@@ -34,15 +34,7 @@ impl AuthorizationEngine {
             )));
         }
 
-        let decision = self.policy.evaluate(&request)?;
-
-        match decision.outcome {
-            DecisionOutcome::Allow => Ok(Decision::allow(decision.reason)),
-            DecisionOutcome::Deny => Ok(Decision::deny(decision.reason)),
-            DecisionOutcome::RequireApproval => {
-                Ok(Decision::require_approval(decision.reason))
-            }
-        }
+        self.policy.evaluate(&request)
     }
 }
 
@@ -141,6 +133,47 @@ mod tests {
             evidence.decision.outcome,
             DecisionOutcome::RequireApproval
         );
+        assert!(evidence.verify());
+    }
+
+    #[test]
+    fn engine_preserves_policy_contributions() {
+        let agent = test_agent();
+
+        let authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            vec!["read_data".into()],
+        );
+
+        let request =
+            AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        let policy = Policy::new(
+            "test-policy",
+            1,
+            vec![
+                PolicyRule::allow_action("read_data"),
+                PolicyRule::deny_action("read_data"),
+            ],
+        )
+        .unwrap();
+
+        let engine = AuthorizationEngine::new(policy);
+        let evidence = engine.evaluate(request).unwrap();
+
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(evidence.decision.contributions.len(), 2);
+
+        assert_eq!(
+            evidence.decision.contributions[0].rule_id,
+            "allow-read_data"
+        );
+        assert_eq!(
+            evidence.decision.contributions[1].rule_id,
+            "deny-read_data"
+        );
+
         assert!(evidence.verify());
     }
 
