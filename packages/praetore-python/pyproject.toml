@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.9,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "praetore"
+version = "0.1.0"
+description = "PRÆTORE Python SDK"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-only" }
+authors = [
+    { name = "PRÆTOR TECHNOLOGIES" }
+]
+
+[tool.maturin]
+manifest-path = "../../crates/praetore-core/Cargo.toml"
+python-source = "src"
+module-name = "praetore._core"

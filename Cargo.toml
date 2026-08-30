@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/praetore-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LicenseRef-PRAETORE-OPEN-CORE"
+authors = ["PRÆTOR TECHNOLOGIES"]
+repository = "https://github.com/Mavericksantander/praetore"

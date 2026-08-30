@@ -1,0 +1,165 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::identity::AgentId;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AuthorityId(Uuid);
+
+impl AuthorityId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for AuthorityId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A constraint limiting where or how an authority may be exercised.
+///
+/// Constraints are explicit data. They are not executable expressions.
+/// Evaluation belongs to the authorization layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityConstraint {
+    pub key: String,
+    pub value: String,
+}
+
+impl AuthorityConstraint {
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+}
+
+/// Validity interval for an authority.
+///
+/// `None` means unbounded on that side.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Validity {
+    pub not_before: Option<String>,
+    pub not_after: Option<String>,
+}
+
+impl Validity {
+    pub fn unbounded() -> Self {
+        Self {
+            not_before: None,
+            not_after: None,
+        }
+    }
+}
+
+/// A delegated authority granted to an agent.
+///
+/// Authority answers "what may this identity potentially do?"
+/// Authorization answers "may it do this specific action now?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Authority {
+    pub id: AuthorityId,
+    pub subject: AgentId,
+    pub capabilities: Vec<String>,
+    pub constraints: Vec<AuthorityConstraint>,
+    pub issuer: String,
+    pub validity: Validity,
+    pub version: u32,
+}
+
+impl Authority {
+    pub fn new(subject: AgentId, issuer: impl Into<String>, capabilities: Vec<String>) -> Self {
+        Self {
+            id: AuthorityId::new(),
+            subject,
+            capabilities,
+            constraints: Vec::new(),
+            issuer: issuer.into(),
+            validity: Validity::unbounded(),
+            version: 1,
+        }
+    }
+
+    pub fn permits(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|item| item == capability)
+    }
+
+    pub fn with_constraint(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.constraints.push(AuthorityConstraint::new(key, value));
+        self
+    }
+
+    pub fn with_validity(mut self, validity: Validity) -> Self {
+        self.validity = validity;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_agent() -> AgentId {
+        AgentId::new()
+    }
+
+    #[test]
+    fn creates_unique_authority_ids() {
+        let first = AuthorityId::new();
+        let second = AuthorityId::new();
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn authority_permits_declared_capability() {
+        let authority = Authority::new(
+            test_agent(),
+            "praetore-root",
+            vec!["read:data".into(), "write:data".into()],
+        );
+
+        assert!(authority.permits("read:data"));
+        assert!(authority.permits("write:data"));
+    }
+
+    #[test]
+    fn authority_rejects_undeclared_capability() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
+
+        assert!(!authority.permits("delete:data"));
+    }
+
+    #[test]
+    fn authority_can_have_constraints() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["call:api".into()])
+            .with_constraint("environment", "production");
+
+        assert_eq!(authority.constraints.len(), 1);
+        assert_eq!(authority.constraints[0].key, "environment");
+        assert_eq!(authority.constraints[0].value, "production");
+    }
+
+    #[test]
+    fn authority_can_have_validity() {
+        let validity = Validity {
+            not_before: Some("2026-01-01T00:00:00Z".into()),
+            not_after: Some("2027-01-01T00:00:00Z".into()),
+        };
+
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_validity(validity.clone());
+
+        assert_eq!(authority.validity, validity);
+    }
+
+    #[test]
+    fn authority_defaults_to_version_one() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
+
+        assert_eq!(authority.version, 1);
+    }
+}
