@@ -30,6 +30,8 @@ impl Policy {
         authority: &Authority,
         action: &Action,
     ) -> Result<Decision> {
+        self.validate()?;
+
         let mut decision = Decision::allow(format!(
             "Policy '{}' v{}: no matching rule",
             self.id, self.version
@@ -487,5 +489,51 @@ mod tests {
         let policy = Policy::new("production", 0, vec![]);
 
         assert!(policy.validate().is_err());
+    }
+
+    #[test]
+    fn policy_evaluate_rejects_empty_id() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+
+        let policy = Policy::new(
+            "",
+            1,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+
+        let result = policy.evaluate(&agent, &authority, &test_action());
+
+        assert!(matches!(
+            result,
+            Err(PraetoreError::PolicyEvaluationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn policy_evaluate_rejects_zero_version() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+
+        let policy = Policy::new(
+            "production",
+            0,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+
+        let result = policy.evaluate(&agent, &authority, &test_action());
+
+        assert!(matches!(
+            result,
+            Err(PraetoreError::PolicyEvaluationFailed(_))
+        ));
     }
 }
