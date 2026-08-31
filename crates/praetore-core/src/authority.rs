@@ -39,12 +39,28 @@ impl AuthorityConstraint {
             value: value.into(),
         }
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.key.trim().is_empty() {
+            return Err(PraetoreError::InvalidRequest(
+                "authority constraint key cannot be empty".into(),
+            ));
+        }
+
+        if self.value.trim().is_empty() {
+            return Err(PraetoreError::InvalidRequest(format!(
+                "authority constraint '{}' cannot have an empty value",
+                self.key
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// Validity interval for an authority.
 ///
 /// `None` means unbounded on that side.
-/// When present, timestamps must be valid RFC 3339 values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Validity {
     pub not_before: Option<String>,
@@ -57,6 +73,38 @@ impl Validity {
             not_before: None,
             not_after: None,
         }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let not_before = self
+            .not_before
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+
+        let not_after = self.not_after.as_deref().map(parse_timestamp).transpose()?;
+
+        if let (Some(not_before), Some(not_after)) = (not_before, not_after) {
+            if not_after < not_before {
+                return Err(PraetoreError::InvalidRequest(
+                    "authority validity not_before cannot be after not_after".into(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn is_active_at(&self, now: OffsetDateTime) -> Result<bool> {
+        let not_before = self
+            .not_before
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+
+        let not_after = self.not_after.as_deref().map(parse_timestamp).transpose()?;
+
+        Ok(not_before.is_none_or(|ts| now >= ts) && not_after.is_none_or(|ts| now <= ts))
     }
 }
 
@@ -73,6 +121,18 @@ pub struct Authority {
     pub issuer: String,
     pub validity: Validity,
     pub version: u32,
+}
+
+fn parse_timestamp(value: &str) -> Result<OffsetDateTime> {
+    if value.trim().is_empty() {
+        return Err(PraetoreError::InvalidRequest(
+            "authority validity timestamp cannot be empty".into(),
+        ));
+    }
+
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(|_| {
+        PraetoreError::InvalidRequest("authority validity timestamp must be valid RFC 3339".into())
+    })
 }
 
 impl Authority {
@@ -104,56 +164,33 @@ impl Authority {
 
     pub fn validate(&self) -> Result<()> {
         if self.issuer.trim().is_empty() {
-            return Err(PraetoreError::AuthorityVerificationFailed);
+            return Err(PraetoreError::InvalidRequest(
+                "authority issuer cannot be empty".into(),
+            ));
         }
 
         if self.version == 0 {
-            return Err(PraetoreError::AuthorityVerificationFailed);
+            return Err(PraetoreError::InvalidRequest(
+                "authority version must be greater than zero".into(),
+            ));
         }
 
         for capability in &self.capabilities {
             if capability.trim().is_empty() {
-                return Err(PraetoreError::AuthorityVerificationFailed);
+                return Err(PraetoreError::InvalidRequest(
+                    "authority capability cannot be empty".into(),
+                ));
             }
         }
 
         for constraint in &self.constraints {
-            if constraint.key.trim().is_empty() || constraint.value.trim().is_empty() {
-                return Err(PraetoreError::AuthorityVerificationFailed);
-            }
+            constraint.validate()?;
         }
 
-        let not_before = self
-            .validity
-            .not_before
-            .as_deref()
-            .map(parse_timestamp)
-            .transpose()?;
-
-        let not_after = self
-            .validity
-            .not_after
-            .as_deref()
-            .map(parse_timestamp)
-            .transpose()?;
-
-        if let (Some(not_before), Some(not_after)) = (not_before, not_after) {
-            if not_after < not_before {
-                return Err(PraetoreError::AuthorityVerificationFailed);
-            }
-        }
+        self.validity.validate()?;
 
         Ok(())
     }
-}
-
-fn parse_timestamp(value: &str) -> Result<OffsetDateTime> {
-    if value.trim().is_empty() {
-        return Err(PraetoreError::AuthorityVerificationFailed);
-    }
-
-    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
-        .map_err(|_| PraetoreError::AuthorityVerificationFailed)
 }
 
 #[cfg(test)]
@@ -199,6 +236,7 @@ mod tests {
         assert_eq!(authority.constraints.len(), 1);
         assert_eq!(authority.constraints[0].key, "environment");
         assert_eq!(authority.constraints[0].value, "production");
+        assert!(authority.validate().is_ok());
     }
 
     #[test]
@@ -230,7 +268,14 @@ mod tests {
     }
 
     #[test]
-    fn authority_rejects_zero_version() {
+    fn authority_rejects_empty_capability() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["".into()]);
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_invalid_version() {
         let mut authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
 
         authority.version = 0;
@@ -239,14 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn authority_rejects_empty_capability() {
-        let authority = Authority::new(test_agent(), "praetore-root", vec!["".into()]);
-
-        assert!(authority.validate().is_err());
-    }
-
-    #[test]
-    fn authority_rejects_invalid_constraint() {
+    fn authority_rejects_empty_constraint_key() {
         let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
             .with_constraint("", "production");
 
@@ -254,54 +292,43 @@ mod tests {
     }
 
     #[test]
-    fn authority_rejects_empty_not_before() {
-        let validity = Validity {
-            not_before: Some(String::new()),
-            not_after: None,
-        };
-
+    fn authority_rejects_empty_constraint_value() {
         let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
-            .with_validity(validity);
+            .with_constraint("environment", "");
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_empty_not_before() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_validity(Validity {
+                not_before: Some(String::new()),
+                not_after: None,
+            });
 
         assert!(authority.validate().is_err());
     }
 
     #[test]
     fn authority_rejects_invalid_timestamp() {
-        let validity = Validity {
-            not_before: Some("not-a-timestamp".into()),
-            not_after: None,
-        };
-
         let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
-            .with_validity(validity);
+            .with_validity(Validity {
+                not_before: Some("not-a-timestamp".into()),
+                not_after: None,
+            });
 
         assert!(authority.validate().is_err());
     }
 
     #[test]
-    fn authority_rejects_inverted_validity_window() {
-        let validity = Validity {
-            not_before: Some("2027-01-01T00:00:00Z".into()),
-            not_after: Some("2026-01-01T00:00:00Z".into()),
-        };
-
+    fn authority_rejects_invalid_validity_range() {
         let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
-            .with_validity(validity);
+            .with_validity(Validity {
+                not_before: Some("2027-01-01T00:00:00Z".into()),
+                not_after: Some("2026-01-01T00:00:00Z".into()),
+            });
 
         assert!(authority.validate().is_err());
-    }
-
-    #[test]
-    fn authority_accepts_open_ended_validity() {
-        let validity = Validity {
-            not_before: Some("2026-01-01T00:00:00Z".into()),
-            not_after: None,
-        };
-
-        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
-            .with_validity(validity);
-
-        assert!(authority.validate().is_ok());
     }
 }

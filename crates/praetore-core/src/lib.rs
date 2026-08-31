@@ -2,6 +2,7 @@ pub mod action;
 pub mod authority;
 pub mod authorization;
 pub mod decision;
+pub mod engine;
 pub mod error;
 pub mod evidence;
 pub mod identity;
