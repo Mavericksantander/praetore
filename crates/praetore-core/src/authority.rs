@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
@@ -43,6 +44,7 @@ impl AuthorityConstraint {
 /// Validity interval for an authority.
 ///
 /// `None` means unbounded on that side.
+/// When present, timestamps must be valid RFC 3339 values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Validity {
     pub not_before: Option<String>,
@@ -121,8 +123,37 @@ impl Authority {
             }
         }
 
+        let not_before = self
+            .validity
+            .not_before
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+
+        let not_after = self
+            .validity
+            .not_after
+            .as_deref()
+            .map(parse_timestamp)
+            .transpose()?;
+
+        if let (Some(not_before), Some(not_after)) = (not_before, not_after) {
+            if not_after < not_before {
+                return Err(PraetoreError::AuthorityVerificationFailed);
+            }
+        }
+
         Ok(())
     }
+}
+
+fn parse_timestamp(value: &str) -> Result<OffsetDateTime> {
+    if value.trim().is_empty() {
+        return Err(PraetoreError::AuthorityVerificationFailed);
+    }
+
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .map_err(|_| PraetoreError::AuthorityVerificationFailed)
 }
 
 #[cfg(test)]
@@ -181,6 +212,7 @@ mod tests {
             .with_validity(validity.clone());
 
         assert_eq!(authority.validity, validity);
+        assert!(authority.validate().is_ok());
     }
 
     #[test]
@@ -219,5 +251,57 @@ mod tests {
             .with_constraint("", "production");
 
         assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_empty_not_before() {
+        let validity = Validity {
+            not_before: Some(String::new()),
+            not_after: None,
+        };
+
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_validity(validity);
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_invalid_timestamp() {
+        let validity = Validity {
+            not_before: Some("not-a-timestamp".into()),
+            not_after: None,
+        };
+
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_validity(validity);
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_inverted_validity_window() {
+        let validity = Validity {
+            not_before: Some("2027-01-01T00:00:00Z".into()),
+            not_after: Some("2026-01-01T00:00:00Z".into()),
+        };
+
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_validity(validity);
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_accepts_open_ended_validity() {
+        let validity = Validity {
+            not_before: Some("2026-01-01T00:00:00Z".into()),
+            not_after: None,
+        };
+
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_validity(validity);
+
+        assert!(authority.validate().is_ok());
     }
 }

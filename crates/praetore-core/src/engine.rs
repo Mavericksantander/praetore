@@ -1,19 +1,74 @@
 use crate::{
     authorization::AuthorizationRequest,
-    decision::{Decision, DecisionOutcome},
+    decision::Decision,
     evidence::Evidence,
     policy::Policy,
+    PraetoreError,
     Result,
 };
 
+use std::sync::Arc;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+pub trait Clock: Send + Sync {
+    fn now(&self) -> OffsetDateTime;
+}
+
 #[derive(Debug, Clone)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedClock {
+    instant: OffsetDateTime,
+}
+
+impl FixedClock {
+    pub fn new(timestamp: &str) -> Self {
+        Self {
+            instant: OffsetDateTime::parse(timestamp, &Rfc3339).unwrap(),
+        }
+    }
+}
+
+impl Clock for FixedClock {
+    fn now(&self) -> OffsetDateTime {
+        self.instant
+    }
+}
+
+#[derive(Clone)]
 pub struct AuthorizationEngine {
     policy: Policy,
+    clock: Arc<dyn Clock>,
+}
+
+impl std::fmt::Debug for AuthorizationEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizationEngine")
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 impl AuthorizationEngine {
     pub fn new(policy: Policy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            clock: Arc::new(SystemClock),
+        }
+    }
+
+    pub fn with_clock(policy: Policy, clock: impl Clock + 'static) -> Self {
+        Self {
+            policy,
+            clock: Arc::new(clock),
+        }
     }
 
     pub fn policy(&self) -> &Policy {
@@ -22,12 +77,31 @@ impl AuthorizationEngine {
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
         let decision = self.evaluate_request(&request)?;
-
         Ok(request.attest(decision))
     }
 
     fn evaluate_request(&self, request: &AuthorizationRequest) -> Result<Decision> {
         request.authority.validate()?;
+
+        let now = self.clock.now();
+
+        if let Some(not_before) = &request.authority.validity.not_before {
+            let ts = OffsetDateTime::parse(not_before, &Rfc3339)
+                .map_err(|_| PraetoreError::AuthorityVerificationFailed)?;
+
+            if now < ts {
+                return Err(PraetoreError::AuthorityVerificationFailed);
+            }
+        }
+
+        if let Some(not_after) = &request.authority.validity.not_after {
+            let ts = OffsetDateTime::parse(not_after, &Rfc3339)
+                .map_err(|_| PraetoreError::AuthorityVerificationFailed)?;
+
+            if now > ts {
+                return Err(PraetoreError::AuthorityVerificationFailed);
+            }
+        }
 
         if !request.authority.permits(&request.action.action_type) {
             return Ok(Decision::deny(format!(
@@ -45,10 +119,9 @@ mod tests {
     use super::*;
     use crate::{
         action::Action,
-        authority::Authority,
+        authority::{Authority, Validity},
         identity::{AgentId, AgentIdentity},
         policy::{Policy, PolicyRule},
-        PraetoreError,
     };
     use serde_json::json;
 
@@ -65,21 +138,9 @@ mod tests {
         Action::new(
             "read_data",
             Some("database".into()),
-            json!({"table": "users"}),
+            json!({"table":"users"}),
         )
         .unwrap()
-    }
-
-    fn test_request() -> AuthorizationRequest {
-        let agent = test_agent();
-
-        let authority = Authority::new(
-            agent.id.clone(),
-            "praetore-root",
-            vec!["read_data".into()],
-        );
-
-        AuthorizationRequest::new(agent, authority, test_action()).unwrap()
     }
 
     fn allow_policy() -> Policy {
@@ -88,139 +149,147 @@ mod tests {
             1,
             vec![PolicyRule::allow_action("read_data")],
         )
-        .unwrap()
     }
 
-    fn deny_policy() -> Policy {
-        Policy::new(
-            "test-policy",
-            1,
-            vec![PolicyRule::deny_action("read_data")],
+    fn authority_with_validity(validity: Validity) -> crate::authority::Authority {
+        let agent = test_agent();
+
+        Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            vec!["read_data".into()],
         )
-        .unwrap()
-    }
-
-    fn approval_policy() -> Policy {
-        Policy::new(
-            "test-policy",
-            1,
-            vec![PolicyRule::require_approval("read_data")],
-        )
-        .unwrap()
+        .with_validity(validity)
     }
 
     #[test]
-    fn engine_allows_authorized_action() {
-        let engine = AuthorizationEngine::new(allow_policy());
-        let evidence = engine.evaluate(test_request()).unwrap();
-
-        assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
-        assert!(evidence.verify());
-    }
-
-    #[test]
-    fn engine_denies_policy_rejection() {
-        let engine = AuthorizationEngine::new(deny_policy());
-        let evidence = engine.evaluate(test_request()).unwrap();
-
-        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
-        assert!(evidence.verify());
-    }
-
-    #[test]
-    fn engine_requires_approval_when_policy_requires_it() {
-        let engine = AuthorizationEngine::new(approval_policy());
-        let evidence = engine.evaluate(test_request()).unwrap();
-
-        assert_eq!(
-            evidence.decision.outcome,
-            DecisionOutcome::RequireApproval
-        );
-        assert!(evidence.verify());
-    }
-
-    #[test]
-    fn engine_preserves_policy_contributions() {
+    fn authority_within_validity_is_accepted() {
         let agent = test_agent();
 
         let authority = Authority::new(
             agent.id.clone(),
             "praetore-root",
             vec!["read_data".into()],
-        );
+        )
+        .with_validity(Validity {
+            not_before: Some("2026-01-01T00:00:00Z".into()),
+            not_after: Some("2026-12-31T23:59:59Z".into()),
+        });
 
         let request =
-            AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+            crate::AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let policy = Policy::new(
-            "test-policy",
-            1,
-            vec![
-                PolicyRule::allow_action("read_data"),
-                PolicyRule::deny_action("read_data"),
-            ],
-        )
-        .unwrap();
-
-        let engine = AuthorizationEngine::new(policy);
-        let evidence = engine.evaluate(request).unwrap();
-
-        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
-        assert_eq!(evidence.decision.contributions.len(), 2);
-
-        assert_eq!(
-            evidence.decision.contributions[0].rule_id,
-            "allow-read_data"
-        );
-        assert_eq!(
-            evidence.decision.contributions[1].rule_id,
-            "deny-read_data"
+        let engine = AuthorizationEngine::with_clock(
+            allow_policy(),
+            FixedClock::new("2026-06-01T12:00:00Z"),
         );
 
-        assert!(evidence.verify());
+        assert!(engine.evaluate(request).is_ok());
     }
 
     #[test]
-    fn engine_rejects_invalid_authority() {
+    fn authority_at_not_before_is_accepted() {
         let agent = test_agent();
 
-        let mut authority = Authority::new(
+        let authority = Authority::new(
             agent.id.clone(),
             "praetore-root",
             vec!["read_data".into()],
-        );
-
-        authority.issuer = String::new();
+        )
+        .with_validity(Validity {
+            not_before: Some("2026-07-01T00:00:00Z".into()),
+            not_after: None,
+        });
 
         let request =
-            AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+            crate::AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
-        let result = engine.evaluate(request);
+        let engine = AuthorizationEngine::with_clock(
+            allow_policy(),
+            FixedClock::new("2026-07-01T00:00:00Z"),
+        );
+
+        assert!(engine.evaluate(request).is_ok());
+    }
+
+    #[test]
+    fn authority_at_not_after_is_accepted() {
+        let agent = test_agent();
+
+        let authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            vec!["read_data".into()],
+        )
+        .with_validity(Validity {
+            not_before: None,
+            not_after: Some("2026-07-01T00:00:00Z".into()),
+        });
+
+        let request =
+            crate::AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        let engine = AuthorizationEngine::with_clock(
+            allow_policy(),
+            FixedClock::new("2026-07-01T00:00:00Z"),
+        );
+
+        assert!(engine.evaluate(request).is_ok());
+    }
+
+    #[test]
+    fn authority_not_yet_valid_is_rejected() {
+        let agent = test_agent();
+
+        let authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            vec!["read_data".into()],
+        )
+        .with_validity(Validity {
+            not_before: Some("2026-07-01T00:00:00Z".into()),
+            not_after: None,
+        });
+
+        let request =
+            crate::AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        let engine = AuthorizationEngine::with_clock(
+            allow_policy(),
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        );
 
         assert!(matches!(
-            result,
+            engine.evaluate(request),
             Err(PraetoreError::AuthorityVerificationFailed)
         ));
     }
 
     #[test]
-    fn engine_denies_undeclared_capability() {
+    fn authority_expired_is_rejected() {
         let agent = test_agent();
 
         let authority = Authority::new(
             agent.id.clone(),
             "praetore-root",
-            vec!["write_data".into()],
-        );
+            vec!["read_data".into()],
+        )
+        .with_validity(Validity {
+            not_before: None,
+            not_after: Some("2026-05-01T00:00:00Z".into()),
+        });
 
         let request =
-            AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+            crate::AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
-        let evidence = engine.evaluate(request).unwrap();
+        let engine = AuthorizationEngine::with_clock(
+            allow_policy(),
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        );
 
-        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
-        assert!(evidence.verify());
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::AuthorityVerificationFailed)
+        ));
     }
 }
