@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -175,16 +176,34 @@ impl Authority {
             ));
         }
 
+        let mut capabilities = HashSet::new();
+
         for capability in &self.capabilities {
             if capability.trim().is_empty() {
                 return Err(PraetoreError::InvalidRequest(
                     "authority capability cannot be empty".into(),
                 ));
             }
+
+            if !capabilities.insert(capability) {
+                return Err(PraetoreError::InvalidRequest(format!(
+                    "authority contains duplicate capability '{}'",
+                    capability
+                )));
+            }
         }
+
+        let mut constraint_keys = HashSet::new();
 
         for constraint in &self.constraints {
             constraint.validate()?;
+
+            if !constraint_keys.insert(&constraint.key) {
+                return Err(PraetoreError::InvalidRequest(format!(
+                    "authority contains duplicate constraint key '{}'",
+                    constraint.key
+                )));
+            }
         }
 
         self.validity.validate()?;
@@ -275,6 +294,20 @@ mod tests {
     }
 
     #[test]
+    fn authority_rejects_duplicate_capabilities() {
+        let authority = Authority::new(
+            test_agent(),
+            "praetore-root",
+            vec!["read:data".into(), "read:data".into()],
+        );
+
+        assert!(matches!(
+            authority.validate(),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
     fn authority_rejects_invalid_version() {
         let mut authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
 
@@ -297,6 +330,30 @@ mod tests {
             .with_constraint("environment", "");
 
         assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_duplicate_constraints() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_constraint("environment", "production")
+            .with_constraint("environment", "production");
+
+        assert!(matches!(
+            authority.validate(),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn authority_rejects_conflicting_constraints() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_constraint("environment", "production")
+            .with_constraint("environment", "staging");
+
+        assert!(matches!(
+            authority.validate(),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
     }
 
     #[test]

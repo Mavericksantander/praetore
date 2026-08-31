@@ -80,6 +80,18 @@ impl Policy {
             rule.validate()?;
         }
 
+        for (index, rule) in self.rules.iter().enumerate() {
+            if self.rules[..index]
+                .iter()
+                .any(|previous| previous.id == rule.id)
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy '{}' contains duplicate rule id '{}'",
+                    self.id, rule.id
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -299,6 +311,10 @@ mod tests {
 
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert!(decision.contributions.is_empty());
+        assert_eq!(
+            decision.reason,
+            "Policy 'production' v1: no matching rule; default deny"
+        );
     }
 
     #[test]
@@ -572,6 +588,78 @@ mod tests {
         );
 
         let result = policy.evaluate(&agent, &authority, &test_action());
+
+        assert!(matches!(
+            result,
+            Err(PraetoreError::PolicyEvaluationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn policy_precedence_is_deny_then_approval_then_allow() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+
+        let effects = [
+            PolicyEffect::Allow,
+            PolicyEffect::RequireApproval,
+            PolicyEffect::Deny,
+        ];
+
+        let expected = [
+            [
+                DecisionOutcome::Allow,
+                DecisionOutcome::RequireApproval,
+                DecisionOutcome::Deny,
+            ],
+            [
+                DecisionOutcome::RequireApproval,
+                DecisionOutcome::RequireApproval,
+                DecisionOutcome::Deny,
+            ],
+            [
+                DecisionOutcome::Deny,
+                DecisionOutcome::Deny,
+                DecisionOutcome::Deny,
+            ],
+        ];
+
+        for (left_index, left_effect) in effects.iter().enumerate() {
+            for (right_index, right_effect) in effects.iter().enumerate() {
+                let policy = Policy::new(
+                    "precedence-test",
+                    1,
+                    vec![
+                        PolicyRule::new("rule-left", "read_data", *left_effect),
+                        PolicyRule::new("rule-right", "read_data", *right_effect),
+                    ],
+                );
+
+                let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
+
+                assert_eq!(
+                    decision.outcome, expected[left_index][right_index],
+                    "unexpected precedence for {:?} + {:?}",
+                    left_effect, right_effect
+                );
+
+                assert_eq!(decision.contributions.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_rejects_duplicate_rule_ids() {
+        let policy = Policy::new(
+            "production",
+            1,
+            vec![
+                PolicyRule::new("read-rule", "read_data", PolicyEffect::Allow),
+                PolicyRule::new("read-rule", "read_data", PolicyEffect::Deny),
+            ],
+        );
+
+        let result = policy.validate();
 
         assert!(matches!(
             result,

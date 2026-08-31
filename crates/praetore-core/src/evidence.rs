@@ -55,7 +55,12 @@ impl Evidence {
         self.decision.outcome
     }
 
-    pub fn verify(&self) -> bool {
+    /// Verifies the integrity of the evidence payload.
+    ///
+    /// This verifies that the evidence contents still correspond to the
+    /// recorded SHA-256 context hash. It does not authenticate the issuer
+    /// cryptographically and does not provide non-repudiation.
+    pub fn verify_integrity(&self) -> bool {
         let expected = Self::compute_context_hash(
             &self.request_id,
             &self.agent,
@@ -66,6 +71,11 @@ impl Evidence {
         );
 
         self.context_hash == expected
+    }
+
+    /// Backwards-compatible alias for `verify_integrity`.
+    pub fn verify(&self) -> bool {
+        self.verify_integrity()
     }
 
     fn compute_context_hash(
@@ -85,10 +95,9 @@ impl Evidence {
             "trace_id": trace_id,
         });
 
-        let canonical =
-            serde_json::to_vec(&payload).expect("evidence serialization must be deterministic");
+        let serialized = serde_json::to_vec(&payload).expect("evidence serialization must succeed");
 
-        let digest = Sha256::digest(canonical);
+        let digest = Sha256::digest(serialized);
 
         hex::encode(digest)
     }
@@ -100,7 +109,7 @@ mod tests {
     use crate::{
         action::Action,
         authority::Authority,
-        decision::Decision,
+        decision::{Decision, DecisionContribution, DecisionOutcome},
         identity::{AgentId, AgentIdentity},
     };
     use serde_json::json;
@@ -153,6 +162,7 @@ mod tests {
         let evidence = test_evidence();
 
         assert!(evidence.verify());
+        assert!(evidence.verify_integrity());
     }
 
     #[test]
@@ -177,7 +187,7 @@ mod tests {
         );
 
         assert_eq!(evidence.trace_id.as_deref(), Some("trace-001"));
-        assert!(evidence.verify());
+        assert!(evidence.verify_integrity());
     }
 
     #[test]
@@ -196,7 +206,7 @@ mod tests {
 
         evidence.trace_id = Some("trace-999".into());
 
-        assert!(!evidence.verify());
+        assert!(!evidence.verify_integrity());
     }
 
     #[test]
@@ -210,7 +220,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!evidence.verify());
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_action_parameters_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.action.parameters = json!({
+            "table": "secrets"
+        });
+
+        assert!(!evidence.verify_integrity());
     }
 
     #[test]
@@ -219,7 +240,7 @@ mod tests {
 
         evidence.request_id = Uuid::new_v4();
 
-        assert!(!evidence.verify());
+        assert!(!evidence.verify_integrity());
     }
 
     #[test]
@@ -228,7 +249,16 @@ mod tests {
 
         evidence.agent.public_key = b"tampered-public-key".to_vec();
 
-        assert!(!evidence.verify());
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_agent_algorithm_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.agent.key_algorithm = "rsa".into();
+
+        assert!(!evidence.verify_integrity());
     }
 
     #[test]
@@ -237,7 +267,31 @@ mod tests {
 
         evidence.authority.issuer = "tampered-issuer".into();
 
-        assert!(!evidence.verify());
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_authority_constraints_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence
+            .authority
+            .constraints
+            .push(crate::authority::AuthorityConstraint::new(
+                "environment",
+                "production",
+            ));
+
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_authority_validity_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.authority.validity.not_after = Some("2027-01-01T00:00:00Z".into());
+
+        assert!(!evidence.verify_integrity());
     }
 
     #[test]
@@ -246,6 +300,42 @@ mod tests {
 
         evidence.decision = Decision::deny("policy rejected action");
 
-        assert!(!evidence.verify());
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_decision_reason_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.decision.reason = "tampered reason".into();
+
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_decision_contributions_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence
+            .decision
+            .contributions
+            .push(DecisionContribution::new(
+                "tampered-rule",
+                DecisionOutcome::Deny,
+                "tampered contribution",
+            ));
+
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn evidence_id_is_not_part_of_integrity_hash() {
+        let mut evidence = test_evidence();
+        let original_hash = evidence.context_hash.clone();
+
+        evidence.evidence_id = Uuid::new_v4();
+
+        assert_eq!(evidence.context_hash, original_hash);
+        assert!(evidence.verify_integrity());
     }
 }

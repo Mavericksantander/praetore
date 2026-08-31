@@ -207,4 +207,109 @@ mod tests {
         assert_eq!(combined.outcome, DecisionOutcome::Allow);
         assert_eq!(combined.contributions.len(), 2);
     }
+
+    #[test]
+    fn strongest_preserves_reason_of_stronger_decision() {
+        let allow = Decision::allow("read operation permitted").with_contribution(
+            DecisionContribution::new(
+                "allow-read",
+                DecisionOutcome::Allow,
+                "read operation permitted",
+            ),
+        );
+
+        let deny = Decision::deny("read operation forbidden").with_contribution(
+            DecisionContribution::new(
+                "deny-read",
+                DecisionOutcome::Deny,
+                "read operation forbidden",
+            ),
+        );
+
+        let combined = allow.strongest(deny);
+
+        assert_eq!(combined.outcome, DecisionOutcome::Deny);
+        assert_eq!(combined.reason, "read operation forbidden");
+        assert_eq!(combined.contributions.len(), 2);
+    }
+
+    #[test]
+    fn strongest_is_associative_for_outcome_and_contributions() {
+        let allow = Decision::allow("allowed").with_contribution(DecisionContribution::new(
+            "allow-read",
+            DecisionOutcome::Allow,
+            "allowed",
+        ));
+
+        let approval = Decision::require_approval("approval required").with_contribution(
+            DecisionContribution::new(
+                "approval-read",
+                DecisionOutcome::RequireApproval,
+                "approval required",
+            ),
+        );
+
+        let deny = Decision::deny("denied").with_contribution(DecisionContribution::new(
+            "deny-read",
+            DecisionOutcome::Deny,
+            "denied",
+        ));
+
+        let left = allow
+            .clone()
+            .strongest(approval.clone())
+            .strongest(deny.clone());
+        let right = allow.strongest(approval.strongest(deny));
+
+        assert_eq!(left.outcome, right.outcome);
+        assert_eq!(left.reason, right.reason);
+
+        let left_rule_ids: std::collections::HashSet<_> = left
+            .contributions
+            .iter()
+            .map(|c| c.rule_id.as_str())
+            .collect();
+
+        let right_rule_ids: std::collections::HashSet<_> = right
+            .contributions
+            .iter()
+            .map(|c| c.rule_id.as_str())
+            .collect();
+
+        assert_eq!(left_rule_ids, right_rule_ids);
+    }
+
+    #[test]
+    fn strongest_is_commutative_for_outcome_and_contributions() {
+        let allow = Decision::allow("allowed").with_contribution(DecisionContribution::new(
+            "allow-read",
+            DecisionOutcome::Allow,
+            "allowed",
+        ));
+
+        let deny = Decision::deny("denied").with_contribution(DecisionContribution::new(
+            "deny-read",
+            DecisionOutcome::Deny,
+            "denied",
+        ));
+
+        let first = allow.clone().strongest(deny.clone());
+        let second = deny.strongest(allow);
+
+        assert_eq!(first.outcome, second.outcome);
+        assert_eq!(first.reason, second.reason);
+
+        let first_rule_ids: std::collections::HashSet<_> = first
+            .contributions
+            .iter()
+            .map(|c| c.rule_id.as_str())
+            .collect();
+        let second_rule_ids: std::collections::HashSet<_> = second
+            .contributions
+            .iter()
+            .map(|c| c.rule_id.as_str())
+            .collect();
+
+        assert_eq!(first_rule_ids, second_rule_ids);
+    }
 }

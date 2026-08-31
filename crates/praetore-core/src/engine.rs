@@ -73,11 +73,19 @@ impl AuthorizationEngine {
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
         let decision = self.evaluate_request(&request)?;
-        Ok(request.attest(decision))
+        request.attest(decision)
     }
 
     fn evaluate_request(&self, request: &AuthorizationRequest) -> Result<Decision> {
+        request.agent.validate()?;
         request.authority.validate()?;
+        request.action.validate()?;
+
+        if request.agent.id != request.authority.subject {
+            return Err(PraetoreError::InvalidRequest(
+                "authority subject does not match agent identity".into(),
+            ));
+        }
 
         let now = self.clock.now();
 
@@ -389,6 +397,59 @@ mod tests {
         assert!(matches!(
             engine.evaluate(request),
             Err(PraetoreError::AuthorityVerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn engine_rejects_tampered_identity() {
+        let agent = test_agent();
+
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        request.agent.public_key.clear();
+
+        let engine = AuthorizationEngine::new(allow_policy());
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidIdentity(_))
+        ));
+    }
+
+    #[test]
+    fn engine_rejects_tampered_action() {
+        let agent = test_agent();
+
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        request.action.parameters = json!("invalid");
+
+        let engine = AuthorizationEngine::new(allow_policy());
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn engine_rejects_mismatched_identity_and_authority_after_construction() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        request.agent.id = AgentId::new();
+
+        let engine = AuthorizationEngine::new(allow_policy());
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidRequest(_))
         ));
     }
 }

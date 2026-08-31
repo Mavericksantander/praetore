@@ -40,25 +40,37 @@ pub struct AgentIdentity {
 
 impl AgentIdentity {
     pub fn new(id: AgentId, public_key: Vec<u8>, key_algorithm: impl Into<String>) -> Result<Self> {
-        if public_key.is_empty() {
+        let identity = Self {
+            id,
+            public_key,
+            key_algorithm: key_algorithm.into(),
+        };
+
+        identity.validate()?;
+
+        Ok(identity)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.public_key.is_empty() {
             return Err(PraetoreError::InvalidIdentity(
                 "public key cannot be empty".into(),
             ));
         }
 
-        let key_algorithm = key_algorithm.into();
-
-        if key_algorithm.trim().is_empty() {
+        if self.key_algorithm.trim().is_empty() {
             return Err(PraetoreError::InvalidIdentity(
                 "key algorithm cannot be empty".into(),
             ));
         }
 
-        Ok(Self {
-            id,
-            public_key,
-            key_algorithm,
-        })
+        if self.key_algorithm != self.key_algorithm.trim() {
+            return Err(PraetoreError::InvalidIdentity(
+                "key algorithm cannot have leading or trailing whitespace".into(),
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -75,17 +87,38 @@ mod tests {
     }
 
     #[test]
+    fn agent_id_exposes_underlying_uuid() {
+        let id = AgentId::new();
+
+        assert!(!id.as_uuid().is_nil());
+    }
+
+    #[test]
     fn rejects_empty_public_key() {
         let result = AgentIdentity::new(AgentId::new(), Vec::new(), "ed25519");
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(PraetoreError::InvalidIdentity(_))));
     }
 
     #[test]
     fn rejects_empty_algorithm() {
         let result = AgentIdentity::new(AgentId::new(), vec![1, 2, 3], "");
 
-        assert!(result.is_err());
+        assert!(matches!(result, Err(PraetoreError::InvalidIdentity(_))));
+    }
+
+    #[test]
+    fn rejects_whitespace_algorithm() {
+        let result = AgentIdentity::new(AgentId::new(), vec![1, 2, 3], "   ");
+
+        assert!(matches!(result, Err(PraetoreError::InvalidIdentity(_))));
+    }
+
+    #[test]
+    fn rejects_algorithm_with_surrounding_whitespace() {
+        let result = AgentIdentity::new(AgentId::new(), vec![1, 2, 3], " ed25519 ");
+
+        assert!(matches!(result, Err(PraetoreError::InvalidIdentity(_))));
     }
 
     #[test]
@@ -95,5 +128,18 @@ mod tests {
 
         assert_eq!(identity.public_key, vec![1, 2, 3]);
         assert_eq!(identity.key_algorithm, "ed25519");
+        assert!(identity.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_tampered_identity() {
+        let mut identity = AgentIdentity::new(AgentId::new(), vec![1, 2, 3], "ed25519").unwrap();
+
+        identity.public_key.clear();
+
+        assert!(matches!(
+            identity.validate(),
+            Err(PraetoreError::InvalidIdentity(_))
+        ));
     }
 }
