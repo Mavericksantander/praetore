@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::identity::AgentId;
+use crate::{
+    error::{PraetoreError, Result},
+    identity::AgentId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthorityId(Uuid);
@@ -96,6 +99,30 @@ impl Authority {
         self.validity = validity;
         self
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.issuer.trim().is_empty() {
+            return Err(PraetoreError::AuthorityVerificationFailed);
+        }
+
+        if self.version == 0 {
+            return Err(PraetoreError::AuthorityVerificationFailed);
+        }
+
+        for capability in &self.capabilities {
+            if capability.trim().is_empty() {
+                return Err(PraetoreError::AuthorityVerificationFailed);
+            }
+        }
+
+        for constraint in &self.constraints {
+            if constraint.key.trim().is_empty() || constraint.value.trim().is_empty() {
+                return Err(PraetoreError::AuthorityVerificationFailed);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -161,5 +188,36 @@ mod tests {
         let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
 
         assert_eq!(authority.version, 1);
+    }
+
+    #[test]
+    fn authority_rejects_empty_issuer() {
+        let authority = Authority::new(test_agent(), "", vec!["read:data".into()]);
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_zero_version() {
+        let mut authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
+
+        authority.version = 0;
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_empty_capability() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["".into()]);
+
+        assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn authority_rejects_invalid_constraint() {
+        let authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()])
+            .with_constraint("", "production");
+
+        assert!(authority.validate().is_err());
     }
 }

@@ -27,6 +27,8 @@ impl AuthorizationEngine {
     }
 
     fn evaluate_request(&self, request: &AuthorizationRequest) -> Result<Decision> {
+        request.authority.validate()?;
+
         if !request.authority.permits(&request.action.action_type) {
             return Ok(Decision::deny(format!(
                 "authority does not permit action type: {}",
@@ -46,6 +48,7 @@ mod tests {
         authority::Authority,
         identity::{AgentId, AgentIdentity},
         policy::{Policy, PolicyRule},
+        PraetoreError,
     };
     use serde_json::json;
 
@@ -175,6 +178,30 @@ mod tests {
         );
 
         assert!(evidence.verify());
+    }
+
+    #[test]
+    fn engine_rejects_invalid_authority() {
+        let agent = test_agent();
+
+        let mut authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            vec!["read_data".into()],
+        );
+
+        authority.issuer = String::new();
+
+        let request =
+            AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+
+        let engine = AuthorizationEngine::new(allow_policy());
+        let result = engine.evaluate(request);
+
+        assert!(matches!(
+            result,
+            Err(PraetoreError::AuthorityVerificationFailed)
+        ));
     }
 
     #[test]
