@@ -32,19 +32,12 @@ impl Policy {
     ) -> Result<Decision> {
         self.validate()?;
 
-        let mut decision = Decision::allow(format!(
-            "Policy '{}' v{}: no matching rule",
-            self.id, self.version
-        ));
-
-        let mut matched = false;
+        let mut decision: Option<Decision> = None;
 
         for rule in &self.rules {
             if !rule.matches(agent, authority, action) {
                 continue;
             }
-
-            matched = true;
 
             let rule_decision = rule.decision()?;
 
@@ -56,17 +49,18 @@ impl Policy {
 
             let rule_decision = rule_decision.with_contribution(contribution);
 
-            decision = decision.strongest(rule_decision);
+            decision = Some(match decision {
+                Some(current) => current.strongest(rule_decision),
+                None => rule_decision,
+            });
         }
 
-        if !matched {
-            return Ok(Decision::deny(format!(
+        Ok(decision.unwrap_or_else(|| {
+            Decision::deny(format!(
                 "Policy '{}' v{}: no matching rule; default deny",
                 self.id, self.version
-            )));
-        }
-
-        Ok(decision)
+            ))
+        }))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -512,6 +506,54 @@ mod tests {
             result,
             Err(PraetoreError::PolicyEvaluationFailed(_))
         ));
+    }
+
+    #[test]
+    fn allow_decision_reason_comes_from_matching_rule() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+
+        let policy = Policy::new(
+            "production",
+            1,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+
+        let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(decision.reason, "Policy rule 'allow-read' matched");
+        assert_eq!(decision.contributions.len(), 1);
+        assert_eq!(decision.contributions[0].rule_id, "allow-read");
+    }
+
+    #[test]
+    fn multiple_allow_rules_preserve_a_real_rule_reason() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+
+        let policy = Policy::new(
+            "production",
+            1,
+            vec![
+                PolicyRule::new("allow-read-1", "read_data", PolicyEffect::Allow),
+                PolicyRule::new("allow-read-2", "read_data", PolicyEffect::Allow),
+            ],
+        );
+
+        let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(decision.contributions.len(), 2);
+        assert!(
+            decision.reason == "Policy rule 'allow-read-1' matched"
+                || decision.reason == "Policy rule 'allow-read-2' matched"
+        );
+        assert_ne!(decision.reason, "Policy 'production' v1: no matching rule");
     }
 
     #[test]
