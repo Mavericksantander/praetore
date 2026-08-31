@@ -30,6 +30,16 @@ impl Action {
             parameters,
         })
     }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.action_type.trim().is_empty() {
+            return Err(PraetoreError::InvalidRequest(
+                "action type cannot be empty".into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -58,5 +68,16 @@ mod tests {
         let result = Action::new("   ", None, Value::Null);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_action_after_construction() {
+        let action = Action {
+            action_type: "   ".into(),
+            target: None,
+            parameters: Value::Null,
+        };
+
+        assert!(action.validate().is_err());
     }
 }
