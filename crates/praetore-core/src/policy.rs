@@ -432,6 +432,29 @@ mod tests {
     }
 
     #[test]
+    fn allow_decision_reason_comes_from_matching_rule() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+
+        let policy = Policy::new(
+            "production",
+            1,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+
+        let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+        assert_eq!(decision.reason, "Policy rule 'allow-read' matched");
+        assert_eq!(decision.contributions.len(), 1);
+        assert_eq!(decision.contributions[0].rule_id, "allow-read");
+    }
+
+    #[test]
     fn allow_combined_with_allow_remains_allow() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
@@ -506,29 +529,6 @@ mod tests {
             result,
             Err(PraetoreError::PolicyEvaluationFailed(_))
         ));
-    }
-
-    #[test]
-    fn allow_decision_reason_comes_from_matching_rule() {
-        let agent = test_agent();
-        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
-
-        let policy = Policy::new(
-            "production",
-            1,
-            vec![PolicyRule::new(
-                "allow-read",
-                "read_data",
-                PolicyEffect::Allow,
-            )],
-        );
-
-        let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
-
-        assert_eq!(decision.outcome, DecisionOutcome::Allow);
-        assert_eq!(decision.reason, "Policy rule 'allow-read' matched");
-        assert_eq!(decision.contributions.len(), 1);
-        assert_eq!(decision.contributions[0].rule_id, "allow-read");
     }
 
     #[test]

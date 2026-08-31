@@ -214,6 +214,33 @@ mod tests {
     }
 
     #[test]
+    fn tampering_with_request_id_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.request_id = Uuid::new_v4();
+
+        assert!(!evidence.verify());
+    }
+
+    #[test]
+    fn tampering_with_agent_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.agent.public_key = b"tampered-public-key".to_vec();
+
+        assert!(!evidence.verify());
+    }
+
+    #[test]
+    fn tampering_with_authority_invalidates_evidence() {
+        let mut evidence = test_evidence();
+
+        evidence.authority.issuer = "tampered-issuer".into();
+
+        assert!(!evidence.verify());
+    }
+
+    #[test]
     fn tampering_with_decision_invalidates_evidence() {
         let mut evidence = test_evidence();
 
