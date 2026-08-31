@@ -325,14 +325,9 @@ mod tests {
 
         authority.issuer = String::new();
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let result = AuthorizationRequest::new(agent, authority, test_action());
 
-        let engine = AuthorizationEngine::new(allow_policy());
-
-        assert!(matches!(
-            engine.evaluate(request),
-            Err(PraetoreError::InvalidRequest(_))
-        ));
+        assert!(matches!(result, Err(PraetoreError::InvalidRequest(_))));
     }
 
     #[test]
