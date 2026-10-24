@@ -7,8 +7,8 @@ PRÆTORE is the core software infrastructure of PRÆTOR TECHNOLOGIES, designed t
 ## Status
 
 PRÆTORE is currently under active development. The repository contains the
-Rust authorization core, offline verification CLI, bounded fuzz targets, and
-verify-only Python bindings.
+Rust authorization core, offline verification CLI, bounded fuzz targets,
+verify-only Python bindings, and optional PostgreSQL replay adapter.
 
 The project is being developed from a security-first and verification-oriented foundation rather than as a conventional application framework.
 
@@ -65,7 +65,8 @@ praetore/
 ├── crates/
 │   ├── praetore-core/
 │   ├── praetore-verify/
-│   └── praetore-python/
+│   ├── praetore-python/
+│   └── praetore-replay-postgres/
 ├── fuzz/
 ├── packages/praetore-python/
 ├── docs/

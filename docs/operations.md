@@ -93,6 +93,30 @@ disabled until claims are reconciled. The library does not authenticate
 deployment configuration, protect the host process, or provide a signed
 deployment/rollback mechanism.
 
+### PostgreSQL adapter
+
+The optional `praetore-replay-postgres` crate implements the replay guard using
+a fixed `praetore.replay_claims` table and an atomic primary-key insert. Apply
+`crates/praetore-replay-postgres/migrations/0001_replay_claims.sql` with a
+privileged migration role before starting the application. The runtime role
+should have only `USAGE` on the `praetore` schema and `INSERT` on the
+`agent_id` and `request_id` columns; do not grant it `UPDATE`, `DELETE`, or
+`TRUNCATE`.
+
+The adapter accepts an already-created PostgreSQL client so the deployment
+controls TLS, credentials, connection lifecycle, and pool topology. It sets
+`synchronous_commit = on` for each claim. This flushes the primary's WAL, but
+does not by itself guarantee that an asynchronous replica has the claim after
+failover. HighAssurance deployments must configure and test synchronous
+replication, fencing, stable storage, and restore procedures appropriate to
+their recovery objectives. The table intentionally has no TTL or cleanup
+mechanism; monitor its growth and fail closed rather than evicting claims.
+
+CI exercises the adapter against a disposable PostgreSQL service, including
+duplicate claims through newly created clients and concurrent connections.
+That does not replace testing the target deployment's replication and
+disaster-recovery configuration.
+
 ## Offline evidence and authority verification
 
 Build the verifier from the locked workspace:

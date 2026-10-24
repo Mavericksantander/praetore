@@ -15,6 +15,7 @@ absence of defects.
 | Dependency advisory gate | committed `Cargo.lock` and RustSec audit | `cargo audit --locked` | `audit` |
 | Python verification behavior stays Rust-backed | `crates/praetore-python/src/lib.rs` and `praetore` package | `packages/praetore-python/tests/test_verify.py` | `python-verify` |
 | HighAssurance consumes each signed request ID once | `crates/praetore-core/src/replay.rs` and production engine | required-guard, duplicate-request, and unavailable-store tests | `rust` |
+| PostgreSQL replay claims are atomic and persist across clients | `crates/praetore-replay-postgres` and migration | disposable PostgreSQL duplicate, persistence, and concurrent connection tests | `replay-postgres` |
 | End-to-end HighAssurance integration stays runnable | `crates/praetore-core/examples/high_assurance.rs` | workspace example command | `rust` |
 | Rust tests, lint, format, patch hygiene | workspace CI workflow | workspace test suite; Clippy `-D warnings`; workspace and fuzz rustfmt; `git diff --check` | `rust` |
 | Software inventory | CycloneDX Cargo integration | SBOMs for all three Rust packages and standalone fuzz package uploaded as CI artifacts | `sbom` |
@@ -33,5 +34,7 @@ absence of defects.
 - Core supplies a replay-guard contract only. Durability, atomicity across
   processes, backup integrity, capacity, and failover behavior must be
   validated for the caller's storage implementation.
+- The PostgreSQL adapter's CI service validates primary-database uniqueness,
+  not the deployment's replication/failover or backup guarantees.
 - CI produces an SBOM and checksums, but does not sign releases, attest
   artifacts, or protect the hosted runner/build supply chain.
