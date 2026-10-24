@@ -42,7 +42,20 @@ pub struct Policy {
     pub id: String,
     pub version: u32,
     pub canonical_version: u8,
+    #[serde(
+        default = "legacy_policy_semantics_version",
+        skip_serializing_if = "is_legacy_policy_semantics_version"
+    )]
+    pub semantics_version: u8,
     pub rules: Vec<PolicyRule>,
+}
+
+fn legacy_policy_semantics_version() -> u8 {
+    1
+}
+
+fn is_legacy_policy_semantics_version(version: &u8) -> bool {
+    *version == 1
 }
 
 impl Policy {
@@ -51,7 +64,20 @@ impl Policy {
             id: id.into(),
             version,
             canonical_version: crate::canonical::CANONICAL_VERSION,
+            semantics_version: 1,
             rules,
+        }
+    }
+
+    /// Creates a policy using conservative unknown-condition semantics.
+    ///
+    /// For DENY and REQUIRE_APPROVAL rules, a missing or type-incompatible
+    /// condition value counts as a match. The semantics version is included in
+    /// the policy digest, so this does not change the meaning of v1 policies.
+    pub fn new_v2(id: impl Into<String>, version: u32, rules: Vec<PolicyRule>) -> Self {
+        Self {
+            semantics_version: 2,
+            ..Self::new(id, version, rules)
         }
     }
 
@@ -76,7 +102,7 @@ impl Policy {
         let mut decision: Option<Decision> = None;
 
         for rule in &self.rules {
-            if !rule.matches(agent, authority, action, context) {
+            if !rule.matches(agent, authority, action, context, self.semantics_version) {
                 continue;
             }
 
@@ -127,6 +153,11 @@ impl Policy {
         if self.canonical_version != crate::canonical::CANONICAL_VERSION {
             return Err(PraetoreError::PolicyEvaluationFailed(
                 "unsupported policy canonical version".into(),
+            ));
+        }
+        if !matches!(self.semantics_version, 1 | 2) {
+            return Err(PraetoreError::PolicyEvaluationFailed(
+                "unsupported policy semantics version".into(),
             ));
         }
 
@@ -234,6 +265,7 @@ impl PolicyRule {
         authority: &Authority,
         action: &Action,
         context: &BTreeMap<String, Value>,
+        semantics_version: u8,
     ) -> bool {
         if self.action_type != action.action_type {
             return false;
@@ -251,13 +283,13 @@ impl PolicyRule {
             }
         }
 
-        self.parameter_conditions
+        let restrictive = semantics_version >= 2 && self.effect != PolicyEffect::Allow;
+        self.parameter_conditions.iter().all(|condition| {
+            condition.matches(&action.parameters, restrictive) != ConditionMatch::False
+        }) && self
+            .context_conditions
             .iter()
-            .all(|condition| condition.matches(&action.parameters))
-            && self
-                .context_conditions
-                .iter()
-                .all(|condition| condition.matches_map(context))
+            .all(|condition| condition.matches_map(context, restrictive) != ConditionMatch::False)
     }
 
     fn decision(&self) -> Result<Decision> {
@@ -363,40 +395,79 @@ impl PolicyCondition {
         Self::new(key, MatchOperator::GreaterThan, expected)
     }
 
-    fn matches(&self, object: &Value) -> bool {
-        object
-            .as_object()
-            .and_then(|values| values.get(&self.key))
-            .is_some_and(|actual| self.matches_value(actual))
+    fn matches(&self, object: &Value, restrictive: bool) -> ConditionMatch {
+        let actual = object.as_object().and_then(|values| values.get(&self.key));
+        self.matches_optional_value(actual, restrictive)
     }
 
-    fn matches_map(&self, values: &BTreeMap<String, Value>) -> bool {
-        values
-            .get(&self.key)
-            .is_some_and(|actual| self.matches_value(actual))
+    fn matches_map(&self, values: &BTreeMap<String, Value>, restrictive: bool) -> ConditionMatch {
+        self.matches_optional_value(values.get(&self.key), restrictive)
     }
 
-    fn matches_value(&self, actual: &Value) -> bool {
-        match self.operator {
-            MatchOperator::Exact => actual == &self.expected,
-            MatchOperator::Prefix => actual
-                .as_str()
-                .zip(self.expected.as_str())
-                .is_some_and(|(actual, prefix)| actual.starts_with(prefix)),
-            MatchOperator::In => self
-                .expected
-                .as_array()
-                .is_some_and(|values| values.contains(actual)),
-            MatchOperator::GreaterThan => compare_numeric(actual, &self.expected)
-                .is_some_and(|order| order == Ordering::Greater),
-            MatchOperator::GreaterThanOrEqual => {
-                compare_numeric(actual, &self.expected).is_some_and(|order| order != Ordering::Less)
+    fn matches_optional_value(&self, actual: Option<&Value>, restrictive: bool) -> ConditionMatch {
+        let Some(actual) = actual else {
+            return if restrictive {
+                ConditionMatch::Unknown
+            } else {
+                ConditionMatch::False
+            };
+        };
+        let result = match self.operator {
+            MatchOperator::Exact => {
+                if actual == &self.expected {
+                    ConditionMatch::True
+                } else if same_json_type(actual, &self.expected) {
+                    ConditionMatch::False
+                } else {
+                    ConditionMatch::Unknown
+                }
             }
-            MatchOperator::LessThan => {
-                compare_numeric(actual, &self.expected).is_some_and(|order| order == Ordering::Less)
+            MatchOperator::Prefix => match (actual.as_str(), self.expected.as_str()) {
+                (Some(actual), Some(prefix)) if actual.starts_with(prefix) => ConditionMatch::True,
+                (Some(_), Some(_)) => ConditionMatch::False,
+                _ => ConditionMatch::Unknown,
+            },
+            MatchOperator::In => {
+                let Some(values) = self.expected.as_array() else {
+                    return ConditionMatch::Unknown;
+                };
+                if values.contains(actual) {
+                    ConditionMatch::True
+                } else if values.iter().any(|value| same_json_type(actual, value)) {
+                    ConditionMatch::False
+                } else {
+                    ConditionMatch::Unknown
+                }
             }
-            MatchOperator::LessThanOrEqual => compare_numeric(actual, &self.expected)
-                .is_some_and(|order| order != Ordering::Greater),
+            MatchOperator::GreaterThan
+            | MatchOperator::GreaterThanOrEqual
+            | MatchOperator::LessThan
+            | MatchOperator::LessThanOrEqual => {
+                let Some(order) = compare_numeric(actual, &self.expected) else {
+                    return if restrictive {
+                        ConditionMatch::Unknown
+                    } else {
+                        ConditionMatch::False
+                    };
+                };
+                let matches = match self.operator {
+                    MatchOperator::GreaterThan => order == Ordering::Greater,
+                    MatchOperator::GreaterThanOrEqual => order != Ordering::Less,
+                    MatchOperator::LessThan => order == Ordering::Less,
+                    MatchOperator::LessThanOrEqual => order != Ordering::Greater,
+                    _ => unreachable!(),
+                };
+                if matches {
+                    ConditionMatch::True
+                } else {
+                    ConditionMatch::False
+                }
+            }
+        };
+        if result == ConditionMatch::Unknown && !restrictive {
+            ConditionMatch::False
+        } else {
+            result
         }
     }
 
@@ -451,6 +522,29 @@ impl PolicyCondition {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionMatch {
+    True,
+    False,
+    Unknown,
+}
+
+fn same_json_type(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null)
+        | (Value::Bool(_), Value::Bool(_))
+        | (Value::String(_), Value::String(_))
+        | (Value::Array(_), Value::Array(_))
+        | (Value::Object(_), Value::Object(_)) => true,
+        (Value::Number(left), Value::Number(right)) => {
+            left.is_i64() && right.is_i64()
+                || left.is_u64() && right.is_u64()
+                || left.is_f64() && right.is_f64()
+        }
+        _ => false,
     }
 }
 
@@ -1090,6 +1184,76 @@ mod tests {
     }
 
     #[test]
+    fn restrictive_conditions_fail_closed_when_values_are_missing_or_mistyped() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["data:read".into()]);
+        let policy = Policy::new_v2(
+            "restrictive-unknowns",
+            1,
+            vec![
+                PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow),
+                PolicyRule::new("deny-large-read", "read_data", PolicyEffect::Deny)
+                    .with_parameter_condition(PolicyCondition::greater_than(
+                        "record_count",
+                        json!(1000),
+                    )),
+            ],
+        );
+
+        for parameters in [
+            json!({}),
+            json!({"record_count": "5000"}),
+            json!({"record_count": 5000.0}),
+            json!({"record_count": 5e3}),
+        ] {
+            let action = Action::new("read_data", None, parameters).unwrap();
+            let decision = policy
+                .evaluate(&agent, &authority, &action)
+                .expect("policy is valid");
+            assert_eq!(
+                decision.outcome,
+                DecisionOutcome::Deny,
+                "unexpected allow for action parameters: {}",
+                action.parameters
+            );
+            assert!(
+                decision
+                    .contributions
+                    .iter()
+                    .any(|contribution| contribution.rule_id == "deny-large-read"),
+                "restrictive unknown condition must be attributed to its rule"
+            );
+        }
+    }
+
+    #[test]
+    fn restrictive_conditions_do_not_match_when_another_condition_is_false() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["data:read".into()]);
+        let policy = Policy::new_v2(
+            "restrictive-false-condition",
+            1,
+            vec![
+                PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow),
+                PolicyRule::new(
+                    "deny-large-production-read",
+                    "read_data",
+                    PolicyEffect::Deny,
+                )
+                .with_target("production")
+                .with_parameter_condition(PolicyCondition::greater_than(
+                    "record_count",
+                    json!(1000),
+                )),
+            ],
+        );
+        let action = Action::new("read_data", Some("development".into()), json!({})).unwrap();
+
+        let decision = policy.evaluate(&agent, &authority, &action).unwrap();
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+    }
+
+    #[test]
     fn typed_conditions_fail_closed_on_missing_or_wrong_json_types() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
@@ -1188,14 +1352,49 @@ mod tests {
     }
 
     #[test]
+    fn policy_v2_changes_digest_and_preserves_v1_digest_bytes() {
+        let rules = vec![PolicyRule::new(
+            "allow-read",
+            "read_data",
+            PolicyEffect::Allow,
+        )];
+        let v1 = Policy::new("versioned-policy", 1, rules.clone());
+        let v2 = Policy::new_v2("versioned-policy", 1, rules);
+
+        assert_eq!(v1.semantics_version, 1);
+        assert_eq!(v2.semantics_version, 2);
+        assert_ne!(v1.digest().unwrap(), v2.digest().unwrap());
+        assert_eq!(
+            serde_json::to_value(&v1).unwrap().get("semantics_version"),
+            None
+        );
+        assert_eq!(
+            serde_json::to_value(&v2).unwrap()["semantics_version"],
+            json!(2)
+        );
+    }
+
+    #[test]
     fn numeric_comparison_preserves_integer_precision_and_rejects_mixed_types() {
         let greater_than = PolicyCondition::greater_than("count", json!(9_007_199_254_740_992_u64));
         let mixed_type = PolicyCondition::greater_than("count", json!(1.0));
 
-        assert!(greater_than.matches(&json!({"count": 9_007_199_254_740_993_u64})));
-        assert!(!greater_than.matches(&json!({"count": 9_007_199_254_740_991_u64})));
-        assert!(!mixed_type.matches(&json!({"count": 1})));
-        assert!(!mixed_type.matches(&json!({"count": "2"})));
+        assert_eq!(
+            greater_than.matches(&json!({"count": 9_007_199_254_740_993_u64}), false),
+            ConditionMatch::True
+        );
+        assert_eq!(
+            greater_than.matches(&json!({"count": 9_007_199_254_740_991_u64}), false),
+            ConditionMatch::False
+        );
+        assert_eq!(
+            mixed_type.matches(&json!({"count": 1}), false),
+            ConditionMatch::False
+        );
+        assert_eq!(
+            mixed_type.matches(&json!({"count": "2"}), true),
+            ConditionMatch::Unknown
+        );
     }
 
     #[test]

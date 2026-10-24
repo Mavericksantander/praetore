@@ -19,6 +19,7 @@ pub enum ErrorKind {
     FreshnessExpired,
     FreshnessUnavailable,
     FreshnessInvalid,
+    FreshnessLeaseTooLong,
 }
 
 #[derive(Debug, Error)]
@@ -98,6 +99,9 @@ impl PraetoreError {
             Self::FreshnessCheckFailed(crate::freshness::FreshnessError::InvalidResponse) => {
                 ErrorKind::FreshnessInvalid
             }
+            Self::FreshnessCheckFailed(crate::freshness::FreshnessError::LeaseTooLong) => {
+                ErrorKind::FreshnessLeaseTooLong
+            }
         }
     }
 
@@ -120,6 +124,7 @@ impl PraetoreError {
             ErrorKind::FreshnessExpired => "FRESHNESS_EXPIRED",
             ErrorKind::FreshnessUnavailable => "FRESHNESS_UNAVAILABLE",
             ErrorKind::FreshnessInvalid => "FRESHNESS_INVALID",
+            ErrorKind::FreshnessLeaseTooLong => "FRESHNESS_LEASE_TOO_LONG",
         }
     }
 }
@@ -171,6 +176,10 @@ mod tests {
             (
                 crate::freshness::FreshnessError::InvalidResponse,
                 "FRESHNESS_INVALID",
+            ),
+            (
+                crate::freshness::FreshnessError::LeaseTooLong,
+                "FRESHNESS_LEASE_TOO_LONG",
             ),
         ];
 

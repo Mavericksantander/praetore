@@ -7,6 +7,12 @@
 - A runnable end-to-end quick start covering signed identity, authority,
   request intents, Strict and HighAssurance evaluation, and evidence
   verification; expanded mode guidance and declarative policy documentation.
+- A documented mandatory tool-gateway integration pattern covering action
+  normalization, fail-closed dispatch, durable execution journaling, and
+  crash/TOCTOU recovery limits.
+- Versioned policy semantics v2: conditional DENY/REQUIRE_APPROVAL rules now
+  match unknown or type-incompatible values conservatively; HighAssurance
+  rejects legacy v1 policy semantics while v1 policy bytes remain stable.
 - Ed25519 agent key generation, typed verified public keys, subject-key-bound
   authority issuance/verification, signed request intents, and strict engine
   issuer trust bindings.
@@ -44,6 +50,12 @@
   not imply revocation.
 - Caller-supplied, veto-only freshness checks required by HighAssurance, with
   stable machine-readable failure codes.
+- Versioned HighAssurance contracts: signed intents bind audience, expiry, and
+  policy digest; HighAssurance requires policy semantics v2 and emits attested
+  evidence schema v2 while retaining v1 verification/canonical bytes.
+- HighAssurance freshness now binds the exact authority content digest and
+  enforces a maximum lease; authorities must be bounded by validity dates and
+  default to a 365-day maximum lifetime.
 
 ### Compatibility notes
 
@@ -65,6 +77,10 @@
   duplicate IDs or storage failure. Strict and Development modes are unchanged.
 - HighAssurance callers must also attach a `FreshnessProvider`; non-current,
   unknown, revoked, expired, or unavailable results fail closed.
+- Existing `FreshnessProvider` implementations must implement
+  `check_authority` to bind freshness to the canonical authority digest. The
+  compatibility default returns `FRESHNESS_INVALID`, so old providers compile
+  but cannot authorize HighAssurance evaluations until migrated.
 - PostgreSQL support is an optional crate. The deployment owns client
   construction, TLS, database provisioning, synchronous replication, backups,
   capacity monitoring, and application-role privileges.

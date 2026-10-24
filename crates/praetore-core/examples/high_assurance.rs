@@ -2,7 +2,7 @@ use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, AuthorizationRequest, EvidenceAttesterKey, Policy,
     PolicyEffect, PolicyRule, Result, TrustedAuthorityIssuer,
     authority::Validity,
-    engine::{AuthorizationEngine, FixedClock},
+    engine::{AuthorizationEngine, Clock, FixedClock},
     freshness::{FreshnessError, FreshnessLease, FreshnessProvider},
     identity::AgentKeyFingerprint,
     replay::{ReplayGuard, ReplayGuardError},
@@ -46,6 +46,22 @@ impl FreshnessProvider for ExampleFreshnessProvider {
             valid_until: now + Duration::minutes(1),
         })
     }
+
+    fn check_authority(
+        &self,
+        _agent: &AgentKeyFingerprint,
+        _authority_id: &praetore_core::authority::AuthorityId,
+        authority_digest: &str,
+        _policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> std::result::Result<FreshnessLease, FreshnessError> {
+        if authority_digest.len() != 64 {
+            return Err(FreshnessError::InvalidResponse);
+        }
+        Ok(FreshnessLease {
+            valid_until: now + Duration::minutes(1),
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -58,6 +74,8 @@ fn main() -> Result<()> {
     let issuer_key = AgentKeyPair::generate();
     let attester_key = EvidenceAttesterKey::generate();
     let attester_public_key = attester_key.public_key()?;
+    let clock = FixedClock::try_new("2026-06-01T12:00:00Z")?;
+    let now = clock.now();
 
     let mut authority =
         Authority::new(agent.id.clone(), "example-issuer", vec!["data:read".into()])
@@ -74,9 +92,7 @@ fn main() -> Result<()> {
         )?
         .with_capability("data:read"),
     )?;
-    request.sign_intent(&agent_key)?;
-
-    let policy = Policy::new(
+    let policy = Policy::new_v2(
         "example-policy",
         1,
         vec![
@@ -84,17 +100,21 @@ fn main() -> Result<()> {
                 .with_capability("data:read"),
         ],
     );
+    request.sign_intent_v2(
+        &agent_key,
+        "example-gateway",
+        now,
+        now + Duration::minutes(1),
+        policy.digest()?,
+    )?;
     let issuer_pin = TrustedAuthorityIssuer::new("example-issuer", issuer_key.public_key())?
         .with_validity(validity)?;
     let config =
         praetore_core::HighAssuranceConfig::new(policy.digest()?, vec![issuer_pin], attester_key)?
+            .with_audience("example-gateway")
             .with_replay_guard(Arc::new(ExampleReplayGuard::default()))
             .with_freshness_provider(Arc::new(ExampleFreshnessProvider));
-    let engine = AuthorizationEngine::production_with_clock(
-        policy,
-        config,
-        FixedClock::try_new("2026-06-01T12:00:00Z")?,
-    )?;
+    let engine = AuthorizationEngine::production_with_clock(policy, config, clock)?;
 
     let evidence = engine.evaluate(request)?;
     evidence.verify_agent_intent()?;

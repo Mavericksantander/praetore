@@ -46,7 +46,10 @@ PostgreSQL replay-guard adapter.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
-deployment responsibilities. Review the [threat model](docs/threat-model.md)
+deployment responsibilities. A library decision does not stop a tool call
+that bypasses the caller; deployments must mediate protected tools through a
+mandatory enforcement point. See the [tool gateway integration
+pattern](docs/tool-gateway-integration.md), [threat model](docs/threat-model.md),
 and [pre-user deployment gates](docs/pre-user-pilot-gates.md) before any
 high-consequence pilot.
 
@@ -71,6 +74,7 @@ for signing and verification details.
 * [Policy language and evaluation semantics](docs/policy-language.md)
 * [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
 * [Threat model and residual risks](docs/threat-model.md)
+* [Mandatory tool gateway integration pattern](docs/tool-gateway-integration.md)
 * [Assurance traceability matrix](docs/assurance-matrix.md)
 * [Operations runbooks](docs/operations.md)
 * [Pre-user deployment gates](docs/pre-user-pilot-gates.md)
@@ -153,7 +157,7 @@ There are three evaluation modes; choose deliberately:
 | --- | --- | --- |
 | **Development** | Local development and compatibility | Allows unsigned authorities; no issuer pins, policy pin, attester, replay guard, or freshness provider. Never use as a production boundary. |
 | **Strict** | Signature-checked offline evaluation | Requires a signed authority from an explicitly pinned issuer, subject-key binding, and a signed agent request intent. Does not require the HighAssurance policy pin, evidence attestation, replay guard, or freshness provider. |
-| **HighAssurance** | Strongest profile provided by this library | Strict checks plus pinned policy digest, time-bounded issuer pins, signed evidence attestation, caller-supplied freshness provider, and caller-owned replay guard. |
+| **HighAssurance** | Strongest profile provided by this library | Strict checks plus v2 policy semantics/digest pin, audience- and expiry-bound signed intents, time-bounded authorities, v2 attested evidence, content-digest-bound freshness with a capped lease, and caller-owned replay guard. |
 
 Use `AuthorizationEngine::production` for HighAssurance. The deprecated
 `new` and `with_clock` constructors remain Development-mode compatibility

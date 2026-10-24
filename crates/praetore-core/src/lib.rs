@@ -14,7 +14,7 @@ pub mod replay;
 
 pub use action::Action;
 pub use authority::{Authority, AuthorityId};
-pub use authorization::AuthorizationRequest;
+pub use authorization::{AuthorizationIntentV2, AuthorizationRequest};
 pub use decision::{Decision, DecisionOutcome};
 pub use engine::{EvaluationMode, HighAssuranceConfig, TrustedAuthorityIssuer};
 pub use error::{ErrorKind, PraetoreError, Result};

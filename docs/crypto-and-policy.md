@@ -13,7 +13,7 @@ name, not a certification or a guarantee about the caller's deployment.
 | --- | --- | --- |
 | Development | Allows unsigned authorities for local compatibility. If a request signature is present, it must still verify. | Policy only; no issuer trust, policy pin, evidence attester, replay guard, or freshness provider. |
 | Strict | Verifies the authority signature against an exact issuer pin, authority validity and subject-key binding, plus the agent-signed request intent. | Non-empty issuer pins. Policy digest pinning, attestation, replay protection, and freshness are not provided by this mode. |
-| HighAssurance | Performs Strict checks and additionally binds the configured policy digest, signs the evidence, checks caller-supplied freshness, and claims each `(agent UUID, request UUID)` once. | Time-bounded issuer pins, pinned policy digest, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
+| HighAssurance | Performs Strict checks and additionally binds a v2 policy digest, audience- and expiry-bound v2 request intent, v2 attested evidence, content-bound caller freshness, and one-time `(agent UUID, request UUID)` claims. | Time-bounded issuer pins, pinned v2 policy digest, audience, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
 
 `AuthorizationEngine::development` and
 `AuthorizationEngine::development_with_clock` are explicit development
@@ -62,18 +62,37 @@ verifying each authority. Provision all trust data through an independently
 authenticated configuration channel. The engine does not implement PKI,
 issuer discovery, or revocation storage.
 
-The caller-supplied `FreshnessProvider` is a veto-only check. It receives the
-verified agent key fingerprint, authority ID, pinned policy digest, and the
-evaluation's single clock snapshot. Only a successful lease whose `valid_until`
-is not earlier than that snapshot permits evaluation to continue. Provider
-errors map to stable codes (`FRESHNESS_REVOKED`, `FRESHNESS_UNKNOWN`,
-`FRESHNESS_EXPIRED`, `FRESHNESS_UNAVAILABLE`, and `FRESHNESS_INVALID`); none
-can grant ALLOW. Freshness is only as current and trustworthy as the caller's
-provider and its source. The core adds no network or persistent storage.
-Evidence schema v1 does not record the provider's lease or response, so an
-offline evidence verifier cannot independently prove which freshness result
-was consulted; a deployment needing that audit trail must preserve it outside
-the frozen evidence payload.
+The caller-supplied `FreshnessProvider` is a veto-only check. HighAssurance
+calls `check_authority` with the verified agent key fingerprint, authority ID,
+SHA-256 digest of the exact canonical authority payload, pinned policy digest,
+and the evaluation's single clock snapshot. A provider that only implements
+the older ID-only `check` method remains source-compatible but fails closed:
+the default `check_authority` returns `FRESHNESS_INVALID`. A successful lease
+must include the evaluation time and may not exceed the configured maximum
+(one minute by default). Provider errors map to stable codes, including
+`FRESHNESS_REVOKED`, `FRESHNESS_UNKNOWN`, `FRESHNESS_EXPIRED`,
+`FRESHNESS_UNAVAILABLE`, `FRESHNESS_INVALID`, and
+`FRESHNESS_LEASE_TOO_LONG`; none can grant ALLOW. Freshness is only as current
+and trustworthy as the caller's provider and its source. The core adds no
+network or persistent storage. Evidence v1 has no freshness record; v2 binds
+the lease deadline and authority digest, but still cannot prove the provider's
+source or truthfulness.
+
+New HighAssurance policies must use `Policy::new_v2` or declare
+`"semantics_version": 2`. This version treats missing or type-incompatible
+condition values as unknown; unknown conditions conservatively match DENY and
+REQUIRE_APPROVAL rules. The semantics version contributes to the policy
+digest. Policies created with `Policy::new` retain v1 behavior and canonical
+bytes for Development/Strict compatibility, but are rejected by the
+HighAssurance constructor. See the [policy language guide](policy-language.md).
+
+HighAssurance also requires a v2 signed intent. Its `PRAETORE_INTENT_V2\0`
+payload adds the intended audience, canonical UTC `issued_at` and `expires_at`,
+and pinned policy digest. The default maximum intent lifetime is five minutes.
+The engine rejects expired/not-yet-valid intents, a different audience or
+policy digest, and invalid signatures. Authorities must have both validity
+bounds; the default maximum lifetime is 365 days. These bounds are
+configuration defaults, not secure-clock guarantees.
 
 `AuthorizationRequest::sign_intent` binds an Ed25519 signature to the request
 ID, identity, authority, action, trace ID, and request context. Strict mode
@@ -109,9 +128,10 @@ encoder:
   `id`, `subject`, `issuer`, `capabilities`, `constraints`, `validity`,
   `version`, `subject_key_hash`, and `issuer_key_id`. The signature field is
   not part of the signed payload.
-* Request-intent payloads contain `canonical_version`, `schema_version`,
+* V1 request-intent payloads contain `canonical_version`, `schema_version`,
   `request_id`, `agent`, `authority`, `action`, `trace_id`, and `context`.
-  The `agent_signature` field is not part of the signed payload.
+  V2 adds the `intent_v2` object described above. The `agent_signature` field
+  is not part of either signed payload.
 * Policy digests are SHA-256 over the complete policy serialization, including
   its canonical version, under the same canonical JSON rules. Rule array
   order is preserved.
@@ -122,6 +142,8 @@ uses these exact byte prefixes:
 * Authority: `PRAETORE_AUTHORITY_V1\0`
 * Request intent: `PRAETORE_INTENT_V1\0`
 * Evidence attestation: `PRAETORE_EVIDENCE_V1\0`
+* HighAssurance request intent: `PRAETORE_INTENT_V2\0`
+* HighAssurance evidence attestation: `PRAETORE_EVIDENCE_V2\0`
 * Agent key fingerprint: `PRAETORE_AGENT_KEY_V1\0ed25519\0`
 * Issuer key ID: `PRAETORE_ISSUER_KEY_V1\0ed25519\0`
 
@@ -146,6 +168,16 @@ evidence ID, and context hash. The `context_hash` itself and the attester
 signature are not members of the integrity payload. Evidence deserialization
 is strict at every typed object boundary, so unknown fields are rejected
 rather than ignored.
+
+Evidence v1 is frozen: its existing payload fields and canonical bytes are
+unchanged. HighAssurance emits evidence schema v2, which adds the signed v2
+intent metadata, decision timestamp, `high_assurance` mode marker, freshness
+lease deadline, authority content digest, and policy semantics version. The
+v2 integrity payload and attester signature bind these fields. Import rejects
+unknown fields for both schema versions, and v2 verification checks metadata
+consistency; authenticity still requires checking the attester key against an
+external pin. The `canonical_version` remains 1 because the canonical JSON
+codec itself is unchanged.
 
 `AgentId` remains a UUID alias and is not an authenticator. The key-derived
 `AgentKeyFingerprint` is SHA-256 over
@@ -183,12 +215,14 @@ Rules can match action parameters and request context with `PolicyCondition`:
   `serde_json`. Comparisons between integer and floating-point representations
   fail closed.
 
-Missing fields and operator/type mismatches do not match. Conditions compose
-with AND within a rule, and matching rules retain the existing strongest
-outcome fold: **DENY > REQUIRE_APPROVAL > ALLOW**. No matching rule still
-defaults to DENY. Validation rejects duplicate rule IDs, invalid matcher
-shapes, and detectable contradictions such as incompatible exact values or
-disjoint membership sets.
+For v1 policies, missing fields and operator/type mismatches do not match. In
+v2, an unknown condition value on a DENY or REQUIRE_APPROVAL rule is treated
+as a match, while it does not make an ALLOW rule match; a definitively false
+condition still makes the rule fail. Conditions compose with AND within a
+rule, and matching rules retain the existing strongest-outcome fold:
+**DENY > REQUIRE_APPROVAL > ALLOW**. No matching rule still defaults to DENY.
+Validation rejects duplicate rule IDs, invalid matcher shapes, and detectable
+contradictions such as incompatible exact values or disjoint membership sets.
 
 Authority capabilities use explicit names such as `data:read`, `data:write`,
 `shell:execute`, `api:call`, and `deployment:create`. An action can select its
@@ -204,7 +238,7 @@ use praetore_core::{
 };
 use serde_json::json;
 
-let policy = Policy::new(
+let policy = Policy::new_v2(
     "operations-v1",
     1,
     vec![

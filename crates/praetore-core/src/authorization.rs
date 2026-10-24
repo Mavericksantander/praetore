@@ -12,6 +12,10 @@ use crate::{
     evidence::Evidence,
     identity::{AgentIdentity, AgentKeyPair, REQUEST_INTENT_DOMAIN},
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+
+const REQUEST_INTENT_V2_DOMAIN: &[u8] = b"PRAETORE_INTENT_V2\0";
+const MAX_INTENT_BYTES: usize = MAX_JSON_VALUE_BYTES - 8192;
 
 const MAX_CONTEXT_KEYS: usize = 128;
 const MAX_CONTEXT_KEY_BYTES: usize = 256;
@@ -31,6 +35,17 @@ pub struct AuthorizationRequest {
     pub trace_id: Option<String>,
     pub context: BTreeMap<String, Value>,
     pub agent_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_v2: Option<AuthorizationIntentV2>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationIntentV2 {
+    pub audience: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub policy_digest: String,
 }
 
 impl AuthorizationRequest {
@@ -54,7 +69,22 @@ impl AuthorizationRequest {
             trace_id: None,
             context: BTreeMap::new(),
             agent_signature: None,
+            intent_v2: None,
         })
+    }
+
+    pub fn from_json(json: &str) -> Result<Self> {
+        if json.len() > MAX_JSON_VALUE_BYTES {
+            return Err(crate::PraetoreError::InvalidRequest(
+                "authorization request exceeds maximum size".into(),
+            ));
+        }
+        let value = crate::canonical::parse_json_rejecting_duplicates(json)
+            .map_err(crate::PraetoreError::InvalidRequest)?;
+        let request: Self = serde_json::from_value(value)
+            .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
+        request.validate()?;
+        Ok(request)
     }
 
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
@@ -68,6 +98,7 @@ impl AuthorizationRequest {
     }
 
     pub fn sign_intent(&mut self, agent_key: &AgentKeyPair) -> Result<()> {
+        self.intent_v2 = None;
         self.validate()?;
 
         let verified_key = self.agent.verified_public_key()?;
@@ -78,6 +109,35 @@ impl AuthorizationRequest {
         let payload = self.canonical_intent_bytes()?;
         self.agent_signature = Some(hex::encode(
             agent_key.sign_domain_message(REQUEST_INTENT_DOMAIN, &payload),
+        ));
+        Ok(())
+    }
+
+    pub fn sign_intent_v2(
+        &mut self,
+        agent_key: &AgentKeyPair,
+        audience: impl Into<String>,
+        issued_at: OffsetDateTime,
+        expires_at: OffsetDateTime,
+        policy_digest: impl Into<String>,
+    ) -> Result<()> {
+        self.agent_signature = None;
+        self.intent_v2 = Some(AuthorizationIntentV2 {
+            audience: audience.into(),
+            issued_at: canonical_timestamp(issued_at)?,
+            expires_at: canonical_timestamp(expires_at)?,
+            policy_digest: policy_digest.into(),
+        });
+        self.validate()?;
+
+        let verified_key = self.agent.verified_public_key()?;
+        if verified_key != agent_key.public_key() {
+            return Err(crate::PraetoreError::IdentityVerificationFailed);
+        }
+
+        let payload = self.canonical_intent_bytes()?;
+        self.agent_signature = Some(hex::encode(
+            agent_key.sign_domain_message(REQUEST_INTENT_V2_DOMAIN, &payload),
         ));
         Ok(())
     }
@@ -94,24 +154,48 @@ impl AuthorizationRequest {
         let payload = self.canonical_intent_bytes()?;
 
         self.agent.verified_public_key()?.verify_domain_message(
-            REQUEST_INTENT_DOMAIN,
+            if self.intent_v2.is_some() {
+                REQUEST_INTENT_V2_DOMAIN
+            } else {
+                REQUEST_INTENT_DOMAIN
+            },
             &payload,
             &signature,
         )
     }
 
     fn canonical_intent_bytes(&self) -> Result<Vec<u8>> {
-        canonical_json(&RequestIntentPayload {
-            canonical_version: crate::canonical::CANONICAL_VERSION,
-            schema_version: 1,
-            request_id: self.request_id,
-            agent: &self.agent,
-            authority: &self.authority,
-            action: &self.action,
-            trace_id: &self.trace_id,
-            context: &self.context,
-        })
-        .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))
+        let payload = if let Some(intent_v2) = &self.intent_v2 {
+            canonical_json(&RequestIntentV2Payload {
+                canonical_version: crate::canonical::CANONICAL_VERSION,
+                schema_version: 2,
+                request_id: self.request_id,
+                agent: &self.agent,
+                authority: &self.authority,
+                action: &self.action,
+                trace_id: &self.trace_id,
+                context: &self.context,
+                intent_v2,
+            })
+        } else {
+            canonical_json(&RequestIntentPayload {
+                canonical_version: crate::canonical::CANONICAL_VERSION,
+                schema_version: 1,
+                request_id: self.request_id,
+                agent: &self.agent,
+                authority: &self.authority,
+                action: &self.action,
+                trace_id: &self.trace_id,
+                context: &self.context,
+            })
+        }
+        .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
+        if payload.len() > MAX_INTENT_BYTES {
+            return Err(crate::PraetoreError::InvalidRequest(
+                "signed authorization intent exceeds maximum size".into(),
+            ));
+        }
+        Ok(payload)
     }
 
     fn validate(&self) -> Result<()> {
@@ -133,6 +217,10 @@ impl AuthorizationRequest {
             return Err(crate::PraetoreError::InvalidRequest(
                 "trace id cannot be empty".into(),
             ));
+        }
+
+        if let Some(intent_v2) = &self.intent_v2 {
+            validate_intent_v2(intent_v2)?;
         }
         if self
             .trace_id
@@ -188,8 +276,48 @@ impl AuthorizationRequest {
             self.trace_id,
             self.context,
         )?
-        .with_agent_signature(self.agent_signature)
+        .with_agent_signature(self.agent_signature)?
+        .with_intent_v2(self.intent_v2)
     }
+}
+
+fn canonical_timestamp(timestamp: OffsetDateTime) -> Result<String> {
+    timestamp
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| crate::PraetoreError::InvalidRequest("invalid intent timestamp".into()))
+}
+
+pub(crate) fn validate_intent_v2(intent: &AuthorizationIntentV2) -> Result<()> {
+    if intent.audience.trim().is_empty()
+        || intent.audience != intent.audience.trim()
+        || intent.audience.len() > 256
+    {
+        return Err(crate::PraetoreError::InvalidRequest(
+            "intent audience is invalid".into(),
+        ));
+    }
+    let issued_at = OffsetDateTime::parse(&intent.issued_at, &Rfc3339)
+        .map_err(|_| crate::PraetoreError::InvalidRequest("intent issued_at is invalid".into()))?;
+    let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
+        .map_err(|_| crate::PraetoreError::InvalidRequest("intent expires_at is invalid".into()))?;
+    if canonical_timestamp(issued_at)? != intent.issued_at
+        || canonical_timestamp(expires_at)? != intent.expires_at
+        || expires_at < issued_at
+    {
+        return Err(crate::PraetoreError::InvalidRequest(
+            "intent timestamps are not canonical or are inverted".into(),
+        ));
+    }
+    let digest_bytes = hex::decode(&intent.policy_digest).map_err(|_| {
+        crate::PraetoreError::InvalidRequest("intent policy digest is invalid".into())
+    })?;
+    if intent.policy_digest.len() != 64 || hex::encode(digest_bytes) != intent.policy_digest {
+        return Err(crate::PraetoreError::InvalidRequest(
+            "intent policy digest is invalid".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -204,6 +332,19 @@ struct RequestIntentPayload<'a> {
     context: &'a BTreeMap<String, Value>,
 }
 
+#[derive(Serialize)]
+struct RequestIntentV2Payload<'a> {
+    canonical_version: u8,
+    schema_version: u8,
+    request_id: Uuid,
+    agent: &'a AgentIdentity,
+    authority: &'a Authority,
+    action: &'a Action,
+    trace_id: &'a Option<String>,
+    context: &'a BTreeMap<String, Value>,
+    intent_v2: &'a AuthorizationIntentV2,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,9 +352,10 @@ mod tests {
         action::Action,
         authority::Authority,
         decision::DecisionOutcome,
-        identity::{AgentId, AgentIdentity},
+        identity::{AgentId, AgentIdentity, AgentKeyPair},
     };
     use serde_json::json;
+    use time::Duration;
 
     fn test_agent() -> AgentIdentity {
         AgentIdentity::new(AgentId::new(), b"test-public-key".to_vec(), "ed25519").unwrap()
@@ -409,6 +551,53 @@ mod tests {
             request.sign_intent(&other_keypair),
             Err(crate::PraetoreError::IdentityVerificationFailed)
         ));
+    }
+
+    #[test]
+    fn v2_intent_signature_binds_audience_expiry_and_policy_digest() {
+        let keypair = AgentKeyPair::from_secret_bytes(&[41; 32]);
+        let agent = keypair.identity(AgentId::new());
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let issued_at = OffsetDateTime::parse("2026-06-01T12:00:00Z", &Rfc3339).unwrap();
+        request
+            .sign_intent_v2(
+                &keypair,
+                "test-gateway",
+                issued_at,
+                issued_at + Duration::minutes(1),
+                "a".repeat(64),
+            )
+            .unwrap();
+        assert!(request.verify_intent_signature().is_ok());
+
+        let mut changed_audience = request.clone();
+        changed_audience.intent_v2.as_mut().unwrap().audience = "other-gateway".into();
+        assert!(changed_audience.verify_intent_signature().is_err());
+
+        let mut changed_expiry = request.clone();
+        changed_expiry.intent_v2.as_mut().unwrap().expires_at = "2026-06-01T12:02:00Z".into();
+        assert!(changed_expiry.verify_intent_signature().is_err());
+
+        let mut changed_policy = request.clone();
+        changed_policy.intent_v2.as_mut().unwrap().policy_digest = "b".repeat(64);
+        assert!(changed_policy.verify_intent_signature().is_err());
+    }
+
+    #[test]
+    fn request_import_rejects_duplicate_unknown_and_oversized_json() {
+        assert!(
+            AuthorizationRequest::from_json(
+                r#"{"request_id":"00000000-0000-0000-0000-000000000001","request_id":"00000000-0000-0000-0000-000000000002"}"#
+            )
+            .is_err()
+        );
+        let mut document = serde_json::to_value(test_request()).unwrap();
+        document["unexpected"] = json!(true);
+        assert!(AuthorizationRequest::from_json(&document.to_string()).is_err());
+
+        let oversized = format!("{{\"padding\":\"{}\"}}", "x".repeat(MAX_JSON_VALUE_BYTES));
+        assert!(AuthorizationRequest::from_json(&oversized).is_err());
     }
 
     #[test]
