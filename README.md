@@ -1,5 +1,10 @@
 # PRÆTORE
 
+[![Assurance gates](https://github.com/Mavericksantander/praetore/actions/workflows/assurance.yml/badge.svg?branch=main)](https://github.com/Mavericksantander/praetore/actions/workflows/assurance.yml)
+[![Rust](https://img.shields.io/badge/Rust-core-000000?logo=rust)](https://www.rust-lang.org/)
+[![Python](https://img.shields.io/badge/Python-bindings-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-replay%20adapter-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+
 Trusted authorization and governance infrastructure for autonomous and AI-enabled systems.
 
 PRÆTORE is the core software infrastructure of PRÆTOR TECHNOLOGIES, designed to provide a deterministic foundation for authorization, policy enforcement, decision-making, and verifiable evidence.
