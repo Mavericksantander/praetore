@@ -8,12 +8,16 @@ use crate::{
     freshness::{FreshnessError, FreshnessProvider},
     identity::VerifiedPublicKey,
     policy::Policy,
-    replay::{ReplayGuard, ReplayGuardError},
+    replay::{
+        AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
+        ReplayGuardError,
+    },
 };
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
+use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub trait Clock: Send + Sync {
@@ -25,6 +29,14 @@ pub enum EvaluationMode {
     Development,
     Strict,
     HighAssurance,
+}
+
+#[derive(Debug, Error)]
+pub enum AtomicEvaluationError {
+    #[error("authorization evaluation failed: {0}")]
+    Evaluation(#[from] PraetoreError),
+    #[error("atomic authorization commit failed: {0}")]
+    Commit(#[from] AuthorizationCommitError),
 }
 
 const ISSUER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ISSUER_KEY_V1\0ed25519\0";
@@ -498,11 +510,15 @@ impl AuthorizationEngine {
             replay_guard: config.replay_guard,
             freshness_provider: config.freshness_provider,
         };
-        engine.validate_production_configuration(engine.clock.now())?;
+        engine.validate_production_configuration(engine.clock.now(), true)?;
         Ok(engine)
     }
 
-    fn validate_production_configuration(&self, now: OffsetDateTime) -> Result<()> {
+    fn validate_production_configuration(
+        &self,
+        now: OffsetDateTime,
+        require_replay_guard: bool,
+    ) -> Result<()> {
         let digest = self.policy.digest()?;
         if self.expected_policy_digest.as_deref() != Some(digest.as_str())
             || self.policy.semantics_version != 2
@@ -527,7 +543,7 @@ impl AuthorizationEngine {
         {
             return Err(PraetoreError::PolicyIntegrityFailed);
         }
-        if self.replay_guard.is_none() {
+        if require_replay_guard && self.replay_guard.is_none() {
             return Err(PraetoreError::ReplayGuardUnavailable);
         }
 
@@ -553,11 +569,56 @@ impl AuthorizationEngine {
     }
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
+        self.evaluate_inner(request, None)
+            .map_err(|error| match error {
+                AtomicEvaluationError::Evaluation(error) => error,
+                AtomicEvaluationError::Commit(AuthorizationCommitError::AlreadyCommitted)
+                | AtomicEvaluationError::Commit(AuthorizationCommitError::OrphanedReplayClaim) => {
+                    PraetoreError::ReplayDetected
+                }
+                AtomicEvaluationError::Commit(AuthorizationCommitError::ConflictingRequest) => {
+                    PraetoreError::InvalidRequest(
+                        "authorization identity conflicts with persisted content".into(),
+                    )
+                }
+                AtomicEvaluationError::Commit(AuthorizationCommitError::Unavailable)
+                | AtomicEvaluationError::Commit(AuthorizationCommitError::NotFound) => {
+                    PraetoreError::ReplayGuardUnavailable
+                }
+                AtomicEvaluationError::Commit(AuthorizationCommitError::InvalidRecord) => {
+                    PraetoreError::EvidenceError("persisted authorization record is invalid".into())
+                }
+            })
+    }
+
+    /// Evaluates a new request and atomically commits its signed HighAssurance
+    /// evidence with the replay claim. Unlike [`Self::evaluate`], this path
+    /// never uses the configured standalone replay guard.
+    pub fn evaluate_with_atomic_commit(
+        &self,
+        request: AuthorizationRequest,
+        commit: &dyn AtomicAuthorizationCommit,
+    ) -> std::result::Result<Evidence, AtomicEvaluationError> {
+        if self.mode != EvaluationMode::HighAssurance {
+            return Err(PraetoreError::InvalidRequest(
+                "atomic authorization commit requires HighAssurance mode".into(),
+            )
+            .into());
+        }
+        self.evaluate_inner(request, Some(commit))
+    }
+
+    fn evaluate_inner(
+        &self,
+        request: AuthorizationRequest,
+        atomic_commit: Option<&dyn AtomicAuthorizationCommit>,
+    ) -> std::result::Result<Evidence, AtomicEvaluationError> {
         let now = self.clock.now();
         if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
             return Err(PraetoreError::InvalidRequest(
                 "v2 intents are accepted only by the HighAssurance profile".into(),
-            ));
+            )
+            .into());
         }
         let replay_key = (*request.agent.id.as_uuid(), request.request_id);
         let (intent_v2, authority_digest) = if self.mode == EvaluationMode::HighAssurance {
@@ -566,7 +627,7 @@ impl AuthorizationEngine {
             (None, None)
         };
         if self.mode == EvaluationMode::HighAssurance {
-            self.validate_production_configuration(now)?;
+            self.validate_production_configuration(now, atomic_commit.is_none())?;
         }
         let decision = self.evaluate_request(&request, now)?;
         let freshness = if self.mode == EvaluationMode::HighAssurance {
@@ -589,12 +650,12 @@ impl AuthorizationEngine {
                 )
                 .map_err(PraetoreError::FreshnessCheckFailed)?;
             if freshness.valid_until < now {
-                return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired));
+                return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired).into());
             }
             if freshness.valid_until > now + self.max_freshness_lease {
-                return Err(PraetoreError::FreshnessCheckFailed(
-                    FreshnessError::LeaseTooLong,
-                ));
+                return Err(
+                    PraetoreError::FreshnessCheckFailed(FreshnessError::LeaseTooLong).into(),
+                );
             }
             Some(freshness)
         } else {
@@ -615,21 +676,40 @@ impl AuthorizationEngine {
             if evidence.intent_v2.as_ref() != Some(&intent) {
                 return Err(PraetoreError::EvidenceError(
                     "evidence intent binding changed during evaluation".into(),
-                ));
+                )
+                .into());
             }
         }
         if let Some(attester) = &self.evidence_attester {
             evidence.sign(attester)?;
         }
         if self.mode == EvaluationMode::HighAssurance {
-            self.replay_guard
-                .as_ref()
-                .ok_or(PraetoreError::ReplayGuardUnavailable)?
-                .claim_once(replay_key.0, replay_key.1)
-                .map_err(|error| match error {
-                    ReplayGuardError::AlreadyClaimed => PraetoreError::ReplayDetected,
-                    ReplayGuardError::Unavailable => PraetoreError::ReplayGuardUnavailable,
-                })?;
+            if let Some(commit) = atomic_commit {
+                let attester = self
+                    .evidence_attester
+                    .as_ref()
+                    .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+                let trusted_attester = attester.public_key()?;
+                evidence.verify_attester_signature(&trusted_attester)?;
+                let authorization = CompletedAuthorization::new(evidence);
+                match commit.commit_authorization(&authorization, &trusted_attester) {
+                    Ok(()) => {}
+                    Err(AuthorizationCommitError::Unavailable) => {
+                        commit.verify_committed_authorization(&authorization, &trusted_attester)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                evidence = authorization.evidence().clone();
+            } else {
+                self.replay_guard
+                    .as_ref()
+                    .ok_or(PraetoreError::ReplayGuardUnavailable)?
+                    .claim_once(replay_key.0, replay_key.1)
+                    .map_err(|error| match error {
+                        ReplayGuardError::AlreadyClaimed => PraetoreError::ReplayDetected,
+                        ReplayGuardError::Unavailable => PraetoreError::ReplayGuardUnavailable,
+                    })?;
+            }
         }
         Ok(evidence)
     }

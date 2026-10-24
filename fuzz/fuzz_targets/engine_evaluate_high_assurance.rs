@@ -99,6 +99,7 @@ fn fixture() -> &'static Fixture {
             EvidenceAttesterKey::from_secret_bytes(&[33; 32]),
         )
         .unwrap()
+        .with_audience("fuzz-gateway")
         .with_replay_guard(Arc::new(FuzzReplayGuard))
         .with_freshness_provider(Arc::new(FuzzFreshnessProvider));
         let engine = AuthorizationEngine::production_with_clock(

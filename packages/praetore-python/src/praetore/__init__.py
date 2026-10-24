@@ -1,4 +1,4 @@
-"""Thin Python bindings to the Rust PRÆTORE evidence verifier."""
+"""Historical evidence verification bindings; these do not authorize execution."""
 
 from ._core import (
     verify_evidence_attester_signature,

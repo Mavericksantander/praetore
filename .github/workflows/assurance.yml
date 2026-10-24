@@ -95,7 +95,43 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p praetore-replay-postgres --locked
-      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored claim_is_unique_and_survives_a_new_client
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored concurrent_connections_allow_exactly_one_claim
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored a_lost_database_connection_fails_closed_and_a_new_client_recovers
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_gateway_authorizes_and_persists_one_effect
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_atomic_commit_rolls_back_claim_when_journal_insert_fails
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_lost_commit_ack_is_verified_before_dispatch
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_unverifiable_commit_acknowledgement_blocks_dispatch
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_legacy_replay_claim_without_authorization_is_orphaned_and_blocked
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_prevents_concurrent_duplicate_effects_across_engines
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_rejects_execution_key_reused_with_different_action
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_failure_before_dispatch_prevents_effect
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_recovery_never_dispatches_authorized_or_ambiguous_rows
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_reconciliation_only_resolves_when_adapter_proves_outcome
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_effect_survives_failed_terminal_write_and_is_reconciled_without_retry
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_terminal_states_cannot_return_to_dispatchable
+      - name: Stage replay-claim restart test
+        env:
+          PRAETORE_TEST_RESTART_PHASE: before
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored replay_claim_survives_server_restart
+      - name: Stage execution-journal restart test
+        env:
+          PRAETORE_TEST_JOURNAL_RESTART_PHASE: before
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_survives_server_restart_without_automatic_dispatch
+      - name: Restart PostgreSQL service
+        run: |
+          container_id="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1)"
+          test -n "$container_id"
+          docker restart "$container_id"
+          until docker exec "$container_id" pg_isready -U praetore -d praetore_test; do sleep 1; done
+      - name: Verify replay-claim recovery after restart
+        env:
+          PRAETORE_TEST_RESTART_PHASE: after
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored replay_claim_survives_server_restart
+      - name: Verify execution-journal recovery after restart
+        env:
+          PRAETORE_TEST_JOURNAL_RESTART_PHASE: after
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_survives_server_restart_without_automatic_dispatch
 
   sbom:
     name: CycloneDX SBOM
@@ -108,6 +144,7 @@ jobs:
       - run: cargo cyclonedx --manifest-path crates/praetore-verify/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-python/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-replay-postgres/Cargo.toml --format json --all
+      - run: cargo cyclonedx --manifest-path crates/praetore-gateway/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path fuzz/Cargo.toml --format json --all
       - run: find crates fuzz -name '*.cdx.json' -print
       - uses: actions/upload-artifact@v4

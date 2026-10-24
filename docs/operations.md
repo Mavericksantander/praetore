@@ -149,7 +149,14 @@ intent signature from being accepted under only a self-asserted embedded
 agent key. For standalone authority documents, `--agent agent.json` is
 optional; without it, the CLI verifies the signed subject-key hash is present
 but cannot compare it to a separately supplied agent identity. Use JSON output
-for machine consumption and check both exit status and `code`.
+for machine consumption and check both exit status and `code`. Evidence
+verification is historical receipt integrity/authenticity verification: it
+does not establish that the intent or freshness lease is still current, that a
+request ID has not already been consumed, or that an action may be executed
+now. JSON output explicitly includes
+`verification_scope=historical_receipt_integrity_and_attestation` and
+`current_authorization=false`. Never use verifier success as a live
+authorization decision or execution permit.
 
 `praetore-verify policy-digest --policy policy.json --format json` prints the
 canonical policy digest. This command computes a digest; it does not establish

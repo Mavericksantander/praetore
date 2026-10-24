@@ -28,15 +28,22 @@ test command above. Treat `docs/golden/*-v1.json` as compatibility fixtures;
 codec changes require a deliberate versioned migration.
 
 The PostgreSQL replay adapter's integration tests need a disposable database.
-The CI job provides one and runs:
+The CI job provides one and runs duplicate-client, concurrent-claim, and
+connection-loss/recovery tests:
 
 ```sh
-PRAETORE_TEST_DATABASE_URL=postgres://user:password@localhost/praetore_test \
-  cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored
+export PRAETORE_TEST_DATABASE_URL=postgres://localhost:5432/praetore_test
+cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored claim_is_unique_and_survives_a_new_client
+cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored concurrent_connections_allow_exactly_one_claim
+cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored a_lost_database_connection_fails_closed_and_a_new_client_recovers
 ```
 
 Do not use a production database: tests intentionally retain claims and apply
-the test migration.
+the test migration. A separate staged test,
+`replay_claim_survives_server_restart`, uses a fixed test claim ID and requires
+a server restart between `PRAETORE_TEST_RESTART_PHASE=before` and
+`PRAETORE_TEST_RESTART_PHASE=after`. Run it only against a disposable cluster
+that you can stop and restart; CI does not orchestrate this service lifecycle.
 
 To refresh the standalone fuzzer lockfile when its manifest changes, run
 `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`, then audit and fuzz
@@ -85,6 +92,7 @@ cargo cyclonedx --manifest-path crates/praetore-core/Cargo.toml --format json --
 cargo cyclonedx --manifest-path crates/praetore-verify/Cargo.toml --format json --all
 cargo cyclonedx --manifest-path crates/praetore-python/Cargo.toml --format json --all
 cargo cyclonedx --manifest-path crates/praetore-replay-postgres/Cargo.toml --format json --all
+cargo cyclonedx --manifest-path crates/praetore-gateway/Cargo.toml --format json --all
 cargo cyclonedx --manifest-path fuzz/Cargo.toml --format json --all
 ```
 

@@ -56,6 +56,23 @@
 - HighAssurance freshness now binds the exact authority content digest and
   enforces a maximum lease; authorities must be bounded by validity dates and
   default to a 365-day maximum lifetime.
+- Offline evidence-verifier output now explicitly marks its scope as historical
+  receipt integrity/attestation and reports that it is not current
+  authorization.
+- Fixed the HighAssurance fuzz fixture to supply the required audience so
+  fuzzing reaches request evaluation instead of panicking during setup.
+- Added a synchronous reference tool gateway that requires HighAssurance,
+  dispatches the exact action from fresh ALLOW evidence, and fails closed on
+  replay, journal, and adapter ambiguity. It includes adversarial tests but no
+  network service or production deployment configuration.
+- Added an optional PostgreSQL execution journal with unique execution claims,
+  immutable authorization/action binding, monotonic durable transitions, and
+  read-only recovery reconciliation. PostgreSQL CI covers concurrent
+  gateways, server restart, ambiguous outcomes, and terminal-state rollback.
+- Added `AtomicAuthorizationCommit` for the gateway path. PostgreSQL now
+  commits the replay claim and completed, verified HighAssurance evidence in
+  one transaction, verifies uncertain commit acknowledgements before
+  dispatch, and blocks legacy orphan claims without reconstructing evidence.
 
 ### Compatibility notes
 
@@ -74,7 +91,9 @@
   hash.
 - HighAssurance callers must attach a durable, atomic `ReplayGuard` to
   `HighAssuranceConfig`; implementers must retain claims and fail closed on
-  duplicate IDs or storage failure. Strict and Development modes are unchanged.
+  duplicate IDs or storage failure. The gateway additionally requires its
+  journal to implement `AtomicAuthorizationCommit`; it cannot fall back to
+  standalone replay-guard writes. Strict and Development modes are unchanged.
 - HighAssurance callers must also attach a `FreshnessProvider`; non-current,
   unknown, revoked, expired, or unavailable results fail closed.
 - Existing `FreshnessProvider` implementations must implement
