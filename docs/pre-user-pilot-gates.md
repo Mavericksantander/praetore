@@ -17,12 +17,15 @@ approved by named technical and operational owners.
   replay-guard implementation, and verifier reported no concrete
   vulnerabilities. This is not a penetration test, certification, or review of
   a deployment-specific adapter.
+- [x] Optional PostgreSQL adapter uses an atomic primary-key claim, requests
+  synchronous primary WAL commit, and includes disposable-service concurrency
+  and persistence integration tests.
 - [ ] Hosted assurance workflow passes on the final candidate commit.
 - [ ] Repository branch protection requires all assurance checks and disallows
   unreviewed direct changes to the release branch.
-- [ ] A deployment-specific durable, atomic ReplayGuard is implemented and
-  tested across processes, restarts, failover, backup/restore, capacity
-  exhaustion, and storage outages.
+- [ ] PostgreSQL adapter integration job passes in hosted CI.
+- [ ] The target database's synchronous replication, fencing, backup/restore,
+  capacity exhaustion, and outage behavior are tested and approved.
 
 ## Required deployment evidence
 

@@ -1,0 +1,15 @@
+[package]
+name = "praetore-replay-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "PostgreSQL-backed durable replay guard for PRÆTORE HighAssurance deployments."
+
+[dependencies]
+postgres = { version = "0.19", features = ["with-uuid-1"] }
+praetore-core = { path = "../praetore-core" }
+uuid = { version = "1.18", features = ["v4"] }

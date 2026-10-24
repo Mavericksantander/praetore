@@ -4,6 +4,7 @@ members = [
     "crates/praetore-core",
     "crates/praetore-verify",
     "crates/praetore-python",
+    "crates/praetore-replay-postgres",
 ]
 
 [workspace.package]

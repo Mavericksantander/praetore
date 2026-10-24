@@ -25,6 +25,17 @@ cargo audit --file fuzz/Cargo.lock
 The canonical policy digest golden vector is checked by core unit tests in the
 workspace test command above.
 
+The PostgreSQL replay adapter's integration tests need a disposable database.
+The CI job provides one and runs:
+
+```sh
+PRAETORE_TEST_DATABASE_URL=postgres://user:password@localhost/praetore_test \
+  cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored
+```
+
+Do not use a production database: tests intentionally retain claims and apply
+the test migration.
+
 To refresh the standalone fuzzer lockfile when its manifest changes, run
 `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`, then audit and fuzz
 the resulting locked dependency graph.
@@ -70,6 +81,7 @@ cargo install cargo-cyclonedx --version 0.5.9 --locked
 cargo cyclonedx --manifest-path crates/praetore-core/Cargo.toml --format json --all
 cargo cyclonedx --manifest-path crates/praetore-verify/Cargo.toml --format json --all
 cargo cyclonedx --manifest-path crates/praetore-python/Cargo.toml --format json --all
+cargo cyclonedx --manifest-path crates/praetore-replay-postgres/Cargo.toml --format json --all
 cargo cyclonedx --manifest-path fuzz/Cargo.toml --format json --all
 ```
 
