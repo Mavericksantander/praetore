@@ -68,6 +68,7 @@ praetore/
 │           ├── action.rs
 │           ├── authority.rs
 │           ├── authorization.rs
+│           ├── canonical.rs
 │           ├── decision.rs
 │           ├── engine.rs
 │           ├── error.rs
@@ -83,6 +84,20 @@ praetore/
 ├── TRADEMARKS.md
 └── README.md
 ```
+
+## Security and production use
+
+The `new` and `with_clock` constructors are compatibility Development-mode
+APIs. For signature-checked evaluation use `strict`; for the production
+high-assurance profile use `AuthorizationEngine::production` with a pinned
+policy digest, bounded issuer pins, and a separate evidence attester key.
+Evaluation remains offline and in-process. It does not provide PKI, revocation,
+replay prevention, secure clocking, deployment integrity, or host isolation.
+
+See [the crypto and policy guide](docs/crypto-and-policy.md), [the threat
+model](docs/threat-model.md), [the operations runbooks](docs/operations.md),
+and the [architecture decisions](docs/adr/README.md) before production
+integration.
 
 ## Development
 
@@ -156,6 +171,27 @@ Authorization evidence contains the request context and resulting decision.
 PRÆTORE computes a SHA-256 context hash over the relevant authorization data so that subsequent modifications to the evidence can be detected.
 
 Evidence verification provides an integrity primitive for downstream systems.
+
+The hash is not a signature: anyone able to modify an evidence document can
+recompute it. Signed authorities and optional signed request intents use
+Ed25519 and are described in [Crypto and policy semantics](docs/crypto-and-policy.md).
+
+## Crypto and policy APIs
+
+Use `AgentKeyPair::generate()` to create Ed25519 keypairs, sign authorities
+for a subject with `Authority::sign_for_agent`, and construct
+`AuthorizationEngine::strict` with explicit issuer-name/public-key trust
+bindings for production evaluation. Strict mode also requires an agent-signed
+request intent. The named `AuthorizationEngine::development` and compatibility
+`AuthorizationEngine::new` constructors permit unsigned authorities.
+
+Policy rules support typed exact, string-prefix, set-membership, and numeric
+conditions against action parameters and request context. Missing fields or
+type mismatches never satisfy a condition. Action types and authority
+capabilities are separate: `Action::with_capability` declares the required
+capability; when omitted, the legacy behavior uses the action type as the
+capability name. See the linked documentation for canonical serialization,
+migration guidance, and examples.
 
 ## Security
 

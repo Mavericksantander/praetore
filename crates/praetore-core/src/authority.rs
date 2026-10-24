@@ -1,12 +1,21 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
+    canonical::canonical_json,
     error::{PraetoreError, Result},
-    identity::AgentId,
+    identity::{AgentId, AgentIdentity, AgentKeyPair, VerifiedPublicKey},
 };
+
+const AUTHORITY_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_AUTHORITY_V1\0";
+const AGENT_KEY_HASH_DOMAIN: &[u8] = b"PRAETORE_AGENT_KEY_V1\0ed25519\0";
+const ISSUER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ISSUER_KEY_V1\0ed25519\0";
+const MAX_CAPABILITIES: usize = 256;
+const MAX_AUTHORITY_CONSTRAINTS: usize = 128;
+const MAX_AUTHORITY_FIELD_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthorityId(Uuid);
@@ -42,9 +51,9 @@ impl AuthorityConstraint {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.key.trim().is_empty() {
+        if self.key.trim().is_empty() || self.key != self.key.trim() {
             return Err(PraetoreError::InvalidRequest(
-                "authority constraint key cannot be empty".into(),
+                "authority constraint key must be a non-empty canonical name".into(),
             ));
         }
 
@@ -122,6 +131,9 @@ pub struct Authority {
     pub issuer: String,
     pub validity: Validity,
     pub version: u32,
+    pub subject_key_hash: Option<String>,
+    pub issuer_key_id: Option<String>,
+    pub signature: Option<String>,
 }
 
 fn parse_timestamp(value: &str) -> Result<OffsetDateTime> {
@@ -146,7 +158,93 @@ impl Authority {
             issuer: issuer.into(),
             validity: Validity::unbounded(),
             version: 1,
+            subject_key_hash: None,
+            issuer_key_id: None,
+            signature: None,
         }
+    }
+
+    pub fn sign_for_agent(
+        &mut self,
+        issuer_key: &AgentKeyPair,
+        agent: &AgentIdentity,
+    ) -> Result<()> {
+        agent.validate()?;
+        if self.subject != agent.id {
+            return Err(PraetoreError::AuthorityVerificationFailed);
+        }
+        agent.verified_public_key()?;
+        self.subject_key_hash = Some(agent_key_hash(agent));
+        self.sign(issuer_key)
+    }
+
+    pub fn sign(&mut self, issuer_key: &AgentKeyPair) -> Result<()> {
+        let mut key_hasher = Sha256::new();
+        key_hasher.update(ISSUER_KEY_ID_DOMAIN);
+        key_hasher.update(issuer_key.public_key().as_bytes());
+        self.issuer_key_id = Some(hex::encode(key_hasher.finalize()));
+        self.validate()?;
+        let payload = self.canonical_signing_bytes()?;
+        self.signature = Some(hex::encode(
+            issuer_key.sign_domain_message(AUTHORITY_SIGNATURE_DOMAIN, &payload),
+        ));
+        Ok(())
+    }
+
+    pub fn verify_subject_identity(&self, agent: &AgentIdentity) -> Result<()> {
+        agent
+            .verified_public_key()
+            .map_err(|_| PraetoreError::AuthorityVerificationFailed)?;
+        let expected_key_hash = agent_key_hash(agent);
+        if self.subject != agent.id
+            || self.subject_key_hash.as_deref() != Some(expected_key_hash.as_str())
+        {
+            return Err(PraetoreError::AuthorityVerificationFailed);
+        }
+
+        Ok(())
+    }
+
+    pub fn verify_signature(&self, issuer_key: &VerifiedPublicKey) -> Result<()> {
+        self.validate()
+            .map_err(|_| PraetoreError::AuthorityVerificationFailed)?;
+        let signature = self
+            .signature
+            .as_deref()
+            .ok_or(PraetoreError::AuthorityVerificationFailed)
+            .and_then(|value| {
+                hex::decode(value).map_err(|_| PraetoreError::AuthorityVerificationFailed)
+            })?;
+        let payload = self
+            .canonical_signing_bytes()
+            .map_err(|_| PraetoreError::AuthorityVerificationFailed)?;
+
+        issuer_key
+            .verify_domain_message(AUTHORITY_SIGNATURE_DOMAIN, &payload, &signature)
+            .map_err(|_| PraetoreError::AuthorityVerificationFailed)
+    }
+
+    fn canonical_signing_bytes(&self) -> Result<Vec<u8>> {
+        let mut capabilities: Vec<_> = self.capabilities.iter().map(String::as_str).collect();
+        capabilities.sort_unstable();
+
+        let mut constraints: Vec<_> = self.constraints.iter().collect();
+        constraints.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+
+        canonical_json(&AuthoritySigningPayload {
+            canonical_version: crate::canonical::CANONICAL_VERSION,
+            schema_version: 1,
+            id: &self.id,
+            subject: &self.subject,
+            issuer: &self.issuer,
+            capabilities,
+            constraints,
+            validity: &self.validity,
+            version: self.version,
+            subject_key_hash: &self.subject_key_hash,
+            issuer_key_id: &self.issuer_key_id,
+        })
+        .map_err(|error| PraetoreError::EvidenceError(error.to_string()))
     }
 
     pub fn permits(&self, capability: &str) -> bool {
@@ -164,9 +262,37 @@ impl Authority {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.issuer.trim().is_empty() {
+        if self.issuer.trim().is_empty() || self.issuer != self.issuer.trim() {
             return Err(PraetoreError::InvalidRequest(
-                "authority issuer cannot be empty".into(),
+                "authority issuer must be a non-empty canonical identifier".into(),
+            ));
+        }
+
+        if self.issuer.len() > MAX_AUTHORITY_FIELD_BYTES
+            || self.capabilities.len() > MAX_CAPABILITIES
+            || self.constraints.len() > MAX_AUTHORITY_CONSTRAINTS
+        {
+            return Err(PraetoreError::InvalidRequest(
+                "authority exceeds configured input limits".into(),
+            ));
+        }
+
+        if self
+            .subject_key_hash
+            .as_deref()
+            .is_some_and(|hash| hash.len() != 64 || hex::decode(hash).is_err())
+        {
+            return Err(PraetoreError::InvalidRequest(
+                "authority subject key hash is malformed".into(),
+            ));
+        }
+        if self
+            .issuer_key_id
+            .as_deref()
+            .is_some_and(|key_id| key_id.len() != 64 || hex::decode(key_id).is_err())
+        {
+            return Err(PraetoreError::InvalidRequest(
+                "authority issuer key id is malformed".into(),
             ));
         }
 
@@ -179,9 +305,12 @@ impl Authority {
         let mut capabilities = HashSet::new();
 
         for capability in &self.capabilities {
-            if capability.trim().is_empty() {
+            if capability.trim().is_empty()
+                || capability != capability.trim()
+                || capability.len() > MAX_AUTHORITY_FIELD_BYTES
+            {
                 return Err(PraetoreError::InvalidRequest(
-                    "authority capability cannot be empty".into(),
+                    "authority capability must be a non-empty canonical name".into(),
                 ));
             }
 
@@ -197,6 +326,13 @@ impl Authority {
 
         for constraint in &self.constraints {
             constraint.validate()?;
+            if constraint.key.len() > MAX_AUTHORITY_FIELD_BYTES
+                || constraint.value.len() > MAX_AUTHORITY_FIELD_BYTES
+            {
+                return Err(PraetoreError::InvalidRequest(
+                    "authority constraint exceeds maximum length".into(),
+                ));
+            }
 
             if !constraint_keys.insert(&constraint.key) {
                 return Err(PraetoreError::InvalidRequest(format!(
@@ -212,9 +348,32 @@ impl Authority {
     }
 }
 
+fn agent_key_hash(agent: &AgentIdentity) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(AGENT_KEY_HASH_DOMAIN);
+    hasher.update(&agent.public_key);
+    hex::encode(hasher.finalize())
+}
+
+#[derive(Serialize)]
+struct AuthoritySigningPayload<'a> {
+    canonical_version: u8,
+    schema_version: u8,
+    id: &'a AuthorityId,
+    subject: &'a AgentId,
+    issuer: &'a str,
+    capabilities: Vec<&'a str>,
+    constraints: Vec<&'a AuthorityConstraint>,
+    validity: &'a Validity,
+    version: u32,
+    subject_key_hash: &'a Option<String>,
+    issuer_key_id: &'a Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::AgentKeyPair;
 
     fn test_agent() -> AgentId {
         AgentId::new()
@@ -270,6 +429,25 @@ mod tests {
 
         assert_eq!(authority.validity, validity);
         assert!(authority.validate().is_ok());
+    }
+
+    #[test]
+    fn validity_bounds_are_inclusive() {
+        let validity = Validity {
+            not_before: Some("2026-01-01T00:00:00Z".into()),
+            not_after: Some("2027-01-01T00:00:00Z".into()),
+        };
+        let start = parse_timestamp("2026-01-01T00:00:00Z").unwrap();
+        let end = parse_timestamp("2027-01-01T00:00:00Z").unwrap();
+
+        assert!(validity.is_active_at(start).unwrap());
+        assert!(validity.is_active_at(end).unwrap());
+        assert!(
+            !validity
+                .is_active_at(start - time::Duration::SECOND)
+                .unwrap()
+        );
+        assert!(!validity.is_active_at(end + time::Duration::SECOND).unwrap());
     }
 
     #[test]
@@ -387,5 +565,80 @@ mod tests {
             });
 
         assert!(authority.validate().is_err());
+    }
+
+    #[test]
+    fn signed_authority_verifies_with_issuer_key() {
+        let issuer_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let mut authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
+
+        authority.sign(&issuer_key).unwrap();
+
+        assert!(authority.verify_signature(&issuer_key.public_key()).is_ok());
+        assert!(authority.signature.is_some());
+    }
+
+    #[test]
+    fn signed_authority_rejects_tampering_and_wrong_issuer() {
+        let issuer_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let other_key = AgentKeyPair::from_secret_bytes(&[8; 32]);
+        let mut authority = Authority::new(test_agent(), "praetore-root", vec!["read:data".into()]);
+
+        authority.sign(&issuer_key).unwrap();
+        assert!(authority.verify_signature(&other_key.public_key()).is_err());
+
+        authority.capabilities.push("delete:data".into());
+        assert!(
+            authority
+                .verify_signature(&issuer_key.public_key())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authority_subject_key_binding_requires_matching_subject() {
+        let issuer_key = AgentKeyPair::generate();
+        let agent = AgentKeyPair::generate().identity(AgentId::new());
+        let other_agent = AgentKeyPair::generate().identity(AgentId::new());
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+
+        assert!(authority.sign_for_agent(&issuer_key, &other_agent).is_err());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        assert!(authority.verify_subject_identity(&agent).is_ok());
+        assert!(authority.verify_subject_identity(&other_agent).is_err());
+    }
+
+    #[test]
+    fn authority_canonical_signature_ignores_set_order() {
+        let issuer_key = AgentKeyPair::from_secret_bytes(&[9; 32]);
+        let subject = test_agent();
+        let mut first = Authority::new(
+            subject.clone(),
+            "praetore-root",
+            vec!["read:data".into(), "write:data".into()],
+        )
+        .with_constraint("region", "south")
+        .with_constraint("environment", "production");
+        let mut second = Authority {
+            id: first.id.clone(),
+            subject,
+            capabilities: vec!["write:data".into(), "read:data".into()],
+            constraints: vec![
+                AuthorityConstraint::new("environment", "production"),
+                AuthorityConstraint::new("region", "south"),
+            ],
+            issuer: "praetore-root".into(),
+            validity: first.validity.clone(),
+            version: first.version,
+            subject_key_hash: None,
+            issuer_key_id: None,
+            signature: None,
+        };
+
+        first.sign(&issuer_key).unwrap();
+        second.sign(&issuer_key).unwrap();
+
+        assert_eq!(first.signature, second.signature);
     }
 }
