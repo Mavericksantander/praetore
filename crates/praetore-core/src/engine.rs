@@ -5,6 +5,7 @@ use crate::{
     canonical::parse_json_rejecting_duplicates,
     decision::Decision,
     evidence::{Evidence, EvidenceAttesterKey},
+    freshness::{FreshnessError, FreshnessProvider},
     identity::VerifiedPublicKey,
     policy::Policy,
     replay::{ReplayGuard, ReplayGuardError},
@@ -29,6 +30,7 @@ pub enum EvaluationMode {
 const ISSUER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ISSUER_KEY_V1\0ed25519\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssuerPinDocument {
     schema_version: u8,
     issuer: String,
@@ -164,6 +166,7 @@ pub struct HighAssuranceConfig {
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     evidence_attester: EvidenceAttesterKey,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
+    freshness_provider: Option<Arc<dyn FreshnessProvider>>,
 }
 
 impl std::fmt::Debug for HighAssuranceConfig {
@@ -173,6 +176,10 @@ impl std::fmt::Debug for HighAssuranceConfig {
             .field("trusted_issuers", &self.trusted_issuers)
             .field("evidence_attester", &self.evidence_attester)
             .field("replay_guard_configured", &self.replay_guard.is_some())
+            .field(
+                "freshness_provider_configured",
+                &self.freshness_provider.is_some(),
+            )
             .finish()
     }
 }
@@ -211,11 +218,20 @@ impl HighAssuranceConfig {
             trusted_issuers,
             evidence_attester,
             replay_guard: None,
+            freshness_provider: None,
         })
     }
 
     pub fn with_replay_guard(mut self, replay_guard: Arc<dyn ReplayGuard>) -> Self {
         self.replay_guard = Some(replay_guard);
+        self
+    }
+
+    pub fn with_freshness_provider(
+        mut self,
+        freshness_provider: Arc<dyn FreshnessProvider>,
+    ) -> Self {
+        self.freshness_provider = Some(freshness_provider);
         self
     }
 }
@@ -261,6 +277,7 @@ pub struct AuthorizationEngine {
     expected_policy_digest: Option<String>,
     evidence_attester: Option<Arc<EvidenceAttesterKey>>,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
+    freshness_provider: Option<Arc<dyn FreshnessProvider>>,
 }
 
 impl std::fmt::Debug for AuthorizationEngine {
@@ -276,6 +293,12 @@ impl std::fmt::Debug for AuthorizationEngine {
 
 impl AuthorizationEngine {
     /// Compatibility constructor using `Development` evaluation mode.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "Development mode allows unsigned authorities; use AuthorizationEngine::production with HighAssuranceConfig for production"
+        )
+    )]
     pub fn new(policy: Policy) -> Self {
         Self::development(policy)
     }
@@ -289,10 +312,17 @@ impl AuthorizationEngine {
             expected_policy_digest: None,
             evidence_attester: None,
             replay_guard: None,
+            freshness_provider: None,
         }
     }
 
     /// Compatibility constructor using `Development` evaluation mode.
+    #[cfg_attr(
+        not(test),
+        deprecated(
+            note = "Development mode allows unsigned authorities; use AuthorizationEngine::production_with_clock with HighAssuranceConfig for production"
+        )
+    )]
     pub fn with_clock(policy: Policy, clock: impl Clock + 'static) -> Self {
         Self::development_with_clock(policy, clock)
     }
@@ -306,6 +336,7 @@ impl AuthorizationEngine {
             expected_policy_digest: None,
             evidence_attester: None,
             replay_guard: None,
+            freshness_provider: None,
         }
     }
 
@@ -332,6 +363,7 @@ impl AuthorizationEngine {
             expected_policy_digest: None,
             evidence_attester: None,
             replay_guard: None,
+            freshness_provider: None,
         })
     }
 
@@ -361,6 +393,11 @@ impl AuthorizationEngine {
         if config.replay_guard.is_none() {
             return Err(PraetoreError::ReplayGuardUnavailable);
         }
+        if config.freshness_provider.is_none() {
+            return Err(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::Unavailable,
+            ));
+        }
 
         let engine = Self {
             policy,
@@ -370,6 +407,7 @@ impl AuthorizationEngine {
             expected_policy_digest: Some(config.policy_digest),
             evidence_attester: Some(Arc::new(config.evidence_attester)),
             replay_guard: config.replay_guard,
+            freshness_provider: config.freshness_provider,
         };
         engine.validate_production_configuration(engine.clock.now())?;
         Ok(engine)
@@ -380,6 +418,7 @@ impl AuthorizationEngine {
         if self.expected_policy_digest.as_deref() != Some(digest.as_str())
             || self.trusted_issuers.is_empty()
             || self.evidence_attester.is_none()
+            || self.freshness_provider.is_none()
             || self
                 .trusted_issuers
                 .iter()
@@ -419,6 +458,26 @@ impl AuthorizationEngine {
             self.validate_production_configuration(now)?;
         }
         let decision = self.evaluate_request(&request, now)?;
+        if self.mode == EvaluationMode::HighAssurance {
+            let freshness = self
+                .freshness_provider
+                .as_ref()
+                .ok_or(PraetoreError::FreshnessCheckFailed(
+                    FreshnessError::Unavailable,
+                ))?
+                .check(
+                    &request.agent.key_fingerprint()?,
+                    &request.authority.id,
+                    self.expected_policy_digest
+                        .as_deref()
+                        .ok_or(PraetoreError::PolicyIntegrityFailed)?,
+                    now,
+                )
+                .map_err(PraetoreError::FreshnessCheckFailed)?;
+            if freshness.valid_until < now {
+                return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired));
+            }
+        }
         let mut evidence = request.attest(decision)?;
         evidence.bind_policy_digest(self.policy.digest()?)?;
         if let Some(attester) = &self.evidence_attester {
@@ -543,6 +602,7 @@ mod tests {
         action::Action,
         authority::{Authority, Validity},
         decision::DecisionOutcome,
+        freshness::{FreshnessLease, FreshnessProvider},
         identity::{AgentId, AgentIdentity, AgentKeyPair},
         policy::{Policy, PolicyRule},
         replay::ReplayGuardError,
@@ -584,6 +644,65 @@ mod tests {
 
     fn test_replay_guard() -> Arc<TestReplayGuard> {
         Arc::new(TestReplayGuard::default())
+    }
+
+    struct TestFreshnessProvider {
+        lease_seconds: std::result::Result<i64, FreshnessError>,
+    }
+
+    impl FreshnessProvider for TestFreshnessProvider {
+        fn check(
+            &self,
+            _agent: &crate::identity::AgentKeyFingerprint,
+            _authority_id: &crate::authority::AuthorityId,
+            _policy_digest: &str,
+            now: OffsetDateTime,
+        ) -> std::result::Result<FreshnessLease, FreshnessError> {
+            let seconds = self.lease_seconds?;
+            Ok(FreshnessLease {
+                valid_until: now + time::Duration::seconds(seconds),
+            })
+        }
+    }
+
+    fn test_freshness_provider() -> Arc<dyn FreshnessProvider> {
+        Arc::new(TestFreshnessProvider {
+            lease_seconds: Ok(60),
+        })
+    }
+
+    fn add_test_freshness(config: HighAssuranceConfig) -> HighAssuranceConfig {
+        config.with_freshness_provider(test_freshness_provider())
+    }
+
+    fn production_engine_with_provider(
+        provider: Arc<dyn FreshnessProvider>,
+    ) -> (AuthorizationEngine, AuthorizationRequest) {
+        let policy = allow_policy();
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(high_assurance_validity());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request.sign_intent(&agent_key).unwrap();
+        let config = HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_replay_guard(test_replay_guard())
+        .with_freshness_provider(provider);
+        let engine = AuthorizationEngine::production_with_clock(
+            policy,
+            config,
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        )
+        .unwrap();
+        (engine, request)
     }
 
     struct CountingClock {
@@ -1236,6 +1355,7 @@ mod tests {
         )
         .unwrap()
         .with_replay_guard(replay_guard);
+        let config = add_test_freshness(config);
         let engine = AuthorizationEngine::production_with_clock(
             policy,
             config,
@@ -1292,6 +1412,7 @@ mod tests {
         )
         .unwrap()
         .with_replay_guard(test_replay_guard());
+        let config = add_test_freshness(config);
 
         assert!(matches!(
             AuthorizationEngine::production_with_clock(
@@ -1321,6 +1442,7 @@ mod tests {
         )
         .unwrap()
         .with_replay_guard(test_replay_guard());
+        let config = add_test_freshness(config);
 
         assert!(matches!(
             AuthorizationEngine::production_with_clock(
@@ -1376,6 +1498,7 @@ mod tests {
             unavailable: true,
             ..TestReplayGuard::default()
         }));
+        let config = add_test_freshness(config);
         let engine = AuthorizationEngine::production_with_clock(
             policy,
             config,
@@ -1386,6 +1509,69 @@ mod tests {
         assert!(matches!(
             engine.evaluate(request),
             Err(PraetoreError::ReplayGuardUnavailable)
+        ));
+    }
+
+    #[test]
+    fn production_freshness_provider_must_vouch_for_current_state() {
+        let current_provider = Arc::new(TestFreshnessProvider {
+            lease_seconds: Ok(0),
+        });
+        let (engine, request) = production_engine_with_provider(current_provider);
+        assert_eq!(
+            engine.evaluate(request).unwrap().decision.outcome,
+            DecisionOutcome::Allow
+        );
+
+        for error in [
+            FreshnessError::Revoked,
+            FreshnessError::Unknown,
+            FreshnessError::Expired,
+            FreshnessError::Unavailable,
+            FreshnessError::InvalidResponse,
+        ] {
+            let provider = Arc::new(TestFreshnessProvider {
+                lease_seconds: Err(error),
+            });
+            let (engine, request) = production_engine_with_provider(provider);
+            let result = engine.evaluate(request);
+            assert!(matches!(
+                result,
+                Err(PraetoreError::FreshnessCheckFailed(actual)) if actual == error
+            ));
+            assert_eq!(result.unwrap_err().code(), error.code());
+        }
+
+        let expired_provider = Arc::new(TestFreshnessProvider {
+            lease_seconds: Ok(-1),
+        });
+        let (engine, request) = production_engine_with_provider(expired_provider);
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
+        ));
+    }
+
+    #[test]
+    fn production_profile_requires_freshness_provider() {
+        let issuer_key = AgentKeyPair::generate();
+        let policy = Policy::new("production", 1, vec![]);
+        let config = HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_replay_guard(test_replay_guard());
+        assert!(matches!(
+            AuthorizationEngine::production_with_clock(
+                policy,
+                config,
+                FixedClock::new("2026-06-01T12:00:00Z")
+            ),
+            Err(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::Unavailable
+            ))
         ));
     }
 

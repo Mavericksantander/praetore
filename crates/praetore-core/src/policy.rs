@@ -19,6 +19,7 @@ const MAX_CONDITIONS_PER_RULE: usize = 128;
 const MAX_POLICY_TEXT_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub id: String,
     pub version: u32,
@@ -161,6 +162,7 @@ impl Policy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRule {
     pub id: String,
     pub action_type: String,
@@ -311,6 +313,7 @@ impl PolicyRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyCondition {
     pub key: String,
     pub operator: MatchOperator,
@@ -595,6 +598,20 @@ mod tests {
     #[test]
     fn policy_import_rejects_duplicate_json_fields() {
         assert!(Policy::from_json(r#"{"policy_id":"a","policy_id":"b"}"#).is_err());
+    }
+
+    #[test]
+    fn policy_import_rejects_unknown_fields_and_versions() {
+        assert!(
+            Policy::from_json(
+                r#"{"id":"p","version":1,"canonical_version":1,"rules":[],"future":true}"#
+            )
+            .is_err()
+        );
+        assert!(
+            Policy::from_json(r#"{"id":"p","version":1,"canonical_version":2,"rules":[]}"#)
+                .is_err()
+        );
     }
 
     #[test]

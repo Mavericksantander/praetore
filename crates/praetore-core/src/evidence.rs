@@ -16,12 +16,14 @@ use crate::{
     },
     decision::{Decision, DecisionOutcome},
     identity::{AgentIdentity, VerifiedPublicKey},
+    key_rotation::KeyRotationProof,
 };
 
 const EVIDENCE_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V1\0";
 const ATTESTER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ATTESTER_KEY_V1\0ed25519\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub evidence_schema_version: u16,
     pub canonical_version: u8,
@@ -182,6 +184,42 @@ impl Evidence {
             agent_signature: self.agent_signature.clone(),
         }
         .verify_intent_signature()
+    }
+
+    pub fn verify_key_rotation(&self) -> crate::Result<KeyRotationProof> {
+        if !self.verify_integrity() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence integrity verification failed".into(),
+            ));
+        }
+        if self.action.action_type != "identity:rotate_key" {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence does not describe a key rotation action".into(),
+            ));
+        }
+        if self.decision.outcome != DecisionOutcome::Allow {
+            return Err(crate::PraetoreError::EvidenceError(
+                "key rotation was not authorized".into(),
+            ));
+        }
+        self.verify_agent_intent()?;
+        let proof_value = self
+            .action
+            .parameters
+            .get("key_rotation_proof")
+            .cloned()
+            .ok_or_else(|| {
+                crate::PraetoreError::EvidenceError("key rotation proof is missing".into())
+            })?;
+        let proof: KeyRotationProof = serde_json::from_value(proof_value).map_err(|_| {
+            crate::PraetoreError::EvidenceError("key rotation proof is invalid".into())
+        })?;
+        proof
+            .verify_new_key_possession(&self.agent, &self.authority, self.request_id)
+            .map_err(|_| {
+                crate::PraetoreError::EvidenceError("key rotation proof verification failed".into())
+            })?;
+        Ok(proof)
     }
 
     pub(crate) fn with_agent_signature(mut self, signature: Option<String>) -> crate::Result<Self> {
@@ -448,7 +486,7 @@ mod tests {
         action::Action,
         authority::Authority,
         decision::{Decision, DecisionContribution, DecisionOutcome},
-        identity::{AgentId, AgentIdentity},
+        identity::{AgentId, AgentIdentity, AgentKeyPair},
     };
     use serde_json::json;
 
@@ -635,11 +673,89 @@ mod tests {
     }
 
     #[test]
+    fn evidence_v1_matches_committed_trust_chain_golden_vector() {
+        let golden: Value =
+            serde_json::from_str(include_str!("../../../docs/golden/trust-chain-v1.json")).unwrap();
+        let agent_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let agent_id: AgentId =
+            serde_json::from_str("\"00000000-0000-0000-0000-000000000002\"").unwrap();
+        let agent = agent_key.identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "golden-issuer", vec!["data:read".into()])
+                .with_validity(crate::authority::Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2027-01-01T00:00:00Z".into()),
+                });
+        authority.id = serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"").unwrap();
+        authority
+            .sign_for_agent(&AgentKeyPair::from_secret_bytes(&[8; 32]), &agent)
+            .unwrap();
+        let action = Action::new("read_data", Some("dataset".into()), json!({}))
+            .unwrap()
+            .with_capability("data:read");
+        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        request.sign_intent(&agent_key).unwrap();
+        let mut evidence = request.attest(Decision::allow("golden allow")).unwrap();
+        evidence.evidence_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
+        evidence.context_hash = evidence.compute_context_hash().unwrap();
+
+        assert_eq!(
+            evidence.context_hash,
+            golden["evidence_context_hash"].as_str().unwrap()
+        );
+        assert_eq!(
+            evidence.to_json().unwrap(),
+            golden["evidence_json"].as_str().unwrap()
+        );
+        assert!(Evidence::from_json(golden["evidence_json"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
     fn evidence_import_rejects_duplicate_json_fields() {
         assert!(
             Evidence::from_json(r#"{"evidence_schema_version":1,"evidence_schema_version":1}"#)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn evidence_import_rejects_unknown_fields_and_versions() {
+        let evidence = test_evidence();
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+
+        document["future_field"] = json!(true);
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["agent"]["unexpected"] = json!("ignored fields are forbidden");
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["authority"]["unexpected"] = json!("ignored fields are forbidden");
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["action"]["unexpected"] = json!("ignored fields are forbidden");
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["decision"]["unexpected"] = json!("ignored fields are forbidden");
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["evidence_schema_version"] = json!(2);
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["canonical_version"] = json!(2);
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+    }
+
+    #[test]
+    fn evidence_import_rejects_oversized_documents() {
+        let oversized = format!("{{\"padding\":\"{}\"}}", "x".repeat(MAX_JSON_VALUE_BYTES));
+        assert!(Evidence::from_json(&oversized).is_err());
     }
 
     #[test]

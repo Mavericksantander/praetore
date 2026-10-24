@@ -11,7 +11,6 @@ use crate::{
 };
 
 const AUTHORITY_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_AUTHORITY_V1\0";
-const AGENT_KEY_HASH_DOMAIN: &[u8] = b"PRAETORE_AGENT_KEY_V1\0ed25519\0";
 const ISSUER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ISSUER_KEY_V1\0ed25519\0";
 const MAX_CAPABILITIES: usize = 256;
 const MAX_AUTHORITY_CONSTRAINTS: usize = 128;
@@ -37,6 +36,7 @@ impl Default for AuthorityId {
 /// Constraints are explicit data. They are not executable expressions.
 /// Evaluation belongs to the authorization layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityConstraint {
     pub key: String,
     pub value: String,
@@ -72,6 +72,7 @@ impl AuthorityConstraint {
 ///
 /// `None` means unbounded on that side.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Validity {
     pub not_before: Option<String>,
     pub not_after: Option<String>,
@@ -123,6 +124,7 @@ impl Validity {
 /// Authority answers "what may this identity potentially do?"
 /// Authorization answers "may it do this specific action now?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Authority {
     pub id: AuthorityId,
     pub subject: AgentId,
@@ -182,7 +184,7 @@ impl Authority {
             return Err(PraetoreError::AuthorityVerificationFailed);
         }
         agent.verified_public_key()?;
-        self.subject_key_hash = Some(agent_key_hash(agent));
+        self.subject_key_hash = Some(agent.key_fingerprint()?.to_hex());
         self.sign(issuer_key)
     }
 
@@ -203,7 +205,10 @@ impl Authority {
         agent
             .verified_public_key()
             .map_err(|_| PraetoreError::AuthorityVerificationFailed)?;
-        let expected_key_hash = agent_key_hash(agent);
+        let expected_key_hash = agent
+            .key_fingerprint()
+            .map_err(|_| PraetoreError::AuthorityVerificationFailed)?
+            .to_hex();
         if self.subject != agent.id
             || self.subject_key_hash.as_deref() != Some(expected_key_hash.as_str())
         {
@@ -356,13 +361,6 @@ impl Authority {
     }
 }
 
-fn agent_key_hash(agent: &AgentIdentity) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(AGENT_KEY_HASH_DOMAIN);
-    hasher.update(&agent.public_key);
-    hex::encode(hasher.finalize())
-}
-
 #[derive(Serialize)]
 struct AuthoritySigningPayload<'a> {
     canonical_version: u8,
@@ -428,6 +426,35 @@ mod tests {
     #[test]
     fn authority_json_parser_rejects_duplicate_fields() {
         assert!(Authority::from_json(r#"{"issuer":"one","issuer":"two"}"#).is_err());
+    }
+
+    #[test]
+    fn authority_signature_matches_v1_golden_vector() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/golden/trust-chain-v1.json")).unwrap();
+        let agent_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let agent_id: AgentId =
+            serde_json::from_str("\"00000000-0000-0000-0000-000000000002\"").unwrap();
+        let agent = agent_key.identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "golden-issuer", vec!["data:read".into()])
+                .with_validity(Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2027-01-01T00:00:00Z".into()),
+                });
+        authority.id = serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"").unwrap();
+        authority
+            .sign_for_agent(&AgentKeyPair::from_secret_bytes(&[8; 32]), &agent)
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(authority.canonical_signing_bytes().unwrap()).unwrap(),
+            golden["authority_signing_payload"].as_str().unwrap()
+        );
+        assert_eq!(
+            authority.signature.as_deref(),
+            golden["authority_signature_hex"].as_str()
+        );
     }
 
     #[test]

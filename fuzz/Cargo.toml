@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4"
 praetore-core = { path = "../crates/praetore-core" }
 serde_json = "1.0"
 time = "0.3"
+uuid = { version = "1.18", features = ["v4"] }
 
 [[bin]]
 name = "canonical_json"
@@ -45,6 +46,13 @@ bench = false
 [[bin]]
 name = "engine_evaluate_dev"
 path = "fuzz_targets/engine_evaluate_dev.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine_evaluate_high_assurance"
+path = "fuzz_targets/engine_evaluate_high_assurance.rs"
 test = false
 doc = false
 bench = false

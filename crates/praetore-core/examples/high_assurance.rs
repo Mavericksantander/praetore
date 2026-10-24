@@ -3,12 +3,15 @@ use praetore_core::{
     PolicyEffect, PolicyRule, Result, TrustedAuthorityIssuer,
     authority::Validity,
     engine::{AuthorizationEngine, FixedClock},
+    freshness::{FreshnessError, FreshnessLease, FreshnessProvider},
+    identity::AgentKeyFingerprint,
     replay::{ReplayGuard, ReplayGuardError},
 };
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
 };
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -26,6 +29,22 @@ impl ReplayGuard for ExampleReplayGuard {
         } else {
             Err(ReplayGuardError::AlreadyClaimed)
         }
+    }
+}
+
+struct ExampleFreshnessProvider;
+
+impl FreshnessProvider for ExampleFreshnessProvider {
+    fn check(
+        &self,
+        _agent: &AgentKeyFingerprint,
+        _authority_id: &praetore_core::authority::AuthorityId,
+        _policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> std::result::Result<FreshnessLease, FreshnessError> {
+        Ok(FreshnessLease {
+            valid_until: now + Duration::minutes(1),
+        })
     }
 }
 
@@ -69,7 +88,8 @@ fn main() -> Result<()> {
         .with_validity(validity)?;
     let config =
         praetore_core::HighAssuranceConfig::new(policy.digest()?, vec![issuer_pin], attester_key)?
-            .with_replay_guard(Arc::new(ExampleReplayGuard::default()));
+            .with_replay_guard(Arc::new(ExampleReplayGuard::default()))
+            .with_freshness_provider(Arc::new(ExampleFreshnessProvider));
     let engine = AuthorizationEngine::production_with_clock(
         policy,
         config,
