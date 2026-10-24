@@ -31,6 +31,8 @@ fn initialize_test_database() {
                  REVOKE ALL ON TABLE praetore.replay_claims FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.replay_claims FROM praetore_replay_test; \
                  GRANT USAGE ON SCHEMA praetore TO praetore_replay_test; \
+                 GRANT SELECT (agent_id, request_id) ON praetore.replay_claims \
+                     TO praetore_replay_test; \
                  GRANT INSERT (agent_id, request_id) ON praetore.replay_claims \
                      TO praetore_replay_test",
             )
