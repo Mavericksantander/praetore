@@ -251,6 +251,16 @@ impl Authority {
             .map_err(|_| PraetoreError::AuthorityVerificationFailed)
     }
 
+    /// Returns the SHA-256 digest of the canonical signed authority payload.
+    ///
+    /// The signature itself is excluded, while every field authenticated by
+    /// that signature—including subject binding, capabilities, constraints,
+    /// and validity—is included.
+    pub fn content_digest(&self) -> Result<String> {
+        let payload = self.canonical_signing_bytes()?;
+        Ok(hex::encode(Sha256::digest(payload)))
+    }
+
     fn canonical_signing_bytes(&self) -> Result<Vec<u8>> {
         let mut capabilities: Vec<_> = self.capabilities.iter().map(String::as_str).collect();
         capabilities.sort_unstable();

@@ -83,8 +83,10 @@ Trust boundaries are explicit:
 | Vulnerable dependency or unreproducible Rust resolution | Tampering, Elevation, Denial of Service | Committed workspace/fuzz lockfiles, `cargo audit --locked`, CI checks, CycloneDX SBOM artifact | Advisory data can lag; SBOM and lockfile do not prove source or build-host integrity |
 | Python/Rust behavior divergence | Tampering, Elevation | PyO3 binding delegates all verification to Rust; known-good/tampered fixtures test behavior in CI | Python is verify-only; the extension does not provide policy evaluation |
 | Replay-store rollback, race, or outage | Elevation, Denial of Service | HighAssurance requires an atomic caller-owned guard; engine tests cover duplicate and unavailable-store fail-closed paths | Core cannot ensure storage durability, cross-process atomicity, backup integrity, or that callers use the configured engine |
-| Stale or compromised freshness provider | Elevation, Denial of Service | HighAssurance requires provider success and an unexpired lease; tests cover current, revoked, unknown, expired, invalid, and unavailable results | Provider truthfulness, source freshness, and bypass prevention are caller responsibilities |
-| Evidence v1 extension or parser ambiguity | Tampering, Elevation | Strict unknown-field/version rejection for evidence and policy imports; canonical tests and goldens | Generic JSON values inside action parameters/context remain extensible; consumers must interpret only documented fields |
+| Stale or compromised freshness provider | Elevation, Denial of Service | HighAssurance binds freshness checks to the verified agent fingerprint, exact authority content digest, pinned policy digest, one clock snapshot, and a bounded lease; failures are veto-only | Provider truthfulness, source freshness, and bypass prevention are caller responsibilities |
+| Cross-gateway or stale request intent | Elevation, Replay | HighAssurance requires a signed v2 intent bound to configured audience, policy digest, and bounded issue/expiry window; replay guard claims request IDs once | Audience naming, trusted time, policy-pin distribution, and guard durability remain caller responsibilities |
+| Tool-gateway bypass or action substitution | Elevation | Deployment must ensure protected tools are reachable only through a gateway that constructs and executes the same normalized action it authorizes; see the [gateway integration pattern](tool-gateway-integration.md) | The core cannot prevent direct tool access, validate the real-world meaning of adapter parameters, or make external effects atomic with evaluation |
+| Evidence schema extension or parser ambiguity | Tampering, Elevation | V1 evidence bytes remain frozen; v2 metadata uses a separate schema and attestation domain; unknown-field/version rejection and canonical goldens | Generic JSON values inside action parameters/context remain extensible; consumers must interpret only documented fields |
 
 ## Guarantees and non-guarantees
 
@@ -92,13 +94,14 @@ Trust boundaries are explicit:
 |---|---|---|
 | Integrity | Canonical SHA-256 detects evidence changes against its stored hash | Hash is unkeyed; a writer can recompute it |
 | Authority authenticity | Strict profile validates an authority signature under a trusted issuer pin and binds it to the subject key | No certificate chain, discovery, revocation protocol, or implicit trust |
-| Request authenticity | Strict profile verifies an agent signature over the canonical intent; HighAssurance consumes request IDs once when the caller supplies a conforming guard | No proof the agent is benign, no guarantee against new signed IDs from a stolen key, and no atomicity between authorization and action execution |
+| Request authenticity | Strict verifies the v1 agent signature; HighAssurance verifies a v2 signature bound to audience, policy digest, and issue/expiry window, and consumes request IDs once when the caller supplies a conforming guard | No proof the agent is benign, no guarantee against new signed IDs from a stolen key, and no atomicity between authorization and action execution |
 | Evidence authenticity | When required, Ed25519 attester signature is verified offline against an external attester pin | No non-repudiation against compromised keys, host, or signing device |
 | Offline verifier | CLI validates evidence integrity, externally pinned attester signature, optional intent, and optional issuer signature/subject binding | It does not establish pin provenance or prove the evaluating host behaved honestly |
 | Determinism | Policy decision is a deterministic fold of validated input and one supplied clock snapshot | HighAssurance evaluation success additionally depends on replay-store state and availability; evidence IDs are not deterministic |
 | Availability | Bounded finite evaluation returns an explicit result or error | No availability/SLA, crash containment, memory isolation, or rate limiting |
 | Time validity | Exact inclusive RFC 3339 validity checks against configured time | No clock synchronization or automatic skew compensation |
-| Policy binding | Production profile rejects an engine policy whose canonical digest differs from the configured pin | Pin provisioning and anti-rollback storage remain outside the library |
+| Policy binding | HighAssurance rejects a policy or signed intent whose v2 canonical digest differs from the configured pin | Pin provisioning and anti-rollback storage remain outside the library |
+| Tool enforcement | No guarantee from the library; the caller must place an unavoidable gateway before each protected side effect | Bypass prevention, action-to-effect fidelity, and crash reconciliation belong to the deployment |
 
 ## Invariants and traceability
 
@@ -111,7 +114,7 @@ Trust boundaries are explicit:
 | Invalid signature cannot produce ALLOW | identity, authority and evidence verifiers | `generated_keypair_signatures_verify_only_for_matching_key_and_message`, `signed_authority_rejects_tampering_and_wrong_issuer`, strict invalid-intent tests | Forgery |
 | Authority time bounds are enforced | `Validity::is_active_at` | `validity_bounds_are_inclusive`, `authority_not_yet_valid_is_rejected`, expired authority and issuer-pin tests | Clock/rollback |
 | Policy pin equals evaluated policy | production engine construction/evaluation | `production_profile_rejects_policy_pin_mismatch` | Policy substitution |
-| HighAssurance consumes request IDs once and checks freshness | required `ReplayGuard` and `FreshnessProvider` before returning evidence | required-guard, duplicate-request, unavailable-store, and freshness status tests | Replay / stale freshness source |
+| HighAssurance consumes request IDs once and checks content-bound freshness | required `ReplayGuard`; `FreshnessProvider::check_authority` receives authority digest and bounded lease is recorded in v2 evidence | required-guard, duplicate-request, unavailable-store, current/revoked/unknown/expired/too-long freshness tests | Replay / stale freshness source |
 | Evidence mutation is detected | `Evidence::verify_integrity` | action/context/signature/policy digest mutation tests | Evidence tampering |
 | Deterministic ordering/encoding | canonical codec and ordered context | `policy_canonical_bytes_match_committed_golden_vector`, `policy_digest_matches_canonical_golden_value`, duplicate-key parser tests | Platform/input-order variance |
 | Work is bounded | request, authority and policy validators | maximum and over-limit tests | Resource exhaustion |

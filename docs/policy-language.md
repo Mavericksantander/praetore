@@ -19,16 +19,27 @@ an exact `action_type`, an effect, and optional match criteria:
 * `context_conditions`: conditions evaluated against the request's explicit
   context map.
 
-All conditions in a rule are ANDed. A missing key, wrong JSON type, or failed
-comparison means that rule does not match. An omitted criterion places no
-additional restriction on that field. Rules do not inherit values from one
-another.
+All conditions in a rule are ANDed. An omitted criterion places no additional
+restriction on that field. Rules do not inherit values from one another.
+Policies created with `Policy::new` or imported without an explicit
+`semantics_version` retain v1 matching for digest and signature compatibility:
+missing or type-incompatible values do not match any conditional rule.
+
+For new policies, use `Policy::new_v2`. In v2, a missing key or
+type-incompatible value is an **unknown condition**. Unknown conditions do not
+match an ALLOW rule, but they conservatively match DENY and REQUIRE_APPROVAL
+rules. A definitely false condition still prevents the rule from matching;
+conditions remain ANDed. This means a restrictive rule cannot silently stop
+applying just because a field is absent or arrives with an unexpected type.
+The semantics version is included in the policy document and digest. The
+HighAssurance constructor rejects v1 policy semantics; v1 policies remain
+available to Development and Strict for compatibility.
 
 ```rust
 use praetore_core::{Policy, PolicyCondition, PolicyEffect, PolicyRule};
 use serde_json::json;
 
-let policy = Policy::new(
+let policy = Policy::new_v2(
     "data-access",
     1,
     vec![
@@ -71,9 +82,9 @@ When constructing conditions directly, `PolicyCondition::new` accepts a
 
 Prefix matching is string-only. Membership compares JSON values exactly.
 Numeric comparisons require compatible number representations; incompatible
-types do not match. Non-finite numbers are not JSON values. The core does not
-coerce strings to numbers or otherwise normalize values to make a condition
-match.
+types are unknown in v2. Non-finite numbers are not JSON values. The core does
+not coerce strings to numbers or otherwise normalize values to make a
+condition match.
 
 ## Capabilities, actions, and authority
 
@@ -142,9 +153,11 @@ is reachable in the full system or that two rules are semantically
 consistent. Review rules as data during policy authoring and test important
 allow/deny cases explicitly.
 
-`Policy::digest` computes the v1 canonical JSON SHA-256 digest. Rule array
-order is preserved in the digest even though decision combination is
-order-independent; changing the document order therefore changes the policy
-digest and requires updating the external pin. See [canonical encoding and
-signatures](crypto-and-policy.md#canonical-encoding) and the committed
-[golden vectors](golden/trust-chain-v1.json).
+`Policy::digest` computes SHA-256 over canonical JSON. For a v1 policy, the
+omitted semantics field preserves the existing v1 canonical bytes and digest.
+For v2 policies, `semantics_version: 2` is included in the document and
+digest. Rule array order is preserved in the digest even though decision
+combination is order-independent; changing the document order therefore
+changes the policy digest and requires updating the external pin. See
+[canonical encoding and signatures](crypto-and-policy.md#canonical-encoding)
+and the committed [golden vectors](golden/trust-chain-v1.json).

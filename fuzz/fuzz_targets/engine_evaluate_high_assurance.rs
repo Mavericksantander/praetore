@@ -8,7 +8,7 @@ use praetore_core::{
     EvidenceAttesterKey, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
     Policy, PolicyEffect, PolicyRule, ReplayGuard, ReplayGuardError, TrustedAuthorityIssuer,
     authority::Validity,
-    engine::{AuthorizationEngine, FixedClock},
+    engine::{AuthorizationEngine, Clock, FixedClock},
 };
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
@@ -40,6 +40,20 @@ impl FreshnessProvider for FuzzFreshnessProvider {
             valid_until: now + Duration::minutes(1),
         })
     }
+
+    fn check_authority(
+        &self,
+        agent: &AgentKeyFingerprint,
+        authority_id: &praetore_core::authority::AuthorityId,
+        authority_digest: &str,
+        policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> std::result::Result<FreshnessLease, FreshnessError> {
+        if authority_digest.len() != 64 {
+            return Err(FreshnessError::InvalidResponse);
+        }
+        self.check(agent, authority_id, policy_digest, now)
+    }
 }
 
 struct Fixture {
@@ -47,6 +61,7 @@ struct Fixture {
     agent_key: AgentKeyPair,
     agent: praetore_core::AgentIdentity,
     authority: Authority,
+    policy_digest: String,
 }
 
 fn fixture() -> &'static Fixture {
@@ -64,7 +79,7 @@ fn fixture() -> &'static Fixture {
                 .with_validity(validity.clone());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
 
-        let policy = Policy::new(
+        let policy = Policy::new_v2(
             "fuzz-high-assurance",
             1,
             vec![PolicyRule::new(
@@ -77,8 +92,9 @@ fn fixture() -> &'static Fixture {
             .unwrap()
             .with_validity(validity)
             .unwrap();
+        let policy_digest = policy.digest().unwrap();
         let config = HighAssuranceConfig::new(
-            policy.digest().unwrap(),
+            policy_digest.clone(),
             vec![issuer_pin],
             EvidenceAttesterKey::from_secret_bytes(&[33; 32]),
         )
@@ -97,6 +113,7 @@ fn fixture() -> &'static Fixture {
             agent_key,
             agent,
             authority,
+            policy_digest,
         }
     })
 }
@@ -124,7 +141,17 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     request.request_id = Uuid::from_bytes(id_bytes);
-    if request.sign_intent(&fixture.agent_key).is_ok() {
+    let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+    if request
+        .sign_intent_v2(
+            &fixture.agent_key,
+            "fuzz-gateway",
+            now,
+            now + Duration::minutes(1),
+            fixture.policy_digest.clone(),
+        )
+        .is_ok()
+    {
         let _ = fixture.engine.evaluate(request);
     }
 });

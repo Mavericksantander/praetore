@@ -13,10 +13,9 @@ approved by named technical and operational owners.
   the guard is missing, unavailable, or reports a duplicate request.
 - [x] Unit tests cover replay guard requirement, concurrent duplicate
   evaluation, and storage-unavailable failure behavior.
-- [x] One scoped independent source review of the trust/evaluation path,
-  replay-guard implementation, and verifier reported no concrete
-  vulnerabilities. This is not a penetration test, certification, or review of
-  a deployment-specific adapter.
+- [ ] Independent review of the current candidate after the versioned
+  HighAssurance security remediation. Earlier reviews are not release signoff
+  and did not cover the current candidate or deployment-specific adapters.
 - [x] Optional PostgreSQL adapter uses an atomic primary-key claim, requests
   synchronous primary WAL commit, and includes disposable-service concurrency
   and persistence integration tests.
@@ -41,7 +40,10 @@ For each target deployment, retain evidence for every applicable item:
 3. **Execution boundary:** prove that the protected action is performed only
    after the intended authorization result, and define recovery for a process
    crash between claim, result delivery, and action execution. PRÆTORE does not
-   make authorization and application side effects atomic.
+   make authorization and application side effects atomic. Use the
+   [tool gateway integration pattern](tool-gateway-integration.md) as a
+   baseline for bypass controls, action binding, journaling, and crash
+   reconciliation; validate it against the actual downstream tool semantics.
 4. **Time and validity:** monitored trusted time, measured skew, alerting and
    fail-closed behavior when clock health is lost. The library adds no skew
    tolerance and cannot identify a manipulated host clock.

@@ -5,12 +5,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
     action::Action,
     authority::Authority,
-    authorization::AuthorizationRequest,
+    authorization::{AuthorizationIntentV2, AuthorizationRequest},
     canonical::{
         MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
     },
@@ -20,6 +21,7 @@ use crate::{
 };
 
 const EVIDENCE_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V1\0";
+const EVIDENCE_V2_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V2\0";
 const ATTESTER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ATTESTER_KEY_V1\0ed25519\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,18 @@ pub struct Evidence {
     pub attester_algorithm: Option<String>,
     pub attester_signature: Option<String>,
     pub context_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_v2: Option<AuthorizationIntentV2>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness_valid_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantics_version: Option<u8>,
 }
 
 pub struct EvidenceAttesterKey {
@@ -144,6 +158,12 @@ impl Evidence {
             attester_algorithm: None,
             attester_signature: None,
             context_hash: String::new(),
+            intent_v2: None,
+            decided_at: None,
+            evaluation_mode: None,
+            freshness_valid_until: None,
+            authority_digest: None,
+            semantics_version: None,
         };
         evidence.context_hash = evidence.compute_context_hash().ok_or_else(|| {
             crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
@@ -161,8 +181,10 @@ impl Evidence {
     /// recorded SHA-256 context hash. It does not authenticate the issuer
     /// cryptographically and does not provide non-repudiation.
     pub fn verify_integrity(&self) -> bool {
-        if self.evidence_schema_version != 1
+        if !matches!(self.evidence_schema_version, 1 | 2)
             || self.canonical_version != crate::canonical::CANONICAL_VERSION
+            || (self.evidence_schema_version == 1 && self.has_v2_fields())
+            || (self.evidence_schema_version == 2 && !self.has_complete_v2_fields())
         {
             return false;
         }
@@ -188,6 +210,7 @@ impl Evidence {
             trace_id: self.trace_id.clone(),
             context: self.context.clone(),
             agent_signature: self.agent_signature.clone(),
+            intent_v2: self.intent_v2.clone(),
         }
         .verify_intent_signature()
     }
@@ -236,6 +259,43 @@ impl Evidence {
         Ok(self)
     }
 
+    pub(crate) fn with_intent_v2(
+        mut self,
+        intent_v2: Option<AuthorizationIntentV2>,
+    ) -> crate::Result<Self> {
+        self.intent_v2 = intent_v2;
+        self.context_hash = self.compute_context_hash().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
+        })?;
+        Ok(self)
+    }
+
+    pub(crate) fn bind_high_assurance_metadata(
+        &mut self,
+        decided_at: String,
+        freshness_valid_until: String,
+        authority_digest: String,
+    ) -> crate::Result<()> {
+        if self.intent_v2.is_none()
+            || self.policy_digest.is_none()
+            || !Self::is_sha256_hex(&authority_digest)
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "HighAssurance evidence metadata is incomplete".into(),
+            ));
+        }
+        self.evidence_schema_version = 2;
+        self.decided_at = Some(decided_at);
+        self.evaluation_mode = Some("high_assurance".into());
+        self.freshness_valid_until = Some(freshness_valid_until);
+        self.authority_digest = Some(authority_digest);
+        self.semantics_version = Some(2);
+        self.context_hash = self.compute_context_hash().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
+        })?;
+        Ok(())
+    }
+
     pub fn sign(&mut self, attester: &EvidenceAttesterKey) -> crate::Result<()> {
         if !self.verify_integrity() {
             return Err(crate::PraetoreError::EvidenceError(
@@ -250,8 +310,9 @@ impl Evidence {
             crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
         })?;
         let payload = self.attestation_bytes()?;
-        let mut message = Vec::with_capacity(EVIDENCE_SIGNATURE_DOMAIN.len() + payload.len());
-        message.extend_from_slice(EVIDENCE_SIGNATURE_DOMAIN);
+        let domain = self.attestation_domain();
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
         message.extend_from_slice(&payload);
         self.attester_signature = Some(hex::encode(attester.signing_key.sign(&message).to_bytes()));
         Ok(())
@@ -279,8 +340,9 @@ impl Evidence {
         let signature = Signature::from_slice(&signature)
             .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)?;
         let payload = self.attestation_bytes()?;
-        let mut message = Vec::with_capacity(EVIDENCE_SIGNATURE_DOMAIN.len() + payload.len());
-        message.extend_from_slice(EVIDENCE_SIGNATURE_DOMAIN);
+        let domain = self.attestation_domain();
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
         message.extend_from_slice(&payload);
         trusted_key
             .as_verifying_key()
@@ -317,6 +379,15 @@ impl Evidence {
                 "evidence integrity verification failed".into(),
             ));
         }
+        if evidence.evidence_schema_version == 2
+            && (evidence.attester_signature.is_none()
+                || evidence.attester_key_id.is_none()
+                || evidence.attester_algorithm.as_deref() != Some("ed25519"))
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "v2 evidence requires an attester signature".into(),
+            ));
+        }
         Ok(evidence)
     }
 
@@ -351,6 +422,12 @@ impl Evidence {
             policy_digest: &self.policy_digest,
             attester_key_id: &self.attester_key_id,
             attester_algorithm: &self.attester_algorithm,
+            intent_v2: &self.intent_v2,
+            decided_at: &self.decided_at,
+            evaluation_mode: &self.evaluation_mode,
+            freshness_valid_until: &self.freshness_valid_until,
+            authority_digest: &self.authority_digest,
+            semantics_version: &self.semantics_version,
         };
 
         Self::compute_payload_hash(&payload)
@@ -416,10 +493,53 @@ impl Evidence {
                 .policy_digest
                 .as_deref()
                 .is_some_and(|value| value.len() != 64)
+            || self
+                .authority_digest
+                .as_deref()
+                .is_some_and(|value| !Self::is_sha256_hex(value))
         {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence cryptographic metadata is malformed".into(),
             ));
+        }
+        if self.evidence_schema_version == 2 {
+            let intent = self.intent_v2.as_ref().ok_or_else(|| {
+                crate::PraetoreError::EvidenceError("v2 intent metadata is missing".into())
+            })?;
+            crate::authorization::validate_intent_v2(intent)?;
+            let decided_at = self
+                .decided_at
+                .as_deref()
+                .and_then(parse_canonical_timestamp);
+            let freshness_valid_until = self
+                .freshness_valid_until
+                .as_deref()
+                .and_then(parse_canonical_timestamp);
+            let issued_at = OffsetDateTime::parse(&intent.issued_at, &Rfc3339).map_err(|_| {
+                crate::PraetoreError::EvidenceError("v2 intent timestamp is invalid".into())
+            })?;
+            let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339).map_err(|_| {
+                crate::PraetoreError::EvidenceError("v2 intent timestamp is invalid".into())
+            })?;
+            let policy_digest = self.policy_digest.as_deref();
+            let authority_digest = self.authority_digest.as_deref();
+            let expected_authority_digest = self.authority.content_digest()?;
+            if decided_at.is_none()
+                || freshness_valid_until.is_none()
+                || policy_digest.is_none_or(|value| !Self::is_sha256_hex(value))
+                || policy_digest != Some(intent.policy_digest.as_str())
+                || authority_digest != Some(expected_authority_digest.as_str())
+                || self.evaluation_mode.as_deref() != Some("high_assurance")
+                || self.semantics_version != Some(2)
+                || decided_at.is_some_and(|value| value < issued_at || value > expires_at)
+                || decided_at
+                    .zip(freshness_valid_until)
+                    .is_some_and(|(decided_at, valid_until)| valid_until < decided_at)
+            {
+                return Err(crate::PraetoreError::EvidenceError(
+                    "v2 evidence metadata is invalid or inconsistent".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -447,6 +567,12 @@ impl Evidence {
                 policy_digest: &self.policy_digest,
                 attester_key_id: &self.attester_key_id,
                 attester_algorithm: &self.attester_algorithm,
+                intent_v2: &self.intent_v2,
+                decided_at: &self.decided_at,
+                evaluation_mode: &self.evaluation_mode,
+                freshness_valid_until: &self.freshness_valid_until,
+                authority_digest: &self.authority_digest,
+                semantics_version: &self.semantics_version,
             },
             evidence_id: &self.evidence_id,
             context_hash: &self.context_hash,
@@ -454,10 +580,56 @@ impl Evidence {
         .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))
     }
 
+    fn has_v2_fields(&self) -> bool {
+        self.intent_v2.is_some()
+            || self.decided_at.is_some()
+            || self.evaluation_mode.is_some()
+            || self.freshness_valid_until.is_some()
+            || self.authority_digest.is_some()
+            || self.semantics_version.is_some()
+    }
+
+    fn has_complete_v2_fields(&self) -> bool {
+        self.intent_v2.is_some()
+            && self.decided_at.is_some()
+            && self.evaluation_mode.as_deref() == Some("high_assurance")
+            && self.freshness_valid_until.is_some()
+            && self
+                .authority_digest
+                .as_deref()
+                .is_some_and(Self::is_sha256_hex)
+            && self.semantics_version == Some(2)
+            && self.policy_digest.is_some()
+            && self.agent_signature.is_some()
+    }
+
+    fn attestation_domain(&self) -> &'static [u8] {
+        if self.evidence_schema_version == 2 {
+            EVIDENCE_V2_SIGNATURE_DOMAIN
+        } else {
+            EVIDENCE_SIGNATURE_DOMAIN
+        }
+    }
+
     fn compute_payload_hash(payload: &EvidenceIntegrityPayload<'_>) -> Option<String> {
         let serialized = canonical_json(payload).ok()?;
         Some(hex::encode(Sha256::digest(serialized)))
     }
+
+    fn is_sha256_hex(value: &str) -> bool {
+        value.len() == 64
+            && hex::decode(value)
+                .is_ok_and(|decoded| decoded.len() == 32 && hex::encode(decoded) == value)
+    }
+}
+
+fn parse_canonical_timestamp(value: &str) -> Option<OffsetDateTime> {
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339).ok()?;
+    let canonical = timestamp
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .ok()?;
+    (canonical == value).then_some(timestamp)
 }
 
 #[derive(Serialize)]
@@ -476,6 +648,18 @@ struct EvidenceIntegrityPayload<'a> {
     policy_digest: &'a Option<String>,
     attester_key_id: &'a Option<String>,
     attester_algorithm: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent_v2: &'a Option<AuthorizationIntentV2>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decided_at: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evaluation_mode: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    freshness_valid_until: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority_digest: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    semantics_version: &'a Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -675,6 +859,61 @@ mod tests {
             restored
                 .verify_attester_signature(&attester.public_key().unwrap())
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn evidence_v2_attestation_detects_rehashed_payload_tampering() {
+        let agent_key = AgentKeyPair::from_secret_bytes(&[21; 32]);
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::from_secret_bytes(&[22; 32]);
+        let mut authority = Authority::new(agent.id.clone(), "v2-issuer", vec!["data:read".into()])
+            .with_validity(crate::authority::Validity {
+                not_before: Some("2026-01-01T00:00:00Z".into()),
+                not_after: Some("2027-01-01T00:00:00Z".into()),
+            });
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let now = OffsetDateTime::parse("2026-06-01T12:00:00Z", &Rfc3339).unwrap();
+        let policy_digest = "a".repeat(64);
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + time::Duration::minutes(1),
+                policy_digest.clone(),
+            )
+            .unwrap();
+        let mut evidence = request.attest(Decision::allow("v2 allow")).unwrap();
+        evidence.bind_policy_digest(policy_digest).unwrap();
+        evidence
+            .bind_high_assurance_metadata(
+                "2026-06-01T12:00:00Z".into(),
+                "2026-06-01T12:01:00Z".into(),
+                evidence.authority.content_digest().unwrap(),
+            )
+            .unwrap();
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[23; 32]);
+        evidence.sign(&attester).unwrap();
+        let pinned_attester = attester.public_key().unwrap();
+
+        assert_eq!(evidence.evidence_schema_version, 2);
+        assert!(evidence.verify_integrity());
+        assert!(evidence.verify_attester_signature(&pinned_attester).is_ok());
+        assert!(Evidence::from_json(&evidence.to_json().unwrap()).is_ok());
+        let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        document["future_field"] = json!(true);
+        assert!(Evidence::from_json(&document.to_string()).is_err());
+
+        evidence.decision = Decision::deny("tampered decision");
+        evidence.context_hash = evidence.compute_context_hash().unwrap();
+
+        assert!(evidence.verify_integrity());
+        assert!(
+            evidence
+                .verify_attester_signature(&pinned_attester)
+                .is_err()
         );
     }
 

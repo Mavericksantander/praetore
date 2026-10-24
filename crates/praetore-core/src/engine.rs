@@ -14,7 +14,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
@@ -160,9 +160,20 @@ fn issuer_key_id(public_key: &VerifiedPublicKey) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn format_timestamp(timestamp: OffsetDateTime) -> Result<String> {
+    timestamp
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| PraetoreError::InvalidRequest("invalid evaluation timestamp".into()))
+}
+
 #[derive(Clone)]
 pub struct HighAssuranceConfig {
     policy_digest: String,
+    audience: Option<String>,
+    max_intent_lifetime: Duration,
+    max_authority_lifetime: Duration,
+    max_freshness_lease: Duration,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     evidence_attester: EvidenceAttesterKey,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
@@ -173,6 +184,10 @@ impl std::fmt::Debug for HighAssuranceConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HighAssuranceConfig")
             .field("policy_digest", &self.policy_digest)
+            .field("audience", &self.audience)
+            .field("max_intent_lifetime", &self.max_intent_lifetime)
+            .field("max_authority_lifetime", &self.max_authority_lifetime)
+            .field("max_freshness_lease", &self.max_freshness_lease)
             .field("trusted_issuers", &self.trusted_issuers)
             .field("evidence_attester", &self.evidence_attester)
             .field("replay_guard_configured", &self.replay_guard.is_some())
@@ -215,11 +230,35 @@ impl HighAssuranceConfig {
 
         Ok(Self {
             policy_digest,
+            audience: None,
+            max_intent_lifetime: Duration::minutes(5),
+            max_authority_lifetime: Duration::days(365),
+            max_freshness_lease: Duration::minutes(1),
             trusted_issuers,
             evidence_attester,
             replay_guard: None,
             freshness_provider: None,
         })
+    }
+
+    pub fn with_audience(mut self, audience: impl Into<String>) -> Self {
+        self.audience = Some(audience.into());
+        self
+    }
+
+    pub fn with_max_intent_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_intent_lifetime = lifetime;
+        self
+    }
+
+    pub fn with_max_authority_lifetime(mut self, lifetime: Duration) -> Self {
+        self.max_authority_lifetime = lifetime;
+        self
+    }
+
+    pub fn with_max_freshness_lease(mut self, lifetime: Duration) -> Self {
+        self.max_freshness_lease = lifetime;
+        self
     }
 
     pub fn with_replay_guard(mut self, replay_guard: Arc<dyn ReplayGuard>) -> Self {
@@ -292,6 +331,10 @@ pub struct AuthorizationEngine {
     mode: EvaluationMode,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     expected_policy_digest: Option<String>,
+    audience: Option<String>,
+    max_intent_lifetime: Duration,
+    max_authority_lifetime: Duration,
+    max_freshness_lease: Duration,
     evidence_attester: Option<Arc<EvidenceAttesterKey>>,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
     freshness_provider: Option<Arc<dyn FreshnessProvider>>,
@@ -327,6 +370,10 @@ impl AuthorizationEngine {
             mode: EvaluationMode::Development,
             trusted_issuers: Vec::new(),
             expected_policy_digest: None,
+            audience: None,
+            max_intent_lifetime: Duration::ZERO,
+            max_authority_lifetime: Duration::ZERO,
+            max_freshness_lease: Duration::ZERO,
             evidence_attester: None,
             replay_guard: None,
             freshness_provider: None,
@@ -351,6 +398,10 @@ impl AuthorizationEngine {
             mode: EvaluationMode::Development,
             trusted_issuers: Vec::new(),
             expected_policy_digest: None,
+            audience: None,
+            max_intent_lifetime: Duration::ZERO,
+            max_authority_lifetime: Duration::ZERO,
+            max_freshness_lease: Duration::ZERO,
             evidence_attester: None,
             replay_guard: None,
             freshness_provider: None,
@@ -378,6 +429,10 @@ impl AuthorizationEngine {
             mode: EvaluationMode::Strict,
             trusted_issuers,
             expected_policy_digest: None,
+            audience: None,
+            max_intent_lifetime: Duration::ZERO,
+            max_authority_lifetime: Duration::ZERO,
+            max_freshness_lease: Duration::ZERO,
             evidence_attester: None,
             replay_guard: None,
             freshness_provider: None,
@@ -403,6 +458,9 @@ impl AuthorizationEngine {
         config: HighAssuranceConfig,
         clock: impl Clock + 'static,
     ) -> Result<Self> {
+        if policy.semantics_version != 2 {
+            return Err(PraetoreError::PolicyIntegrityFailed);
+        }
         let actual_digest = policy.digest()?;
         if actual_digest != config.policy_digest {
             return Err(PraetoreError::PolicyIntegrityFailed);
@@ -415,6 +473,16 @@ impl AuthorizationEngine {
                 FreshnessError::Unavailable,
             ));
         }
+        if config.audience.as_deref().is_none_or(|audience| {
+            audience.trim().is_empty() || audience != audience.trim() || audience.len() > 256
+        }) || config.max_intent_lifetime <= Duration::ZERO
+            || config.max_authority_lifetime <= Duration::ZERO
+            || config.max_freshness_lease <= Duration::ZERO
+        {
+            return Err(PraetoreError::InvalidRequest(
+                "HighAssurance requires a canonical audience and positive lifetime limits".into(),
+            ));
+        }
 
         let engine = Self {
             policy,
@@ -422,6 +490,10 @@ impl AuthorizationEngine {
             mode: EvaluationMode::HighAssurance,
             trusted_issuers: config.trusted_issuers,
             expected_policy_digest: Some(config.policy_digest),
+            audience: config.audience,
+            max_intent_lifetime: config.max_intent_lifetime,
+            max_authority_lifetime: config.max_authority_lifetime,
+            max_freshness_lease: config.max_freshness_lease,
             evidence_attester: Some(Arc::new(config.evidence_attester)),
             replay_guard: config.replay_guard,
             freshness_provider: config.freshness_provider,
@@ -433,9 +505,21 @@ impl AuthorizationEngine {
     fn validate_production_configuration(&self, now: OffsetDateTime) -> Result<()> {
         let digest = self.policy.digest()?;
         if self.expected_policy_digest.as_deref() != Some(digest.as_str())
+            || self.policy.semantics_version != 2
             || self.trusted_issuers.is_empty()
             || self.evidence_attester.is_none()
             || self.freshness_provider.is_none()
+            || self
+                .audience
+                .as_deref()
+                .is_none_or(|audience| audience.trim().is_empty() || audience != audience.trim())
+            || self.max_intent_lifetime <= Duration::ZERO
+            || self.max_authority_lifetime <= Duration::ZERO
+            || self.max_freshness_lease <= Duration::ZERO
+            || self.audience.as_deref().is_none_or(str::is_empty)
+            || self.max_intent_lifetime <= Duration::ZERO
+            || self.max_authority_lifetime <= Duration::ZERO
+            || self.max_freshness_lease <= Duration::ZERO
             || self
                 .trusted_issuers
                 .iter()
@@ -470,21 +554,34 @@ impl AuthorizationEngine {
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
         let now = self.clock.now();
+        if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
+            return Err(PraetoreError::InvalidRequest(
+                "v2 intents are accepted only by the HighAssurance profile".into(),
+            ));
+        }
         let replay_key = (*request.agent.id.as_uuid(), request.request_id);
+        let (intent_v2, authority_digest) = if self.mode == EvaluationMode::HighAssurance {
+            self.validate_high_assurance_request(&request, now)?
+        } else {
+            (None, None)
+        };
         if self.mode == EvaluationMode::HighAssurance {
             self.validate_production_configuration(now)?;
         }
         let decision = self.evaluate_request(&request, now)?;
-        if self.mode == EvaluationMode::HighAssurance {
+        let freshness = if self.mode == EvaluationMode::HighAssurance {
             let freshness = self
                 .freshness_provider
                 .as_ref()
                 .ok_or(PraetoreError::FreshnessCheckFailed(
                     FreshnessError::Unavailable,
                 ))?
-                .check(
+                .check_authority(
                     &request.agent.key_fingerprint()?,
                     &request.authority.id,
+                    authority_digest
+                        .as_deref()
+                        .ok_or(PraetoreError::PolicyIntegrityFailed)?,
                     self.expected_policy_digest
                         .as_deref()
                         .ok_or(PraetoreError::PolicyIntegrityFailed)?,
@@ -494,9 +591,33 @@ impl AuthorizationEngine {
             if freshness.valid_until < now {
                 return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired));
             }
-        }
+            if freshness.valid_until > now + self.max_freshness_lease {
+                return Err(PraetoreError::FreshnessCheckFailed(
+                    FreshnessError::LeaseTooLong,
+                ));
+            }
+            Some(freshness)
+        } else {
+            None
+        };
         let mut evidence = request.attest(decision)?;
         evidence.bind_policy_digest(self.policy.digest()?)?;
+        if self.mode == EvaluationMode::HighAssurance {
+            let intent = intent_v2.ok_or(PraetoreError::IntentInvalid)?;
+            let lease = freshness.ok_or(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::Unavailable,
+            ))?;
+            evidence.bind_high_assurance_metadata(
+                format_timestamp(now)?,
+                format_timestamp(lease.valid_until)?,
+                authority_digest.ok_or(PraetoreError::PolicyIntegrityFailed)?,
+            )?;
+            if evidence.intent_v2.as_ref() != Some(&intent) {
+                return Err(PraetoreError::EvidenceError(
+                    "evidence intent binding changed during evaluation".into(),
+                ));
+            }
+        }
         if let Some(attester) = &self.evidence_attester {
             evidence.sign(attester)?;
         }
@@ -511,6 +632,73 @@ impl AuthorizationEngine {
                 })?;
         }
         Ok(evidence)
+    }
+
+    fn validate_high_assurance_request(
+        &self,
+        request: &AuthorizationRequest,
+        now: OffsetDateTime,
+    ) -> Result<(
+        Option<crate::authorization::AuthorizationIntentV2>,
+        Option<String>,
+    )> {
+        let intent = request
+            .intent_v2
+            .as_ref()
+            .ok_or(PraetoreError::IntentInvalid)?;
+        let expected_audience = self
+            .audience
+            .as_deref()
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        if intent.audience != expected_audience
+            || self.expected_policy_digest.as_deref() != Some(intent.policy_digest.as_str())
+        {
+            return Err(PraetoreError::IntentInvalid);
+        }
+
+        let issued_at = OffsetDateTime::parse(&intent.issued_at, &Rfc3339)
+            .map_err(|_| PraetoreError::IntentInvalid)?;
+        let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
+            .map_err(|_| PraetoreError::IntentInvalid)?;
+        if issued_at > now || expires_at < now || expires_at - issued_at > self.max_intent_lifetime
+        {
+            return Err(PraetoreError::IntentInvalid);
+        }
+
+        let not_before = request
+            .authority
+            .validity
+            .not_before
+            .as_deref()
+            .ok_or_else(|| {
+                PraetoreError::InvalidRequest(
+                    "HighAssurance requires bounded authority validity".into(),
+                )
+            })?;
+        let not_after = request
+            .authority
+            .validity
+            .not_after
+            .as_deref()
+            .ok_or_else(|| {
+                PraetoreError::InvalidRequest(
+                    "HighAssurance requires bounded authority validity".into(),
+                )
+            })?;
+        let authority_start = OffsetDateTime::parse(not_before, &Rfc3339)
+            .map_err(|_| PraetoreError::InvalidRequest("authority validity is invalid".into()))?;
+        let authority_end = OffsetDateTime::parse(not_after, &Rfc3339)
+            .map_err(|_| PraetoreError::InvalidRequest("authority validity is invalid".into()))?;
+        if authority_end - authority_start > self.max_authority_lifetime {
+            return Err(PraetoreError::InvalidRequest(
+                "authority lifetime exceeds HighAssurance maximum".into(),
+            ));
+        }
+
+        Ok((
+            Some(intent.clone()),
+            Some(request.authority.content_digest()?),
+        ))
     }
 
     fn evaluate_request(
@@ -680,6 +868,20 @@ mod tests {
                 valid_until: now + time::Duration::seconds(seconds),
             })
         }
+
+        fn check_authority(
+            &self,
+            agent: &crate::identity::AgentKeyFingerprint,
+            authority_id: &crate::authority::AuthorityId,
+            authority_digest: &str,
+            policy_digest: &str,
+            now: OffsetDateTime,
+        ) -> std::result::Result<FreshnessLease, FreshnessError> {
+            if authority_digest.len() != 64 {
+                return Err(FreshnessError::InvalidResponse);
+            }
+            self.check(agent, authority_id, policy_digest, now)
+        }
     }
 
     fn test_freshness_provider() -> Arc<dyn FreshnessProvider> {
@@ -689,7 +891,9 @@ mod tests {
     }
 
     fn add_test_freshness(config: HighAssuranceConfig) -> HighAssuranceConfig {
-        config.with_freshness_provider(test_freshness_provider())
+        config
+            .with_audience("test-gateway")
+            .with_freshness_provider(test_freshness_provider())
     }
 
     fn production_engine_with_provider(
@@ -703,14 +907,25 @@ mod tests {
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
                 .with_validity(high_assurance_validity());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let policy_digest = policy.digest().unwrap();
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
         let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
-        request.sign_intent(&agent_key).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + time::Duration::minutes(1),
+                policy_digest.clone(),
+            )
+            .unwrap();
         let config = HighAssuranceConfig::new(
-            policy.digest().unwrap(),
+            policy_digest,
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
             EvidenceAttesterKey::generate(),
         )
         .unwrap()
+        .with_audience("test-gateway")
         .with_replay_guard(test_replay_guard())
         .with_freshness_provider(provider);
         let engine = AuthorizationEngine::production_with_clock(
@@ -749,7 +964,7 @@ mod tests {
     }
 
     fn allow_policy() -> Policy {
-        Policy::new(
+        Policy::new_v2(
             "test-policy",
             1,
             vec![PolicyRule::new(
@@ -1345,12 +1560,7 @@ mod tests {
             Authority::new(agent.id.clone(), "praetore-root", vec!["data:read".into()])
                 .with_validity(high_assurance_validity());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request =
-            AuthorizationRequest::new(agent, authority, test_action().with_capability("data:read"))
-                .unwrap();
-        request.sign_intent(&agent_key).unwrap();
-
-        let policy = Policy::new(
+        let policy = Policy::new_v2(
             "production-read",
             1,
             vec![
@@ -1362,6 +1572,19 @@ mod tests {
                 .with_capability("data:read"),
             ],
         );
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, test_action().with_capability("data:read"))
+                .unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + Duration::minutes(1),
+                policy.digest().unwrap(),
+            )
+            .unwrap();
         let attester = EvidenceAttesterKey::generate();
         let attester_public_key = attester.public_key().unwrap();
         let replay_guard = test_replay_guard();
@@ -1371,6 +1594,7 @@ mod tests {
             attester,
         )
         .unwrap()
+        .with_audience("test-gateway")
         .with_replay_guard(replay_guard);
         let config = add_test_freshness(config);
         let engine = AuthorizationEngine::production_with_clock(
@@ -1408,6 +1632,12 @@ mod tests {
         assert_eq!(engine.mode(), EvaluationMode::HighAssurance);
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
         assert!(evidence.verify_integrity());
+        assert_eq!(evidence.evidence_schema_version, 2);
+        assert_eq!(evidence.evaluation_mode.as_deref(), Some("high_assurance"));
+        assert_eq!(
+            evidence.authority_digest.as_deref(),
+            Some(evidence.authority.content_digest().unwrap().as_str())
+        );
         assert!(evidence.verify_agent_intent().is_ok());
         assert!(
             evidence
@@ -1420,8 +1650,8 @@ mod tests {
     fn production_profile_rejects_policy_pin_mismatch() {
         let issuer_key = AgentKeyPair::generate();
         let attester = EvidenceAttesterKey::generate();
-        let expected_policy = Policy::new("expected", 1, vec![]);
-        let actual_policy = Policy::new("substituted", 1, vec![]);
+        let expected_policy = Policy::new_v2("expected", 1, vec![]);
+        let actual_policy = Policy::new_v2("substituted", 1, vec![]);
         let config = HighAssuranceConfig::new(
             expected_policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
@@ -1442,9 +1672,32 @@ mod tests {
     }
 
     #[test]
+    fn production_profile_rejects_legacy_policy_semantics() {
+        let issuer_key = AgentKeyPair::generate();
+        let policy = Policy::new("legacy-policy", 1, vec![]);
+        let config = HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_replay_guard(test_replay_guard());
+        let config = add_test_freshness(config);
+
+        assert!(matches!(
+            AuthorizationEngine::production_with_clock(
+                policy,
+                config,
+                FixedClock::new("2026-06-01T12:00:00Z")
+            ),
+            Err(PraetoreError::PolicyIntegrityFailed)
+        ));
+    }
+
+    #[test]
     fn production_profile_rejects_expired_issuer_pin() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new("production", 1, vec![]);
+        let policy = Policy::new_v2("production", 1, vec![]);
         let pin = production_test_pin(
             &issuer_key,
             Validity {
@@ -1474,7 +1727,7 @@ mod tests {
     #[test]
     fn production_profile_requires_replay_guard() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new("production", 1, vec![]);
+        let policy = Policy::new_v2("production", 1, vec![]);
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
@@ -1501,16 +1754,26 @@ mod tests {
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
                 .with_validity(high_assurance_validity());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
-        request.sign_intent(&agent_key).unwrap();
-
         let policy = allow_policy();
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + Duration::minutes(1),
+                policy.digest().unwrap(),
+            )
+            .unwrap();
+
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
             EvidenceAttesterKey::generate(),
         )
         .unwrap()
+        .with_audience("test-gateway")
         .with_replay_guard(Arc::new(TestReplayGuard {
             unavailable: true,
             ..TestReplayGuard::default()
@@ -1567,12 +1830,104 @@ mod tests {
             engine.evaluate(request),
             Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
         ));
+
+        let excessive_lease_provider = Arc::new(TestFreshnessProvider {
+            lease_seconds: Ok(61),
+        });
+        let (engine, request) = production_engine_with_provider(excessive_lease_provider);
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::LeaseTooLong
+            ))
+        ));
+    }
+
+    #[test]
+    fn production_profile_rejects_invalid_intent_metadata_and_unbounded_authority() {
+        let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
+        request.intent_v2.as_mut().unwrap().audience = "other-gateway".into();
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::IntentInvalid)
+        ));
+
+        let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
+        request.intent_v2.as_mut().unwrap().policy_digest = "0".repeat(64);
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::IntentInvalid)
+        ));
+
+        let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
+        request.intent_v2.as_mut().unwrap().expires_at = "2026-06-01T12:00:00Z".into();
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::IntentInvalid)
+        ));
+
+        let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
+        request.authority.validity.not_after = None;
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+
+        let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
+        request.authority.validity.not_before = Some("2020-01-01T00:00:00Z".into());
+        request.authority.validity.not_after = Some("2030-01-01T00:00:00Z".into());
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn production_freshness_provider_receives_exact_authority_digest() {
+        struct RecordingProvider(Arc<Mutex<Option<String>>>);
+
+        impl FreshnessProvider for RecordingProvider {
+            fn check(
+                &self,
+                _agent: &crate::identity::AgentKeyFingerprint,
+                _authority_id: &crate::authority::AuthorityId,
+                _policy_digest: &str,
+                now: OffsetDateTime,
+            ) -> std::result::Result<FreshnessLease, FreshnessError> {
+                Ok(FreshnessLease {
+                    valid_until: now + time::Duration::minutes(1),
+                })
+            }
+
+            fn check_authority(
+                &self,
+                agent: &crate::identity::AgentKeyFingerprint,
+                authority_id: &crate::authority::AuthorityId,
+                authority_digest: &str,
+                policy_digest: &str,
+                now: OffsetDateTime,
+            ) -> std::result::Result<FreshnessLease, FreshnessError> {
+                *self.0.lock().unwrap() = Some(authority_digest.to_owned());
+                self.check(agent, authority_id, policy_digest, now)
+            }
+        }
+
+        let observed_digest = Arc::new(Mutex::new(None));
+        let provider = Arc::new(RecordingProvider(observed_digest.clone()));
+        let (engine, request) = production_engine_with_provider(provider);
+        let expected_digest = request.authority.content_digest().unwrap();
+
+        assert!(engine.evaluate(request).is_ok());
+        assert_eq!(
+            observed_digest.lock().unwrap().as_deref(),
+            Some(expected_digest.as_str())
+        );
     }
 
     #[test]
     fn production_profile_requires_freshness_provider() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new("production", 1, vec![]);
+        let policy = Policy::new_v2("production", 1, vec![]);
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],

@@ -16,6 +16,7 @@ pub enum FreshnessError {
     Expired,
     Unavailable,
     InvalidResponse,
+    LeaseTooLong,
 }
 
 impl FreshnessError {
@@ -26,6 +27,7 @@ impl FreshnessError {
             Self::Expired => "FRESHNESS_EXPIRED",
             Self::Unavailable => "FRESHNESS_UNAVAILABLE",
             Self::InvalidResponse => "FRESHNESS_INVALID",
+            Self::LeaseTooLong => "FRESHNESS_LEASE_TOO_LONG",
         }
     }
 }
@@ -46,4 +48,19 @@ pub trait FreshnessProvider: Send + Sync {
         policy_digest: &str,
         now: OffsetDateTime,
     ) -> std::result::Result<FreshnessLease, FreshnessError>;
+
+    /// Checks current state for the exact canonical authority payload.
+    ///
+    /// Implementations that do not bind freshness to authority content remain
+    /// source-compatible but fail closed in HighAssurance.
+    fn check_authority(
+        &self,
+        _agent: &AgentKeyFingerprint,
+        _authority_id: &AuthorityId,
+        _authority_digest: &str,
+        _policy_digest: &str,
+        _now: OffsetDateTime,
+    ) -> std::result::Result<FreshnessLease, FreshnessError> {
+        Err(FreshnessError::InvalidResponse)
+    }
 }
