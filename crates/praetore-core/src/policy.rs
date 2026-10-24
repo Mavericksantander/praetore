@@ -1,17 +1,28 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{cmp::Ordering, collections::BTreeMap};
 
 use crate::{
     action::Action,
     authority::Authority,
+    canonical::{
+        MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
+    },
     decision::{Decision, DecisionContribution},
     error::{PraetoreError, Result},
     identity::AgentIdentity,
 };
 
+const MAX_POLICY_RULES: usize = 1024;
+const MAX_CONDITIONS_PER_RULE: usize = 128;
+const MAX_POLICY_TEXT_BYTES: usize = 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Policy {
     pub id: String,
     pub version: u32,
+    pub canonical_version: u8,
     pub rules: Vec<PolicyRule>,
 }
 
@@ -20,6 +31,7 @@ impl Policy {
         Self {
             id: id.into(),
             version,
+            canonical_version: crate::canonical::CANONICAL_VERSION,
             rules,
         }
     }
@@ -30,12 +42,22 @@ impl Policy {
         authority: &Authority,
         action: &Action,
     ) -> Result<Decision> {
+        self.evaluate_with_context(agent, authority, action, &BTreeMap::new())
+    }
+
+    pub fn evaluate_with_context(
+        &self,
+        agent: &AgentIdentity,
+        authority: &Authority,
+        action: &Action,
+        context: &BTreeMap<String, Value>,
+    ) -> Result<Decision> {
         self.validate()?;
 
         let mut decision: Option<Decision> = None;
 
         for rule in &self.rules {
-            if !rule.matches(agent, authority, action) {
+            if !rule.matches(agent, authority, action, context) {
                 continue;
             }
 
@@ -63,16 +85,47 @@ impl Policy {
         }))
     }
 
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        let canonical = canonical_json(self).map_err(|error| {
+            PraetoreError::PolicyEvaluationFailed(format!(
+                "could not serialize policy for digest: {error}"
+            ))
+        })?;
+        Ok(hex::encode(Sha256::digest(canonical)))
+    }
+
+    pub fn from_json(json: &str) -> Result<Self> {
+        let value =
+            parse_json_rejecting_duplicates(json).map_err(PraetoreError::PolicyEvaluationFailed)?;
+        let policy: Self = serde_json::from_value(value)
+            .map_err(|error| PraetoreError::PolicyEvaluationFailed(error.to_string()))?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<()> {
-        if self.id.trim().is_empty() {
+        if self.canonical_version != crate::canonical::CANONICAL_VERSION {
             return Err(PraetoreError::PolicyEvaluationFailed(
-                "policy id cannot be empty".into(),
+                "unsupported policy canonical version".into(),
+            ));
+        }
+
+        if self.id.trim().is_empty() || self.id != self.id.trim() {
+            return Err(PraetoreError::PolicyEvaluationFailed(
+                "policy id must be a non-empty canonical identifier".into(),
             ));
         }
 
         if self.version == 0 {
             return Err(PraetoreError::PolicyEvaluationFailed(
                 "policy version must be greater than zero".into(),
+            ));
+        }
+
+        if self.id.len() > MAX_POLICY_TEXT_BYTES || self.rules.len() > MAX_POLICY_RULES {
+            return Err(PraetoreError::PolicyEvaluationFailed(
+                "policy exceeds configured input limits".into(),
             ));
         }
 
@@ -92,6 +145,17 @@ impl Policy {
             }
         }
 
+        let canonical = canonical_json(self).map_err(|error| {
+            PraetoreError::PolicyEvaluationFailed(format!(
+                "policy exceeds canonical input limits: {error}"
+            ))
+        })?;
+        if canonical.len() > MAX_JSON_VALUE_BYTES {
+            return Err(PraetoreError::PolicyEvaluationFailed(
+                "policy exceeds maximum canonical size".into(),
+            ));
+        }
+
         Ok(())
     }
 }
@@ -103,6 +167,8 @@ pub struct PolicyRule {
     pub effect: PolicyEffect,
     pub required_capability: Option<String>,
     pub target: Option<String>,
+    pub parameter_conditions: Vec<PolicyCondition>,
+    pub context_conditions: Vec<PolicyCondition>,
 }
 
 impl PolicyRule {
@@ -117,6 +183,8 @@ impl PolicyRule {
             effect,
             required_capability: None,
             target: None,
+            parameter_conditions: Vec::new(),
+            context_conditions: Vec::new(),
         }
     }
 
@@ -130,7 +198,23 @@ impl PolicyRule {
         self
     }
 
-    fn matches(&self, _agent: &AgentIdentity, authority: &Authority, action: &Action) -> bool {
+    pub fn with_parameter_condition(mut self, condition: PolicyCondition) -> Self {
+        self.parameter_conditions.push(condition);
+        self
+    }
+
+    pub fn with_context_condition(mut self, condition: PolicyCondition) -> Self {
+        self.context_conditions.push(condition);
+        self
+    }
+
+    fn matches(
+        &self,
+        _agent: &AgentIdentity,
+        authority: &Authority,
+        action: &Action,
+        context: &BTreeMap<String, Value>,
+    ) -> bool {
         if self.action_type != action.action_type {
             return false;
         }
@@ -147,7 +231,13 @@ impl PolicyRule {
             }
         }
 
-        true
+        self.parameter_conditions
+            .iter()
+            .all(|condition| condition.matches(&action.parameters))
+            && self
+                .context_conditions
+                .iter()
+                .all(|condition| condition.matches_map(context))
     }
 
     fn decision(&self) -> Result<Decision> {
@@ -161,38 +251,292 @@ impl PolicyRule {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.id.trim().is_empty() {
+        if self.id.trim().is_empty() || self.id != self.id.trim() {
             return Err(PraetoreError::PolicyEvaluationFailed(
-                "policy rule id cannot be empty".into(),
+                "policy rule id must be a non-empty canonical identifier".into(),
             ));
         }
 
-        if self.action_type.trim().is_empty() {
+        if self.action_type.trim().is_empty() || self.action_type != self.action_type.trim() {
             return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                "policy rule '{}' has empty action_type",
+                "policy rule '{}' has invalid action_type",
+                self.id
+            )));
+        }
+        if self.id.len() > MAX_POLICY_TEXT_BYTES || self.action_type.len() > MAX_POLICY_TEXT_BYTES {
+            return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                "policy rule '{}' exceeds maximum text length",
                 self.id
             )));
         }
 
         if let Some(capability) = &self.required_capability {
-            if capability.trim().is_empty() {
+            if capability.trim().is_empty() || capability != capability.trim() {
                 return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                    "policy rule '{}' has empty capability",
+                    "policy rule '{}' has invalid capability",
                     self.id
                 )));
             }
         }
 
         if let Some(target) = &self.target {
-            if target.trim().is_empty() {
+            if target.trim().is_empty() || target != target.trim() {
                 return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                    "policy rule '{}' has empty target",
+                    "policy rule '{}' has invalid target",
+                    self.id
+                )));
+            }
+            if target.len() > MAX_POLICY_TEXT_BYTES {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{}' target exceeds maximum length",
                     self.id
                 )));
             }
         }
 
+        if self.parameter_conditions.len() > MAX_CONDITIONS_PER_RULE
+            || self.context_conditions.len() > MAX_CONDITIONS_PER_RULE
+        {
+            return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                "policy rule '{}' has too many conditions",
+                self.id
+            )));
+        }
+
+        validate_conditions(&self.id, "parameter", &self.parameter_conditions)?;
+        validate_conditions(&self.id, "context", &self.context_conditions)?;
+
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyCondition {
+    pub key: String,
+    pub operator: MatchOperator,
+    pub expected: Value,
+}
+
+impl PolicyCondition {
+    pub fn new(key: impl Into<String>, operator: MatchOperator, expected: Value) -> Self {
+        Self {
+            key: key.into(),
+            operator,
+            expected,
+        }
+    }
+
+    pub fn exact(key: impl Into<String>, expected: Value) -> Self {
+        Self::new(key, MatchOperator::Exact, expected)
+    }
+
+    pub fn prefix(key: impl Into<String>, expected: impl Into<String>) -> Self {
+        Self::new(key, MatchOperator::Prefix, Value::String(expected.into()))
+    }
+
+    pub fn one_of(key: impl Into<String>, expected: Vec<Value>) -> Self {
+        Self::new(key, MatchOperator::In, Value::Array(expected))
+    }
+
+    pub fn greater_than(key: impl Into<String>, expected: Value) -> Self {
+        Self::new(key, MatchOperator::GreaterThan, expected)
+    }
+
+    fn matches(&self, object: &Value) -> bool {
+        object
+            .as_object()
+            .and_then(|values| values.get(&self.key))
+            .is_some_and(|actual| self.matches_value(actual))
+    }
+
+    fn matches_map(&self, values: &BTreeMap<String, Value>) -> bool {
+        values
+            .get(&self.key)
+            .is_some_and(|actual| self.matches_value(actual))
+    }
+
+    fn matches_value(&self, actual: &Value) -> bool {
+        match self.operator {
+            MatchOperator::Exact => actual == &self.expected,
+            MatchOperator::Prefix => actual
+                .as_str()
+                .zip(self.expected.as_str())
+                .is_some_and(|(actual, prefix)| actual.starts_with(prefix)),
+            MatchOperator::In => self
+                .expected
+                .as_array()
+                .is_some_and(|values| values.contains(actual)),
+            MatchOperator::GreaterThan => compare_numeric(actual, &self.expected)
+                .is_some_and(|order| order == Ordering::Greater),
+            MatchOperator::GreaterThanOrEqual => {
+                compare_numeric(actual, &self.expected).is_some_and(|order| order != Ordering::Less)
+            }
+            MatchOperator::LessThan => {
+                compare_numeric(actual, &self.expected).is_some_and(|order| order == Ordering::Less)
+            }
+            MatchOperator::LessThanOrEqual => compare_numeric(actual, &self.expected)
+                .is_some_and(|order| order != Ordering::Greater),
+        }
+    }
+
+    fn validate(&self, rule_id: &str, scope: &str) -> Result<()> {
+        if self.key.trim().is_empty()
+            || self.key != self.key.trim()
+            || self.key.len() > MAX_POLICY_TEXT_BYTES
+        {
+            return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                "policy rule '{rule_id}' has invalid {scope} condition key"
+            )));
+        }
+
+        validate_json_value(&self.expected).map_err(|message| {
+            PraetoreError::PolicyEvaluationFailed(format!(
+                "policy rule '{rule_id}' has invalid {scope} condition value: {message}"
+            ))
+        })?;
+
+        match self.operator {
+            MatchOperator::Prefix
+                if self
+                    .expected
+                    .as_str()
+                    .is_none_or(|prefix| prefix.is_empty()) =>
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{rule_id}' prefix condition must use a non-empty string"
+                )));
+            }
+            MatchOperator::In
+                if self
+                    .expected
+                    .as_array()
+                    .is_none_or(|values| values.is_empty()) =>
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{rule_id}' membership condition must use a non-empty array"
+                )));
+            }
+            MatchOperator::GreaterThan
+            | MatchOperator::GreaterThanOrEqual
+            | MatchOperator::LessThan
+            | MatchOperator::LessThanOrEqual
+                if !self.expected.is_number() =>
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{rule_id}' numeric condition must use a number"
+                )));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MatchOperator {
+    Exact,
+    Prefix,
+    In,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
+}
+
+fn compare_numeric(actual: &Value, expected: &Value) -> Option<Ordering> {
+    let actual = actual.as_number()?;
+    let expected = expected.as_number()?;
+
+    if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_i64()) {
+        return Some(actual.cmp(&expected));
+    }
+
+    if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_u64()) {
+        return Some(actual.cmp(&expected));
+    }
+
+    if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_u64()) {
+        return Some(if actual < 0 {
+            Ordering::Less
+        } else {
+            (actual as u64).cmp(&expected)
+        });
+    }
+
+    if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_i64()) {
+        return Some(if expected < 0 {
+            Ordering::Greater
+        } else {
+            actual.cmp(&(expected as u64))
+        });
+    }
+
+    let actual_is_float = actual.as_i64().is_none() && actual.as_u64().is_none();
+    let expected_is_float = expected.as_i64().is_none() && expected.as_u64().is_none();
+    if !actual_is_float || !expected_is_float {
+        return None;
+    }
+
+    actual.as_f64()?.partial_cmp(&expected.as_f64()?)
+}
+
+fn validate_conditions(rule_id: &str, scope: &str, conditions: &[PolicyCondition]) -> Result<()> {
+    for (index, condition) in conditions.iter().enumerate() {
+        condition.validate(rule_id, scope)?;
+
+        if conditions[..index]
+            .iter()
+            .any(|previous| conditions_conflict(previous, condition))
+        {
+            return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                "policy rule '{rule_id}' contains contradictory {scope} conditions for '{}'",
+                condition.key
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn conditions_conflict(left: &PolicyCondition, right: &PolicyCondition) -> bool {
+    if left.key != right.key {
+        return false;
+    }
+
+    match (left.operator, right.operator) {
+        (MatchOperator::Exact, MatchOperator::Exact) => left.expected != right.expected,
+        (MatchOperator::Exact, MatchOperator::In) => right
+            .expected
+            .as_array()
+            .is_some_and(|values| !values.contains(&left.expected)),
+        (MatchOperator::In, MatchOperator::Exact) => left
+            .expected
+            .as_array()
+            .is_some_and(|values| !values.contains(&right.expected)),
+        (MatchOperator::In, MatchOperator::In) => {
+            let left_values = left.expected.as_array();
+            let right_values = right.expected.as_array();
+            left_values
+                .zip(right_values)
+                .is_some_and(|(left, right)| left.iter().all(|value| !right.contains(value)))
+        }
+        (MatchOperator::Prefix, MatchOperator::Prefix) => left
+            .expected
+            .as_str()
+            .zip(right.expected.as_str())
+            .is_some_and(|(left, right)| !left.starts_with(right) && !right.starts_with(left)),
+        (MatchOperator::Exact, MatchOperator::Prefix) => left
+            .expected
+            .as_str()
+            .zip(right.expected.as_str())
+            .is_some_and(|(exact, prefix)| !exact.starts_with(prefix)),
+        (MatchOperator::Prefix, MatchOperator::Exact) => left
+            .expected
+            .as_str()
+            .zip(right.expected.as_str())
+            .is_some_and(|(prefix, exact)| !exact.starts_with(prefix)),
+        _ => false,
     }
 }
 
@@ -246,6 +590,11 @@ mod tests {
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
         assert_eq!(decision.contributions.len(), 1);
         assert_eq!(decision.contributions[0].rule_id, "allow-read");
+    }
+
+    #[test]
+    fn policy_import_rejects_duplicate_json_fields() {
+        assert!(Policy::from_json(r#"{"policy_id":"a","policy_id":"b"}"#).is_err());
     }
 
     #[test]
@@ -665,5 +1014,189 @@ mod tests {
             result,
             Err(PraetoreError::PolicyEvaluationFailed(_))
         ));
+    }
+
+    #[test]
+    fn parameter_conditions_support_exact_prefix_membership_and_numeric_match() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+        let action = Action::new(
+            "read_data",
+            None,
+            json!({
+                "resource": "users.private",
+                "region": "south",
+                "record_count": 12,
+                "enabled": true
+            }),
+        )
+        .unwrap();
+        let policy = Policy::new(
+            "typed-matches",
+            1,
+            vec![
+                PolicyRule::new("allow-query", "read_data", PolicyEffect::Allow)
+                    .with_parameter_condition(PolicyCondition::exact("enabled", json!(true)))
+                    .with_parameter_condition(PolicyCondition::prefix("resource", "users."))
+                    .with_parameter_condition(PolicyCondition::one_of(
+                        "region",
+                        vec![json!("north"), json!("south")],
+                    ))
+                    .with_parameter_condition(PolicyCondition::greater_than(
+                        "record_count",
+                        json!(10),
+                    )),
+            ],
+        );
+
+        let decision = policy.evaluate(&agent, &authority, &action).unwrap();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+    }
+
+    #[test]
+    fn typed_conditions_fail_closed_on_missing_or_wrong_json_types() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+        let action = Action::new(
+            "read_data",
+            None,
+            json!({"record_count": "12", "region": "south"}),
+        )
+        .unwrap();
+        let policy = Policy::new(
+            "typed-matches",
+            1,
+            vec![
+                PolicyRule::new("allow-query", "read_data", PolicyEffect::Allow)
+                    .with_parameter_condition(PolicyCondition::greater_than(
+                        "record_count",
+                        json!(10),
+                    ))
+                    .with_parameter_condition(PolicyCondition::exact("missing", json!(true))),
+            ],
+        );
+
+        let decision = policy.evaluate(&agent, &authority, &action).unwrap();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.contributions.is_empty());
+    }
+
+    #[test]
+    fn context_conditions_are_matched_independently_of_action_parameters() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
+        let mut context = BTreeMap::new();
+        context.insert("risk_level".into(), json!(2));
+        let policy = Policy::new(
+            "context-policy",
+            1,
+            vec![
+                PolicyRule::new("allow-low-risk", "read_data", PolicyEffect::Allow)
+                    .with_context_condition(PolicyCondition::new(
+                        "risk_level",
+                        MatchOperator::LessThanOrEqual,
+                        json!(3),
+                    )),
+            ],
+        );
+
+        let decision = policy
+            .evaluate_with_context(&agent, &authority, &test_action(), &context)
+            .unwrap();
+
+        assert_eq!(decision.outcome, DecisionOutcome::Allow);
+    }
+
+    #[test]
+    fn policy_validation_rejects_contradictory_conditions() {
+        let policy = Policy::new(
+            "invalid-policy",
+            1,
+            vec![
+                PolicyRule::new("unreachable", "read_data", PolicyEffect::Allow)
+                    .with_parameter_condition(PolicyCondition::exact("region", json!("north")))
+                    .with_parameter_condition(PolicyCondition::exact("region", json!("south"))),
+            ],
+        );
+
+        assert!(matches!(
+            policy.validate(),
+            Err(PraetoreError::PolicyEvaluationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn policy_digest_is_stable_and_sensitive_to_policy_changes() {
+        let policy = Policy::new(
+            "digest-test",
+            1,
+            vec![
+                PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+                    .with_parameter_condition(PolicyCondition::exact("enabled", json!(true))),
+            ],
+        );
+        let same_policy = policy.clone();
+        let changed_policy = Policy::new(
+            "digest-test",
+            1,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Deny,
+            )],
+        );
+
+        assert_eq!(policy.digest().unwrap(), same_policy.digest().unwrap());
+        assert_ne!(policy.digest().unwrap(), changed_policy.digest().unwrap());
+    }
+
+    #[test]
+    fn numeric_comparison_preserves_integer_precision_and_rejects_mixed_types() {
+        let greater_than = PolicyCondition::greater_than("count", json!(9_007_199_254_740_992_u64));
+        let mixed_type = PolicyCondition::greater_than("count", json!(1.0));
+
+        assert!(greater_than.matches(&json!({"count": 9_007_199_254_740_993_u64})));
+        assert!(!greater_than.matches(&json!({"count": 9_007_199_254_740_991_u64})));
+        assert!(!mixed_type.matches(&json!({"count": 1})));
+        assert!(!mixed_type.matches(&json!({"count": "2"})));
+    }
+
+    #[test]
+    fn policy_digest_matches_canonical_golden_value() {
+        let policy = Policy::new(
+            "golden",
+            1,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+
+        assert_eq!(
+            policy.digest().unwrap(),
+            "5d45f213fc1f9fcfa17bf0a462169ea9e14efa028d873b79841924eae90ddd1f"
+        );
+    }
+
+    #[test]
+    fn policy_canonical_bytes_match_committed_golden_vector() {
+        let policy = Policy::new(
+            "golden",
+            1,
+            vec![PolicyRule::new(
+                "allow-read",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+        let expected = include_str!("../../../docs/golden/canonical-policy-v1.json").trim();
+        let canonical = canonical_json(&policy).unwrap();
+        let expected_digest = hex::encode(Sha256::digest(expected.as_bytes()));
+
+        assert_eq!(canonical, expected.as_bytes());
+        assert_eq!(policy.digest().unwrap(), expected_digest);
     }
 }
