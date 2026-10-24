@@ -3,14 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PRÆTORE / Control Plane</title>
-  <link rel="stylesheet" href="/assets/styles.css">
-  <script defer src="/assets/app.js"></script>
+  <meta name="color-scheme" content="light dark">
+  <title>Prætore</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="mark">P</span><span>PRÆTORE <small>CONTROL PLANE</small></span></div>
-    <div class="environment"><i></i> READ-ONLY OBSERVABILITY</div>
+    <div class="brand">Prætore</div>
+    <div class="environment"><i></i>Read-only</div>
   </header>
   <main>
     <section class="auth-panel">
@@ -27,7 +28,7 @@
     <section id="notice" class="notice" role="status">Authenticate to query the read-only journal.</section>
     <section id="operations" class="view">
       <div class="section-head">
-        <div><p class="eyebrow">EXECUTION JOURNAL</p><h1>Operations</h1></div>
+        <h1>Operations</h1>
         <div class="pager"><button id="prev">Previous</button><span id="page-label">Page 1</span><button id="next">Next</button></div>
       </div>
       <form id="filters" class="filters">
@@ -45,15 +46,18 @@
       <div id="detail" class="detail-panel hidden"></div>
     </section>
     <section id="health" class="view hidden">
-      <div class="section-head"><div><p class="eyebrow">LIVE PROBES</p><h1>System health</h1></div><button id="refresh-health">Refresh</button></div>
+      <div class="section-head"><h1>System health</h1><button id="refresh-health">Refresh</button></div>
       <div id="health-cards" class="cards"></div>
       <p class="fine">A successful PostgreSQL probe is a point-in-time connectivity signal. Adapter health and journal error counts are not instrumented by this service.</p>
     </section>
     <section id="assurance" class="view hidden">
-      <div class="section-head"><div><p class="eyebrow">BOUNDED CLAIMS</p><h1>Assurance</h1></div></div>
+      <div class="section-head"><h1>Assurance</h1></div>
       <div id="assurance-cards" class="assurance-grid"></div>
     </section>
-    <footer>Evidence status describes a historical receipt. It is not current authorization or proof of an external effect.</footer>
+    <footer>
+      <p>Evidence status describes a historical receipt. It is not current authorization or proof of an external effect.</p>
+      <small>© 2026 PRÆTOR TECHNOLOGIES · CHILE</small>
+    </footer>
   </main>
 </body>
 </html>

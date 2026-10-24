@@ -94,6 +94,8 @@ impl ObserveState {
 
         Router::new()
             .route("/", get(index))
+            .route("/app.js", get(app_js))
+            .route("/styles.css", get(app_css))
             .route("/assets/app.js", get(app_js))
             .route("/assets/styles.css", get(app_css))
             .nest("/api/v1", api)
@@ -722,6 +724,49 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn relative_ui_assets_are_served_and_legacy_asset_paths_remain_available() {
+        let (state, _) = test_state(true, true);
+        let app = state.router();
+        for (path, expected_type, expected_content) in [
+            ("/styles.css", "text/css; charset=utf-8", "--bg: #fbfbfd"),
+            (
+                "/assets/styles.css",
+                "text/css; charset=utf-8",
+                "--bg: #fbfbfd",
+            ),
+            (
+                "/app.js",
+                "text/javascript; charset=utf-8",
+                "const tokenInput",
+            ),
+            (
+                "/assets/app.js",
+                "text/javascript; charset=utf-8",
+                "const tokenInput",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                expected_type,
+                "{path}"
+            );
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            assert!(
+                String::from_utf8(body.to_vec())
+                    .unwrap()
+                    .contains(expected_content),
+                "{path}"
+            );
         }
     }
 
