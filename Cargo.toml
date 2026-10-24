@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/praetore-core",
+    "crates/praetore-verify",
+    "crates/praetore-python",
 ]
 
 [workspace.package]

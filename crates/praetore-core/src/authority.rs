@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    canonical::canonical_json,
+    canonical::{canonical_json, parse_json_rejecting_duplicates},
     error::{PraetoreError, Result},
     identity::{AgentId, AgentIdentity, AgentKeyPair, VerifiedPublicKey},
 };
@@ -149,6 +149,14 @@ fn parse_timestamp(value: &str) -> Result<OffsetDateTime> {
 }
 
 impl Authority {
+    pub fn from_json(json: &str) -> Result<Self> {
+        let value = parse_json_rejecting_duplicates(json).map_err(PraetoreError::InvalidRequest)?;
+        let authority: Self = serde_json::from_value(value)
+            .map_err(|error| PraetoreError::InvalidRequest(error.to_string()))?;
+        authority.validate()?;
+        Ok(authority)
+    }
+
     pub fn new(subject: AgentId, issuer: impl Into<String>, capabilities: Vec<String>) -> Self {
         Self {
             id: AuthorityId::new(),
@@ -415,6 +423,11 @@ mod tests {
         assert_eq!(authority.constraints[0].key, "environment");
         assert_eq!(authority.constraints[0].value, "production");
         assert!(authority.validate().is_ok());
+    }
+
+    #[test]
+    fn authority_json_parser_rejects_duplicate_fields() {
+        assert!(Authority::from_json(r#"{"issuer":"one","issuer":"two"}"#).is_err());
     }
 
     #[test]

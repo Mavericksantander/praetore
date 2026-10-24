@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{PraetoreError, Result};
+use crate::{
+    canonical::parse_json_rejecting_duplicates,
+    error::{PraetoreError, Result},
+};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 
@@ -43,6 +46,15 @@ pub struct AgentIdentity {
 }
 
 impl AgentIdentity {
+    pub fn from_json(json: &str) -> Result<Self> {
+        let value =
+            parse_json_rejecting_duplicates(json).map_err(PraetoreError::InvalidIdentity)?;
+        let identity: Self = serde_json::from_value(value)
+            .map_err(|error| PraetoreError::InvalidIdentity(error.to_string()))?;
+        identity.validate()?;
+        Ok(identity)
+    }
+
     pub fn new(id: AgentId, public_key: Vec<u8>, key_algorithm: impl Into<String>) -> Result<Self> {
         let identity = Self {
             id,
@@ -240,6 +252,16 @@ mod tests {
             identity.validate(),
             Err(PraetoreError::InvalidIdentity(_))
         ));
+    }
+
+    #[test]
+    fn identity_json_parser_rejects_duplicate_fields() {
+        assert!(
+            AgentIdentity::from_json(
+                r#"{"id":"00000000-0000-0000-0000-000000000000","id":"00000000-0000-0000-0000-000000000001","public_key":[1],"key_algorithm":"ed25519"}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

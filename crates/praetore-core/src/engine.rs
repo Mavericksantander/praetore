@@ -110,8 +110,8 @@ impl TrustedAuthorityIssuer {
             hex::decode(&document.public_key).map_err(|_| PraetoreError::TrustStoreFailure)?;
         let public_key = VerifiedPublicKey::from_bytes(&key_bytes)
             .map_err(|_| PraetoreError::TrustStoreFailure)?;
-        let pin = Self::new(document.issuer, public_key)?
-            .with_validity(document.validity)
+        let pin = Self::new(document.issuer, public_key)
+            .and_then(|pin| pin.with_validity(document.validity))
             .map_err(|_| PraetoreError::TrustStoreFailure)?;
         if pin.key_id != document.key_id {
             return Err(PraetoreError::TrustStoreFailure);
@@ -119,8 +119,30 @@ impl TrustedAuthorityIssuer {
         Ok(pin)
     }
 
-    fn is_active_at(&self, now: OffsetDateTime) -> Result<bool> {
+    pub fn is_active_at(&self, now: OffsetDateTime) -> Result<bool> {
         self.validity.is_active_at(now)
+    }
+
+    pub fn verify_authority_at(
+        &self,
+        authority: &crate::authority::Authority,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        if authority.issuer != self.issuer
+            || authority.issuer_key_id.as_deref() != Some(self.key_id.as_str())
+        {
+            return Err(PraetoreError::TrustStoreFailure);
+        }
+        if !self.is_active_at(now)? {
+            return Err(PraetoreError::TrustStoreFailure);
+        }
+        if authority.subject_key_hash.is_none() {
+            return Err(PraetoreError::AuthorityVerificationFailed);
+        }
+        if !authority.validity.is_active_at(now)? {
+            return Err(PraetoreError::AuthorityExpired);
+        }
+        authority.verify_signature(&self.public_key)
     }
 
     fn is_time_bounded(&self) -> bool {
@@ -1019,6 +1041,34 @@ mod tests {
         assert!(matches!(
             engine.evaluate(request),
             Err(PraetoreError::TrustStoreFailure)
+        ));
+    }
+
+    #[test]
+    fn trusted_issuer_verification_enforces_subject_binding_and_authority_time() {
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let pin = TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2026-05-01T00:00:00Z".into()),
+                });
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let current_time = OffsetDateTime::parse("2026-06-01T00:00:00Z", &Rfc3339).unwrap();
+
+        assert!(matches!(
+            pin.verify_authority_at(&authority, current_time),
+            Err(PraetoreError::AuthorityExpired)
+        ));
+
+        authority.subject_key_hash = None;
+        authority.sign(&issuer_key).unwrap();
+        assert!(matches!(
+            pin.verify_authority_at(&authority, current_time),
+            Err(PraetoreError::AuthorityVerificationFailed)
         ));
     }
 

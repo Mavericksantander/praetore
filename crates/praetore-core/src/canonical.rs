@@ -124,6 +124,14 @@ pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_j
     Ok(output)
 }
 
+pub fn canonicalize_json(input: &str) -> crate::Result<Vec<u8>> {
+    let value =
+        parse_json_rejecting_duplicates(input).map_err(crate::PraetoreError::InvalidRequest)?;
+    canonical_json(&value).map_err(|error| {
+        crate::PraetoreError::InvalidRequest(format!("canonical JSON encoding failed: {error}"))
+    })
+}
+
 pub(crate) fn validate_json_value(value: &Value) -> Result<usize, &'static str> {
     let mut pending = vec![(value, 1usize)];
     let mut nodes = 0usize;

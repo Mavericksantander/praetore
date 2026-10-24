@@ -1,7 +1,7 @@
 pub mod action;
 pub mod authority;
 pub mod authorization;
-mod canonical;
+pub mod canonical;
 pub mod decision;
 pub mod engine;
 pub mod error;

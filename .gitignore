@@ -1,5 +1,6 @@
 # Rust
 target/
+fuzz/artifacts/
 
 # Python
 __pycache__/
@@ -16,6 +17,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+*.cdx.json
 
 # macOS
 .DS_Store
