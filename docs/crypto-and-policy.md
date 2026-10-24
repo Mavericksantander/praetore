@@ -28,11 +28,12 @@ compatibility constructors for the unsigned model. Use `strict` or
 `strict_with_clock` when signed authority and signed intent verification are
 needed. For the production profile, use `AuthorizationEngine::production` with
 a `HighAssuranceConfig`: it requires a pinned policy digest, non-empty
-time-bounded issuer pins, and an evidence attester key. It verifies that at
-least one issuer pin is active at construction and on each evaluation, and
-checks the matching issuer pin when verifying each authority. Provision all
-trust data through an independently authenticated configuration channel. The
-engine does not implement PKI, issuer discovery, revocation, or key rotation.
+time-bounded issuer pins, an evidence attester key, and a caller-owned durable
+`ReplayGuard`. It verifies that at least one issuer pin is active at
+construction and on each evaluation, and checks the matching issuer pin when
+verifying each authority. Provision all trust data through an independently
+authenticated configuration channel. The engine does not implement PKI,
+issuer discovery, revocation, or key rotation.
 
 `AuthorizationRequest::sign_intent` binds an Ed25519 signature to the request
 ID, identity, authority, action, trace ID, and request context. Strict mode
@@ -40,6 +41,18 @@ requires and verifies this signature, proving possession of the subject key
 bound into the authority. Development mode permits unsigned requests, but
 rejects any invalid signature that is present. The signature is retained in
 evidence and can be checked offline with `Evidence::verify_agent_intent`.
+
+HighAssurance evaluation atomically claims the signed `(agent_id, request_id)`
+through the configured `ReplayGuard` before returning evidence. This applies
+to ALLOW, REQUIRE_APPROVAL, and DENY results. Duplicate claims or storage
+failure return an error; no evidence is returned. The caller's implementation
+must be durable and shared across all engine instances in the authorization
+domain, and must not expire or delete claims automatically. Use a bounded store
+that rejects new claims when full rather than evicting old claims. Strict and
+Development modes do not use the replay guard. This prevents re-submission of
+the same request ID; it does not prevent an authorized agent from signing new
+request IDs, revoke a stolen key, or make action execution atomic with
+authorization. See [ADR-006](adr/006-high-assurance-replay-guard.md).
 
 ## Canonical encoding
 
@@ -150,10 +163,12 @@ otherwise the compatibility fallback requires an additional capability named
 
 * **Cooperative agent:** deterministic decisions follow the supplied policy,
   authority, request, and one clock snapshot per evaluation. Evidence includes
-  the context and policy digest used by the engine.
+  the context and policy digest used by the engine. HighAssurance also consumes
+  each authenticated request ID once through caller-owned replay storage.
 * **Stolen agent key:** an attacker can create valid signatures for that key.
-  The core cannot detect compromise or revoke keys; applications need key
-  protection, issuer controls, and revocation/rotation procedures.
+  HighAssurance replay storage rejects reuse of an already evaluated request
+  ID. The core cannot detect compromise or revoke keys; a stolen key can sign
+  new request IDs until authorities expire or operators remove trust.
 * **Tampered evidence:** `verify_integrity()` detects changes relative to the
   stored SHA-256 hash. Since the hash is not signed, an attacker who can rewrite
   the document can also recompute it. Production evidence is attester-signed;
@@ -161,8 +176,10 @@ otherwise the compatibility fallback requires an additional capability named
 * **Clock skew:** validity is checked against the configured `Clock`, with no
   built-in skew allowance. Production callers are responsible for a
   trustworthy clock source and any required operational margin.
-* **Replay:** request signatures bind a unique request ID, but this library
-  does not keep replay state or enforce one-time use.
+* **Replay:** HighAssurance requires a caller-supplied durable guard that
+  atomically consumes each authenticated request ID. Storage rollback, bypass
+  of the configured engine, or an unsafe guard implementation can re-enable
+  replay; Strict and Development modes do not provide replay protection.
 * **Policy or issuer substitution:** the production profile pins the policy
   digest and issuer public keys, but does not authenticate deployment
   configuration or persist anti-rollback state.
@@ -178,7 +195,7 @@ Existing code using `AuthorizationEngine::new` continues to run in
 3. Configure `AuthorizationEngine::strict` with issuer pins for strict
    signature verification, or use `AuthorizationEngine::production` with
    bounded issuer pins, the expected policy digest, and an evidence attester
-   key for the high-assurance profile.
+   key plus a tested, durable `ReplayGuard` for the high-assurance profile.
 4. Sign each strict-mode request intent with the agent key.
 5. Verify issuer and attester key distribution out of band; do not treat
    serialized issuer labels or key IDs as proof of trust. Export and protect

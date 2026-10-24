@@ -6,9 +6,9 @@ PRÆTORE is the core software infrastructure of PRÆTOR TECHNOLOGIES, designed t
 
 ## Status
 
-PRÆTORE is currently under active development.
-
-The current repository contains the `praetore-core` Rust crate.
+PRÆTORE is currently under active development. The repository contains the
+Rust authorization core, offline verification CLI, bounded fuzz targets, and
+verify-only Python bindings.
 
 The project is being developed from a security-first and verification-oriented foundation rather than as a conventional application framework.
 
@@ -83,14 +83,17 @@ praetore/
 The `new` and `with_clock` constructors are compatibility Development-mode
 APIs. For signature-checked evaluation use `strict`; for the production
 high-assurance profile use `AuthorizationEngine::production` with a pinned
-policy digest, bounded issuer pins, and a separate evidence attester key.
-Evaluation remains offline and in-process. It does not provide PKI, revocation,
-replay prevention, secure clocking, deployment integrity, or host isolation.
+policy digest, bounded issuer pins, a separate evidence attester key, and a
+durable caller-owned replay guard. Evaluation remains offline and in-process.
+The core does not provide PKI, revocation, secure clocking, deployment
+integrity, or host isolation.
 
 See [the crypto and policy guide](docs/crypto-and-policy.md), [the threat
 model](docs/threat-model.md), [the operations runbooks](docs/operations.md),
 and the [architecture decisions](docs/adr/README.md) before production
-integration.
+integration. High-consequence pilots must also close the
+[pre-user deployment gates](docs/pre-user-pilot-gates.md); these documents do
+not represent certification or accreditation.
 
 ## Development
 
@@ -231,6 +234,21 @@ evaluation or authority issuance.
 See [the assurance traceability matrix](docs/assurance-matrix.md) for
 requirements, tests, and CI job mapping, and [CONTRIBUTING.md](CONTRIBUTING.md)
 for exact local validation and release commands.
+
+## End-to-end high-assurance example
+
+Run the local example with:
+
+```sh
+cargo run -p praetore-core --example high_assurance
+```
+
+It demonstrates signed identity, authority, and request intent; pinned policy
+and issuer trust; attested evidence; and a replay guard. Its ephemeral keys and
+in-memory replay storage are for demonstration only. Production deployments
+must use protected keys and a durable, atomic `ReplayGuard` shared by every
+engine instance in the authorization domain. A guard outage or duplicate
+request fails closed.
 
 ## Security
 

@@ -1,0 +1,66 @@
+# Pre-user high-assurance deployment gates
+
+This is a deployment acceptance checklist, not a certification claim. No
+external or operational user should rely on PRÆTORE for a high-consequence
+decision until every gate applicable to that deployment is evidenced and
+approved by named technical and operational owners.
+
+## Current engineering state
+
+- [x] Rust authorization core, signed identity/authority/intent, policy pin,
+  attested evidence, and offline verifier exist.
+- [x] HighAssurance requires a caller-owned replay guard and fails closed when
+  the guard is missing, unavailable, or reports a duplicate request.
+- [x] Unit tests cover replay guard requirement, concurrent duplicate
+  evaluation, and storage-unavailable failure behavior.
+- [x] One scoped independent source review of the trust/evaluation path,
+  replay-guard implementation, and verifier reported no concrete
+  vulnerabilities. This is not a penetration test, certification, or review of
+  a deployment-specific adapter.
+- [ ] Hosted assurance workflow passes on the final candidate commit.
+- [ ] Repository branch protection requires all assurance checks and disallows
+  unreviewed direct changes to the release branch.
+- [ ] A deployment-specific durable, atomic ReplayGuard is implemented and
+  tested across processes, restarts, failover, backup/restore, capacity
+  exhaustion, and storage outages.
+
+## Required deployment evidence
+
+For each target deployment, retain evidence for every applicable item:
+
+1. **Trust configuration:** issuer and attester key custody, independent pin
+   distribution, rotation/compromise procedures, protected policy digests, and
+   prevention or detection of unauthorized rollback.
+2. **Replay persistence:** a linearizable one-time claim shared by all engine
+   instances, durable across restart/failover, no silent eviction or rollback,
+   bounded-capacity fail-closed behavior, and recovery tests. The core trait
+   does not supply this backend.
+3. **Execution boundary:** prove that the protected action is performed only
+   after the intended authorization result, and define recovery for a process
+   crash between claim, result delivery, and action execution. PRÆTORE does not
+   make authorization and application side effects atomic.
+4. **Time and validity:** monitored trusted time, measured skew, alerting and
+   fail-closed behavior when clock health is lost. The library adds no skew
+   tolerance and cannot identify a manipulated host clock.
+5. **Host and key protection:** operating-system hardening, process isolation,
+   secrets handling, key custody/HSM policy if required, access control, logs,
+   backups, and incident response. These are outside the core.
+6. **Supply chain and release:** reviewed dependency changes, signed source
+   tags, independently verified release checksums/SBOM, protected build
+   provenance, action/toolchain pinning policy, and a reproducible release
+   procedure. Current CI does not sign or attest artifacts.
+7. **Adversarial verification:** independent review of the final commit and
+   deployment adapter, extended fuzz campaigns, negative end-to-end scenarios,
+   concurrency testing, and a documented remediation/exception process.
+8. **Operational ownership:** named approvers for policy and key changes,
+   monitoring and on-call responsibilities, stop/recovery procedures, and
+   explicit acceptance of residual risks.
+
+## Stop conditions
+
+Do not enable authorization if any required pin is missing, expired, or
+mismatched; the policy digest is not approved; replay storage is unavailable,
+full, inconsistent, or rolled back; the clock is unhealthy; evidence cannot be
+verified; or the application would fall back to Development mode. Do not treat
+a green CI run, this checklist, or the independent code review as a military
+certification or accreditation.

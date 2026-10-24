@@ -8,6 +8,7 @@ pub mod error;
 pub mod evidence;
 pub mod identity;
 pub mod policy;
+pub mod replay;
 
 pub use action::Action;
 pub use authority::{Authority, AuthorityId};
@@ -18,3 +19,4 @@ pub use error::{ErrorKind, PraetoreError, Result};
 pub use evidence::{Evidence, EvidenceAttesterKey};
 pub use identity::{AgentId, AgentIdentity, AgentKeyPair, VerifiedPublicKey};
 pub use policy::{MatchOperator, Policy, PolicyCondition, PolicyEffect, PolicyRule};
+pub use replay::{ReplayGuard, ReplayGuardError};

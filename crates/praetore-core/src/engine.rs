@@ -7,6 +7,7 @@ use crate::{
     evidence::{Evidence, EvidenceAttesterKey},
     identity::VerifiedPublicKey,
     policy::Policy,
+    replay::{ReplayGuard, ReplayGuardError},
 };
 
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,7 @@ pub struct HighAssuranceConfig {
     policy_digest: String,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     evidence_attester: EvidenceAttesterKey,
+    replay_guard: Option<Arc<dyn ReplayGuard>>,
 }
 
 impl std::fmt::Debug for HighAssuranceConfig {
@@ -170,6 +172,7 @@ impl std::fmt::Debug for HighAssuranceConfig {
             .field("policy_digest", &self.policy_digest)
             .field("trusted_issuers", &self.trusted_issuers)
             .field("evidence_attester", &self.evidence_attester)
+            .field("replay_guard_configured", &self.replay_guard.is_some())
             .finish()
     }
 }
@@ -207,7 +210,13 @@ impl HighAssuranceConfig {
             policy_digest,
             trusted_issuers,
             evidence_attester,
+            replay_guard: None,
         })
+    }
+
+    pub fn with_replay_guard(mut self, replay_guard: Arc<dyn ReplayGuard>) -> Self {
+        self.replay_guard = Some(replay_guard);
+        self
     }
 }
 
@@ -251,6 +260,7 @@ pub struct AuthorizationEngine {
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     expected_policy_digest: Option<String>,
     evidence_attester: Option<Arc<EvidenceAttesterKey>>,
+    replay_guard: Option<Arc<dyn ReplayGuard>>,
 }
 
 impl std::fmt::Debug for AuthorizationEngine {
@@ -278,6 +288,7 @@ impl AuthorizationEngine {
             trusted_issuers: Vec::new(),
             expected_policy_digest: None,
             evidence_attester: None,
+            replay_guard: None,
         }
     }
 
@@ -294,6 +305,7 @@ impl AuthorizationEngine {
             trusted_issuers: Vec::new(),
             expected_policy_digest: None,
             evidence_attester: None,
+            replay_guard: None,
         }
     }
 
@@ -319,6 +331,7 @@ impl AuthorizationEngine {
             trusted_issuers,
             expected_policy_digest: None,
             evidence_attester: None,
+            replay_guard: None,
         })
     }
 
@@ -345,6 +358,9 @@ impl AuthorizationEngine {
         if actual_digest != config.policy_digest {
             return Err(PraetoreError::PolicyIntegrityFailed);
         }
+        if config.replay_guard.is_none() {
+            return Err(PraetoreError::ReplayGuardUnavailable);
+        }
 
         let engine = Self {
             policy,
@@ -353,6 +369,7 @@ impl AuthorizationEngine {
             trusted_issuers: config.trusted_issuers,
             expected_policy_digest: Some(config.policy_digest),
             evidence_attester: Some(Arc::new(config.evidence_attester)),
+            replay_guard: config.replay_guard,
         };
         engine.validate_production_configuration(engine.clock.now())?;
         Ok(engine)
@@ -369,6 +386,9 @@ impl AuthorizationEngine {
                 .any(|pin| !pin.is_time_bounded())
         {
             return Err(PraetoreError::PolicyIntegrityFailed);
+        }
+        if self.replay_guard.is_none() {
+            return Err(PraetoreError::ReplayGuardUnavailable);
         }
 
         let mut has_active_issuer = false;
@@ -394,6 +414,7 @@ impl AuthorizationEngine {
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
         let now = self.clock.now();
+        let replay_key = (*request.agent.id.as_uuid(), request.request_id);
         if self.mode == EvaluationMode::HighAssurance {
             self.validate_production_configuration(now)?;
         }
@@ -402,6 +423,16 @@ impl AuthorizationEngine {
         evidence.bind_policy_digest(self.policy.digest()?)?;
         if let Some(attester) = &self.evidence_attester {
             evidence.sign(attester)?;
+        }
+        if self.mode == EvaluationMode::HighAssurance {
+            self.replay_guard
+                .as_ref()
+                .ok_or(PraetoreError::ReplayGuardUnavailable)?
+                .claim_once(replay_key.0, replay_key.1)
+                .map_err(|error| match error {
+                    ReplayGuardError::AlreadyClaimed => PraetoreError::ReplayDetected,
+                    ReplayGuardError::Unavailable => PraetoreError::ReplayGuardUnavailable,
+                })?;
         }
         Ok(evidence)
     }
@@ -514,9 +545,46 @@ mod tests {
         decision::DecisionOutcome,
         identity::{AgentId, AgentIdentity, AgentKeyPair},
         policy::{Policy, PolicyRule},
+        replay::ReplayGuardError,
     };
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct TestReplayGuard {
+        claims: Mutex<HashSet<(Uuid, Uuid)>>,
+        unavailable: bool,
+    }
+
+    impl ReplayGuard for TestReplayGuard {
+        fn claim_once(
+            &self,
+            agent_id: Uuid,
+            request_id: Uuid,
+        ) -> std::result::Result<(), ReplayGuardError> {
+            if self.unavailable {
+                return Err(ReplayGuardError::Unavailable);
+            }
+            if self
+                .claims
+                .lock()
+                .expect("test replay guard lock")
+                .insert((agent_id, request_id))
+            {
+                Ok(())
+            } else {
+                Err(ReplayGuardError::AlreadyClaimed)
+            }
+        }
+    }
+
+    fn test_replay_guard() -> Arc<TestReplayGuard> {
+        Arc::new(TestReplayGuard::default())
+    }
 
     struct CountingClock {
         calls: Arc<AtomicUsize>,
@@ -1160,12 +1228,14 @@ mod tests {
         );
         let attester = EvidenceAttesterKey::generate();
         let attester_public_key = attester.public_key().unwrap();
+        let replay_guard = test_replay_guard();
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
             attester,
         )
-        .unwrap();
+        .unwrap()
+        .with_replay_guard(replay_guard);
         let engine = AuthorizationEngine::production_with_clock(
             policy,
             config,
@@ -1173,7 +1243,30 @@ mod tests {
         )
         .unwrap();
 
-        let evidence = engine.evaluate(request).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let evaluation_threads = (0..2)
+            .map(|_| {
+                let engine = engine.clone();
+                let request = request.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine.evaluate(request)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = evaluation_threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, Err(PraetoreError::ReplayDetected)))
+        );
+        let evidence = results.into_iter().find_map(Result::ok).unwrap();
 
         assert_eq!(engine.mode(), EvaluationMode::HighAssurance);
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
@@ -1197,7 +1290,8 @@ mod tests {
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
             attester,
         )
-        .unwrap();
+        .unwrap()
+        .with_replay_guard(test_replay_guard());
 
         assert!(matches!(
             AuthorizationEngine::production_with_clock(
@@ -1225,7 +1319,8 @@ mod tests {
             vec![pin],
             EvidenceAttesterKey::generate(),
         )
-        .unwrap();
+        .unwrap()
+        .with_replay_guard(test_replay_guard());
 
         assert!(matches!(
             AuthorizationEngine::production_with_clock(
@@ -1234,6 +1329,63 @@ mod tests {
                 FixedClock::new("2026-06-01T12:00:00Z")
             ),
             Err(PraetoreError::TrustStoreFailure)
+        ));
+    }
+
+    #[test]
+    fn production_profile_requires_replay_guard() {
+        let issuer_key = AgentKeyPair::generate();
+        let policy = Policy::new("production", 1, vec![]);
+        let config = HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            AuthorizationEngine::production_with_clock(
+                policy,
+                config,
+                FixedClock::new("2026-06-01T12:00:00Z")
+            ),
+            Err(PraetoreError::ReplayGuardUnavailable)
+        ));
+    }
+
+    #[test]
+    fn production_profile_fails_closed_when_replay_guard_is_unavailable() {
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(high_assurance_validity());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request.sign_intent(&agent_key).unwrap();
+
+        let policy = allow_policy();
+        let config = HighAssuranceConfig::new(
+            policy.digest().unwrap(),
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_replay_guard(Arc::new(TestReplayGuard {
+            unavailable: true,
+            ..TestReplayGuard::default()
+        }));
+        let engine = AuthorizationEngine::production_with_clock(
+            policy,
+            config,
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::ReplayGuardUnavailable)
         ));
     }
 

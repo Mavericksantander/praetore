@@ -27,8 +27,10 @@ profile and an authenticated configuration channel.
 1. Stop or isolate the affected agent and prevent further use of its private
    key.
 2. Remove or replace authorities bound to the compromised agent public key.
-   The core has no revocation list or replay cache; a still-valid authority
-   remains verifiable until relying deployments stop trusting it or it expires.
+   The core has no revocation list. HighAssurance guards reject reuse of
+   previously consumed request IDs, but a stolen key can create new IDs; a
+   still-valid authority remains usable until relying deployments stop
+   trusting it or it expires.
 3. Provision a new agent key using the approved key-protection mechanism,
    issue a new subject-bound authority, and verify a signed request end to end.
 4. Preserve existing evidence and separately identify the compromise window;
@@ -74,11 +76,22 @@ Before deployment, verify that:
 - issuer pins are non-empty, time-bounded, and active;
 - an evidence attester key is configured separately from agent and issuer
   keys, and evidence consumers trust its public key out of band;
+- a durable `ReplayGuard` is shared across all engine instances in the
+  authorization domain, persists claims across restart and failover, rejects
+  duplicates atomically, and fails closed when unavailable or full;
+- replay claims are not automatically expired, evicted, or removed during
+  routine cleanup; backup and restore cannot silently roll back claims;
 - the application fails closed on configuration errors and does not silently
   retry in Development mode.
 
-The library does not authenticate deployment configuration, protect the host
-process, or provide a signed deployment/rollback mechanism.
+The core supplies only the `ReplayGuard` contract, not a storage backend.
+Storage atomicity, durability, access control, capacity monitoring, and
+disaster-recovery behavior must be tested for the selected deployment.
+Restoring an older replay-store backup can re-enable previously consumed
+requests; treat rollback as a security incident and keep dependent actions
+disabled until claims are reconciled. The library does not authenticate
+deployment configuration, protect the host process, or provide a signed
+deployment/rollback mechanism.
 
 ## Offline evidence and authority verification
 
