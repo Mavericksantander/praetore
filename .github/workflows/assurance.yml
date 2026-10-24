@@ -105,6 +105,7 @@ jobs:
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_legacy_replay_claim_without_authorization_is_orphaned_and_blocked
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_prevents_concurrent_duplicate_effects_across_engines
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_rejects_execution_key_reused_with_different_action
+      - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_observability_lists_filters_and_reads_real_transition_history
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_failure_before_dispatch_prevents_effect
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_recovery_never_dispatches_authorized_or_ambiguous_rows
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_reconciliation_only_resolves_when_adapter_proves_outcome

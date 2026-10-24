@@ -4,8 +4,13 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 mod execution;
+mod observability;
 
 pub use execution::PostgresExecutionJournal;
+pub use observability::{
+    ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
+    PostgresObservabilityReader,
+};
 
 pub struct PostgresReplayGuard {
     client: Mutex<Client>,

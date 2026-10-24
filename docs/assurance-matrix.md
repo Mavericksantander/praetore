@@ -22,6 +22,7 @@ absence of defects.
 | Gateway HighAssurance authorization and replay claim commit together | `AtomicAuthorizationCommit`, `AuthorizationEngine::evaluate_with_atomic_commit`, and `PostgresExecutionJournal` | real PostgreSQL rollback-trigger, lost-ack verification, unavailable verification, legacy orphan claim, identical duplicate, conflicting action, and independent-client concurrency tests assert both durable rows and adapter effects | `replay-postgres` |
 | Reference gateway requires the atomic capability, rejects non-HighAssurance engines, and dispatches only evidence-bound ALLOW actions | `crates/praetore-gateway` | adversarial local-tool tests for deny, expired/tampered requests, backend failures, replay, ambiguity, and concurrency; historical receipts are a compile-time type mismatch | `rust` |
 | PostgreSQL execution journal enforces monotonic durable transitions after atomic authorization commit | `crates/praetore-replay-postgres/src/execution.rs` and migrations `0002` / `0003` | real PostgreSQL tests for concurrent gateway instances, conflicting action content, fail-closed journal loss, restart recovery, effect/result-write crash, reconciliation, and terminal-state rollback | `replay-postgres` |
+| Read-only observability reads journal state and actual post-migration transition events | `crates/praetore-observe` and migration `0004_execution_journal_events.sql` | authenticated router tests for access rejection, bounded filters, redaction, evidence status, health, and real PostgreSQL tests for history and SELECT-only role enforcement | `rust`, `replay-postgres` |
 | End-to-end HighAssurance integration stays runnable | `crates/praetore-core/examples/high_assurance.rs` | workspace example command | `rust` |
 | Rust tests, lint, format, patch hygiene | workspace CI workflow | workspace test suite; Clippy `-D warnings`; workspace and fuzz rustfmt; `git diff --check` | `rust` |
 | Software inventory | CycloneDX Cargo integration | SBOMs for all workspace packages and standalone fuzz package uploaded as CI artifacts | `sbom` |
@@ -63,5 +64,10 @@ absence of defects.
   automatically promoted. External effects still require a downstream
   idempotency or authoritative reconciliation contract, and PostgreSQL cannot
   fence an already-issued external call.
+- The observability service binds loopback-only and authenticates API reads
+  with one operator bearer token. It has no operator identity/audit trail,
+  adapter-health telemetry, or remote authentication. The database reader
+  depends on deployment-created SELECT-only credentials and protected local
+  or tunneled PostgreSQL transport.
 - CI produces an SBOM and checksums, but does not sign releases, attest
   artifacts, or protect the hosted runner/build supply chain.
