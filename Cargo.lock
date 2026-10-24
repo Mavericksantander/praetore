@@ -595,6 +595,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "praetore-gateway"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "praetore-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "praetore-python"
 version = "0.1.0"
 dependencies = [
@@ -607,8 +621,13 @@ dependencies = [
 name = "praetore-replay-postgres"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "postgres",
  "praetore-core",
+ "praetore-gateway",
+ "serde_json",
+ "sha2 0.11.0",
+ "time",
  "uuid",
 ]
 

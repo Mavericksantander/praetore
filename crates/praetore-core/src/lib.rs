@@ -16,11 +16,16 @@ pub use action::Action;
 pub use authority::{Authority, AuthorityId};
 pub use authorization::{AuthorizationIntentV2, AuthorizationRequest};
 pub use decision::{Decision, DecisionOutcome};
-pub use engine::{EvaluationMode, HighAssuranceConfig, TrustedAuthorityIssuer};
+pub use engine::{
+    AtomicEvaluationError, EvaluationMode, HighAssuranceConfig, TrustedAuthorityIssuer,
+};
 pub use error::{ErrorKind, PraetoreError, Result};
 pub use evidence::{Evidence, EvidenceAttesterKey};
 pub use freshness::{FreshnessError, FreshnessLease, FreshnessProvider};
 pub use identity::{AgentId, AgentIdentity, AgentKeyFingerprint, AgentKeyPair, VerifiedPublicKey};
 pub use key_rotation::KeyRotationProof;
 pub use policy::{MatchOperator, Policy, PolicyCondition, PolicyEffect, PolicyRule};
-pub use replay::{ReplayGuard, ReplayGuardError};
+pub use replay::{
+    AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
+    ReplayGuardError,
+};

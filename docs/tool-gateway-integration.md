@@ -1,8 +1,10 @@
 # Tool gateway integration pattern
 
 This document defines a conservative deployment pattern for placing PRÆTORE
-at an agent tool-execution boundary. It is guidance for an application-owned
-gateway, not a gateway implementation shipped by this repository.
+at an agent tool-execution boundary. The workspace includes
+[`praetore-gateway`](../crates/praetore-gateway) and an optional
+PostgreSQL-backed journal in `praetore-replay-postgres`. They are reference
+components, not a deployable service or a production-certified gateway.
 
 ## Security objective and scope
 
@@ -28,7 +30,8 @@ mandatory gateway -- authenticate + validate + normalize
      |                         v
      |                 PRÆTORE HighAssurance
      |                         |
-     |                 evidence + decision
+     |                 validate + evaluate + sign;
+     |                 atomically persist replay claim + evidence
      |                         v
      +---- only ALLOW ----> durable execution journal
                                  |
@@ -92,27 +95,37 @@ gateway's action model. The gateway is responsible for that mapping.
    changes the signed bytes, use a gateway challenge/confirmation step so the
    agent signs the gateway-produced request; do not rewrite a previously
    signed request and treat its signature as still valid.
-4. Before calling `evaluate`, durably create or transition the operation's
-   journal record to `AUTHORIZATION_PENDING`, binding the request ID and
-   normalized-operation digest. If this write fails, do not evaluate or
-   dispatch. Then evaluate using the configured HighAssurance engine with
-   externally provisioned pins and caller-owned replay/freshness
-   implementations.
-5. Stop unless the result is exactly `ALLOW`. Do not interpret
+4. Evaluate with the configured HighAssurance engine using externally
+   provisioned pins and caller-owned freshness implementations. The reference
+   gateway requires an `ExecutionJournal` that also implements the core
+   `AtomicAuthorizationCommit` contract. The PostgreSQL implementation commits
+   the replay claim and completed, verified HighAssurance evidence in one
+   transaction; no standalone replay write is used on this path. A legacy
+   replay claim without a matching journal record is blocked as orphaned, not
+   promoted or reconstructed.
+5. The atomic commit must be confirmed before the gateway proceeds. If commit
+   acknowledgement is uncertain, the core queries the same execution identity
+   and validates the durable claim/evidence pair and initial execution state.
+   If PostgreSQL is unavailable, the pair disagrees, or evidence verification
+   fails, do not dispatch. Stop unless the decision is exactly `ALLOW`; do not
+   interpret
    `REQUIRE_APPROVAL` as permission to execute or automatically resume the
    same request after an out-of-band approval.
-6. Verify and durably journal the evidence, expected policy digest, and
-   operation binding as `AUTHORIZED_PENDING` before dispatch. Bind the journal
-   entry to the adapter's idempotency key when the downstream tool supports
-   one. Use an atomic journal transition or exclusive lease so another gateway
-   worker cannot dispatch the same operation concurrently.
+6. Commit the journal transition from `Authorized` to `Dispatched` before
+   invoking the adapter. This prevents another gateway instance from claiming
+   the same journal key; a crash after the transition is ambiguous even if the
+   adapter call had not yet begun. Bind the journal entry to the adapter's
+   idempotency key when the downstream tool supports one.
 7. Invoke the adapter using the exact normalized operation. Record the
    downstream result and transition the journal entry to a terminal state.
    Return the result and receipt without allowing caller-controlled data to
    overwrite the journal record.
 8. Reconcile incomplete records after restart using the adapter's
    authoritative operation status or idempotency facility. Do not blindly
-   replay an operation whose side-effect status cannot be determined.
+   replay an operation whose side-effect status cannot be determined. The
+   gateway exposes `reconcile`, which never dispatches and only resolves an
+   ambiguous record when the adapter reports `Applied` or `NotApplied` under
+   its documented contract.
 
 The gateway should independently verify evidence before treating it as an
 audit receipt: verify integrity, the expected policy digest, the agent intent,
@@ -121,21 +134,143 @@ against externally pinned keys. Do not trust a key embedded only in the
 evidence. Evidence verification does not itself authorize execution; the
 gateway must also ensure it is acting on the exact request it constructed.
 
+## Reference implementation
+
+`praetore-gateway::Gateway` accepts only `AuthorizationRequest`, rejects any
+engine whose mode is not `HighAssurance`, and invokes the core engine for each
+call. It checks the returned evidence integrity and HighAssurance metadata.
+Only an evidence decision exactly equal to `ALLOW` can advance to dispatch.
+The action passed to `ActionDispatcher` is the action inside that newly
+produced evidence; the gateway does not accept a second action argument and
+does not reconstruct tool parameters after authorization.
+
+The adapter API receives an immutable `&Action`. Production adapters must
+validate the allowed action type, target and parameter schema and consume
+those exact values. Agent intent signatures bind the normalized request, so a
+parameter change after signing is rejected by the core. Callers must normalize
+the tool call before signing; this reference library does not authenticate a
+network peer or implement a tool-schema registry.
+
+The adapter also receives an `ExecutionKey` containing the signed request ID
+and logical agent ID, which can be forwarded as a downstream idempotency key.
+The reference gateway deduplicates only that exact key. A caller presenting
+the same semantic operation under a new signed request ID is a distinct
+operation unless the adapter or a higher-level journal applies a separate
+business idempotency rule.
+
+Before calling an adapter, the gateway records the authorization evidence in
+an `ExecutionJournal` and commits a one-time dispatch transition. If either
+write fails, it does not invoke the tool. It records a successful adapter
+result as `Executed` or `Confirmed`; an adapter error is recorded as
+`OutcomeUnknown` and is never retried automatically. `Confirmed` means only
+that the adapter's own confirmation contract succeeded. The optional
+`PostgresExecutionJournal` uses a unique `(agent_id, request_id)` key,
+transactional state changes, and a database transition trigger. PostgreSQL
+integration tests exercise concurrent gateways, restart recovery, and
+ambiguous outcomes with a persistent test adapter. This does not establish
+high availability, replication durability, or suitability for a specific
+production deployment.
+
+### Durable execution states
+
+| Transition | Trigger and precondition | Durable operation | Safe automatic retry? | Restart meaning |
+| --- | --- | --- | --- | --- |
+| absent → `Authorized` | HighAssurance evaluation produced valid evidence and exact `ALLOW` | Insert immutable evidence, request digest, and action digest | No; the core replay claim may already be consumed | No dispatch is known. Recovery closes this as `NotDispatched`. |
+| absent → `NotDispatched` | Evaluation produced DENY or REQUIRE_APPROVAL | Insert evidence and decision | No execution retry from this record | Terminal for this request; approval protocol is not implemented. |
+| `Authorized` → `Dispatched` | The unique journal claim exists and is allowed | Commit state transition before adapter call | No after restart | Dispatch may not have begun; treat as ambiguous and reconcile. |
+| `Dispatched` → `Executed` / `Confirmed` | Adapter returned the corresponding report | Persist output and terminal state | No | Adapter report is durable gateway evidence, not proof beyond its contract. |
+| `Dispatched` → `OutcomeUnknown` | Adapter returned an error or the caller cannot record its result | Persist ambiguity when possible; a crash may leave `Dispatched` | Never redispatch automatically | Reconcile read-only; preserve ambiguity without sufficient adapter evidence. |
+| `Dispatched` / `OutcomeUnknown` → `Failed` | Adapter proves `NotApplied` | Persist terminal state without output | No | No automatic retry: the request/replay claim remains consumed. |
+| `Dispatched` / `OutcomeUnknown` → `Confirmed` | Adapter proves `Applied` and supplies output | Persist output and terminal state | No | Return the reconciled result; do not call the adapter again. |
+
+`Executed`, `Confirmed`, `Failed`, and `NotDispatched` cannot transition back
+to a dispatchable state. `OutcomeUnknown` is intentionally reconcilable, but
+not dispatchable. If the journal is unreachable or a transition commit is not
+confirmed, the gateway does not intentionally call the adapter; if the
+connection drops after PostgreSQL committed, the state is resolved from the
+durable row rather than by retrying execution.
+
+`Gateway::reconcile` is an operator/recovery operation, not a concurrent
+worker loop. Before calling it for `Dispatched` or `OutcomeUnknown`, fence or
+stop every process that could still be inside the original adapter call and
+confirm it cannot resume. The journal does not hold a distributed execution
+lease across adapter dispatch. Concurrently reconciling an `OutcomeUnknown`
+row while its original worker is merely paused could otherwise let an adapter
+report `NotApplied` before that worker later performs the effect.
+
+The PostgreSQL atomic authorization path closes the gap between committing a
+new replay claim and committing its verified authorization record. Legacy
+replay claims without a journal row remain blocked and are never automatically
+promoted. The `Dispatched` write and an external effect still cannot be atomic
+without a shared transaction or a downstream idempotency/status protocol.
+PostgreSQL's `synchronous_commit=on`
+requests local WAL flush for each journal transaction; it does not guarantee
+survival of host loss, asynchronous replica failover, storage corruption, or
+operator rollback. Production use additionally depends on trustworthy clocks,
+externally protected signing/trust keys, database access controls and backups,
+and preventing the agent from reaching alternate execution paths.
+
+Apply migrations in order: `0001_replay_claims.sql`, then
+`0002_execution_journal.sql`, then `0003_execution_replay_link.sql`. The final
+migration adds a `NOT VALID` foreign key so existing rows are not silently
+rewritten or promoted; PostgreSQL still enforces it for new journal inserts.
+Legacy orphan claims are explicitly detected by the atomic provider. Each
+authorization transaction uses the default `READ COMMITTED` isolation level,
+the replay table's `(agent_id, request_id)` primary key to serialize competing
+claims, and locks a matching journal row while classifying an existing claim. The
+transaction inserts the claim and journal evidence together and commits with
+`synchronous_commit=on`; an error before commit rolls back both. If commit
+acknowledgement is uncertain, the provider uses a fresh connection from its
+configured factory to verify the durable pair before execution can continue.
+Rollback of the schema migrations does not restore the previous atomicity
+guarantee; do not run the gateway against an older schema or silently downgrade.
+
+The integration test adapter records its invocation/effect in PostgreSQL in a
+single transaction, so it can authoritatively reconcile by execution key and
+action digest. Real adapters must separately document whether they can prove
+`Applied` or `NotApplied`. If they cannot, operators must retain
+`OutcomeUnknown`, investigate downstream logs/state, and resolve only with
+independent evidence; a stable execution key alone does not provide
+idempotency.
+
+The returned `GatewayReceipt` keeps the core `Evidence` separate from the
+gateway authorization/execution states. The core evidence signature covers
+the authorization decision, not the gateway's later execution result. A
+production deployment must persist and protect the wrapper/journal record
+independently. The compile-fail API example and runtime tests demonstrate
+that an `Evidence` object cannot be passed in place of a new
+`AuthorizationRequest`.
+
+The PostgreSQL journal stores the full serialized evidence and adapter output,
+which can include action parameters or contextual data. Do not place raw
+credentials or secrets in those fields. Restrict database roles, network access,
+retention, exports, and backups; use storage encryption and redaction policies
+appropriate to the data classification.
+
 ## Crash and retry behavior
 
-HighAssurance's `ReplayGuard` atomically consumes an `(agent UUID, request
-UUID)` during `evaluate`, before evidence is returned. This prevents reuse of
-that signed request ID, but it does not record tool execution state and does
-not make evaluation, evidence delivery, and an external side effect atomic.
-The guard's claim must not be removed to make a retry convenient.
+The legacy core `evaluate` API continues to consume a standalone
+`ReplayGuard` claim before returning evidence. Gateway execution does not use
+that path: it calls `evaluate_with_atomic_commit`, which finishes the same
+HighAssurance validation, policy, freshness, signing, and evidence verification
+before asking the atomic provider to persist both records. The gateway's
+`ExecutionJournal` trait requires that provider, so an old non-atomic journal
+cannot be supplied accidentally.
+For source compatibility, the existing HighAssurance engine constructor still
+requires a configured `ReplayGuard`; the gateway's atomic evaluation method
+does not call that guard. It uses the transaction provider instead.
 
 | Failure point | Safe default | Recovery |
 | --- | --- | --- |
-| Before evaluation | No dispatch | If the durable journal proves evaluation was never started, the gateway may proceed with that request. Otherwise leave it unresolved. |
-| During evaluation, or result lost after evaluation | Do not retry with the same ID expecting another evaluation; do not mint a new ID automatically | The pre-evaluation journal record remains `AUTHORIZATION_PENDING`; no dispatch is permitted without a later durable `AUTHORIZED_PENDING` record. Reconcile the record. A new signed request is allowed only after the gateway proves no dispatch occurred and applies current policy/freshness; do not resolve ambiguity by deleting the replay claim. |
-| After evidence/journal commit but before dispatch | Do not blindly dispatch from a stale authorization receipt | Re-evaluate only under a new, freshly signed request after proving no side effect occurred and applying current policy/freshness. |
-| During dispatch or after effect but before result is journaled | Treat outcome as unknown; do not blindly repeat a non-idempotent operation | Query downstream status by idempotency key or operation ID. If status is unavailable, quarantine for reconciliation. |
-| After terminal result is recorded | Return the recorded result for a duplicate gateway call | Do not execute again. Protect terminal records from rollback or deletion that would re-enable execution. |
+| Before atomic commit | No dispatch | Neither claim nor authorization record is committed by the atomic transaction. The same signed request can be resubmitted, subject to full validation and freshness checks. |
+| Atomic commit rolls back | No dispatch | PostgreSQL transaction rollback leaves neither new record. Do not compensate by deleting a claim. |
+| Commit acknowledgement is uncertain | No dispatch until verified | Query by the same identity and verify the durable claim, request/action digests, evidence integrity/signature, and initial execution state. If the query is unavailable or inconsistent, remain blocked; do not re-evaluate to recover. |
+| Legacy claim exists without authorization record | No dispatch | Treat as `OrphanedReplayClaim`; do not promote it or reconstruct evidence. Operator investigation is required. |
+| After atomic commit but before `Dispatched` | No adapter call can have started | Reconcile to `NotDispatched`; the request ID remains consumed and cannot be authorized again. |
+| After journal records `Authorized` but before `Dispatched` | No adapter call can have started | Reconcile to `NotDispatched`; the consumed request ID is not reusable. |
+| After journal commits `Dispatched`, including before adapter invocation | Do not assume the adapter was or was not called | First fence all original workers, then reconcile. The state is ambiguous because the commit precedes the adapter call. |
+| During dispatch or after effect but before result is journaled | Treat outcome as unknown; do not blindly repeat a non-idempotent operation | After fencing original workers, query downstream status by idempotency key or operation ID. If status is unavailable, quarantine for reconciliation. |
+| After terminal result is recorded | A deployment may return the recorded result for a duplicate call; this reference API returns a replay error and has no lookup API | Do not execute again. Protect terminal records from rollback or deletion that would re-enable execution. |
 
 For useful automated recovery, the downstream tool should provide an
 idempotency key or a queryable operation ID that the gateway can bind to its
@@ -144,8 +279,8 @@ available. Without cooperation from the side-effect system, exactly-once
 execution cannot generally be guaranteed across process crashes. A journal
 alone improves auditability but does not close the TOCTOU window.
 
-The current core does not issue execution leases, expose a transactional
-authorization-and-execution API, or store execution state in Evidence v1.
+The core atomic-authorization contract does not include the subsequent
+`Dispatched` transition or external action in the same transaction.
 Freshness is checked at evaluation time, not continuously through dispatch.
 Keep the decision-to-dispatch interval short, enforce a gateway-side deadline,
 and re-evaluate if the deadline or relevant state changes. This narrows but

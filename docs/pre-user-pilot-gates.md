@@ -44,6 +44,9 @@ For each target deployment, retain evidence for every applicable item:
    [tool gateway integration pattern](tool-gateway-integration.md) as a
    baseline for bypass controls, action binding, journaling, and crash
    reconciliation; validate it against the actual downstream tool semantics.
+   The workspace `praetore-gateway` crate is a synchronous reference only; it
+   does not provide a network service or production-grade durable execution
+   journal.
 4. **Time and validity:** monitored trusted time, measured skew, alerting and
    fail-closed behavior when clock health is lost. The library adds no skew
    tolerance and cannot identify a manipulated host clock.

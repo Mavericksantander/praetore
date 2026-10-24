@@ -22,8 +22,8 @@ validation, threat modeling, operational controls, or a security assessment
 appropriate to your environment.
 
 The repository includes the Rust authorization core, an offline evidence
-verifier, verify-only Python bindings, bounded fuzz targets, and an optional
-PostgreSQL replay-guard adapter.
+verifier, verify-only Python bindings, a reference tool-gateway crate,
+bounded fuzz targets, and an optional PostgreSQL replay-guard adapter.
 
 ## What it is — and is not
 
@@ -48,8 +48,10 @@ Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
 deployment responsibilities. A library decision does not stop a tool call
 that bypasses the caller; deployments must mediate protected tools through a
-mandatory enforcement point. See the [tool gateway integration
-pattern](docs/tool-gateway-integration.md), [threat model](docs/threat-model.md),
+mandatory enforcement point. The workspace now includes a synchronous
+reference gateway crate and adversarial local-tool tests, but it has no
+network service or production execution journal. See the [tool gateway
+integration](docs/tool-gateway-integration.md), [threat model](docs/threat-model.md),
 and [pre-user deployment gates](docs/pre-user-pilot-gates.md) before any
 high-consequence pilot.
 
@@ -75,6 +77,7 @@ for signing and verification details.
 * [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
 * [Threat model and residual risks](docs/threat-model.md)
 * [Mandatory tool gateway integration pattern](docs/tool-gateway-integration.md)
+* [Reference gateway crate](crates/praetore-gateway)
 * [Assurance traceability matrix](docs/assurance-matrix.md)
 * [Operations runbooks](docs/operations.md)
 * [Pre-user deployment gates](docs/pre-user-pilot-gates.md)
@@ -136,7 +139,8 @@ praetore/
 │   ├── praetore-core/
 │   ├── praetore-verify/
 │   ├── praetore-python/
-│   └── praetore-replay-postgres/
+│   ├── praetore-replay-postgres/
+│   └── praetore-gateway/
 ├── fuzz/
 ├── packages/praetore-python/
 ├── docs/

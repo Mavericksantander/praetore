@@ -3,6 +3,10 @@ use praetore_core::replay::{ReplayGuard, ReplayGuardError};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+mod execution;
+
+pub use execution::PostgresExecutionJournal;
+
 pub struct PostgresReplayGuard {
     client: Mutex<Client>,
 }
