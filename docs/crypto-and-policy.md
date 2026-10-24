@@ -24,16 +24,30 @@ keys, and authorities outside their validity window.
 
 `AuthorizationEngine::development` is the explicit development constructor.
 `AuthorizationEngine::new` and `with_clock` remain development-mode
-compatibility constructors for the unsigned model. Use `strict` or
+compatibility constructors for the unsigned model and are deprecated. Use
+`strict` or
 `strict_with_clock` when signed authority and signed intent verification are
 needed. For the production profile, use `AuthorizationEngine::production` with
 a `HighAssuranceConfig`: it requires a pinned policy digest, non-empty
 time-bounded issuer pins, an evidence attester key, and a caller-owned durable
-`ReplayGuard`. It verifies that at least one issuer pin is active at
+`ReplayGuard` and `FreshnessProvider`. It verifies that at least one issuer pin is active at
 construction and on each evaluation, and checks the matching issuer pin when
 verifying each authority. Provision all trust data through an independently
 authenticated configuration channel. The engine does not implement PKI,
-issuer discovery, revocation, or key rotation.
+issuer discovery, or revocation storage.
+
+The caller-supplied `FreshnessProvider` is a veto-only check. It receives the
+verified agent key fingerprint, authority ID, pinned policy digest, and the
+evaluation's single clock snapshot. Only a successful lease whose `valid_until`
+is not earlier than that snapshot permits evaluation to continue. Provider
+errors map to stable codes (`FRESHNESS_REVOKED`, `FRESHNESS_UNKNOWN`,
+`FRESHNESS_EXPIRED`, `FRESHNESS_UNAVAILABLE`, and `FRESHNESS_INVALID`); none
+can grant ALLOW. Freshness is only as current and trustworthy as the caller's
+provider and its source. The core adds no network or persistent storage.
+Evidence schema v1 does not record the provider's lease or response, so an
+offline evidence verifier cannot independently prove which freshness result
+was consulted; a deployment needing that audit trail must preserve it outside
+the frozen evidence payload.
 
 `AuthorizationRequest::sign_intent` binds an Ed25519 signature to the request
 ID, identity, authority, action, trace ID, and request context. Strict mode
@@ -87,10 +101,41 @@ uses these exact byte prefixes:
 
 Authority signatures bind `issuer_key_id` as well as the subject key hash.
 Signatures, fingerprints, and key IDs are lowercase hexadecimal. Parsing
-helpers for policy, issuer pins, and evidence reject duplicate JSON object
-keys, trailing data, unsafe integral numbers, and values over the documented
+helpers for policy, issuer pins, authority, and evidence reject duplicate JSON
+object keys, trailing data, unknown fields, unsupported schema/canonical
+versions, unsafe integral numbers, and values over the documented
 size/depth/node limits. Unicode normalization is not performed; byte-distinct
-Unicode strings remain distinct.
+Unicode strings remain distinct. JSON strings are UTF-8 and escaped by
+`serde_json`; floating-point values are emitted using `serde_json::Number`'s
+representation, and arrays preserve their order. These rules plus the
+committed golden vectors define codec v1. A semantic or byte-level change
+requires a new canonical version; v1 payload fields must not be extended.
+
+`Evidence` v1 exposes its schema and codec version, evidence/request UUIDs,
+agent identity, authority, action, decision, trace ID, context, request
+signature, policy digest, attester key metadata/signature, and context hash.
+The integrity hash covers the canonical `EvidenceIntegrityPayload` fields
+listed in `evidence.rs`; the attester signature covers that payload, the
+evidence ID, and context hash. The `context_hash` itself and the attester
+signature are not members of the integrity payload. Evidence deserialization
+is strict at every typed object boundary, so unknown fields are rejected
+rather than ignored.
+
+`AgentId` remains a UUID alias and is not an authenticator. The key-derived
+`AgentKeyFingerprint` is SHA-256 over
+`PRAETORE_AGENT_KEY_V1\0ed25519\0 || verified_public_key_bytes`; its v1 test
+vector is [agent-key-fingerprint-v1.json](golden/agent-key-fingerprint-v1.json).
+
+Key rotation is represented as an ordinary `identity:rotate_key` action.
+`KeyRotationProof` contains the old and new fingerprints, new public key,
+subject, authority ID, and request ID; its proof-of-possession signature uses
+`PRAETORE_KEY_ROTATION_V1\0`. The old key signs the request intent, which binds
+the proof into evidence. `Evidence::verify_key_rotation` checks evidence
+integrity, old-key intent, action type, an ALLOW decision, and the new-key
+proof. It does not establish issuer/attester trust by itself; consumers must
+also verify those signatures against their external pins. This receipt does
+not update an agent registry or revoke the old key; those operations remain
+caller-owned.
 
 Evidence keeps the SHA-256 `context_hash` for integrity and can also carry an
 Ed25519 signature from a separate `EvidenceAttesterKey`. The signature covers
@@ -169,6 +214,10 @@ otherwise the compatibility fallback requires an additional capability named
   HighAssurance replay storage rejects reuse of an already evaluated request
   ID. The core cannot detect compromise or revoke keys; a stolen key can sign
   new request IDs until authorities expire or operators remove trust.
+* **Freshness source compromise or staleness:** HighAssurance asks a
+  caller-provided freshness provider to veto stale/revoked state. A provider
+  that lies, serves stale state as current, or is bypassed by the caller can
+  defeat this check; the core cannot independently establish its source.
 * **Tampered evidence:** `verify_integrity()` detects changes relative to the
   stored SHA-256 hash. Since the hash is not signed, an attacker who can rewrite
   the document can also recompute it. Production evidence is attester-signed;

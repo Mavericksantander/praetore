@@ -90,7 +90,9 @@ The `new` and `with_clock` constructors are compatibility Development-mode
 APIs. For signature-checked evaluation use `strict`; for the production
 high-assurance profile use `AuthorizationEngine::production` with a pinned
 policy digest, bounded issuer pins, a separate evidence attester key, and a
-durable caller-owned replay guard. Evaluation remains offline and in-process.
+durable caller-owned replay guard plus a caller-supplied freshness provider.
+The `new` and `with_clock` compatibility constructors are deprecated.
+Evaluation remains offline and in-process.
 The core does not provide PKI, revocation, secure clocking, deployment
 integrity, or host isolation.
 
@@ -254,7 +256,8 @@ and issuer trust; attested evidence; and a replay guard. Its ephemeral keys and
 in-memory replay storage are for demonstration only. Production deployments
 must use protected keys and a durable, atomic `ReplayGuard` shared by every
 engine instance in the authorization domain. A guard outage or duplicate
-request fails closed.
+request fails closed. HighAssurance also requires a `FreshnessProvider`; the
+example provider is only a demonstration and is not a revocation service.
 
 ## Security
 

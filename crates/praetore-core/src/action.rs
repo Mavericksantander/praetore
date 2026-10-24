@@ -10,6 +10,7 @@ const MAX_ACTION_NAME_BYTES: usize = 256;
 const MAX_ACTION_TARGET_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Action {
     pub action_type: String,
     pub capability: Option<String>,

@@ -385,6 +385,7 @@ dependencies = [
  "praetore-core",
  "serde_json",
  "time",
+ "uuid",
 ]
 
 [[package]]

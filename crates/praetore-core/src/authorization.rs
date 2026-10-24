@@ -17,6 +17,7 @@ const MAX_CONTEXT_KEYS: usize = 128;
 const MAX_CONTEXT_KEY_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizationRequest {
     pub request_id: Uuid,
     pub agent: AgentIdentity,
@@ -403,5 +404,40 @@ mod tests {
             request.sign_intent(&other_keypair),
             Err(crate::PraetoreError::IdentityVerificationFailed)
         ));
+    }
+
+    #[test]
+    fn request_intent_matches_v1_golden_vector() {
+        let golden: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/golden/trust-chain-v1.json")).unwrap();
+        let agent_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let agent_id: AgentId =
+            serde_json::from_str("\"00000000-0000-0000-0000-000000000002\"").unwrap();
+        let agent = agent_key.identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "golden-issuer", vec!["data:read".into()])
+                .with_validity(crate::authority::Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2027-01-01T00:00:00Z".into()),
+                });
+        authority.id = serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"").unwrap();
+        authority
+            .sign_for_agent(&AgentKeyPair::from_secret_bytes(&[8; 32]), &agent)
+            .unwrap();
+        let action = Action::new("read_data", Some("dataset".into()), json!({}))
+            .unwrap()
+            .with_capability("data:read");
+        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+
+        assert_eq!(
+            String::from_utf8(request.canonical_intent_bytes().unwrap()).unwrap(),
+            golden["intent_signing_payload"].as_str().unwrap()
+        );
+        request.sign_intent(&agent_key).unwrap();
+        assert_eq!(
+            request.agent_signature.as_deref(),
+            golden["intent_signature_hex"].as_str()
+        );
     }
 }

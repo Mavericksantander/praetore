@@ -22,8 +22,10 @@ cargo audit
 cargo audit --file fuzz/Cargo.lock
 ```
 
-The canonical policy digest golden vector is checked by core unit tests in the
-workspace test command above.
+Canonical policy digest, authority, intent, evidence, and agent-key
+fingerprint golden vectors are checked by core unit tests in the workspace
+test command above. Treat `docs/golden/*-v1.json` as compatibility fixtures;
+codec changes require a deliberate versioned migration.
 
 The PostgreSQL replay adapter's integration tests need a disposable database.
 The CI job provides one and runs:
@@ -54,6 +56,7 @@ cargo +nightly fuzz run --fuzz-dir fuzz policy_parse -- -max_total_time=10
 cargo +nightly fuzz run --fuzz-dir fuzz authority_verify -- -max_total_time=10
 cargo +nightly fuzz run --fuzz-dir fuzz evidence_verify -- -max_total_time=10
 cargo +nightly fuzz run --fuzz-dir fuzz engine_evaluate_dev -- -max_total_time=10
+cargo +nightly fuzz run --fuzz-dir fuzz engine_evaluate_high_assurance -- -max_total_time=10
 ```
 
 Remove the time limit for longer local campaigns. Review and minimize fuzz

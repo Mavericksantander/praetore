@@ -25,8 +25,8 @@
 - Offline `praetore-verify` commands for evidence, policy digests, and signed
   authorities, with machine-readable reason codes and explicit external pins.
 - Bounded libFuzzer targets for canonical JSON, policy parsing, authority
-  verification, evidence verification, and Development-mode evaluation, seeded
-  from committed goldens and deterministic test fixtures.
+  verification, evidence verification, and Development/HighAssurance
+  evaluation, seeded from committed goldens and deterministic test fixtures.
 - Pull-request/main CI gates for workspace tests, strict Clippy, formatting,
   RustSec audit, bounded fuzz smoke, Python verification tests, and CycloneDX
   SBOM artifacts; release tags produce a checksummed verifier binary artifact.
@@ -36,13 +36,18 @@
   duplicate requests and unavailable replay storage fail closed.
 - Optional PostgreSQL replay-guard adapter with atomic primary-key claims and
   CI integration tests for concurrency and persistence across clients.
+- Strict unknown-field rejection for v1 typed documents, deterministic
+  `AgentKeyFingerprint`, and proof-carrying key rotation evidence that does
+  not imply revocation.
+- Caller-supplied, veto-only freshness checks required by HighAssurance, with
+  stable machine-readable failure codes.
 
 ### Compatibility notes
 
 - `AuthorizationEngine::evaluate(request) -> Result<Evidence>` is unchanged.
-- `new` and `with_clock` remain development-mode constructors and continue to
-  permit unsigned authorities. Production callers should configure strict
-  issuer trust.
+- `new` and `with_clock` remain deprecated development-mode compatibility
+  constructors and continue to permit unsigned authorities. Production callers
+  should use `AuthorizationEngine::production` with `HighAssuranceConfig`.
 - Public structs gained fields. Struct-literal construction may require source
   changes; constructors and builders are the preferred API ahead of v1.
 - `Action::with_capability` separates action type from required authority
@@ -55,6 +60,8 @@
 - HighAssurance callers must attach a durable, atomic `ReplayGuard` to
   `HighAssuranceConfig`; implementers must retain claims and fail closed on
   duplicate IDs or storage failure. Strict and Development modes are unchanged.
+- HighAssurance callers must also attach a `FreshnessProvider`; non-current,
+  unknown, revoked, expired, or unavailable results fail closed.
 - PostgreSQL support is an optional crate. The deployment owns client
   construction, TLS, database provisioning, synchronous replication, backups,
   capacity monitoring, and application-role privileges.

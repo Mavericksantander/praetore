@@ -38,6 +38,7 @@ impl DecisionOutcome {
 
 /// A single policy rule that contributed to a decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecisionContribution {
     pub rule_id: String,
     pub outcome: DecisionOutcome,
@@ -59,6 +60,7 @@ impl DecisionContribution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Decision {
     pub outcome: DecisionOutcome,
     pub reason: String,

@@ -14,6 +14,11 @@ pub enum ErrorKind {
     EvidenceFailure,
     ReplayDetected,
     ReplayGuardFailure,
+    FreshnessRevoked,
+    FreshnessUnknown,
+    FreshnessExpired,
+    FreshnessUnavailable,
+    FreshnessInvalid,
 }
 
 #[derive(Debug, Error)]
@@ -56,6 +61,9 @@ pub enum PraetoreError {
 
     #[error("replay protection storage is unavailable")]
     ReplayGuardUnavailable,
+
+    #[error("freshness check failed")]
+    FreshnessCheckFailed(crate::freshness::FreshnessError),
 }
 
 impl PraetoreError {
@@ -75,6 +83,21 @@ impl PraetoreError {
             Self::EvidenceError(_) => ErrorKind::EvidenceFailure,
             Self::ReplayDetected => ErrorKind::ReplayDetected,
             Self::ReplayGuardUnavailable => ErrorKind::ReplayGuardFailure,
+            Self::FreshnessCheckFailed(crate::freshness::FreshnessError::Revoked) => {
+                ErrorKind::FreshnessRevoked
+            }
+            Self::FreshnessCheckFailed(crate::freshness::FreshnessError::Unknown) => {
+                ErrorKind::FreshnessUnknown
+            }
+            Self::FreshnessCheckFailed(crate::freshness::FreshnessError::Expired) => {
+                ErrorKind::FreshnessExpired
+            }
+            Self::FreshnessCheckFailed(crate::freshness::FreshnessError::Unavailable) => {
+                ErrorKind::FreshnessUnavailable
+            }
+            Self::FreshnessCheckFailed(crate::freshness::FreshnessError::InvalidResponse) => {
+                ErrorKind::FreshnessInvalid
+            }
         }
     }
 
@@ -92,6 +115,11 @@ impl PraetoreError {
             ErrorKind::EvidenceFailure => "EVIDENCE_FAIL",
             ErrorKind::ReplayDetected => "REPLAY_DETECTED",
             ErrorKind::ReplayGuardFailure => "REPLAY_GUARD_FAIL",
+            ErrorKind::FreshnessRevoked => "FRESHNESS_REVOKED",
+            ErrorKind::FreshnessUnknown => "FRESHNESS_UNKNOWN",
+            ErrorKind::FreshnessExpired => "FRESHNESS_EXPIRED",
+            ErrorKind::FreshnessUnavailable => "FRESHNESS_UNAVAILABLE",
+            ErrorKind::FreshnessInvalid => "FRESHNESS_INVALID",
         }
     }
 }
@@ -119,5 +147,38 @@ mod tests {
             unavailable.to_string(),
             "replay protection storage is unavailable"
         );
+    }
+
+    #[test]
+    fn freshness_failures_have_stable_machine_codes() {
+        let cases = [
+            (
+                crate::freshness::FreshnessError::Revoked,
+                "FRESHNESS_REVOKED",
+            ),
+            (
+                crate::freshness::FreshnessError::Unknown,
+                "FRESHNESS_UNKNOWN",
+            ),
+            (
+                crate::freshness::FreshnessError::Expired,
+                "FRESHNESS_EXPIRED",
+            ),
+            (
+                crate::freshness::FreshnessError::Unavailable,
+                "FRESHNESS_UNAVAILABLE",
+            ),
+            (
+                crate::freshness::FreshnessError::InvalidResponse,
+                "FRESHNESS_INVALID",
+            ),
+        ];
+
+        for (error, expected_code) in cases {
+            assert_eq!(
+                PraetoreError::FreshnessCheckFailed(error).code(),
+                expected_code
+            );
+        }
     }
 }

@@ -7,6 +7,9 @@ use crate::{
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::OsRng;
+use sha2::{Digest, Sha256};
+
+const AGENT_KEY_FINGERPRINT_DOMAIN: &[u8] = b"PRAETORE_AGENT_KEY_V1\0ed25519\0";
 
 pub(crate) const REQUEST_INTENT_DOMAIN: &[u8] = b"PRAETORE_INTENT_V1\0";
 pub const PRAETORE_MOTTO: &str = "Be Bold. The Mighty Forces Will Come to Your Aid.";
@@ -39,6 +42,7 @@ impl Default for AgentId {
 /// The serialized key remains algorithm-tagged bytes for interoperability.
 /// Call `verified_public_key` before using Ed25519 verification operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentIdentity {
     pub id: AgentId,
     pub public_key: Vec<u8>,
@@ -100,6 +104,32 @@ impl AgentIdentity {
         }
 
         VerifiedPublicKey::from_bytes(&self.public_key)
+    }
+
+    pub fn key_fingerprint(&self) -> Result<AgentKeyFingerprint> {
+        Ok(AgentKeyFingerprint::from_verified_key(
+            &self.verified_public_key()?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AgentKeyFingerprint([u8; 32]);
+
+impl AgentKeyFingerprint {
+    pub fn from_verified_key(key: &VerifiedPublicKey) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(AGENT_KEY_FINGERPRINT_DOMAIN);
+        hasher.update(key.as_bytes());
+        Self(hasher.finalize().into())
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
     }
 }
 
@@ -202,6 +232,27 @@ mod tests {
         let id = AgentId::new();
 
         assert!(!id.as_uuid().is_nil());
+    }
+
+    #[test]
+    fn key_fingerprint_is_derived_from_verified_public_key() {
+        let key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let identity = key.identity(AgentId::new());
+        let fingerprint = identity.key_fingerprint().unwrap();
+
+        assert_eq!(
+            fingerprint,
+            AgentKeyFingerprint::from_verified_key(&key.public_key())
+        );
+        assert_eq!(
+            fingerprint.to_hex(),
+            "57caa81d5a974ba0d7f9c17ba230b54284fc656fd492df2f8bbe52eb8f23f67e"
+        );
+        assert_eq!(fingerprint.as_bytes().len(), 32);
+        assert_eq!(fingerprint.to_hex().len(), 64);
+        let second_alias = key.identity(AgentId::new());
+        assert_ne!(identity.id, second_alias.id);
+        assert_eq!(fingerprint, second_alias.key_fingerprint().unwrap());
     }
 
     #[test]
