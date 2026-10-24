@@ -41,6 +41,14 @@ impl Default for AgentId {
 ///
 /// The serialized key remains algorithm-tagged bytes for interoperability.
 /// Call `verified_public_key` before using Ed25519 verification operations.
+///
+/// ```
+/// use praetore_core::{AgentId, AgentKeyPair};
+///
+/// let key_pair = AgentKeyPair::generate();
+/// let identity = key_pair.identity(AgentId::new());
+/// assert!(identity.verified_public_key().is_ok());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIdentity {

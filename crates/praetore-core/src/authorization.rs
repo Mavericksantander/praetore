@@ -18,6 +18,11 @@ const MAX_CONTEXT_KEY_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// An agent's request to authorize one action under one delegated authority.
+///
+/// Strict and HighAssurance engines require the agent to sign the intent with
+/// the key bound to the authority's subject. See the runnable
+/// `quickstart` example for issuance, signing, evaluation, and verification.
 pub struct AuthorizationRequest {
     pub request_id: Uuid,
     pub agent: AgentIdentity,

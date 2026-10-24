@@ -5,17 +5,78 @@
 [![Python](https://img.shields.io/badge/Python-bindings-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-replay%20adapter-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-Trusted authorization and governance infrastructure for autonomous and AI-enabled systems.
+Deterministic authorization and governance primitives for autonomous and
+AI-enabled systems.
 
-PRÆTORE is the core software infrastructure of PRÆTOR TECHNOLOGIES, designed to provide a deterministic foundation for authorization, policy enforcement, decision-making, and verifiable evidence.
+PRÆTORE Core is a Rust library for evaluating signed authorization requests
+against declarative policy and delegated authority. It keeps identity,
+authority, policy, decisions, and evidence as separate concepts and defaults
+to deny when a policy has no applicable rule.
 
 ## Status
 
-PRÆTORE is currently under active development. The repository contains the
-Rust authorization core, offline verification CLI, bounded fuzz targets,
-verify-only Python bindings, and optional PostgreSQL replay adapter.
+**Production readiness: not yet established.** PRÆTORE is under active
+development and has not been independently certified or accredited. Passing
+the repository's tests and assurance gates is not a substitute for deployment
+validation, threat modeling, operational controls, or a security assessment
+appropriate to your environment.
 
-The project is being developed from a security-first and verification-oriented foundation rather than as a conventional application framework.
+The repository includes the Rust authorization core, an offline evidence
+verifier, verify-only Python bindings, bounded fuzz targets, and an optional
+PostgreSQL replay-guard adapter.
+
+## What it is — and is not
+
+**PRÆTORE is:**
+
+* An embeddable, deterministic authorization kernel that evaluates requests
+  locally and produces verifiable evidence.
+* A library with caller-supplied clocks, trust pins, freshness checks, and
+  replay protection in its high-assurance profile.
+* A security boundary between the requesting agent, delegated authority,
+  policy decision, and evidence receipt.
+
+**PRÆTORE is not:**
+
+* A PKI, identity registry, revocation database, secure clock, or key
+  management system.
+* A network service, policy distribution control plane, or action executor.
+* A sandbox or isolation boundary for the host that runs it.
+* A certification, accreditation, or guarantee that a deployment is safe.
+
+Trust anchors, key custody, freshness source, replay storage, host hardening,
+and the atomic relationship between authorization and action execution remain
+deployment responsibilities. Review the [threat model](docs/threat-model.md)
+and [pre-user deployment gates](docs/pre-user-pilot-gates.md) before any
+high-consequence pilot.
+
+## Quick start
+
+Run the self-contained example from the repository root:
+
+```sh
+cargo run -p praetore-core --example quickstart
+```
+
+It creates an agent keypair, issues an authority bound to that key, signs
+requests, evaluates them in both **Strict** and **HighAssurance** modes, and
+verifies the resulting evidence. The example uses ephemeral keys, an
+in-memory replay guard, and a demonstration freshness provider; none is
+suitable for production. See the [policy language guide](docs/policy-language.md)
+for declarative rules and the [crypto and policy guide](docs/crypto-and-policy.md)
+for signing and verification details.
+
+## Documentation
+
+* [Policy language and evaluation semantics](docs/policy-language.md)
+* [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
+* [Threat model and residual risks](docs/threat-model.md)
+* [Assurance traceability matrix](docs/assurance-matrix.md)
+* [Operations runbooks](docs/operations.md)
+* [Pre-user deployment gates](docs/pre-user-pilot-gates.md)
+* [Architecture decision records](docs/adr/README.md)
+* [Offline verifier CLI](#verify-evidence-offline)
+* [Contributing and validation](CONTRIBUTING.md)
 
 ## Core Concepts
 
@@ -86,22 +147,23 @@ praetore/
 
 ## Security and production use
 
-The `new` and `with_clock` constructors are compatibility Development-mode
-APIs. For signature-checked evaluation use `strict`; for the production
-high-assurance profile use `AuthorizationEngine::production` with a pinned
-policy digest, bounded issuer pins, a separate evidence attester key, and a
-durable caller-owned replay guard plus a caller-supplied freshness provider.
-The `new` and `with_clock` compatibility constructors are deprecated.
-Evaluation remains offline and in-process.
-The core does not provide PKI, revocation, secure clocking, deployment
-integrity, or host isolation.
+There are three evaluation modes; choose deliberately:
 
-See [the crypto and policy guide](docs/crypto-and-policy.md), [the threat
-model](docs/threat-model.md), [the operations runbooks](docs/operations.md),
-and the [architecture decisions](docs/adr/README.md) before production
-integration. High-consequence pilots must also close the
-[pre-user deployment gates](docs/pre-user-pilot-gates.md); these documents do
-not represent certification or accreditation.
+| Mode | Intended use | Security checks |
+| --- | --- | --- |
+| **Development** | Local development and compatibility | Allows unsigned authorities; no issuer pins, policy pin, attester, replay guard, or freshness provider. Never use as a production boundary. |
+| **Strict** | Signature-checked offline evaluation | Requires a signed authority from an explicitly pinned issuer, subject-key binding, and a signed agent request intent. Does not require the HighAssurance policy pin, evidence attestation, replay guard, or freshness provider. |
+| **HighAssurance** | Strongest profile provided by this library | Strict checks plus pinned policy digest, time-bounded issuer pins, signed evidence attestation, caller-supplied freshness provider, and caller-owned replay guard. |
+
+Use `AuthorizationEngine::production` for HighAssurance. The deprecated
+`new` and `with_clock` constructors remain Development-mode compatibility
+APIs. The crate runs offline and in-process; it does not supply PKI, revocation
+storage, a secure clock, deployment integrity, host isolation, or atomic action
+execution.
+
+See the linked documentation above before production integration. High-
+consequence pilots must close the [pre-user deployment gates](docs/pre-user-pilot-gates.md);
+these documents do not represent certification or accreditation.
 
 ## Development
 
@@ -180,23 +242,6 @@ The hash is not a signature: anyone able to modify an evidence document can
 recompute it. Signed authorities and optional signed request intents use
 Ed25519 and are described in [Crypto and policy semantics](docs/crypto-and-policy.md).
 
-## Crypto and policy APIs
-
-Use `AgentKeyPair::generate()` to create Ed25519 keypairs, sign authorities
-for a subject with `Authority::sign_for_agent`, and construct
-`AuthorizationEngine::strict` with explicit issuer-name/public-key trust
-bindings for production evaluation. Strict mode also requires an agent-signed
-request intent. The named `AuthorizationEngine::development` and compatibility
-`AuthorizationEngine::new` constructors permit unsigned authorities.
-
-Policy rules support typed exact, string-prefix, set-membership, and numeric
-conditions against action parameters and request context. Missing fields or
-type mismatches never satisfy a condition. Action types and authority
-capabilities are separate: `Action::with_capability` declares the required
-capability; when omitted, the legacy behavior uses the action type as the
-capability name. See the linked documentation for canonical serialization,
-migration guidance, and examples.
-
 ## Verify evidence offline
 
 Install the verifier with `cargo install --path crates/praetore-verify --locked`
@@ -243,21 +288,21 @@ See [the assurance traceability matrix](docs/assurance-matrix.md) for
 requirements, tests, and CI job mapping, and [CONTRIBUTING.md](CONTRIBUTING.md)
 for exact local validation and release commands.
 
-## End-to-end high-assurance example
+## End-to-end examples
 
-Run the local example with:
+Run the combined Strict and HighAssurance example:
 
 ```sh
-cargo run -p praetore-core --example high_assurance
+cargo run -p praetore-core --example quickstart
 ```
 
-It demonstrates signed identity, authority, and request intent; pinned policy
-and issuer trust; attested evidence; and a replay guard. Its ephemeral keys and
-in-memory replay storage are for demonstration only. Production deployments
-must use protected keys and a durable, atomic `ReplayGuard` shared by every
-engine instance in the authorization domain. A guard outage or duplicate
-request fails closed. HighAssurance also requires a `FreshnessProvider`; the
-example provider is only a demonstration and is not a revocation service.
+For the narrower HighAssurance-only example, run
+`cargo run -p praetore-core --example high_assurance`. Both examples use
+ephemeral keys and demonstration adapters. Production deployments must use
+protected keys, a durable atomic `ReplayGuard` shared by every engine instance
+in the authorization domain, and a real freshness source. Duplicate requests,
+storage outages, or freshness failures fail closed; neither example is a
+revocation service.
 
 ## Security
 

@@ -4,6 +4,9 @@
 
 ### Added
 
+- A runnable end-to-end quick start covering signed identity, authority,
+  request intents, Strict and HighAssurance evaluation, and evidence
+  verification; expanded mode guidance and declarative policy documentation.
 - Ed25519 agent key generation, typed verified public keys, subject-key-bound
   authority issuance/verification, signed request intents, and strict engine
   issuer trust bindings.

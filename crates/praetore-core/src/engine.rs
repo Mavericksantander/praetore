@@ -269,6 +269,23 @@ impl Clock for FixedClock {
 }
 
 #[derive(Clone)]
+/// Coordinates request validation, authority checks, policy evaluation, and
+/// evidence creation.
+///
+/// Use `strict` for signed authority and request verification, or
+/// `production` with [`HighAssuranceConfig`] for the strongest profile this
+/// library provides. Development mode permits unsigned authorities and is not
+/// a production security boundary.
+///
+/// ```
+/// use praetore_core::{engine::{AuthorizationEngine, EvaluationMode}, Policy};
+///
+/// let engine = AuthorizationEngine::development(Policy::new("local", 1, vec![]));
+/// assert_eq!(engine.mode(), EvaluationMode::Development);
+/// ```
+///
+/// The complete signed-request examples are runnable with
+/// `cargo run -p praetore-core --example quickstart`.
 pub struct AuthorizationEngine {
     policy: Policy,
     clock: Arc<dyn Clock>,

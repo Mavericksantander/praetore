@@ -123,6 +123,20 @@ impl Validity {
 ///
 /// Authority answers "what may this identity potentially do?"
 /// Authorization answers "may it do this specific action now?"
+///
+/// ```
+/// use praetore_core::{AgentId, AgentKeyPair, Authority};
+///
+/// let agent_key = AgentKeyPair::generate();
+/// let agent = agent_key.identity(AgentId::new());
+/// let issuer_key = AgentKeyPair::generate();
+/// let mut authority =
+///     Authority::new(agent.id.clone(), "example-issuer", vec!["data:read".into()]);
+/// authority.sign_for_agent(&issuer_key, &agent).expect("sign authority");
+/// authority
+///     .verify_subject_identity(&agent)
+///     .expect("authority is bound to this agent key");
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Authority {

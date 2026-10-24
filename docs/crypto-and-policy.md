@@ -4,6 +4,32 @@ This document describes the cryptographic and declarative policy surfaces in
 `praetore-core`. The core performs no network access and does not distribute
 trust anchors.
 
+## Evaluation modes
+
+Choose the mode explicitly; "production" is the HighAssurance constructor
+name, not a certification or a guarantee about the caller's deployment.
+
+| Mode | Behavior | Required caller configuration |
+| --- | --- | --- |
+| Development | Allows unsigned authorities for local compatibility. If a request signature is present, it must still verify. | Policy only; no issuer trust, policy pin, evidence attester, replay guard, or freshness provider. |
+| Strict | Verifies the authority signature against an exact issuer pin, authority validity and subject-key binding, plus the agent-signed request intent. | Non-empty issuer pins. Policy digest pinning, attestation, replay protection, and freshness are not provided by this mode. |
+| HighAssurance | Performs Strict checks and additionally binds the configured policy digest, signs the evidence, checks caller-supplied freshness, and claims each `(agent UUID, request UUID)` once. | Time-bounded issuer pins, pinned policy digest, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
+
+`AuthorizationEngine::development` and
+`AuthorizationEngine::development_with_clock` are explicit development
+constructors. The compatibility constructors `new` and `with_clock` are
+deprecated; they preserve their Development behavior. Use `strict` /
+`strict_with_clock` when signature validation is required, or `production` /
+`production_with_clock` with `HighAssuranceConfig` for the strongest profile.
+The runnable [`quickstart` example](../crates/praetore-core/examples/quickstart.rs)
+shows both Strict and HighAssurance paths.
+
+None of these modes supplies an authoritative clock, identity registry, key
+custody, revocation database, host isolation, or atomic execution of the
+authorized side effect. HighAssurance uses caller-provided replay and
+freshness implementations; their correctness, durability, and trustworthiness
+are deployment responsibilities.
+
 ## Agent keys and authority signatures
 
 `AgentKeyPair::generate()` creates an Ed25519 keypair from the operating
