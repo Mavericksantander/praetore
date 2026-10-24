@@ -397,7 +397,7 @@ fn verify_authorization_pair(
     Ok(())
 }
 
-fn validate_evidence(
+pub(super) fn validate_evidence(
     key: ExecutionKey,
     evidence: &Evidence,
     authorization: AuthorizationStatus,
@@ -445,7 +445,7 @@ fn authorization_from_evidence(
     }
 }
 
-fn execution_digests(evidence: &Evidence) -> Result<(String, String), JournalError> {
+pub(super) fn execution_digests(evidence: &Evidence) -> Result<(String, String), JournalError> {
     let action_digest = action_digest(&evidence.action).map_err(|_| JournalError::InvalidRecord)?;
 
     Ok((request_digest_for_evidence(evidence)?, action_digest))
@@ -484,7 +484,7 @@ fn digest(domain: &[u8], canonical: &[u8]) -> String {
     hex::encode(hash.finalize())
 }
 
-fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecord, JournalError> {
+pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecord, JournalError> {
     let request_digest: String = row.get(0);
     let action_digest: String = row.get(1);
     if !is_digest(&request_digest) || !is_digest(&action_digest) {
@@ -513,7 +513,7 @@ fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecord, JournalE
     })
 }
 
-fn is_digest(value: &str) -> bool {
+pub(super) fn is_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -534,7 +534,7 @@ fn is_terminal_db(status: &str) -> bool {
     matches!(status, "executed" | "confirmed" | "failed")
 }
 
-fn authorization_as_db(status: AuthorizationStatus) -> &'static str {
+pub(super) fn authorization_as_db(status: AuthorizationStatus) -> &'static str {
     match status {
         AuthorizationStatus::Allowed => "allowed",
         AuthorizationStatus::RequiresApproval => "requires_approval",
@@ -542,7 +542,7 @@ fn authorization_as_db(status: AuthorizationStatus) -> &'static str {
     }
 }
 
-fn parse_authorization(value: &str) -> Result<AuthorizationStatus, JournalError> {
+pub(super) fn parse_authorization(value: &str) -> Result<AuthorizationStatus, JournalError> {
     match value {
         "allowed" => Ok(AuthorizationStatus::Allowed),
         "requires_approval" => Ok(AuthorizationStatus::RequiresApproval),
@@ -551,7 +551,7 @@ fn parse_authorization(value: &str) -> Result<AuthorizationStatus, JournalError>
     }
 }
 
-fn execution_as_db(status: ExecutionStatus) -> &'static str {
+pub(super) fn execution_as_db(status: ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::NotDispatched => "not_dispatched",
         ExecutionStatus::Authorized => "authorized",
@@ -563,7 +563,7 @@ fn execution_as_db(status: ExecutionStatus) -> &'static str {
     }
 }
 
-fn parse_execution(value: &str) -> Result<ExecutionStatus, JournalError> {
+pub(super) fn parse_execution(value: &str) -> Result<ExecutionStatus, JournalError> {
     match value {
         "not_dispatched" => Ok(ExecutionStatus::NotDispatched),
         "authorized" => Ok(ExecutionStatus::Authorized),

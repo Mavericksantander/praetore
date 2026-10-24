@@ -1,0 +1,30 @@
+[package]
+name = "praetore-observe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "Authenticated read-only observability API and UI for PRÆTORE gateway journals."
+
+[dependencies]
+axum = "0.8"
+hex = "0.4.3"
+praetore-core = { path = "../praetore-core" }
+praetore-gateway = { path = "../praetore-gateway" }
+praetore-replay-postgres = { path = "../praetore-replay-postgres" }
+postgres = { version = "0.19", features = ["with-uuid-1"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+subtle = "2.6"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18", features = ["serde"] }
+
+[dev-dependencies]
+serde_urlencoded = "0.7"
+tower = { version = "0.5", features = ["util"] }

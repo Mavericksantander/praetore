@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>PRÆTORE / Control Plane</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark">P</span><span>PRÆTORE <small>CONTROL PLANE</small></span></div>
+    <div class="environment"><i></i> READ-ONLY OBSERVABILITY</div>
+  </header>
+  <main>
+    <section class="auth-panel">
+      <label for="token">Operator read token</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="32-byte hex bearer token">
+      <button id="connect">Connect</button>
+      <span id="auth-state" role="status">Disconnected</span>
+    </section>
+    <nav aria-label="Observability views">
+      <button class="tab active" data-view="operations">Operations</button>
+      <button class="tab" data-view="health">System health</button>
+      <button class="tab" data-view="assurance">Assurance</button>
+    </nav>
+    <section id="notice" class="notice" role="status">Authenticate to query the read-only journal.</section>
+    <section id="operations" class="view">
+      <div class="section-head">
+        <div><p class="eyebrow">EXECUTION JOURNAL</p><h1>Operations</h1></div>
+        <div class="pager"><button id="prev">Previous</button><span id="page-label">Page 1</span><button id="next">Next</button></div>
+      </div>
+      <form id="filters" class="filters">
+        <label>Agent ID<input name="agent_id" placeholder="UUID"></label>
+        <label>Decision<select name="decision"><option value="">Any decision</option><option value="allowed">Allowed</option><option value="requires_approval">Requires approval</option><option value="denied">Denied</option></select></label>
+        <label>Execution state<select name="execution_state"><option value="">Any state</option><option>authorized</option><option>dispatched</option><option>outcome_unknown</option><option>executed</option><option>confirmed</option><option>failed</option><option>not_dispatched</option></select></label>
+        <label>From (RFC 3339)<input name="from" placeholder="2026-10-24T00:00:00Z"></label>
+        <label>To (RFC 3339)<input name="to" placeholder="2026-10-25T00:00:00Z"></label>
+        <button type="submit">Apply filters</button>
+      </form>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Recorded</th><th>Agent</th><th>Action</th><th>Decision</th><th>Execution</th><th>Evidence</th></tr></thead>
+        <tbody id="operations-body"><tr><td colspan="6" class="empty">Connect to load operations.</td></tr></tbody>
+      </table></div>
+      <div id="detail" class="detail-panel hidden"></div>
+    </section>
+    <section id="health" class="view hidden">
+      <div class="section-head"><div><p class="eyebrow">LIVE PROBES</p><h1>System health</h1></div><button id="refresh-health">Refresh</button></div>
+      <div id="health-cards" class="cards"></div>
+      <p class="fine">A successful PostgreSQL probe is a point-in-time connectivity signal. Adapter health and journal error counts are not instrumented by this service.</p>
+    </section>
+    <section id="assurance" class="view hidden">
+      <div class="section-head"><div><p class="eyebrow">BOUNDED CLAIMS</p><h1>Assurance</h1></div></div>
+      <div id="assurance-cards" class="assurance-grid"></div>
+    </section>
+    <footer>Evidence status describes a historical receipt. It is not current authorization or proof of an external effect.</footer>
+  </main>
+</body>
+</html>

@@ -40,7 +40,8 @@ bounded fuzz targets, and an optional PostgreSQL replay-guard adapter.
 
 * A PKI, identity registry, revocation database, secure clock, or key
   management system.
-* A network service, policy distribution control plane, or action executor.
+* A general-purpose network service, policy distribution control plane, or
+  administrative action executor.
 * A sandbox or isolation boundary for the host that runs it.
 * A certification, accreditation, or guarantee that a deployment is safe.
 
@@ -49,9 +50,11 @@ and the atomic relationship between authorization and action execution remain
 deployment responsibilities. A library decision does not stop a tool call
 that bypasses the caller; deployments must mediate protected tools through a
 mandatory enforcement point. The workspace now includes a synchronous
-reference gateway crate and adversarial local-tool tests, but it has no
-network service or production execution journal. See the [tool gateway
+reference gateway crate, a durable PostgreSQL execution journal, and a
+loopback-only authenticated read-only observability service; it is not a
+production administration plane. See the [tool gateway
 integration](docs/tool-gateway-integration.md), [threat model](docs/threat-model.md),
+[observability MVP](docs/observability-mvp.md),
 and [pre-user deployment gates](docs/pre-user-pilot-gates.md) before any
 high-consequence pilot.
 
@@ -78,6 +81,7 @@ for signing and verification details.
 * [Threat model and residual risks](docs/threat-model.md)
 * [Mandatory tool gateway integration pattern](docs/tool-gateway-integration.md)
 * [Reference gateway crate](crates/praetore-gateway)
+* [Read-only observability MVP](docs/observability-mvp.md)
 * [Assurance traceability matrix](docs/assurance-matrix.md)
 * [Operations runbooks](docs/operations.md)
 * [Pre-user deployment gates](docs/pre-user-pilot-gates.md)
@@ -140,7 +144,8 @@ praetore/
 │   ├── praetore-verify/
 │   ├── praetore-python/
 │   ├── praetore-replay-postgres/
-│   └── praetore-gateway/
+│   ├── praetore-gateway/
+│   └── praetore-observe/
 ├── fuzz/
 ├── packages/praetore-python/
 ├── docs/

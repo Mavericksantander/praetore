@@ -52,6 +52,11 @@ fn initialize_test_database() {
             .batch_execute(include_str!("../migrations/0003_execution_replay_link.sql"))
             .expect("link execution journal to replay claims");
         client
+            .batch_execute(include_str!(
+                "../migrations/0004_execution_journal_events.sql"
+            ))
+            .expect("install execution journal transition history");
+        client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
                      agent_id UUID NOT NULL, request_id UUID NOT NULL, \
@@ -67,18 +72,36 @@ fn initialize_test_database() {
                 "DO $$ BEGIN \
                      CREATE ROLE praetore_replay_test NOLOGIN; \
                  EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+                DO $$ BEGIN \
+                    CREATE ROLE praetore_observe_test NOLOGIN; \
+                EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
                  REVOKE ALL ON SCHEMA praetore FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.replay_claims FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.replay_claims FROM praetore_replay_test; \
                  REVOKE ALL ON TABLE praetore.execution_journal FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.execution_journal FROM praetore_replay_test; \
+                 REVOKE ALL ON TABLE praetore.execution_journal_events FROM PUBLIC; \
+                 REVOKE ALL ON TABLE praetore.execution_journal_events \
+                     FROM praetore_replay_test; \
                  GRANT USAGE ON SCHEMA praetore TO praetore_replay_test; \
                  GRANT SELECT (agent_id, request_id) ON praetore.replay_claims \
                      TO praetore_replay_test; \
                  GRANT INSERT (agent_id, request_id) ON praetore.replay_claims \
                      TO praetore_replay_test; \
                  GRANT SELECT, INSERT, UPDATE ON praetore.execution_journal \
-                     TO praetore_replay_test",
+                     TO praetore_replay_test; \
+                 GRANT SELECT ON praetore.execution_journal_events \
+                     TO praetore_replay_test; \
+                 GRANT USAGE ON SCHEMA praetore TO praetore_observe_test; \
+                 REVOKE ALL ON TABLE praetore.execution_journal \
+                     FROM praetore_observe_test; \
+                 REVOKE ALL ON TABLE praetore.execution_journal_events \
+                     FROM praetore_observe_test; \
+                 GRANT SELECT (agent_id, request_id, request_digest, action_digest, \
+                     authorization_status, execution_status, evidence_json, created_at, updated_at) \
+                     ON praetore.execution_journal TO praetore_observe_test; \
+                 GRANT SELECT (event_id, agent_id, request_id, from_status, to_status, occurred_at) \
+                     ON praetore.execution_journal_events TO praetore_observe_test",
             )
             .expect("configure least-privilege test role");
     });
@@ -102,6 +125,15 @@ fn connect_journal() -> PostgresExecutionJournal {
         Ok(client)
     })
     .unwrap()
+}
+
+fn connect_observability_reader() -> praetore_replay_postgres::PostgresObservabilityReader {
+    initialize_test_database();
+    let mut client = connect_client();
+    client
+        .batch_execute("SET ROLE praetore_observe_test")
+        .expect("assume read-only observability role");
+    praetore_replay_postgres::PostgresObservabilityReader::from_client(client).unwrap()
 }
 
 fn connect_guard() -> PostgresReplayGuard {
@@ -635,10 +667,18 @@ fn database_agent_for_request(request_id: Uuid) -> Uuid {
 
 fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
     let mut client = connect_client();
+    client
+        .batch_execute(
+            "BEGIN; \
+             ALTER TABLE praetore.execution_journal_events \
+                 DISABLE TRIGGER execution_journal_events_immutable;",
+        )
+        .unwrap();
     for request_id in request_ids {
         for table in [
             "praetore.gateway_test_invocations",
             "praetore.gateway_test_effects",
+            "praetore.execution_journal_events",
             "praetore.execution_journal",
             "praetore.replay_claims",
         ] {
@@ -650,6 +690,13 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
                 .unwrap();
         }
     }
+    client
+        .batch_execute(
+            "ALTER TABLE praetore.execution_journal_events \
+                 ENABLE TRIGGER execution_journal_events_immutable; \
+             COMMIT;",
+        )
+        .unwrap();
 }
 
 fn database_rows_for_request(table: &str, request_id: Uuid) -> i64 {
@@ -1112,6 +1159,99 @@ fn postgres_journal_terminal_states_cannot_return_to_dispatchable() {
         ExecutionStatus::Confirmed
     );
     assert_eq!(database_invocation_count(key), 1);
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_observability_lists_filters_and_reads_real_transition_history() {
+    let fixture = create_postgres_gateway(Uuid::new_v4());
+    let receipt = fixture.gateway.execute(fixture.request).unwrap();
+    let key = ExecutionKey {
+        agent_id: *receipt.evidence.agent.id.as_uuid(),
+        request_id: receipt.evidence.request_id,
+    };
+    let reader = connect_observability_reader();
+    assert!(reader.database_available());
+
+    let filters = praetore_replay_postgres::ExecutionFilters {
+        agent_id: Some(key.agent_id),
+        decision: Some(praetore_gateway::AuthorizationStatus::Allowed),
+        execution: Some(ExecutionStatus::Confirmed),
+        from: Some(OffsetDateTime::now_utc() - Duration::days(1)),
+        to: Some(OffsetDateTime::now_utc() + Duration::days(1)),
+        limit: 10,
+        offset: 0,
+    };
+    let page = reader.list(&filters).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.rows.len(), 1);
+    assert_eq!(page.rows[0].key, key);
+    assert_eq!(
+        page.rows[0].authorization,
+        praetore_gateway::AuthorizationStatus::Allowed
+    );
+    assert_eq!(page.rows[0].execution, ExecutionStatus::Confirmed);
+    assert!(page.rows[0].evidence.verify_integrity());
+    assert!(page.rows[0].output_available);
+
+    let (detail, history) = reader.get(key).unwrap().unwrap();
+    assert_eq!(detail.key, key);
+    assert_eq!(
+        history.iter().map(|event| event.to).collect::<Vec<_>>(),
+        vec![
+            ExecutionStatus::Authorized,
+            ExecutionStatus::Dispatched,
+            ExecutionStatus::Confirmed
+        ]
+    );
+    assert_eq!(history[0].from, None);
+    assert_eq!(history[1].from, Some(ExecutionStatus::Authorized));
+    assert_eq!(history[2].from, Some(ExecutionStatus::Dispatched));
+
+    let mut read_only_client = connect_client();
+    read_only_client
+        .batch_execute("SET ROLE praetore_observe_test")
+        .unwrap();
+    assert!(
+        read_only_client
+            .query_opt(
+                "SELECT output_json FROM praetore.execution_journal \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .is_err()
+    );
+    assert!(
+        read_only_client
+            .execute(
+                "UPDATE praetore.execution_journal SET execution_status = 'failed' \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .is_err()
+    );
+    assert!(
+        connect_client()
+            .execute(
+                "DELETE FROM praetore.execution_journal_events \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .is_err()
+    );
+    assert!(
+        read_only_client
+            .execute(
+                "DELETE FROM praetore.execution_journal_events \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .is_err()
+    );
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::Confirmed
+    );
 }
 
 #[test]
