@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// Ordering is intentional:
 /// DENY > REQUIRE_APPROVAL > ALLOW
+///
+/// ```
+/// use praetore_core::DecisionOutcome;
+///
+/// assert_eq!(
+///     DecisionOutcome::Allow.strongest(DecisionOutcome::Deny),
+///     DecisionOutcome::Deny,
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DecisionOutcome {
     Allow,

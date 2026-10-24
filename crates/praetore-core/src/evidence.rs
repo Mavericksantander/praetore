@@ -24,6 +24,12 @@ const ATTESTER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ATTESTER_KEY_V1\0ed25519\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// A versioned receipt binding an authorization request to its decision.
+///
+/// `verify_integrity` detects payload changes but does not authenticate who
+/// produced the evidence. Verify any available agent, issuer, and attester
+/// signatures against externally pinned keys. The end-to-end `quickstart`
+/// example demonstrates those checks.
 pub struct Evidence {
     pub evidence_schema_version: u16,
     pub canonical_version: u8,

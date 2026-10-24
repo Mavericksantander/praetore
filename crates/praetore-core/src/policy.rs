@@ -20,6 +20,24 @@ const MAX_POLICY_TEXT_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+/// A versioned set of declarative authorization rules.
+///
+/// No matching rule produces a DENY decision. Matching effects are combined
+/// using DENY > REQUIRE_APPROVAL > ALLOW.
+///
+/// ```
+/// use praetore_core::{Policy, PolicyCondition, PolicyEffect, PolicyRule};
+/// use serde_json::json;
+///
+/// let policy = Policy::new(
+///     "read-policy",
+///     1,
+///     vec![PolicyRule::new("allow-public", "read_data", PolicyEffect::Allow)
+///         .with_parameter_condition(PolicyCondition::exact("classification", json!("public")))],
+/// );
+/// policy.validate().expect("valid policy");
+/// assert_eq!(policy.digest().expect("canonical digest").len(), 64);
+/// ```
 pub struct Policy {
     pub id: String,
     pub version: u32,

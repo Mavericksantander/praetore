@@ -11,6 +11,20 @@ const MAX_ACTION_TARGET_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// An operation presented for authorization.
+///
+/// Set the required capability explicitly for Strict and HighAssurance
+/// evaluation.
+///
+/// ```
+/// use praetore_core::Action;
+/// use serde_json::json;
+///
+/// let action = Action::new("read_data", Some("dataset-1".into()), json!({}))
+///     .expect("valid action")
+///     .with_capability("data:read");
+/// assert_eq!(action.capability.as_deref(), Some("data:read"));
+/// ```
 pub struct Action {
     pub action_type: String,
     pub capability: Option<String>,
