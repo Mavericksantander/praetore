@@ -7,6 +7,7 @@ pull request:
 
 ```sh
 cargo test --workspace --locked
+cargo run --locked --package praetore-core --example high_assurance
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all -- --check
 cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check

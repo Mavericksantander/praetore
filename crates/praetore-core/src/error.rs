@@ -12,6 +12,8 @@ pub enum ErrorKind {
     PolicyIntegrityFailure,
     PolicyEvaluationFailure,
     EvidenceFailure,
+    ReplayDetected,
+    ReplayGuardFailure,
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +50,12 @@ pub enum PraetoreError {
 
     #[error("evidence error: {0}")]
     EvidenceError(String),
+
+    #[error("authorization request has already been used")]
+    ReplayDetected,
+
+    #[error("replay protection storage is unavailable")]
+    ReplayGuardUnavailable,
 }
 
 impl PraetoreError {
@@ -65,6 +73,8 @@ impl PraetoreError {
             Self::PolicyIntegrityFailed => ErrorKind::PolicyIntegrityFailure,
             Self::PolicyEvaluationFailed(_) => ErrorKind::PolicyEvaluationFailure,
             Self::EvidenceError(_) => ErrorKind::EvidenceFailure,
+            Self::ReplayDetected => ErrorKind::ReplayDetected,
+            Self::ReplayGuardUnavailable => ErrorKind::ReplayGuardFailure,
         }
     }
 
@@ -80,8 +90,34 @@ impl PraetoreError {
             ErrorKind::PolicyIntegrityFailure => "POLICY_INTEGRITY_FAIL",
             ErrorKind::PolicyEvaluationFailure => "POLICY_EVALUATION_FAIL",
             ErrorKind::EvidenceFailure => "EVIDENCE_FAIL",
+            ErrorKind::ReplayDetected => "REPLAY_DETECTED",
+            ErrorKind::ReplayGuardFailure => "REPLAY_GUARD_FAIL",
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, PraetoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_errors_have_stable_non_leaky_codes() {
+        let replay = PraetoreError::ReplayDetected;
+        assert_eq!(replay.kind(), ErrorKind::ReplayDetected);
+        assert_eq!(replay.code(), "REPLAY_DETECTED");
+        assert_eq!(
+            replay.to_string(),
+            "authorization request has already been used"
+        );
+
+        let unavailable = PraetoreError::ReplayGuardUnavailable;
+        assert_eq!(unavailable.kind(), ErrorKind::ReplayGuardFailure);
+        assert_eq!(unavailable.code(), "REPLAY_GUARD_FAIL");
+        assert_eq!(
+            unavailable.to_string(),
+            "replay protection storage is unavailable"
+        );
+    }
+}

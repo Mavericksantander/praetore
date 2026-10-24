@@ -7,15 +7,18 @@ Status: accepted
 `Strict` requires a non-empty issuer trust set and requires an explicit action
 capability, signed authority bound to the agent public key, and signed request
 intent. `HighAssurance` is built by the production constructor and additionally
-requires a policy digest pin, bounded time-valid issuer pins, and an evidence
-attester key. It validates policy binding and that an issuer pin is active at
-construction and on each evaluation. No missing production setting falls back
-to development mode.
+requires a policy digest pin, bounded time-valid issuer pins, an evidence
+attester key, and a durable caller-owned replay guard. It validates policy
+binding and that an issuer pin is active at construction and on each
+evaluation. No missing production setting falls back to development mode.
 
 Legacy `new` remains for source compatibility but is explicitly Development.
 Applications must not use it for production decisions.
 
 ## Consequences
 
-The engine remains pure and immutable after construction. The deployer remains
-responsible for authenticating configuration and preventing downgrade.
+Policy evaluation remains deterministic and has no network or filesystem
+dependency. HighAssurance additionally calls its explicit replay-guard
+interface, so successful evaluations require external state and fail closed
+when that state is unavailable. The caller remains responsible for durable
+atomic storage, authenticating configuration, and preventing downgrade.

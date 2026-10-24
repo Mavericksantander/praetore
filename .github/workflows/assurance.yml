@@ -17,14 +17,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
+      - run: cargo run --locked --package praetore-core --example high_assurance
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
-      - run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
+      - name: Check changed patch whitespace
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+        run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
 
   audit:
     name: Dependency advisory audit

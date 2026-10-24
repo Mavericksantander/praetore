@@ -14,6 +14,8 @@ absence of defects.
 | Parser/evaluator no-panic exploration | `fuzz/fuzz_targets/*.rs` | Five seeded libFuzzer target corpora | `fuzz-smoke` (10 seconds per target) |
 | Dependency advisory gate | committed `Cargo.lock` and RustSec audit | `cargo audit --locked` | `audit` |
 | Python verification behavior stays Rust-backed | `crates/praetore-python/src/lib.rs` and `praetore` package | `packages/praetore-python/tests/test_verify.py` | `python-verify` |
+| HighAssurance consumes each signed request ID once | `crates/praetore-core/src/replay.rs` and production engine | required-guard, duplicate-request, and unavailable-store tests | `rust` |
+| End-to-end HighAssurance integration stays runnable | `crates/praetore-core/examples/high_assurance.rs` | workspace example command | `rust` |
 | Rust tests, lint, format, patch hygiene | workspace CI workflow | workspace test suite; Clippy `-D warnings`; workspace and fuzz rustfmt; `git diff --check` | `rust` |
 | Software inventory | CycloneDX Cargo integration | SBOMs for all three Rust packages and standalone fuzz package uploaded as CI artifacts | `sbom` |
 | Release binary integrity | tag-triggered verifier build/checksum job | `SHA256SUMS` uploaded with release binary | `release-integrity` |
@@ -28,5 +30,8 @@ absence of defects.
 - Fuzz CI runs bounded smoke intervals. It is not an exhaustive campaign.
 - Python exposes evidence verification only. Policy evaluation and authority
   verification remain in Rust/CLI.
+- Core supplies a replay-guard contract only. Durability, atomicity across
+  processes, backup integrity, capacity, and failover behavior must be
+  validated for the caller's storage implementation.
 - CI produces an SBOM and checksums, but does not sign releases, attest
   artifacts, or protect the hosted runner/build supply chain.
