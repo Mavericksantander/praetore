@@ -99,9 +99,10 @@ The optional `praetore-replay-postgres` crate implements the replay guard using
 a fixed `praetore.replay_claims` table and an atomic primary-key insert. Apply
 `crates/praetore-replay-postgres/migrations/0001_replay_claims.sql` with a
 privileged migration role before starting the application. The runtime role
-should have only `USAGE` on the `praetore` schema and `INSERT` on the
-`agent_id` and `request_id` columns; do not grant it `UPDATE`, `DELETE`, or
-`TRUNCATE`.
+should have `USAGE` on the `praetore` schema, `INSERT` on the `agent_id` and
+`request_id` columns, and `SELECT` on those same columns only (required by
+PostgreSQL for the `ON CONFLICT` key). Do not grant table-wide `SELECT`,
+`UPDATE`, `DELETE`, or `TRUNCATE`.
 
 The adapter accepts an already-created PostgreSQL client so the deployment
 controls TLS, credentials, connection lifecycle, and pool topology. It sets
