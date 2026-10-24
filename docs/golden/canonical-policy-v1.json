@@ -1,0 +1,1 @@
+{"canonical_version":1,"id":"golden","rules":[{"action_type":"read_data","context_conditions":[],"effect":"Allow","id":"allow-read","parameter_conditions":[],"required_capability":null,"target":null}],"version":1}

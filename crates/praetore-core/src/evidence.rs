@@ -1,16 +1,30 @@
+use ed25519_dalek::{Signature, Signer, SigningKey};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
     action::Action,
     authority::Authority,
+    authorization::AuthorizationRequest,
+    canonical::{
+        MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
+    },
     decision::{Decision, DecisionOutcome},
-    identity::AgentIdentity,
+    identity::{AgentIdentity, VerifiedPublicKey},
 };
+
+const EVIDENCE_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V1\0";
+const ATTESTER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ATTESTER_KEY_V1\0ed25519\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Evidence {
+    pub evidence_schema_version: u16,
+    pub canonical_version: u8,
     pub evidence_id: Uuid,
     pub request_id: Uuid,
     pub agent: AgentIdentity,
@@ -18,7 +32,62 @@ pub struct Evidence {
     pub action: Action,
     pub decision: Decision,
     pub trace_id: Option<String>,
+    pub context: BTreeMap<String, Value>,
+    pub agent_signature: Option<String>,
+    pub policy_digest: Option<String>,
+    pub attester_key_id: Option<String>,
+    pub attester_algorithm: Option<String>,
+    pub attester_signature: Option<String>,
     pub context_hash: String,
+}
+
+pub struct EvidenceAttesterKey {
+    signing_key: SigningKey,
+}
+
+impl std::fmt::Debug for EvidenceAttesterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvidenceAttesterKey")
+            .field("key_id", &self.key_id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for EvidenceAttesterKey {
+    fn clone(&self) -> Self {
+        Self {
+            signing_key: self.signing_key.clone(),
+        }
+    }
+}
+
+impl EvidenceAttesterKey {
+    pub fn generate() -> Self {
+        Self {
+            signing_key: SigningKey::generate(&mut OsRng),
+        }
+    }
+
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(secret),
+        }
+    }
+
+    pub fn public_key(&self) -> crate::Result<VerifiedPublicKey> {
+        VerifiedPublicKey::from_bytes(&self.signing_key.verifying_key().to_bytes())
+    }
+
+    pub fn key_id(&self) -> String {
+        key_id(self.signing_key.verifying_key().as_bytes())
+    }
+}
+
+fn key_id(public_key: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(ATTESTER_KEY_ID_DOMAIN);
+    hasher.update(public_key);
+    hex::encode(hasher.finalize())
 }
 
 impl Evidence {
@@ -29,17 +98,30 @@ impl Evidence {
         action: Action,
         decision: Decision,
         trace_id: Option<String>,
-    ) -> Self {
-        let context_hash = Self::compute_context_hash(
-            &request_id,
-            &agent,
-            &authority,
-            &action,
-            &decision,
-            &trace_id,
-        );
+    ) -> crate::Result<Self> {
+        Self::new_with_context(
+            request_id,
+            agent,
+            authority,
+            action,
+            decision,
+            trace_id,
+            BTreeMap::new(),
+        )
+    }
 
-        Self {
+    pub fn new_with_context(
+        request_id: Uuid,
+        agent: AgentIdentity,
+        authority: Authority,
+        action: Action,
+        decision: Decision,
+        trace_id: Option<String>,
+        context: BTreeMap<String, Value>,
+    ) -> crate::Result<Self> {
+        let mut evidence = Self {
+            evidence_schema_version: 1,
+            canonical_version: crate::canonical::CANONICAL_VERSION,
             evidence_id: Uuid::new_v4(),
             request_id,
             agent,
@@ -47,8 +129,18 @@ impl Evidence {
             action,
             decision,
             trace_id,
-            context_hash,
-        }
+            context,
+            agent_signature: None,
+            policy_digest: None,
+            attester_key_id: None,
+            attester_algorithm: None,
+            attester_signature: None,
+            context_hash: String::new(),
+        };
+        evidence.context_hash = evidence.compute_context_hash().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
+        })?;
+        Ok(evidence)
     }
 
     pub fn outcome(&self) -> DecisionOutcome {
@@ -61,16 +153,17 @@ impl Evidence {
     /// recorded SHA-256 context hash. It does not authenticate the issuer
     /// cryptographically and does not provide non-repudiation.
     pub fn verify_integrity(&self) -> bool {
-        let expected = Self::compute_context_hash(
-            &self.request_id,
-            &self.agent,
-            &self.authority,
-            &self.action,
-            &self.decision,
-            &self.trace_id,
-        );
+        if self.evidence_schema_version != 1
+            || self.canonical_version != crate::canonical::CANONICAL_VERSION
+        {
+            return false;
+        }
+        let Some(expected) = self.compute_context_hash() else {
+            return false;
+        };
 
-        self.context_hash == expected
+        self.context_hash.len() == expected.len()
+            && bool::from(self.context_hash.as_bytes().ct_eq(expected.as_bytes()))
     }
 
     /// Backwards-compatible alias for `verify_integrity`.
@@ -78,29 +171,274 @@ impl Evidence {
         self.verify_integrity()
     }
 
-    fn compute_context_hash(
-        request_id: &Uuid,
-        agent: &AgentIdentity,
-        authority: &Authority,
-        action: &Action,
-        decision: &Decision,
-        trace_id: &Option<String>,
-    ) -> String {
-        let payload = serde_json::json!({
-            "request_id": request_id,
-            "agent": agent,
-            "authority": authority,
-            "action": action,
-            "decision": decision,
-            "trace_id": trace_id,
-        });
-
-        let serialized = serde_json::to_vec(&payload).expect("evidence serialization must succeed");
-
-        let digest = Sha256::digest(serialized);
-
-        hex::encode(digest)
+    pub fn verify_agent_intent(&self) -> crate::Result<()> {
+        AuthorizationRequest {
+            request_id: self.request_id,
+            agent: self.agent.clone(),
+            authority: self.authority.clone(),
+            action: self.action.clone(),
+            trace_id: self.trace_id.clone(),
+            context: self.context.clone(),
+            agent_signature: self.agent_signature.clone(),
+        }
+        .verify_intent_signature()
     }
+
+    pub(crate) fn with_agent_signature(mut self, signature: Option<String>) -> crate::Result<Self> {
+        self.agent_signature = signature;
+        self.context_hash = self.compute_context_hash().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
+        })?;
+        Ok(self)
+    }
+
+    pub fn sign(&mut self, attester: &EvidenceAttesterKey) -> crate::Result<()> {
+        if !self.verify_integrity() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "cannot sign evidence with invalid integrity hash".into(),
+            ));
+        }
+
+        self.attester_key_id = Some(attester.key_id());
+        self.attester_algorithm = Some("ed25519".into());
+        self.attester_signature = None;
+        self.context_hash = self.compute_context_hash().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
+        })?;
+        let payload = self.attestation_bytes()?;
+        let mut message = Vec::with_capacity(EVIDENCE_SIGNATURE_DOMAIN.len() + payload.len());
+        message.extend_from_slice(EVIDENCE_SIGNATURE_DOMAIN);
+        message.extend_from_slice(&payload);
+        self.attester_signature = Some(hex::encode(attester.signing_key.sign(&message).to_bytes()));
+        Ok(())
+    }
+
+    pub fn verify_attester_signature(&self, trusted_key: &VerifiedPublicKey) -> crate::Result<()> {
+        if !self.verify_integrity() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence integrity verification failed".into(),
+            ));
+        }
+        if self.attester_algorithm.as_deref() != Some("ed25519")
+            || self.attester_key_id.as_deref() != Some(key_id(&trusted_key.as_bytes()).as_str())
+        {
+            return Err(crate::PraetoreError::IdentityVerificationFailed);
+        }
+
+        let signature = self
+            .attester_signature
+            .as_deref()
+            .ok_or(crate::PraetoreError::IdentityVerificationFailed)
+            .and_then(|signature| {
+                hex::decode(signature).map_err(|_| crate::PraetoreError::IdentityVerificationFailed)
+            })?;
+        let signature = Signature::from_slice(&signature)
+            .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)?;
+        let payload = self.attestation_bytes()?;
+        let mut message = Vec::with_capacity(EVIDENCE_SIGNATURE_DOMAIN.len() + payload.len());
+        message.extend_from_slice(EVIDENCE_SIGNATURE_DOMAIN);
+        message.extend_from_slice(&payload);
+        trusted_key
+            .as_verifying_key()
+            .verify_strict(&message, &signature)
+            .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)
+    }
+
+    pub fn to_json(&self) -> crate::Result<String> {
+        if !self.verify_integrity() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "cannot export evidence with invalid integrity hash".into(),
+            ));
+        }
+
+        String::from_utf8(
+            canonical_json(self)
+                .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))?,
+        )
+        .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))
+    }
+
+    pub fn from_json(json: &str) -> crate::Result<Self> {
+        if json.len() > MAX_JSON_VALUE_BYTES {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence document exceeds maximum size".into(),
+            ));
+        }
+        let value =
+            parse_json_rejecting_duplicates(json).map_err(crate::PraetoreError::EvidenceError)?;
+        let evidence: Self = serde_json::from_value(value)
+            .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))?;
+        if !evidence.verify_integrity() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence integrity verification failed".into(),
+            ));
+        }
+        Ok(evidence)
+    }
+
+    pub fn bind_policy_digest(&mut self, digest: String) -> crate::Result<()> {
+        if digest.len() != 64 || hex::decode(&digest).is_err() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "policy digest must be a 32-byte SHA-256 hex value".into(),
+            ));
+        }
+
+        self.policy_digest = Some(digest);
+        self.context_hash = self.compute_context_hash().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
+        })?;
+        Ok(())
+    }
+
+    fn compute_context_hash(&self) -> Option<String> {
+        self.validate_integrity_inputs().ok()?;
+        let payload = EvidenceIntegrityPayload {
+            evidence_schema_version: self.evidence_schema_version,
+            canonical_version: self.canonical_version,
+            evidence_id: &self.evidence_id,
+            request_id: &self.request_id,
+            agent: &self.agent,
+            authority: &self.authority,
+            action: &self.action,
+            decision: &self.decision,
+            trace_id: &self.trace_id,
+            context: &self.context,
+            agent_signature: &self.agent_signature,
+            policy_digest: &self.policy_digest,
+            attester_key_id: &self.attester_key_id,
+            attester_algorithm: &self.attester_algorithm,
+        };
+
+        Self::compute_payload_hash(&payload)
+    }
+
+    fn validate_integrity_inputs(&self) -> crate::Result<()> {
+        self.agent.validate()?;
+        if self.agent.public_key.len() > 4096 {
+            return Err(crate::PraetoreError::EvidenceError(
+                "agent key exceeds maximum size".into(),
+            ));
+        }
+        self.authority.validate()?;
+        self.action.validate()?;
+        if self.context.len() > 128
+            || self
+                .context
+                .keys()
+                .any(|key| key.is_empty() || key.len() > 256)
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence context exceeds configured limits".into(),
+            ));
+        }
+        let mut context_size = 0usize;
+        for (key, value) in &self.context {
+            context_size += key.len();
+            context_size += validate_json_value(value)
+                .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+            if context_size > MAX_JSON_VALUE_BYTES {
+                return Err(crate::PraetoreError::EvidenceError(
+                    "evidence context exceeds maximum size".into(),
+                ));
+            }
+        }
+        if self.decision.reason.len() > 4096
+            || self.decision.contributions.len() > 1024
+            || self.decision.contributions.iter().any(|contribution| {
+                contribution.rule_id.len() > 1024 || contribution.reason.len() > 4096
+            })
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence decision exceeds configured limits".into(),
+            ));
+        }
+        if self
+            .agent_signature
+            .as_deref()
+            .is_some_and(|value| value.len() > 128)
+            || self
+                .attester_signature
+                .as_deref()
+                .is_some_and(|value| value.len() > 128)
+            || self
+                .attester_key_id
+                .as_deref()
+                .is_some_and(|value| value.len() != 64)
+            || self
+                .attester_algorithm
+                .as_deref()
+                .is_some_and(|value| value != "ed25519")
+            || self
+                .policy_digest
+                .as_deref()
+                .is_some_and(|value| value.len() != 64)
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence cryptographic metadata is malformed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn attestation_bytes(&self) -> crate::Result<Vec<u8>> {
+        self.validate_integrity_inputs()?;
+        if !self.verify_integrity() {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence integrity verification failed".into(),
+            ));
+        }
+        canonical_json(&EvidenceAttestationPayload {
+            evidence: EvidenceIntegrityPayload {
+                evidence_schema_version: self.evidence_schema_version,
+                canonical_version: self.canonical_version,
+                evidence_id: &self.evidence_id,
+                request_id: &self.request_id,
+                agent: &self.agent,
+                authority: &self.authority,
+                action: &self.action,
+                decision: &self.decision,
+                trace_id: &self.trace_id,
+                context: &self.context,
+                agent_signature: &self.agent_signature,
+                policy_digest: &self.policy_digest,
+                attester_key_id: &self.attester_key_id,
+                attester_algorithm: &self.attester_algorithm,
+            },
+            evidence_id: &self.evidence_id,
+            context_hash: &self.context_hash,
+        })
+        .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))
+    }
+
+    fn compute_payload_hash(payload: &EvidenceIntegrityPayload<'_>) -> Option<String> {
+        let serialized = canonical_json(payload).ok()?;
+        Some(hex::encode(Sha256::digest(serialized)))
+    }
+}
+
+#[derive(Serialize)]
+struct EvidenceIntegrityPayload<'a> {
+    evidence_schema_version: u16,
+    canonical_version: u8,
+    evidence_id: &'a Uuid,
+    request_id: &'a Uuid,
+    agent: &'a AgentIdentity,
+    authority: &'a Authority,
+    action: &'a Action,
+    decision: &'a Decision,
+    trace_id: &'a Option<String>,
+    context: &'a BTreeMap<String, Value>,
+    agent_signature: &'a Option<String>,
+    policy_digest: &'a Option<String>,
+    attester_key_id: &'a Option<String>,
+    attester_algorithm: &'a Option<String>,
+}
+
+#[derive(Serialize)]
+struct EvidenceAttestationPayload<'a> {
+    evidence: EvidenceIntegrityPayload<'a>,
+    evidence_id: &'a Uuid,
+    context_hash: &'a str,
 }
 
 #[cfg(test)]
@@ -147,6 +485,7 @@ mod tests {
             test_decision(),
             None,
         )
+        .unwrap()
     }
 
     #[test]
@@ -184,10 +523,162 @@ mod tests {
             test_action(),
             test_decision(),
             Some("trace-001".into()),
-        );
+        )
+        .unwrap();
 
         assert_eq!(evidence.trace_id.as_deref(), Some("trace-001"));
         assert!(evidence.verify_integrity());
+    }
+
+    #[test]
+    fn context_is_bound_to_integrity_hash() {
+        let agent = test_agent();
+        let authority = test_authority(&agent);
+        let mut context = BTreeMap::new();
+        context.insert("region".into(), json!("santiago"));
+        let mut evidence = Evidence::new_with_context(
+            Uuid::new_v4(),
+            agent,
+            authority,
+            test_action(),
+            test_decision(),
+            None,
+            context,
+        )
+        .unwrap();
+
+        assert!(evidence.verify_integrity());
+        evidence.context.insert("region".into(), json!("north"));
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn policy_digest_is_bound_to_integrity_hash() {
+        let mut evidence = test_evidence();
+        let digest = hex::encode([42; 32]);
+
+        evidence.bind_policy_digest(digest.clone()).unwrap();
+
+        assert_eq!(evidence.policy_digest.as_deref(), Some(digest.as_str()));
+        assert!(evidence.verify_integrity());
+        evidence.policy_digest = Some(hex::encode([43; 32]));
+        assert!(!evidence.verify_integrity());
+    }
+
+    #[test]
+    fn tampering_with_agent_signature_invalidates_evidence() {
+        let evidence = test_evidence()
+            .with_agent_signature(Some("00".repeat(64)))
+            .unwrap();
+
+        assert!(evidence.verify_integrity());
+        let mut tampered = evidence;
+        tampered.agent_signature = Some("11".repeat(64));
+        assert!(!tampered.verify_integrity());
+    }
+
+    #[test]
+    fn rejects_malformed_policy_digest() {
+        let mut evidence = test_evidence();
+
+        assert!(evidence.bind_policy_digest("not-a-digest".into()).is_err());
+    }
+
+    #[test]
+    fn evidence_attester_signature_verifies_and_fails_after_tampering() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[51; 32]);
+        let wrong_attester = EvidenceAttesterKey::from_secret_bytes(&[52; 32]);
+        let mut evidence = test_evidence();
+
+        evidence.bind_policy_digest(hex::encode([53; 32])).unwrap();
+        evidence.sign(&attester).unwrap();
+
+        assert!(
+            evidence
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_ok()
+        );
+        assert!(
+            evidence
+                .verify_attester_signature(&wrong_attester.public_key().unwrap())
+                .is_err()
+        );
+
+        evidence.attester_signature = Some("00".repeat(64));
+        assert!(
+            evidence
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_round_trip_exports_versioned_stable_json() {
+        let attester = EvidenceAttesterKey::generate();
+        let mut evidence = test_evidence();
+        evidence.sign(&attester).unwrap();
+
+        let json = evidence.to_json().unwrap();
+        let restored = Evidence::from_json(&json).unwrap();
+
+        assert_eq!(restored.evidence_schema_version, 1);
+        assert_eq!(
+            restored.canonical_version,
+            crate::canonical::CANONICAL_VERSION
+        );
+        assert!(restored.verify_integrity());
+        assert!(
+            restored
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn evidence_import_rejects_duplicate_json_fields() {
+        assert!(
+            Evidence::from_json(r#"{"evidence_schema_version":1,"evidence_schema_version":1}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_constructor_rejects_oversized_context() {
+        let mut nested = json!(null);
+        for _ in 0..=crate::canonical::MAX_JSON_DEPTH {
+            nested = json!([nested]);
+        }
+
+        let agent = test_agent();
+        let authority = test_authority(&agent);
+        let context = BTreeMap::from([("oversized".into(), nested)]);
+
+        assert!(
+            Evidence::new_with_context(
+                Uuid::new_v4(),
+                agent,
+                authority,
+                test_action(),
+                test_decision(),
+                None,
+                context,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn evidence_verification_fails_closed_for_oversized_nested_input() {
+        let mut value = json!(0);
+        for _ in 0..=crate::canonical::MAX_JSON_DEPTH {
+            value = json!([value]);
+        }
+
+        let mut evidence = test_evidence();
+        evidence.action.parameters = json!({"nested": value});
+
+        assert!(!evidence.verify_integrity());
+        assert!(evidence.to_json().is_err());
     }
 
     #[test]
@@ -202,7 +693,8 @@ mod tests {
             test_action(),
             test_decision(),
             Some("trace-001".into()),
-        );
+        )
+        .unwrap();
 
         evidence.trace_id = Some("trace-999".into());
 
@@ -329,13 +821,11 @@ mod tests {
     }
 
     #[test]
-    fn evidence_id_is_not_part_of_integrity_hash() {
+    fn tampering_with_evidence_id_invalidates_integrity_hash() {
         let mut evidence = test_evidence();
-        let original_hash = evidence.context_hash.clone();
 
         evidence.evidence_id = Uuid::new_v4();
 
-        assert_eq!(evidence.context_hash, original_hash);
-        assert!(evidence.verify_integrity());
+        assert!(!evidence.verify_integrity());
     }
 }

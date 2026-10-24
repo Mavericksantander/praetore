@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{PraetoreError, Result};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use rand_core::OsRng;
+
+pub(crate) const REQUEST_INTENT_DOMAIN: &[u8] = b"PRAETORE_INTENT_V1\0";
+pub const PRAETORE_MOTTO: &str = "Be Bold. The Mighty Forces Will Come to Your Aid.";
 
 /// Stable identifier for an agent.
 ///
@@ -28,9 +33,8 @@ impl Default for AgentId {
 
 /// Public identity information associated with an agent.
 ///
-/// `public_key` is represented as opaque bytes at this layer. The concrete
-/// cryptographic algorithm belongs to the authentication layer and must not
-/// be inferred from an arbitrary caller-supplied string.
+/// The serialized key remains algorithm-tagged bytes for interoperability.
+/// Call `verified_public_key` before using Ed25519 verification operations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentIdentity {
     pub id: AgentId,
@@ -57,6 +61,11 @@ impl AgentIdentity {
                 "public key cannot be empty".into(),
             ));
         }
+        if self.public_key.len() > 4096 {
+            return Err(PraetoreError::InvalidIdentity(
+                "public key exceeds maximum size".into(),
+            ));
+        }
 
         if self.key_algorithm.trim().is_empty() {
             return Err(PraetoreError::InvalidIdentity(
@@ -71,6 +80,96 @@ impl AgentIdentity {
         }
 
         Ok(())
+    }
+
+    pub fn verified_public_key(&self) -> Result<VerifiedPublicKey> {
+        if self.key_algorithm != "ed25519" {
+            return Err(PraetoreError::IdentityVerificationFailed);
+        }
+
+        VerifiedPublicKey::from_bytes(&self.public_key)
+    }
+}
+
+pub struct AgentKeyPair {
+    signing_key: SigningKey,
+}
+
+impl std::fmt::Debug for AgentKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentKeyPair").finish_non_exhaustive()
+    }
+}
+
+impl AgentKeyPair {
+    pub fn generate() -> Self {
+        Self {
+            signing_key: SigningKey::generate(&mut OsRng),
+        }
+    }
+
+    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(secret),
+        }
+    }
+
+    pub fn public_key(&self) -> VerifiedPublicKey {
+        VerifiedPublicKey(self.signing_key.verifying_key())
+    }
+
+    pub fn identity(&self, id: AgentId) -> AgentIdentity {
+        AgentIdentity {
+            id,
+            public_key: self.signing_key.verifying_key().to_bytes().to_vec(),
+            key_algorithm: "ed25519".into(),
+        }
+    }
+
+    pub(crate) fn sign_domain_message(&self, domain: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
+        message.extend_from_slice(payload);
+        self.signing_key.sign(&message).to_bytes().to_vec()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedPublicKey(VerifyingKey);
+
+impl VerifiedPublicKey {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let key_bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| PraetoreError::IdentityVerificationFailed)?;
+
+        VerifyingKey::from_bytes(&key_bytes)
+            .map(Self)
+            .map_err(|_| PraetoreError::IdentityVerificationFailed)
+    }
+
+    pub fn as_bytes(&self) -> [u8; 32] {
+        self.0.to_bytes()
+    }
+
+    pub(crate) fn as_verifying_key(&self) -> &VerifyingKey {
+        &self.0
+    }
+
+    pub fn verify_domain_message(
+        &self,
+        domain: &[u8],
+        payload: &[u8],
+        signature: &[u8],
+    ) -> Result<()> {
+        let signature = Signature::from_slice(signature)
+            .map_err(|_| PraetoreError::IdentityVerificationFailed)?;
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
+        message.extend_from_slice(payload);
+        self.0
+            .verify_strict(&message, &signature)
+            .map_err(|_| PraetoreError::IdentityVerificationFailed)
     }
 }
 
@@ -123,12 +222,12 @@ mod tests {
 
     #[test]
     fn accepts_valid_identity() {
-        let identity =
-            AgentIdentity::new(AgentId::new(), vec![1, 2, 3], "ed25519").expect("valid identity");
+        let identity = AgentKeyPair::generate().identity(AgentId::new());
 
-        assert_eq!(identity.public_key, vec![1, 2, 3]);
+        assert_eq!(identity.public_key.len(), 32);
         assert_eq!(identity.key_algorithm, "ed25519");
         assert!(identity.validate().is_ok());
+        assert!(identity.verified_public_key().is_ok());
     }
 
     #[test]
@@ -141,5 +240,34 @@ mod tests {
             identity.validate(),
             Err(PraetoreError::InvalidIdentity(_))
         ));
+    }
+
+    #[test]
+    fn generated_keypair_signatures_verify_only_for_matching_key_and_message() {
+        let keypair = AgentKeyPair::generate();
+        let public_key = keypair.public_key();
+        let signature = keypair.sign_domain_message(REQUEST_INTENT_DOMAIN, b"request");
+
+        assert!(
+            public_key
+                .verify_domain_message(REQUEST_INTENT_DOMAIN, b"request", &signature)
+                .is_ok()
+        );
+        assert!(
+            public_key
+                .verify_domain_message(REQUEST_INTENT_DOMAIN, b"changed", &signature)
+                .is_err()
+        );
+        assert!(
+            AgentKeyPair::generate()
+                .public_key()
+                .verify_domain_message(REQUEST_INTENT_DOMAIN, b"request", &signature)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_ed25519_public_key() {
+        assert!(VerifiedPublicKey::from_bytes(&[0; 31]).is_err());
     }
 }
