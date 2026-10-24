@@ -1,0 +1,52 @@
+[package]
+name = "praetore-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+hex = "0.4.3"
+libfuzzer-sys = "0.4"
+praetore-core = { path = "../crates/praetore-core" }
+serde_json = "1.0"
+time = "0.3"
+
+[[bin]]
+name = "canonical_json"
+path = "fuzz_targets/canonical_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_parse"
+path = "fuzz_targets/policy_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authority_verify"
+path = "fuzz_targets/authority_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "evidence_verify"
+path = "fuzz_targets/evidence_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine_evaluate_dev"
+path = "fuzz_targets/engine_evaluate_dev.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

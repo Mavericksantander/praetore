@@ -63,19 +63,12 @@ Identity, authority, policy, authorization, and evidence are treated as distinct
 ```text
 praetore/
 ├── crates/
-│   └── praetore-core/
-│       └── src/
-│           ├── action.rs
-│           ├── authority.rs
-│           ├── authorization.rs
-│           ├── canonical.rs
-│           ├── decision.rs
-│           ├── engine.rs
-│           ├── error.rs
-│           ├── evidence.rs
-│           ├── identity.rs
-│           ├── lib.rs
-│           └── policy.rs
+│   ├── praetore-core/
+│   ├── praetore-verify/
+│   └── praetore-python/
+├── fuzz/
+├── packages/praetore-python/
+├── docs/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE
@@ -192,6 +185,52 @@ capabilities are separate: `Action::with_capability` declares the required
 capability; when omitted, the legacy behavior uses the action type as the
 capability name. See the linked documentation for canonical serialization,
 migration guidance, and examples.
+
+## Verify evidence offline
+
+Install the verifier with `cargo install --path crates/praetore-verify --locked`
+(or build it with `cargo build --release --locked --package
+praetore-verify`). The attester pin file is the trusted Ed25519 public key as
+lowercase hex (32 bytes); it is provisioned separately from the evidence.
+Issuer pin files are JSON Lines: one exported `TrustedAuthorityIssuer` pin
+document per line.
+
+```sh
+praetore-verify evidence \
+  --evidence evidence.json \
+  --attester-pin attester-public-key.hex \
+  --issuer-pins issuer-pins.jsonl \
+  --require-intent \
+  --format json
+
+praetore-verify policy-digest --policy policy.json --format json
+
+praetore-verify authority \
+  --authority authority.json \
+  --issuer-pins issuer-pins.jsonl \
+  --agent agent.json \
+  --now 2026-10-24T00:00:00Z \
+  --format json
+```
+
+The optional `--agent` enables explicit subject-key binding verification for
+standalone authority documents. When omitted, the verifier checks the issuer
+signature, key ID, and time validity and reports that the subject identity was
+not independently matched. Evidence verification with issuer pins checks the
+subject binding against the embedded agent identity. `--require-intent` also
+requires `--issuer-pins`, so intent verification is bound to an issuer-trusted
+agent key rather than a self-asserted key in the evidence. The CLI never treats
+public keys inside evidence or authority documents as trust anchors. Invalid
+inputs return non-zero with stable reason codes.
+
+The Python package is verify-only and calls the same Rust implementation:
+`praetore.verify_evidence_integrity` and
+`praetore.verify_evidence_attester_signature`. It does not implement policy
+evaluation or authority issuance.
+
+See [the assurance traceability matrix](docs/assurance-matrix.md) for
+requirements, tests, and CI job mapping, and [CONTRIBUTING.md](CONTRIBUTING.md)
+for exact local validation and release commands.
 
 ## Security
 

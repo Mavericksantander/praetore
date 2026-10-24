@@ -79,3 +79,53 @@ Before deployment, verify that:
 
 The library does not authenticate deployment configuration, protect the host
 process, or provide a signed deployment/rollback mechanism.
+
+## Offline evidence and authority verification
+
+Build the verifier from the locked workspace:
+
+```sh
+cargo install --path crates/praetore-verify --locked
+# Or produce a local release binary:
+cargo build --release --locked --package praetore-verify
+```
+
+Use an attester pin file containing the independently provisioned lowercase
+hex Ed25519 public key. Issuer pins are supplied as JSON Lines, one
+`TrustedAuthorityIssuer::export_pin_json()` document per line. Do not derive
+trust pins from the evidence or authority being verified.
+
+```sh
+target/release/praetore-verify evidence \
+  --evidence evidence.json \
+  --attester-pin attester-public-key.hex \
+  --issuer-pins issuer-pins.jsonl \
+  --require-intent \
+  --format json
+```
+
+`--issuer-pins` on evidence verification additionally validates the authority
+signature, pin validity, and authority subject-key binding against the
+evidence agent. `--require-intent` requires `--issuer-pins`, preventing an
+intent signature from being accepted under only a self-asserted embedded
+agent key. For standalone authority documents, `--agent agent.json` is
+optional; without it, the CLI verifies the signed subject-key hash is present
+but cannot compare it to a separately supplied agent identity. Use JSON output
+for machine consumption and check both exit status and `code`.
+
+`praetore-verify policy-digest --policy policy.json --format json` prints the
+canonical policy digest. This command computes a digest; it does not establish
+that the policy is approved. Compare the result with the independently
+provisioned production pin.
+
+The Python package provides Rust-backed integrity and attester signature
+verification only. It does not evaluate policies or establish trust in a
+public key supplied by an untrusted caller.
+
+## Release artifact integrity
+
+For a `v*` tag, CI builds `praetore-verify` and uploads the binary and
+`SHA256SUMS` as a workflow artifact. CI also uploads CycloneDX workspace SBOM
+files. Follow the signed-tag procedure in [CONTRIBUTING.md](../CONTRIBUTING.md),
+download those artifacts, verify the checksum, and publish them with the
+release. CI does not sign artifacts or create releases automatically.

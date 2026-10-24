@@ -75,6 +75,11 @@ Trust boundaries are explicit:
 | Strict → Development downgrade | Tampering, Elevation | Production constructor creates a `HighAssurance` engine with no Development fallback; explicit profile constructors distinguish modes | A malicious deployer can change application code/configuration; signed deployment and process control required |
 | Oversized/nested input | Denial of Service | Input byte/depth/count bounds tested at constructors and evaluation boundary | Runtime scheduling, memory limits, and rate limiting belong to caller |
 | Weak algorithm negotiation | Elevation | Ed25519-only key parser and exact algorithm identifiers; unsupported algorithm tests | Future algorithm additions require a separate reviewed ADR |
+| Verifier trusts attacker-supplied key | Spoofing, Repudiation | `praetore-verify` requires an external attester pin; issuer pins are external JSONL entries; CLI tests exercise trusted and wrong keys | The operator must provision pins independently and protect the verifier host |
+| Ambiguous or malformed offline input | Tampering, Elevation | Evidence, authority, policy, identity, and pin imports use duplicate-key-rejecting bounded JSON parsing; CLI caps input size and rejects malformed pin files | CLI verifies the supplied artifact, not its provenance before it reaches the verifier |
+| Fuzzer regression or panic in parser/evaluator | Denial of Service | Five dedicated libFuzzer targets and seeded corpus; CI runs each target for a bounded smoke interval | Smoke duration is not proof of absence of defects; longer campaigns and sanitizer-supported hosts remain valuable |
+| Vulnerable dependency or unreproducible Rust resolution | Tampering, Elevation, Denial of Service | Committed workspace/fuzz lockfiles, `cargo audit --locked`, CI checks, CycloneDX SBOM artifact | Advisory data can lag; SBOM and lockfile do not prove source or build-host integrity |
+| Python/Rust behavior divergence | Tampering, Elevation | PyO3 binding delegates all verification to Rust; known-good/tampered fixtures test behavior in CI | Python is verify-only; the extension does not provide policy evaluation |
 
 ## Guarantees and non-guarantees
 
@@ -84,6 +89,7 @@ Trust boundaries are explicit:
 | Authority authenticity | Strict profile validates an authority signature under a trusted issuer pin and binds it to the subject key | No certificate chain, discovery, revocation protocol, or implicit trust |
 | Request authenticity | Strict profile verifies an agent signature over the canonical intent | No proof the agent is benign; no replay cache or exactly-once execution |
 | Evidence authenticity | When required, Ed25519 attester signature is verified offline against an external attester pin | No non-repudiation against compromised keys, host, or signing device |
+| Offline verifier | CLI validates evidence integrity, externally pinned attester signature, optional intent, and optional issuer signature/subject binding | It does not establish pin provenance or prove the evaluating host behaved honestly |
 | Determinism | Decision is a pure fold of validated input and the supplied clock value | System clock, locale, deployment state, or external effects are not made deterministic |
 | Availability | Bounded finite evaluation returns an explicit result or error | No availability/SLA, crash containment, memory isolation, or rate limiting |
 | Time validity | Exact inclusive RFC 3339 validity checks against configured time | No clock synchronization or automatic skew compensation |
@@ -104,10 +110,15 @@ Trust boundaries are explicit:
 | Deterministic ordering/encoding | canonical codec and ordered context | `policy_canonical_bytes_match_committed_golden_vector`, `policy_digest_matches_canonical_golden_value`, duplicate-key parser tests | Platform/input-order variance |
 | Work is bounded | request, authority and policy validators | maximum and over-limit tests | Resource exhaustion |
 | Single timestamp per evaluation | `AuthorizationEngine::evaluate` passes one snapshot to all checks | `evaluation_uses_one_clock_snapshot` | Clock/rollback |
+| CLI does not trust document-embedded keys | `praetore-verify` reads attester and issuer pins from separate command-line paths | `evidence_command_verifies_trusted_signature_intent_and_authority`, `evidence_command_rejects_tampered_documents_and_wrong_pins` | Operator pin provisioning |
+| CLI emits stable machine result and failure status | verifier `Summary` and exit handling | `verify_cli` integration tests | Input/output transport is operator-controlled |
+| Python verification is Rust-backed | `praetore-python` PyO3 crate calls core evidence APIs | Python `test_verify.py` good, tampered, and wrong-key fixtures | Python API intentionally has no evaluate or policy features |
+| Parser surfaces are fuzzed in bounded CI smoke | `fuzz/fuzz_targets` and seed corpora | Each target is run by `fuzz-smoke` workflow job | A short smoke run is not exhaustive fuzz coverage |
+| Build and dependency controls run in CI | `.github/workflows/assurance.yml` | `rust`, `audit`, `fuzz-smoke`, `python-verify`, `sbom`, and `release-integrity` jobs | Hosted CI and action supply chain remain trusted dependencies |
 
-Tests listed for upcoming implementation must be added before the associated
-guarantee is claimed as complete. Until then, the unimplemented mitigation is
-an explicit residual risk, not a delivered assurance.
+The [assurance matrix](assurance-matrix.md) maps shipped requirements to code,
+tests, and CI jobs. Fuzz smoke, SBOM generation, and audit reduce risk but do
+not constitute exhaustive proof, certification, or a clean-room build.
 
 ## Operational response
 
