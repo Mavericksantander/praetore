@@ -215,9 +215,11 @@ externally protected signing/trust keys, database access controls and backups,
 and preventing the agent from reaching alternate execution paths.
 
 Apply migrations `0001_replay_claims.sql` through
-`0007_tenant_scoped_execution.sql` in numeric order. The final migration
-converts execution keys and foreign keys to include the tenant UUID while
-retaining legacy unscoped claims under the reserved nil tenant.
+`0008_tenant_row_level_security.sql` in numeric order. Migration 0007 converts
+execution keys and foreign keys to include the tenant UUID while retaining
+legacy unscoped claims under the reserved nil tenant. Migration 0008 enables
+and forces RLS on tenant-keyed execution tables; each database operation sets
+the verified tenant UUID transaction-locally.
 Legacy orphan claims are explicitly detected by the atomic provider. Each
 authorization transaction uses the default `READ COMMITTED` isolation level,
 the replay table's `(tenant_id, agent_id, request_id)` primary key to serialize
@@ -397,8 +399,14 @@ rejects mismatched signed authority/tenant pairs. Production still needs
 tenant-isolated credentials, authenticated workload transport, secret-manager/
 KMS integration, rate limits, PostgreSQL row-level security, and tenant-aware
 administrative authorization. In particular, do not place all tenants'
-production API credentials in one shared process environment. The current
-database role and observer token are still service-wide. Migration
+production API credentials in one shared process environment. Observer API
+tokens are tenant-scoped, and migration
+`0008_tenant_row_level_security.sql` adds database policies using a
+transaction-local tenant context for journal access. The observer must use a
+dedicated non-owner, non-superuser, non-`BYPASSRLS` database role. Because
+roles can set custom PostgreSQL settings, this protects against missing SQL
+tenant filters but does not protect against compromise of the observer process
+or its database credential. Migration
 `0007_tenant_scoped_execution.sql` maps legacy records only when their stored
 evidence contains a UUID tenant claim. Unscoped claims and records without a
 valid tenant remain under the reserved nil tenant, are not addressable as
