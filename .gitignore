@@ -40,3 +40,6 @@ build/
 
 # Local architecture notes not intended for the public repository
 /docs/enterprise-architecture-rfc.md
+
+# Local Engineering Command Center
+/engineering-command-center/
