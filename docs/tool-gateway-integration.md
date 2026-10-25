@@ -385,12 +385,20 @@ protected by its configured Ed25519 approver key, but challenge reads and
 administrative identity/role management still need a separately enforced
 administrative access layer.
 
-For external tools, set an explicit egress proxy in the route configuration
-and make it enforce the destination hostname allowlist. In a separately networked pod, the example
+HTTP adapter configuration requires an explicit egress proxy in the route
+configuration; the production parser rejects a missing proxy. Make it enforce
+the destination hostname allowlist. In a separately networked pod, the example
 listener can bind with `PRAETORE_GATEWAY_LISTEN_ADDR=0.0.0.0:8080`; this is
 plain HTTP and is only safe behind private network policy and authenticated
 TLS termination.
 Without that variable the listener remains loopback-only.
+
+HTTP adapter mode also uses the Chrony-backed trusted clock and fails startup
+unless the initial `chronyc -n tracking` sample is synchronized within the
+configured error bound. See the
+[runtime security scaffold](runtime-security-scaffold.md) for the Chrony
+health thresholds and required host controls. Local demo mode remains on the
+system clock and is not a production configuration.
 
 The binary remains a **local development demo**, with local freshness and
 loopback-only PostgreSQL. These settings do not make it suitable for SaaS
@@ -429,6 +437,18 @@ Also prohibit `hostNetwork` for agent workloads and verify CNI behavior against
 node, service, and DNS paths. External APIs should be reached through the
 configured egress proxy and a cloud/CNI policy that blocks direct gateway
 egress. Without those controls an agent may bypass the gateway.
+For a Cilium cluster, apply the separate
+[Cilium policy template](../deploy/kubernetes/cilium-mandatory-enforcement.yaml)
+instead of combining it with the generic Kubernetes NetworkPolicy set. Replace
+its example FQDNs and in-cluster service names, verify DNS proxy support, and
+inspect effective policy; additive broad DNS allowances can undermine the
+FQDN/DNS policy. The templates do not prove enforcement until exercised from
+the deployed pods.
+
+For the Firecracker-backed Kata agent pod and Chrony trusted-clock integration,
+see the [runtime security scaffold](runtime-security-scaffold.md). The pod
+template requires an operator-provisioned CRI handler and Firecracker-capable
+KVM nodes; it is not itself a complete sandbox deployment.
 
 ## Human approvals
 

@@ -20,6 +20,7 @@ pub enum ErrorKind {
     FreshnessUnavailable,
     FreshnessInvalid,
     FreshnessLeaseTooLong,
+    TrustedClockUnavailable,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +64,9 @@ pub enum PraetoreError {
     #[error("replay protection storage is unavailable")]
     ReplayGuardUnavailable,
 
+    #[error("trusted clock is unavailable or unhealthy")]
+    TrustedClockUnavailable,
+
     #[error("freshness check failed")]
     FreshnessCheckFailed(crate::freshness::FreshnessError),
 }
@@ -84,6 +88,7 @@ impl PraetoreError {
             Self::EvidenceError(_) => ErrorKind::EvidenceFailure,
             Self::ReplayDetected => ErrorKind::ReplayDetected,
             Self::ReplayGuardUnavailable => ErrorKind::ReplayGuardFailure,
+            Self::TrustedClockUnavailable => ErrorKind::TrustedClockUnavailable,
             Self::FreshnessCheckFailed(crate::freshness::FreshnessError::Revoked) => {
                 ErrorKind::FreshnessRevoked
             }
@@ -125,6 +130,7 @@ impl PraetoreError {
             ErrorKind::FreshnessUnavailable => "FRESHNESS_UNAVAILABLE",
             ErrorKind::FreshnessInvalid => "FRESHNESS_INVALID",
             ErrorKind::FreshnessLeaseTooLong => "FRESHNESS_LEASE_TOO_LONG",
+            ErrorKind::TrustedClockUnavailable => "TRUSTED_CLOCK_UNAVAILABLE",
         }
     }
 }
@@ -151,6 +157,17 @@ mod tests {
         assert_eq!(
             unavailable.to_string(),
             "replay protection storage is unavailable"
+        );
+    }
+
+    #[test]
+    fn trusted_clock_failures_have_a_stable_non_leaky_code() {
+        let error = PraetoreError::TrustedClockUnavailable;
+        assert_eq!(error.kind(), ErrorKind::TrustedClockUnavailable);
+        assert_eq!(error.code(), "TRUSTED_CLOCK_UNAVAILABLE");
+        assert_eq!(
+            error.to_string(),
+            "trusted clock is unavailable or unhealthy"
         );
     }
 

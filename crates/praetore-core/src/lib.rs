@@ -18,6 +18,7 @@ pub use authorization::{AuthorizationIntentV2, AuthorizationRequest};
 pub use decision::{Decision, DecisionOutcome};
 pub use engine::{
     AtomicEvaluationError, EvaluationMode, HighAssuranceConfig, TrustedAuthorityIssuer,
+    TrustedClock, TrustedClockError,
 };
 pub use error::{ErrorKind, PraetoreError, Result};
 pub use evidence::{Evidence, EvidenceAttesterKey};

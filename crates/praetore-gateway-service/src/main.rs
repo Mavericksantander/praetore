@@ -9,6 +9,7 @@ use praetore_gateway::{
     ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway,
     HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
 };
+use praetore_gateway_service::chrony_clock::ChronyClock;
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,6 +19,7 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
+    time::Duration as StdDuration,
 };
 use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
@@ -97,6 +99,7 @@ struct GatewayAdapterSetup {
     dispatcher: Arc<dyn ActionDispatcher>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: String,
+    require_trusted_clock: bool,
 }
 
 impl LocalExecutionSigner {
@@ -240,6 +243,7 @@ fn build_gateway(
     dispatcher: Arc<dyn ActionDispatcher>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: &str,
+    require_trusted_clock: bool,
 ) -> Result<Gateway, Box<dyn std::error::Error>> {
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
@@ -266,7 +270,18 @@ fn build_gateway(
     if let Some(bindings) = tenant_issuer_bindings {
         config = config.with_tenant_issuer_bindings(bindings);
     }
-    let engine = AuthorizationEngine::production(policy, config)?;
+    let engine = if require_trusted_clock {
+        let chronyc_path =
+            env::var("PRAETORE_GATEWAY_CHRONYC_PATH").unwrap_or_else(|_| "/usr/bin/chronyc".into());
+        let poll_interval = env_duration_ms("PRAETORE_GATEWAY_CHRONY_POLL_INTERVAL_MS", 500)?;
+        let max_sample_age = env_duration_ms("PRAETORE_GATEWAY_CHRONY_MAX_SAMPLE_AGE_MS", 2_000)?;
+        let max_error = env_duration_ms("PRAETORE_GATEWAY_CHRONY_MAX_ERROR_MS", 100)?;
+        let clock = ChronyClock::new(&chronyc_path, poll_interval, max_sample_age, max_error)
+            .map_err(std::io::Error::other)?;
+        AuthorizationEngine::production_with_trusted_clock(policy, config, clock)?
+    } else {
+        AuthorizationEngine::production(policy, config)?
+    };
 
     let journal = Arc::new(PostgresExecutionJournal::from_connection_factory({
         let database_url = database_url.to_owned();
@@ -305,18 +320,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let audience = required_env("PRAETORE_GATEWAY_AUDIENCE")?;
             GatewayAdapterSetup {
                 dispatcher: Arc::new(
-                    praetore_gateway_service::http_dispatcher::HttpActionDispatcher::from_json(
-                        &route_config,
-                    )?,
+                    praetore_gateway_service::http_dispatcher::HttpActionDispatcher::from_json_with_required_egress_proxy(&route_config)?,
                 ),
                 tenant_issuer_bindings: Some(bindings),
                 audience,
+                require_trusted_clock: true,
             }
         }
         Ok("local-demo") | Err(_) => GatewayAdapterSetup {
             dispatcher: Arc::new(LocalDemoDispatcher::new()),
             tenant_issuer_bindings: None,
             audience: "praetore-local-demo".to_owned(),
+            require_trusted_clock: false,
         },
         Ok(_) => return Err("PRAETORE_GATEWAY_ADAPTER must be http or local-demo".into()),
     };
@@ -325,6 +340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         adapter_setup.dispatcher,
         adapter_setup.tenant_issuer_bindings,
         &adapter_setup.audience,
+        adapter_setup.require_trusted_clock,
     )?);
     apply_migrations(&database_url)?;
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
@@ -358,6 +374,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<_, std::io::Error>(())
     })?;
     Ok(())
+}
+
+fn env_duration_ms(name: &str, default: u64) -> Result<StdDuration, Box<dyn std::error::Error>> {
+    let value = env::var(name)
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(default))?;
+    if value == 0 {
+        return Err(format!("{name} must be greater than zero").into());
+    }
+    Ok(StdDuration::from_millis(value))
 }
 
 fn validate_secret_key(value: &str, description: &str) -> Result<(), Box<dyn std::error::Error>> {

@@ -143,7 +143,8 @@ fn gateway_error_response(error: GatewayError) -> Response {
             | ErrorKind::PolicyEvaluationFailure
             | ErrorKind::EvidenceFailure
             | ErrorKind::FreshnessInvalid
-            | ErrorKind::FreshnessLeaseTooLong => {
+            | ErrorKind::FreshnessLeaseTooLong
+            | ErrorKind::TrustedClockUnavailable => {
                 error_response(StatusCode::SERVICE_UNAVAILABLE, "authorization_unavailable")
             }
             _ => error_response(StatusCode::FORBIDDEN, "authorization_failed"),
@@ -193,4 +194,18 @@ fn gateway_error_response(error: GatewayError) -> Response {
 
 fn error_response(status: StatusCode, code: &'static str) -> Response {
     (status, Json(ErrorResponse { code })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use praetore_core::PraetoreError;
+
+    #[test]
+    fn trusted_clock_failure_maps_to_service_unavailable() {
+        let response = gateway_error_response(GatewayError::Authorization(
+            PraetoreError::TrustedClockUnavailable,
+        ));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

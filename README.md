@@ -85,6 +85,7 @@ for signing and verification details.
 * [Read-only observability MVP](docs/observability-mvp.md)
 * [Assurance traceability matrix](docs/assurance-matrix.md)
 * [Operations runbooks](docs/operations.md)
+* [Runtime security scaffold: sandbox, trusted clocks, and network controls](docs/runtime-security-scaffold.md)
 * [Pre-user deployment gates](docs/pre-user-pilot-gates.md)
 * [Architecture decision records](docs/adr/README.md)
 * [Offline verifier CLI](#verify-evidence-offline)
@@ -169,7 +170,10 @@ There are three evaluation modes; choose deliberately:
 | **Strict** | Signature-checked offline evaluation | Requires a signed authority from an explicitly pinned issuer, subject-key binding, and a signed agent request intent. Does not require the HighAssurance policy pin, evidence attestation, replay guard, or freshness provider. |
 | **HighAssurance** | Strongest profile provided by this library | Strict checks plus v2 policy semantics/digest pin, audience- and expiry-bound signed intents, time-bounded authorities, v2 attested evidence, content-digest-bound freshness with a capped lease, and caller-owned replay guard. |
 
-Use `AuthorizationEngine::production` for HighAssurance. The deprecated
+Use `AuthorizationEngine::production` for HighAssurance. When the deployment
+requires a fail-closed clock-health check, implement `TrustedClock` and use
+`production_with_trusted_clock`; `production` and `production_with_clock` do
+not independently establish that the host time source is trustworthy. The deprecated
 `new` and `with_clock` constructors remain Development-mode compatibility
 APIs. The crate runs offline and in-process; it does not supply PKI, revocation
 storage, a secure clock, deployment integrity, host isolation, or atomic action
