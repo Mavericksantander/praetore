@@ -27,6 +27,7 @@ impl PostgresReplayGuard {
 impl ReplayGuard for PostgresReplayGuard {
     fn claim_once(
         &self,
+        tenant_id: Uuid,
         agent_id: Uuid,
         request_id: Uuid,
     ) -> std::result::Result<(), ReplayGuardError> {
@@ -39,9 +40,10 @@ impl ReplayGuard for PostgresReplayGuard {
             .map_err(|_| ReplayGuardError::Unavailable)?;
         let inserted = client
             .execute(
-                "INSERT INTO praetore.replay_claims (agent_id, request_id) \
-                 VALUES ($1, $2) ON CONFLICT (agent_id, request_id) DO NOTHING",
-                &[&agent_id, &request_id],
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3) \
+                 ON CONFLICT (tenant_id, agent_id, request_id) DO NOTHING",
+                &[&tenant_id, &agent_id, &request_id],
             )
             .map_err(|_| ReplayGuardError::Unavailable)?;
 

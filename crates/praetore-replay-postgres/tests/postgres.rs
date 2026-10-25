@@ -34,6 +34,7 @@ use uuid::Uuid;
 
 static TEST_DATABASE_SETUP: OnceLock<()> = OnceLock::new();
 const TEST_NOW: &str = "2026-06-01T12:00:00Z";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 struct TestExecutionAttester(SigningKey);
 
@@ -94,14 +95,35 @@ fn initialize_test_database() {
             .batch_execute(include_str!("../migrations/0006_human_approvals.sql"))
             .expect("install append-only human approvals");
         client
+            .batch_execute(include_str!(
+                "../migrations/0007_tenant_scoped_execution.sql"
+            ))
+            .expect("install tenant-scoped execution identity");
+        client
+            .batch_execute(include_str!(
+                "../migrations/0007_tenant_scoped_execution.sql"
+            ))
+            .expect("reapply tenant-scoped execution migration safely");
+        client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
-                     agent_id UUID NOT NULL, request_id UUID NOT NULL, \
+                     tenant_id UUID NOT NULL, agent_id UUID NOT NULL, request_id UUID NOT NULL, \
                      action_digest CHAR(64) NOT NULL, output_json TEXT NOT NULL, \
-                     PRIMARY KEY (agent_id, request_id)); \
+                     PRIMARY KEY (tenant_id, agent_id, request_id)); \
                  CREATE TABLE IF NOT EXISTS praetore.gateway_test_invocations (\
-                     invocation_id BIGSERIAL PRIMARY KEY, \
-                     agent_id UUID NOT NULL, request_id UUID NOT NULL);",
+                     invocation_id BIGSERIAL PRIMARY KEY, tenant_id UUID NOT NULL, \
+                     agent_id UUID NOT NULL, request_id UUID NOT NULL); \
+                 ALTER TABLE praetore.gateway_test_effects \
+                     ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL \
+                     DEFAULT '00000000-0000-0000-0000-000000000000'; \
+                 ALTER TABLE praetore.gateway_test_effects \
+                     DROP CONSTRAINT IF EXISTS gateway_test_effects_pkey; \
+                 ALTER TABLE praetore.gateway_test_effects \
+                     ADD CONSTRAINT gateway_test_effects_pkey \
+                     PRIMARY KEY (tenant_id, agent_id, request_id); \
+                 ALTER TABLE praetore.gateway_test_invocations \
+                     ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL \
+                     DEFAULT '00000000-0000-0000-0000-000000000000';",
             )
             .expect("install persistent test adapter tables");
         client
@@ -127,9 +149,9 @@ fn initialize_test_database() {
                  REVOKE ALL ON TABLE praetore.human_approvals \
                      FROM praetore_replay_test; \
                  GRANT USAGE ON SCHEMA praetore TO praetore_replay_test; \
-                 GRANT SELECT (agent_id, request_id) ON praetore.replay_claims \
+                 GRANT SELECT (tenant_id, agent_id, request_id) ON praetore.replay_claims \
                      TO praetore_replay_test; \
-                 GRANT INSERT (agent_id, request_id) ON praetore.replay_claims \
+                 GRANT INSERT (tenant_id, agent_id, request_id) ON praetore.replay_claims \
                      TO praetore_replay_test; \
                  GRANT SELECT, INSERT, UPDATE ON praetore.execution_journal \
                      TO praetore_replay_test; \
@@ -144,10 +166,10 @@ fn initialize_test_database() {
                      FROM praetore_observe_test; \
                  REVOKE ALL ON TABLE praetore.execution_journal_events \
                      FROM praetore_observe_test; \
-                 GRANT SELECT (agent_id, request_id, request_digest, action_digest, \
+                 GRANT SELECT (tenant_id, agent_id, request_id, request_digest, action_digest, \
                      authorization_status, execution_status, evidence_json, created_at, updated_at) \
                      ON praetore.execution_journal TO praetore_observe_test; \
-                 GRANT SELECT (event_id, agent_id, request_id, from_status, to_status, occurred_at) \
+                 GRANT SELECT (event_id, tenant_id, agent_id, request_id, from_status, to_status, occurred_at) \
                      ON praetore.execution_journal_events TO praetore_observe_test",
             )
             .expect("configure least-privilege test role");
@@ -198,14 +220,40 @@ fn claim_is_unique_and_survives_a_new_client() {
     let agent_id = Uuid::new_v4();
     let request_id = Uuid::new_v4();
     let first_guard = connect_guard();
-    assert_eq!(first_guard.claim_once(agent_id, request_id), Ok(()));
+    assert_eq!(
+        first_guard.claim_once(TEST_TENANT_ID, agent_id, request_id),
+        Ok(())
+    );
 
     let second_guard = connect_guard();
     assert_eq!(
-        second_guard.claim_once(agent_id, request_id),
+        second_guard.claim_once(TEST_TENANT_ID, agent_id, request_id),
         Err(ReplayGuardError::AlreadyClaimed)
     );
-    assert_eq!(second_guard.claim_once(agent_id, Uuid::new_v4()), Ok(()));
+    assert_eq!(
+        second_guard.claim_once(TEST_TENANT_ID, agent_id, Uuid::new_v4()),
+        Ok(())
+    );
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn replay_claims_are_namespaced_by_tenant() {
+    let agent_id = Uuid::new_v4();
+    let request_id = Uuid::new_v4();
+    let first_tenant = Uuid::from_u128(1);
+    let second_tenant = Uuid::from_u128(2);
+    let guard = connect_guard();
+
+    assert_eq!(guard.claim_once(first_tenant, agent_id, request_id), Ok(()));
+    assert_eq!(
+        guard.claim_once(second_tenant, agent_id, request_id),
+        Ok(())
+    );
+    assert_eq!(
+        guard.claim_once(first_tenant, agent_id, request_id),
+        Err(ReplayGuardError::AlreadyClaimed)
+    );
 }
 
 #[test]
@@ -223,7 +271,7 @@ fn concurrent_connections_allow_exactly_one_claim() {
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
-                guard.claim_once(agent_id, request_id)
+                guard.claim_once(TEST_TENANT_ID, agent_id, request_id)
             })
         })
         .collect::<Vec<_>>();
@@ -267,12 +315,15 @@ fn a_lost_database_connection_fails_closed_and_a_new_client_recovers() {
         .get(0);
     assert!(terminated);
     assert_eq!(
-        guard.claim_once(agent_id, request_id),
+        guard.claim_once(TEST_TENANT_ID, agent_id, request_id),
         Err(ReplayGuardError::Unavailable)
     );
 
     let recovered_guard = connect_guard();
-    assert_eq!(recovered_guard.claim_once(agent_id, request_id), Ok(()));
+    assert_eq!(
+        recovered_guard.claim_once(TEST_TENANT_ID, agent_id, request_id),
+        Ok(())
+    );
 }
 
 #[test]
@@ -287,21 +338,26 @@ fn replay_claim_survives_server_restart() {
             initialize_test_database();
             connect_client()
                 .execute(
-                    "DELETE FROM praetore.replay_claims WHERE agent_id = $1 AND request_id = $2",
-                    &[&agent_id, &request_id],
+                    "DELETE FROM praetore.replay_claims \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                    &[&Uuid::nil(), &agent_id, &request_id],
                 )
                 .expect("clear only the fixed restart-test claim");
-            assert_eq!(connect_guard().claim_once(agent_id, request_id), Ok(()));
+            assert_eq!(
+                connect_guard().claim_once(TEST_TENANT_ID, agent_id, request_id),
+                Ok(())
+            );
         }
         "after" => {
             assert_eq!(
-                connect_guard().claim_once(agent_id, request_id),
+                connect_guard().claim_once(TEST_TENANT_ID, agent_id, request_id),
                 Err(ReplayGuardError::AlreadyClaimed)
             );
             connect_client()
                 .execute(
-                    "DELETE FROM praetore.replay_claims WHERE agent_id = $1 AND request_id = $2",
-                    &[&agent_id, &request_id],
+                    "DELETE FROM praetore.replay_claims \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                    &[&Uuid::nil(), &agent_id, &request_id],
                 )
                 .expect("remove only the fixed restart-test claim");
         }
@@ -367,8 +423,8 @@ impl PostgresTestAdapter {
         let row = client
             .query_opt(
                 "SELECT action_digest, output_json FROM praetore.gateway_test_effects \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .ok()??;
         let digest: String = row.get(0);
@@ -381,6 +437,7 @@ impl ActionDispatcher for PostgresTestAdapter {
     fn dispatch(
         &self,
         key: ExecutionKey,
+        _authority: &Authority,
         action: &Action,
         digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
@@ -397,17 +454,19 @@ impl ActionDispatcher for PostgresTestAdapter {
         let mut transaction = client.transaction().map_err(|_| DispatchError)?;
         transaction
             .execute(
-                "INSERT INTO praetore.gateway_test_invocations (agent_id, request_id) \
-                 VALUES ($1, $2)",
-                &[&key.agent_id, &key.request_id],
+                "INSERT INTO praetore.gateway_test_invocations \
+                 (tenant_id, agent_id, request_id) VALUES ($1, $2, $3)",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| DispatchError)?;
         let inserted = transaction
             .execute(
                 "INSERT INTO praetore.gateway_test_effects \
-                 (agent_id, request_id, action_digest, output_json) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (agent_id, request_id) DO NOTHING",
+                 (tenant_id, agent_id, request_id, action_digest, output_json) \
+                 VALUES ($1, $2, $3, $4, $5) \
+                 ON CONFLICT (tenant_id, agent_id, request_id) DO NOTHING",
                 &[
+                    &key.tenant_id,
                     &key.agent_id,
                     &key.request_id,
                     &digest,
@@ -419,8 +478,8 @@ impl ActionDispatcher for PostgresTestAdapter {
             let existing: String = transaction
                 .query_one(
                     "SELECT action_digest FROM praetore.gateway_test_effects \
-                     WHERE agent_id = $1 AND request_id = $2",
-                    &[&key.agent_id, &key.request_id],
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
                 .map_err(|_| DispatchError)?
                 .get(0);
@@ -449,6 +508,7 @@ impl ActionDispatcher for PostgresTestAdapter {
     fn reconcile(
         &self,
         key: ExecutionKey,
+        _authority: &Authority,
         _action: &Action,
         expected_digest: &str,
     ) -> ReconciliationReport {
@@ -591,7 +651,8 @@ fn create_postgres_gateway(request_id: Uuid) -> PostgresGatewayFixture {
         "gateway-test-issuer",
         vec!["local:write".into()],
     )
-    .with_validity(validity.clone());
+    .with_validity(validity.clone())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
     let action = Action::new(
         "local:set_value",
@@ -655,7 +716,8 @@ fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture
         "gateway-test-issuer",
         vec!["local:write".into()],
     )
-    .with_validity(validity.clone());
+    .with_validity(validity.clone())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
     let action = Action::new(
         "local:set_value",
@@ -774,8 +836,8 @@ fn database_invocation_count(key: ExecutionKey) -> i64 {
     connect_client()
         .query_one(
             "SELECT count(*) FROM praetore.gateway_test_invocations \
-             WHERE agent_id = $1 AND request_id = $2",
-            &[&key.agent_id, &key.request_id],
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
         .unwrap()
         .get(0)
@@ -785,8 +847,8 @@ fn database_effect_count(key: ExecutionKey) -> i64 {
     connect_client()
         .query_one(
             "SELECT count(*) FROM praetore.gateway_test_effects \
-             WHERE agent_id = $1 AND request_id = $2",
-            &[&key.agent_id, &key.request_id],
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
         .unwrap()
         .get(0)
@@ -796,8 +858,19 @@ fn database_replay_claim_count(key: ExecutionKey) -> i64 {
     connect_client()
         .query_one(
             "SELECT count(*) FROM praetore.replay_claims \
-             WHERE agent_id = $1 AND request_id = $2",
-            &[&key.agent_id, &key.request_id],
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap()
+        .get(0)
+}
+
+fn database_unscoped_replay_claim_count(key: ExecutionKey) -> i64 {
+    connect_client()
+        .query_one(
+            "SELECT count(*) FROM praetore.replay_claims \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&Uuid::nil(), &key.agent_id, &key.request_id],
         )
         .unwrap()
         .get(0)
@@ -807,8 +880,8 @@ fn database_journal_count(key: ExecutionKey) -> i64 {
     connect_client()
         .query_one(
             "SELECT count(*) FROM praetore.execution_journal \
-             WHERE agent_id = $1 AND request_id = $2",
-            &[&key.agent_id, &key.request_id],
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
         .unwrap()
         .get(0)
@@ -817,8 +890,9 @@ fn database_journal_count(key: ExecutionKey) -> i64 {
 fn database_agent_for_request(request_id: Uuid) -> Uuid {
     connect_client()
         .query_one(
-            "SELECT agent_id FROM praetore.execution_journal WHERE request_id = $1",
-            &[&request_id],
+            "SELECT agent_id FROM praetore.execution_journal \
+             WHERE tenant_id = $1 AND request_id = $2",
+            &[&TEST_TENANT_ID, &request_id],
         )
         .unwrap()
         .get(0)
@@ -849,8 +923,8 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
         ] {
             client
                 .execute(
-                    &format!("DELETE FROM {table} WHERE request_id = $1"),
-                    &[request_id],
+                    &format!("DELETE FROM {table} WHERE tenant_id = $1 AND request_id = $2"),
+                    &[&TEST_TENANT_ID, request_id],
                 )
                 .unwrap();
         }
@@ -871,12 +945,12 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
 fn database_rows_for_request(table: &str, request_id: Uuid) -> i64 {
     let query = match table {
         "praetore.replay_claims" | "praetore.execution_journal" => {
-            format!("SELECT COUNT(*) FROM {table} WHERE request_id = $1")
+            format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1 AND request_id = $2")
         }
         _ => panic!("unsupported test table"),
     };
     connect_client()
-        .query_one(&query, &[&request_id])
+        .query_one(&query, &[&TEST_TENANT_ID, &request_id])
         .unwrap()
         .get(0)
 }
@@ -887,6 +961,7 @@ fn postgres_gateway_authorizes_and_persists_one_effect() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
     let receipt = fixture.gateway.execute(fixture.request.clone()).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -930,6 +1005,72 @@ fn postgres_gateway_authorizes_and_persists_one_effect() {
 
 #[test]
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_execution_identity_isolated_for_same_agent_and_request_across_tenants() {
+    let first = create_postgres_gateway(Uuid::new_v4());
+    let first_receipt = first.gateway.execute(first.request.clone()).unwrap();
+    let second_tenant = Uuid::from_u128(2);
+    let agent_key = AgentKeyPair::from_secret_bytes(&[71; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[72; 32]);
+    let agent = first.request.agent.clone();
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "gateway-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(test_validity())
+    .with_constraint("tenant_id", second_tenant.to_string());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+
+    let mut second_request =
+        AuthorizationRequest::new(agent, authority, first.request.action.clone()).unwrap();
+    second_request.request_id = first.request.request_id;
+    let now = FixedClock::try_new(TEST_NOW).unwrap().now();
+    second_request
+        .sign_intent_v2(
+            &agent_key,
+            "postgres-test-gateway",
+            now,
+            now + Duration::minutes(1),
+            first.policy.digest().unwrap(),
+        )
+        .unwrap();
+    let second_adapter = Arc::new(PostgresTestAdapter::new(None));
+    let second_gateway = Gateway::new(
+        create_test_engine(
+            first.policy.clone(),
+            first.issuer_public_key.clone(),
+            first.attester.clone(),
+        ),
+        Arc::new(connect_journal()),
+        second_adapter.clone(),
+        execution_attester(),
+    )
+    .unwrap();
+    let second_receipt = second_gateway.execute(second_request).unwrap();
+    let first_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *first_receipt.evidence.agent.id.as_uuid(),
+        request_id: first_receipt.evidence.request_id,
+    };
+    let second_key = ExecutionKey {
+        tenant_id: second_tenant,
+        agent_id: *second_receipt.evidence.agent.id.as_uuid(),
+        request_id: second_receipt.evidence.request_id,
+    };
+
+    assert_eq!(first_key.agent_id, second_key.agent_id);
+    assert_eq!(first_key.request_id, second_key.request_id);
+    assert_ne!(first_key.tenant_id, second_key.tenant_id);
+    assert_eq!(database_journal_count(first_key), 1);
+    assert_eq!(database_journal_count(second_key), 1);
+    assert_eq!(database_replay_claim_count(first_key), 1);
+    assert_eq!(database_replay_claim_count(second_key), 1);
+    assert_eq!(database_effect_count(first_key), 1);
+    assert_eq!(database_effect_count(second_key), 1);
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
 fn postgres_atomic_commit_rolls_back_claim_when_journal_insert_fails() {
     const REQUEST_ID: &str = "00000000-0000-0000-0000-000000000301";
     let request_id = Uuid::parse_str(REQUEST_ID).unwrap();
@@ -955,6 +1096,7 @@ fn postgres_atomic_commit_rolls_back_claim_when_journal_insert_fails() {
         Err(GatewayError::Journal(JournalError::Unavailable))
     ));
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id,
     };
@@ -995,6 +1137,7 @@ fn postgres_lost_commit_ack_is_verified_before_dispatch() {
     .unwrap();
     let receipt = gateway.execute(fixture.request).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -1028,6 +1171,7 @@ fn postgres_unverifiable_commit_acknowledgement_blocks_dispatch() {
     )
     .unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1046,18 +1190,19 @@ fn postgres_unverifiable_commit_acknowledgement_blocks_dispatch() {
 fn postgres_legacy_replay_claim_without_authorization_is_orphaned_and_blocked() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
     connect_guard()
-        .claim_once(key.agent_id, key.request_id)
+        .claim_once(Uuid::nil(), key.agent_id, key.request_id)
         .unwrap();
 
     assert!(matches!(
         fixture.gateway.execute(fixture.request),
         Err(GatewayError::Journal(JournalError::OrphanedReplayClaim))
     ));
-    assert_eq!(database_replay_claim_count(key), 1);
+    assert_eq!(database_unscoped_replay_claim_count(key), 1);
     assert_eq!(database_journal_count(key), 0);
     assert_eq!(database_effect_count(key), 0);
     assert_eq!(database_invocation_count(key), 0);
@@ -1098,6 +1243,7 @@ fn postgres_journal_prevents_concurrent_duplicate_effects_across_engines() {
         })
         .count();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1116,6 +1262,7 @@ fn postgres_journal_rejects_execution_key_reused_with_different_action() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
     let first = fixture.gateway.execute(fixture.request.clone()).unwrap();
     let first_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *first.evidence.agent.id.as_uuid(),
         request_id: first.evidence.request_id,
     };
@@ -1163,6 +1310,7 @@ fn postgres_journal_rejects_execution_key_reused_with_different_action() {
         Err(GatewayError::Journal(JournalError::ConflictingRequest))
     ));
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *first.evidence.agent.id.as_uuid(),
         request_id: first.evidence.request_id,
     };
@@ -1197,6 +1345,7 @@ fn postgres_journal_failure_before_dispatch_prevents_effect() {
         Err(GatewayError::Journal(JournalError::Unavailable))
     ));
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1212,6 +1361,7 @@ fn postgres_recovery_never_dispatches_authorized_or_ambiguous_rows() {
     let authorized = create_postgres_gateway(Uuid::new_v4());
     let evidence = evaluate_and_commit(&authorized, authorized.request.clone());
     let authorized_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *evidence.agent.id.as_uuid(),
         request_id: evidence.request_id,
     };
@@ -1224,6 +1374,7 @@ fn postgres_recovery_never_dispatches_authorized_or_ambiguous_rows() {
     let ambiguous = create_postgres_gateway(Uuid::new_v4());
     let evidence = evaluate_and_commit(&ambiguous, ambiguous.request.clone());
     let ambiguous_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *evidence.agent.id.as_uuid(),
         request_id: evidence.request_id,
     };
@@ -1241,6 +1392,7 @@ fn postgres_recovery_never_dispatches_authorized_or_ambiguous_rows() {
 fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1322,6 +1474,7 @@ fn postgres_effect_survives_failed_terminal_write_and_is_reconciled_without_retr
     )
     .unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1346,6 +1499,7 @@ fn postgres_journal_terminal_states_cannot_return_to_dispatchable() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -1378,8 +1532,8 @@ fn postgres_journal_terminal_states_cannot_return_to_dispatchable() {
         direct_client
             .execute(
                 "UPDATE praetore.execution_journal SET execution_status = 'authorized' \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .is_err()
     );
@@ -1396,6 +1550,7 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -1403,6 +1558,7 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
     assert!(reader.database_available());
 
     let filters = praetore_replay_postgres::ExecutionFilters {
+        tenant_id: Some(key.tenant_id),
         agent_id: Some(key.agent_id),
         decision: Some(praetore_gateway::AuthorizationStatus::Allowed),
         execution: Some(ExecutionStatus::Confirmed),
@@ -1445,8 +1601,8 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
         read_only_client
             .query_opt(
                 "SELECT output_json FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .is_err()
     );
@@ -1454,8 +1610,8 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
         read_only_client
             .execute(
                 "UPDATE praetore.execution_journal SET execution_status = 'failed' \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .is_err()
     );
@@ -1463,8 +1619,8 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
         connect_client()
             .execute(
                 "DELETE FROM praetore.execution_journal_events \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .is_err()
     );
@@ -1472,8 +1628,8 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
         read_only_client
             .execute(
                 "DELETE FROM praetore.execution_journal_events \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .is_err()
     );
@@ -1493,6 +1649,7 @@ fn postgres_human_approval_is_persisted_atomically_and_consumed_once() {
         DecisionOutcome::RequireApproval
     );
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *pending.evidence.agent.id.as_uuid(),
         request_id: pending.evidence.request_id,
     };
@@ -1532,8 +1689,8 @@ fn postgres_human_approval_is_persisted_atomically_and_consumed_once() {
         connect_client()
             .execute(
                 "UPDATE praetore.human_approvals SET outcome = 'reject' \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .is_err()
     );
@@ -1562,6 +1719,7 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
             let authorized_evidence =
                 evaluate_and_commit(&authorized_fixture, authorized_fixture.request.clone());
             let authorized_key = ExecutionKey {
+                tenant_id: TEST_TENANT_ID,
                 agent_id: *authorized_evidence.agent.id.as_uuid(),
                 request_id: authorized_evidence.request_id,
             };
@@ -1572,6 +1730,7 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
             let dispatching_evidence =
                 evaluate_and_commit(&dispatching_fixture, dispatching_fixture.request.clone());
             let dispatching_key = ExecutionKey {
+                tenant_id: TEST_TENANT_ID,
                 agent_id: *dispatching_evidence.agent.id.as_uuid(),
                 request_id: dispatching_evidence.request_id,
             };
@@ -1623,10 +1782,12 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
             let dispatching_request = Uuid::parse_str(DISPATCHING_REQUEST).unwrap();
             let rolled_back_request = Uuid::parse_str(ROLLED_BACK_REQUEST).unwrap();
             let authorized_key = ExecutionKey {
+                tenant_id: TEST_TENANT_ID,
                 agent_id: database_agent_for_request(authorized_request),
                 request_id: authorized_request,
             };
             let dispatching_key = ExecutionKey {
+                tenant_id: TEST_TENANT_ID,
                 agent_id: database_agent_for_request(dispatching_request),
                 request_id: dispatching_request,
             };

@@ -30,7 +30,7 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route("/healthz", get(health))
         .route("/v1/execute", post(execute))
         .route(
-            "/v1/approvals/{agent_id}/{request_id}",
+            "/v1/approvals/{tenant_id}/{agent_id}/{request_id}",
             get(approval_challenge).post(resolve_approval),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -83,9 +83,10 @@ async fn execute(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
 
 async fn approval_challenge(
     State(gateway): State<Arc<Gateway>>,
-    Path((agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
 ) -> Response {
     let key = crate::ExecutionKey {
+        tenant_id,
         agent_id,
         request_id,
     };
@@ -101,7 +102,7 @@ async fn approval_challenge(
 
 async fn resolve_approval(
     State(gateway): State<Arc<Gateway>>,
-    Path((agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
     body: Bytes,
 ) -> Response {
     let decision = match std::str::from_utf8(&body)
@@ -111,7 +112,10 @@ async fn resolve_approval(
         Some(decision) => decision,
         None => return error_response(StatusCode::BAD_REQUEST, "invalid_approval_decision"),
     };
-    if decision.challenge.agent_id != agent_id || decision.challenge.request_id != request_id {
+    if decision.challenge.tenant_id != tenant_id
+        || decision.challenge.agent_id != agent_id
+        || decision.challenge.request_id != request_id
+    {
         return error_response(StatusCode::BAD_REQUEST, "approval_challenge_mismatch");
     }
     match tokio::task::spawn_blocking(move || gateway.resolve_human_approval(decision)).await {
@@ -163,6 +167,9 @@ fn gateway_error_response(error: GatewayError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "gateway_configuration_error",
         ),
+        GatewayError::TenantIdentityInvalid => {
+            error_response(StatusCode::BAD_REQUEST, "tenant_identity_invalid")
+        }
         GatewayError::ExecutionNotFound(_) => {
             error_response(StatusCode::NOT_FOUND, "execution_not_found")
         }

@@ -49,10 +49,11 @@ Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
 deployment responsibilities. A library decision does not stop a tool call
 that bypasses the caller; deployments must mediate protected tools through a
-mandatory enforcement point. The workspace now includes a synchronous
-reference gateway crate, a durable PostgreSQL execution journal, and a
-loopback-only authenticated read-only observability service; it is not a
-production administration plane. See the [tool gateway
+mandatory enforcement point. The workspace now includes a synchronous reference gateway crate, a
+tenant-scoped, fixed-route HTTP adapter, a durable PostgreSQL execution
+journal, and a loopback-only authenticated read-only observability service.
+The gateway service and adapter remain development/reference components, not a
+production SaaS enforcement plane. See the [tool gateway
 integration](docs/tool-gateway-integration.md), [threat model](docs/threat-model.md),
 [observability MVP](docs/observability-mvp.md),
 and [pre-user deployment gates](docs/pre-user-pilot-gates.md) before any

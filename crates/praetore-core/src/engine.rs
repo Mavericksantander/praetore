@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
@@ -621,6 +622,7 @@ impl AuthorizationEngine {
             .into());
         }
         let replay_key = (*request.agent.id.as_uuid(), request.request_id);
+        let replay_tenant_id = request.authority.tenant_id().unwrap_or_else(Uuid::nil);
         let (intent_v2, authority_digest) = if self.mode == EvaluationMode::HighAssurance {
             self.validate_high_assurance_request(&request, now)?
         } else {
@@ -704,7 +706,7 @@ impl AuthorizationEngine {
                 self.replay_guard
                     .as_ref()
                     .ok_or(PraetoreError::ReplayGuardUnavailable)?
-                    .claim_once(replay_key.0, replay_key.1)
+                    .claim_once(replay_tenant_id, replay_key.0, replay_key.1)
                     .map_err(|error| match error {
                         ReplayGuardError::AlreadyClaimed => PraetoreError::ReplayDetected,
                         ReplayGuardError::Unavailable => PraetoreError::ReplayGuardUnavailable,
@@ -840,6 +842,10 @@ impl AuthorizationEngine {
         }
 
         for constraint in &request.authority.constraints {
+            // The gateway consumes this issuer-signed routing claim separately.
+            if constraint.key == "tenant_id" {
+                continue;
+            }
             let satisfied = if constraint.key == "target" {
                 request.action.target.as_deref() == Some(constraint.value.as_str())
             } else {
@@ -901,13 +907,14 @@ mod tests {
 
     #[derive(Default)]
     struct TestReplayGuard {
-        claims: Mutex<HashSet<(Uuid, Uuid)>>,
+        claims: Mutex<HashSet<(Uuid, Uuid, Uuid)>>,
         unavailable: bool,
     }
 
     impl ReplayGuard for TestReplayGuard {
         fn claim_once(
             &self,
+            tenant_id: Uuid,
             agent_id: Uuid,
             request_id: Uuid,
         ) -> std::result::Result<(), ReplayGuardError> {
@@ -918,7 +925,7 @@ mod tests {
                 .claims
                 .lock()
                 .expect("test replay guard lock")
-                .insert((agent_id, request_id))
+                .insert((tenant_id, agent_id, request_id))
             {
                 Ok(())
             } else {

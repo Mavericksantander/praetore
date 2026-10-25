@@ -6,11 +6,12 @@ use praetore_core::{
 use praetore_gateway::{
     ApprovalChallenge, AuthorizationStatus, ExecutionAttestation, ExecutionJournal, ExecutionKey,
     ExecutionRecord, ExecutionStatus, HumanApprovalDecision, HumanApprovalOutcome, JournalError,
-    action_digest,
+    action_digest, authority_tenant_id,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
+use uuid::Uuid;
 
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_REQUEST_V1\0";
 
@@ -47,6 +48,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
         let evidence = authorization.evidence();
         validate_atomic_evidence(evidence, trusted_attester)?;
         let key = ExecutionKey {
+            tenant_id: authority_tenant_id(&evidence.authority)
+                .ok_or(AuthorizationCommitError::InvalidRecord)?,
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
         };
@@ -72,11 +75,22 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
             .batch_execute("SET LOCAL synchronous_commit = on")
             .map_err(|_| AuthorizationCommitError::Unavailable)?;
 
+        let legacy_claim = transaction
+            .query_opt(
+                "SELECT 1 FROM praetore.replay_claims \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&Uuid::nil(), &key.agent_id, &key.request_id],
+            )
+            .map_err(|_| AuthorizationCommitError::Unavailable)?;
+        if legacy_claim.is_some() {
+            return Err(AuthorizationCommitError::OrphanedReplayClaim);
+        }
+
         let claim_inserted = transaction
             .execute(
-                "INSERT INTO praetore.replay_claims (agent_id, request_id) \
-                 VALUES ($1, $2) ON CONFLICT (agent_id, request_id) DO NOTHING",
-                &[&key.agent_id, &key.request_id],
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT (tenant_id, agent_id, request_id) DO NOTHING",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| AuthorizationCommitError::Unavailable)?;
 
@@ -84,8 +98,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
             transaction
                 .query_opt(
                     "SELECT 1 FROM praetore.replay_claims \
-                     WHERE agent_id = $1 AND request_id = $2",
-                    &[&key.agent_id, &key.request_id],
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
                 .map_err(|_| AuthorizationCommitError::Unavailable)?
                 .ok_or(AuthorizationCommitError::Unavailable)?;
@@ -94,15 +108,17 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
                     "SELECT request_digest, action_digest, authorization_status, \
                      execution_status, evidence_json, output_json, \
                      (SELECT attestation_json FROM praetore.execution_attestations ea \
-                      WHERE ea.agent_id = execution_journal.agent_id \
+                      WHERE ea.tenant_id = execution_journal.tenant_id \
+                        AND ea.agent_id = execution_journal.agent_id \
                         AND ea.request_id = execution_journal.request_id \
                         AND ea.execution_status = execution_journal.execution_status), \
                      (SELECT decision_json FROM praetore.human_approvals ha \
-                      WHERE ha.agent_id = execution_journal.agent_id \
+                      WHERE ha.tenant_id = execution_journal.tenant_id \
+                        AND ha.agent_id = execution_journal.agent_id \
                         AND ha.request_id = execution_journal.request_id) \
                      FROM praetore.execution_journal \
-                     WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
-                    &[&key.agent_id, &key.request_id],
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
                 .map_err(|_| AuthorizationCommitError::Unavailable)?;
             let Some(existing) = existing else {
@@ -132,8 +148,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
         let existing = transaction
             .query_opt(
                 "SELECT 1 FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| AuthorizationCommitError::Unavailable)?;
         if existing.is_some() {
@@ -143,10 +159,11 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
         transaction
             .execute(
                 "INSERT INTO praetore.execution_journal \
-                 (agent_id, request_id, request_digest, action_digest, authorization_status, \
-                  execution_status, evidence_json) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 &[
+                    &key.tenant_id,
                     &key.agent_id,
                     &key.request_id,
                     &request_digest,
@@ -171,6 +188,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
         let evidence = authorization.evidence();
         validate_atomic_evidence(evidence, trusted_attester)?;
         let key = ExecutionKey {
+            tenant_id: authority_tenant_id(&evidence.authority)
+                .ok_or(AuthorizationCommitError::InvalidRecord)?,
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
         };
@@ -202,9 +221,9 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .execute(
                 "UPDATE praetore.execution_journal \
                  SET execution_status = 'dispatched', updated_at = clock_timestamp() \
-                 WHERE agent_id = $1 AND request_id = $2 \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
                    AND authorization_status = 'allowed' AND execution_status = 'authorized'",
-                &[&key.agent_id, &key.request_id],
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?;
         transaction
@@ -240,8 +259,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .query_opt(
                 "SELECT authorization_status, execution_status, evidence_json, action_digest \
                      FROM praetore.execution_journal \
-                     WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
-                &[&key.agent_id, &key.request_id],
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?
             .ok_or(JournalError::InvalidTransition)?;
@@ -252,6 +271,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let stored_action_digest: String = row.get(3);
         if authorization != AuthorizationStatus::RequiresApproval
             || execution != ExecutionStatus::NotDispatched
+            || decision.challenge.tenant_id != key.tenant_id
             || decision.challenge.agent_id != key.agent_id
             || decision.challenge.request_id != key.request_id
             || decision.challenge.action_digest != stored_action_digest
@@ -264,42 +284,44 @@ impl ExecutionJournal for PostgresExecutionJournal {
         }
 
         transaction
-                .execute(
-                    "INSERT INTO praetore.human_approvals \
-                     (approval_id, agent_id, request_id, evidence_id, evidence_hash, action_digest, \
-                      policy_digest, outcome, approver_key_id, expires_at, decision_json) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-                    &[
-                        &decision.approval_id,
-                        &key.agent_id,
-                        &key.request_id,
-                        &decision.challenge.evidence_id,
-                        &decision.challenge.evidence_hash,
-                        &decision.challenge.action_digest,
-                        &decision.challenge.policy_digest,
-                        &approval_outcome_as_db(decision.outcome),
-                        &decision.approver_key_id,
-                        &expires_at,
-                        &decision_json,
-                    ],
-                )
-                .map_err(|error| {
-                    if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) {
-                        JournalError::ApprovalAlreadyRecorded
-                    } else {
-                        JournalError::Unavailable
-                    }
-                })?;
+            .execute(
+                "INSERT INTO praetore.human_approvals \
+                     (approval_id, tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+                      action_digest, policy_digest, outcome, approver_key_id, expires_at, \
+                      decision_json) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &decision.approval_id,
+                    &key.tenant_id,
+                    &key.agent_id,
+                    &key.request_id,
+                    &decision.challenge.evidence_id,
+                    &decision.challenge.evidence_hash,
+                    &decision.challenge.action_digest,
+                    &decision.challenge.policy_digest,
+                    &approval_outcome_as_db(decision.outcome),
+                    &decision.approver_key_id,
+                    &expires_at,
+                    &decision_json,
+                ],
+            )
+            .map_err(|error| {
+                if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) {
+                    JournalError::ApprovalAlreadyRecorded
+                } else {
+                    JournalError::Unavailable
+                }
+            })?;
 
         if decision.outcome == HumanApprovalOutcome::Approve {
             let changed = transaction
                 .execute(
                     "UPDATE praetore.execution_journal \
                          SET execution_status = 'dispatched', updated_at = clock_timestamp() \
-                         WHERE agent_id = $1 AND request_id = $2 \
+                         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
                            AND authorization_status = 'requires_approval' \
                            AND execution_status = 'not_dispatched'",
-                    &[&key.agent_id, &key.request_id],
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
                 .map_err(|_| JournalError::Unavailable)?;
             if changed != 1 {
@@ -339,8 +361,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .query_opt(
                 "SELECT execution_status, output_json, evidence_json, authorization_status \
                  FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
-                &[&key.agent_id, &key.request_id],
+                WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?
             .ok_or(JournalError::InvalidTransition)?;
@@ -357,8 +379,14 @@ impl ExecutionJournal for PostgresExecutionJournal {
             let stored = transaction
                 .query_opt(
                     "SELECT attestation_json FROM praetore.execution_attestations \
-                     WHERE agent_id = $1 AND request_id = $2 AND execution_status = $3",
-                    &[&key.agent_id, &key.request_id, &execution_as_db(execution)],
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                       AND execution_status = $4",
+                    &[
+                        &key.tenant_id,
+                        &key.agent_id,
+                        &key.request_id,
+                        &execution_as_db(execution),
+                    ],
                 )
                 .map_err(|_| JournalError::Unavailable)?;
             let same_attestation = stored.map(|row| row.get::<_, Value>(0) == attestation_json);
@@ -381,9 +409,10 @@ impl ExecutionJournal for PostgresExecutionJournal {
         transaction
             .execute(
                 "UPDATE praetore.execution_journal \
-                 SET execution_status = $3, output_json = $4, updated_at = clock_timestamp() \
-                 WHERE agent_id = $1 AND request_id = $2",
+                 SET execution_status = $4, output_json = $5, updated_at = clock_timestamp() \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                 &[
+                    &key.tenant_id,
                     &key.agent_id,
                     &key.request_id,
                     &execution_as_db(execution),
@@ -418,8 +447,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .query_opt(
                 "SELECT execution_status, output_json, evidence_json, authorization_status \
                  FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
-                &[&key.agent_id, &key.request_id],
+                WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?
             .ok_or(JournalError::InvalidTransition)?;
@@ -445,8 +474,14 @@ impl ExecutionJournal for PostgresExecutionJournal {
         if let Some(existing) = transaction
             .query_opt(
                 "SELECT attestation_json FROM praetore.execution_attestations \
-                 WHERE agent_id = $1 AND request_id = $2 AND execution_status = $3",
-                &[&key.agent_id, &key.request_id, &execution_as_db(execution)],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                   AND execution_status = $4",
+                &[
+                    &key.tenant_id,
+                    &key.agent_id,
+                    &key.request_id,
+                    &execution_as_db(execution),
+                ],
             )
             .map_err(|_| JournalError::Unavailable)?
         {
@@ -474,15 +509,17 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 "SELECT request_digest, action_digest, authorization_status, execution_status, \
                  evidence_json, output_json, \
                  (SELECT attestation_json FROM praetore.execution_attestations ea \
-                  WHERE ea.agent_id = execution_journal.agent_id \
+                  WHERE ea.tenant_id = execution_journal.tenant_id \
+                    AND ea.agent_id = execution_journal.agent_id \
                     AND ea.request_id = execution_journal.request_id \
                     AND ea.execution_status = execution_journal.execution_status), \
                  (SELECT decision_json FROM praetore.human_approvals ha \
-                  WHERE ha.agent_id = execution_journal.agent_id \
+                  WHERE ha.tenant_id = execution_journal.tenant_id \
+                    AND ha.agent_id = execution_journal.agent_id \
                     AND ha.request_id = execution_journal.request_id) \
                  FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?;
         row.map(|row| parse_record(key, row)).transpose()
@@ -506,8 +543,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .query_opt(
                 "SELECT execution_status, evidence_json, authorization_status \
                  FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
-                &[&key.agent_id, &key.request_id],
+                WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?
             .ok_or(JournalError::InvalidTransition)?;
@@ -532,9 +569,9 @@ impl ExecutionJournal for PostgresExecutionJournal {
             let existing = transaction
                 .query_opt(
                     "SELECT attestation_json FROM praetore.execution_attestations \
-                     WHERE agent_id = $1 AND request_id = $2 \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
                        AND execution_status = 'not_dispatched'",
-                    &[&key.agent_id, &key.request_id],
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
                 .map_err(|_| JournalError::Unavailable)?;
             let result =
@@ -555,8 +592,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .execute(
                 "UPDATE praetore.execution_journal \
                  SET execution_status = 'not_dispatched', updated_at = clock_timestamp() \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?;
         insert_execution_attestation(
@@ -580,8 +617,9 @@ fn verify_authorization_pair(
 ) -> Result<(), AuthorizationCommitError> {
     let replay_claim = client
         .query_opt(
-            "SELECT 1 FROM praetore.replay_claims WHERE agent_id = $1 AND request_id = $2",
-            &[&key.agent_id, &key.request_id],
+            "SELECT 1 FROM praetore.replay_claims \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
         .map_err(|_| AuthorizationCommitError::Unavailable)?;
     if replay_claim.is_none() {
@@ -592,15 +630,17 @@ fn verify_authorization_pair(
             "SELECT request_digest, action_digest, authorization_status, \
              execution_status, evidence_json, output_json, \
              (SELECT attestation_json FROM praetore.execution_attestations ea \
-              WHERE ea.agent_id = execution_journal.agent_id \
+              WHERE ea.tenant_id = execution_journal.tenant_id \
+                AND ea.agent_id = execution_journal.agent_id \
                 AND ea.request_id = execution_journal.request_id \
                 AND ea.execution_status = execution_journal.execution_status), \
              (SELECT decision_json FROM praetore.human_approvals ha \
-              WHERE ha.agent_id = execution_journal.agent_id \
+              WHERE ha.tenant_id = execution_journal.tenant_id \
+                AND ha.agent_id = execution_journal.agent_id \
                 AND ha.request_id = execution_journal.request_id) \
              FROM praetore.execution_journal \
-             WHERE agent_id = $1 AND request_id = $2",
-            &[&key.agent_id, &key.request_id],
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
         .map_err(|_| AuthorizationCommitError::Unavailable)?
         .ok_or(AuthorizationCommitError::OrphanedReplayClaim)?;
@@ -640,6 +680,7 @@ pub(super) fn validate_evidence(
     };
     if key.agent_id != *evidence.agent.id.as_uuid()
         || key.request_id != evidence.request_id
+        || Some(key.tenant_id) != authority_tenant_id(&evidence.authority)
         || evidence.decision.outcome != expected
         || evidence.evidence_schema_version != 2
         || evidence.evaluation_mode.as_deref() != Some("high_assurance")
@@ -657,6 +698,7 @@ fn validate_atomic_evidence(
     if evidence.evidence_schema_version != 2
         || evidence.evaluation_mode.as_deref() != Some("high_assurance")
         || evidence.policy_digest.is_none()
+        || authority_tenant_id(&evidence.authority).is_none()
         || !evidence.verify_integrity()
     {
         return Err(AuthorizationCommitError::InvalidRecord);
@@ -774,10 +816,12 @@ fn insert_execution_attestation(
     transaction
         .execute(
             "INSERT INTO praetore.execution_attestations \
-             (attestation_id, agent_id, request_id, execution_status, attestation_json) \
-             VALUES ($1, $2, $3, $4, $5)",
+             (attestation_id, tenant_id, agent_id, request_id, execution_status, \
+              attestation_json) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
             &[
                 &uuid::Uuid::new_v4(),
+                &key.tenant_id,
                 &key.agent_id,
                 &key.request_id,
                 &execution_as_db(execution),

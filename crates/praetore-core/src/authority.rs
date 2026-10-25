@@ -288,6 +288,19 @@ impl Authority {
         self.capabilities.iter().any(|item| item == capability)
     }
 
+    /// Returns the non-nil tenant UUID in this authority, when present.
+    ///
+    /// This is issuer-signed routing metadata. The gateway uses it to scope
+    /// replay and execution identity independently of action parameters.
+    pub fn tenant_id(&self) -> Option<Uuid> {
+        let mut constraints = self
+            .constraints
+            .iter()
+            .filter(|constraint| constraint.key == "tenant_id");
+        let tenant_id: Uuid = constraints.next()?.value.parse().ok()?;
+        (constraints.next().is_none() && !tenant_id.is_nil()).then_some(tenant_id)
+    }
+
     pub fn with_constraint(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.constraints.push(AuthorityConstraint::new(key, value));
         self

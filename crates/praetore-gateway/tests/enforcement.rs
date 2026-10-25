@@ -21,6 +21,7 @@ use praetore_gateway::{
     ExecutionAttestationError, ExecutionAttestationSigner, ExecutionJournal, ExecutionKey,
     ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
     HumanApprovalOutcome, HumanApprovalVerifier, JournalError, ReconciliationReport,
+    authority_tenant_id,
 };
 use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
@@ -37,6 +38,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const NOW: &str = "2026-06-01T12:00:00Z";
+const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
 struct TestExecutionAttester {
     signing_key: SigningKey,
@@ -97,12 +99,17 @@ fn long_validity() -> Validity {
 
 #[derive(Default)]
 struct MemoryReplayGuard {
-    claims: Mutex<HashSet<(Uuid, Uuid)>>,
+    claims: Mutex<HashSet<(Uuid, Uuid, Uuid)>>,
     unavailable: AtomicBool,
 }
 
 impl ReplayGuard for MemoryReplayGuard {
-    fn claim_once(&self, agent_id: Uuid, request_id: Uuid) -> Result<(), ReplayGuardError> {
+    fn claim_once(
+        &self,
+        tenant_id: Uuid,
+        agent_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<(), ReplayGuardError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(ReplayGuardError::Unavailable);
         }
@@ -110,7 +117,7 @@ impl ReplayGuard for MemoryReplayGuard {
             .claims
             .lock()
             .map_err(|_| ReplayGuardError::Unavailable)?;
-        if claims.insert((agent_id, request_id)) {
+        if claims.insert((tenant_id, agent_id, request_id)) {
             Ok(())
         } else {
             Err(ReplayGuardError::AlreadyClaimed)
@@ -258,6 +265,8 @@ impl AtomicAuthorizationCommit for MemoryJournal {
             .verify_attester_signature(trusted_attester)
             .map_err(|_| AuthorizationCommitError::InvalidRecord)?;
         let key = ExecutionKey {
+            tenant_id: authority_tenant_id(&evidence.authority)
+                .ok_or(AuthorizationCommitError::InvalidRecord)?,
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
         };
@@ -289,6 +298,8 @@ impl AtomicAuthorizationCommit for MemoryJournal {
             .verify_attester_signature(trusted_attester)
             .map_err(|_| AuthorizationCommitError::InvalidRecord)?;
         let key = ExecutionKey {
+            tenant_id: authority_tenant_id(&evidence.authority)
+                .ok_or(AuthorizationCommitError::InvalidRecord)?,
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
         };
@@ -530,6 +541,7 @@ impl ActionDispatcher for LocalSetTool {
     fn dispatch(
         &self,
         execution_key: ExecutionKey,
+        _authority: &Authority,
         action: &Action,
         _action_digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
@@ -580,6 +592,7 @@ impl ActionDispatcher for LocalSetTool {
     fn reconcile(
         &self,
         execution_key: ExecutionKey,
+        _authority: &Authority,
         _action: &Action,
         _action_digest: &str,
     ) -> ReconciliationReport {
@@ -643,7 +656,8 @@ fn fixture_with_replay(
         "local-test-issuer",
         vec!["local:write".into()],
     )
-    .with_validity(long_validity());
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
 
     let action = Action::new(
@@ -759,7 +773,8 @@ fn approval_fixture() -> (
         "local-test-issuer",
         vec!["local:write".into()],
     )
-    .with_validity(long_validity());
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
     let action = Action::new(
         "local:set_value",
@@ -838,6 +853,19 @@ async fn http_gateway_returns_receipt_and_dispatches_allowed_action_once() {
             "test-execution-attester-v1",
         )
         .unwrap();
+    assert_eq!(
+        receipt.execution_attestation.tenant_id,
+        Some(TEST_TENANT_ID)
+    );
+    let mut reassigned_attestation = receipt.clone();
+    reassigned_attestation.execution_attestation.tenant_id = Some(Uuid::from_u128(2));
+    assert!(matches!(
+        reassigned_attestation.verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1"
+        ),
+        Err(ExecutionAttestationError::InvalidPayload)
+    ));
 }
 
 #[tokio::test]
@@ -879,10 +907,19 @@ fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
     assert_eq!(tool.invocations(), 0);
 
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *pending.evidence.agent.id.as_uuid(),
         request_id: pending.evidence.request_id,
     };
     let challenge = gateway.approval_challenge(key).unwrap();
+    let other_tenant_key = ExecutionKey {
+        tenant_id: Uuid::from_u128(2),
+        ..key
+    };
+    assert!(matches!(
+        gateway.approval_challenge(other_tenant_key),
+        Err(GatewayError::ExecutionNotFound(_))
+    ));
     assert_eq!(
         challenge.action_digest,
         praetore_gateway::action_digest(&pending.evidence.action).unwrap()
@@ -921,6 +958,7 @@ fn human_approval_signature_cannot_be_reused_for_modified_action_scope() {
     let (gateway, request, tool, _, approver_key) = approval_fixture();
     let pending = gateway.execute(request).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *pending.evidence.agent.id.as_uuid(),
         request_id: pending.evidence.request_id,
     };
@@ -941,6 +979,7 @@ fn rejected_human_approval_is_persisted_without_dispatch() {
     let (gateway, request, tool, journal, approver_key) = approval_fixture();
     let pending = gateway.execute(request).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *pending.evidence.agent.id.as_uuid(),
         request_id: pending.evidence.request_id,
     };
@@ -977,15 +1016,35 @@ async fn http_human_approval_resumes_the_pending_execution() {
     let body = to_bytes(response.into_body(), 65_536).await.unwrap();
     let pending: praetore_gateway::GatewayReceipt = serde_json::from_slice(&body).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *pending.evidence.agent.id.as_uuid(),
         request_id: pending.evidence.request_id,
     };
+
+    let wrong_tenant_response = app
+        .clone()
+        .oneshot(http_body_request(
+            "GET",
+            &format!(
+                "/v1/approvals/{}/{}/{}",
+                Uuid::from_u128(2),
+                key.agent_id,
+                key.request_id
+            ),
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_tenant_response.status(), StatusCode::NOT_FOUND);
 
     let response = app
         .clone()
         .oneshot(http_body_request(
             "GET",
-            &format!("/v1/approvals/{}/{}", key.agent_id, key.request_id),
+            &format!(
+                "/v1/approvals/{}/{}/{}",
+                key.tenant_id, key.agent_id, key.request_id
+            ),
             String::new(),
         ))
         .await
@@ -999,7 +1058,12 @@ async fn http_human_approval_resumes_the_pending_execution() {
         .clone()
         .oneshot(http_body_request(
             "POST",
-            &format!("/v1/approvals/{}/{}", Uuid::new_v4(), key.request_id),
+            &format!(
+                "/v1/approvals/{}/{}/{}",
+                key.tenant_id,
+                Uuid::new_v4(),
+                key.request_id
+            ),
             serde_json::to_string(&decision).unwrap(),
         ))
         .await
@@ -1010,7 +1074,10 @@ async fn http_human_approval_resumes_the_pending_execution() {
     let response = app
         .oneshot(http_body_request(
             "POST",
-            &format!("/v1/approvals/{}/{}", key.agent_id, key.request_id),
+            &format!(
+                "/v1/approvals/{}/{}/{}",
+                key.tenant_id, key.agent_id, key.request_id
+            ),
             serde_json::to_string(&decision).unwrap(),
         ))
         .await
@@ -1034,7 +1101,8 @@ async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
         "local-test-issuer",
         vec!["demo:write".into()],
     )
-    .with_validity(long_validity());
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
 
     let action = Action::new(
@@ -1120,6 +1188,7 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     let receipt = fixture.gateway.execute(fixture.request.clone()).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -1286,6 +1355,7 @@ fn ambiguous_adapter_failure_is_recorded_and_never_retried() {
     fixture.tool.fail_after_write.store(true, Ordering::SeqCst);
     let receipt = fixture.gateway.execute(fixture.request.clone()).unwrap();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -1323,6 +1393,7 @@ fn terminal_journal_failure_is_reported_without_a_retry() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     fixture.journal.fail_terminal.store(true, Ordering::SeqCst);
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1352,6 +1423,7 @@ fn signer_failure_after_execution_is_recoverable_without_redispatch() {
         .fail_signing
         .store(true, Ordering::SeqCst);
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };
@@ -1388,6 +1460,7 @@ fn reconciliation_reuses_the_persisted_attestation_without_signing_again() {
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
     let signed_count = fixture.execution_attester.sign_count();
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
@@ -1439,6 +1512,7 @@ fn concurrent_duplicate_requests_cause_at_most_one_effect() {
 fn shared_execution_journal_rejects_duplicate_key_across_independent_engines() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
         agent_id: *fixture.request.agent.id.as_uuid(),
         request_id: fixture.request.request_id,
     };

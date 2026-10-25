@@ -20,13 +20,17 @@ impl fmt::Display for ReplayGuardError {
 
 /// Caller-owned, durable, atomic one-time request-ID storage.
 ///
-/// Implementations must make the claim atomic across every engine instance
-/// sharing the same authorization domain. Claims must not expire automatically:
-/// removing an entry can make an old signed request usable again. If storage is
-/// unavailable or full, implementations must return `Unavailable`.
+/// `tenant_id` is derived from the signed authority. The nil UUID represents
+/// an authority without a tenant claim and keeps those requests in one
+/// unscoped namespace. Implementations must make the claim atomic across every
+/// engine instance sharing a tenant namespace. Claims must not expire
+/// automatically: removing an entry can make an old signed request usable
+/// again. If storage is unavailable or full, implementations must return
+/// `Unavailable`.
 pub trait ReplayGuard: Send + Sync {
     fn claim_once(
         &self,
+        tenant_id: Uuid,
         agent_id: Uuid,
         request_id: Uuid,
     ) -> std::result::Result<(), ReplayGuardError>;

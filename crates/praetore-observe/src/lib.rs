@@ -84,7 +84,10 @@ impl ObserveState {
         let state = Arc::new(self);
         let api = Router::new()
             .route("/operations", get(list_operations))
-            .route("/operations/{agent_id}/{request_id}", get(operation_detail))
+            .route(
+                "/operations/{tenant_id}/{agent_id}/{request_id}",
+                get(operation_detail),
+            )
             .route("/health", get(system_health))
             .route("/assurance", get(assurance))
             .route_layer(middleware::from_fn_with_state(
@@ -160,6 +163,7 @@ async fn require_bearer(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListQuery {
+    tenant_id: Option<String>,
     agent_id: Option<String>,
     decision: Option<String>,
     execution_state: Option<String>,
@@ -179,6 +183,7 @@ struct OperationPage {
 
 #[derive(Debug, Serialize)]
 struct OperationSummary {
+    tenant_id: Uuid,
     agent_id: Uuid,
     request_id: Uuid,
     created_at: String,
@@ -283,9 +288,9 @@ async fn list_operations(
 
 async fn operation_detail(
     State(state): State<Arc<ObserveState>>,
-    Path((agent_id, request_id)): Path<(String, String)>,
+    Path((tenant_id, agent_id, request_id)): Path<(String, String, String)>,
 ) -> Response {
-    let key = match parse_key(&agent_id, &request_id) {
+    let key = match parse_key(&tenant_id, &agent_id, &request_id) {
         Ok(key) => key,
         Err(()) => return api_error(StatusCode::BAD_REQUEST, "invalid_execution_identity"),
     };
@@ -385,6 +390,10 @@ fn validate_query(query: ListQuery) -> Result<ExecutionFilters, &'static str> {
     if limit == 0 || limit > MAX_PAGE_SIZE || offset > MAX_OFFSET {
         return Err("invalid_pagination");
     }
+    let tenant_id = query
+        .tenant_id
+        .map(|value| Uuid::parse_str(&value).map_err(|_| "invalid_tenant_id"))
+        .transpose()?;
     let agent_id = query
         .agent_id
         .map(|value| Uuid::parse_str(&value).map_err(|_| "invalid_agent_id"))
@@ -409,6 +418,7 @@ fn validate_query(query: ListQuery) -> Result<ExecutionFilters, &'static str> {
         }
     }
     Ok(ExecutionFilters {
+        tenant_id,
         agent_id,
         decision,
         execution,
@@ -449,8 +459,9 @@ fn parse_execution(value: &str) -> Result<ExecutionStatus, &'static str> {
     }
 }
 
-fn parse_key(agent_id: &str, request_id: &str) -> Result<ExecutionKey, ()> {
+fn parse_key(tenant_id: &str, agent_id: &str, request_id: &str) -> Result<ExecutionKey, ()> {
     Ok(ExecutionKey {
+        tenant_id: Uuid::parse_str(tenant_id).map_err(|_| ())?,
         agent_id: Uuid::parse_str(agent_id).map_err(|_| ())?,
         request_id: Uuid::parse_str(request_id).map_err(|_| ())?,
     })
@@ -471,6 +482,7 @@ fn operation_summary(
         },
     };
     OperationSummary {
+        tenant_id: row.key.tenant_id,
         agent_id: row.key.agent_id,
         request_id: row.key.request_id,
         created_at: row.created_at.clone(),
@@ -704,7 +716,7 @@ mod tests {
         let app = state.router();
         for uri in [
             "/api/v1/operations",
-            "/api/v1/operations/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "/api/v1/operations/cccccccc-cccc-4ccc-8ccc-cccccccccccc/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         ] {
             let response = app
                 .clone()
@@ -789,8 +801,8 @@ mod tests {
         let detail_response = app
             .clone()
             .oneshot(authorized_request(&format!(
-                "/api/v1/operations/{}/{}",
-                key.agent_id, key.request_id
+                "/api/v1/operations/{}/{}/{}",
+                key.tenant_id, key.agent_id, key.request_id
             )))
             .await
             .unwrap();
@@ -899,8 +911,8 @@ mod tests {
         let app = state.router();
         let response = app
             .oneshot(authorized_request(&format!(
-                "/api/v1/operations/{}/{}",
-                key.agent_id, key.request_id
+                "/api/v1/operations/{}/{}/{}",
+                key.tenant_id, key.agent_id, key.request_id
             )))
             .await
             .unwrap();
@@ -928,7 +940,8 @@ mod tests {
             agent.id.clone(),
             "observability-test-issuer",
             vec!["local:write".into()],
-        );
+        )
+        .with_constraint("tenant_id", Uuid::from_u128(1).to_string());
         let action = Action::new(
             "local:set_value",
             Some("target-secret".into()),
@@ -955,6 +968,7 @@ mod tests {
             evidence.action.parameters = json!({"value": "tampered-secret"});
         }
         let key = ExecutionKey {
+            tenant_id: praetore_gateway::authority_tenant_id(&evidence.authority).unwrap(),
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
         };
@@ -980,6 +994,7 @@ mod tests {
 
     fn query_with(query: &str) -> ListQuery {
         serde_urlencoded::from_str(query).unwrap_or(ListQuery {
+            tenant_id: None,
             agent_id: None,
             decision: None,
             execution_state: None,

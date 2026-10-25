@@ -72,7 +72,7 @@ are logged only as a bounded error category, not query values or credentials.
 | Method and route | Contract |
 |---|---|
 | `GET /api/v1/operations` | List; optional `agent_id`, `decision`, `execution_state`, `from`, `to`, `limit`, `offset`. |
-| `GET /api/v1/operations/{agent_id}/{request_id}` | Detail for a stable `(agent UUID, request UUID)` key. |
+| `GET /api/v1/operations/{tenant_id}/{agent_id}/{request_id}` | Detail for a tenant-scoped `(tenant UUID, agent UUID, request UUID)` key. |
 | `GET /api/v1/health` | Live database `SELECT 1` probe; adapter and error telemetry are explicitly reported as unavailable. |
 | `GET /api/v1/assurance` | Static, documented guarantees and limitations. |
 

@@ -6,21 +6,22 @@ use praetore_core::{
     identity::AgentKeyFingerprint,
 };
 use praetore_gateway::{
-    ExecutionAttestationError, ExecutionAttestationSigner, Gateway, HumanApprovalVerifier,
-    http_api, local_demo::LocalDemoDispatcher,
+    ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway,
+    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
 };
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
 use std::{env, fs, path::Path, str::FromStr, sync::Arc};
 use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 
-const MIGRATIONS: [&str; 6] = [
+const MIGRATIONS: [&str; 7] = [
     include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0004_execution_journal_events.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0005_execution_attestations.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
+    include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
 ];
 
 struct LocalFreshnessProvider {
@@ -135,7 +136,10 @@ fn validate_local_database_url(database_url: &str) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn build_gateway(database_url: &str) -> Result<Gateway, Box<dyn std::error::Error>> {
+fn build_gateway(
+    database_url: &str,
+    dispatcher: Arc<dyn ActionDispatcher>,
+) -> Result<Gateway, Box<dyn std::error::Error>> {
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
     let policy = Policy::from_json(&read_limited(&policy_path, 1_048_576)?)?;
@@ -164,7 +168,6 @@ fn build_gateway(database_url: &str) -> Result<Gateway, Box<dyn std::error::Erro
         let database_url = database_url.to_owned();
         move || Client::connect(&database_url, NoTls)
     })?);
-    let dispatcher = Arc::new(LocalDemoDispatcher::new());
     let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
         "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
     )?)?);
@@ -190,18 +193,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_secret_key(&execution_key_hex, "execution attester")?;
 
     apply_migrations(&database_url)?;
-    let gateway = Arc::new(build_gateway(&database_url)?);
-    let port = env::var("PRAETORE_GATEWAY_PORT")
-        .unwrap_or_else(|_| "8080".into())
-        .parse::<u16>()?;
-    if port == 0 {
-        return Err("PRAETORE_GATEWAY_PORT must be between 1 and 65535".into());
+    let dispatcher: Arc<dyn ActionDispatcher> =
+        match env::var("PRAETORE_GATEWAY_ADAPTER").as_deref() {
+            Ok("http") => {
+                let route_path = required_env("PRAETORE_GATEWAY_TOOL_ROUTES_FILE")?;
+                let route_config = read_limited(&route_path, 65_536)?;
+                Arc::new(
+                    praetore_gateway_service::http_dispatcher::HttpActionDispatcher::from_json(
+                        &route_config,
+                    )?,
+                )
+            }
+            Ok("local-demo") | Err(_) => Arc::new(LocalDemoDispatcher::new()),
+            Ok(_) => return Err("PRAETORE_GATEWAY_ADAPTER must be http or local-demo".into()),
+        };
+    let gateway = Arc::new(build_gateway(&database_url, dispatcher)?);
+    let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
+        Ok(address) => address.parse::<std::net::SocketAddr>()?,
+        Err(_) => {
+            let port = env::var("PRAETORE_GATEWAY_PORT")
+                .unwrap_or_else(|_| "8080".into())
+                .parse::<u16>()?;
+            if port == 0 {
+                return Err("PRAETORE_GATEWAY_PORT must be between 1 and 65535".into());
+            }
+            std::net::SocketAddr::from(([127, 0, 0, 1], port))
+        }
+    };
+    if address.port() == 0 {
+        return Err("gateway listener port must be between 1 and 65535".into());
     }
-    let address = format!("127.0.0.1:{port}");
 
     tracing::warn!(
         %address,
-        "local demo only: loopback HTTP, local freshness, in-memory tool adapter, no production API"
+        loopback_only = address.ip().is_loopback(),
+        "development service: plain HTTP and local freshness; do not expose without private-network policy and authenticated TLS termination"
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

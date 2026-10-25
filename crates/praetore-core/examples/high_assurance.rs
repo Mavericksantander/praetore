@@ -15,16 +15,17 @@ use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 #[derive(Default)]
-struct ExampleReplayGuard(Mutex<HashSet<(Uuid, Uuid)>>);
+struct ExampleReplayGuard(Mutex<HashSet<(Uuid, Uuid, Uuid)>>);
 
 impl ReplayGuard for ExampleReplayGuard {
     fn claim_once(
         &self,
+        tenant_id: Uuid,
         agent_id: Uuid,
         request_id: Uuid,
     ) -> std::result::Result<(), ReplayGuardError> {
         let mut claims = self.0.lock().map_err(|_| ReplayGuardError::Unavailable)?;
-        if claims.insert((agent_id, request_id)) {
+        if claims.insert((tenant_id, agent_id, request_id)) {
             Ok(())
         } else {
             Err(ReplayGuardError::AlreadyClaimed)
