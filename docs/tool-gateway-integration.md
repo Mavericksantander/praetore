@@ -107,10 +107,12 @@ gateway's action model. The gateway is responsible for that mapping.
    acknowledgement is uncertain, the core queries the same execution identity
    and validates the durable claim/evidence pair and initial execution state.
    If PostgreSQL is unavailable, the pair disagrees, or evidence verification
-   fails, do not dispatch. Stop unless the decision is exactly `ALLOW`; do not
-   interpret
-   `REQUIRE_APPROVAL` as permission to execute or automatically resume the
-   same request after an out-of-band approval.
+   fails, do not dispatch. `REQUIRE_APPROVAL` is not permission to execute by
+   itself. The reference gateway supports a separate signed human decision for
+   a persisted pending request, described in [Human approvals](#human-approvals).
+   This is not an out-of-band bypass: it is bound to the original evidence and
+   exact action digest, expires with the authorization intent/freshness lease,
+   and is consumed once.
 6. Commit the journal transition from `Authorized` to `Dispatched` before
    invoking the adapter. This prevents another gateway instance from claiming
    the same journal key; a crash after the transition is ambiguous even if the
@@ -176,8 +178,9 @@ production deployment.
 | Transition | Trigger and precondition | Durable operation | Safe automatic retry? | Restart meaning |
 | --- | --- | --- | --- | --- |
 | absent → `Authorized` | HighAssurance evaluation produced valid evidence and exact `ALLOW` | Insert immutable evidence, request digest, and action digest | No; the core replay claim may already be consumed | No dispatch is known. Recovery closes this as `NotDispatched`. |
-| absent → `NotDispatched` | Evaluation produced DENY or REQUIRE_APPROVAL | Insert evidence and decision | No execution retry from this record | Terminal for this request; approval protocol is not implemented. |
+| absent → `NotDispatched` | Evaluation produced DENY or REQUIRE_APPROVAL | Insert evidence and decision | No execution retry from this record | For DENY, terminal. For REQUIRE_APPROVAL, it may enter the one-time approval flow below before expiry. |
 | `Authorized` → `Dispatched` | The unique journal claim exists and is allowed | Commit state transition before adapter call | No after restart | Dispatch may not have begun; treat as ambiguous and reconcile. |
+| `NotDispatched` → `Dispatched` | Pending REQUIRE_APPROVAL has a valid signed approval | Persist append-only approval and transition in one PostgreSQL transaction | No after restart | Approval is consumed; do not redispatch automatically. |
 | `Dispatched` → `Executed` / `Confirmed` | Adapter returned the corresponding report | Persist output and terminal state | No | Adapter report is durable gateway evidence, not proof beyond its contract. |
 | `Dispatched` → `OutcomeUnknown` | Adapter returned an error or the caller cannot record its result | Persist ambiguity when possible; a crash may leave `Dispatched` | Never redispatch automatically | Reconcile read-only; preserve ambiguity without sufficient adapter evidence. |
 | `Dispatched` / `OutcomeUnknown` → `Failed` | Adapter proves `NotApplied` | Persist terminal state without output | No | No automatic retry: the request/replay claim remains consumed. |
@@ -286,16 +289,56 @@ Keep the decision-to-dispatch interval short, enforce a gateway-side deadline,
 and re-evaluate if the deadline or relevant state changes. This narrows but
 does not eliminate TOCTOU risk.
 
-## Approvals and delegation are not implemented here
+## Human approvals
 
-`REQUIRE_APPROVAL` is a decision outcome only. The core does not identify an
-approver, collect approval, bind an approval credential to an action, or
-resume execution. Until a separately reviewed approval protocol exists, the
-gateway must hold the request and perform no side effect. A caller-built
-approval mechanism must cryptographically bind approver identity, exact
-normalized action, subject, authority, policy digest, expiry, and request
-identifier, and must be independently validated before creating a new
-authorization request; this document does not define that protocol.
+The gateway reference implements a minimal signed approval protocol for
+`REQUIRE_APPROVAL`. It does not implement an enterprise approval service, UI,
+OIDC/MFA integration, approver-role management, KMS/HSM signing, notification
+delivery, or approval-key rotation.
+
+The HTTP flow is:
+
+1. `POST /v1/execute` returns `202 Accepted` and a receipt with
+   `authorization = requires_approval`; the action remains `NotDispatched`.
+2. `GET /v1/approvals/{agent_id}/{request_id}` returns the persisted
+   `ApprovalChallenge` derived from the pending execution's stored evidence.
+   Its fields bind the agent and request IDs, evidence ID/context hash, exact
+   action digest, policy digest, and expiry.
+3. An external approver system constructs a `HumanApprovalDecision` containing
+   the challenge, a unique approval ID, the configured approver key ID, an
+   `approve` or `reject` outcome, and an Ed25519 signature. The signature
+   covers the canonical decision payload under the
+   `PRAETORE_HUMAN_APPROVAL_V1\0` domain separator.
+4. `POST /v1/approvals/{agent_id}/{request_id}` submits that signed decision.
+   The gateway checks the fixed approver key, signature, exact pending
+   challenge, path IDs, and expiration. PostgreSQL rechecks the pending
+   execution and expiry while holding the journal row lock.
+5. PostgreSQL stores the decision append-only. For `approve`, it records the
+   approval and moves the journal to `Dispatched` in the same transaction.
+   Only then does the gateway invoke the adapter with the action in persisted
+   evidence. `reject` is recorded and never dispatches. The original
+   authorization remains `RequiresApproval`; the human decision does not
+   rewrite it as `ALLOW`.
+
+An approval is valid only until the earlier of the signed intent expiration
+and the freshness lease expiration. Once expired, the request cannot be
+approved; submit a newly signed authorization request and obtain a fresh
+decision instead. The decision is single-use per `(agent_id, request_id)`.
+
+The demo service loads the approver key ID and public key from
+`PRAETORE_GATEWAY_APPROVER_KEY_ID` and
+`PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX`. The matching private key must
+remain in the external approver system. The demo HTTP listener is loopback-only
+and has no network authentication or TLS; these endpoints must not be exposed
+to an untrusted network.
+
+There is a deliberate crash-safety tradeoff: after approval is durably
+consumed and the journal reaches `Dispatched`, a process crash before or during
+the adapter call does not trigger automatic redispatch. Reconcile using the
+adapter's authoritative status or idempotency facility. Exactly-once effects
+cannot be guaranteed by the journal alone.
+
+## Delegation is not implemented
 
 Signed Authority currently describes an issuer-granted capability set and
 validity window. The core does not implement parent-child delegation,

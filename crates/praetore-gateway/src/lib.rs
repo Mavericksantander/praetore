@@ -61,6 +61,7 @@ pub mod local_demo;
 const ACTION_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ACTION_V1\0";
 const EXECUTION_ATTESTATION_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ATTESTATION_V1\0";
 const OUTPUT_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_OUTPUT_V1\0";
+const HUMAN_APPROVAL_DOMAIN: &[u8] = b"PRAETORE_HUMAN_APPROVAL_V1\0";
 
 /// Computes the stable digest used to bind one normalized action to an
 /// execution key. The canonical v1 encoding is domain separated from core
@@ -103,6 +104,169 @@ pub enum ExecutionStatus {
     Confirmed,
     OutcomeUnknown,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalChallenge {
+    pub schema_version: u8,
+    pub agent_id: Uuid,
+    pub request_id: Uuid,
+    pub evidence_id: Uuid,
+    pub evidence_hash: String,
+    pub action_digest: String,
+    pub policy_digest: String,
+    pub expires_at: String,
+}
+
+impl ApprovalChallenge {
+    pub fn from_evidence(evidence: &Evidence, action_digest: &str) -> Result<Self, ApprovalError> {
+        let intent = evidence
+            .intent_v2
+            .as_ref()
+            .ok_or(ApprovalError::InvalidChallenge)?;
+        let intent_expiry = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        let freshness_expiry = evidence
+            .freshness_valid_until
+            .as_deref()
+            .ok_or(ApprovalError::InvalidChallenge)
+            .and_then(|value| {
+                OffsetDateTime::parse(value, &Rfc3339).map_err(|_| ApprovalError::InvalidChallenge)
+            })?;
+        let expires_at = intent_expiry.min(freshness_expiry);
+        let expires_at = expires_at
+            .to_offset(time::UtcOffset::UTC)
+            .format(&Rfc3339)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        Ok(Self {
+            schema_version: 1,
+            agent_id: *evidence.agent.id.as_uuid(),
+            request_id: evidence.request_id,
+            evidence_id: evidence.evidence_id,
+            evidence_hash: evidence.context_hash.clone(),
+            action_digest: action_digest.to_owned(),
+            policy_digest: evidence
+                .policy_digest
+                .clone()
+                .ok_or(ApprovalError::InvalidChallenge)?,
+            expires_at,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanApprovalOutcome {
+    Approve,
+    Reject,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanApprovalDecision {
+    pub schema_version: u8,
+    pub approval_id: Uuid,
+    pub approver_key_id: String,
+    pub challenge: ApprovalChallenge,
+    pub outcome: HumanApprovalOutcome,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+struct HumanApprovalPayload<'a> {
+    schema_version: u8,
+    approval_id: Uuid,
+    approver_key_id: &'a str,
+    challenge: &'a ApprovalChallenge,
+    outcome: HumanApprovalOutcome,
+}
+
+impl HumanApprovalDecision {
+    pub fn from_json(json: &str) -> Result<Self, ApprovalError> {
+        if json.len() > 16_384 {
+            return Err(ApprovalError::InvalidChallenge);
+        }
+        let value = praetore_core::canonical::parse_json_rejecting_duplicates(json)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        let decision =
+            serde_json::from_value(value).map_err(|_| ApprovalError::InvalidChallenge)?;
+        Ok(decision)
+    }
+
+    /// Returns the canonical payload that the approver signs with Ed25519.
+    pub fn signing_payload(&self) -> Result<Vec<u8>, ApprovalError> {
+        let payload = HumanApprovalPayload {
+            schema_version: self.schema_version,
+            approval_id: self.approval_id,
+            approver_key_id: &self.approver_key_id,
+            challenge: &self.challenge,
+            outcome: self.outcome,
+        };
+        let json = serde_json::to_string(&payload).map_err(|_| ApprovalError::InvalidChallenge)?;
+        canonicalize_json(&json).map_err(|_| ApprovalError::InvalidChallenge)
+    }
+
+    pub fn signing_message(&self) -> Result<Vec<u8>, ApprovalError> {
+        let payload = self.signing_payload()?;
+        let mut message = Vec::with_capacity(HUMAN_APPROVAL_DOMAIN.len() + payload.len());
+        message.extend_from_slice(HUMAN_APPROVAL_DOMAIN);
+        message.extend_from_slice(&payload);
+        Ok(message)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HumanApprovalVerifier {
+    key_id: String,
+    public_key: praetore_core::VerifiedPublicKey,
+}
+
+impl HumanApprovalVerifier {
+    pub fn new(
+        key_id: impl Into<String>,
+        public_key: praetore_core::VerifiedPublicKey,
+    ) -> Result<Self, ApprovalError> {
+        let key_id = key_id.into();
+        if key_id.trim().is_empty() || key_id != key_id.trim() || key_id.len() > 256 {
+            return Err(ApprovalError::InvalidVerifier);
+        }
+        Ok(Self { key_id, public_key })
+    }
+
+    fn verify(&self, decision: &HumanApprovalDecision) -> Result<(), ApprovalError> {
+        if decision.schema_version != 1
+            || decision.approver_key_id != self.key_id
+            || decision.approval_id.is_nil()
+        {
+            return Err(ApprovalError::InvalidSignature);
+        }
+        let signature =
+            hex::decode(&decision.signature).map_err(|_| ApprovalError::InvalidSignature)?;
+        self.public_key
+            .verify_domain_message(
+                HUMAN_APPROVAL_DOMAIN,
+                &decision.signing_payload()?,
+                &signature,
+            )
+            .map_err(|_| ApprovalError::InvalidSignature)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ApprovalError {
+    #[error("human approval is not configured")]
+    NotConfigured,
+    #[error("human approval verifier configuration is invalid")]
+    InvalidVerifier,
+    #[error("approval signature is invalid")]
+    InvalidSignature,
+    #[error("approval challenge does not match a pending request")]
+    InvalidChallenge,
+    #[error("approval request has expired")]
+    Expired,
+    #[error("execution is not awaiting human approval")]
+    NotPending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -286,8 +450,17 @@ impl ExecutionAttestation {
             || self.policy_digest != evidence.policy_digest.as_deref().unwrap_or_default()
             || self.evidence_hash != evidence.context_hash
             || !evidence.verify_integrity()
-            || authorization != AuthorizationStatus::Allowed
+            || authorization == AuthorizationStatus::Denied
                 && execution != ExecutionStatus::NotDispatched
+            || authorization == AuthorizationStatus::RequiresApproval
+                && !matches!(
+                    execution,
+                    ExecutionStatus::NotDispatched
+                        | ExecutionStatus::Executed
+                        | ExecutionStatus::Confirmed
+                        | ExecutionStatus::OutcomeUnknown
+                        | ExecutionStatus::Failed
+                )
             || matches!(
                 execution,
                 ExecutionStatus::Authorized | ExecutionStatus::Dispatched
@@ -388,6 +561,8 @@ pub enum JournalError {
     InvalidTransition,
     #[error("execution journal record is invalid")]
     InvalidRecord,
+    #[error("human approval decision has already been recorded")]
+    ApprovalAlreadyRecorded,
 }
 
 #[derive(Debug, Clone)]
@@ -399,6 +574,7 @@ pub struct ExecutionRecord {
     pub action_digest: String,
     pub output: Option<Value>,
     pub execution_attestation: Option<ExecutionAttestation>,
+    pub human_approval: Option<HumanApprovalDecision>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -441,6 +617,12 @@ pub trait ExecutionJournal: AtomicAuthorizationCommit + Send + Sync {
         &self,
         key: ExecutionKey,
         attestation: &ExecutionAttestation,
+    ) -> Result<(), JournalError>;
+
+    fn record_human_approval(
+        &self,
+        key: ExecutionKey,
+        decision: &HumanApprovalDecision,
     ) -> Result<(), JournalError>;
 }
 
@@ -497,6 +679,15 @@ pub enum GatewayError {
     ExecutionAttestation(#[from] ExecutionAttestationError),
     #[error("execution record does not exist for {0:?}")]
     ExecutionNotFound(ExecutionKey),
+    #[error("human approval failed: {0}")]
+    Approval(#[from] ApprovalError),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanApprovalReceipt {
+    pub decision: HumanApprovalDecision,
+    pub receipt: GatewayReceipt,
 }
 
 /// A synchronous gateway that binds a current authorization result to one
@@ -507,6 +698,7 @@ pub struct Gateway {
     journal: Arc<dyn ExecutionJournal>,
     dispatcher: Arc<dyn ActionDispatcher>,
     execution_attester: Arc<dyn ExecutionAttestationSigner>,
+    approval_verifier: Option<HumanApprovalVerifier>,
 }
 
 impl Gateway {
@@ -524,7 +716,13 @@ impl Gateway {
             journal,
             dispatcher,
             execution_attester,
+            approval_verifier: None,
         })
+    }
+
+    pub fn with_human_approval_verifier(mut self, verifier: HumanApprovalVerifier) -> Self {
+        self.approval_verifier = Some(verifier);
+        self
     }
 
     fn create_execution_attestation(
@@ -557,6 +755,96 @@ impl Gateway {
             output,
             execution_attestation,
         }
+    }
+
+    pub fn approval_challenge(&self, key: ExecutionKey) -> Result<ApprovalChallenge, GatewayError> {
+        let record = self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?;
+        if record.authorization != AuthorizationStatus::RequiresApproval
+            || record.execution != ExecutionStatus::NotDispatched
+            || record.human_approval.is_some()
+        {
+            return Err(ApprovalError::NotPending.into());
+        }
+        Ok(ApprovalChallenge::from_evidence(
+            &record.evidence,
+            &record.action_digest,
+        )?)
+    }
+
+    /// Validates and consumes a signed human decision exactly once. Approval
+    /// and the transition to `Dispatched` are committed atomically before the
+    /// exact persisted evidence action is passed to the dispatcher.
+    pub fn resolve_human_approval(
+        &self,
+        decision: HumanApprovalDecision,
+    ) -> Result<HumanApprovalReceipt, GatewayError> {
+        let verifier = self
+            .approval_verifier
+            .as_ref()
+            .ok_or(ApprovalError::NotConfigured)?;
+        let key = ExecutionKey {
+            agent_id: decision.challenge.agent_id,
+            request_id: decision.challenge.request_id,
+        };
+        let mut record = self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?;
+        if record.authorization != AuthorizationStatus::RequiresApproval
+            || record.execution != ExecutionStatus::NotDispatched
+            || record.human_approval.is_some()
+        {
+            return Err(ApprovalError::NotPending.into());
+        }
+
+        let expected = ApprovalChallenge::from_evidence(&record.evidence, &record.action_digest)?;
+        if decision.challenge != expected {
+            return Err(ApprovalError::InvalidChallenge.into());
+        }
+        let expires_at = OffsetDateTime::parse(&expected.expires_at, &Rfc3339)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        if OffsetDateTime::now_utc() >= expires_at {
+            return Err(ApprovalError::Expired.into());
+        }
+        verifier.verify(&decision)?;
+        self.journal.record_human_approval(key, &decision)?;
+        record.human_approval = Some(decision.clone());
+
+        if decision.outcome == HumanApprovalOutcome::Reject {
+            let receipt = self.attest_record(&mut record)?;
+            return Ok(HumanApprovalReceipt { decision, receipt });
+        }
+
+        record.execution = ExecutionStatus::Dispatched;
+        let (execution, output) =
+            match self
+                .dispatcher
+                .dispatch(key, &record.evidence.action, &record.action_digest)
+            {
+                Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
+                Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
+                Err(_) => (ExecutionStatus::OutcomeUnknown, None),
+            };
+        let execution_attestation = self.create_execution_attestation(
+            &record.evidence,
+            record.authorization,
+            execution,
+            output.as_ref(),
+        )?;
+        self.journal
+            .record_terminal_attested(key, execution, output.as_ref(), &execution_attestation)
+            .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
+        let receipt = Self::receipt(
+            record.evidence,
+            record.authorization,
+            execution,
+            output,
+            execution_attestation,
+        );
+        Ok(HumanApprovalReceipt { decision, receipt })
     }
 
     fn attest_record(&self, record: &mut ExecutionRecord) -> Result<GatewayReceipt, GatewayError> {

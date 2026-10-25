@@ -16,7 +16,8 @@ use praetore_core::{
 use praetore_gateway::{
     ActionDispatcher, DispatchError, DispatchReport, ExecutionAttestationError,
     ExecutionAttestationSigner, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
-    Gateway, GatewayError, JournalError, ReconciliationReport, action_digest,
+    Gateway, GatewayError, HumanApprovalDecision, HumanApprovalOutcome, HumanApprovalVerifier,
+    JournalError, ReconciliationReport, action_digest,
 };
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
 use serde_json::{Value, json};
@@ -90,6 +91,9 @@ fn initialize_test_database() {
             ))
             .expect("install append-only execution attestations");
         client
+            .batch_execute(include_str!("../migrations/0006_human_approvals.sql"))
+            .expect("install append-only human approvals");
+        client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
                      agent_id UUID NOT NULL, request_id UUID NOT NULL, \
@@ -115,9 +119,12 @@ fn initialize_test_database() {
                  REVOKE ALL ON TABLE praetore.execution_journal FROM praetore_replay_test; \
                  REVOKE ALL ON TABLE praetore.execution_journal_events FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.execution_attestations FROM PUBLIC; \
+                 REVOKE ALL ON TABLE praetore.human_approvals FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.execution_journal_events \
                      FROM praetore_replay_test; \
                  REVOKE ALL ON TABLE praetore.execution_attestations \
+                     FROM praetore_replay_test; \
+                 REVOKE ALL ON TABLE praetore.human_approvals \
                      FROM praetore_replay_test; \
                  GRANT USAGE ON SCHEMA praetore TO praetore_replay_test; \
                  GRANT SELECT (agent_id, request_id) ON praetore.replay_claims \
@@ -127,6 +134,8 @@ fn initialize_test_database() {
                  GRANT SELECT, INSERT, UPDATE ON praetore.execution_journal \
                      TO praetore_replay_test; \
                  GRANT SELECT, INSERT ON praetore.execution_attestations \
+                     TO praetore_replay_test; \
+                 GRANT SELECT, INSERT ON praetore.human_approvals \
                      TO praetore_replay_test; \
                  GRANT SELECT ON praetore.execution_journal_events \
                      TO praetore_replay_test; \
@@ -535,6 +544,14 @@ impl ExecutionJournal for CommitFaultJournal {
     ) -> Result<(), JournalError> {
         self.inner.mark_not_dispatched_attested(key, attestation)
     }
+
+    fn record_human_approval(
+        &self,
+        key: ExecutionKey,
+        decision: &praetore_gateway::HumanApprovalDecision,
+    ) -> Result<(), JournalError> {
+        self.inner.record_human_approval(key, decision)
+    }
 }
 
 struct PostgresGatewayFixture {
@@ -546,6 +563,13 @@ struct PostgresGatewayFixture {
     attester: EvidenceAttesterKey,
     agent_key: AgentKeyPair,
     adapter: Arc<PostgresTestAdapter>,
+}
+
+struct PostgresApprovalFixture {
+    gateway: Gateway,
+    request: AuthorizationRequest,
+    adapter: Arc<PostgresTestAdapter>,
+    approver_key: SigningKey,
 }
 
 fn test_validity() -> Validity {
@@ -616,6 +640,84 @@ fn create_postgres_gateway(request_id: Uuid) -> PostgresGatewayFixture {
         attester,
         agent_key,
         adapter,
+    }
+}
+
+fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture {
+    initialize_test_database();
+    let agent_key = AgentKeyPair::from_secret_bytes(&[81; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[82; 32]);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[83; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let validity = test_validity();
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "gateway-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(validity.clone());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+    let action = Action::new(
+        "local:set_value",
+        Some("persistent-state".into()),
+        json!({"key": "state", "value": "human-approved"}),
+    )
+    .unwrap()
+    .with_capability("local:write");
+    let policy = Policy::new_v2(
+        "postgres-human-approval",
+        1,
+        vec![
+            PolicyRule::new(
+                "require-human-approval",
+                "local:set_value",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("local:write"),
+        ],
+    );
+    let now = OffsetDateTime::now_utc();
+    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    request.request_id = request_id;
+    request
+        .sign_intent_v2(
+            &agent_key,
+            "postgres-test-gateway",
+            now,
+            now + Duration::seconds(20),
+            policy.digest().unwrap(),
+        )
+        .unwrap();
+    let issuer_pin = TrustedAuthorityIssuer::new("gateway-test-issuer", issuer_key.public_key())
+        .unwrap()
+        .with_validity(validity)
+        .unwrap();
+    let config = HighAssuranceConfig::new(policy.digest().unwrap(), vec![issuer_pin], attester)
+        .unwrap()
+        .with_audience("postgres-test-gateway")
+        .with_replay_guard(Arc::new(connect_guard()))
+        .with_freshness_provider(Arc::new(TestFreshness));
+    let engine = AuthorizationEngine::production(policy, config).unwrap();
+    let adapter = Arc::new(PostgresTestAdapter::new(None));
+    let approver_key = SigningKey::from_bytes(&[84; 32]);
+    let verifier = HumanApprovalVerifier::new(
+        "postgres-human-approver-v1",
+        VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap(),
+    )
+    .unwrap();
+    let gateway = Gateway::new(
+        engine,
+        Arc::new(connect_journal()),
+        adapter.clone(),
+        execution_attester(),
+    )
+    .unwrap()
+    .with_human_approval_verifier(verifier);
+    PostgresApprovalFixture {
+        gateway,
+        request,
+        adapter,
+        approver_key,
     }
 }
 
@@ -730,7 +832,9 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
              ALTER TABLE praetore.execution_journal_events \
                  DISABLE TRIGGER execution_journal_events_immutable; \
              ALTER TABLE praetore.execution_attestations \
-                 DISABLE TRIGGER execution_attestations_immutable;",
+                 DISABLE TRIGGER execution_attestations_immutable; \
+             ALTER TABLE praetore.human_approvals \
+                 DISABLE TRIGGER human_approvals_immutable;",
         )
         .unwrap();
     for request_id in request_ids {
@@ -738,6 +842,7 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
             "praetore.gateway_test_invocations",
             "praetore.gateway_test_effects",
             "praetore.execution_attestations",
+            "praetore.human_approvals",
             "praetore.execution_journal_events",
             "praetore.execution_journal",
             "praetore.replay_claims",
@@ -756,6 +861,8 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
                  ENABLE TRIGGER execution_journal_events_immutable; \
              ALTER TABLE praetore.execution_attestations \
                  ENABLE TRIGGER execution_attestations_immutable; \
+             ALTER TABLE praetore.human_approvals \
+                 ENABLE TRIGGER human_approvals_immutable; \
              COMMIT;",
         )
         .unwrap();
@@ -1374,6 +1481,64 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
         connect_journal().get(key).unwrap().unwrap().execution,
         ExecutionStatus::Confirmed
     );
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_human_approval_is_persisted_atomically_and_consumed_once() {
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let pending = fixture.gateway.execute(fixture.request).unwrap();
+    assert_eq!(
+        pending.evidence.decision.outcome,
+        DecisionOutcome::RequireApproval
+    );
+    let key = ExecutionKey {
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let challenge = fixture.gateway.approval_challenge(key).unwrap();
+    let mut decision = HumanApprovalDecision {
+        schema_version: 1,
+        approval_id: Uuid::new_v4(),
+        approver_key_id: "postgres-human-approver-v1".into(),
+        challenge,
+        outcome: HumanApprovalOutcome::Approve,
+        signature: String::new(),
+    };
+    decision.signature = hex::encode(
+        fixture
+            .approver_key
+            .sign(&decision.signing_message().unwrap())
+            .to_bytes(),
+    );
+
+    let resolution = fixture
+        .gateway
+        .resolve_human_approval(decision.clone())
+        .unwrap();
+    assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 1);
+
+    let record = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(
+        record.authorization,
+        praetore_gateway::AuthorizationStatus::RequiresApproval
+    );
+    assert_eq!(record.execution, ExecutionStatus::Confirmed);
+    assert_eq!(record.human_approval, Some(decision.clone()));
+    assert_eq!(database_invocation_count(key), 1);
+    assert_eq!(database_effect_count(key), 1);
+    assert!(
+        connect_client()
+            .execute(
+                "UPDATE praetore.human_approvals SET outcome = 'reject' \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .is_err()
+    );
+    assert!(fixture.gateway.resolve_human_approval(decision).is_err());
+    assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 1);
 }
 
 #[test]

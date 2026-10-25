@@ -2,23 +2,25 @@ use ed25519_dalek::{Signer, SigningKey};
 use postgres::{Client, NoTls};
 use praetore_core::{
     EvidenceAttesterKey, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
-    Policy, TrustedAuthorityIssuer, engine::AuthorizationEngine, identity::AgentKeyFingerprint,
+    Policy, TrustedAuthorityIssuer, VerifiedPublicKey, engine::AuthorizationEngine,
+    identity::AgentKeyFingerprint,
 };
 use praetore_gateway::{
-    ExecutionAttestationError, ExecutionAttestationSigner, Gateway, http_api,
-    local_demo::LocalDemoDispatcher,
+    ExecutionAttestationError, ExecutionAttestationSigner, Gateway, HumanApprovalVerifier,
+    http_api, local_demo::LocalDemoDispatcher,
 };
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
 use std::{env, fs, path::Path, str::FromStr, sync::Arc};
 use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 
-const MIGRATIONS: [&str; 5] = [
+const MIGRATIONS: [&str; 6] = [
     include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0004_execution_journal_events.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0005_execution_attestations.sql"),
+    include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
 ];
 
 struct LocalFreshnessProvider {
@@ -166,8 +168,14 @@ fn build_gateway(database_url: &str) -> Result<Gateway, Box<dyn std::error::Erro
     let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
         "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
     )?)?);
+    let approval_key_id = required_env("PRAETORE_GATEWAY_APPROVER_KEY_ID")?;
+    let approval_public_key = VerifiedPublicKey::from_bytes(&hex::decode(required_env(
+        "PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX",
+    )?)?)?;
+    let approval_verifier = HumanApprovalVerifier::new(approval_key_id, approval_public_key)?;
 
-    Ok(Gateway::new(engine, journal, dispatcher, execution_signer)?)
+    Ok(Gateway::new(engine, journal, dispatcher, execution_signer)?
+        .with_human_approval_verifier(approval_verifier))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

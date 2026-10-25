@@ -17,9 +17,10 @@ use praetore_core::{
     },
 };
 use praetore_gateway::{
-    ActionDispatcher, AuthorizationStatus, DispatchError, DispatchReport,
+    ActionDispatcher, ApprovalError, AuthorizationStatus, DispatchError, DispatchReport,
     ExecutionAttestationError, ExecutionAttestationSigner, ExecutionJournal, ExecutionKey,
-    ExecutionRecord, ExecutionStatus, Gateway, GatewayError, JournalError, ReconciliationReport,
+    ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
+    HumanApprovalOutcome, HumanApprovalVerifier, JournalError, ReconciliationReport,
 };
 use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
@@ -155,6 +156,7 @@ struct JournalEntry {
     action_digest: String,
     output: Option<Value>,
     execution_attestations: Vec<praetore_gateway::ExecutionAttestation>,
+    human_approval: Option<HumanApprovalDecision>,
 }
 
 impl Default for JournalEntry {
@@ -167,6 +169,7 @@ impl Default for JournalEntry {
             action_digest: String::new(),
             output: None,
             execution_attestations: Vec::new(),
+            human_approval: None,
         }
     }
 }
@@ -191,16 +194,16 @@ impl MemoryJournal {
         }
         let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
         if let Some(existing) = entries.get(&key) {
-            let action =
-                serde_json::to_string(&evidence.action).map_err(|_| JournalError::InvalidRecord)?;
+            let action = praetore_gateway::action_digest(&evidence.action)
+                .map_err(|_| JournalError::InvalidRecord)?;
             return if existing.action_digest == action {
                 Err(JournalError::AlreadyRecorded)
             } else {
                 Err(JournalError::ConflictingRequest)
             };
         }
-        let action_digest =
-            serde_json::to_string(&evidence.action).map_err(|_| JournalError::InvalidRecord)?;
+        let action_digest = praetore_gateway::action_digest(&evidence.action)
+            .map_err(|_| JournalError::InvalidRecord)?;
         entries.insert(
             key,
             JournalEntry {
@@ -215,6 +218,7 @@ impl MemoryJournal {
                 action_digest,
                 output: None,
                 execution_attestations: Vec::new(),
+                human_approval: None,
             },
         );
         Ok(())
@@ -268,6 +272,7 @@ impl AtomicAuthorizationCommit for MemoryJournal {
                 JournalError::ConflictingRequest => AuthorizationCommitError::ConflictingRequest,
                 JournalError::OrphanedReplayClaim => AuthorizationCommitError::OrphanedReplayClaim,
                 JournalError::Unavailable => AuthorizationCommitError::Unavailable,
+                JournalError::ApprovalAlreadyRecorded => AuthorizationCommitError::InvalidRecord,
                 JournalError::InvalidTransition | JournalError::InvalidRecord => {
                     AuthorizationCommitError::InvalidRecord
                 }
@@ -433,6 +438,7 @@ impl ExecutionJournal for MemoryJournal {
             action_digest: entry.action_digest.clone(),
             output: entry.output.clone(),
             execution_attestation: entry.execution_attestations.last().cloned(),
+            human_approval: entry.human_approval.clone(),
         }))
     }
 
@@ -464,6 +470,34 @@ impl ExecutionJournal for MemoryJournal {
         entry.execution = ExecutionStatus::NotDispatched;
         entry.states.push(ExecutionStatus::NotDispatched);
         entry.execution_attestations.push(attestation.clone());
+        Ok(())
+    }
+
+    fn record_human_approval(
+        &self,
+        key: ExecutionKey,
+        decision: &HumanApprovalDecision,
+    ) -> Result<(), JournalError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(JournalError::Unavailable);
+        }
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
+        let entry = entries
+            .get_mut(&key)
+            .ok_or(JournalError::InvalidTransition)?;
+        if entry.authorization != Some(AuthorizationStatus::RequiresApproval)
+            || entry.execution != ExecutionStatus::NotDispatched
+        {
+            return Err(JournalError::InvalidTransition);
+        }
+        if entry.human_approval.is_some() {
+            return Err(JournalError::ApprovalAlreadyRecorded);
+        }
+        if decision.outcome == HumanApprovalOutcome::Approve {
+            entry.states.push(ExecutionStatus::Dispatched);
+            entry.execution = ExecutionStatus::Dispatched;
+        }
+        entry.human_approval = Some(decision.clone());
         Ok(())
     }
 }
@@ -676,12 +710,111 @@ fn fixture_with_replay(
 }
 
 fn http_request(body: String) -> Request<Body> {
+    http_body_request("POST", "/v1/execute", body)
+}
+
+fn http_body_request(method: &str, uri: &str, body: String) -> Request<Body> {
     Request::builder()
-        .method("POST")
-        .uri("/v1/execute")
+        .method(method)
+        .uri(uri)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap()
+}
+
+fn human_approval_decision(
+    challenge: praetore_gateway::ApprovalChallenge,
+    outcome: HumanApprovalOutcome,
+    signing_key: &SigningKey,
+) -> HumanApprovalDecision {
+    let mut decision = HumanApprovalDecision {
+        schema_version: 1,
+        approval_id: Uuid::new_v4(),
+        approver_key_id: "test-human-approver-v1".into(),
+        challenge,
+        outcome,
+        signature: String::new(),
+    };
+    decision.signature = hex::encode(
+        signing_key
+            .sign(&decision.signing_message().unwrap())
+            .to_bytes(),
+    );
+    decision
+}
+
+fn approval_fixture() -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
+    let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[32; 32]);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[33; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "local-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(long_validity());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+    let action = Action::new(
+        "local:set_value",
+        Some("local-state".into()),
+        json!({"key": "mode", "value": "approved"}),
+    )
+    .unwrap()
+    .with_capability("local:write");
+    let policy = Policy::new_v2(
+        "human-approval-test",
+        1,
+        vec![
+            PolicyRule::new(
+                "require-human-approval",
+                "local:set_value",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("local:write"),
+        ],
+    );
+    let now = OffsetDateTime::now_utc();
+    let policy_digest = policy.digest().unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    request
+        .sign_intent_v2(
+            &agent_key,
+            "local-test-gateway",
+            now,
+            now + Duration::seconds(20),
+            policy_digest.clone(),
+        )
+        .unwrap();
+
+    let issuer_pin = TrustedAuthorityIssuer::new("local-test-issuer", issuer_key.public_key())
+        .unwrap()
+        .with_validity(long_validity())
+        .unwrap();
+    let config = HighAssuranceConfig::new(policy_digest, vec![issuer_pin], attester)
+        .unwrap()
+        .with_audience("local-test-gateway")
+        .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
+        .with_freshness_provider(Arc::new(CurrentFreshness));
+    let engine = AuthorizationEngine::production(policy, config).unwrap();
+    let tool = Arc::new(LocalSetTool::default());
+    let journal = Arc::new(MemoryJournal::default());
+    let approver_key = SigningKey::from_bytes(&[34; 32]);
+    let verifier = HumanApprovalVerifier::new(
+        "test-human-approver-v1",
+        VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap(),
+    )
+    .unwrap();
+    let gateway = Gateway::new(engine, journal.clone(), tool.clone(), execution_attester())
+        .unwrap()
+        .with_human_approval_verifier(verifier);
+    (gateway, request, tool, journal, approver_key)
 }
 
 #[tokio::test]
@@ -735,6 +868,159 @@ async fn http_gateway_returns_approval_receipt_without_dispatch() {
     assert_eq!(receipt["authorization"], "requires_approval");
     assert_eq!(receipt["execution"], "not_dispatched");
     assert_eq!(fixture.tool.invocations(), 0);
+}
+
+#[test]
+fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    assert_eq!(pending.authorization, AuthorizationStatus::RequiresApproval);
+    assert_eq!(pending.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(tool.invocations(), 0);
+
+    let key = ExecutionKey {
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let challenge = gateway.approval_challenge(key).unwrap();
+    assert_eq!(
+        challenge.action_digest,
+        praetore_gateway::action_digest(&pending.evidence.action).unwrap()
+    );
+    let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    let resolution = gateway.resolve_human_approval(decision.clone()).unwrap();
+
+    assert_eq!(resolution.decision, decision);
+    assert_eq!(
+        resolution.receipt.authorization,
+        AuthorizationStatus::RequiresApproval
+    );
+    assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(tool.value("mode"), Some(json!("approved")));
+    assert_eq!(tool.invocations(), 1);
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().human_approval,
+        Some(decision.clone())
+    );
+    resolution
+        .receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    assert!(matches!(
+        gateway.resolve_human_approval(resolution.decision),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+    assert_eq!(tool.invocations(), 1);
+}
+
+#[test]
+fn human_approval_signature_cannot_be_reused_for_modified_action_scope() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let challenge = gateway.approval_challenge(key).unwrap();
+    let mut decision =
+        human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    decision.challenge.action_digest = "0".repeat(64);
+
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::InvalidChallenge))
+    ));
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn rejected_human_approval_is_persisted_without_dispatch() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Reject,
+        &approver_key,
+    );
+    let resolution = gateway.resolve_human_approval(decision).unwrap();
+
+    assert_eq!(resolution.receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(tool.value("mode"), None);
+    assert_eq!(tool.invocations(), 0);
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().human_approval.unwrap(),
+        resolution.decision
+    );
+    assert!(matches!(
+        gateway.approval_challenge(key),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+}
+
+#[tokio::test]
+async fn http_human_approval_resumes_the_pending_execution() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let app = http_api::router(Arc::new(gateway));
+    let response = app
+        .clone()
+        .oneshot(http_request(serde_json::to_string(&request).unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let pending: praetore_gateway::GatewayReceipt = serde_json::from_slice(&body).unwrap();
+    let key = ExecutionKey {
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+
+    let response = app
+        .clone()
+        .oneshot(http_body_request(
+            "GET",
+            &format!("/v1/approvals/{}/{}", key.agent_id, key.request_id),
+            String::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let challenge: praetore_gateway::ApprovalChallenge = serde_json::from_slice(&body).unwrap();
+    let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+
+    let mismatched_path = app
+        .clone()
+        .oneshot(http_body_request(
+            "POST",
+            &format!("/v1/approvals/{}/{}", Uuid::new_v4(), key.request_id),
+            serde_json::to_string(&decision).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatched_path.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(tool.invocations(), 0);
+
+    let response = app
+        .oneshot(http_body_request(
+            "POST",
+            &format!("/v1/approvals/{}/{}", key.agent_id, key.request_id),
+            serde_json::to_string(&decision).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let resolution: praetore_gateway::HumanApprovalReceipt = serde_json::from_slice(&body).unwrap();
+    assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(tool.value("mode"), Some(json!("approved")));
+    assert_eq!(tool.invocations(), 1);
 }
 
 #[tokio::test]

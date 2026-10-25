@@ -4,8 +4,9 @@ use praetore_core::{
     canonical::canonicalize_json, replay::AtomicAuthorizationCommit,
 };
 use praetore_gateway::{
-    AuthorizationStatus, ExecutionAttestation, ExecutionJournal, ExecutionKey, ExecutionRecord,
-    ExecutionStatus, JournalError, action_digest,
+    ApprovalChallenge, AuthorizationStatus, ExecutionAttestation, ExecutionJournal, ExecutionKey,
+    ExecutionRecord, ExecutionStatus, HumanApprovalDecision, HumanApprovalOutcome, JournalError,
+    action_digest,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -95,7 +96,10 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
                      (SELECT attestation_json FROM praetore.execution_attestations ea \
                       WHERE ea.agent_id = execution_journal.agent_id \
                         AND ea.request_id = execution_journal.request_id \
-                        AND ea.execution_status = execution_journal.execution_status) \
+                        AND ea.execution_status = execution_journal.execution_status), \
+                     (SELECT decision_json FROM praetore.human_approvals ha \
+                      WHERE ha.agent_id = execution_journal.agent_id \
+                        AND ha.request_id = execution_journal.request_id) \
                      FROM praetore.execution_journal \
                      WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
                     &[&key.agent_id, &key.request_id],
@@ -211,6 +215,101 @@ impl ExecutionJournal for PostgresExecutionJournal {
         } else {
             Err(JournalError::InvalidTransition)
         }
+    }
+
+    fn record_human_approval(
+        &self,
+        key: ExecutionKey,
+        decision: &HumanApprovalDecision,
+    ) -> Result<(), JournalError> {
+        let decision_json =
+            serde_json::to_value(decision).map_err(|_| JournalError::InvalidRecord)?;
+        let expires_at = time::OffsetDateTime::parse(
+            &decision.challenge.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| JournalError::InvalidRecord)?;
+        let mut client = self.client.lock().map_err(|_| JournalError::Unavailable)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| JournalError::Unavailable)?;
+        transaction
+            .batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(|_| JournalError::Unavailable)?;
+        let row = transaction
+            .query_opt(
+                "SELECT authorization_status, execution_status, evidence_json, action_digest \
+                     FROM praetore.execution_journal \
+                     WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
+                &[&key.agent_id, &key.request_id],
+            )
+            .map_err(|_| JournalError::Unavailable)?
+            .ok_or(JournalError::InvalidTransition)?;
+        let authorization = parse_authorization(&row.get::<_, String>(0))?;
+        let execution = parse_execution(&row.get::<_, String>(1))?;
+        let evidence = Evidence::from_json(&row.get::<_, String>(2))
+            .map_err(|_| JournalError::InvalidRecord)?;
+        let stored_action_digest: String = row.get(3);
+        if authorization != AuthorizationStatus::RequiresApproval
+            || execution != ExecutionStatus::NotDispatched
+            || decision.challenge.agent_id != key.agent_id
+            || decision.challenge.request_id != key.request_id
+            || decision.challenge.action_digest != stored_action_digest
+            || ApprovalChallenge::from_evidence(&evidence, &stored_action_digest)
+                .map_err(|_| JournalError::InvalidRecord)?
+                != decision.challenge
+            || expires_at <= time::OffsetDateTime::now_utc()
+        {
+            return Err(JournalError::InvalidRecord);
+        }
+
+        transaction
+                .execute(
+                    "INSERT INTO praetore.human_approvals \
+                     (approval_id, agent_id, request_id, evidence_id, evidence_hash, action_digest, \
+                      policy_digest, outcome, approver_key_id, expires_at, decision_json) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                    &[
+                        &decision.approval_id,
+                        &key.agent_id,
+                        &key.request_id,
+                        &decision.challenge.evidence_id,
+                        &decision.challenge.evidence_hash,
+                        &decision.challenge.action_digest,
+                        &decision.challenge.policy_digest,
+                        &approval_outcome_as_db(decision.outcome),
+                        &decision.approver_key_id,
+                        &expires_at,
+                        &decision_json,
+                    ],
+                )
+                .map_err(|error| {
+                    if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) {
+                        JournalError::ApprovalAlreadyRecorded
+                    } else {
+                        JournalError::Unavailable
+                    }
+                })?;
+
+        if decision.outcome == HumanApprovalOutcome::Approve {
+            let changed = transaction
+                .execute(
+                    "UPDATE praetore.execution_journal \
+                         SET execution_status = 'dispatched', updated_at = clock_timestamp() \
+                         WHERE agent_id = $1 AND request_id = $2 \
+                           AND authorization_status = 'requires_approval' \
+                           AND execution_status = 'not_dispatched'",
+                    &[&key.agent_id, &key.request_id],
+                )
+                .map_err(|_| JournalError::Unavailable)?;
+            if changed != 1 {
+                return Err(JournalError::InvalidTransition);
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|_| JournalError::Unavailable)?;
+        Ok(())
     }
 
     fn record_terminal_attested(
@@ -377,7 +476,10 @@ impl ExecutionJournal for PostgresExecutionJournal {
                  (SELECT attestation_json FROM praetore.execution_attestations ea \
                   WHERE ea.agent_id = execution_journal.agent_id \
                     AND ea.request_id = execution_journal.request_id \
-                    AND ea.execution_status = execution_journal.execution_status) \
+                    AND ea.execution_status = execution_journal.execution_status), \
+                 (SELECT decision_json FROM praetore.human_approvals ha \
+                  WHERE ha.agent_id = execution_journal.agent_id \
+                    AND ha.request_id = execution_journal.request_id) \
                  FROM praetore.execution_journal \
                  WHERE agent_id = $1 AND request_id = $2",
                 &[&key.agent_id, &key.request_id],
@@ -492,7 +594,10 @@ fn verify_authorization_pair(
              (SELECT attestation_json FROM praetore.execution_attestations ea \
               WHERE ea.agent_id = execution_journal.agent_id \
                 AND ea.request_id = execution_journal.request_id \
-                AND ea.execution_status = execution_journal.execution_status) \
+                AND ea.execution_status = execution_journal.execution_status), \
+             (SELECT decision_json FROM praetore.human_approvals ha \
+              WHERE ha.agent_id = execution_journal.agent_id \
+                AND ha.request_id = execution_journal.request_id) \
              FROM praetore.execution_journal \
              WHERE agent_id = $1 AND request_id = $2",
             &[&key.agent_id, &key.request_id],
@@ -628,6 +733,10 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
         .get::<_, Option<Value>>(6)
         .map(|value| serde_json::from_value(value).map_err(|_| JournalError::InvalidRecord))
         .transpose()?;
+    let human_approval = row
+        .get::<_, Option<Value>>(7)
+        .map(|value| serde_json::from_value(value).map_err(|_| JournalError::InvalidRecord))
+        .transpose()?;
     validate_evidence(key, &evidence, authorization)?;
     let (expected_request_digest, expected_action_digest) = execution_digests(&evidence)?;
     if expected_request_digest != request_digest || expected_action_digest != action_digest {
@@ -641,7 +750,15 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
         action_digest,
         output,
         execution_attestation,
+        human_approval,
     })
+}
+
+fn approval_outcome_as_db(outcome: HumanApprovalOutcome) -> &'static str {
+    match outcome {
+        HumanApprovalOutcome::Approve => "approve",
+        HumanApprovalOutcome::Reject => "reject",
+    }
 }
 
 fn serialize_attestation(attestation: &ExecutionAttestation) -> Result<Value, JournalError> {
