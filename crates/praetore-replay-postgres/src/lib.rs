@@ -1,4 +1,4 @@
-use postgres::Client;
+use postgres::{Client, Transaction};
 use praetore_core::replay::{ReplayGuard, ReplayGuardError};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -35,10 +35,15 @@ impl ReplayGuard for PostgresReplayGuard {
             .client
             .lock()
             .map_err(|_| ReplayGuardError::Unavailable)?;
-        client
-            .batch_execute("SET synchronous_commit = on")
+        let mut transaction = client
+            .transaction()
             .map_err(|_| ReplayGuardError::Unavailable)?;
-        let inserted = client
+        transaction
+            .batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(|_| ReplayGuardError::Unavailable)?;
+        set_tenant_context(&mut transaction, tenant_id)
+            .map_err(|_| ReplayGuardError::Unavailable)?;
+        let inserted = transaction
             .execute(
                 "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
                  VALUES ($1, $2, $3) \
@@ -48,9 +53,22 @@ impl ReplayGuard for PostgresReplayGuard {
             .map_err(|_| ReplayGuardError::Unavailable)?;
 
         match inserted {
-            1 => Ok(()),
+            1 => transaction
+                .commit()
+                .map_err(|_| ReplayGuardError::Unavailable),
             0 => Err(ReplayGuardError::AlreadyClaimed),
             _ => Err(ReplayGuardError::Unavailable),
         }
     }
+}
+
+pub(crate) fn set_tenant_context(
+    transaction: &mut Transaction<'_>,
+    tenant_id: Uuid,
+) -> Result<(), postgres::Error> {
+    transaction.query_one(
+        "SELECT set_config('praetore.tenant_id', $1, true)",
+        &[&tenant_id.to_string()],
+    )?;
+    Ok(())
 }

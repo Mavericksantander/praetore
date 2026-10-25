@@ -1,20 +1,21 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State, rejection::QueryRejection},
+    extract::{Extension, Path, Query, State, rejection::QueryRejection},
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
-use praetore_core::VerifiedPublicKey;
+use praetore_core::{VerifiedPublicKey, canonical::parse_json_rejecting_duplicates};
 use praetore_gateway::{AuthorizationStatus, ExecutionKey, ExecutionStatus};
 use praetore_replay_postgres::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,
 };
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use sha2::{Digest, Sha256};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use subtle::ConstantTimeEq;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -29,9 +30,26 @@ const MAX_TIME_RANGE: Duration = Duration::days(90);
 #[derive(Clone)]
 pub struct ObserveState {
     reader: Arc<dyn ObservationStore>,
-    bearer_token: [u8; 32],
+    tenant_token_hashes: HashMap<[u8; 32], Uuid>,
     trusted_attester: Option<VerifiedPublicKey>,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantTokenFile {
+    schema_version: u8,
+    tenants: Vec<TenantTokenEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantTokenEntry {
+    tenant_id: Uuid,
+    bearer_token_sha256: String,
+}
+
+#[derive(Clone, Copy)]
+struct AuthenticatedTenant(Uuid);
 
 pub trait ObservationStore: Send + Sync + 'static {
     fn list(
@@ -69,13 +87,25 @@ impl ObservationStore for PostgresObservabilityReader {
 impl ObserveState {
     pub fn new(
         reader: Arc<dyn ObservationStore>,
-        bearer_token_hex: &str,
+        tenant_token_hashes: HashMap<Uuid, String>,
         trusted_attester: Option<VerifiedPublicKey>,
     ) -> Result<Self, ConfigError> {
-        let bearer_token = parse_bearer_token(bearer_token_hex)?;
+        if tenant_token_hashes.is_empty() {
+            return Err(ConfigError::InvalidTokenConfiguration);
+        }
+        let mut token_hashes = HashMap::with_capacity(tenant_token_hashes.len());
+        for (tenant_id, digest) in tenant_token_hashes {
+            if tenant_id.is_nil() {
+                return Err(ConfigError::InvalidTokenConfiguration);
+            }
+            let digest = parse_token_digest(&digest)?;
+            if token_hashes.insert(digest, tenant_id).is_some() {
+                return Err(ConfigError::InvalidTokenConfiguration);
+            }
+        }
         Ok(Self {
             reader,
-            bearer_token,
+            tenant_token_hashes: token_hashes,
             trusted_attester,
         })
     }
@@ -108,14 +138,16 @@ impl ObserveState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
-    InvalidToken,
+    InvalidTokenConfiguration,
     NonLoopbackBind,
 }
 
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidToken => f.write_str("bearer token must be exactly 32 bytes in hex"),
+            Self::InvalidTokenConfiguration => {
+                f.write_str("tenant bearer token configuration is invalid")
+            }
             Self::NonLoopbackBind => f.write_str("observability bind address must be loopback"),
         }
     }
@@ -131,25 +163,70 @@ pub fn validate_bind_address(address: SocketAddr) -> Result<SocketAddr, ConfigEr
     }
 }
 
-fn parse_bearer_token(token_hex: &str) -> Result<[u8; 32], ConfigError> {
-    let token = hex::decode(token_hex).map_err(|_| ConfigError::InvalidToken)?;
-    token.try_into().map_err(|_| ConfigError::InvalidToken)
+fn parse_token_digest(digest_hex: &str) -> Result<[u8; 32], ConfigError> {
+    let digest = hex::decode(digest_hex).map_err(|_| ConfigError::InvalidTokenConfiguration)?;
+    if digest.len() != 32 || hex::encode(&digest) != digest_hex {
+        return Err(ConfigError::InvalidTokenConfiguration);
+    }
+    digest
+        .try_into()
+        .map_err(|_| ConfigError::InvalidTokenConfiguration)
+}
+
+pub fn parse_tenant_token_hashes(document: &str) -> Result<HashMap<Uuid, String>, ConfigError> {
+    if document.len() > 1_048_576 {
+        return Err(ConfigError::InvalidTokenConfiguration);
+    }
+    let value = parse_json_rejecting_duplicates(document)
+        .map_err(|_| ConfigError::InvalidTokenConfiguration)?;
+    let config: TenantTokenFile =
+        serde_json::from_value(value).map_err(|_| ConfigError::InvalidTokenConfiguration)?;
+    if config.schema_version != 1 || config.tenants.is_empty() || config.tenants.len() > 4096 {
+        return Err(ConfigError::InvalidTokenConfiguration);
+    }
+
+    let mut tokens = HashMap::with_capacity(config.tenants.len());
+    let mut seen_hashes = std::collections::HashSet::with_capacity(config.tenants.len());
+    for entry in config.tenants {
+        let digest = parse_token_digest(&entry.bearer_token_sha256)?;
+        if entry.tenant_id.is_nil()
+            || !seen_hashes.insert(digest)
+            || tokens
+                .insert(entry.tenant_id, entry.bearer_token_sha256)
+                .is_some()
+        {
+            return Err(ConfigError::InvalidTokenConfiguration);
+        }
+    }
+    Ok(tokens)
 }
 
 async fn require_bearer(
     State(state): State<Arc<ObserveState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let valid = request
+    let token = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .and_then(|value| hex::decode(value).ok())
-        .filter(|provided| provided.len() == state.bearer_token.len())
-        .is_some_and(|provided| bool::from(provided.as_slice().ct_eq(&state.bearer_token)));
-    if valid {
+        .filter(|value| value.len() == 32);
+    let authenticated_tenant = token.and_then(|token| {
+        let digest: [u8; 32] = Sha256::digest(token).into();
+        let mut matched_tenant = None;
+        for (expected, tenant_id) in &state.tenant_token_hashes {
+            if bool::from(expected.as_slice().ct_eq(digest.as_slice())) {
+                matched_tenant = Some(*tenant_id);
+            }
+        }
+        matched_tenant
+    });
+    if let Some(tenant_id) = authenticated_tenant {
+        request
+            .extensions_mut()
+            .insert(AuthenticatedTenant(tenant_id));
         next.run(request).await
     } else {
         let mut response = api_error(StatusCode::UNAUTHORIZED, "unauthorized");
@@ -246,16 +323,24 @@ struct AssuranceView {
 
 async fn list_operations(
     State(state): State<Arc<ObserveState>>,
+    Extension(tenant): Extension<AuthenticatedTenant>,
     query: Result<Query<ListQuery>, QueryRejection>,
 ) -> Response {
     let Query(query) = match query {
         Ok(query) => query,
         Err(_) => return api_error(StatusCode::BAD_REQUEST, "invalid_query"),
     };
-    let filters = match validate_query(query) {
+    let mut filters = match validate_query(query) {
         Ok(filters) => filters,
         Err(message) => return api_error(StatusCode::BAD_REQUEST, message),
     };
+    if filters
+        .tenant_id
+        .is_some_and(|requested| requested != tenant.0)
+    {
+        return api_error(StatusCode::FORBIDDEN, "tenant_access_denied");
+    }
+    filters.tenant_id = Some(tenant.0);
     let reader = state.reader.clone();
     let response_limit = filters.limit;
     let response_offset = filters.offset;
@@ -288,12 +373,16 @@ async fn list_operations(
 
 async fn operation_detail(
     State(state): State<Arc<ObserveState>>,
+    Extension(tenant): Extension<AuthenticatedTenant>,
     Path((tenant_id, agent_id, request_id)): Path<(String, String, String)>,
 ) -> Response {
     let key = match parse_key(&tenant_id, &agent_id, &request_id) {
         Ok(key) => key,
         Err(()) => return api_error(StatusCode::BAD_REQUEST, "invalid_execution_identity"),
     };
+    if key.tenant_id != tenant.0 {
+        return api_error(StatusCode::NOT_FOUND, "operation_not_found");
+    }
     let reader = state.reader.clone();
     let stored = match tokio::task::spawn_blocking(move || reader.get(key)).await {
         Ok(Ok(Some(stored))) => stored,
@@ -633,24 +722,28 @@ mod tests {
     use praetore_gateway::JournalError;
     use praetore_replay_postgres::ExecutionPage;
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         sync::atomic::{AtomicUsize, Ordering},
     };
     use tower::ServiceExt;
 
     const TOKEN: &str = "4242424242424242424242424242424242424242424242424242424242424242";
+    const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
     struct MemoryStore {
         row: ObservedExecution,
         reads: AtomicUsize,
         writes: AtomicUsize,
         database_available: bool,
+        listed_tenant: std::sync::Mutex<Option<Uuid>>,
     }
 
     impl ObservationStore for MemoryStore {
-        fn list(&self, _filters: &ExecutionFilters) -> Result<ExecutionPage, JournalError> {
+        fn list(&self, filters: &ExecutionFilters) -> Result<ExecutionPage, JournalError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            *self.listed_tenant.lock().unwrap() = filters.tenant_id;
             Ok(ExecutionPage {
                 total: 1,
                 rows: vec![self.row.clone()],
@@ -705,9 +798,34 @@ mod tests {
     }
 
     #[test]
-    fn token_configuration_requires_exactly_32_bytes() {
-        assert!(parse_bearer_token(&"00".repeat(32)).is_ok());
-        assert!(parse_bearer_token("secret").is_err());
+    fn tenant_token_configuration_requires_unique_tenant_scoped_hashes() {
+        let tenant = Uuid::from_u128(1);
+        let digest = hex::encode(Sha256::digest([0x42; 32]));
+        let valid = format!(
+            r#"{{"schema_version":1,"tenants":[{{"tenant_id":"{tenant}","bearer_token_sha256":"{digest}"}}]}}"#
+        );
+        assert_eq!(parse_tenant_token_hashes(&valid).unwrap()[&tenant], digest);
+        assert!(parse_tenant_token_hashes(r#"{"schema_version":1,"tenants":[]}"#).is_err());
+        assert!(
+            parse_tenant_token_hashes(r#"{"schema_version":1,"schema_version":1,"tenants":[]}"#)
+                .is_err()
+        );
+        assert!(parse_tenant_token_hashes(
+            &format!(
+                r#"{{"schema_version":1,"tenants":[{{"tenant_id":"{tenant}","bearer_token_sha256":"{digest}"}},{{"tenant_id":"{tenant}","bearer_token_sha256":"{}"}}]}}"#,
+                hex::encode(Sha256::digest([0x43; 32]))
+            )
+        )
+        .is_err()
+        );
+        assert!(
+        parse_tenant_token_hashes(
+            &format!(
+                r#"{{"schema_version":1,"tenants":[{{"tenant_id":"{tenant}","bearer_token_sha256":"{digest}"}},{{"tenant_id":"{}","bearer_token_sha256":"{digest}"}}]}}"#,
+                Uuid::from_u128(2)
+            )
+        )
+        .is_err());
     }
 
     #[tokio::test]
@@ -861,6 +979,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_token_scopes_operation_lists_and_details() {
+        let (state, store) = test_state(true, true);
+        let app = state.router();
+        let allowed_list = app
+            .clone()
+            .oneshot(authorized_request("/api/v1/operations"))
+            .await
+            .unwrap();
+        assert_eq!(allowed_list.status(), StatusCode::OK);
+        assert_eq!(*store.listed_tenant.lock().unwrap(), Some(TEST_TENANT_ID));
+
+        let cross_tenant_list = app
+            .clone()
+            .oneshot(authorized_request(&format!(
+                "/api/v1/operations?tenant_id={}",
+                Uuid::from_u128(2)
+            )))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_list.status(), StatusCode::FORBIDDEN);
+
+        let cross_tenant_detail = app
+            .oneshot(authorized_request(&format!(
+                "/api/v1/operations/{}/{}/{}",
+                Uuid::from_u128(2),
+                store.row.key.agent_id,
+                store.row.key.request_id
+            )))
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_detail.status(), StatusCode::NOT_FOUND);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+
+        let other_tenant = Uuid::from_u128(2);
+        let other_token = hex::encode([0x43; 32]);
+        let other_state = ObserveState::new(
+            store.clone(),
+            HashMap::from([(other_tenant, hex::encode(Sha256::digest([0x43; 32])))]),
+            None,
+        )
+        .unwrap();
+        let other_app = other_state.router();
+        let cross_tenant_access = other_app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/operations/{}/{}/{}",
+                        store.row.key.tenant_id, store.row.key.agent_id, store.row.key.request_id
+                    ))
+                    .header(header::AUTHORIZATION, format!("Bearer {other_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cross_tenant_access.status(), StatusCode::NOT_FOUND);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn missing_health_telemetry_is_never_reported_healthy() {
         let (state, _) = test_state(false, true);
         let app = state.router();
@@ -987,8 +1165,14 @@ mod tests {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             database_available,
+            listed_tenant: std::sync::Mutex::new(None),
         });
-        let state = ObserveState::new(store.clone(), TOKEN, Some(trusted_attester)).unwrap();
+        let tenant_tokens = HashMap::from([(
+            Uuid::from_u128(1),
+            hex::encode(Sha256::digest(hex::decode(TOKEN).unwrap())),
+        )]);
+        let state =
+            ObserveState::new(store.clone(), tenant_tokens, Some(trusted_attester)).unwrap();
         (state, store)
     }
 

@@ -1,8 +1,8 @@
 use postgres::{Client, NoTls};
 use praetore_core::VerifiedPublicKey;
-use praetore_observe::{ObserveState, validate_bind_address};
+use praetore_observe::{ObserveState, parse_tenant_token_hashes, validate_bind_address};
 use praetore_replay_postgres::PostgresObservabilityReader;
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, fs, net::SocketAddr, path::Path, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -10,8 +10,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let bearer_token = env::var("PRAETORE_OBSERVE_BEARER_TOKEN")
-        .map_err(|_| "PRAETORE_OBSERVE_BEARER_TOKEN is required (32 random bytes, hex encoded)")?;
+    let token_file = env::var("PRAETORE_OBSERVE_TENANT_TOKENS_FILE")
+        .map_err(|_| "PRAETORE_OBSERVE_TENANT_TOKENS_FILE is required")?;
+    let metadata = fs::metadata(Path::new(&token_file))?;
+    if !metadata.is_file() || metadata.len() > 1_048_576 {
+        return Err("tenant token file must be a file no larger than 1048576 bytes".into());
+    }
+    let tenant_token_hashes = parse_tenant_token_hashes(&fs::read_to_string(token_file)?)?;
     let database_url = env::var("PRAETORE_OBSERVE_DATABASE_URL")
         .map_err(|_| "PRAETORE_OBSERVE_DATABASE_URL is required")?;
     let address: SocketAddr = env::var("PRAETORE_OBSERVE_BIND")
@@ -29,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &database_url,
         NoTls,
     )?)?);
-    let state = ObserveState::new(reader, &bearer_token, trusted_attester)?;
+    let state = ObserveState::new(reader, tenant_token_hashes, trusted_attester)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

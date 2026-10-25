@@ -105,6 +105,16 @@ fn initialize_test_database() {
             ))
             .expect("reapply tenant-scoped execution migration safely");
         client
+            .batch_execute(include_str!(
+                "../migrations/0008_tenant_row_level_security.sql"
+            ))
+            .expect("enable tenant row-level security");
+        client
+            .batch_execute(include_str!(
+                "../migrations/0008_tenant_row_level_security.sql"
+            ))
+            .expect("reapply tenant row-level security migration safely");
+        client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
                      tenant_id UUID NOT NULL, agent_id UUID NOT NULL, request_id UUID NOT NULL, \
@@ -1528,6 +1538,12 @@ fn postgres_journal_terminal_states_cannot_return_to_dispatchable() {
     );
 
     let mut direct_client = connect_journal_client();
+    direct_client
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, false)",
+            &[&key.tenant_id.to_string()],
+        )
+        .unwrap();
     assert!(
         direct_client
             .execute(
@@ -1633,6 +1649,61 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
             )
             .is_err()
     );
+    assert_eq!(
+        read_only_client
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0,
+        "RLS must hide tenant rows when no tenant context is set"
+    );
+
+    let mut rls_client = connect_client();
+    rls_client
+        .batch_execute("SET ROLE praetore_observe_test")
+        .unwrap();
+    let mut rls_transaction = rls_client.transaction().unwrap();
+    rls_transaction
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&key.tenant_id.to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        rls_transaction
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    rls_transaction
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&Uuid::from_u128(2).to_string()],
+        )
+        .unwrap();
+    assert_eq!(
+        rls_transaction
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap()
+            .get::<_, i64>(0),
+        0,
+        "RLS must hide another tenant even when the query asks for its exact key"
+    );
+    rls_transaction.commit().unwrap();
+
     assert_eq!(
         connect_journal().get(key).unwrap().unwrap().execution,
         ExecutionStatus::Confirmed

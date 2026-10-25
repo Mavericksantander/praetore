@@ -19,6 +19,7 @@ struct FuzzReplayGuard;
 impl ReplayGuard for FuzzReplayGuard {
     fn claim_once(
         &self,
+        _tenant_id: Uuid,
         _agent_id: Uuid,
         _request_id: Uuid,
     ) -> std::result::Result<(), ReplayGuardError> {

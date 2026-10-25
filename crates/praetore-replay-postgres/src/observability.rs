@@ -5,6 +5,8 @@ use std::sync::Mutex;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::set_tenant_context;
+
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionFilters {
     pub tenant_id: Option<Uuid>,
@@ -70,6 +72,8 @@ impl PostgresObservabilityReader {
         transaction
             .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .map_err(|_| JournalError::Unavailable)?;
+        let tenant_id = filters.tenant_id.ok_or(JournalError::InvalidRecord)?;
+        set_tenant_context(&mut transaction, tenant_id).map_err(|_| JournalError::Unavailable)?;
         let decision = filters.decision.map(crate::execution::authorization_as_db);
         let execution = filters.execution.map(crate::execution::execution_as_db);
         let total: i64 = transaction
@@ -141,6 +145,11 @@ impl PostgresObservabilityReader {
         transaction
             .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .map_err(|_| JournalError::Unavailable)?;
+        if key.tenant_id.is_nil() {
+            return Err(JournalError::InvalidRecord);
+        }
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
                 "SELECT tenant_id, agent_id, request_id, request_digest, action_digest, \
@@ -189,7 +198,11 @@ impl PostgresObservabilityReader {
 }
 
 fn validate_filters(filters: &ExecutionFilters) -> Result<(), JournalError> {
-    if filters.limit == 0 || filters.limit > 100 || filters.offset > 10_000 {
+    if filters.tenant_id.is_none_or(|tenant_id| tenant_id.is_nil())
+        || filters.limit == 0
+        || filters.limit > 100
+        || filters.offset > 10_000
+    {
         return Err(JournalError::InvalidRecord);
     }
     Ok(())

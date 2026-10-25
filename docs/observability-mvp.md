@@ -11,9 +11,11 @@ The service binds only to a loopback address. `PRAETORE_OBSERVE_BIND` defaults
 to `127.0.0.1:8088`; startup rejects non-loopback addresses. Missing or
 malformed required configuration aborts startup:
 
-- `PRAETORE_OBSERVE_BEARER_TOKEN`: exactly 32 cryptographically random bytes
-  encoded as 64 hexadecimal characters. Supply it through a secret manager;
-  do not put it in shell history, source control, URLs, or logs.
+- `PRAETORE_OBSERVE_TENANT_TOKENS_FILE`: JSON file with one SHA-256 digest of
+  a 32-byte cryptographically random bearer token per tenant. Provision the
+  raw tokens out of band through a secret manager and store only their SHA-256
+  digests in this file. Protect the mounted file and rotate tokens when
+  operators leave or credentials are suspected to be compromised.
 - `PRAETORE_OBSERVE_DATABASE_URL`: connection information for a dedicated,
   SELECT-only PostgreSQL role.
 - `PRAETORE_OBSERVE_ATTESTER_PUBLIC_KEY_HEX`: optional externally pinned
@@ -21,12 +23,16 @@ malformed required configuration aborts startup:
   `not_configured`, never `verified`.
 
 The API requires `Authorization: Bearer <64-hex-character-token>` on every
-route. The token is compared in constant time after decoding. The embedded UI
-shell and static assets contain no journal data and can be loaded without the
-token; the UI holds the supplied token in memory only and sends it only in the
-authorization header. No cookie, URL parameter, or local storage token flow
-exists. Responses are `no-store` and include restrictive content-security and
-MIME-sniffing headers.
+route. The token is SHA-256 hashed and matched in constant time against the
+configured digests. Each token maps to exactly one non-nil tenant UUID. List
+queries are always constrained to that authenticated tenant, and specifying a
+different tenant is rejected. Detail routes for another tenant return the
+same not-found response as an absent operation. Tenant ID in a URL or query is
+never an identity claim. The embedded UI shell and static assets contain no
+journal data and can be loaded without a token; the UI holds the supplied
+token in memory only and sends it only in the authorization header. No cookie,
+URL parameter, or local storage token flow exists. Responses are `no-store`
+and include restrictive content-security and MIME-sniffing headers.
 
 Do not expose this listener to a network. Remote operator access requires a
 separately reviewed authenticated TLS proxy and network boundary; forwarding
@@ -35,7 +41,8 @@ deployment pattern. The current PostgreSQL client uses `NoTls`; use a local
 socket or a trusted protected database network/tunnel. The API never connects
 to PostgreSQL from the browser.
 
-Apply migrations in order through `0004_execution_journal_events.sql`.
+Apply migrations in numeric order through
+`0008_tenant_row_level_security.sql`.
 Grant the service role schema usage and SELECT only on the journal identity,
 digest, status, evidence, and timestamp columns, plus event identity/status/
 timestamp/sequence columns. Do not grant it access to `output_json`; output availability
@@ -61,8 +68,37 @@ GRANT SELECT (
 ) ON praetore.execution_journal_events TO praetore_observe;
 ```
 
+Tenant token file example:
+
+```json
+{
+  "schema_version": 1,
+  "tenants": [
+    {
+      "tenant_id": "replace-with-tenant-uuid",
+      "bearer_token_sha256": "sha256-of-the-32-byte-token-in-lowercase-hex"
+    }
+  ]
+}
+```
+
 Run with `cargo run -p praetore-observe` after provisioning the required
-environment variables from a secret manager and applying migrations.
+environment variables from a secret manager and applying migrations. Migration
+0008 enables RLS on all tenant-keyed journal tables. Each observer query sets
+`praetore.tenant_id` transaction-locally from the already authenticated token;
+unset context returns no journal rows. The observer connection must use a
+dedicated read-only role that is not a table owner, superuser, or
+`BYPASSRLS` role. Migration 0008 uses `FORCE ROW LEVEL SECURITY`, so table
+owners are subject to the policy too; PostgreSQL superusers and roles with
+`BYPASSRLS` still bypass RLS and must not be used by the observer.
+
+This RLS context prevents unscoped or incorrectly filtered SQL in the observer
+from returning cross-tenant rows. PostgreSQL custom settings can be changed by
+the connected role, so RLS with this shared connection is not protection
+against compromise of the observer process or its database credential. Keep
+that credential private to the service, keep operator tokens tenant-scoped,
+and use separate database principals or a trusted database-side identity
+mapping if the threat model requires RLS to resist a compromised application.
 
 ## API v1
 
@@ -71,7 +107,7 @@ are logged only as a bounded error category, not query values or credentials.
 
 | Method and route | Contract |
 |---|---|
-| `GET /api/v1/operations` | List; optional `agent_id`, `decision`, `execution_state`, `from`, `to`, `limit`, `offset`. |
+| `GET /api/v1/operations` | Tenant-scoped list; optional `tenant_id` (must match the authenticated tenant), `agent_id`, `decision`, `execution_state`, `from`, `to`, `limit`, `offset`. |
 | `GET /api/v1/operations/{tenant_id}/{agent_id}/{request_id}` | Detail for a tenant-scoped `(tenant UUID, agent UUID, request UUID)` key. |
 | `GET /api/v1/health` | Live database `SELECT 1` probe; adapter and error telemetry are explicitly reported as unavailable. |
 | `GET /api/v1/assurance` | Static, documented guarantees and limitations. |

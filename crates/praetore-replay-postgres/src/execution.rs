@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+use crate::set_tenant_context;
+
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_REQUEST_V1\0";
 
 /// PostgreSQL-backed durable gateway execution journal.
@@ -75,6 +77,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
             .batch_execute("SET LOCAL synchronous_commit = on")
             .map_err(|_| AuthorizationCommitError::Unavailable)?;
 
+        set_tenant_context(&mut transaction, Uuid::nil())
+            .map_err(|_| AuthorizationCommitError::Unavailable)?;
         let legacy_claim = transaction
             .query_opt(
                 "SELECT 1 FROM praetore.replay_claims \
@@ -86,6 +90,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
             return Err(AuthorizationCommitError::OrphanedReplayClaim);
         }
 
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| AuthorizationCommitError::Unavailable)?;
         let claim_inserted = transaction
             .execute(
                 "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
@@ -217,6 +223,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
             .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| JournalError::Unavailable)?;
         let changed = transaction
             .execute(
                 "UPDATE praetore.execution_journal \
@@ -254,6 +262,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
@@ -357,6 +367,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
             .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
                 "SELECT execution_status, output_json, evidence_json, authorization_status \
@@ -443,6 +455,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
             .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
                 "SELECT execution_status, output_json, evidence_json, authorization_status \
@@ -504,7 +518,12 @@ impl ExecutionJournal for PostgresExecutionJournal {
 
     fn get(&self, key: ExecutionKey) -> Result<Option<ExecutionRecord>, JournalError> {
         let mut client = self.client.lock().map_err(|_| JournalError::Unavailable)?;
-        let row = client
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| JournalError::Unavailable)?;
+        let row = transaction
             .query_opt(
                 "SELECT request_digest, action_digest, authorization_status, execution_status, \
                  evidence_json, output_json, \
@@ -522,7 +541,11 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?;
-        row.map(|row| parse_record(key, row)).transpose()
+        let record = row.map(|row| parse_record(key, row)).transpose()?;
+        transaction
+            .commit()
+            .map_err(|_| JournalError::Unavailable)?;
+        Ok(record)
     }
 
     fn mark_not_dispatched_attested(
@@ -538,6 +561,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         transaction
             .batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
@@ -615,7 +640,12 @@ fn verify_authorization_pair(
     trusted_attester: &VerifiedPublicKey,
     key: ExecutionKey,
 ) -> Result<(), AuthorizationCommitError> {
-    let replay_claim = client
+    let mut transaction = client
+        .transaction()
+        .map_err(|_| AuthorizationCommitError::Unavailable)?;
+    set_tenant_context(&mut transaction, key.tenant_id)
+        .map_err(|_| AuthorizationCommitError::Unavailable)?;
+    let replay_claim = transaction
         .query_opt(
             "SELECT 1 FROM praetore.replay_claims \
              WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
@@ -625,7 +655,7 @@ fn verify_authorization_pair(
     if replay_claim.is_none() {
         return Err(AuthorizationCommitError::NotFound);
     }
-    let row = client
+    let row = transaction
         .query_opt(
             "SELECT request_digest, action_digest, authorization_status, \
              execution_status, evidence_json, output_json, \
@@ -665,6 +695,9 @@ fn verify_authorization_pair(
     {
         return Err(AuthorizationCommitError::InvalidRecord);
     }
+    transaction
+        .commit()
+        .map_err(|_| AuthorizationCommitError::Unavailable)?;
     Ok(())
 }
 
