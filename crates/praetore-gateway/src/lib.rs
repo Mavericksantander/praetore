@@ -535,7 +535,7 @@ impl Gateway {
         output: Option<&Value>,
     ) -> Result<ExecutionAttestation, GatewayError> {
         Ok(ExecutionAttestation::create(
-            &evidence,
+            evidence,
             authorization,
             execution,
             output,
