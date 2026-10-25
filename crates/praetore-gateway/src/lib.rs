@@ -43,7 +43,7 @@
 //! ```
 
 use praetore_core::{
-    Action, AtomicAuthorizationCommit, AtomicEvaluationError, AuthorizationCommitError,
+    Action, AtomicAuthorizationCommit, AtomicEvaluationError, Authority, AuthorizationCommitError,
     AuthorizationRequest, DecisionOutcome, EvaluationMode, Evidence, PraetoreError,
     canonical::canonicalize_json, engine::AuthorizationEngine,
 };
@@ -76,10 +76,18 @@ pub fn action_digest(action: &Action) -> Result<String, PraetoreError> {
     Ok(hex::encode(hash.finalize()))
 }
 
+/// Returns the tenant UUID only when the authority contains exactly one
+/// well-formed `tenant_id` constraint.
+pub fn authority_tenant_id(authority: &Authority) -> Option<Uuid> {
+    authority.tenant_id()
+}
+
 /// A stable key for one signed request and its single permitted execution
-/// attempt. The request ID is signed as part of the authorization intent.
+/// attempt within a tenant. The tenant comes from the issuer-signed authority;
+/// the request ID is signed as part of the authorization intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ExecutionKey {
+    pub tenant_id: Uuid,
     pub agent_id: Uuid,
     pub request_id: Uuid,
 }
@@ -110,6 +118,7 @@ pub enum ExecutionStatus {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalChallenge {
     pub schema_version: u8,
+    pub tenant_id: Uuid,
     pub agent_id: Uuid,
     pub request_id: Uuid,
     pub evidence_id: Uuid,
@@ -141,6 +150,8 @@ impl ApprovalChallenge {
             .map_err(|_| ApprovalError::InvalidChallenge)?;
         Ok(Self {
             schema_version: 1,
+            tenant_id: authority_tenant_id(&evidence.authority)
+                .ok_or(ApprovalError::InvalidChallenge)?,
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
             evidence_id: evidence.evidence_id,
@@ -296,6 +307,8 @@ pub trait ExecutionAttestationSigner: Send + Sync {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionAttestation {
     pub schema_version: u8,
+    #[serde(default)]
+    pub tenant_id: Option<Uuid>,
     pub key_id: String,
     pub evidence_id: Uuid,
     pub request_id: Uuid,
@@ -313,6 +326,8 @@ pub struct ExecutionAttestation {
 #[derive(Serialize)]
 struct ExecutionAttestationPayload<'a> {
     schema_version: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant_id: Option<Uuid>,
     key_id: &'a str,
     evidence_id: Uuid,
     request_id: Uuid,
@@ -352,11 +367,14 @@ impl ExecutionAttestation {
             .policy_digest
             .as_deref()
             .ok_or(ExecutionAttestationError::InvalidPayload)?;
+        let tenant_id = authority_tenant_id(&evidence.authority)
+            .ok_or(ExecutionAttestationError::InvalidPayload)?;
         let action_digest = action_digest(&evidence.action)
             .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
         let output_digest = output.map(output_digest).transpose()?;
         let payload = ExecutionAttestationPayload {
-            schema_version: 1,
+            schema_version: 2,
+            tenant_id: Some(tenant_id),
             key_id,
             evidence_id: evidence.evidence_id,
             request_id: evidence.request_id,
@@ -381,7 +399,8 @@ impl ExecutionAttestation {
         }
 
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
+            tenant_id: Some(tenant_id),
             key_id: key_id.to_owned(),
             evidence_id: evidence.evidence_id,
             request_id: evidence.request_id,
@@ -413,6 +432,7 @@ impl ExecutionAttestation {
 
         let payload = ExecutionAttestationPayload {
             schema_version: self.schema_version,
+            tenant_id: self.tenant_id,
             key_id: &self.key_id,
             evidence_id: self.evidence_id,
             request_id: self.request_id,
@@ -440,7 +460,11 @@ impl ExecutionAttestation {
         execution: ExecutionStatus,
         output: Option<&Value>,
     ) -> Result<(), ExecutionAttestationError> {
-        if self.schema_version != 1
+        if !matches!(
+            (self.schema_version, self.tenant_id),
+            (1, None) | (2, Some(_))
+        ) || self.schema_version == 2
+            && self.tenant_id != authority_tenant_id(&evidence.authority)
             || self.evidence_id != evidence.evidence_id
             || self.request_id != evidence.request_id
             || self.agent_id != *evidence.agent.id.as_uuid()
@@ -626,12 +650,15 @@ pub trait ExecutionJournal: AtomicAuthorizationCommit + Send + Sync {
     ) -> Result<(), JournalError>;
 }
 
-/// An adapter receives the exact normalized action evaluated by the engine.
-/// It must not re-parse a caller payload or silently broaden the operation.
+/// An adapter receives the verified issuer-signed authority and exact
+/// normalized action evaluated by the engine. Implementations must derive
+/// tenant routing only from that authority, never from agent-controlled
+/// action parameters or context. They must not silently broaden the operation.
 pub trait ActionDispatcher: Send + Sync {
     fn dispatch(
         &self,
         key: ExecutionKey,
+        authority: &Authority,
         action: &Action,
         action_digest: &str,
     ) -> Result<DispatchReport, DispatchError>;
@@ -642,6 +669,7 @@ pub trait ActionDispatcher: Send + Sync {
     fn reconcile(
         &self,
         _key: ExecutionKey,
+        _authority: &Authority,
         _action: &Action,
         _action_digest: &str,
     ) -> ReconciliationReport {
@@ -671,6 +699,8 @@ pub enum GatewayError {
     Authorization(#[from] PraetoreError),
     #[error("authorization engine returned invalid HighAssurance evidence")]
     InvalidEvidence,
+    #[error("authorization authority has no valid tenant identity")]
+    TenantIdentityInvalid,
     #[error("execution journal failed: {0}")]
     Journal(#[from] JournalError),
     #[error("tool outcome may have occurred but could not be journaled for {0:?}")]
@@ -786,6 +816,7 @@ impl Gateway {
             .as_ref()
             .ok_or(ApprovalError::NotConfigured)?;
         let key = ExecutionKey {
+            tenant_id: decision.challenge.tenant_id,
             agent_id: decision.challenge.agent_id,
             request_id: decision.challenge.request_id,
         };
@@ -819,15 +850,16 @@ impl Gateway {
         }
 
         record.execution = ExecutionStatus::Dispatched;
-        let (execution, output) =
-            match self
-                .dispatcher
-                .dispatch(key, &record.evidence.action, &record.action_digest)
-            {
-                Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
-                Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
-                Err(_) => (ExecutionStatus::OutcomeUnknown, None),
-            };
+        let (execution, output) = match self.dispatcher.dispatch(
+            key,
+            &record.evidence.authority,
+            &record.evidence.action,
+            &record.action_digest,
+        ) {
+            Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
+            Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
+            Err(_) => (ExecutionStatus::OutcomeUnknown, None),
+        };
         let execution_attestation = self.create_execution_attestation(
             &record.evidence,
             record.authorization,
@@ -955,6 +987,8 @@ impl Gateway {
         }
 
         let key = ExecutionKey {
+            tenant_id: authority_tenant_id(&evidence.authority)
+                .ok_or(GatewayError::TenantIdentityInvalid)?,
             agent_id: *evidence.agent.id.as_uuid(),
             request_id: evidence.request_id,
         };
@@ -981,15 +1015,16 @@ impl Gateway {
 
         self.journal.mark_dispatched(key)?;
         let action_digest = action_digest(&evidence.action)?;
-        let (execution, output) =
-            match self
-                .dispatcher
-                .dispatch(key, &evidence.action, &action_digest)
-            {
-                Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
-                Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
-                Err(_) => (ExecutionStatus::OutcomeUnknown, None),
-            };
+        let (execution, output) = match self.dispatcher.dispatch(
+            key,
+            &evidence.authority,
+            &evidence.action,
+            &action_digest,
+        ) {
+            Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
+            Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
+            Err(_) => (ExecutionStatus::OutcomeUnknown, None),
+        };
 
         let execution_attestation = self.create_execution_attestation(
             &evidence,
@@ -1045,10 +1080,12 @@ impl Gateway {
                 ));
             }
             ExecutionStatus::Dispatched | ExecutionStatus::OutcomeUnknown => {
-                match self
-                    .dispatcher
-                    .reconcile(key, &record.evidence.action, &record.action_digest)
-                {
+                match self.dispatcher.reconcile(
+                    key,
+                    &record.evidence.authority,
+                    &record.evidence.action,
+                    &record.action_digest,
+                ) {
                     ReconciliationReport::Applied(output) => {
                         return self.record_terminal_attested(
                             &mut record,

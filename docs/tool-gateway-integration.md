@@ -288,6 +288,107 @@ Freshness is checked at evaluation time, not continuously through dispatch.
 Keep the decision-to-dispatch interval short, enforce a gateway-side deadline,
 and re-evaluate if the deadline or relevant state changes. This narrows but
 does not eliminate TOCTOU risk.
+New execution attestations use schema version 2 and sign the tenant UUID
+alongside the action and execution observation. Version 1 attestations remain
+verifiable as historical records but do not carry a tenant claim.
+
+## Fixed-route HTTP tool adapter
+
+`praetore-gateway-service` now provides `HttpActionDispatcher` for a bounded
+HTTP tool integration. The dispatcher is constructed with a static route
+catalog and forwards only `Action.parameters` as JSON `POST` bodies. The
+agent cannot supply a URL, HTTP method, authorization header, or redirect.
+Routes are matched exactly by:
+
+* `tenant_id`, read from exactly one `tenant_id` constraint in the
+  issuer-signed `Authority` already verified by HighAssurance;
+* `action_type`;
+* `target`; and
+* the required action capability.
+
+The configured tenant UUID is not read from `AuthorizationRequest.context`,
+parameters, or a caller-provided header. An issuer must assign tenant
+constraints only after binding the agent to that tenant. The HTTP adapter
+rejects requests without exactly one tenant constraint or without an exact
+route match. The same verified tenant UUID is part of the gateway execution
+key, PostgreSQL replay claim, execution journal, human approval, and
+observability lookup. This prevents a request ID collision in one tenant from
+blocking or resolving another tenant's record.
+
+Route configuration is versioned JSON loaded at process startup. For example:
+
+```json
+{
+  "schema_version": 1,
+  "egress_proxy": "http://egress-proxy.praetore-egress.svc.cluster.local:3128",
+  "routes": [
+    {
+      "tenant_id": "4c7a63c0-b326-4d61-9178-02824d79a571",
+      "action_type": "orders:create",
+      "target": "orders-api",
+      "capability": "orders:write",
+      "endpoint": "https://orders.internal/v1/orders",
+      "bearer_token_env": "PRAETORE_TENANT_ACME_ORDERS_TOKEN"
+    }
+  ]
+}
+```
+
+Only fixed HTTPS endpoints are accepted. Plain HTTP is allowed only for
+loopback tests. Redirects are disabled, route configuration rejects duplicate
+JSON keys and duplicate tenant/action/target tuples, and tool parameters and
+responses are bounded to 64 KiB. Configured bearer credentials are read from
+the named process environment variable and never accepted from the agent.
+Requests have a 10-second timeout and carry a tenant-scoped
+`Idempotency-Key` based on the verified tenant, agent, and request IDs.
+An HTTP success response is recorded as `Executed`, not `Confirmed`; an
+adapter timeout or non-success response is ambiguous and is never retried
+automatically. This adapter cannot query downstream operation status, so an
+ambiguous result remains `OutcomeUnknown` until an operator or an
+adapter-specific reconciliation integration proves the outcome.
+
+The `praetore-gateway-demo` binary can select this adapter with
+`PRAETORE_GATEWAY_ADAPTER=http` and
+`PRAETORE_GATEWAY_TOOL_ROUTES_FILE=<path>`. For external tools, set an
+explicit egress proxy in the route configuration and make it enforce the
+destination hostname allowlist. In a separately networked pod, the example
+listener can bind with `PRAETORE_GATEWAY_LISTEN_ADDR=0.0.0.0:8080`; this is
+plain HTTP and is only safe behind private network policy and authenticated
+TLS termination.
+Without that variable the listener remains loopback-only.
+
+The binary remains a **local development demo**, with local freshness and
+loopback-only PostgreSQL. These settings do not make it suitable for SaaS
+production. The journal/replay identity is now tenant-scoped using the UUID
+from the verified authority, but the deployment still needs tenant-bound
+identity issuance, tenant-isolated credentials, authenticated transport,
+secret-manager/KMS integration, rate limits and operational controls. In
+particular, do not place all tenants' production API credentials in one shared
+process environment. This is application-level key isolation, not PostgreSQL
+row-level security or tenant authentication for administrative endpoints; the
+current database role and observer token are still service-wide. Migration
+`0007_tenant_scoped_execution.sql` maps legacy records only when their stored
+evidence contains a UUID tenant claim. Unscoped claims and records without a
+valid tenant remain under the reserved nil tenant, are not addressable as
+tenant executions, and continue to block reuse of those agent/request IDs.
+Reconcile such records before upgrading; do not assign them to a tenant by
+guesswork.
+
+The adapter provides a code-level dispatch boundary, not a network guarantee.
+Production infrastructure must ensure protected tool credentials are absent
+from agent workloads and deny agent egress to protected APIs, allowing access
+only to the gateway. The repository includes a reference
+[Kubernetes NetworkPolicy set](../deploy/kubernetes/mandatory-enforcement.yaml)
+for separately networked agent, gateway, data, and tool workloads. Adapt its
+selectors and ports to the cluster, use a CNI that enforces NetworkPolicy, and
+ensure no additional policy re-allows direct agent egress. Kubernetes
+NetworkPolicies are additive; this example does not override another policy
+that allows broader egress. The gateway pod must be separate from agent pods
+because pod-level network policy cannot isolate containers within one pod.
+Also prohibit `hostNetwork` for agent workloads and verify CNI behavior against
+node, service, and DNS paths. External APIs should be reached through the
+configured egress proxy and a cloud/CNI policy that blocks direct gateway
+egress. Without those controls an agent may bypass the gateway.
 
 ## Human approvals
 
@@ -300,16 +401,16 @@ The HTTP flow is:
 
 1. `POST /v1/execute` returns `202 Accepted` and a receipt with
    `authorization = requires_approval`; the action remains `NotDispatched`.
-2. `GET /v1/approvals/{agent_id}/{request_id}` returns the persisted
+2. `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}` returns the persisted
    `ApprovalChallenge` derived from the pending execution's stored evidence.
-   Its fields bind the agent and request IDs, evidence ID/context hash, exact
-   action digest, policy digest, and expiry.
+   Its fields bind the tenant, agent and request IDs, evidence ID/context hash,
+   exact action digest, policy digest, and expiry.
 3. An external approver system constructs a `HumanApprovalDecision` containing
    the challenge, a unique approval ID, the configured approver key ID, an
    `approve` or `reject` outcome, and an Ed25519 signature. The signature
    covers the canonical decision payload under the
    `PRAETORE_HUMAN_APPROVAL_V1\0` domain separator.
-4. `POST /v1/approvals/{agent_id}/{request_id}` submits that signed decision.
+4. `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}` submits that signed decision.
    The gateway checks the fixed approver key, signature, exact pending
    challenge, path IDs, and expiration. PostgreSQL rechecks the pending
    execution and expiry while holding the journal row lock.

@@ -185,15 +185,21 @@ fn json_output(output: &Output) -> Value {
 }
 
 #[derive(Default)]
-struct TestReplayGuard(Mutex<HashSet<(Uuid, Uuid)>>);
+struct TestReplayGuard(Mutex<HashSet<(Uuid, Uuid, Uuid)>>);
 
 impl ReplayGuard for TestReplayGuard {
     fn claim_once(
         &self,
+        tenant_id: Uuid,
         agent_id: Uuid,
         request_id: Uuid,
     ) -> std::result::Result<(), ReplayGuardError> {
-        if self.0.lock().unwrap().insert((agent_id, request_id)) {
+        if self
+            .0
+            .lock()
+            .unwrap()
+            .insert((tenant_id, agent_id, request_id))
+        {
             Ok(())
         } else {
             Err(ReplayGuardError::AlreadyClaimed)

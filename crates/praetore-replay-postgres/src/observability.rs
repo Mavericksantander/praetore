@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionFilters {
+    pub tenant_id: Option<Uuid>,
     pub agent_id: Option<Uuid>,
     pub decision: Option<AuthorizationStatus>,
     pub execution: Option<ExecutionStatus>,
@@ -74,12 +75,14 @@ impl PostgresObservabilityReader {
         let total: i64 = transaction
             .query_one(
                 "SELECT COUNT(*) FROM praetore.execution_journal \
-                 WHERE ($1::uuid IS NULL OR agent_id = $1) \
-                   AND ($2::text IS NULL OR authorization_status = $2) \
-                   AND ($3::text IS NULL OR execution_status = $3) \
-                   AND ($4::timestamptz IS NULL OR created_at >= $4) \
-                   AND ($5::timestamptz IS NULL OR created_at <= $5)",
+                 WHERE ($1::uuid IS NULL OR tenant_id = $1) \
+                   AND ($2::uuid IS NULL OR agent_id = $2) \
+                   AND ($3::text IS NULL OR authorization_status = $3) \
+                   AND ($4::text IS NULL OR execution_status = $4) \
+                   AND ($5::timestamptz IS NULL OR created_at >= $5) \
+                   AND ($6::timestamptz IS NULL OR created_at <= $6)",
                 &[
+                    &filters.tenant_id,
                     &filters.agent_id,
                     &decision,
                     &execution,
@@ -91,21 +94,23 @@ impl PostgresObservabilityReader {
             .get(0);
         let rows = transaction
             .query(
-                "SELECT agent_id, request_id, request_digest, action_digest, \
+                "SELECT tenant_id, agent_id, request_id, request_digest, action_digest, \
                         authorization_status, execution_status, evidence_json, \
                         to_char(created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
                         to_char(updated_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
                  FROM praetore.execution_journal \
-                 WHERE ($1::uuid IS NULL OR agent_id = $1) \
-                   AND ($2::text IS NULL OR authorization_status = $2) \
-                   AND ($3::text IS NULL OR execution_status = $3) \
-                   AND ($4::timestamptz IS NULL OR created_at >= $4) \
-                   AND ($5::timestamptz IS NULL OR created_at <= $5) \
+                 WHERE ($1::uuid IS NULL OR tenant_id = $1) \
+                   AND ($2::uuid IS NULL OR agent_id = $2) \
+                   AND ($3::text IS NULL OR authorization_status = $3) \
+                   AND ($4::text IS NULL OR execution_status = $4) \
+                   AND ($5::timestamptz IS NULL OR created_at >= $5) \
+                   AND ($6::timestamptz IS NULL OR created_at <= $6) \
                  ORDER BY created_at DESC, agent_id, request_id \
-                 LIMIT $6 OFFSET $7",
+                 LIMIT $7 OFFSET $8",
                 &[
+                    &filters.tenant_id,
                     &filters.agent_id,
                     &decision,
                     &execution,
@@ -138,15 +143,15 @@ impl PostgresObservabilityReader {
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT agent_id, request_id, request_digest, action_digest, \
+                "SELECT tenant_id, agent_id, request_id, request_digest, action_digest, \
                         authorization_status, execution_status, evidence_json, \
                         to_char(created_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
                         to_char(updated_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
                  FROM praetore.execution_journal \
-                 WHERE agent_id = $1 AND request_id = $2",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?;
         let Some(row) = row else {
@@ -162,8 +167,8 @@ impl PostgresObservabilityReader {
                         to_char(occurred_at AT TIME ZONE 'UTC', \
                             'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
                  FROM praetore.execution_journal_events \
-                 WHERE agent_id = $1 AND request_id = $2 ORDER BY event_id",
-                &[&key.agent_id, &key.request_id],
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 ORDER BY event_id",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?
             .iter()
@@ -192,17 +197,18 @@ fn validate_filters(filters: &ExecutionFilters) -> Result<(), JournalError> {
 
 fn parse_observed(row: Row) -> Result<ObservedExecution, JournalError> {
     let key = ExecutionKey {
-        agent_id: row.get(0),
-        request_id: row.get(1),
+        tenant_id: row.get(0),
+        agent_id: row.get(1),
+        request_id: row.get(2),
     };
-    let request_digest: String = row.get(2);
-    let action_digest: String = row.get(3);
-    let authorization = crate::execution::parse_authorization(&row.get::<_, String>(4))?;
-    let execution = crate::execution::parse_execution(&row.get::<_, String>(5))?;
-    let evidence_json: String = row.get(6);
+    let request_digest: String = row.get(3);
+    let action_digest: String = row.get(4);
+    let authorization = crate::execution::parse_authorization(&row.get::<_, String>(5))?;
+    let execution = crate::execution::parse_execution(&row.get::<_, String>(6))?;
+    let evidence_json: String = row.get(7);
     let evidence = Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
-    let created_at: String = row.get(7);
-    let updated_at: String = row.get(8);
+    let created_at: String = row.get(8);
+    let updated_at: String = row.get(9);
     crate::execution::validate_evidence(key, &evidence, authorization)?;
     let (expected_request_digest, expected_action_digest) =
         crate::execution::execution_digests(&evidence)?;

@@ -1,5 +1,5 @@
 use crate::{ActionDispatcher, DispatchError, DispatchReport, ExecutionKey, ReconciliationReport};
-use praetore_core::Action;
+use praetore_core::{Action, Authority};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -34,6 +34,7 @@ impl ActionDispatcher for LocalDemoDispatcher {
     fn dispatch(
         &self,
         key: ExecutionKey,
+        _authority: &Authority,
         action: &Action,
         action_digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
@@ -78,6 +79,7 @@ impl ActionDispatcher for LocalDemoDispatcher {
     fn reconcile(
         &self,
         key: ExecutionKey,
+        _authority: &Authority,
         _action: &Action,
         action_digest: &str,
     ) -> ReconciliationReport {
@@ -96,6 +98,7 @@ impl ActionDispatcher for LocalDemoDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use praetore_core::AgentId;
     use serde_json::json;
     use uuid::Uuid;
 
@@ -111,9 +114,15 @@ mod tests {
 
     fn key() -> ExecutionKey {
         ExecutionKey {
+            tenant_id: Uuid::from_u128(3),
             agent_id: Uuid::from_u128(1),
             request_id: Uuid::from_u128(2),
         }
+    }
+
+    fn authority() -> Authority {
+        Authority::new(AgentId::new(), "local-demo-test", vec![])
+            .with_constraint("tenant_id", Uuid::from_u128(3).to_string())
     }
 
     #[test]
@@ -124,16 +133,18 @@ mod tests {
         let digest = crate::action_digest(&action).unwrap();
 
         assert_eq!(
-            dispatcher.dispatch(key, &action, &digest).unwrap(),
+            dispatcher
+                .dispatch(key, &authority(), &action, &digest)
+                .unwrap(),
             DispatchReport::Confirmed(json!({"key": "mode", "value": "safe"}))
         );
         assert_eq!(dispatcher.value("mode").as_deref(), Some("safe"));
         assert_eq!(
-            dispatcher.reconcile(key, &action, &digest),
+            dispatcher.reconcile(key, &authority(), &action, &digest),
             ReconciliationReport::Applied(json!({"key": "mode", "value": "safe"}))
         );
         assert_eq!(
-            dispatcher.reconcile(key, &action, "different-digest"),
+            dispatcher.reconcile(key, &authority(), &action, "different-digest"),
             ReconciliationReport::Unknown
         );
     }
@@ -145,11 +156,15 @@ mod tests {
         let key = key();
         let digest = crate::action_digest(&action).unwrap();
 
-        let first = dispatcher.dispatch(key, &action, &digest).unwrap();
-        let second = dispatcher.dispatch(key, &action, &digest).unwrap();
+        let first = dispatcher
+            .dispatch(key, &authority(), &action, &digest)
+            .unwrap();
+        let second = dispatcher
+            .dispatch(key, &authority(), &action, &digest)
+            .unwrap();
         assert_eq!(first, second);
         assert_eq!(
-            dispatcher.dispatch(key, &action, "different-digest"),
+            dispatcher.dispatch(key, &authority(), &action, "different-digest"),
             Err(DispatchError)
         );
         assert_eq!(dispatcher.value("mode").as_deref(), Some("safe"));
@@ -167,7 +182,12 @@ mod tests {
         .with_capability("demo:write");
 
         assert_eq!(
-            dispatcher.dispatch(key(), &invalid, &crate::action_digest(&invalid).unwrap()),
+            dispatcher.dispatch(
+                key(),
+                &authority(),
+                &invalid,
+                &crate::action_digest(&invalid).unwrap(),
+            ),
             Err(DispatchError)
         );
         assert_eq!(dispatcher.value("mode"), None);

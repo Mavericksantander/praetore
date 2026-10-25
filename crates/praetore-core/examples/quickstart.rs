@@ -14,7 +14,7 @@ use praetore_core::{
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-struct LocalReplayGuard(Mutex<HashSet<(Uuid, Uuid)>>);
+struct LocalReplayGuard(Mutex<HashSet<(Uuid, Uuid, Uuid)>>);
 
 impl Default for LocalReplayGuard {
     fn default() -> Self {
@@ -25,11 +25,12 @@ impl Default for LocalReplayGuard {
 impl ReplayGuard for LocalReplayGuard {
     fn claim_once(
         &self,
+        tenant_id: Uuid,
         agent_id: Uuid,
         request_id: Uuid,
     ) -> std::result::Result<(), ReplayGuardError> {
         let mut claims = self.0.lock().map_err(|_| ReplayGuardError::Unavailable)?;
-        if claims.insert((agent_id, request_id)) {
+        if claims.insert((tenant_id, agent_id, request_id)) {
             Ok(())
         } else {
             Err(ReplayGuardError::AlreadyClaimed)

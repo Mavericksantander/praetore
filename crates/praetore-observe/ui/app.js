@@ -46,7 +46,7 @@
     if (page.operations.length === 0) {
       const row = document.createElement("tr");
       const cell = document.createElement("td");
-      cell.colSpan = 6;
+      cell.colSpan = 7;
       cell.className = "empty";
       cell.textContent = "No operations match these filters.";
       row.append(cell);
@@ -56,12 +56,13 @@
       const row = document.createElement("tr");
       row.tabIndex = 0;
       row.className = "operation-row";
-      row.addEventListener("click", () => loadDetail(operation.agent_id, operation.request_id));
+      row.addEventListener("click", () => loadDetail(operation.tenant_id, operation.agent_id, operation.request_id));
       row.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") loadDetail(operation.agent_id, operation.request_id);
+        if (event.key === "Enter") loadDetail(operation.tenant_id, operation.agent_id, operation.request_id);
       });
       const values = [
         operation.created_at,
+        operation.tenant_id,
         operation.agent_id,
         `${operation.action_type}${operation.capability ? ` · ${operation.capability}` : ""}`,
         operation.decision,
@@ -111,9 +112,9 @@
     return element;
   }
 
-  async function loadDetail(agent, request) {
+  async function loadDetail(tenant, agent, request) {
     try {
-      const result = await api(`/api/v1/operations/${encodeURIComponent(agent)}/${encodeURIComponent(request)}`);
+      const result = await api(`/api/v1/operations/${encodeURIComponent(tenant)}/${encodeURIComponent(agent)}/${encodeURIComponent(request)}`);
       const operation = result.operation;
       detail.replaceChildren();
       detail.classList.remove("hidden");
@@ -122,6 +123,7 @@
       const grid = document.createElement("div");
       grid.className = "detail-grid";
       [
+        ["Tenant", operation.tenant_id],
         ["Agent", operation.agent_id],
         ["Request", operation.request_id],
         ["Action", operation.action_type],
