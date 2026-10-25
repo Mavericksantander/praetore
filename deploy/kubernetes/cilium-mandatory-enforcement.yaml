@@ -1,0 +1,151 @@
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-agent-egress
+  namespace: praetore-agents
+spec:
+  endpointSelector:
+    matchLabels:
+      praetore.io/role: agent
+  ingress: []
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-gateway
+            app.kubernetes.io/name: praetore-gateway
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchPattern: "praetore-gateway.praetore-gateway.svc.cluster.local."
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-gateway-ingress-egress
+  namespace: praetore-gateway
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: praetore-gateway
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-agents
+            praetore.io/role: agent
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-data
+            app.kubernetes.io/name: postgres
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-egress
+            app.kubernetes.io/name: egress-proxy
+      toPorts:
+        - ports:
+            - port: "3128"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchPattern: "postgres.praetore-data.svc.cluster.local."
+              - matchPattern: "egress-proxy.praetore-egress.svc.cluster.local."
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-egress-proxy-allowlist
+  namespace: praetore-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: egress-proxy
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-gateway
+            app.kubernetes.io/name: praetore-gateway
+      toPorts:
+        - ports:
+            - port: "3128"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-tools
+            praetore.io/role: protected-tool
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: api.example.com
+              - matchPattern: "*.api.example.com"
+              - matchPattern: "*.praetore-tools.svc.cluster.local."
+    - toFQDNs:
+        - matchName: api.example.com
+        - matchPattern: "*.api.example.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: protected-tools-ingress-only-from-egress-proxy
+  namespace: praetore-tools
+spec:
+  endpointSelector:
+    matchLabels:
+      praetore.io/role: protected-tool
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-egress
+            app.kubernetes.io/name: egress-proxy
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

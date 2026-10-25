@@ -9,6 +9,10 @@ repository.workspace = true
 
 description = "Loopback-only development HTTP service for the PRÆTORE gateway."
 
+[lib]
+name = "praetore_gateway_service"
+path = "src/lib.rs"
+
 [[bin]]
 name = "praetore-gateway-demo"
 path = "src/main.rs"

@@ -62,6 +62,14 @@ verifying each authority. Provision all trust data through an independently
 authenticated configuration channel. The engine does not implement PKI,
 issuer discovery, or revocation storage.
 
+`production` uses the host `SystemClock`; this does not assert that host time
+is trustworthy. Deployments needing a clock-health gate can implement
+`TrustedClock` and use `production_with_trusted_clock`. Its timestamp is read
+at construction and for each evaluation; a source failure returns
+`TRUSTED_CLOCK_UNAVAILABLE` and prevents authorization. The trait is an
+integration seam, not an NTP/PTP, cloud-time, or hardware-backed clock
+implementation.
+
 The caller-supplied `FreshnessProvider` is a veto-only check. HighAssurance
 calls `check_authority` with the verified agent key fingerprint, authority ID,
 SHA-256 digest of the exact canonical authority payload, pinned policy digest,

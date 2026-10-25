@@ -53,6 +53,19 @@ pub struct HttpActionDispatcher {
 
 impl HttpActionDispatcher {
     pub fn from_json(config_json: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::parse_json(config_json, false)
+    }
+
+    pub fn from_json_with_required_egress_proxy(
+        config_json: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::parse_json(config_json, true)
+    }
+
+    fn parse_json(
+        config_json: &str,
+        require_egress_proxy: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         if config_json.len() > MAX_CONFIG_BYTES {
             return Err("tool route configuration exceeds the size limit".into());
         }
@@ -65,6 +78,9 @@ impl HttpActionDispatcher {
             return Err(
                 "tool route configuration has an unsupported version or route count".into(),
             );
+        }
+        if require_egress_proxy && config.egress_proxy.is_none() {
+            return Err("HTTP tool routes require a policy-enforcing egress proxy".into());
         }
 
         let mut routes = HashMap::with_capacity(config.routes.len());
@@ -499,6 +515,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn production_route_parser_requires_an_explicit_egress_proxy() {
+        assert!(
+            HttpActionDispatcher::from_json_with_required_egress_proxy(&route_config(
+                "https://orders.internal/v1/orders"
+            ))
+            .is_err()
+        );
+
+        let configuration = serde_json::to_string(&json!({
+            "schema_version": 1,
+            "egress_proxy": "http://127.0.0.1:3128",
+            "routes": [{
+                "tenant_id": Uuid::from_u128(10),
+                "action_type": "orders:create",
+                "target": "orders-api",
+                "capability": "orders:write",
+                "endpoint": "https://orders.internal/v1/orders"
+            }]
+        }))
+        .unwrap();
+        assert!(HttpActionDispatcher::from_json_with_required_egress_proxy(&configuration).is_ok());
     }
 
     #[test]

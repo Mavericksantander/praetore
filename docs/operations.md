@@ -54,24 +54,35 @@ profile and an authenticated configuration channel.
 
 ## Clock source and validity boundaries
 
-1. Provide a monitored UTC clock appropriate to the deployment's risk profile.
+1. For an integration that must fail closed on clock-health loss, implement
+   `TrustedClock` and construct the engine with
+   `AuthorizationEngine::production_with_trusted_clock`. The HTTP gateway
+   reference uses a Chrony tracking monitor; configure its polling interval,
+   sample-age limit and error-bound threshold. Its provider must return an
+   error whenever synchronization or source health is uncertain. `SystemClock`
+   and `production_with_clock` do not establish time trust.
+2. Provide a monitored UTC clock appropriate to the deployment's risk profile.
    The library applies exact inclusive `not_before` / `not_after` checks and
    adds no skew tolerance.
-2. Keep operational margin when issuing authorities and issuer pins to account
+3. Keep operational margin when issuing authorities and issuer pins to account
    for measured clock uncertainty. Do not widen validity windows as a substitute
    for repairing clock synchronization.
-3. Alert on clock-health loss and stop authorization if the configured clock
-   cannot be trusted. The core cannot distinguish a correct clock from a
-   manipulated host clock.
-4. In tests and incident replay, use a fixed clock and preserve the exact
+4. Alert on clock-health loss and stop authorization if the configured clock
+   cannot be trusted. `TrustedClock` failures fail closed; the core cannot
+   detect manipulation in a provider that incorrectly reports healthy. For
+   Chrony integration details and residual risks, see
+   [`runtime-security-scaffold.md`](runtime-security-scaffold.md).
+5. In tests and incident replay, use a fixed clock and preserve the exact
    timestamp supplied to evaluation.
 
 ## Production profile checks
 
 Before deployment, verify that:
 
-- engine construction uses `AuthorizationEngine::production`, not `new`,
-  `with_clock`, or `development`;
+- engine construction uses `AuthorizationEngine::production` or
+ `production_with_trusted_clock`, not `new`, `with_clock`, or `development`;
+- deployments whose risk profile requires clock-health gating use a tested
+ `TrustedClock` adapter and do not silently fall back to system time;
 - the policy digest matches an approved pin;
 - issuer pins are non-empty, time-bounded, and active;
 - an evidence attester key is configured separately from agent and issuer

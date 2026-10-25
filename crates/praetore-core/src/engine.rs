@@ -28,6 +28,37 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TrustedClockError {
+    #[error("trusted clock is unavailable")]
+    Unavailable,
+    #[error("trusted clock health check failed")]
+    Untrusted,
+}
+
+/// A time source that checks its trust/health status on every read and fails
+/// closed when it cannot provide a trustworthy UTC instant.
+pub trait TrustedClock: Send + Sync {
+    fn now(&self) -> std::result::Result<OffsetDateTime, TrustedClockError>;
+}
+
+#[derive(Clone)]
+enum ClockSource {
+    System(Arc<dyn Clock>),
+    Trusted(Arc<dyn TrustedClock>),
+}
+
+impl ClockSource {
+    fn now(&self) -> Result<OffsetDateTime> {
+        match self {
+            Self::System(clock) => Ok(clock.now()),
+            Self::Trusted(clock) => clock
+                .now()
+                .map_err(|_| PraetoreError::TrustedClockUnavailable),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvaluationMode {
     Development,
@@ -357,7 +388,7 @@ impl Clock for FixedClock {
 /// `cargo run -p praetore-core --example quickstart`.
 pub struct AuthorizationEngine {
     policy: Policy,
-    clock: Arc<dyn Clock>,
+    clock: ClockSource,
     mode: EvaluationMode,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
@@ -397,7 +428,7 @@ impl AuthorizationEngine {
     pub fn development(policy: Policy) -> Self {
         Self {
             policy,
-            clock: Arc::new(SystemClock),
+            clock: ClockSource::System(Arc::new(SystemClock)),
             mode: EvaluationMode::Development,
             trusted_issuers: Vec::new(),
             tenant_issuer_bindings: None,
@@ -426,7 +457,7 @@ impl AuthorizationEngine {
     pub fn development_with_clock(policy: Policy, clock: impl Clock + 'static) -> Self {
         Self {
             policy,
-            clock: Arc::new(clock),
+            clock: ClockSource::System(Arc::new(clock)),
             mode: EvaluationMode::Development,
             trusted_issuers: Vec::new(),
             tenant_issuer_bindings: None,
@@ -458,7 +489,7 @@ impl AuthorizationEngine {
 
         Ok(Self {
             policy,
-            clock: Arc::new(SystemClock),
+            clock: ClockSource::System(Arc::new(SystemClock)),
             mode: EvaluationMode::Strict,
             trusted_issuers,
             tenant_issuer_bindings: None,
@@ -479,7 +510,7 @@ impl AuthorizationEngine {
         trusted_issuers: Vec<TrustedAuthorityIssuer>,
     ) -> Result<Self> {
         let mut engine = Self::strict(policy, trusted_issuers)?;
-        engine.clock = Arc::new(clock);
+        engine.clock = ClockSource::System(Arc::new(clock));
         Ok(engine)
     }
 
@@ -491,6 +522,25 @@ impl AuthorizationEngine {
         policy: Policy,
         config: HighAssuranceConfig,
         clock: impl Clock + 'static,
+    ) -> Result<Self> {
+        Self::production_with_clock_source(policy, config, ClockSource::System(Arc::new(clock)))
+    }
+
+    /// Constructs a HighAssurance engine with a trusted, health-checked time
+    /// source. The source is checked during construction and on every
+    /// evaluation; an unhealthy source prevents authorization.
+    pub fn production_with_trusted_clock(
+        policy: Policy,
+        config: HighAssuranceConfig,
+        clock: impl TrustedClock + 'static,
+    ) -> Result<Self> {
+        Self::production_with_clock_source(policy, config, ClockSource::Trusted(Arc::new(clock)))
+    }
+
+    fn production_with_clock_source(
+        policy: Policy,
+        config: HighAssuranceConfig,
+        clock: ClockSource,
     ) -> Result<Self> {
         if policy.semantics_version != 2 {
             return Err(PraetoreError::PolicyIntegrityFailed);
@@ -520,7 +570,7 @@ impl AuthorizationEngine {
 
         let engine = Self {
             policy,
-            clock: Arc::new(clock),
+            clock,
             mode: EvaluationMode::HighAssurance,
             trusted_issuers: config.trusted_issuers,
             tenant_issuer_bindings: config.tenant_issuer_bindings,
@@ -533,7 +583,7 @@ impl AuthorizationEngine {
             replay_guard: config.replay_guard,
             freshness_provider: config.freshness_provider,
         };
-        engine.validate_production_configuration(engine.clock.now(), true)?;
+        engine.validate_production_configuration(engine.clock.now()?, true)?;
         Ok(engine)
     }
 
@@ -661,7 +711,7 @@ impl AuthorizationEngine {
         request: AuthorizationRequest,
         atomic_commit: Option<&dyn AtomicAuthorizationCommit>,
     ) -> std::result::Result<Evidence, AtomicEvaluationError> {
-        let now = self.clock.now();
+        let now = self.clock.now()?;
         if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
             return Err(PraetoreError::InvalidRequest(
                 "v2 intents are accepted only by the HighAssurance profile".into(),
@@ -966,7 +1016,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{
         Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use uuid::Uuid;
 
@@ -1106,6 +1156,42 @@ mod tests {
         )
         .unwrap();
         (engine, request)
+    }
+
+    struct TestTrustedClock {
+        instant: OffsetDateTime,
+        healthy: AtomicBool,
+    }
+
+    impl TrustedClock for TestTrustedClock {
+        fn now(&self) -> std::result::Result<OffsetDateTime, TrustedClockError> {
+            if self.healthy.load(Ordering::SeqCst) {
+                Ok(self.instant)
+            } else {
+                Err(TrustedClockError::Untrusted)
+            }
+        }
+    }
+
+    #[test]
+    fn high_assurance_fails_closed_when_trusted_clock_becomes_unhealthy() {
+        let (mut engine, request) = production_engine_with_provider(test_freshness_provider());
+        let clock = Arc::new(TestTrustedClock {
+            instant: FixedClock::new("2026-06-01T12:00:00Z").now(),
+            healthy: AtomicBool::new(false),
+        });
+        engine.clock = ClockSource::Trusted(clock.clone());
+
+        assert!(matches!(
+            engine.evaluate(request.clone()),
+            Err(PraetoreError::TrustedClockUnavailable)
+        ));
+
+        clock.healthy.store(true, Ordering::SeqCst);
+        assert_eq!(
+            engine.evaluate(request).unwrap().decision.outcome,
+            DecisionOutcome::Allow
+        );
     }
 
     #[test]

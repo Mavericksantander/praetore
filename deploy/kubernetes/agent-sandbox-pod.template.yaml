@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: replace-with-agent-workload
+  namespace: praetore-agents
+  labels:
+    praetore.io/role: agent
+spec:
+  runtimeClassName: praetore-firecracker
+  nodeSelector:
+    praetore.io/firecracker-runtime: "true"
+  automountServiceAccountToken: false
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: agent
+      image: replace-with-reviewed-agent-image
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: "1"
+          memory: 512Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop:
+            - ALL
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 64Mi
