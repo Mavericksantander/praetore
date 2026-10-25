@@ -445,10 +445,14 @@ inspect effective policy; additive broad DNS allowances can undermine the
 FQDN/DNS policy. The templates do not prove enforcement until exercised from
 the deployed pods.
 
-For the Firecracker-backed Kata agent pod and Chrony trusted-clock integration,
-see the [runtime security scaffold](runtime-security-scaffold.md). The pod
-template requires an operator-provisioned CRI handler and Firecracker-capable
-KVM nodes; it is not itself a complete sandbox deployment.
+For the Firecracker-backed Kata agent pod, per-invocation Job contract, and
+Chrony trusted-clock integration, see the
+[runtime security scaffold](runtime-security-scaffold.md). The repository
+contains templates for an ephemeral Firecracker-backed Job and a
+namespace-scoped supervisor Role, but not the authenticated supervisor service
+or its gateway dispatcher client. These templates are not a sandbox execution
+boundary; the CRI handler, admission controls, Cilium policy, and KVM nodes
+must also be configured and tested by the operator.
 
 ## Human approvals
 

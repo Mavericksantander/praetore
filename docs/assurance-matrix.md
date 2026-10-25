@@ -55,6 +55,11 @@ absence of defects.
   backups, capacity, replication, failover, and deployment controls remain the
   deployer's responsibility. The core evidence signature covers authorization
   only, not later execution state.
+- Kubernetes Firecracker/Kata, per-invocation Job, supervisor RBAC, and Cilium
+  policies are deployment scaffolding. The authenticated sandbox supervisor,
+  gateway dispatcher client, cluster admission policy, and live-cluster
+  enforcement tests are not implemented; these manifests do not establish
+  sandbox execution isolation.
 - CI runs the staged PostgreSQL 16 server-restart test against its service
   container. This verifies persisted rows across a primary restart, not
   replication/failover or backup guarantees. The effect adapter in tests

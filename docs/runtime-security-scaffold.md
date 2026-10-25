@@ -1,9 +1,9 @@
 # Runtime security scaffold
 
-Status: integration skeleton, not a production sandbox or trusted-time
-implementation. It makes the runtime boundaries explicit while leaving the
-cluster-specific isolation backend and trusted time source to deployment
-owners.
+Status: hardened deployment scaffolding, not yet an end-to-end sandbox
+service or trusted-time implementation. The repository does not yet include
+the supervisor that turns an authorized invocation into an ephemeral Job.
+The manifests below specify its intended least-privilege boundary.
 
 ## Agent sandbox
 
@@ -41,12 +41,51 @@ dedicated node pool when the threat model requires it. A Kubernetes
 not by itself constrain node/metadata paths or host-network workloads. Verify
 those paths in the target cluster before production.
 
-The repository has no process-execution tool adapter or sandbox supervisor
-yet. The gateway's `ActionDispatcher` is the integration seam: add an adapter
-that submits a typed, bounded tool invocation to the sandbox supervisor;
-never run agent-selected shell commands in the gateway process. The template
-does not attest the sandbox, isolate the gateway, or guarantee that a
-particular cluster runtime is configured correctly.
+[`tool-invocation-job.template.yaml`](../deploy/kubernetes/tool-invocation-job.template.yaml)
+defines the target execution unit: one Job and one Firecracker-backed
+microVM per authorized tool call, with no retries, a fixed runner entrypoint,
+an approved digest-pinned image, a read-only one-time invocation Secret,
+bounded CPU/memory/storage, a hard deadline, and automatic Job cleanup.
+Never construct the container command or image from agent-controlled fields;
+map the verified action to an operator-approved tool profile. Pass results
+back to the supervisor over authenticated TLS; do not use pod logs as an
+application result channel because tool output may contain sensitive data.
+The supervisor should create the Job first, then create its one-time Secret
+with a Job owner reference, so Kubernetes garbage collection removes the
+Secret when the Job expires. Make that Secret immutable. Use a deterministic,
+non-sensitive execution label derived from the execution key and action
+digest; enforce uniqueness against the durable gateway journal rather than
+relying on Kubernetes names alone. The supervisor endpoint and worker result
+callback require workload authentication (mTLS for the gateway-to-supervisor
+call, plus a one-time result token for the worker); this authentication
+protocol is not implemented in the repository yet.
+
+[`sandbox-namespace.yaml`](../deploy/kubernetes/sandbox-namespace.yaml)
+establishes a dedicated restricted namespace, a worker ServiceAccount with no
+API token, and a supervisor Role scoped to that namespace. Only the supervisor
+receives Kubernetes API credentials; the gateway must call it through a
+separately authenticated service boundary and must not receive permission to
+create Jobs or Secrets. Namespace-scoped RBAC alone cannot constrain fields
+in a Job spec, so a cluster admission policy must enforce the runtime class,
+approved image digests, resource ceilings, pod security settings, and allowed
+volume types. Add supervisor-side request/concurrency limits and namespace
+ResourceQuota/LimitRange controls to prevent a valid caller from exhausting
+cluster capacity. Enable encryption at rest for Secrets, use one-time
+credentials with short expiry, and delete invocation Secrets after completion
+or timeout.
+The supervisor Role intentionally has no pod-log permission; it must not use
+logs to retrieve action output. The Job template also expects a trusted
+`praetore-sandbox-supervisor-ca` ConfigMap and a supervisor Service reachable
+on port 8443. Tool profiles use the configured egress proxy; network policy
+must still block direct egress if a runner ignores proxy environment
+variables.
+
+The gateway's `ActionDispatcher` is the integration seam, but the supervisor
+service and its dispatcher client are not implemented yet. Until those exist,
+the templates are not an execution boundary: never run agent-selected shell
+commands in the gateway process. This scaffold does not attest the sandbox,
+isolate the gateway, or prove that a particular cluster runtime is configured
+correctly.
 
 ## Trusted clock seam
 
@@ -120,25 +159,37 @@ CONNECT destinations outside that list, and avoid becoming an open proxy. The
 Rust route parser does not enforce DNS/IP allowlists or prevent an operator
 from configuring a prohibited endpoint.
 
-Before enabling a protected tool, verify from the actual agent and gateway
-pods that direct paths, redirects, alternate DNS/IP routes, cloud metadata,
-node ports, and any service-mesh side paths are denied as intended. Maintain
-a route/configuration inventory by tenant and review changes as security
-policy. Network reachability controls complement authorization; neither
-replaces the other.
+Before enabling a protected tool, verify from actual agent, gateway,
+supervisor, and invocation-worker pods that direct paths, redirects, alternate
+DNS/IP routes, cloud metadata, node ports, and any service-mesh side paths are
+denied as intended. Maintain a route/configuration inventory by tenant and
+review changes as security policy. Network reachability controls complement
+authorization; neither replaces the other.
+
+The Cilium template includes scoped supervisor, worker, and proxy paths for
+`praetore-sandbox`: workers can reach only the supervisor result endpoint,
+DNS, and the egress proxy; only the supervisor can reach the Kubernetes API.
+Set the matching supervisor labels and verify the cluster's API-server entity,
+DNS proxy, proxy behavior, and TLS identities. Do not deploy the invocation
+Job template until the matching admission policy is installed and these paths
+are tested.
 
 ## Implementation sequence
 
 1. Install the Firecracker-backed Kata handler on dedicated Linux/KVM nodes,
    restrict RuntimeClass and node-label mutation to cluster administrators,
    and add admission rules plus adversarial escape/resource-exhaustion tests.
-2. Configure chronyd with approved, monitored time sources and a restricted
+2. Implement the separately authenticated supervisor and one-time Job
+   lifecycle. Test duplicate requests, create/timeout ambiguity, cleanup,
+   result authentication, worker crashes, admission denials, and no-retry
+   behavior against a disposable cluster.
+3. Configure chronyd with approved, monitored time sources and a restricted
    query-only command endpoint; test loss of sync, stale status, excessive
    uncertainty, clock rollback, query timeout, and recovery without fallback.
-3. Apply the Cilium template with exact tool FQDNs, enforce the same allowlist
+4. Apply the Cilium template with exact tool FQDNs, enforce the same allowlist
    in the proxy/firewall, and test direct egress, DNS rebinding, metadata,
    NodePort, service-mesh and alternate-IP bypasses from real pods.
-4. Record runtime image/handler version, clock health/error bound, egress
+5. Record runtime image/handler version, clock health/error bound, egress
    policy version and policy digest in deployment telemetry, without logging
    credentials or sensitive tool parameters.
 
