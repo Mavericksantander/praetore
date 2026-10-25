@@ -22,8 +22,9 @@ validation, threat modeling, operational controls, or a security assessment
 appropriate to your environment.
 
 The repository includes the Rust authorization core, an offline evidence
-verifier, verify-only Python bindings, a reference tool-gateway crate,
-bounded fuzz targets, and an optional PostgreSQL replay-guard adapter.
+verifier, verify-only Python bindings, a reference tool-gateway crate, a
+PostgreSQL-backed local CLI demo, bounded fuzz targets, and an optional
+PostgreSQL replay-guard adapter.
 
 ## What it is — and is not
 
@@ -43,9 +44,10 @@ bounded fuzz targets, and an optional PostgreSQL replay-guard adapter.
 * A general-purpose network service, policy distribution control plane, or
   administrative action executor.
 * A sandbox or isolation boundary by itself. The repository includes a
-  Kubernetes/Kata-Firecracker deployment template and a per-invocation Job
-  contract, but not the tool-execution adapter or authenticated sandbox
-  supervisor needed to make it an end-to-end sandbox.
+  mTLS gateway dispatcher, a Kubernetes Job supervisor, and Firecracker/Kata
+  deployment contracts, but not the production tool-runner implementation or
+  validated target-cluster integration needed to establish an end-to-end
+  sandbox.
 * A certification, accreditation, or guarantee that a deployment is safe.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
@@ -78,6 +80,14 @@ suitable for production. See the [policy language guide](docs/policy-language.md
 for declarative rules and the [crypto and policy guide](docs/crypto-and-policy.md)
 for signing and verification details.
 
+## Local PostgreSQL gateway demo
+
+The [local CLI guide](crates/praetore-cli/README.md) walks through initializing
+a demo directory, checking local PostgreSQL and gateway health, running the
+loopback-only gateway, and submitting its single signed key/value demo action.
+The generated keys and in-memory adapter are for local development only; this
+is not a production deployment or an external-agent integration.
+
 ## Documentation
 
 * [Policy language and evaluation semantics](docs/policy-language.md)
@@ -85,6 +95,7 @@ for signing and verification details.
 * [Threat model and residual risks](docs/threat-model.md)
 * [Mandatory tool gateway integration pattern](docs/tool-gateway-integration.md)
 * [Reference gateway crate](crates/praetore-gateway)
+* [Local PostgreSQL CLI demo](crates/praetore-cli/README.md)
 * [Read-only observability MVP](docs/observability-mvp.md)
 * [Assurance traceability matrix](docs/assurance-matrix.md)
 * [Operations runbooks](docs/operations.md)
@@ -150,6 +161,7 @@ praetore/
 │   ├── praetore-python/
 │   ├── praetore-replay-postgres/
 │   ├── praetore-gateway/
+│   ├── praetore-cli/
 │   └── praetore-observe/
 ├── fuzz/
 ├── packages/praetore-python/

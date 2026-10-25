@@ -1,13 +1,19 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: replace-with-unique-execution-name
+  name: tool-replace-with-52-char-execution-id
   namespace: praetore-sandbox
   labels:
     praetore.io/component: tool-invocation
-    praetore.io/execution-id: replace-with-stable-execution-id
+    praetore.io/execution-id: replace-with-52-char-execution-key-hash
+    praetore.io/action-digest: replace-with-52-char-action-hash
     praetore.io/tool-profile: replace-with-approved-profile
+  annotations:
+    praetore.io/execution-key-sha256: replace-with-full-execution-key-sha256
+    praetore.io/action-sha256: replace-with-full-action-sha256
+    praetore.io/result-token-sha256: replace-with-full-result-token-sha256
 spec:
+  suspend: true
   completions: 1
   parallelism: 1
   backoffLimit: 0
@@ -17,8 +23,13 @@ spec:
     metadata:
       labels:
         praetore.io/component: tool-invocation
-        praetore.io/execution-id: replace-with-stable-execution-id
+        praetore.io/execution-id: replace-with-52-char-execution-key-hash
+        praetore.io/action-digest: replace-with-52-char-action-hash
         praetore.io/tool-profile: replace-with-approved-profile
+      annotations:
+        praetore.io/execution-key-sha256: replace-with-full-execution-key-sha256
+        praetore.io/action-sha256: replace-with-full-action-sha256
+        praetore.io/result-token-sha256: replace-with-full-result-token-sha256
     spec:
       runtimeClassName: praetore-firecracker
       restartPolicy: Never
@@ -48,7 +59,7 @@ spec:
             - /run/praetore/invocation/invocation.json
           env:
             - name: PRAETORE_RESULT_URL
-              value: https://praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local:8443/v1/results
+              value: https://praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local:8444/v1/results
             - name: PRAETORE_RESULT_TOKEN_FILE
               value: /run/praetore/invocation/result-token
             - name: PRAETORE_RESULT_CA_FILE
@@ -69,6 +80,9 @@ spec:
               memory: 512Mi
               ephemeral-storage: 128Mi
           securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -86,7 +100,7 @@ spec:
       volumes:
         - name: invocation
           secret:
-            secretName: replace-with-one-time-invocation-secret
+            secretName: inv-replace-with-52-char-execution-key-hash
             defaultMode: 0440
         - name: tmp
           emptyDir:

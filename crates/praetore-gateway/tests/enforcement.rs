@@ -155,6 +155,54 @@ impl FreshnessProvider for CurrentFreshness {
     }
 }
 
+struct SharedTestClock(Arc<Mutex<OffsetDateTime>>);
+
+impl Clock for SharedTestClock {
+    fn now(&self) -> OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+struct ExpiringOnDispatchFreshness {
+    clock: Arc<Mutex<OffsetDateTime>>,
+    calls: AtomicUsize,
+    expire_on_call: usize,
+    advance_by: Duration,
+    lease_duration: Duration,
+}
+
+impl FreshnessProvider for ExpiringOnDispatchFreshness {
+    fn check(
+        &self,
+        _agent: &AgentKeyFingerprint,
+        _authority_id: &praetore_core::AuthorityId,
+        _policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> Result<FreshnessLease, FreshnessError> {
+        Ok(FreshnessLease {
+            valid_until: now + self.lease_duration,
+        })
+    }
+
+    fn check_authority(
+        &self,
+        agent: &AgentKeyFingerprint,
+        authority_id: &praetore_core::AuthorityId,
+        authority_digest: &str,
+        policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> Result<FreshnessLease, FreshnessError> {
+        if authority_digest.len() != 64 {
+            return Err(FreshnessError::InvalidResponse);
+        }
+        if self.calls.fetch_add(1, Ordering::SeqCst) == self.expire_on_call {
+            let mut clock = self.clock.lock().unwrap();
+            *clock += self.advance_by;
+        }
+        self.check(agent, authority_id, policy_digest, now)
+    }
+}
+
 struct JournalEntry {
     evidence: Option<Evidence>,
     authorization: Option<AuthorizationStatus>,
@@ -764,6 +812,18 @@ fn approval_fixture() -> (
     Arc<MemoryJournal>,
     SigningKey,
 ) {
+    approval_fixture_with_provider(|_| Arc::new(CurrentFreshness))
+}
+
+fn approval_fixture_with_provider(
+    build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
+) -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
     let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[32; 32]);
     let attester = EvidenceAttesterKey::from_secret_bytes(&[33; 32]);
@@ -796,6 +856,7 @@ fn approval_fixture() -> (
         ],
     );
     let now = OffsetDateTime::now_utc();
+    let clock = Arc::new(Mutex::new(now));
     let policy_digest = policy.digest().unwrap();
     let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
     request
@@ -816,8 +877,9 @@ fn approval_fixture() -> (
         .unwrap()
         .with_audience("local-test-gateway")
         .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
-        .with_freshness_provider(Arc::new(CurrentFreshness));
-    let engine = AuthorizationEngine::production(policy, config).unwrap();
+        .with_freshness_provider(build_provider(clock.clone()));
+    let engine =
+        AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock)).unwrap();
     let tool = Arc::new(LocalSetTool::default());
     let journal = Arc::new(MemoryJournal::default());
     let approver_key = SigningKey::from_bytes(&[34; 32]);
@@ -954,6 +1016,51 @@ fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
 }
 
 #[test]
+fn approved_action_is_not_dispatched_if_freshness_expires_during_approval_commit() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture_with_provider(|clock| {
+        Arc::new(ExpiringOnDispatchFreshness {
+            clock,
+            calls: AtomicUsize::new(0),
+            expire_on_call: 2,
+            advance_by: Duration::seconds(6),
+            lease_duration: Duration::seconds(5),
+        })
+    });
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+
+    assert!(matches!(
+        gateway.resolve_human_approval(decision.clone()),
+        Err(GatewayError::Authorization(
+            PraetoreError::FreshnessCheckFailed(FreshnessError::Expired)
+        ))
+    ));
+    assert_eq!(tool.value("mode"), None);
+    assert_eq!(tool.invocations(), 0);
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::Failed);
+    assert_eq!(record.human_approval, Some(decision.clone()));
+    assert_eq!(
+        record.execution_attestation.unwrap().execution,
+        ExecutionStatus::Failed
+    );
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
 fn human_approval_signature_cannot_be_reused_for_modified_action_scope() {
     let (gateway, request, tool, _, approver_key) = approval_fixture();
     let pending = gateway.execute(request).unwrap();
@@ -1001,6 +1108,39 @@ fn rejected_human_approval_is_persisted_without_dispatch() {
         gateway.approval_challenge(key),
         Err(GatewayError::Approval(ApprovalError::NotPending))
     ));
+}
+
+#[test]
+fn expired_human_rejection_uses_the_engine_clock() {
+    let captured_clock = Arc::new(Mutex::new(None));
+    let capture = captured_clock.clone();
+    let (gateway, request, tool, journal, approver_key) =
+        approval_fixture_with_provider(move |clock| {
+            *capture.lock().unwrap() = Some(clock);
+            Arc::new(CurrentFreshness)
+        });
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Reject,
+        &approver_key,
+    );
+    let clock = captured_clock.lock().unwrap().clone().unwrap();
+    *clock.lock().unwrap() += Duration::seconds(21);
+
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::Expired))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert!(record.human_approval.is_none());
+    assert_eq!(tool.invocations(), 0);
 }
 
 #[tokio::test]
@@ -1292,6 +1432,96 @@ fn expired_request_is_rejected_before_any_tool_invocation() {
     ));
     assert_eq!(fixture.tool.value("mode"), None);
     assert_eq!(fixture.tool.invocations(), 0);
+}
+
+#[test]
+fn gateway_does_not_dispatch_when_freshness_expires_after_journal_claim() {
+    let agent_key = AgentKeyPair::from_secret_bytes(&[21; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[22; 32]);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[23; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "local-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+    let action = Action::new(
+        "local:set_value",
+        Some("local-state".into()),
+        json!({"key": "mode", "value": "safe"}),
+    )
+    .unwrap()
+    .with_capability("local:write");
+    let policy = Policy::new_v2(
+        "dispatch-freshness-test",
+        1,
+        vec![
+            PolicyRule::new("allow-local-set", "local:set_value", PolicyEffect::Allow)
+                .with_capability("local:write"),
+        ],
+    );
+    let initial_time = FixedClock::try_new(NOW).unwrap().now();
+    let clock = Arc::new(Mutex::new(initial_time));
+    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    request
+        .sign_intent_v2(
+            &agent_key,
+            "local-test-gateway",
+            initial_time - Duration::seconds(1),
+            initial_time + Duration::minutes(1),
+            policy.digest().unwrap(),
+        )
+        .unwrap();
+    let issuer_pin = TrustedAuthorityIssuer::new("local-test-issuer", issuer_key.public_key())
+        .unwrap()
+        .with_validity(long_validity())
+        .unwrap();
+    let config =
+        HighAssuranceConfig::new(policy.digest().unwrap(), vec![issuer_pin], attester.clone())
+            .unwrap()
+            .with_audience("local-test-gateway")
+            .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
+            .with_freshness_provider(Arc::new(ExpiringOnDispatchFreshness {
+                clock: clock.clone(),
+                calls: AtomicUsize::new(0),
+                expire_on_call: 1,
+                advance_by: Duration::seconds(31),
+                lease_duration: Duration::seconds(30),
+            }));
+    let engine =
+        AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock)).unwrap();
+    let tool = Arc::new(LocalSetTool::default());
+    let journal = Arc::new(MemoryJournal::default());
+    let gateway =
+        Gateway::new(engine, journal.clone(), tool.clone(), execution_attester()).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *request.agent.id.as_uuid(),
+        request_id: request.request_id,
+    };
+
+    assert!(matches!(
+        gateway.execute(request.clone()),
+        Err(GatewayError::Authorization(
+            PraetoreError::FreshnessCheckFailed(FreshnessError::Expired)
+        ))
+    ));
+    assert_eq!(tool.value("mode"), None);
+    assert_eq!(tool.invocations(), 0);
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::Failed);
+    assert_eq!(
+        record.execution_attestation.unwrap().execution,
+        ExecutionStatus::Failed
+    );
+    assert!(matches!(
+        gateway.execute(request),
+        Err(GatewayError::Journal(JournalError::AlreadyRecorded))
+    ));
+    assert_eq!(tool.invocations(), 0);
 }
 
 #[test]

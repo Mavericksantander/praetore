@@ -449,10 +449,13 @@ For the Firecracker-backed Kata agent pod, per-invocation Job contract, and
 Chrony trusted-clock integration, see the
 [runtime security scaffold](runtime-security-scaffold.md). The repository
 contains templates for an ephemeral Firecracker-backed Job and a
-namespace-scoped supervisor Role, but not the authenticated supervisor service
-or its gateway dispatcher client. These templates are not a sandbox execution
-boundary; the CRI handler, admission controls, Cilium policy, and KVM nodes
-must also be configured and tested by the operator.
+namespace-scoped supervisor Role, an authenticated supervisor service, and
+its gateway mTLS dispatcher client. The supervisor currently keeps pending
+worker callbacks in memory and cannot recover a completed result after a
+restart. These templates and service are not a proven sandbox execution
+boundary; the production runner image, CRI handler, admission controls,
+Cilium policy, and KVM nodes must also be configured and tested by the
+operator.
 
 ## Human approvals
 

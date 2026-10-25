@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Local engineering and security assurance status for PRÆTORE.">
+  <title>PRÆTORE · Engineering Command Center</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="dashboard-data.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#overview" aria-label="PRÆTORE command center home">
+      <span class="brand-mark">P</span>
+      <span><strong>PRÆTORE</strong><small>ENGINEERING COMMAND CENTER</small></span>
+    </a>
+    <div class="top-meta">
+      <span class="live-dot"></span><span>LOCAL SNAPSHOT</span>
+      <span class="meta-divider"></span>
+      <span id="revision-label">Revision unavailable</span>
+      <span id="worktree-label" class="pill">Checking worktree</span>
+    </div>
+    <button class="menu-toggle" id="menu-toggle" aria-label="Toggle navigation" aria-expanded="false">☰</button>
+  </header>
+
+  <nav class="side-nav" id="side-nav" aria-label="Dashboard sections">
+    <div class="nav-caption">ENGINEERING STATE</div>
+    <a class="nav-link active" href="#overview"><span>01</span>Overview</a>
+    <a class="nav-link" href="#architecture"><span>02</span>Architecture</a>
+    <a class="nav-link" href="#foundations"><span>03</span>Foundations</a>
+    <a class="nav-link" href="#inventory"><span>04</span>Components</a>
+    <a class="nav-link" href="#security"><span>05</span>Security assurance</a>
+    <a class="nav-link" href="#readiness"><span>06</span>Plug-and-play</a>
+    <a class="nav-link" href="#board"><span>07</span>Development board</a>
+    <a class="nav-link" href="#critical-path"><span>08</span>Critical path</a>
+    <a class="nav-link" href="#verification"><span>09</span>Verification</a>
+    <div class="nav-foot">
+      <span class="overline">SOURCE</span>
+      <p>Local repository facts + explicit engineering assessments.</p>
+      <a href="README.md">Method and update guide ↗</a>
+    </div>
+  </nav>
+
+  <main>
+    <section class="hero section" id="overview">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="eyebrow-line"></span> SYSTEM STATUS / <span id="refreshed-date">SNAPSHOT</span></div>
+        <h1>What is built.<br><span>What is proven.</span><br>What remains.</h1>
+        <p class="hero-subtitle">An evidence-led view of PRÆTORE's engineering state. Product completeness and security assurance are tracked separately; neither is reduced to a security score.</p>
+        <div class="maturity-banner">
+          <span class="maturity-icon">◈</span>
+          <div><span class="overline">ENGINEERING MATURITY</span><strong id="maturity-label">Loading assessment…</strong></div>
+          <span class="maturity-note" id="maturity-basis"></span>
+        </div>
+      </div>
+      <aside class="focus-card">
+        <div class="card-kicker"><span class="status-dot amber"></span> DEVELOPMENT SIGNAL</div>
+        <h2 id="focus-label">Loading</h2>
+        <p id="focus-basis"></p>
+        <span class="inference-tag" id="focus-confidence">INFERRED FROM WORKTREE</span>
+      </aside>
+    </section>
+
+    <section class="section overview-grid" aria-label="Engineering overview">
+      <div class="stat-card lead-stat">
+        <div class="stat-top"><span>FOUNDATION ASSESSMENT</span><span class="tiny-icon">◉</span></div>
+        <div class="stat-value" id="assessment-total">—</div>
+        <div class="stat-label">areas assessed, not a maturity percentage</div>
+        <div class="stacked-bar" id="assessment-bar" aria-label="Foundation status distribution"></div>
+        <div class="legend" id="assessment-legend"></div>
+      </div>
+      <div class="stat-card status-card">
+        <span class="stat-top">VERIFIED SCOPE</span>
+        <div class="status-number green-text" id="count-verified">—</div>
+        <div class="stat-label">specific properties with focused test evidence</div>
+        <span class="stat-foot">Not subsystem-wide proof</span>
+      </div>
+      <div class="stat-card status-card">
+        <span class="stat-top">NEEDS VALIDATION</span>
+        <div class="status-number amber-text" id="count-validation">—</div>
+        <div class="stat-label">implemented, important integration evidence missing</div>
+        <span class="stat-foot">Current candidate is locally dirty</span>
+      </div>
+      <div class="stat-card status-card blocker-stat">
+        <span class="stat-top">OPEN P1 WORK ITEMS</span>
+        <div class="blocker-number" id="blocker-count">—</div>
+        <div class="stat-label">highest-impact gaps on the path to a pilot</div>
+        <a href="#critical-path" class="text-link">View critical path <span>↗</span></a>
+      </div>
+    </section>
+    <div class="verification-glance">
+      <span id="overview-test-dot" class="status-dot amber" aria-hidden="true"></span>
+      <span class="glance-label">LATEST LOCAL VERIFICATION</span>
+      <strong id="overview-test-result">Not recorded</strong>
+      <span id="overview-test-time" class="glance-time"></span>
+      <a href="#verification">Full validation record ↗</a>
+    </div>
+
+    <section class="section section-blockers">
+      <div class="section-heading">
+        <div><div class="eyebrow">DECISION SUPPORT</div><h2>What limits confidence right now</h2></div>
+        <span class="section-note">Top unresolved dependencies</span>
+      </div>
+      <div class="blocker-list" id="top-blockers"></div>
+    </section>
+
+    <section class="section" id="architecture">
+      <div class="section-heading">
+        <div><div class="eyebrow">01 / SYSTEM MAP</div><h2>Architecture & trust boundaries</h2></div>
+        <span class="section-note">Authorization ends before the external effect.</span>
+      </div>
+      <div class="architecture-panel">
+        <div class="diagram-label"><span>REQUEST → DECISION → EFFECT</span><span class="diagram-key"><i class="key-built"></i> code exists <i class="key-boundary"></i> external boundary</span></div>
+        <div id="request-flow" class="flow-row"></div>
+        <div class="approval-branch">
+          <span>OPTIONAL APPROVAL PATH · REQUIRE_APPROVAL DOES NOT DISPATCH</span>
+          <div id="approval-flow" class="flow-row"></div>
+        </div>
+        <div class="boundary-line"><span>ENFORCEMENT BOUNDARY · gateway must be the only path to protected tools</span></div>
+        <div id="effect-flow" class="flow-row effect-flow"></div>
+        <div class="evidence-path">
+          <div class="path-label"><span class="path-symbol">↘</span><span>EVIDENCE & PERSISTENCE PATH</span></div>
+          <div id="evidence-flow" class="evidence-flow"></div>
+        </div>
+        <div id="architecture-details" class="architecture-details"></div>
+      </div>
+      <p class="subtle-note">The map describes repository components and documented contracts. A test or interface does not establish deployment enforcement.</p>
+    </section>
+
+    <section class="section" id="foundations">
+      <div class="section-heading">
+        <div><div class="eyebrow">02 / STRUCTURAL INTEGRITY</div><h2>Foundation assessment</h2></div>
+        <div class="filter-inline"><label for="foundation-filter">Filter</label><select id="foundation-filter"><option value="all">All states</option></select></div>
+      </div>
+      <div class="assessment-grid" id="assessment-grid"></div>
+    </section>
+
+    <section class="section" id="inventory">
+      <div class="section-heading">
+        <div><div class="eyebrow">03 / REPOSITORY SURFACE</div><h2>Component inventory</h2></div>
+        <span class="section-note" id="inventory-summary"></span>
+      </div>
+      <div class="toolbar">
+        <label class="search-box"><span aria-hidden="true">⌕</span><input id="inventory-search" type="search" placeholder="Search components, paths, dependencies…" aria-label="Search components"></label>
+        <label class="select-label">Status<select id="inventory-status"><option value="all">All statuses</option></select></label>
+        <label class="select-label">Type<select id="inventory-type"><option value="all">All types</option></select></label>
+      </div>
+      <div class="inventory-table-wrap">
+        <table class="inventory-table">
+          <thead><tr><th>COMPONENT / PATH</th><th>STATUS</th><th>DEPENDENCIES</th><th>TEST SIGNAL</th><th></th></tr></thead>
+          <tbody id="inventory-body"></tbody>
+        </table>
+      </div>
+      <p class="subtle-note">Cargo packages, paths and direct dependencies are discovered by the refresh script. Judgments and next actions are maintained in dashboard-data.json.</p>
+    </section>
+
+    <section class="section" id="security">
+      <div class="section-heading">
+        <div><div class="eyebrow">04 / IMPLEMENTATION ≠ GUARANTEE</div><h2>Security assurance matrix</h2></div>
+        <label class="filter-inline">Show<select id="security-filter"><option value="all">All controls</option></select></label>
+      </div>
+      <div class="assurance-intro"><span class="shield-mark">⌑</span><p><strong>What these statuses mean:</strong> mechanisms and focused evidence are assessed separately from environmental assumptions. Nothing here is a certification or production-readiness claim.</p></div>
+      <div class="security-list" id="security-list"></div>
+    </section>
+
+    <section class="section" id="readiness">
+      <div class="section-heading">
+        <div><div class="eyebrow">05 / PRODUCTIZATION WORKSTREAM</div><h2>Plug-and-play readiness</h2></div>
+        <span class="section-note">Manual steps between this repo and a protected real tool</span>
+      </div>
+      <div class="readiness-grid" id="readiness-grid"></div>
+    </section>
+
+    <section class="section" id="board">
+      <div class="section-heading">
+        <div><div class="eyebrow">06 / PRIORITIZED ENGINEERING</div><h2>Development board</h2></div>
+        <span class="section-note">Priority considers security impact, dependencies and integration friction.</span>
+      </div>
+      <div class="toolbar board-toolbar">
+        <label class="select-label">Category<select id="board-category"><option value="all">All categories</option></select></label>
+        <label class="select-label">Status<select id="board-status"><option value="all">All statuses</option></select></label>
+        <span id="board-count" class="result-count"></span>
+      </div>
+      <div id="board-grid" class="board-grid"></div>
+    </section>
+
+    <section class="section" id="critical-path">
+      <div class="section-heading">
+        <div><div class="eyebrow">07 / SHORTEST SAFE ROUTE</div><h2>Critical path to a local release</h2></div>
+        <span class="section-note">Complete and validate one end-to-end local tool before expanding platform scope.</span>
+      </div>
+      <div id="milestones" class="milestone-list"></div>
+    </section>
+
+    <section class="section" id="verification">
+      <div class="section-heading">
+        <div><div class="eyebrow">08 / VALIDATION RECORD</div><h2>Verification results</h2></div>
+        <span class="section-note" id="verification-stamp">No current result recorded</span>
+      </div>
+      <div id="verification-banner" class="verification-banner"></div>
+      <div id="verification-grid" class="verification-grid"></div>
+      <p class="subtle-note">Configured CI commands are not run results. Local results only apply to the captured worktree at the recorded time. Hosted status for this exact snapshot is unavailable unless explicitly integrated.</p>
+    </section>
+
+    <footer class="footer">
+      <div><strong>PRÆTORE · ENGINEERING COMMAND CENTER</strong><p>Local, offline-capable snapshot · No connection to live CI, databases or running services.</p></div>
+      <div class="footer-right"><span id="footer-refresh">Refresh time unavailable</span><a href="README.md">Methodology & maintenance ↗</a></div>
+    </footer>
+  </main>
+  <script>
+    document.getElementById("menu-toggle").addEventListener("click", function () {
+      const nav = document.getElementById("side-nav");
+      const open = nav.classList.toggle("nav-open");
+      this.setAttribute("aria-expanded", String(open));
+    });
+  </script>
+</body>
+</html>

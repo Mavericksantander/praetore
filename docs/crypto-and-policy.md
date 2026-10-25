@@ -37,7 +37,9 @@ system's cryptographic random source. `AgentKeyPair::from_secret_bytes` is for
 deterministic key restoration and tests; its 32-byte input must already be a
 high-entropy secret. `AgentIdentity` stores the serialized algorithm-tagged
 public key for interoperability. `verified_public_key()` parses it into the
-typed `VerifiedPublicKey` used by verification.
+typed `VerifiedPublicKey` used by verification. Parsing rejects malformed and
+small-order (weak) Ed25519 points before they can be fingerprinted or admitted
+as trust pins; signature verification also uses strict Ed25519 verification.
 
 `Authority::sign_for_agent` signs the authority payload using Ed25519 and
 binds the subject to a SHA-256 hash of the agent's Ed25519 public key.

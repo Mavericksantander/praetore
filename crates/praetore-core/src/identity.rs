@@ -193,9 +193,12 @@ impl VerifiedPublicKey {
             .try_into()
             .map_err(|_| PraetoreError::IdentityVerificationFailed)?;
 
-        VerifyingKey::from_bytes(&key_bytes)
-            .map(Self)
-            .map_err(|_| PraetoreError::IdentityVerificationFailed)
+        let key = VerifyingKey::from_bytes(&key_bytes)
+            .map_err(|_| PraetoreError::IdentityVerificationFailed)?;
+        if key.is_weak() {
+            return Err(PraetoreError::IdentityVerificationFailed);
+        }
+        Ok(Self(key))
     }
 
     pub fn as_bytes(&self) -> [u8; 32] {
@@ -350,5 +353,10 @@ mod tests {
     #[test]
     fn rejects_malformed_ed25519_public_key() {
         assert!(VerifiedPublicKey::from_bytes(&[0; 31]).is_err());
+    }
+
+    #[test]
+    fn rejects_weak_ed25519_public_keys_before_they_are_fingerprinted() {
+        assert!(VerifiedPublicKey::from_bytes(&[0; 32]).is_err());
     }
 }

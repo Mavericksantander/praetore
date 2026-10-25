@@ -68,6 +68,14 @@ spec:
               protocol: TCP
     - toEndpoints:
         - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-sandbox
+            app.kubernetes.io/name: praetore-sandbox-supervisor
+      toPorts:
+        - ports:
+            - port: "8443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
             k8s:io.kubernetes.pod.namespace: kube-system
             k8s-app: kube-dns
       toPorts:
@@ -114,14 +122,6 @@ spec:
               protocol: TCP
     - toEndpoints:
         - matchLabels:
-            k8s:io.kubernetes.pod.namespace: praetore-sandbox
-            app.kubernetes.io/name: praetore-sandbox-supervisor
-      toPorts:
-        - ports:
-            - port: "8443"
-              protocol: TCP
-    - toEndpoints:
-        - matchLabels:
             k8s:io.kubernetes.pod.namespace: kube-system
             k8s-app: kube-dns
       toPorts:
@@ -135,7 +135,6 @@ spec:
               - matchName: api.example.com
               - matchPattern: "*.api.example.com"
               - matchPattern: "*.praetore-tools.svc.cluster.local."
-              - matchName: praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local.
     - toFQDNs:
         - matchName: api.example.com
         - matchPattern: "*.api.example.com"
@@ -166,14 +165,19 @@ spec:
   ingress:
     - fromEndpoints:
         - matchLabels:
-            k8s:io.kubernetes.pod.namespace: praetore-egress
-            app.kubernetes.io/name: egress-proxy
+            k8s:io.kubernetes.pod.namespace: praetore-gateway
+            app.kubernetes.io/name: praetore-gateway
+      toPorts:
+        - ports:
+            - port: "8443"
+              protocol: TCP
+    - fromEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: praetore-sandbox
             praetore.io/component: tool-invocation
       toPorts:
         - ports:
-            - port: "8443"
+            - port: "8444"
               protocol: TCP
   egress:
     - toEntities:
@@ -214,7 +218,7 @@ spec:
             app.kubernetes.io/name: praetore-sandbox-supervisor
       toPorts:
         - ports:
-            - port: "8443"
+            - port: "8444"
               protocol: TCP
     - toEndpoints:
         - matchLabels:

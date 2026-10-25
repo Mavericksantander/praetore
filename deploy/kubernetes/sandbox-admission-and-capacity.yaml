@@ -1,0 +1,216 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: praetore-sandbox-jobs
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - batch
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - jobs
+        scope: Namespaced
+  matchConditions:
+    - name: sandbox-namespace
+      expression: request.namespace == "praetore-sandbox"
+  validations:
+    - expression: request.userInfo.username == "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
+      message: Only the sandbox supervisor ServiceAccount may create or start sandbox Jobs.
+    - expression: (request.operation == "CREATE" && object.spec.suspend == true) || (request.operation == "UPDATE" && oldObject.spec.suspend == true && object.spec.suspend == false && object.spec.template == oldObject.spec.template && object.metadata.labels == oldObject.metadata.labels && object.metadata.annotations == oldObject.metadata.annotations && object.spec.parallelism == oldObject.spec.parallelism && object.spec.completions == oldObject.spec.completions && object.spec.backoffLimit == oldObject.spec.backoffLimit && object.spec.activeDeadlineSeconds == oldObject.spec.activeDeadlineSeconds && object.spec.ttlSecondsAfterFinished == oldObject.spec.ttlSecondsAfterFinished)
+      message: Sandbox Jobs may only be created suspended and updated once to start, without changing identity, action, or pod template.
+    - expression: object.spec.parallelism == 1 && object.spec.completions == 1 && object.spec.backoffLimit == 0
+      message: Sandbox Jobs must be single-shot and must not retry.
+    - expression: has(object.spec.activeDeadlineSeconds) && object.spec.activeDeadlineSeconds <= 120
+      message: Sandbox Jobs must have an active deadline of at most 120 seconds.
+    - expression: has(object.spec.ttlSecondsAfterFinished) && object.spec.ttlSecondsAfterFinished <= 300
+      message: Completed sandbox Jobs must be garbage-collected within five minutes.
+    - expression: object.spec.template.spec.runtimeClassName == "praetore-firecracker"
+      message: Sandbox Jobs must use the Firecracker RuntimeClass.
+    - expression: object.spec.template.spec.serviceAccountName == "praetore-sandbox-worker" && object.spec.template.spec.automountServiceAccountToken == false
+      message: Sandbox workers must use the tokenless worker ServiceAccount.
+    - expression: object.spec.template.spec.restartPolicy == "Never" && object.spec.template.spec.enableServiceLinks == false
+      message: Sandbox workers must not restart or receive implicit service links.
+    - expression: has(object.spec.template.spec.terminationGracePeriodSeconds) && object.spec.template.spec.terminationGracePeriodSeconds <= 5
+      message: Sandbox workers must terminate within five seconds after cancellation.
+    - expression: object.metadata.labels["praetore.io/component"] == "tool-invocation" && object.spec.template.metadata.labels["praetore.io/component"] == "tool-invocation" && object.metadata.labels["praetore.io/execution-id"].matches("^[a-f0-9]{52}$") && object.spec.template.metadata.labels["praetore.io/execution-id"] == object.metadata.labels["praetore.io/execution-id"] && object.metadata.annotations["praetore.io/execution-key-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].startsWith(object.metadata.labels["praetore.io/execution-id"]) && object.spec.template.metadata.annotations["praetore.io/execution-key-sha256"] == object.metadata.annotations["praetore.io/execution-key-sha256"] && object.metadata.labels["praetore.io/action-digest"].matches("^[a-f0-9]{52}$") && object.spec.template.metadata.labels["praetore.io/action-digest"] == object.metadata.labels["praetore.io/action-digest"] && object.metadata.annotations["praetore.io/action-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/action-sha256"].startsWith(object.metadata.labels["praetore.io/action-digest"]) && object.spec.template.metadata.annotations["praetore.io/action-sha256"] == object.metadata.annotations["praetore.io/action-sha256"] && object.metadata.annotations["praetore.io/result-token-sha256"].matches("^[a-f0-9]{64}$") && object.spec.template.metadata.annotations["praetore.io/result-token-sha256"] == object.metadata.annotations["praetore.io/result-token-sha256"] && object.metadata.labels["praetore.io/tool-profile"].matches("^[a-z0-9][a-z0-9-]{0,62}$")
+      message: Sandbox Jobs must carry consistent execution, action digest, and approved-profile identity labels.
+    - expression: object.metadata.name == "tool-" + object.metadata.labels["praetore.io/execution-id"]
+      message: Sandbox Job names must be deterministic for the signed execution identity.
+    - expression: object.spec.template.spec.hostNetwork == false && object.spec.template.spec.hostPID == false && object.spec.template.spec.hostIPC == false
+      message: Sandbox Jobs must not share host namespaces or networking.
+    - expression: object.spec.template.spec.containers.size() == 1
+      message: Sandbox Jobs may contain exactly one runner container.
+    - expression: '!has(object.spec.template.spec.initContainers) || object.spec.template.spec.initContainers.size() == 0'
+      message: Sandbox Jobs may not add init containers.
+    - expression: object.spec.template.spec.containers.all(c, c.image.matches("^registry\\.example\\.com/praetore/tool-runner@sha256:[a-f0-9]{64}$"))
+      message: Sandbox runner images must match the approved registry and be pinned by a SHA-256 digest.
+    - expression: object.spec.template.spec.containers.all(c, c.command == ["/usr/local/bin/praetore-tool-runner"] && c.args == ["--invocation", "/run/praetore/invocation/invocation.json"])
+      message: Sandbox Jobs must use the fixed tool-runner command and invocation path.
+    - expression: object.spec.template.spec.containers.all(c, c.imagePullPolicy == "Always" && c.env.size() == 6 && c.env.exists(e, e.name == "PRAETORE_RESULT_URL" && e.value == "https://praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local:8444/v1/results") && c.env.exists(e, e.name == "PRAETORE_RESULT_TOKEN_FILE" && e.value == "/run/praetore/invocation/result-token") && c.env.exists(e, e.name == "PRAETORE_RESULT_CA_FILE" && e.value == "/run/praetore/supervisor-ca/ca.crt") && c.env.exists(e, e.name == "HTTPS_PROXY" && e.value == "http://egress-proxy.praetore-egress.svc.cluster.local:3128") && c.env.exists(e, e.name == "HTTP_PROXY" && e.value == "http://egress-proxy.praetore-egress.svc.cluster.local:3128") && c.env.exists(e, e.name == "NO_PROXY" && e.value == "praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local"))
+      message: Sandbox runners must use the fixed result endpoint and egress proxy configuration.
+    - expression: object.spec.template.spec.containers.all(c, has(c.securityContext) && c.securityContext.runAsNonRoot == true && c.securityContext.runAsUser == 10001 && c.securityContext.runAsGroup == 10001 && c.securityContext.allowPrivilegeEscalation == false && c.securityContext.readOnlyRootFilesystem == true && has(c.securityContext.capabilities) && c.securityContext.capabilities.drop.exists(cap, cap == "ALL") && (!has(c.ports) || c.ports.size() == 0))
+      message: Sandbox containers must be non-root, read-only, unprivileged, and drop all capabilities.
+    - expression: has(object.spec.template.spec.securityContext) && object.spec.template.spec.securityContext.runAsNonRoot == true && object.spec.template.spec.securityContext.seccompProfile.type == "RuntimeDefault"
+      message: Sandbox Pods must run non-root with the RuntimeDefault seccomp profile.
+    - expression: object.spec.template.spec.securityContext.runAsUser == 10001 && object.spec.template.spec.securityContext.runAsGroup == 10001 && object.spec.template.spec.securityContext.fsGroup == 10001
+      message: Sandbox Pods must use the dedicated unprivileged UID, GID, and filesystem group.
+    - expression: object.spec.template.spec.volumes.all(v, (has(v.secret) && v.secret.defaultMode == 288 && v.secret.secretName == "inv-" + object.metadata.labels["praetore.io/execution-id"]) || (has(v.emptyDir) && v.emptyDir.medium == "Memory") || (has(v.configMap) && v.configMap.name == "praetore-sandbox-supervisor-ca"))
+      message: Sandbox Jobs may mount only read-only invocation Secrets, memory-backed temporary storage, and the supervisor CA.
+    - expression: object.spec.template.spec.volumes.size() == 3 && object.spec.template.spec.volumes.exists(v, v.name == "invocation" && has(v.secret) && v.secret.secretName == "inv-" + object.metadata.labels["praetore.io/execution-id"]) && object.spec.template.spec.volumes.exists(v, v.name == "tmp" && has(v.emptyDir)) && object.spec.template.spec.volumes.exists(v, v.name == "supervisor-ca" && has(v.configMap) && v.configMap.name == "praetore-sandbox-supervisor-ca")
+      message: Sandbox Jobs must use only the declared invocation, temporary, and supervisor CA volumes.
+    - expression: object.spec.template.spec.containers.all(c, c.volumeMounts.size() == 3 && c.volumeMounts.exists(m, m.name == "invocation" && m.mountPath == "/run/praetore/invocation" && m.readOnly == true) && c.volumeMounts.exists(m, m.name == "tmp" && m.mountPath == "/tmp" && !m.readOnly) && c.volumeMounts.exists(m, m.name == "supervisor-ca" && m.mountPath == "/run/praetore/supervisor-ca" && m.readOnly == true))
+      message: Sandbox volume mounts must use the fixed read-only paths.
+    - expression: object.spec.template.spec.containers.all(c, has(c.resources.requests) && has(c.resources.limits))
+      message: Sandbox runner containers must declare resource requests and limits.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: praetore-sandbox-jobs
+spec:
+  policyName: praetore-sandbox-jobs
+  validationActions:
+    - Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: praetore-sandbox
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: praetore-sandbox-invocation-secrets
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - ""
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+        resources:
+          - secrets
+        scope: Namespaced
+  matchConditions:
+    - name: sandbox-namespace
+      expression: request.namespace == "praetore-sandbox"
+  validations:
+    - expression: object.metadata.labels["praetore.io/component"] != "invocation-input" || request.userInfo.username == "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
+      message: Only the sandbox supervisor ServiceAccount may create invocation Secrets.
+    - expression: object.metadata.labels["praetore.io/component"] != "supervisor-tls" || request.userInfo.username == "system:serviceaccount:praetore-security:tls-provisioner"
+      message: Only the dedicated TLS provisioner ServiceAccount may create or rotate the supervisor TLS Secret.
+    - expression: request.operation == "CREATE"
+      message: Invocation Secrets are immutable and cannot be updated.
+    - expression: object.immutable == true
+      message: Sandbox Secrets must be immutable.
+    - expression: (object.metadata.labels["praetore.io/component"] == "invocation-input" && object.metadata.name == "inv-" + object.metadata.labels["praetore.io/execution-id"] && object.metadata.labels["praetore.io/execution-id"].matches("^[a-f0-9]{52}$") && object.metadata.labels["praetore.io/action-digest"].matches("^[a-f0-9]{52}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].startsWith(object.metadata.labels["praetore.io/execution-id"]) && object.metadata.annotations["praetore.io/action-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/action-sha256"].startsWith(object.metadata.labels["praetore.io/action-digest"]) && object.metadata.ownerReferences.exists(owner, owner.apiVersion == "batch/v1" && owner.kind == "Job" && owner.name == "tool-" + object.metadata.labels["praetore.io/execution-id"] && owner.controller == true) && object.type == "Opaque" && object.data.size() == 2 && "invocation.json" in object.data && "result-token" in object.data) || (object.metadata.labels["praetore.io/component"] == "supervisor-tls" && object.metadata.name == "praetore-supervisor-tls" && object.type == "kubernetes.io/tls" && object.data.size() == 2 && "tls.crt" in object.data && "tls.key" in object.data)
+      message: Sandbox Secrets must be an invocation input with the fixed name and keys, or the operator-managed supervisor TLS certificate.
+    - expression: object.metadata.labels["praetore.io/component"] != "supervisor-tls" || request.userInfo.username != "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
+      message: The supervisor ServiceAccount may not create or rotate its own TLS identity.
+    - expression: object.data.values().all(value, size(value) <= 87384)
+      message: Encoded sandbox Secret values may not exceed 64 KiB.
+    - expression: '!has(object.stringData) || object.stringData.size() == 0'
+      message: Secret values must use the immutable data field.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: praetore-sandbox-invocation-secrets
+spec:
+  policyName: praetore-sandbox-invocation-secrets
+  validationActions:
+    - Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: praetore-sandbox
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: praetore-sandbox-execution-claims
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups:
+          - ""
+        apiVersions:
+          - v1
+        operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+        resources:
+          - configmaps
+        scope: Namespaced
+  matchConditions:
+    - name: sandbox-namespace
+      expression: request.namespace == "praetore-sandbox"
+  validations:
+    - expression: request.userInfo.username == "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
+      message: Only the sandbox supervisor ServiceAccount may reserve execution identities.
+    - expression: request.operation == "CREATE" && object.immutable == true
+      message: Execution claims must be immutable and create-only.
+    - expression: object.metadata.name == "claim-" + object.metadata.labels["praetore.io/execution-id"] && object.metadata.labels["praetore.io/component"] == "execution-claim" && object.metadata.labels["praetore.io/execution-id"].matches("^[a-f0-9]{52}$") && object.metadata.labels["praetore.io/action-digest"].matches("^[a-f0-9]{52}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].startsWith(object.metadata.labels["praetore.io/execution-id"]) && object.metadata.annotations["praetore.io/action-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/action-sha256"].startsWith(object.metadata.labels["praetore.io/action-digest"])
+      message: Execution claims must persist the deterministic execution identity and exact action digest.
+    - expression: (!has(object.data) || object.data.size() == 0) && (!has(object.binaryData) || object.binaryData.size() == 0)
+      message: Execution claims must not contain request payloads or credentials.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: praetore-sandbox-execution-claims
+spec:
+  policyName: praetore-sandbox-execution-claims
+  validationActions:
+    - Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: praetore-sandbox
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: praetore-sandbox-capacity
+  namespace: praetore-sandbox
+spec:
+  hard:
+    count/jobs.batch: "50"
+    count/secrets: "100"
+    count/configmaps: "10000"
+    count/pods: "50"
+    count/services: "10"
+    requests.cpu: "10"
+    requests.memory: 5Gi
+    requests.ephemeral-storage: 10Gi
+    limits.cpu: "50"
+    limits.memory: 25Gi
+    limits.ephemeral-storage: 20Gi
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: praetore-sandbox-container-limits
+  namespace: praetore-sandbox
+spec:
+  limits:
+    - type: Container
+      min:
+        cpu: 50m
+        memory: 64Mi
+        ephemeral-storage: 16Mi
+      max:
+        cpu: "2"
+        memory: 1Gi
+        ephemeral-storage: 256Mi

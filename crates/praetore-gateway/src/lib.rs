@@ -45,7 +45,7 @@
 use praetore_core::{
     Action, AtomicAuthorizationCommit, AtomicEvaluationError, Authority, AuthorizationCommitError,
     AuthorizationRequest, DecisionOutcome, EvaluationMode, Evidence, PraetoreError,
-    canonical::canonicalize_json, engine::AuthorizationEngine,
+    canonical::canonicalize_json, engine::AuthorizationEngine, freshness::FreshnessError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -835,12 +835,14 @@ impl Gateway {
         if decision.challenge != expected {
             return Err(ApprovalError::InvalidChallenge.into());
         }
-        let expires_at = OffsetDateTime::parse(&expected.expires_at, &Rfc3339)
-            .map_err(|_| ApprovalError::InvalidChallenge)?;
-        if OffsetDateTime::now_utc() >= expires_at {
-            return Err(ApprovalError::Expired.into());
-        }
+        self.validate_approval_time_bounds(&record.evidence)?;
         verifier.verify(&decision)?;
+        if decision.outcome == HumanApprovalOutcome::Approve {
+            self.engine
+                .validate_evidence_for_dispatch(&record.evidence)
+                .map_err(GatewayError::Authorization)?;
+        }
+        self.validate_approval_time_bounds(&record.evidence)?;
         self.journal.record_human_approval(key, &decision)?;
         record.human_approval = Some(decision.clone());
 
@@ -850,6 +852,10 @@ impl Gateway {
         }
 
         record.execution = ExecutionStatus::Dispatched;
+        if let Err(error) = self.engine.validate_evidence_for_dispatch(&record.evidence) {
+            self.record_terminal_attested(&mut record, ExecutionStatus::Failed, None)?;
+            return Err(GatewayError::Authorization(error));
+        }
         let (execution, output) = match self.dispatcher.dispatch(
             key,
             &record.evidence.authority,
@@ -877,6 +883,18 @@ impl Gateway {
             execution_attestation,
         );
         Ok(HumanApprovalReceipt { decision, receipt })
+    }
+
+    fn validate_approval_time_bounds(&self, evidence: &Evidence) -> Result<(), GatewayError> {
+        self.engine
+            .validate_evidence_time_bounds(evidence)
+            .map_err(|error| match error {
+                PraetoreError::IntentInvalid
+                | PraetoreError::FreshnessCheckFailed(FreshnessError::Expired) => {
+                    GatewayError::Approval(ApprovalError::Expired)
+                }
+                error => GatewayError::Authorization(error),
+            })
     }
 
     fn attest_record(&self, record: &mut ExecutionRecord) -> Result<GatewayReceipt, GatewayError> {
@@ -1014,6 +1032,15 @@ impl Gateway {
         }
 
         self.journal.mark_dispatched(key)?;
+        if let Err(error) = self.engine.validate_evidence_for_dispatch(&evidence) {
+            let execution = ExecutionStatus::Failed;
+            let attestation =
+                self.create_execution_attestation(&evidence, authorization, execution, None)?;
+            self.journal
+                .record_terminal_attested(key, execution, None, &attestation)
+                .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
+            return Err(GatewayError::Authorization(error));
+        }
         let action_digest = action_digest(&evidence.action)?;
         let (execution, output) = match self.dispatcher.dispatch(
             key,
