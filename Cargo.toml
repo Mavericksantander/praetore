@@ -7,6 +7,7 @@ members = [
     "crates/praetore-replay-postgres",
     "crates/praetore-gateway",
     "crates/praetore-gateway-service",
+    "crates/praetore-cli",
     "crates/praetore-observe",
 ]
 

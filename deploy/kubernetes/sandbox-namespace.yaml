@@ -8,6 +8,27 @@ metadata:
     pod-security.kubernetes.io/warn: restricted
 ---
 apiVersion: v1
+kind: Service
+metadata:
+  name: praetore-sandbox-supervisor
+  namespace: praetore-sandbox
+  labels:
+    app.kubernetes.io/name: praetore-sandbox-supervisor
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: praetore-sandbox-supervisor
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+    - name: worker-results
+      port: 8444
+      targetPort: 8444
+      protocol: TCP
+---
+apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: praetore-sandbox-supervisor
@@ -34,8 +55,7 @@ rules:
     verbs:
       - create
       - get
-      - list
-      - watch
+      - patch
       - delete
   - apiGroups:
       - ""
@@ -43,8 +63,12 @@ rules:
       - secrets
     verbs:
       - create
-      - get
-      - delete
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - create
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

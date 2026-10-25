@@ -17,19 +17,32 @@ path = "src/lib.rs"
 name = "praetore-gateway-demo"
 path = "src/main.rs"
 
+[[bin]]
+name = "praetore-sandbox-supervisor"
+path = "src/sandbox_supervisor_main.rs"
+
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
 ed25519-dalek = "2"
 hex = "0.4.3"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["server", "service", "tokio"] }
 postgres = "0.19"
 praetore-core = { path = "../praetore-core" }
 praetore-gateway = { path = "../praetore-gateway" }
 praetore-replay-postgres = { path = "../praetore-replay-postgres" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11.0"
+subtle = "2.6.1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = { version = "0.5", features = ["util"] }
 uuid = "1.18"

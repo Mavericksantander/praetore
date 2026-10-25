@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -45,16 +45,56 @@ pub trait TrustedClock: Send + Sync {
 #[derive(Clone)]
 enum ClockSource {
     System(Arc<dyn Clock>),
-    Trusted(Arc<dyn TrustedClock>),
+    Trusted(Arc<TrustedClockSource>),
+}
+
+struct TrustedClockSource {
+    clock: Arc<dyn TrustedClock>,
+    state: Mutex<TrustedClockState>,
+}
+
+struct TrustedClockState {
+    last_returned: Option<OffsetDateTime>,
+    failed: bool,
+}
+
+impl TrustedClockSource {
+    fn new(clock: Arc<dyn TrustedClock>) -> Self {
+        Self {
+            clock,
+            state: Mutex::new(TrustedClockState {
+                last_returned: None,
+                failed: false,
+            }),
+        }
+    }
+
+    fn now(&self) -> Result<OffsetDateTime> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| PraetoreError::TrustedClockUnavailable)?;
+        if state.failed {
+            return Err(PraetoreError::TrustedClockUnavailable);
+        }
+        let now = self
+            .clock
+            .now()
+            .map_err(|_| PraetoreError::TrustedClockUnavailable)?;
+        if state.last_returned.is_some_and(|last| now < last) {
+            state.failed = true;
+            return Err(PraetoreError::TrustedClockUnavailable);
+        }
+        state.last_returned = Some(now);
+        Ok(now)
+    }
 }
 
 impl ClockSource {
     fn now(&self) -> Result<OffsetDateTime> {
         match self {
             Self::System(clock) => Ok(clock.now()),
-            Self::Trusted(clock) => clock
-                .now()
-                .map_err(|_| PraetoreError::TrustedClockUnavailable),
+            Self::Trusted(clock) => clock.now(),
         }
     }
 }
@@ -528,13 +568,17 @@ impl AuthorizationEngine {
 
     /// Constructs a HighAssurance engine with a trusted, health-checked time
     /// source. The source is checked during construction and on every
-    /// evaluation; an unhealthy source prevents authorization.
+    /// evaluation; an unhealthy or regressing source prevents authorization.
     pub fn production_with_trusted_clock(
         policy: Policy,
         config: HighAssuranceConfig,
         clock: impl TrustedClock + 'static,
     ) -> Result<Self> {
-        Self::production_with_clock_source(policy, config, ClockSource::Trusted(Arc::new(clock)))
+        Self::production_with_clock_source(
+            policy,
+            config,
+            ClockSource::Trusted(Arc::new(TrustedClockSource::new(Arc::new(clock)))),
+        )
     }
 
     fn production_with_clock_source(
@@ -605,10 +649,6 @@ impl AuthorizationEngine {
             || self.max_intent_lifetime <= Duration::ZERO
             || self.max_authority_lifetime <= Duration::ZERO
             || self.max_freshness_lease <= Duration::ZERO
-            || self.audience.as_deref().is_none_or(str::is_empty)
-            || self.max_intent_lifetime <= Duration::ZERO
-            || self.max_authority_lifetime <= Duration::ZERO
-            || self.max_freshness_lease <= Duration::ZERO
             || self
                 .trusted_issuers
                 .iter()
@@ -618,6 +658,11 @@ impl AuthorizationEngine {
         }
         if require_replay_guard && self.replay_guard.is_none() {
             return Err(PraetoreError::ReplayGuardUnavailable);
+        }
+        if now.checked_add(self.max_freshness_lease).is_none() {
+            return Err(PraetoreError::InvalidRequest(
+                "maximum freshness lease exceeds the supported clock range".into(),
+            ));
         }
 
         if let Some(bindings) = &self.tenant_issuer_bindings {
@@ -664,6 +709,187 @@ impl AuthorizationEngine {
 
     pub fn mode(&self) -> EvaluationMode {
         self.mode
+    }
+
+    /// Checks the signed authorization's time bounds using the configured
+    /// clock. This is useful for decisions that do not dispatch an action but
+    /// still must not be consumed after their challenge has expired.
+    pub fn validate_evidence_time_bounds(&self, evidence: &Evidence) -> Result<()> {
+        if self.mode != EvaluationMode::HighAssurance
+            || evidence.evidence_schema_version != 2
+            || evidence.evaluation_mode.as_deref() != Some("high_assurance")
+            || !evidence.verify_integrity()
+        {
+            return Err(PraetoreError::EvidenceError(
+                "evidence is not valid HighAssurance evidence".into(),
+            ));
+        }
+        let attester = self
+            .evidence_attester
+            .as_ref()
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        evidence.verify_attester_signature(&attester.public_key()?)?;
+        evidence.verify_agent_intent()?;
+
+        let intent = evidence
+            .intent_v2
+            .as_ref()
+            .ok_or(PraetoreError::IntentInvalid)?;
+        let issued_at = OffsetDateTime::parse(&intent.issued_at, &Rfc3339)
+            .map_err(|_| PraetoreError::IntentInvalid)?;
+        let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
+            .map_err(|_| PraetoreError::IntentInvalid)?;
+        let decided_at = evidence
+            .decided_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        let freshness_valid_until = evidence
+            .freshness_valid_until
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        let now = self.clock.now()?;
+
+        if now < issued_at || now < decided_at {
+            return Err(PraetoreError::TrustedClockUnavailable);
+        }
+        if expires_at <= now {
+            return Err(PraetoreError::IntentInvalid);
+        }
+        if freshness_valid_until <= now {
+            return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired));
+        }
+        Ok(())
+    }
+
+    /// Revalidates an attested HighAssurance authorization immediately before
+    /// a gateway dispatches its bound action.
+    pub fn validate_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
+        if self.mode != EvaluationMode::HighAssurance
+            || evidence.evidence_schema_version != 2
+            || evidence.evaluation_mode.as_deref() != Some("high_assurance")
+            || !matches!(
+                evidence.decision.outcome,
+                crate::decision::DecisionOutcome::Allow
+                    | crate::decision::DecisionOutcome::RequireApproval
+            )
+            || !evidence.verify_integrity()
+        {
+            return Err(PraetoreError::EvidenceError(
+                "evidence is not a valid HighAssurance allow decision".into(),
+            ));
+        }
+
+        let attester = self
+            .evidence_attester
+            .as_ref()
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        evidence.verify_attester_signature(&attester.public_key()?)?;
+        evidence.verify_agent_intent()?;
+
+        let request = AuthorizationRequest {
+            request_id: evidence.request_id,
+            agent: evidence.agent.clone(),
+            authority: evidence.authority.clone(),
+            action: evidence.action.clone(),
+            trace_id: evidence.trace_id.clone(),
+            context: evidence.context.clone(),
+            agent_signature: evidence.agent_signature.clone(),
+            intent_v2: evidence.intent_v2.clone(),
+        };
+        let authority_digest = request.authority.content_digest()?;
+        if evidence.authority_digest.as_deref() != Some(authority_digest.as_str())
+            || evidence.policy_digest.as_deref() != self.expected_policy_digest.as_deref()
+            || self.expected_policy_digest.as_deref() != Some(self.policy.digest()?.as_str())
+        {
+            return Err(PraetoreError::PolicyIntegrityFailed);
+        }
+
+        let decided_at = evidence
+            .decided_at
+            .as_deref()
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        let decided_at = OffsetDateTime::parse(decided_at, &Rfc3339)
+            .map_err(|_| PraetoreError::PolicyIntegrityFailed)?;
+        let freshness_valid_until = evidence
+            .freshness_valid_until
+            .as_deref()
+            .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+        let freshness_valid_until = OffsetDateTime::parse(freshness_valid_until, &Rfc3339)
+            .map_err(|_| PraetoreError::PolicyIntegrityFailed)?;
+
+        let now = self.clock.now()?;
+        if now < decided_at {
+            return Err(PraetoreError::TrustedClockUnavailable);
+        }
+        self.validate_production_configuration(now, false)?;
+        self.validate_high_assurance_request(&request, now)?;
+        let decision = self.evaluate_request(&request, now)?;
+        if decision != evidence.decision {
+            return Err(PraetoreError::PolicyIntegrityFailed);
+        }
+        if freshness_valid_until <= now {
+            return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired));
+        }
+
+        let maximum_valid_until = now.checked_add(self.max_freshness_lease).ok_or_else(|| {
+            PraetoreError::InvalidRequest(
+                "maximum freshness lease exceeds the supported clock range".into(),
+            )
+        })?;
+        if freshness_valid_until > maximum_valid_until {
+            return Err(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::LeaseTooLong,
+            ));
+        }
+
+        let intent = request
+            .intent_v2
+            .as_ref()
+            .ok_or(PraetoreError::IntentInvalid)?;
+        let fresh_lease = self
+            .freshness_provider
+            .as_ref()
+            .ok_or(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::Unavailable,
+            ))?
+            .check_authority(
+                &request.agent.key_fingerprint()?,
+                &request.authority.id,
+                &authority_digest,
+                &intent.policy_digest,
+                now,
+            )
+            .map_err(PraetoreError::FreshnessCheckFailed)?;
+
+        let final_now = self.clock.now()?;
+        if final_now < now {
+            return Err(PraetoreError::TrustedClockUnavailable);
+        }
+        self.validate_production_configuration(final_now, false)?;
+        self.validate_high_assurance_request(&request, final_now)?;
+        if fresh_lease.valid_until <= final_now || freshness_valid_until <= final_now {
+            return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired));
+        }
+        if fresh_lease.valid_until
+            > final_now
+                .checked_add(self.max_freshness_lease)
+                .ok_or_else(|| {
+                    PraetoreError::InvalidRequest(
+                        "maximum freshness lease exceeds the supported clock range".into(),
+                    )
+                })?
+        {
+            return Err(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::LeaseTooLong,
+            ));
+        }
+        let final_decision = self.evaluate_request(&request, final_now)?;
+        if final_decision != evidence.decision {
+            return Err(PraetoreError::PolicyIntegrityFailed);
+        }
+        Ok(())
     }
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
@@ -748,10 +974,16 @@ impl AuthorizationEngine {
                     now,
                 )
                 .map_err(PraetoreError::FreshnessCheckFailed)?;
-            if freshness.valid_until < now {
+            if freshness.valid_until <= now {
                 return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired).into());
             }
-            if freshness.valid_until > now + self.max_freshness_lease {
+            let maximum_valid_until =
+                now.checked_add(self.max_freshness_lease).ok_or_else(|| {
+                    PraetoreError::InvalidRequest(
+                        "maximum freshness lease exceeds the supported clock range".into(),
+                    )
+                })?;
+            if freshness.valid_until > maximum_valid_until {
                 return Err(
                     PraetoreError::FreshnessCheckFailed(FreshnessError::LeaseTooLong).into(),
                 );
@@ -760,6 +992,8 @@ impl AuthorizationEngine {
         } else {
             None
         };
+        let high_assurance_request =
+            (self.mode == EvaluationMode::HighAssurance).then(|| request.clone());
         let mut evidence = request.attest(decision)?;
         evidence.bind_policy_digest(self.policy.digest()?)?;
         if self.mode == EvaluationMode::HighAssurance {
@@ -783,6 +1017,25 @@ impl AuthorizationEngine {
             evidence.sign(attester)?;
         }
         if self.mode == EvaluationMode::HighAssurance {
+            let commit_now = self.clock.now()?;
+            if commit_now < now {
+                return Err(PraetoreError::TrustedClockUnavailable.into());
+            }
+            self.validate_production_configuration(commit_now, atomic_commit.is_none())?;
+            let request = high_assurance_request
+                .as_ref()
+                .ok_or(PraetoreError::PolicyIntegrityFailed)?;
+            self.validate_high_assurance_request(request, commit_now)?;
+            let current_decision = self.evaluate_request(request, commit_now)?;
+            if current_decision != evidence.decision {
+                return Err(PraetoreError::PolicyIntegrityFailed.into());
+            }
+            let lease = freshness.ok_or(PraetoreError::FreshnessCheckFailed(
+                FreshnessError::Unavailable,
+            ))?;
+            if lease.valid_until <= commit_now {
+                return Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired).into());
+            }
             if let Some(commit) = atomic_commit {
                 let attester = self
                     .evidence_attester
@@ -839,7 +1092,7 @@ impl AuthorizationEngine {
             .map_err(|_| PraetoreError::IntentInvalid)?;
         let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
             .map_err(|_| PraetoreError::IntentInvalid)?;
-        if issued_at > now || expires_at < now || expires_at - issued_at > self.max_intent_lifetime
+        if issued_at > now || expires_at <= now || expires_at - issued_at > self.max_intent_lifetime
         {
             return Err(PraetoreError::IntentInvalid);
         }
@@ -1092,6 +1345,48 @@ mod tests {
         })
     }
 
+    struct AdvancingClock(Arc<Mutex<OffsetDateTime>>);
+
+    impl Clock for AdvancingClock {
+        fn now(&self) -> OffsetDateTime {
+            *self.0.lock().expect("test clock lock")
+        }
+    }
+
+    struct AdvancingFreshnessProvider {
+        clock: Arc<Mutex<OffsetDateTime>>,
+        advance_by: Duration,
+        lease_duration: Duration,
+    }
+
+    impl FreshnessProvider for AdvancingFreshnessProvider {
+        fn check(
+            &self,
+            _agent: &crate::identity::AgentKeyFingerprint,
+            _authority_id: &crate::authority::AuthorityId,
+            _policy_digest: &str,
+            now: OffsetDateTime,
+        ) -> std::result::Result<FreshnessLease, FreshnessError> {
+            Ok(FreshnessLease {
+                valid_until: now + self.lease_duration,
+            })
+        }
+
+        fn check_authority(
+            &self,
+            agent: &crate::identity::AgentKeyFingerprint,
+            authority_id: &crate::authority::AuthorityId,
+            _authority_digest: &str,
+            policy_digest: &str,
+            now: OffsetDateTime,
+        ) -> std::result::Result<FreshnessLease, FreshnessError> {
+            let mut clock = self.clock.lock().expect("test clock lock");
+            *clock += self.advance_by;
+            drop(clock);
+            self.check(agent, authority_id, policy_digest, now)
+        }
+    }
+
     fn add_test_freshness(config: HighAssuranceConfig) -> HighAssuranceConfig {
         config
             .with_audience("test-gateway")
@@ -1180,7 +1475,7 @@ mod tests {
             instant: FixedClock::new("2026-06-01T12:00:00Z").now(),
             healthy: AtomicBool::new(false),
         });
-        engine.clock = ClockSource::Trusted(clock.clone());
+        engine.clock = ClockSource::Trusted(Arc::new(TrustedClockSource::new(clock.clone())));
 
         assert!(matches!(
             engine.evaluate(request.clone()),
@@ -1192,6 +1487,45 @@ mod tests {
             engine.evaluate(request).unwrap().decision.outcome,
             DecisionOutcome::Allow
         );
+    }
+
+    struct MutableTrustedClock {
+        instant: Mutex<OffsetDateTime>,
+    }
+
+    impl TrustedClock for MutableTrustedClock {
+        fn now(&self) -> std::result::Result<OffsetDateTime, TrustedClockError> {
+            Ok(*self.instant.lock().unwrap())
+        }
+    }
+
+    #[test]
+    fn high_assurance_latches_failure_when_trusted_clock_regresses() {
+        let (mut engine, request) = production_engine_with_provider(test_freshness_provider());
+        let start = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let clock = Arc::new(MutableTrustedClock {
+            instant: Mutex::new(start),
+        });
+        engine.clock = ClockSource::Trusted(Arc::new(TrustedClockSource::new(clock.clone())));
+        let evidence = engine.evaluate(request).unwrap();
+
+        *clock.instant.lock().unwrap() = start + Duration::minutes(2);
+        assert!(matches!(
+            engine.validate_evidence_time_bounds(&evidence),
+            Err(PraetoreError::IntentInvalid)
+        ));
+
+        *clock.instant.lock().unwrap() = start + Duration::seconds(30);
+        assert!(matches!(
+            engine.validate_evidence_time_bounds(&evidence),
+            Err(PraetoreError::TrustedClockUnavailable)
+        ));
+
+        *clock.instant.lock().unwrap() = start + Duration::minutes(3);
+        assert!(matches!(
+            engine.validate_evidence_time_bounds(&evidence),
+            Err(PraetoreError::TrustedClockUnavailable)
+        ));
     }
 
     #[test]
@@ -2032,6 +2366,110 @@ mod tests {
     }
 
     #[test]
+    fn production_profile_rejects_noncanonical_audience_and_nonpositive_lifetimes() {
+        let issuer_key = AgentKeyPair::generate();
+        let policy = Policy::new_v2("production", 1, vec![]);
+        let build_config = || {
+            HighAssuranceConfig::new(
+                policy.digest().unwrap(),
+                vec![production_test_pin(&issuer_key, high_assurance_validity())],
+                EvidenceAttesterKey::generate(),
+            )
+            .unwrap()
+            .with_replay_guard(test_replay_guard())
+            .with_freshness_provider(test_freshness_provider())
+        };
+        let invalid_configs = [
+            build_config().with_audience(""),
+            build_config().with_audience(" trailing"),
+            build_config().with_audience("a".repeat(257)),
+            build_config()
+                .with_audience("valid")
+                .with_max_intent_lifetime(Duration::ZERO),
+            build_config()
+                .with_audience("valid")
+                .with_max_authority_lifetime(Duration::seconds(-1)),
+            build_config()
+                .with_audience("valid")
+                .with_max_freshness_lease(Duration::ZERO),
+            build_config()
+                .with_audience("valid")
+                .with_max_freshness_lease(Duration::MAX),
+        ];
+
+        for config in invalid_configs {
+            assert!(matches!(
+                AuthorizationEngine::production_with_clock(
+                    policy.clone(),
+                    config,
+                    FixedClock::new("2026-06-01T12:00:00Z")
+                ),
+                Err(PraetoreError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn production_profile_rejects_invalid_tenant_issuer_bindings() {
+        let issuer_key = AgentKeyPair::generate();
+        let second_issuer_key = AgentKeyPair::generate();
+        let policy = Policy::new_v2("production", 1, vec![]);
+        let issuer_pin = production_test_pin(&issuer_key, high_assurance_validity());
+        let second_issuer_pin = production_test_pin(&second_issuer_key, high_assurance_validity());
+        let issuer_key_id = issuer_pin.key_id().to_owned();
+        let second_issuer_key_id = second_issuer_pin.key_id().to_owned();
+        let base_config = || {
+            HighAssuranceConfig::new(
+                policy.digest().unwrap(),
+                vec![issuer_pin.clone(), second_issuer_pin.clone()],
+                EvidenceAttesterKey::generate(),
+            )
+            .unwrap()
+            .with_audience("test-gateway")
+            .with_replay_guard(test_replay_guard())
+            .with_freshness_provider(test_freshness_provider())
+        };
+        let tenant_a = Uuid::from_u128(1);
+        let tenant_b = Uuid::from_u128(2);
+        let invalid_bindings = [
+            HashMap::new(),
+            HashMap::from([(Uuid::nil(), vec![issuer_key_id.clone()])]),
+            HashMap::from([(tenant_a, Vec::new())]),
+            HashMap::from([(tenant_a, vec!["A".repeat(64)])]),
+            HashMap::from([(tenant_a, vec!["f".repeat(64)])]),
+            HashMap::from([
+                (tenant_a, vec![issuer_key_id.clone()]),
+                (tenant_b, vec![issuer_key_id.clone()]),
+            ]),
+            HashMap::from([(tenant_a, vec![issuer_key_id.clone()])]),
+        ];
+
+        for bindings in invalid_bindings {
+            let config = base_config().with_tenant_issuer_bindings(bindings);
+            assert!(matches!(
+                AuthorizationEngine::production_with_clock(
+                    policy.clone(),
+                    config,
+                    FixedClock::new("2026-06-01T12:00:00Z")
+                ),
+                Err(PraetoreError::TrustStoreFailure)
+            ));
+        }
+
+        let valid_bindings = HashMap::from([
+            (tenant_a, vec![issuer_key_id]),
+            (tenant_b, vec![second_issuer_key_id]),
+        ]);
+        let engine = AuthorizationEngine::production_with_clock(
+            policy.clone(),
+            base_config().with_tenant_issuer_bindings(valid_bindings),
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        )
+        .unwrap();
+        assert_eq!(engine.mode(), EvaluationMode::HighAssurance);
+    }
+
+    #[test]
     fn production_profile_fails_closed_when_replay_guard_is_unavailable() {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
@@ -2080,14 +2518,14 @@ mod tests {
 
     #[test]
     fn production_freshness_provider_must_vouch_for_current_state() {
-        let current_provider = Arc::new(TestFreshnessProvider {
+        let zero_length_provider = Arc::new(TestFreshnessProvider {
             lease_seconds: Ok(0),
         });
-        let (engine, request) = production_engine_with_provider(current_provider);
-        assert_eq!(
-            engine.evaluate(request).unwrap().decision.outcome,
-            DecisionOutcome::Allow
-        );
+        let (engine, request) = production_engine_with_provider(zero_length_provider);
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
+        ));
 
         for error in [
             FreshnessError::Revoked,
@@ -2130,6 +2568,106 @@ mod tests {
     }
 
     #[test]
+    fn production_rechecks_freshness_before_consuming_replay_claim() {
+        let policy = allow_policy();
+        let policy_digest = policy.digest().unwrap();
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let clock = Arc::new(Mutex::new(now));
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(high_assurance_validity());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + Duration::minutes(4),
+                policy_digest.clone(),
+            )
+            .unwrap();
+        let replay_guard = test_replay_guard();
+        let config = HighAssuranceConfig::new(
+            policy_digest,
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_audience("test-gateway")
+        .with_replay_guard(replay_guard.clone())
+        .with_freshness_provider(Arc::new(AdvancingFreshnessProvider {
+            clock: clock.clone(),
+            advance_by: Duration::seconds(31),
+            lease_duration: Duration::seconds(30),
+        }));
+        let engine =
+            AuthorizationEngine::production_with_clock(policy, config, AdvancingClock(clock))
+                .unwrap();
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
+        ));
+        assert!(replay_guard.claims.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dispatch_validation_rejects_evidence_after_its_freshness_lease_expires() {
+        let policy = allow_policy();
+        let policy_digest = policy.digest().unwrap();
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let clock = Arc::new(Mutex::new(now));
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(high_assurance_validity());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + Duration::minutes(4),
+                policy_digest.clone(),
+            )
+            .unwrap();
+        let config = HighAssuranceConfig::new(
+            policy_digest,
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_audience("test-gateway")
+        .with_replay_guard(test_replay_guard())
+        .with_freshness_provider(Arc::new(AdvancingFreshnessProvider {
+            clock: clock.clone(),
+            advance_by: Duration::ZERO,
+            lease_duration: Duration::seconds(30),
+        }));
+        let engine = AuthorizationEngine::production_with_clock(
+            policy,
+            config,
+            AdvancingClock(clock.clone()),
+        )
+        .unwrap();
+
+        let evidence = engine.evaluate(request).unwrap();
+        *clock.lock().unwrap() = now + Duration::seconds(30);
+
+        assert!(matches!(
+            engine.validate_evidence_for_dispatch(&evidence),
+            Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
+        ));
+    }
+
+    #[test]
     fn production_profile_rejects_invalid_intent_metadata_and_unbounded_authority() {
         let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
         request.intent_v2.as_mut().unwrap().audience = "other-gateway".into();
@@ -2166,6 +2704,62 @@ mod tests {
             engine.evaluate(request),
             Err(PraetoreError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn production_profile_rejects_future_and_overlong_intent_windows() {
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let make_signed_case = |issued_at: OffsetDateTime, expires_at: OffsetDateTime| {
+            let policy = allow_policy();
+            let policy_digest = policy.digest().unwrap();
+            let agent_key = AgentKeyPair::generate();
+            let agent = agent_key.identity(AgentId::new());
+            let issuer_key = AgentKeyPair::generate();
+            let mut authority =
+                Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                    .with_validity(high_assurance_validity());
+            authority.sign_for_agent(&issuer_key, &agent).unwrap();
+            let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+            request
+                .sign_intent_v2(
+                    &agent_key,
+                    "test-gateway",
+                    issued_at,
+                    expires_at,
+                    policy_digest.clone(),
+                )
+                .unwrap();
+            let config = HighAssuranceConfig::new(
+                policy_digest,
+                vec![production_test_pin(&issuer_key, high_assurance_validity())],
+                EvidenceAttesterKey::generate(),
+            )
+            .unwrap()
+            .with_audience("test-gateway")
+            .with_replay_guard(test_replay_guard())
+            .with_freshness_provider(test_freshness_provider());
+            let engine = AuthorizationEngine::production_with_clock(
+                policy,
+                config,
+                FixedClock::new("2026-06-01T12:00:00Z"),
+            )
+            .unwrap();
+            (engine, request)
+        };
+        let invalid_windows = [
+            (now + Duration::seconds(1), now + Duration::minutes(1)),
+            (now, now + Duration::minutes(6)),
+            (now - Duration::minutes(2), now - Duration::minutes(1)),
+            (now - Duration::minutes(1), now),
+        ];
+
+        for (issued_at, expires_at) in invalid_windows {
+            let (engine, request) = make_signed_case(issued_at, expires_at);
+            assert!(matches!(
+                engine.evaluate(request),
+                Err(PraetoreError::IntentInvalid)
+            ));
+        }
     }
 
     #[test]

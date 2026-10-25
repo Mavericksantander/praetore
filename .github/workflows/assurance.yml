@@ -27,6 +27,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
+      - name: Validate Kubernetes manifest YAML syntax
+        run: |
+          ruby -e 'require "yaml"; Dir.glob("deploy/kubernetes/**/*.yaml").each { |path| YAML.load_stream(File.read(path)); puts "valid YAML: #{path}" }'
       - name: Check changed patch whitespace
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD

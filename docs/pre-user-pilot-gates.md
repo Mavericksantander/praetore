@@ -45,11 +45,16 @@ For each target deployment, retain evidence for every applicable item:
    baseline for bypass controls, action binding, journaling, and crash
    reconciliation; validate it against the actual downstream tool semantics.
    The workspace `praetore-gateway` crate is a synchronous reference only; it
-   does not provide a network service or production-grade durable execution
-   journal. The Firecracker/Kata and per-invocation Job manifests are
-   deployment templates only: the authenticated sandbox supervisor and its
-   gateway adapter are not implemented, and no sandbox claim is established
-   until that path and the target cluster are tested.
+   does not provide a production gateway service or durable journal by itself.
+   The gateway-side mTLS dispatcher and Kubernetes supervisor/Job lifecycle
+   now exist. The production tool-runner image, durable recovery of in-flight
+   worker results, operator cleanup after supervisor interruption, and live
+   cluster tests remain outstanding. The Firecracker/Kata and per-invocation
+   Job manifests remain deployment templates only: no sandbox claim is
+   established until the complete path and target cluster are tested. Validate the
+   `ValidatingAdmissionPolicy` CEL expressions against the target Kubernetes
+   API server and demonstrate that privileged images, altered commands,
+   retries, extra volumes, and worker API access are rejected.
 4. **Time and validity:** monitored trusted time, measured skew, alerting and
    fail-closed behavior when clock health is lost. The library adds no skew
    tolerance and cannot identify a manipulated host clock.

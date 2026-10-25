@@ -327,13 +327,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 require_trusted_clock: true,
             }
         }
+        Ok("sandbox") => {
+            let endpoint = required_env("PRAETORE_GATEWAY_SANDBOX_SUPERVISOR_URL")?;
+            let ca_path = required_env("PRAETORE_GATEWAY_SANDBOX_CA_FILE")?;
+            let identity_path = required_env("PRAETORE_GATEWAY_SANDBOX_CLIENT_IDENTITY_FILE")?;
+            let bindings_path = required_env("PRAETORE_GATEWAY_TENANT_ISSUER_BINDINGS_FILE")?;
+            let bindings = parse_tenant_issuer_bindings(&read_limited(&bindings_path, 1_048_576)?)?;
+            let audience = required_env("PRAETORE_GATEWAY_AUDIENCE")?;
+            GatewayAdapterSetup {
+                dispatcher: Arc::new(
+                    praetore_gateway_service::sandbox_dispatcher::SandboxActionDispatcher::from_pem_files(
+                        &endpoint,
+                        &ca_path,
+                        &identity_path,
+                    )?,
+                ),
+                tenant_issuer_bindings: Some(bindings),
+                audience,
+                require_trusted_clock: true,
+            }
+        }
         Ok("local-demo") | Err(_) => GatewayAdapterSetup {
             dispatcher: Arc::new(LocalDemoDispatcher::new()),
             tenant_issuer_bindings: None,
             audience: "praetore-local-demo".to_owned(),
             require_trusted_clock: false,
         },
-        Ok(_) => return Err("PRAETORE_GATEWAY_ADAPTER must be http or local-demo".into()),
+        Ok(_) => {
+            return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
+        }
     };
     let gateway = Arc::new(build_gateway(
         &database_url,
