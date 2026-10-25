@@ -13,12 +13,12 @@
     }
   },
   "discovered": {
-    "lastRefreshed": "2026-10-25T19:54:24+00:00",
-    "revision": "a86b4b6",
+    "lastRefreshed": "2026-10-25T20:25:04+00:00",
+    "revision": "fd0bb3f",
     "branch": "main",
     "worktree": {
       "available": true,
-      "changedFiles": 37,
+      "changedFiles": 5,
       "clean": false
     },
     "workspacePackageCount": 8,
@@ -181,7 +181,7 @@
         ],
         "externalDependencyCount": 21,
         "testFiles": [],
-        "rustTestAttributes": 23
+        "rustTestAttributes": 24
       },
       {
         "id": "praetore-observe",
@@ -559,7 +559,7 @@
       "id": "sandbox-isolation",
       "area": "Sandbox isolation",
       "status": "partial",
-      "summary": "Kubernetes RuntimeClass/Job/admission/network templates and supervisor plus gateway mTLS dispatcher code exist. The supervisor independently validates authority/action structure and verifies callback token/action/execution digests with constant-time comparison before consuming its one-shot result channel.",
+      "summary": "Kubernetes RuntimeClass/Job/admission/network templates and supervisor plus gateway mTLS dispatcher code exist. The supervisor rejects duplicate JSON keys in startup configuration and HTTP requests before deserialization, independently validates authority/action structure, and verifies callback token/action/execution digests with constant-time comparison before consuming its one-shot result channel.",
       "evidence": [
         "crates/praetore-gateway-service/src/sandbox_supervisor.rs",
         "crates/praetore-gateway-service/src/sandbox_dispatcher.rs",

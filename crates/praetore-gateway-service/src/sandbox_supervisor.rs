@@ -1,14 +1,16 @@
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use praetore_core::{Action, Authority};
+use praetore_core::{Action, Authority, canonical::parse_json_rejecting_duplicates};
 use praetore_gateway::{DispatchReport, ExecutionKey, action_digest, authority_tenant_id};
 use reqwest::{Client, StatusCode as ClientStatus, Url};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -290,7 +292,9 @@ impl SandboxSupervisor {
         if config_json.len() > MAX_REQUEST_BYTES {
             return Err("sandbox supervisor configuration exceeds the size limit".into());
         }
-        let config: SupervisorConfig = serde_json::from_str(config_json)?;
+        let config_value = parse_json_rejecting_duplicates(config_json)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let config: SupervisorConfig = serde_json::from_value(config_value)?;
         if config.schema_version != 1
             || config.routes.is_empty()
             || config.routes.len() > 128
@@ -347,8 +351,12 @@ impl SandboxSupervisor {
 async fn dispatch(
     State(supervisor): State<SandboxSupervisor>,
     headers: HeaderMap,
-    Json(request): Json<DispatchRequest>,
+    body: Bytes,
 ) -> Result<Json<DispatchReport>, ApiError> {
+    if !is_json_content_type(&headers) {
+        return Err(ApiError::bad_request());
+    }
+    let request: DispatchRequest = parse_strict_json(&body)?;
     let _permit = supervisor
         .concurrency
         .clone()
@@ -514,10 +522,29 @@ fn valid_dispatch_request(request: &DispatchRequest, idempotency: &str) -> bool 
         && idempotency == idempotency_key(request.execution_key)
 }
 
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("application/json"))
+}
+
+fn parse_strict_json<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
+    let body = std::str::from_utf8(body).map_err(|_| ApiError::bad_request())?;
+    let value = parse_json_rejecting_duplicates(body).map_err(|_| ApiError::bad_request())?;
+    serde_json::from_value(value).map_err(|_| ApiError::bad_request())
+}
+
 async fn submit_result(
     State(supervisor): State<SandboxSupervisor>,
-    Json(result): Json<ResultRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Result<StatusCode, ApiError> {
+    if !is_json_content_type(&headers) {
+        return Err(ApiError::bad_request());
+    }
+    let result: ResultRequest = parse_strict_json(&body)?;
     if result.schema_version != 1
         || result.result_token.is_empty()
         || result.result_token.len() > 128
@@ -1136,6 +1163,33 @@ mod tests {
     }
 
     #[test]
+    fn strict_supervisor_json_rejects_duplicate_keys_inside_nested_values() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Callback {
+            output: Value,
+        }
+
+        assert!(
+            parse_strict_json::<Callback>(br#"{"output":{"status":"safe","status":"overridden"}}"#)
+                .is_err()
+        );
+        assert!(
+            parse_strict_json::<Callback>(br#"{"output":{"status":"safe"}}"#)
+                .is_ok_and(|callback| callback.output["status"] == "safe")
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            "application/json; charset=utf-8".parse().unwrap(),
+        );
+        assert!(is_json_content_type(&headers));
+        headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
+        assert!(!is_json_content_type(&headers));
+    }
+
+    #[test]
     fn supervisor_config_requires_a_digest_pinned_runner_and_unique_routes() {
         let kubernetes = || KubernetesApi {
             client: Client::new(),
@@ -1157,6 +1211,20 @@ mod tests {
             "routes": [route]
         });
         assert!(SandboxSupervisor::new(kubernetes(), &valid.to_string()).is_ok());
+
+        let duplicate_root_key = valid.to_string().replacen(
+            "\"schema_version\":1",
+            "\"schema_version\":1,\"schema_version\":1",
+            1,
+        );
+        assert!(SandboxSupervisor::new(kubernetes(), &duplicate_root_key).is_err());
+
+        let duplicate_route_key = valid.to_string().replacen(
+            "\"action_type\":\"orders:create\"",
+            "\"action_type\":\"orders:create\",\"action_type\":\"orders:delete\"",
+            1,
+        );
+        assert!(SandboxSupervisor::new(kubernetes(), &duplicate_route_key).is_err());
 
         let invalid_image = json!({
             "schema_version": 1,
