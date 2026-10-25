@@ -1,0 +1,27 @@
+[package]
+name = "praetore-gateway-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "Loopback-only development HTTP service for the PRÆTORE gateway."
+
+[[bin]]
+name = "praetore-gateway-demo"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+ed25519-dalek = "2"
+hex = "0.4.3"
+postgres = "0.19"
+praetore-core = { path = "../praetore-core" }
+praetore-gateway = { path = "../praetore-gateway" }
+praetore-replay-postgres = { path = "../praetore-replay-postgres" }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

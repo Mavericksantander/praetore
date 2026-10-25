@@ -770,6 +770,8 @@ dependencies = [
  "bytes",
  "fallible-iterator",
  "postgres-protocol",
+ "serde_core",
+ "serde_json",
  "time",
  "uuid",
 ]
@@ -800,6 +802,8 @@ dependencies = [
 name = "praetore-gateway"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "ed25519-dalek",
  "hex",
  "praetore-core",
  "serde",
@@ -807,7 +811,27 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "time",
+ "tokio",
+ "tower",
+ "tracing",
  "uuid",
+]
+
+[[package]]
+name = "praetore-gateway-service"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "ed25519-dalek",
+ "hex",
+ "postgres",
+ "praetore-core",
+ "praetore-gateway",
+ "praetore-replay-postgres",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -845,6 +869,7 @@ dependencies = [
 name = "praetore-replay-postgres"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "hex",
  "postgres",
  "praetore-core",

@@ -37,3 +37,6 @@ build/
 # Temporary files
 *.tmp
 *.swp
+
+# Local architecture notes not intended for the public repository
+/docs/enterprise-architecture-rfc.md
