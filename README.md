@@ -42,7 +42,10 @@ bounded fuzz targets, and an optional PostgreSQL replay-guard adapter.
   management system.
 * A general-purpose network service, policy distribution control plane, or
   administrative action executor.
-* A sandbox or isolation boundary for the host that runs it.
+* A sandbox or isolation boundary by itself. The repository includes a
+  Kubernetes/Kata-Firecracker deployment template and a per-invocation Job
+  contract, but not the tool-execution adapter or authenticated sandbox
+  supervisor needed to make it an end-to-end sandbox.
 * A certification, accreditation, or guarantee that a deployment is safe.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,

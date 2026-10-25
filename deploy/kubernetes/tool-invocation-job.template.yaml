@@ -1,0 +1,100 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: replace-with-unique-execution-name
+  namespace: praetore-sandbox
+  labels:
+    praetore.io/component: tool-invocation
+    praetore.io/execution-id: replace-with-stable-execution-id
+    praetore.io/tool-profile: replace-with-approved-profile
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 120
+  template:
+    metadata:
+      labels:
+        praetore.io/component: tool-invocation
+        praetore.io/execution-id: replace-with-stable-execution-id
+        praetore.io/tool-profile: replace-with-approved-profile
+    spec:
+      runtimeClassName: praetore-firecracker
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 5
+      automountServiceAccountToken: false
+      serviceAccountName: praetore-sandbox-worker
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tool-runner
+          image: replace-with-reviewed-image-at-sha256-digest
+          imagePullPolicy: Always
+          command:
+            - /usr/local/bin/praetore-tool-runner
+          args:
+            - --invocation
+            - /run/praetore/invocation/invocation.json
+          env:
+            - name: PRAETORE_RESULT_URL
+              value: https://praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local:8443/v1/results
+            - name: PRAETORE_RESULT_TOKEN_FILE
+              value: /run/praetore/invocation/result-token
+            - name: PRAETORE_RESULT_CA_FILE
+              value: /run/praetore/supervisor-ca/ca.crt
+            - name: HTTPS_PROXY
+              value: http://egress-proxy.praetore-egress.svc.cluster.local:3128
+            - name: HTTP_PROXY
+              value: http://egress-proxy.praetore-egress.svc.cluster.local:3128
+            - name: NO_PROXY
+              value: praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+              ephemeral-storage: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+              ephemeral-storage: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: invocation
+              mountPath: /run/praetore/invocation
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: supervisor-ca
+              mountPath: /run/praetore/supervisor-ca
+              readOnly: true
+      volumes:
+        - name: invocation
+          secret:
+            secretName: replace-with-one-time-invocation-secret
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        - name: supervisor-ca
+          configMap:
+            name: praetore-sandbox-supervisor-ca
+            items:
+              - key: ca.crt
+                path: ca.crt

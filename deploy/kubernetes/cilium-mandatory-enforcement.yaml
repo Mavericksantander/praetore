@@ -80,6 +80,7 @@ spec:
             dns:
               - matchPattern: "postgres.praetore-data.svc.cluster.local."
               - matchPattern: "egress-proxy.praetore-egress.svc.cluster.local."
+              - matchPattern: "praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local."
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
@@ -95,6 +96,9 @@ spec:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: praetore-gateway
             app.kubernetes.io/name: praetore-gateway
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-sandbox
+            praetore.io/component: tool-invocation
       toPorts:
         - ports:
             - port: "3128"
@@ -107,6 +111,14 @@ spec:
       toPorts:
         - ports:
             - port: "443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-sandbox
+            app.kubernetes.io/name: praetore-sandbox-supervisor
+      toPorts:
+        - ports:
+            - port: "8443"
               protocol: TCP
     - toEndpoints:
         - matchLabels:
@@ -123,6 +135,7 @@ spec:
               - matchName: api.example.com
               - matchPattern: "*.api.example.com"
               - matchPattern: "*.praetore-tools.svc.cluster.local."
+              - matchName: praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local.
     - toFQDNs:
         - matchName: api.example.com
         - matchPattern: "*.api.example.com"
@@ -130,6 +143,101 @@ spec:
         - ports:
             - port: "443"
               protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-sandbox-default-deny
+  namespace: praetore-sandbox
+spec:
+  endpointSelector: {}
+  ingress: []
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-sandbox-supervisor
+  namespace: praetore-sandbox
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: praetore-sandbox-supervisor
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-egress
+            app.kubernetes.io/name: egress-proxy
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-sandbox
+            praetore.io/component: tool-invocation
+      toPorts:
+        - ports:
+            - port: "8443"
+              protocol: TCP
+  egress:
+    - toEntities:
+        - kube-apiserver
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: kubernetes.default.svc.cluster.local.
+              - matchName: praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local.
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-sandbox-worker
+  namespace: praetore-sandbox
+spec:
+  endpointSelector:
+    matchLabels:
+      praetore.io/component: tool-invocation
+  ingress: []
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-sandbox
+            app.kubernetes.io/name: praetore-sandbox-supervisor
+      toPorts:
+        - ports:
+            - port: "8443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-egress
+            app.kubernetes.io/name: egress-proxy
+      toPorts:
+        - ports:
+            - port: "3128"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local.
+              - matchName: egress-proxy.praetore-egress.svc.cluster.local.
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy

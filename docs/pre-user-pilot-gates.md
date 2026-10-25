@@ -46,7 +46,10 @@ For each target deployment, retain evidence for every applicable item:
    reconciliation; validate it against the actual downstream tool semantics.
    The workspace `praetore-gateway` crate is a synchronous reference only; it
    does not provide a network service or production-grade durable execution
-   journal.
+   journal. The Firecracker/Kata and per-invocation Job manifests are
+   deployment templates only: the authenticated sandbox supervisor and its
+   gateway adapter are not implemented, and no sandbox claim is established
+   until that path and the target cluster are tested.
 4. **Time and validity:** monitored trusted time, measured skew, alerting and
    fail-closed behavior when clock health is lost. The library adds no skew
    tolerance and cannot identify a manipulated host clock.
