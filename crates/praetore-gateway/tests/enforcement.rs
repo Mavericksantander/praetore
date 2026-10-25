@@ -1,3 +1,8 @@
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use ed25519_dalek::{Signer, SigningKey};
 use praetore_core::{
     Action, AgentId, AgentKeyPair, AuthorizationRequest, DecisionOutcome, Evidence,
     EvidenceAttesterKey, HighAssuranceConfig, Policy, PolicyEffect, PolicyRule, PraetoreError,
@@ -12,10 +17,11 @@ use praetore_core::{
     },
 };
 use praetore_gateway::{
-    ActionDispatcher, AuthorizationStatus, DispatchError, DispatchReport, ExecutionJournal,
-    ExecutionKey, ExecutionRecord, ExecutionStatus, Gateway, GatewayError, JournalError,
-    ReconciliationReport,
+    ActionDispatcher, AuthorizationStatus, DispatchError, DispatchReport,
+    ExecutionAttestationError, ExecutionAttestationSigner, ExecutionJournal, ExecutionKey,
+    ExecutionRecord, ExecutionStatus, Gateway, GatewayError, JournalError, ReconciliationReport,
 };
+use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -26,9 +32,61 @@ use std::{
     thread,
 };
 use time::{Duration, OffsetDateTime};
+use tower::ServiceExt;
 use uuid::Uuid;
 
 const NOW: &str = "2026-06-01T12:00:00Z";
+
+struct TestExecutionAttester {
+    signing_key: SigningKey,
+    fail_signing: AtomicBool,
+    sign_count: AtomicUsize,
+}
+
+impl TestExecutionAttester {
+    fn new() -> Self {
+        Self {
+            signing_key: SigningKey::from_bytes(&[14; 32]),
+            fail_signing: AtomicBool::new(false),
+            sign_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ExecutionAttestationSigner for TestExecutionAttester {
+    fn key_id(&self) -> &str {
+        "test-execution-attester-v1"
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError> {
+        if self.fail_signing.load(Ordering::SeqCst) {
+            return Err(ExecutionAttestationError::SignerFailed);
+        }
+        self.sign_count.fetch_add(1, Ordering::SeqCst);
+        Ok(self.signing_key.sign(message).to_bytes().to_vec())
+    }
+}
+
+fn execution_attester() -> Arc<TestExecutionAttester> {
+    Arc::new(TestExecutionAttester::new())
+}
+
+impl TestExecutionAttester {
+    fn sign_count(&self) -> usize {
+        self.sign_count.load(Ordering::SeqCst)
+    }
+}
+
+fn execution_attester_public_key() -> VerifiedPublicKey {
+    VerifiedPublicKey::from_bytes(
+        &TestExecutionAttester::new()
+            .signing_key
+            .verifying_key()
+            .to_bytes(),
+    )
+    .unwrap()
+}
+
 fn long_validity() -> Validity {
     Validity {
         not_before: Some("2026-01-01T00:00:00Z".into()),
@@ -96,6 +154,7 @@ struct JournalEntry {
     execution: ExecutionStatus,
     action_digest: String,
     output: Option<Value>,
+    execution_attestations: Vec<praetore_gateway::ExecutionAttestation>,
 }
 
 impl Default for JournalEntry {
@@ -107,6 +166,7 @@ impl Default for JournalEntry {
             execution: ExecutionStatus::NotDispatched,
             action_digest: String::new(),
             output: None,
+            execution_attestations: Vec::new(),
         }
     }
 }
@@ -154,6 +214,7 @@ impl MemoryJournal {
                 },
                 action_digest,
                 output: None,
+                execution_attestations: Vec::new(),
             },
         );
         Ok(())
@@ -168,6 +229,7 @@ impl MemoryJournal {
             states: entry.states.clone(),
             execution: entry.execution,
             output: entry.output.clone(),
+            execution_attestation: entry.execution_attestations.last().cloned(),
         })
     }
 }
@@ -178,6 +240,7 @@ struct JournalEntrySnapshot {
     states: Vec<ExecutionStatus>,
     execution: ExecutionStatus,
     output: Option<Value>,
+    execution_attestation: Option<praetore_gateway::ExecutionAttestation>,
 }
 
 impl AtomicAuthorizationCommit for MemoryJournal {
@@ -266,11 +329,12 @@ impl ExecutionJournal for MemoryJournal {
         Ok(())
     }
 
-    fn record_terminal(
+    fn record_terminal_attested(
         &self,
         key: ExecutionKey,
         execution: ExecutionStatus,
         output: Option<&Value>,
+        attestation: &praetore_gateway::ExecutionAttestation,
     ) -> Result<(), JournalError> {
         if self.unavailable.load(Ordering::SeqCst) || self.fail_terminal.load(Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
@@ -288,15 +352,68 @@ impl ExecutionJournal for MemoryJournal {
         let entry = entries
             .get_mut(&key)
             .ok_or(JournalError::InvalidTransition)?;
+        let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
+        let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
+        attestation
+            .validate_binding(evidence, authorization, execution, output)
+            .map_err(|_| JournalError::InvalidRecord)?;
         if !matches!(
             entry.execution,
             ExecutionStatus::Dispatched | ExecutionStatus::OutcomeUnknown
         ) {
-            return Err(JournalError::InvalidTransition);
+            let existing = entry.execution_attestations.last();
+            return if entry.execution == execution
+                && entry.output.as_ref() == output
+                && existing.is_some_and(|existing| {
+                    serde_json::to_value(existing).ok() == serde_json::to_value(attestation).ok()
+                }) {
+                Ok(())
+            } else {
+                Err(JournalError::InvalidTransition)
+            };
         }
         entry.states.push(execution);
         entry.execution = execution;
         entry.output = output.cloned();
+        entry.execution_attestations.push(attestation.clone());
+        Ok(())
+    }
+
+    fn record_attestation(
+        &self,
+        key: ExecutionKey,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+        attestation: &praetore_gateway::ExecutionAttestation,
+    ) -> Result<(), JournalError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(JournalError::Unavailable);
+        }
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
+        let entry = entries
+            .get_mut(&key)
+            .ok_or(JournalError::InvalidTransition)?;
+        let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
+        let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
+        if entry.execution != execution || entry.output.as_ref() != output {
+            return Err(JournalError::InvalidTransition);
+        }
+        attestation
+            .validate_binding(evidence, authorization, execution, output)
+            .map_err(|_| JournalError::InvalidRecord)?;
+        if let Some(existing) = entry
+            .execution_attestations
+            .iter()
+            .find(|existing| existing.execution == execution)
+        {
+            return if serde_json::to_value(existing).ok() == serde_json::to_value(attestation).ok()
+            {
+                Ok(())
+            } else {
+                Err(JournalError::InvalidTransition)
+            };
+        }
+        entry.execution_attestations.push(attestation.clone());
         Ok(())
     }
 
@@ -315,10 +432,15 @@ impl ExecutionJournal for MemoryJournal {
             execution: entry.execution,
             action_digest: entry.action_digest.clone(),
             output: entry.output.clone(),
+            execution_attestation: entry.execution_attestations.last().cloned(),
         }))
     }
 
-    fn mark_not_dispatched(&self, key: ExecutionKey) -> Result<(), JournalError> {
+    fn mark_not_dispatched_attested(
+        &self,
+        key: ExecutionKey,
+        attestation: &praetore_gateway::ExecutionAttestation,
+    ) -> Result<(), JournalError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
         }
@@ -329,28 +451,20 @@ impl ExecutionJournal for MemoryJournal {
         if entry.execution != ExecutionStatus::Authorized {
             return Err(JournalError::InvalidTransition);
         }
+        let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
+        let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
+        attestation
+            .validate_binding(
+                evidence,
+                authorization,
+                ExecutionStatus::NotDispatched,
+                None,
+            )
+            .map_err(|_| JournalError::InvalidRecord)?;
         entry.execution = ExecutionStatus::NotDispatched;
         entry.states.push(ExecutionStatus::NotDispatched);
+        entry.execution_attestations.push(attestation.clone());
         Ok(())
-    }
-
-    fn mark_outcome_unknown(&self, key: ExecutionKey) -> Result<(), JournalError> {
-        if self.unavailable.load(Ordering::SeqCst) {
-            return Err(JournalError::Unavailable);
-        }
-        let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
-        let entry = entries
-            .get_mut(&key)
-            .ok_or(JournalError::InvalidTransition)?;
-        match entry.execution {
-            ExecutionStatus::Dispatched => {
-                entry.execution = ExecutionStatus::OutcomeUnknown;
-                entry.states.push(ExecutionStatus::OutcomeUnknown);
-                Ok(())
-            }
-            ExecutionStatus::OutcomeUnknown => Ok(()),
-            _ => Err(JournalError::InvalidTransition),
-        }
     }
 }
 
@@ -452,6 +566,7 @@ struct Fixture {
     request: AuthorizationRequest,
     tool: Arc<LocalSetTool>,
     journal: Arc<MemoryJournal>,
+    execution_attester: Arc<TestExecutionAttester>,
     policy: Policy,
     issuer_public_key: VerifiedPublicKey,
     attester: EvidenceAttesterKey,
@@ -540,16 +655,178 @@ fn fixture_with_replay(
     );
     let tool = Arc::new(LocalSetTool::default());
     let journal = Arc::new(MemoryJournal::default());
-    let gateway = Gateway::new(engine, journal.clone(), tool.clone()).unwrap();
+    let execution_attester = execution_attester();
+    let gateway = Gateway::new(
+        engine,
+        journal.clone(),
+        tool.clone(),
+        execution_attester.clone(),
+    )
+    .unwrap();
     Fixture {
         gateway,
         request,
         tool,
         journal,
+        execution_attester,
         policy,
         issuer_public_key,
         attester,
     }
+}
+
+fn http_request(body: String) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/execute")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn http_gateway_returns_receipt_and_dispatches_allowed_action_once() {
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    let request_body = serde_json::to_string(&fixture.request).unwrap();
+    let app = http_api::router(Arc::new(fixture.gateway));
+
+    let response = app.oneshot(http_request(request_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(receipt["authorization"], "allowed");
+    assert_eq!(receipt["execution"], "confirmed");
+    assert_eq!(fixture.tool.invocations(), 1);
+
+    let receipt: praetore_gateway::GatewayReceipt = serde_json::from_value(receipt).unwrap();
+    receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn http_gateway_returns_denials_without_dispatch() {
+    let fixture = fixture(None, false);
+    let request_body = serde_json::to_string(&fixture.request).unwrap();
+    let app = http_api::router(Arc::new(fixture.gateway));
+
+    let response = app.oneshot(http_request(request_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(receipt["authorization"], "denied");
+    assert_eq!(receipt["execution"], "not_dispatched");
+    assert_eq!(fixture.tool.invocations(), 0);
+}
+
+#[tokio::test]
+async fn http_gateway_returns_approval_receipt_without_dispatch() {
+    let fixture = fixture(Some(PolicyEffect::RequireApproval), false);
+    let request_body = serde_json::to_string(&fixture.request).unwrap();
+    let app = http_api::router(Arc::new(fixture.gateway));
+
+    let response = app.oneshot(http_request(request_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(receipt["authorization"], "requires_approval");
+    assert_eq!(receipt["execution"], "not_dispatched");
+    assert_eq!(fixture.tool.invocations(), 0);
+}
+
+#[tokio::test]
+async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
+    let agent_key = AgentKeyPair::from_secret_bytes(&[11; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[12; 32]);
+    let evidence_attester = EvidenceAttesterKey::from_secret_bytes(&[13; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "local-test-issuer",
+        vec!["demo:write".into()],
+    )
+    .with_validity(long_validity());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+
+    let action = Action::new(
+        "demo:set_value",
+        Some("demo-state".into()),
+        json!({"key": "mode", "value": "safe"}),
+    )
+    .unwrap()
+    .with_capability("demo:write");
+    let policy = Policy::new_v2(
+        "local-demo",
+        1,
+        vec![
+            PolicyRule::new("allow-demo-write", "demo:set_value", PolicyEffect::Allow)
+                .with_capability("demo:write"),
+        ],
+    );
+    let now = FixedClock::try_new(NOW).unwrap().now();
+    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    request
+        .sign_intent_v2(
+            &agent_key,
+            "local-test-gateway",
+            now - Duration::seconds(1),
+            now + Duration::minutes(1),
+            policy.digest().unwrap(),
+        )
+        .unwrap();
+
+    let engine = production_engine(
+        policy,
+        issuer_key.public_key(),
+        evidence_attester,
+        Arc::new(MemoryReplayGuard::default()),
+    );
+    let dispatcher = Arc::new(LocalDemoDispatcher::new());
+    let signer = execution_attester();
+    let gateway = Gateway::new(
+        engine,
+        Arc::new(MemoryJournal::default()),
+        dispatcher.clone(),
+        signer.clone(),
+    )
+    .unwrap();
+    let app = http_api::router(Arc::new(gateway));
+    let response = app
+        .oneshot(http_request(serde_json::to_string(&request).unwrap()))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let receipt: praetore_gateway::GatewayReceipt = serde_json::from_slice(&body).unwrap();
+    receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(dispatcher.value("mode").as_deref(), Some("safe"));
+}
+
+#[tokio::test]
+async fn http_gateway_rejects_duplicate_json_keys_before_gateway_execution() {
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    let mut request_body = serde_json::to_string(&fixture.request).unwrap();
+    request_body = request_body.replacen(
+        '{',
+        &format!(r#"{{"request_id":"{}", "#, fixture.request.request_id),
+        1,
+    );
+    let app = http_api::router(Arc::new(fixture.gateway));
+
+    let response = app.oneshot(http_request(request_body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.tool.invocations(), 0);
 }
 
 #[test]
@@ -564,6 +841,12 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
 
     assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
     assert_eq!(receipt.evidence.decision.outcome, DecisionOutcome::Allow);
     assert_eq!(
         entry.states,
@@ -571,11 +854,30 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
     );
     assert_eq!(entry.execution, ExecutionStatus::Confirmed);
     assert_eq!(entry.authorization, AuthorizationStatus::Allowed);
+    assert!(entry.execution_attestation.is_some());
+    assert_eq!(
+        serde_json::to_value(entry.execution_attestation.unwrap()).unwrap(),
+        serde_json::to_value(receipt.execution_attestation.clone()).unwrap()
+    );
     assert_eq!(entry.evidence.context_hash, receipt.evidence.context_hash);
     assert_eq!(entry.output, receipt.output);
     assert_eq!(
         receipt.evidence.action.parameters["value"],
         receipt.output.as_ref().unwrap()["value"]
+    );
+
+    let mut tampered = receipt.clone();
+    tampered.output = Some(json!({"key": "mode", "value": "changed"}));
+    assert_eq!(
+        tampered.verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        ),
+        Err(ExecutionAttestationError::InvalidPayload)
+    );
+    assert_eq!(
+        receipt.verify_execution_attestation(&execution_attester_public_key(), "wrong-key-id",),
+        Err(ExecutionAttestationError::KeyMismatch)
     );
     assert_eq!(fixture.tool.value("mode"), Some(json!("safe")));
     assert_eq!(fixture.tool.invocations(), 1);
@@ -599,6 +901,12 @@ fn denied_or_unmatched_action_has_no_observable_tool_effect() {
         let receipt = fixture.gateway.execute(fixture.request).unwrap();
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
         assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        receipt
+            .verify_execution_attestation(
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
         assert_eq!(fixture.tool.value("mode"), None);
         assert_eq!(fixture.tool.invocations(), 0);
     }
@@ -610,6 +918,12 @@ fn approval_required_is_not_permission_to_dispatch() {
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
     assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
     assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
     assert_eq!(fixture.tool.value("mode"), None);
     assert_eq!(fixture.tool.invocations(), 0);
 }
@@ -658,7 +972,8 @@ fn development_engine_cannot_construct_gateway() {
         Gateway::new(
             engine,
             Arc::new(MemoryJournal::default()),
-            Arc::new(LocalSetTool::default())
+            Arc::new(LocalSetTool::default()),
+            execution_attester()
         ),
         Err(GatewayError::HighAssuranceRequired)
     ));
@@ -744,6 +1059,64 @@ fn terminal_journal_failure_is_reported_without_a_retry() {
 }
 
 #[test]
+fn signer_failure_after_execution_is_recoverable_without_redispatch() {
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    fixture
+        .execution_attester
+        .fail_signing
+        .store(true, Ordering::SeqCst);
+    let key = ExecutionKey {
+        agent_id: *fixture.request.agent.id.as_uuid(),
+        request_id: fixture.request.request_id,
+    };
+
+    assert!(matches!(
+        fixture.gateway.execute(fixture.request.clone()),
+        Err(GatewayError::ExecutionAttestation(
+            ExecutionAttestationError::SignerFailed
+        ))
+    ));
+    assert_eq!(fixture.tool.invocations(), 1);
+    let persisted = fixture.journal.entry(key).unwrap();
+    assert_eq!(persisted.execution, ExecutionStatus::Dispatched);
+    assert!(persisted.execution_attestation.is_none());
+
+    fixture
+        .execution_attester
+        .fail_signing
+        .store(false, Ordering::SeqCst);
+    let receipt = fixture.gateway.reconcile(key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    assert_eq!(fixture.tool.invocations(), 1);
+}
+
+#[test]
+fn reconciliation_reuses_the_persisted_attestation_without_signing_again() {
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    let receipt = fixture.gateway.execute(fixture.request).unwrap();
+    let signed_count = fixture.execution_attester.sign_count();
+    let key = ExecutionKey {
+        agent_id: *receipt.evidence.agent.id.as_uuid(),
+        request_id: receipt.evidence.request_id,
+    };
+
+    let recovered = fixture.gateway.reconcile(key).unwrap();
+    assert_eq!(recovered.execution, ExecutionStatus::Confirmed);
+    assert_eq!(fixture.execution_attester.sign_count(), signed_count);
+    assert_eq!(
+        serde_json::to_value(recovered.execution_attestation).unwrap(),
+        serde_json::to_value(receipt.execution_attestation).unwrap()
+    );
+    assert_eq!(fixture.tool.invocations(), 1);
+}
+
+#[test]
 fn concurrent_duplicate_requests_cause_at_most_one_effect() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     let workers = 12;
@@ -789,8 +1162,13 @@ fn shared_execution_journal_rejects_duplicate_key_across_independent_engines() {
         fixture.attester.clone(),
         Arc::new(MemoryReplayGuard::default()),
     );
-    let second_gateway =
-        Gateway::new(second_engine, fixture.journal.clone(), fixture.tool.clone()).unwrap();
+    let second_gateway = Gateway::new(
+        second_engine,
+        fixture.journal.clone(),
+        fixture.tool.clone(),
+        execution_attester(),
+    )
+    .unwrap();
 
     fixture
         .gateway

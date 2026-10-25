@@ -52,9 +52,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+pub mod http_api;
+pub mod local_demo;
+
 const ACTION_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ACTION_V1\0";
+const EXECUTION_ATTESTATION_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ATTESTATION_V1\0";
+const OUTPUT_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_OUTPUT_V1\0";
 
 /// Computes the stable digest used to bind one normalized action to an
 /// execution key. The canonical v1 encoding is domain separated from core
@@ -99,9 +105,248 @@ pub enum ExecutionStatus {
     Failed,
 }
 
-/// A transport/audit wrapper. The contained core evidence attests to the
-/// authorization decision only; the execution fields are gateway records and
-/// are not covered by the core evidence signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ExecutionAttestationError {
+    #[error("execution attestation signer failed")]
+    SignerFailed,
+    #[error("execution attestation key identifier is invalid")]
+    InvalidKeyId,
+    #[error("execution attestation payload is invalid")]
+    InvalidPayload,
+    #[error("execution attestation signature is invalid")]
+    InvalidSignature,
+    #[error("execution attestation key does not match the pinned identifier")]
+    KeyMismatch,
+}
+
+/// Signs gateway execution observations using an externally managed key.
+///
+/// `message` contains the PRÆTORE execution-attestation domain separator and
+/// canonical payload. Implementations may delegate signing to a KMS/HSM.
+pub trait ExecutionAttestationSigner: Send + Sync {
+    fn key_id(&self) -> &str;
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionAttestation {
+    pub schema_version: u8,
+    pub key_id: String,
+    pub evidence_id: Uuid,
+    pub request_id: Uuid,
+    pub agent_id: Uuid,
+    pub authorization: AuthorizationStatus,
+    pub execution: ExecutionStatus,
+    pub policy_digest: String,
+    pub evidence_hash: String,
+    pub action_digest: String,
+    pub output_digest: Option<String>,
+    pub observed_at: String,
+    pub signature: String,
+}
+
+#[derive(Serialize)]
+struct ExecutionAttestationPayload<'a> {
+    schema_version: u8,
+    key_id: &'a str,
+    evidence_id: Uuid,
+    request_id: Uuid,
+    agent_id: Uuid,
+    authorization: AuthorizationStatus,
+    execution: ExecutionStatus,
+    policy_digest: &'a str,
+    evidence_hash: &'a str,
+    action_digest: &'a str,
+    output_digest: Option<&'a str>,
+    observed_at: &'a str,
+}
+
+impl ExecutionAttestation {
+    fn create(
+        evidence: &Evidence,
+        authorization: AuthorizationStatus,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+        signer: &dyn ExecutionAttestationSigner,
+    ) -> Result<Self, ExecutionAttestationError> {
+        let key_id = signer.key_id();
+        if key_id.is_empty() || key_id.len() > 256 || key_id.trim() != key_id {
+            return Err(ExecutionAttestationError::InvalidKeyId);
+        }
+        if !evidence.verify_integrity()
+            || evidence.evidence_schema_version != 2
+            || evidence.evaluation_mode.as_deref() != Some("high_assurance")
+        {
+            return Err(ExecutionAttestationError::InvalidPayload);
+        }
+
+        let observed_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+        let policy_digest = evidence
+            .policy_digest
+            .as_deref()
+            .ok_or(ExecutionAttestationError::InvalidPayload)?;
+        let action_digest = action_digest(&evidence.action)
+            .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+        let output_digest = output.map(output_digest).transpose()?;
+        let payload = ExecutionAttestationPayload {
+            schema_version: 1,
+            key_id,
+            evidence_id: evidence.evidence_id,
+            request_id: evidence.request_id,
+            agent_id: *evidence.agent.id.as_uuid(),
+            authorization,
+            execution,
+            policy_digest,
+            evidence_hash: &evidence.context_hash,
+            action_digest: &action_digest,
+            output_digest: output_digest.as_deref(),
+            observed_at: &observed_at,
+        };
+        let canonical = attestation_payload_bytes(&payload)?;
+        let mut message = Vec::with_capacity(EXECUTION_ATTESTATION_DOMAIN.len() + canonical.len());
+        message.extend_from_slice(EXECUTION_ATTESTATION_DOMAIN);
+        message.extend_from_slice(&canonical);
+        let signature = signer
+            .sign(&message)
+            .map_err(|_| ExecutionAttestationError::SignerFailed)?;
+        if signature.len() != 64 {
+            return Err(ExecutionAttestationError::InvalidSignature);
+        }
+
+        Ok(Self {
+            schema_version: 1,
+            key_id: key_id.to_owned(),
+            evidence_id: evidence.evidence_id,
+            request_id: evidence.request_id,
+            agent_id: *evidence.agent.id.as_uuid(),
+            authorization,
+            execution,
+            policy_digest: policy_digest.to_owned(),
+            evidence_hash: evidence.context_hash.clone(),
+            action_digest,
+            output_digest,
+            observed_at,
+            signature: hex::encode(signature),
+        })
+    }
+
+    fn verify(
+        &self,
+        evidence: &Evidence,
+        authorization: AuthorizationStatus,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+        public_key: &praetore_core::VerifiedPublicKey,
+        expected_key_id: &str,
+    ) -> Result<(), ExecutionAttestationError> {
+        if self.key_id != expected_key_id {
+            return Err(ExecutionAttestationError::KeyMismatch);
+        }
+        self.validate_binding(evidence, authorization, execution, output)?;
+
+        let payload = ExecutionAttestationPayload {
+            schema_version: self.schema_version,
+            key_id: &self.key_id,
+            evidence_id: self.evidence_id,
+            request_id: self.request_id,
+            agent_id: self.agent_id,
+            authorization: self.authorization,
+            execution: self.execution,
+            policy_digest: &self.policy_digest,
+            evidence_hash: &self.evidence_hash,
+            action_digest: &self.action_digest,
+            output_digest: self.output_digest.as_deref(),
+            observed_at: &self.observed_at,
+        };
+        let canonical = attestation_payload_bytes(&payload)?;
+        let signature = hex::decode(&self.signature)
+            .map_err(|_| ExecutionAttestationError::InvalidSignature)?;
+        public_key
+            .verify_domain_message(EXECUTION_ATTESTATION_DOMAIN, &canonical, &signature)
+            .map_err(|_| ExecutionAttestationError::InvalidSignature)
+    }
+
+    pub fn validate_binding(
+        &self,
+        evidence: &Evidence,
+        authorization: AuthorizationStatus,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+    ) -> Result<(), ExecutionAttestationError> {
+        if self.schema_version != 1
+            || self.evidence_id != evidence.evidence_id
+            || self.request_id != evidence.request_id
+            || self.agent_id != *evidence.agent.id.as_uuid()
+            || self.authorization != authorization
+            || authorization_for_outcome(evidence.decision.outcome) != authorization
+            || self.execution != execution
+            || self.policy_digest != evidence.policy_digest.as_deref().unwrap_or_default()
+            || self.evidence_hash != evidence.context_hash
+            || !evidence.verify_integrity()
+            || authorization != AuthorizationStatus::Allowed
+                && execution != ExecutionStatus::NotDispatched
+            || matches!(
+                execution,
+                ExecutionStatus::Authorized | ExecutionStatus::Dispatched
+            )
+            || output.is_some()
+                != matches!(
+                    execution,
+                    ExecutionStatus::Executed | ExecutionStatus::Confirmed
+                )
+            || self.key_id.is_empty()
+            || self.key_id.len() > 256
+            || self.key_id.trim() != self.key_id
+            || hex::decode(&self.signature).map_or(true, |signature| signature.len() != 64)
+            || OffsetDateTime::parse(&self.observed_at, &Rfc3339).is_err()
+        {
+            return Err(ExecutionAttestationError::InvalidPayload);
+        }
+
+        let expected_action_digest = action_digest(&evidence.action)
+            .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+        let expected_output_digest = output.map(output_digest).transpose()?;
+        if self.action_digest != expected_action_digest
+            || self.output_digest != expected_output_digest
+        {
+            return Err(ExecutionAttestationError::InvalidPayload);
+        }
+        Ok(())
+    }
+}
+
+fn authorization_for_outcome(outcome: praetore_core::DecisionOutcome) -> AuthorizationStatus {
+    match outcome {
+        praetore_core::DecisionOutcome::Allow => AuthorizationStatus::Allowed,
+        praetore_core::DecisionOutcome::RequireApproval => AuthorizationStatus::RequiresApproval,
+        praetore_core::DecisionOutcome::Deny => AuthorizationStatus::Denied,
+    }
+}
+
+fn attestation_payload_bytes(
+    payload: &ExecutionAttestationPayload<'_>,
+) -> Result<Vec<u8>, ExecutionAttestationError> {
+    let json =
+        serde_json::to_string(payload).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    canonicalize_json(&json).map_err(|_| ExecutionAttestationError::InvalidPayload)
+}
+
+fn output_digest(output: &Value) -> Result<String, ExecutionAttestationError> {
+    let json =
+        serde_json::to_string(output).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    let bytes = canonicalize_json(&json).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    let mut hash = Sha256::new();
+    hash.update(OUTPUT_DIGEST_DOMAIN);
+    hash.update(&bytes);
+    Ok(hex::encode(hash.finalize()))
+}
+
+/// A receipt keeps authorization evidence separate from the gateway's signed
+/// observation of dispatch/execution. The attestation does not independently
+/// prove an external effect beyond the adapter's documented contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayReceipt {
@@ -109,6 +354,24 @@ pub struct GatewayReceipt {
     pub authorization: AuthorizationStatus,
     pub execution: ExecutionStatus,
     pub output: Option<Value>,
+    pub execution_attestation: ExecutionAttestation,
+}
+
+impl GatewayReceipt {
+    pub fn verify_execution_attestation(
+        &self,
+        public_key: &praetore_core::VerifiedPublicKey,
+        expected_key_id: &str,
+    ) -> Result<(), ExecutionAttestationError> {
+        self.execution_attestation.verify(
+            &self.evidence,
+            self.authorization,
+            self.execution,
+            self.output.as_ref(),
+            public_key,
+            expected_key_id,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -135,6 +398,7 @@ pub struct ExecutionRecord {
     pub execution: ExecutionStatus,
     pub action_digest: String,
     pub output: Option<Value>,
+    pub execution_attestation: Option<ExecutionAttestation>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -155,18 +419,29 @@ pub enum ReconciliationReport {
 pub trait ExecutionJournal: AtomicAuthorizationCommit + Send + Sync {
     fn mark_dispatched(&self, key: ExecutionKey) -> Result<(), JournalError>;
 
-    fn record_terminal(
+    fn record_terminal_attested(
         &self,
         key: ExecutionKey,
         execution: ExecutionStatus,
         output: Option<&Value>,
+        attestation: &ExecutionAttestation,
+    ) -> Result<(), JournalError>;
+
+    fn record_attestation(
+        &self,
+        key: ExecutionKey,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+        attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError>;
 
     fn get(&self, key: ExecutionKey) -> Result<Option<ExecutionRecord>, JournalError>;
 
-    fn mark_not_dispatched(&self, key: ExecutionKey) -> Result<(), JournalError>;
-
-    fn mark_outcome_unknown(&self, key: ExecutionKey) -> Result<(), JournalError>;
+    fn mark_not_dispatched_attested(
+        &self,
+        key: ExecutionKey,
+        attestation: &ExecutionAttestation,
+    ) -> Result<(), JournalError>;
 }
 
 /// An adapter receives the exact normalized action evaluated by the engine.
@@ -218,6 +493,8 @@ pub enum GatewayError {
     Journal(#[from] JournalError),
     #[error("tool outcome may have occurred but could not be journaled for {0:?}")]
     OutcomeNotRecorded(ExecutionKey),
+    #[error("execution outcome was recorded but its attestation could not be created: {0}")]
+    ExecutionAttestation(#[from] ExecutionAttestationError),
     #[error("execution record does not exist for {0:?}")]
     ExecutionNotFound(ExecutionKey),
 }
@@ -229,6 +506,7 @@ pub struct Gateway {
     engine: AuthorizationEngine,
     journal: Arc<dyn ExecutionJournal>,
     dispatcher: Arc<dyn ActionDispatcher>,
+    execution_attester: Arc<dyn ExecutionAttestationSigner>,
 }
 
 impl Gateway {
@@ -236,6 +514,7 @@ impl Gateway {
         engine: AuthorizationEngine,
         journal: Arc<dyn ExecutionJournal>,
         dispatcher: Arc<dyn ActionDispatcher>,
+        execution_attester: Arc<dyn ExecutionAttestationSigner>,
     ) -> Result<Self, GatewayError> {
         if engine.mode() != EvaluationMode::HighAssurance {
             return Err(GatewayError::HighAssuranceRequired);
@@ -244,7 +523,110 @@ impl Gateway {
             engine,
             journal,
             dispatcher,
+            execution_attester,
         })
+    }
+
+    fn create_execution_attestation(
+        &self,
+        evidence: &Evidence,
+        authorization: AuthorizationStatus,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+    ) -> Result<ExecutionAttestation, GatewayError> {
+        Ok(ExecutionAttestation::create(
+            &evidence,
+            authorization,
+            execution,
+            output,
+            self.execution_attester.as_ref(),
+        )?)
+    }
+
+    fn receipt(
+        evidence: Evidence,
+        authorization: AuthorizationStatus,
+        execution: ExecutionStatus,
+        output: Option<Value>,
+        execution_attestation: ExecutionAttestation,
+    ) -> GatewayReceipt {
+        GatewayReceipt {
+            evidence,
+            authorization,
+            execution,
+            output,
+            execution_attestation,
+        }
+    }
+
+    fn attest_record(&self, record: &mut ExecutionRecord) -> Result<GatewayReceipt, GatewayError> {
+        if let Some(attestation) = &record.execution_attestation {
+            if attestation.execution == record.execution {
+                attestation
+                    .validate_binding(
+                        &record.evidence,
+                        record.authorization,
+                        record.execution,
+                        record.output.as_ref(),
+                    )
+                    .map_err(|_| GatewayError::Journal(JournalError::InvalidRecord))?;
+                return Ok(Self::receipt(
+                    record.evidence.clone(),
+                    record.authorization,
+                    record.execution,
+                    record.output.clone(),
+                    attestation.clone(),
+                ));
+            }
+        }
+
+        let attestation = self.create_execution_attestation(
+            &record.evidence,
+            record.authorization,
+            record.execution,
+            record.output.as_ref(),
+        )?;
+        self.journal.record_attestation(
+            record.key,
+            record.execution,
+            record.output.as_ref(),
+            &attestation,
+        )?;
+        record.execution_attestation = Some(attestation.clone());
+        Ok(Self::receipt(
+            record.evidence.clone(),
+            record.authorization,
+            record.execution,
+            record.output.clone(),
+            attestation,
+        ))
+    }
+
+    fn record_terminal_attested(
+        &self,
+        record: &mut ExecutionRecord,
+        execution: ExecutionStatus,
+        output: Option<Value>,
+    ) -> Result<GatewayReceipt, GatewayError> {
+        let attestation = self.create_execution_attestation(
+            &record.evidence,
+            record.authorization,
+            execution,
+            output.as_ref(),
+        )?;
+        self.journal
+            .record_terminal_attested(record.key, execution, output.as_ref(), &attestation)
+            .map_err(|_| GatewayError::OutcomeNotRecorded(record.key))?;
+        record.execution = execution;
+        record.output = output.clone();
+        record.execution_attestation = Some(attestation.clone());
+        Ok(Self::receipt(
+            record.evidence.clone(),
+            record.authorization,
+            execution,
+            output,
+            attestation,
+        ))
     }
 
     /// Evaluates a new signed request and, only for an exact `ALLOW`, records
@@ -295,12 +677,18 @@ impl Gateway {
         };
 
         if authorization != AuthorizationStatus::Allowed {
-            return Ok(GatewayReceipt {
+            let execution = ExecutionStatus::NotDispatched;
+            let attestation =
+                self.create_execution_attestation(&evidence, authorization, execution, None)?;
+            self.journal
+                .record_attestation(key, execution, None, &attestation)?;
+            return Ok(Self::receipt(
                 evidence,
                 authorization,
-                execution: ExecutionStatus::NotDispatched,
-                output: None,
-            });
+                execution,
+                None,
+                attestation,
+            ));
         }
 
         self.journal.mark_dispatched(key)?;
@@ -315,16 +703,23 @@ impl Gateway {
                 Err(_) => (ExecutionStatus::OutcomeUnknown, None),
             };
 
+        let execution_attestation = self.create_execution_attestation(
+            &evidence,
+            authorization,
+            execution,
+            output.as_ref(),
+        )?;
         self.journal
-            .record_terminal(key, execution, output.as_ref())
+            .record_terminal_attested(key, execution, output.as_ref(), &execution_attestation)
             .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
 
-        Ok(GatewayReceipt {
+        Ok(Self::receipt(
             evidence,
             authorization,
             execution,
             output,
-        })
+            execution_attestation,
+        ))
     }
 
     /// Resolves persisted execution state without dispatching an action.
@@ -343,55 +738,52 @@ impl Gateway {
 
         match record.execution {
             ExecutionStatus::Authorized => {
-                self.journal.mark_not_dispatched(key)?;
+                let execution_attestation = self.create_execution_attestation(
+                    &record.evidence,
+                    record.authorization,
+                    ExecutionStatus::NotDispatched,
+                    None,
+                )?;
+                self.journal
+                    .mark_not_dispatched_attested(key, &execution_attestation)?;
                 record.execution = ExecutionStatus::NotDispatched;
+                record.execution_attestation = Some(execution_attestation.clone());
+                return Ok(Self::receipt(
+                    record.evidence,
+                    record.authorization,
+                    record.execution,
+                    None,
+                    execution_attestation,
+                ));
             }
-            ExecutionStatus::Dispatched => {
-                self.journal.mark_outcome_unknown(key)?;
-                record.execution = ExecutionStatus::OutcomeUnknown;
+            ExecutionStatus::Dispatched | ExecutionStatus::OutcomeUnknown => {
                 match self
                     .dispatcher
                     .reconcile(key, &record.evidence.action, &record.action_digest)
                 {
                     ReconciliationReport::Applied(output) => {
-                        self.journal.record_terminal(
-                            key,
+                        return self.record_terminal_attested(
+                            &mut record,
                             ExecutionStatus::Confirmed,
-                            Some(&output),
-                        )?;
-                        record.execution = ExecutionStatus::Confirmed;
-                        record.output = Some(output);
+                            Some(output),
+                        );
                     }
                     ReconciliationReport::NotApplied => {
-                        self.journal
-                            .record_terminal(key, ExecutionStatus::Failed, None)?;
-                        record.execution = ExecutionStatus::Failed;
-                        record.output = None;
+                        return self.record_terminal_attested(
+                            &mut record,
+                            ExecutionStatus::Failed,
+                            None,
+                        );
                     }
-                    ReconciliationReport::Unknown => {}
-                }
-            }
-            ExecutionStatus::OutcomeUnknown => {
-                match self
-                    .dispatcher
-                    .reconcile(key, &record.evidence.action, &record.action_digest)
-                {
-                    ReconciliationReport::Applied(output) => {
-                        self.journal.record_terminal(
-                            key,
-                            ExecutionStatus::Confirmed,
-                            Some(&output),
-                        )?;
-                        record.execution = ExecutionStatus::Confirmed;
-                        record.output = Some(output);
+                    ReconciliationReport::Unknown => {
+                        if record.execution == ExecutionStatus::Dispatched {
+                            return self.record_terminal_attested(
+                                &mut record,
+                                ExecutionStatus::OutcomeUnknown,
+                                None,
+                            );
+                        }
                     }
-                    ReconciliationReport::NotApplied => {
-                        self.journal
-                            .record_terminal(key, ExecutionStatus::Failed, None)?;
-                        record.execution = ExecutionStatus::Failed;
-                        record.output = None;
-                    }
-                    ReconciliationReport::Unknown => {}
                 }
             }
             ExecutionStatus::NotDispatched
@@ -400,11 +792,6 @@ impl Gateway {
             | ExecutionStatus::Failed => {}
         }
 
-        Ok(GatewayReceipt {
-            evidence: record.evidence,
-            authorization: record.authorization,
-            execution: record.execution,
-            output: record.output,
-        })
+        self.attest_record(&mut record)
     }
 }

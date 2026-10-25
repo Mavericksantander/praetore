@@ -1,3 +1,4 @@
+use ed25519_dalek::{Signer, SigningKey};
 use postgres::{Client, NoTls};
 use praetore_core::{
     Action, AgentId, AgentKeyPair, AuthorizationRequest, DecisionOutcome, EvidenceAttesterKey,
@@ -13,9 +14,9 @@ use praetore_core::{
     },
 };
 use praetore_gateway::{
-    ActionDispatcher, DispatchError, DispatchReport, ExecutionJournal, ExecutionKey,
-    ExecutionRecord, ExecutionStatus, Gateway, GatewayError, JournalError, ReconciliationReport,
-    action_digest,
+    ActionDispatcher, DispatchError, DispatchReport, ExecutionAttestationError,
+    ExecutionAttestationSigner, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
+    Gateway, GatewayError, JournalError, ReconciliationReport, action_digest,
 };
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
 use serde_json::{Value, json};
@@ -32,6 +33,33 @@ use uuid::Uuid;
 
 static TEST_DATABASE_SETUP: OnceLock<()> = OnceLock::new();
 const TEST_NOW: &str = "2026-06-01T12:00:00Z";
+
+struct TestExecutionAttester(SigningKey);
+
+impl TestExecutionAttester {
+    fn new() -> Self {
+        Self(SigningKey::from_bytes(&[74; 32]))
+    }
+}
+
+impl ExecutionAttestationSigner for TestExecutionAttester {
+    fn key_id(&self) -> &str {
+        "postgres-test-execution-attester-v1"
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError> {
+        Ok(self.0.sign(message).to_bytes().to_vec())
+    }
+}
+
+fn execution_attester() -> Arc<TestExecutionAttester> {
+    Arc::new(TestExecutionAttester::new())
+}
+
+fn execution_attester_public_key() -> VerifiedPublicKey {
+    VerifiedPublicKey::from_bytes(&TestExecutionAttester::new().0.verifying_key().to_bytes())
+        .unwrap()
+}
 
 fn connect_client() -> Client {
     let url = env::var("PRAETORE_TEST_DATABASE_URL")
@@ -57,6 +85,11 @@ fn initialize_test_database() {
             ))
             .expect("install execution journal transition history");
         client
+            .batch_execute(include_str!(
+                "../migrations/0005_execution_attestations.sql"
+            ))
+            .expect("install append-only execution attestations");
+        client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
                      agent_id UUID NOT NULL, request_id UUID NOT NULL, \
@@ -81,7 +114,10 @@ fn initialize_test_database() {
                  REVOKE ALL ON TABLE praetore.execution_journal FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.execution_journal FROM praetore_replay_test; \
                  REVOKE ALL ON TABLE praetore.execution_journal_events FROM PUBLIC; \
+                 REVOKE ALL ON TABLE praetore.execution_attestations FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.execution_journal_events \
+                     FROM praetore_replay_test; \
+                 REVOKE ALL ON TABLE praetore.execution_attestations \
                      FROM praetore_replay_test; \
                  GRANT USAGE ON SCHEMA praetore TO praetore_replay_test; \
                  GRANT SELECT (agent_id, request_id) ON praetore.replay_claims \
@@ -89,6 +125,8 @@ fn initialize_test_database() {
                  GRANT INSERT (agent_id, request_id) ON praetore.replay_claims \
                      TO praetore_replay_test; \
                  GRANT SELECT, INSERT, UPDATE ON praetore.execution_journal \
+                     TO praetore_replay_test; \
+                 GRANT SELECT, INSERT ON praetore.execution_attestations \
                      TO praetore_replay_test; \
                  GRANT SELECT ON praetore.execution_journal_events \
                      TO praetore_replay_test; \
@@ -461,28 +499,41 @@ impl ExecutionJournal for CommitFaultJournal {
         self.inner.mark_dispatched(key)
     }
 
-    fn record_terminal(
+    fn record_terminal_attested(
         &self,
         key: ExecutionKey,
         execution: ExecutionStatus,
         output: Option<&Value>,
+        attestation: &praetore_gateway::ExecutionAttestation,
     ) -> Result<(), JournalError> {
         if self.fail_terminal.swap(false, Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
         }
-        self.inner.record_terminal(key, execution, output)
+        self.inner
+            .record_terminal_attested(key, execution, output, attestation)
+    }
+
+    fn record_attestation(
+        &self,
+        key: ExecutionKey,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+        attestation: &praetore_gateway::ExecutionAttestation,
+    ) -> Result<(), JournalError> {
+        self.inner
+            .record_attestation(key, execution, output, attestation)
     }
 
     fn get(&self, key: ExecutionKey) -> Result<Option<ExecutionRecord>, JournalError> {
         self.inner.get(key)
     }
 
-    fn mark_not_dispatched(&self, key: ExecutionKey) -> Result<(), JournalError> {
-        self.inner.mark_not_dispatched(key)
-    }
-
-    fn mark_outcome_unknown(&self, key: ExecutionKey) -> Result<(), JournalError> {
-        self.inner.mark_outcome_unknown(key)
+    fn mark_not_dispatched_attested(
+        &self,
+        key: ExecutionKey,
+        attestation: &praetore_gateway::ExecutionAttestation,
+    ) -> Result<(), JournalError> {
+        self.inner.mark_not_dispatched_attested(key, attestation)
     }
 }
 
@@ -549,8 +600,13 @@ fn create_postgres_gateway(request_id: Uuid) -> PostgresGatewayFixture {
     let issuer_public_key = issuer_key.public_key();
     let engine = create_test_engine(policy.clone(), issuer_public_key.clone(), attester.clone());
     let adapter = Arc::new(PostgresTestAdapter::new(None));
-    let gateway =
-        Gateway::new(engine.clone(), Arc::new(connect_journal()), adapter.clone()).unwrap();
+    let gateway = Gateway::new(
+        engine.clone(),
+        Arc::new(connect_journal()),
+        adapter.clone(),
+        execution_attester(),
+    )
+    .unwrap();
     PostgresGatewayFixture {
         gateway,
         engine,
@@ -597,6 +653,7 @@ fn create_gateway_for_fixture(
         ),
         Arc::new(connect_journal()),
         adapter,
+        execution_attester(),
     )
     .unwrap()
 }
@@ -671,13 +728,16 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
         .batch_execute(
             "BEGIN; \
              ALTER TABLE praetore.execution_journal_events \
-                 DISABLE TRIGGER execution_journal_events_immutable;",
+                 DISABLE TRIGGER execution_journal_events_immutable; \
+             ALTER TABLE praetore.execution_attestations \
+                 DISABLE TRIGGER execution_attestations_immutable;",
         )
         .unwrap();
     for request_id in request_ids {
         for table in [
             "praetore.gateway_test_invocations",
             "praetore.gateway_test_effects",
+            "praetore.execution_attestations",
             "praetore.execution_journal_events",
             "praetore.execution_journal",
             "praetore.replay_claims",
@@ -694,6 +754,8 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
         .batch_execute(
             "ALTER TABLE praetore.execution_journal_events \
                  ENABLE TRIGGER execution_journal_events_immutable; \
+             ALTER TABLE praetore.execution_attestations \
+                 ENABLE TRIGGER execution_attestations_immutable; \
              COMMIT;",
         )
         .unwrap();
@@ -716,12 +778,18 @@ fn database_rows_for_request(table: &str, request_id: Uuid) -> i64 {
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
 fn postgres_gateway_authorizes_and_persists_one_effect() {
     let fixture = create_postgres_gateway(Uuid::new_v4());
-    let receipt = fixture.gateway.execute(fixture.request).unwrap();
+    let receipt = fixture.gateway.execute(fixture.request.clone()).unwrap();
     let key = ExecutionKey {
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    receipt
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "postgres-test-execution-attester-v1",
+        )
+        .unwrap();
     assert_eq!(receipt.evidence.decision.outcome, DecisionOutcome::Allow);
     assert_eq!(database_effect_count(key), 1);
     assert_eq!(database_invocation_count(key), 1);
@@ -731,6 +799,24 @@ fn postgres_gateway_authorizes_and_persists_one_effect() {
         persisted.action_digest,
         action_digest(&receipt.evidence.action).unwrap()
     );
+    assert_eq!(
+        serde_json::to_value(persisted.execution_attestation.unwrap()).unwrap(),
+        serde_json::to_value(receipt.execution_attestation.clone()).unwrap()
+    );
+    let recovered = create_gateway_for_fixture(&fixture, fixture.adapter.clone())
+        .reconcile(key)
+        .unwrap();
+    recovered
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "postgres-test-execution-attester-v1",
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(recovered.execution_attestation).unwrap(),
+        serde_json::to_value(receipt.execution_attestation).unwrap()
+    );
+    assert_eq!(fixture.adapter.invocation_count(), 1);
     assert_eq!(database_replay_claim_count(key), 1);
     assert_eq!(database_journal_count(key), 1);
 }
@@ -797,6 +883,7 @@ fn postgres_lost_commit_ack_is_verified_before_dispatch() {
         ),
         journal,
         fixture.adapter.clone(),
+        execution_attester(),
     )
     .unwrap();
     let receipt = gateway.execute(fixture.request).unwrap();
@@ -830,6 +917,7 @@ fn postgres_unverifiable_commit_acknowledgement_blocks_dispatch() {
         ),
         journal,
         fixture.adapter.clone(),
+        execution_attester(),
     )
     .unwrap();
     let key = ExecutionKey {
@@ -994,6 +1082,7 @@ fn postgres_journal_failure_before_dispatch_prevents_effect() {
         create_test_engine(fixture.policy, fixture.issuer_public_key, fixture.attester),
         journal,
         adapter.clone(),
+        execution_attester(),
     )
     .unwrap();
     assert!(matches!(
@@ -1063,6 +1152,22 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
     let gateway = create_gateway_for_fixture(&fixture, fixture.adapter.clone());
     let unresolved = gateway.reconcile(key).unwrap();
     assert_eq!(unresolved.execution, ExecutionStatus::OutcomeUnknown);
+    unresolved
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "postgres-test-execution-attester-v1",
+        )
+        .unwrap();
+    assert_eq!(
+        connect_journal()
+            .get(key)
+            .unwrap()
+            .unwrap()
+            .execution_attestation
+            .unwrap()
+            .execution,
+        ExecutionStatus::OutcomeUnknown
+    );
     assert_eq!(database_effect_count(key), 1);
     assert_eq!(database_invocation_count(key), 1);
 
@@ -1072,6 +1177,12 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
         .store(false, Ordering::SeqCst);
     let resolved = gateway.reconcile(key).unwrap();
     assert_eq!(resolved.execution, ExecutionStatus::Confirmed);
+    resolved
+        .verify_execution_attestation(
+            &execution_attester_public_key(),
+            "postgres-test-execution-attester-v1",
+        )
+        .unwrap();
     assert_eq!(database_effect_count(key), 1);
     assert_eq!(database_invocation_count(key), 1);
     assert_eq!(
@@ -1100,6 +1211,7 @@ fn postgres_effect_survives_failed_terminal_write_and_is_reconciled_without_retr
         ),
         journal,
         adapter.clone(),
+        execution_attester(),
     )
     .unwrap();
     let key = ExecutionKey {
@@ -1136,11 +1248,21 @@ fn postgres_journal_terminal_states_cannot_return_to_dispatchable() {
         Err(JournalError::InvalidTransition)
     );
     assert_eq!(
-        journal.record_terminal(key, ExecutionStatus::Failed, None),
-        Err(JournalError::InvalidTransition)
+        journal.record_terminal_attested(
+            key,
+            ExecutionStatus::Failed,
+            None,
+            &receipt.execution_attestation,
+        ),
+        Err(JournalError::InvalidRecord)
     );
     assert_eq!(
-        journal.record_terminal(key, ExecutionStatus::Confirmed, receipt.output.as_ref()),
+        journal.record_terminal_attested(
+            key,
+            ExecutionStatus::Confirmed,
+            receipt.output.as_ref(),
+            &receipt.execution_attestation,
+        ),
         Ok(())
     );
 

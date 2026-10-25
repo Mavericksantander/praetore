@@ -4,8 +4,8 @@ use praetore_core::{
     canonical::canonicalize_json, replay::AtomicAuthorizationCommit,
 };
 use praetore_gateway::{
-    AuthorizationStatus, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
-    JournalError, action_digest,
+    AuthorizationStatus, ExecutionAttestation, ExecutionJournal, ExecutionKey, ExecutionRecord,
+    ExecutionStatus, JournalError, action_digest,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -91,7 +91,11 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
             let existing = transaction
                 .query_opt(
                     "SELECT request_digest, action_digest, authorization_status, \
-                     execution_status, evidence_json, output_json \
+                     execution_status, evidence_json, output_json, \
+                     (SELECT attestation_json FROM praetore.execution_attestations ea \
+                      WHERE ea.agent_id = execution_journal.agent_id \
+                        AND ea.request_id = execution_journal.request_id \
+                        AND ea.execution_status = execution_journal.execution_status) \
                      FROM praetore.execution_journal \
                      WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
                     &[&key.agent_id, &key.request_id],
@@ -209,11 +213,12 @@ impl ExecutionJournal for PostgresExecutionJournal {
         }
     }
 
-    fn record_terminal(
+    fn record_terminal_attested(
         &self,
         key: ExecutionKey,
         execution: ExecutionStatus,
         output: Option<&Value>,
+        attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError> {
         if !is_terminal(execution) {
             return Err(JournalError::InvalidTransition);
@@ -222,6 +227,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|_| JournalError::InvalidRecord)?;
+        let attestation_json =
+            serialize_attestation(attestation).map_err(|_| JournalError::InvalidRecord)?;
         let mut client = self.client.lock().map_err(|_| JournalError::Unavailable)?;
         let mut transaction = client
             .transaction()
@@ -231,7 +238,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT execution_status, output_json FROM praetore.execution_journal \
+                "SELECT execution_status, output_json, evidence_json, authorization_status \
+                 FROM praetore.execution_journal \
                  WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
                 &[&key.agent_id, &key.request_id],
             )
@@ -239,9 +247,23 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .ok_or(JournalError::InvalidTransition)?;
         let current: String = row.get(0);
         let current_output: Option<String> = row.get(1);
-        if is_terminal_db(&current) {
+        let evidence: String = row.get(2);
+        let authorization = super::execution::parse_authorization(&row.get::<_, String>(3))?;
+        let evidence = Evidence::from_json(&evidence).map_err(|_| JournalError::InvalidRecord)?;
+        attestation
+            .validate_binding(&evidence, authorization, execution, output)
+            .map_err(|_| JournalError::InvalidRecord)?;
+        if current == execution_as_db(execution) {
             let same_output = current_output.as_deref() == output_json.as_deref();
-            let result = if current == execution_as_db(execution) && same_output {
+            let stored = transaction
+                .query_opt(
+                    "SELECT attestation_json FROM praetore.execution_attestations \
+                     WHERE agent_id = $1 AND request_id = $2 AND execution_status = $3",
+                    &[&key.agent_id, &key.request_id, &execution_as_db(execution)],
+                )
+                .map_err(|_| JournalError::Unavailable)?;
+            let same_attestation = stored.map(|row| row.get::<_, Value>(0) == attestation_json);
+            let result = if same_output && same_attestation == Some(true) {
                 Ok(())
             } else {
                 Err(JournalError::InvalidTransition)
@@ -250,6 +272,9 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 .commit()
                 .map_err(|_| JournalError::Unavailable)?;
             return result;
+        }
+        if is_terminal_db(&current) {
+            return Err(JournalError::InvalidTransition);
         }
         if current != "dispatched" && current != "outcome_unknown" {
             return Err(JournalError::InvalidTransition);
@@ -267,6 +292,76 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 ],
             )
             .map_err(|_| JournalError::Unavailable)?;
+        insert_execution_attestation(&mut transaction, key, execution, &attestation_json)?;
+        transaction
+            .commit()
+            .map_err(|_| JournalError::Unavailable)?;
+        Ok(())
+    }
+
+    fn record_attestation(
+        &self,
+        key: ExecutionKey,
+        execution: ExecutionStatus,
+        output: Option<&Value>,
+        attestation: &ExecutionAttestation,
+    ) -> Result<(), JournalError> {
+        let attestation_json =
+            serialize_attestation(attestation).map_err(|_| JournalError::InvalidRecord)?;
+        let mut client = self.client.lock().map_err(|_| JournalError::Unavailable)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| JournalError::Unavailable)?;
+        transaction
+            .batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(|_| JournalError::Unavailable)?;
+        let row = transaction
+            .query_opt(
+                "SELECT execution_status, output_json, evidence_json, authorization_status \
+                 FROM praetore.execution_journal \
+                 WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
+                &[&key.agent_id, &key.request_id],
+            )
+            .map_err(|_| JournalError::Unavailable)?
+            .ok_or(JournalError::InvalidTransition)?;
+        let current: String = row.get(0);
+        let output_json: Option<String> = row.get(1);
+        let expected_output_json = output
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| JournalError::InvalidRecord)?;
+        if current != execution_as_db(execution) || output_json != expected_output_json {
+            return Err(JournalError::InvalidTransition);
+        }
+        let evidence_json: String = row.get(2);
+        let authorization = super::execution::parse_authorization(&row.get::<_, String>(3))?;
+        let evidence =
+            Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
+        if !matches!(execution, ExecutionStatus::NotDispatched) && !is_terminal(execution) {
+            return Err(JournalError::InvalidTransition);
+        }
+        attestation
+            .validate_binding(&evidence, authorization, execution, output)
+            .map_err(|_| JournalError::InvalidRecord)?;
+        if let Some(existing) = transaction
+            .query_opt(
+                "SELECT attestation_json FROM praetore.execution_attestations \
+                 WHERE agent_id = $1 AND request_id = $2 AND execution_status = $3",
+                &[&key.agent_id, &key.request_id, &execution_as_db(execution)],
+            )
+            .map_err(|_| JournalError::Unavailable)?
+        {
+            let result = if existing.get::<_, Value>(0) == attestation_json {
+                Ok(())
+            } else {
+                Err(JournalError::InvalidTransition)
+            };
+            transaction
+                .commit()
+                .map_err(|_| JournalError::Unavailable)?;
+            return result;
+        }
+        insert_execution_attestation(&mut transaction, key, execution, &attestation_json)?;
         transaction
             .commit()
             .map_err(|_| JournalError::Unavailable)?;
@@ -278,7 +373,12 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let row = client
             .query_opt(
                 "SELECT request_digest, action_digest, authorization_status, execution_status, \
-                 evidence_json, output_json FROM praetore.execution_journal \
+                 evidence_json, output_json, \
+                 (SELECT attestation_json FROM praetore.execution_attestations ea \
+                  WHERE ea.agent_id = execution_journal.agent_id \
+                    AND ea.request_id = execution_journal.request_id \
+                    AND ea.execution_status = execution_journal.execution_status) \
+                 FROM praetore.execution_journal \
                  WHERE agent_id = $1 AND request_id = $2",
                 &[&key.agent_id, &key.request_id],
             )
@@ -286,30 +386,13 @@ impl ExecutionJournal for PostgresExecutionJournal {
         row.map(|row| parse_record(key, row)).transpose()
     }
 
-    fn mark_not_dispatched(&self, key: ExecutionKey) -> Result<(), JournalError> {
-        self.transition_or_idempotent(key, "authorized", "not_dispatched", "not_dispatched", true)
-    }
-
-    fn mark_outcome_unknown(&self, key: ExecutionKey) -> Result<(), JournalError> {
-        self.transition_or_idempotent(
-            key,
-            "dispatched",
-            "outcome_unknown",
-            "outcome_unknown",
-            true,
-        )
-    }
-}
-
-impl PostgresExecutionJournal {
-    fn transition_or_idempotent(
+    fn mark_not_dispatched_attested(
         &self,
         key: ExecutionKey,
-        from: &str,
-        to: &str,
-        already: &str,
-        allow_already: bool,
+        attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError> {
+        let attestation_json =
+            serialize_attestation(attestation).map_err(|_| JournalError::InvalidRecord)?;
         let mut client = self.client.lock().map_err(|_| JournalError::Unavailable)?;
         let mut transaction = client
             .transaction()
@@ -319,32 +402,71 @@ impl PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT execution_status FROM praetore.execution_journal \
+                "SELECT execution_status, evidence_json, authorization_status \
+                 FROM praetore.execution_journal \
                  WHERE agent_id = $1 AND request_id = $2 FOR UPDATE",
                 &[&key.agent_id, &key.request_id],
             )
             .map_err(|_| JournalError::Unavailable)?
             .ok_or(JournalError::InvalidTransition)?;
         let current: String = row.get(0);
-        let result = if current == from {
-            transaction
-                .execute(
-                    "UPDATE praetore.execution_journal \
-                     SET execution_status = $3, updated_at = clock_timestamp() \
-                     WHERE agent_id = $1 AND request_id = $2",
-                    &[&key.agent_id, &key.request_id, &to],
+        let evidence_json: String = row.get(1);
+        let authorization = parse_authorization(&row.get::<_, String>(2))?;
+        let evidence =
+            Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
+        if authorization != AuthorizationStatus::Allowed {
+            return Err(JournalError::InvalidTransition);
+        }
+        attestation
+            .validate_binding(
+                &evidence,
+                authorization,
+                ExecutionStatus::NotDispatched,
+                None,
+            )
+            .map_err(|_| JournalError::InvalidRecord)?;
+
+        if current == "not_dispatched" {
+            let existing = transaction
+                .query_opt(
+                    "SELECT attestation_json FROM praetore.execution_attestations \
+                     WHERE agent_id = $1 AND request_id = $2 \
+                       AND execution_status = 'not_dispatched'",
+                    &[&key.agent_id, &key.request_id],
                 )
                 .map_err(|_| JournalError::Unavailable)?;
-            Ok(())
-        } else if allow_already && current == already {
-            Ok(())
-        } else {
-            Err(JournalError::InvalidTransition)
-        };
+            let result =
+                if existing.map(|row| row.get::<_, Value>(0)) == Some(attestation_json.clone()) {
+                    Ok(())
+                } else {
+                    Err(JournalError::InvalidTransition)
+                };
+            transaction
+                .commit()
+                .map_err(|_| JournalError::Unavailable)?;
+            return result;
+        }
+        if current != "authorized" {
+            return Err(JournalError::InvalidTransition);
+        }
+        transaction
+            .execute(
+                "UPDATE praetore.execution_journal \
+                 SET execution_status = 'not_dispatched', updated_at = clock_timestamp() \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .map_err(|_| JournalError::Unavailable)?;
+        insert_execution_attestation(
+            &mut transaction,
+            key,
+            ExecutionStatus::NotDispatched,
+            &attestation_json,
+        )?;
         transaction
             .commit()
             .map_err(|_| JournalError::Unavailable)?;
-        result
+        Ok(())
     }
 }
 
@@ -366,7 +488,11 @@ fn verify_authorization_pair(
     let row = client
         .query_opt(
             "SELECT request_digest, action_digest, authorization_status, \
-             execution_status, evidence_json, output_json \
+             execution_status, evidence_json, output_json, \
+             (SELECT attestation_json FROM praetore.execution_attestations ea \
+              WHERE ea.agent_id = execution_journal.agent_id \
+                AND ea.request_id = execution_journal.request_id \
+                AND ea.execution_status = execution_journal.execution_status) \
              FROM praetore.execution_journal \
              WHERE agent_id = $1 AND request_id = $2",
             &[&key.agent_id, &key.request_id],
@@ -498,6 +624,10 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
     let output = output_json
         .map(|json| serde_json::from_str(&json).map_err(|_| JournalError::InvalidRecord))
         .transpose()?;
+    let execution_attestation = row
+        .get::<_, Option<Value>>(6)
+        .map(|value| serde_json::from_value(value).map_err(|_| JournalError::InvalidRecord))
+        .transpose()?;
     validate_evidence(key, &evidence, authorization)?;
     let (expected_request_digest, expected_action_digest) = execution_digests(&evidence)?;
     if expected_request_digest != request_digest || expected_action_digest != action_digest {
@@ -510,7 +640,41 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
         execution,
         action_digest,
         output,
+        execution_attestation,
     })
+}
+
+fn serialize_attestation(attestation: &ExecutionAttestation) -> Result<Value, JournalError> {
+    serde_json::to_value(attestation).map_err(|_| JournalError::InvalidRecord)
+}
+
+fn insert_execution_attestation(
+    transaction: &mut postgres::Transaction<'_>,
+    key: ExecutionKey,
+    execution: ExecutionStatus,
+    attestation: &Value,
+) -> Result<(), JournalError> {
+    transaction
+        .execute(
+            "INSERT INTO praetore.execution_attestations \
+             (attestation_id, agent_id, request_id, execution_status, attestation_json) \
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &uuid::Uuid::new_v4(),
+                &key.agent_id,
+                &key.request_id,
+                &execution_as_db(execution),
+                attestation,
+            ],
+        )
+        .map_err(|error| {
+            if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) {
+                JournalError::InvalidTransition
+            } else {
+                JournalError::Unavailable
+            }
+        })?;
+    Ok(())
 }
 
 pub(super) fn is_digest(value: &str) -> bool {
