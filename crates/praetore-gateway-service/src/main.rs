@@ -2,17 +2,26 @@ use ed25519_dalek::{Signer, SigningKey};
 use postgres::{Client, NoTls};
 use praetore_core::{
     EvidenceAttesterKey, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
-    Policy, TrustedAuthorityIssuer, VerifiedPublicKey, engine::AuthorizationEngine,
-    identity::AgentKeyFingerprint,
+    Policy, TrustedAuthorityIssuer, VerifiedPublicKey, canonical::parse_json_rejecting_duplicates,
+    engine::AuthorizationEngine, identity::AgentKeyFingerprint,
 };
 use praetore_gateway::{
     ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway,
     HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
 };
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
-use std::{env, fs, path::Path, str::FromStr, sync::Arc};
+use serde::Deserialize;
+use serde_json::Value;
+use std::{
+    collections::{HashMap, HashSet},
+    env, fs,
+    path::Path,
+    str::FromStr,
+    sync::Arc,
+};
 use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 const MIGRATIONS: [&str; 7] = [
     include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
@@ -69,6 +78,26 @@ struct LocalExecutionSigner {
     signing_key: SigningKey,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantIssuerBindingsFile {
+    schema_version: u8,
+    tenants: Vec<TenantIssuerBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TenantIssuerBinding {
+    tenant_id: Uuid,
+    issuer_key_ids: Vec<String>,
+}
+
+struct GatewayAdapterSetup {
+    dispatcher: Arc<dyn ActionDispatcher>,
+    tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
+    audience: String,
+}
+
 impl LocalExecutionSigner {
     fn from_hex(value: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let bytes = hex::decode(value)?;
@@ -108,6 +137,75 @@ fn read_limited(path: &str, max_bytes: u64) -> Result<String, Box<dyn std::error
     Ok(fs::read_to_string(path)?)
 }
 
+fn load_issuer_pins(
+    document: &str,
+) -> Result<Vec<TrustedAuthorityIssuer>, Box<dyn std::error::Error>> {
+    if document.len() > 1_048_576 {
+        return Err("issuer pin configuration exceeds the size limit".into());
+    }
+    let value = parse_json_rejecting_duplicates(document)?;
+    let pin_documents = match value {
+        Value::Array(pins) if !pins.is_empty() && pins.len() <= 4096 => pins
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?,
+        Value::Array(_) => return Err("issuer pin list must contain 1 to 4096 pins".into()),
+        _ => vec![document.to_owned()],
+    };
+    let pins = pin_documents
+        .iter()
+        .map(|pin| TrustedAuthorityIssuer::from_pin_json(pin))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut key_ids = HashSet::with_capacity(pins.len());
+    if pins.iter().any(|pin| !key_ids.insert(pin.key_id())) {
+        return Err("issuer pin list contains duplicate key ids".into());
+    }
+    Ok(pins)
+}
+
+fn parse_tenant_issuer_bindings(
+    document: &str,
+) -> Result<HashMap<Uuid, Vec<String>>, Box<dyn std::error::Error>> {
+    if document.len() > 1_048_576 {
+        return Err("tenant issuer binding configuration exceeds the size limit".into());
+    }
+    let value = parse_json_rejecting_duplicates(document)?;
+    let bindings: TenantIssuerBindingsFile = serde_json::from_value(value)?;
+    if bindings.schema_version != 1 || bindings.tenants.is_empty() || bindings.tenants.len() > 4096
+    {
+        return Err(
+            "tenant issuer binding configuration has an unsupported version or size".into(),
+        );
+    }
+
+    let mut tenants = HashMap::with_capacity(bindings.tenants.len());
+    let mut assigned_key_ids = HashSet::new();
+    for binding in bindings.tenants {
+        if binding.tenant_id.is_nil()
+            || binding.issuer_key_ids.is_empty()
+            || binding.issuer_key_ids.len() > 16
+        {
+            return Err("tenant issuer binding contains an invalid tenant or key list".into());
+        }
+        for key_id in &binding.issuer_key_ids {
+            let valid_key_id = key_id.len() == 64
+                && hex::decode(key_id).is_ok_and(|bytes| hex::encode(bytes) == *key_id);
+            if !valid_key_id || !assigned_key_ids.insert(key_id.clone()) {
+                return Err(
+                    "issuer key ids must be canonical and assigned to exactly one tenant".into(),
+                );
+            }
+        }
+        if tenants
+            .insert(binding.tenant_id, binding.issuer_key_ids)
+            .is_some()
+        {
+            return Err("tenant issuer binding contains a duplicate tenant id".into());
+        }
+    }
+    Ok(tenants)
+}
+
 fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_local_database_url(database_url)?;
     let mut client = Client::connect(database_url, NoTls)?;
@@ -139,6 +237,8 @@ fn validate_local_database_url(database_url: &str) -> Result<(), Box<dyn std::er
 fn build_gateway(
     database_url: &str,
     dispatcher: Arc<dyn ActionDispatcher>,
+    tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
+    audience: &str,
 ) -> Result<Gateway, Box<dyn std::error::Error>> {
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
@@ -147,21 +247,24 @@ fn build_gateway(
         return Err("gateway service requires policy semantics version 2".into());
     }
     let policy_digest = policy.digest()?;
-    let issuer_pin = TrustedAuthorityIssuer::from_pin_json(&read_limited(&issuer_pin_path, 8192)?)?;
+    let issuer_pins = load_issuer_pins(&read_limited(&issuer_pin_path, 1_048_576)?)?;
     let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
     let evidence_key_bytes: [u8; 32] = hex::decode(evidence_key_hex)?
         .try_into()
         .map_err(|_| "evidence attester key must be exactly 32 bytes")?;
     let evidence_attester = EvidenceAttesterKey::from_secret_bytes(&evidence_key_bytes);
 
-    let config =
-        HighAssuranceConfig::new(policy_digest.clone(), vec![issuer_pin], evidence_attester)?
-            .with_audience("praetore-local-demo")
+    let mut config =
+        HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_attester)?
+            .with_audience(audience)
             .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(Client::connect(
                 database_url,
                 NoTls,
             )?)))
             .with_freshness_provider(Arc::new(LocalFreshnessProvider { policy_digest }));
+    if let Some(bindings) = tenant_issuer_bindings {
+        config = config.with_tenant_issuer_bindings(bindings);
+    }
     let engine = AuthorizationEngine::production(policy, config)?;
 
     let journal = Arc::new(PostgresExecutionJournal::from_connection_factory({
@@ -192,22 +295,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_secret_key(&evidence_key_hex, "evidence attester")?;
     validate_secret_key(&execution_key_hex, "execution attester")?;
 
-    apply_migrations(&database_url)?;
-    let dispatcher: Arc<dyn ActionDispatcher> =
-        match env::var("PRAETORE_GATEWAY_ADAPTER").as_deref() {
-            Ok("http") => {
-                let route_path = required_env("PRAETORE_GATEWAY_TOOL_ROUTES_FILE")?;
-                let route_config = read_limited(&route_path, 65_536)?;
-                Arc::new(
+    let adapter_setup = match env::var("PRAETORE_GATEWAY_ADAPTER").as_deref() {
+        Ok("http") => {
+            let route_path = required_env("PRAETORE_GATEWAY_TOOL_ROUTES_FILE")?;
+            let route_config = read_limited(&route_path, 65_536)?;
+            let bindings_path = required_env("PRAETORE_GATEWAY_TENANT_ISSUER_BINDINGS_FILE")?;
+            let bindings = parse_tenant_issuer_bindings(&read_limited(&bindings_path, 1_048_576)?)?;
+            let audience = required_env("PRAETORE_GATEWAY_AUDIENCE")?;
+            GatewayAdapterSetup {
+                dispatcher: Arc::new(
                     praetore_gateway_service::http_dispatcher::HttpActionDispatcher::from_json(
                         &route_config,
                     )?,
-                )
+                ),
+                tenant_issuer_bindings: Some(bindings),
+                audience,
             }
-            Ok("local-demo") | Err(_) => Arc::new(LocalDemoDispatcher::new()),
-            Ok(_) => return Err("PRAETORE_GATEWAY_ADAPTER must be http or local-demo".into()),
-        };
-    let gateway = Arc::new(build_gateway(&database_url, dispatcher)?);
+        }
+        Ok("local-demo") | Err(_) => GatewayAdapterSetup {
+            dispatcher: Arc::new(LocalDemoDispatcher::new()),
+            tenant_issuer_bindings: None,
+            audience: "praetore-local-demo".to_owned(),
+        },
+        Ok(_) => return Err("PRAETORE_GATEWAY_ADAPTER must be http or local-demo".into()),
+    };
+    let gateway = Arc::new(build_gateway(
+        &database_url,
+        adapter_setup.dispatcher,
+        adapter_setup.tenant_issuer_bindings,
+        &adapter_setup.audience,
+    )?);
+    apply_migrations(&database_url)?;
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
         Ok(address) => address.parse::<std::net::SocketAddr>()?,
         Err(_) => {
@@ -278,6 +396,51 @@ mod tests {
     fn invalid_secret_key_lengths_are_rejected() {
         assert!(validate_secret_key(&hex::encode([0; 31]), "test").is_err());
         assert!(validate_secret_key(&hex::encode([0; 32]), "test").is_ok());
+    }
+
+    #[test]
+    fn tenant_issuer_bindings_reject_reused_keys_and_tenants() {
+        let tenant_a = Uuid::from_u128(1);
+        let tenant_b = Uuid::from_u128(2);
+        let issuer_key_id = "0123456789abcdef".repeat(4);
+        let valid = format!(
+            r#"{{"schema_version":1,"tenants":[{{"tenant_id":"{tenant_a}","issuer_key_ids":["{issuer_key_id}"]}}]}}"#
+        );
+        let bindings = parse_tenant_issuer_bindings(&valid).unwrap();
+        assert_eq!(bindings[&tenant_a], vec![issuer_key_id.clone()]);
+
+        let duplicate_key = format!(
+            r#"{{"schema_version":1,"tenants":[{{"tenant_id":"{tenant_a}","issuer_key_ids":["{issuer_key_id}"]}},{{"tenant_id":"{tenant_b}","issuer_key_ids":["{issuer_key_id}"]}}]}}"#
+        );
+        assert!(parse_tenant_issuer_bindings(&duplicate_key).is_err());
+
+        let duplicate_tenant = format!(
+            r#"{{"schema_version":1,"tenants":[{{"tenant_id":"{tenant_a}","issuer_key_ids":["{issuer_key_id}"]}},{{"tenant_id":"{tenant_a}","issuer_key_ids":["{}"]}}]}}"#,
+            "fedcba9876543210".repeat(4)
+        );
+        assert!(parse_tenant_issuer_bindings(&duplicate_tenant).is_err());
+    }
+
+    #[test]
+    fn issuer_pin_loader_accepts_single_pin_and_pin_array() {
+        let first_key = praetore_core::AgentKeyPair::generate();
+        let second_key = praetore_core::AgentKeyPair::generate();
+        let first_pin = TrustedAuthorityIssuer::new("tenant-one", first_key.public_key()).unwrap();
+        let second_pin =
+            TrustedAuthorityIssuer::new("tenant-two", second_key.public_key()).unwrap();
+
+        assert_eq!(
+            load_issuer_pins(&first_pin.export_pin_json().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        let pins = format!(
+            "[{},{}]",
+            first_pin.export_pin_json().unwrap(),
+            second_pin.export_pin_json().unwrap()
+        );
+        assert_eq!(load_issuer_pins(&pins).unwrap().len(), 2);
     }
 
     #[test]
