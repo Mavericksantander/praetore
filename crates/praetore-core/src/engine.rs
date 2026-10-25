@@ -16,7 +16,10 @@ use crate::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -188,6 +191,7 @@ pub struct HighAssuranceConfig {
     max_authority_lifetime: Duration,
     max_freshness_lease: Duration,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
+    tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     evidence_attester: EvidenceAttesterKey,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
     freshness_provider: Option<Arc<dyn FreshnessProvider>>,
@@ -202,6 +206,10 @@ impl std::fmt::Debug for HighAssuranceConfig {
             .field("max_authority_lifetime", &self.max_authority_lifetime)
             .field("max_freshness_lease", &self.max_freshness_lease)
             .field("trusted_issuers", &self.trusted_issuers)
+            .field(
+                "tenant_issuer_bindings_configured",
+                &self.tenant_issuer_bindings.is_some(),
+            )
             .field("evidence_attester", &self.evidence_attester)
             .field("replay_guard_configured", &self.replay_guard.is_some())
             .field(
@@ -248,6 +256,7 @@ impl HighAssuranceConfig {
             max_authority_lifetime: Duration::days(365),
             max_freshness_lease: Duration::minutes(1),
             trusted_issuers,
+            tenant_issuer_bindings: None,
             evidence_attester,
             replay_guard: None,
             freshness_provider: None,
@@ -271,6 +280,14 @@ impl HighAssuranceConfig {
 
     pub fn with_max_freshness_lease(mut self, lifetime: Duration) -> Self {
         self.max_freshness_lease = lifetime;
+        self
+    }
+
+    /// Restricts each tenant to its own issuer signing keys. Each issuer key
+    /// may be assigned to only one tenant; multiple keys per tenant support
+    /// planned key rotation.
+    pub fn with_tenant_issuer_bindings(mut self, bindings: HashMap<Uuid, Vec<String>>) -> Self {
+        self.tenant_issuer_bindings = Some(bindings);
         self
     }
 
@@ -343,6 +360,7 @@ pub struct AuthorizationEngine {
     clock: Arc<dyn Clock>,
     mode: EvaluationMode,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
+    tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     expected_policy_digest: Option<String>,
     audience: Option<String>,
     max_intent_lifetime: Duration,
@@ -382,6 +400,7 @@ impl AuthorizationEngine {
             clock: Arc::new(SystemClock),
             mode: EvaluationMode::Development,
             trusted_issuers: Vec::new(),
+            tenant_issuer_bindings: None,
             expected_policy_digest: None,
             audience: None,
             max_intent_lifetime: Duration::ZERO,
@@ -410,6 +429,7 @@ impl AuthorizationEngine {
             clock: Arc::new(clock),
             mode: EvaluationMode::Development,
             trusted_issuers: Vec::new(),
+            tenant_issuer_bindings: None,
             expected_policy_digest: None,
             audience: None,
             max_intent_lifetime: Duration::ZERO,
@@ -441,6 +461,7 @@ impl AuthorizationEngine {
             clock: Arc::new(SystemClock),
             mode: EvaluationMode::Strict,
             trusted_issuers,
+            tenant_issuer_bindings: None,
             expected_policy_digest: None,
             audience: None,
             max_intent_lifetime: Duration::ZERO,
@@ -502,6 +523,7 @@ impl AuthorizationEngine {
             clock: Arc::new(clock),
             mode: EvaluationMode::HighAssurance,
             trusted_issuers: config.trusted_issuers,
+            tenant_issuer_bindings: config.tenant_issuer_bindings,
             expected_policy_digest: Some(config.policy_digest),
             audience: config.audience,
             max_intent_lifetime: config.max_intent_lifetime,
@@ -546,6 +568,31 @@ impl AuthorizationEngine {
         }
         if require_replay_guard && self.replay_guard.is_none() {
             return Err(PraetoreError::ReplayGuardUnavailable);
+        }
+
+        if let Some(bindings) = &self.tenant_issuer_bindings {
+            let mut bound_key_ids = HashSet::new();
+            if bindings.is_empty() {
+                return Err(PraetoreError::TrustStoreFailure);
+            }
+            for (tenant_id, key_ids) in bindings {
+                if tenant_id.is_nil() || key_ids.is_empty() {
+                    return Err(PraetoreError::TrustStoreFailure);
+                }
+                for key_id in key_ids {
+                    let valid_key_id = key_id.len() == 64
+                        && hex::decode(key_id).is_ok_and(|bytes| hex::encode(bytes) == *key_id);
+                    if !valid_key_id
+                        || !self.trusted_issuers.iter().any(|pin| pin.key_id == *key_id)
+                        || !bound_key_ids.insert(key_id)
+                    {
+                        return Err(PraetoreError::TrustStoreFailure);
+                    }
+                }
+            }
+            if bound_key_ids.len() != self.trusted_issuers.len() {
+                return Err(PraetoreError::TrustStoreFailure);
+            }
         }
 
         let mut has_active_issuer = false;
@@ -799,6 +846,24 @@ impl AuthorizationEngine {
         }
 
         if self.mode != EvaluationMode::Development {
+            if let Some(bindings) = &self.tenant_issuer_bindings {
+                let tenant_id = request
+                    .authority
+                    .tenant_id()
+                    .ok_or(PraetoreError::TrustStoreFailure)?;
+                let key_id = request
+                    .authority
+                    .issuer_key_id
+                    .as_deref()
+                    .ok_or(PraetoreError::TrustStoreFailure)?;
+                if !bindings
+                    .get(&tenant_id)
+                    .is_some_and(|key_ids| key_ids.iter().any(|bound| bound == key_id))
+                {
+                    return Err(PraetoreError::TrustStoreFailure);
+                }
+            }
+
             if request.action.capability.is_none() {
                 return Err(PraetoreError::InvalidRequest(
                     "strict evaluation requires an explicit action capability".into(),
@@ -986,6 +1051,13 @@ mod tests {
     fn production_engine_with_provider(
         provider: Arc<dyn FreshnessProvider>,
     ) -> (AuthorizationEngine, AuthorizationRequest) {
+        production_engine_with_tenant_binding(provider, None)
+    }
+
+    fn production_engine_with_tenant_binding(
+        provider: Arc<dyn FreshnessProvider>,
+        tenant_binding: Option<(Uuid, Uuid)>,
+    ) -> (AuthorizationEngine, AuthorizationRequest) {
         let policy = allow_policy();
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
@@ -993,6 +1065,9 @@ mod tests {
         let mut authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
                 .with_validity(high_assurance_validity());
+        if let Some((request_tenant_id, _)) = tenant_binding {
+            authority = authority.with_constraint("tenant_id", request_tenant_id.to_string());
+        }
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
         let policy_digest = policy.digest().unwrap();
         let now = FixedClock::new("2026-06-01T12:00:00Z").now();
@@ -1006,15 +1081,24 @@ mod tests {
                 policy_digest.clone(),
             )
             .unwrap();
+        let issuer_pin = production_test_pin(&issuer_key, high_assurance_validity());
         let config = HighAssuranceConfig::new(
             policy_digest,
-            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            vec![issuer_pin.clone()],
             EvidenceAttesterKey::generate(),
         )
         .unwrap()
         .with_audience("test-gateway")
         .with_replay_guard(test_replay_guard())
         .with_freshness_provider(provider);
+        let config = if let Some((_, configured_tenant_id)) = tenant_binding {
+            config.with_tenant_issuer_bindings(HashMap::from([(
+                configured_tenant_id,
+                vec![issuer_pin.key_id().to_owned()],
+            )]))
+        } else {
+            config
+        };
         let engine = AuthorizationEngine::production_with_clock(
             policy,
             config,
@@ -1022,6 +1106,35 @@ mod tests {
         )
         .unwrap();
         (engine, request)
+    }
+
+    #[test]
+    fn high_assurance_tenant_issuer_binding_rejects_cross_tenant_authority() {
+        let request_tenant_id = Uuid::from_u128(100);
+        let configured_tenant_id = Uuid::from_u128(200);
+        let (engine, request) = production_engine_with_tenant_binding(
+            test_freshness_provider(),
+            Some((request_tenant_id, configured_tenant_id)),
+        );
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::TrustStoreFailure)
+        ));
+    }
+
+    #[test]
+    fn high_assurance_tenant_issuer_binding_accepts_configured_tenant() {
+        let tenant_id = Uuid::from_u128(100);
+        let (engine, request) = production_engine_with_tenant_binding(
+            test_freshness_provider(),
+            Some((tenant_id, tenant_id)),
+        );
+
+        assert_eq!(
+            engine.evaluate(request).unwrap().decision.outcome,
+            DecisionOutcome::Allow
+        );
     }
 
     struct CountingClock {

@@ -166,7 +166,8 @@ write fails, it does not invoke the tool. It records a successful adapter
 result as `Executed` or `Confirmed`; an adapter error is recorded as
 `OutcomeUnknown` and is never retried automatically. `Confirmed` means only
 that the adapter's own confirmation contract succeeded. The optional
-`PostgresExecutionJournal` uses a unique `(agent_id, request_id)` key,
+`PostgresExecutionJournal` uses a unique
+`(tenant_id, agent_id, request_id)` key,
 transactional state changes, and a database transition trigger. PostgreSQL
 integration tests exercise concurrent gateways, restart recovery, and
 ambiguous outcomes with a persistent test adapter. This does not establish
@@ -213,14 +214,15 @@ operator rollback. Production use additionally depends on trustworthy clocks,
 externally protected signing/trust keys, database access controls and backups,
 and preventing the agent from reaching alternate execution paths.
 
-Apply migrations in order: `0001_replay_claims.sql`, then
-`0002_execution_journal.sql`, then `0003_execution_replay_link.sql`. The final
-migration adds a `NOT VALID` foreign key so existing rows are not silently
-rewritten or promoted; PostgreSQL still enforces it for new journal inserts.
+Apply migrations `0001_replay_claims.sql` through
+`0007_tenant_scoped_execution.sql` in numeric order. The final migration
+converts execution keys and foreign keys to include the tenant UUID while
+retaining legacy unscoped claims under the reserved nil tenant.
 Legacy orphan claims are explicitly detected by the atomic provider. Each
 authorization transaction uses the default `READ COMMITTED` isolation level,
-the replay table's `(agent_id, request_id)` primary key to serialize competing
-claims, and locks a matching journal row while classifying an existing claim. The
+the replay table's `(tenant_id, agent_id, request_id)` primary key to serialize
+competing claims, and locks a matching journal row while classifying an existing
+claim. The
 transaction inserts the claim and journal evidence together and commits with
 `synchronous_commit=on`; an error before commit rolls back both. If commit
 acknowledgement is uncertain, the provider uses a fresh connection from its
@@ -349,9 +351,40 @@ adapter-specific reconciliation integration proves the outcome.
 
 The `praetore-gateway-demo` binary can select this adapter with
 `PRAETORE_GATEWAY_ADAPTER=http` and
-`PRAETORE_GATEWAY_TOOL_ROUTES_FILE=<path>`. For external tools, set an
-explicit egress proxy in the route configuration and make it enforce the
-destination hostname allowlist. In a separately networked pod, the example
+`PRAETORE_GATEWAY_TOOL_ROUTES_FILE=<path>`. HTTP mode also requires
+`PRAETORE_GATEWAY_TENANT_ISSUER_BINDINGS_FILE` and
+`PRAETORE_GATEWAY_AUDIENCE`. The issuer pin file accepts either one exported
+issuer pin or a JSON array of exported pins. The tenant binding file has this
+shape:
+
+```json
+{
+  "schema_version": 1,
+  "tenants": [
+    {
+      "tenant_id": "replace-with-tenant-uuid",
+      "issuer_key_ids": ["replace-with-64-character-issuer-key-id"]
+    }
+  ]
+}
+```
+
+Assign every trusted issuer key to exactly one tenant. A tenant may list
+multiple keys during a planned rotation. Startup rejects duplicate tenants,
+reused or malformed key IDs, untrusted keys, and trusted issuer pins that are
+not assigned to a tenant. HighAssurance rejects requests without a signed
+tenant claim or whose authority issuer key is not bound to that tenant. The
+agent intent must be signed for the configured gateway audience.
+
+This binds agent identities to tenant-scoped issuer trust; it does not
+authenticate an HTTP network peer or provide user/admin RBAC. Keep authenticated
+TLS termination and private network controls in place. Human approval remains
+protected by its configured Ed25519 approver key, but challenge reads and
+administrative identity/role management still need a separately enforced
+administrative access layer.
+
+For external tools, set an explicit egress proxy in the route configuration
+and make it enforce the destination hostname allowlist. In a separately networked pod, the example
 listener can bind with `PRAETORE_GATEWAY_LISTEN_ADDR=0.0.0.0:8080`; this is
 plain HTTP and is only safe behind private network policy and authenticated
 TLS termination.
@@ -359,14 +392,13 @@ Without that variable the listener remains loopback-only.
 
 The binary remains a **local development demo**, with local freshness and
 loopback-only PostgreSQL. These settings do not make it suitable for SaaS
-production. The journal/replay identity is now tenant-scoped using the UUID
-from the verified authority, but the deployment still needs tenant-bound
-identity issuance, tenant-isolated credentials, authenticated transport,
-secret-manager/KMS integration, rate limits and operational controls. In
-particular, do not place all tenants' production API credentials in one shared
-process environment. This is application-level key isolation, not PostgreSQL
-row-level security or tenant authentication for administrative endpoints; the
-current database role and observer token are still service-wide. Migration
+production. HTTP mode now requires tenant-bound issuer configuration and
+rejects mismatched signed authority/tenant pairs. Production still needs
+tenant-isolated credentials, authenticated workload transport, secret-manager/
+KMS integration, rate limits, PostgreSQL row-level security, and tenant-aware
+administrative authorization. In particular, do not place all tenants'
+production API credentials in one shared process environment. The current
+database role and observer token are still service-wide. Migration
 `0007_tenant_scoped_execution.sql` maps legacy records only when their stored
 evidence contains a UUID tenant claim. Unscoped claims and records without a
 valid tenant remain under the reserved nil tenant, are not addressable as
@@ -424,7 +456,8 @@ The HTTP flow is:
 An approval is valid only until the earlier of the signed intent expiration
 and the freshness lease expiration. Once expired, the request cannot be
 approved; submit a newly signed authorization request and obtain a fresh
-decision instead. The decision is single-use per `(agent_id, request_id)`.
+decision instead. The decision is single-use per
+`(tenant_id, agent_id, request_id)`.
 
 The demo service loads the approver key ID and public key from
 `PRAETORE_GATEWAY_APPROVER_KEY_ID` and
