@@ -454,17 +454,6 @@ impl std::fmt::Debug for AuthorizationEngine {
 // The Mighty Forces Will Come to Your Aid.
 
 impl AuthorizationEngine {
-    /// Compatibility constructor using `Development` evaluation mode.
-    #[cfg_attr(
-        not(test),
-        deprecated(
-            note = "Development mode allows unsigned authorities; use AuthorizationEngine::production with HighAssuranceConfig for production"
-        )
-    )]
-    pub fn new(policy: Policy) -> Self {
-        Self::development(policy)
-    }
-
     pub fn development(policy: Policy) -> Self {
         Self {
             policy,
@@ -481,17 +470,6 @@ impl AuthorizationEngine {
             replay_guard: None,
             freshness_provider: None,
         }
-    }
-
-    /// Compatibility constructor using `Development` evaluation mode.
-    #[cfg_attr(
-        not(test),
-        deprecated(
-            note = "Development mode allows unsigned authorities; use AuthorizationEngine::production_with_clock with HighAssuranceConfig for production"
-        )
-    )]
-    pub fn with_clock(policy: Policy, clock: impl Clock + 'static) -> Self {
-        Self::development_with_clock(policy, clock)
     }
 
     pub fn development_with_clock(policy: Policy, clock: impl Clock + 'static) -> Self {
@@ -1254,8 +1232,11 @@ impl AuthorizationEngine {
 
         // The authority check above uses a caller-chosen capability; only a
         // rule's required_capability binds the authority to the action_type.
-        if self.mode != EvaluationMode::Development
-            && decision.outcome != crate::decision::DecisionOutcome::Deny
+        // Development still accepts such a rule when the authority grants the
+        // action_type itself, which is what the implicit fallback meant.
+        if decision.outcome != crate::decision::DecisionOutcome::Deny
+            && (self.mode != EvaluationMode::Development
+                || !request.authority.permits(&request.action.action_type))
             && let Some(contribution) = decision.contributions.iter().find(|contribution| {
                 contribution.outcome != crate::decision::DecisionOutcome::Deny
                     && self.policy.rules.iter().any(|rule| {
@@ -1684,7 +1665,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
@@ -1703,7 +1684,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::with_clock(
+        let engine = AuthorizationEngine::development_with_clock(
             allow_policy(),
             FixedClock::new("2026-06-01T12:00:00Z"),
         );
@@ -1720,7 +1701,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
 
@@ -1753,7 +1734,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
 
@@ -1767,7 +1748,7 @@ mod tests {
             .with_constraint("record_count", "12");
         let action = Action::new("read_data", None, json!({"record_count": 12})).unwrap();
         let request = AuthorizationRequest::new(agent, authority, action).unwrap();
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
 
@@ -1783,7 +1764,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
 
@@ -1799,7 +1780,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
@@ -1814,7 +1795,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
@@ -1830,7 +1811,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
@@ -1861,7 +1842,7 @@ mod tests {
             ],
         );
 
-        let engine = AuthorizationEngine::new(policy);
+        let engine = AuthorizationEngine::development(policy);
         let evidence = engine.evaluate(request).unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
@@ -1892,11 +1873,54 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
         assert!(evidence.verify());
+    }
+
+    fn delete_with_read_capability(authority_capabilities: Vec<String>) -> DecisionOutcome {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", authority_capabilities);
+        let action = Action::new(
+            "delete_data",
+            Some("database".into()),
+            json!({"table":"users"}),
+        )
+        .unwrap()
+        .with_capability("read_data");
+        let policy = Policy::new_v2(
+            "unbound-capability",
+            1,
+            vec![PolicyRule::new(
+                "allow-delete-data",
+                "delete_data",
+                crate::policy::PolicyEffect::Allow,
+            )],
+        );
+        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        AuthorizationEngine::development(policy)
+            .evaluate(request)
+            .unwrap()
+            .decision
+            .outcome
+    }
+
+    #[test]
+    fn development_denies_caller_chosen_capability_for_unbound_rule() {
+        assert_eq!(
+            delete_with_read_capability(vec!["read_data".into()]),
+            DecisionOutcome::Deny
+        );
+    }
+
+    #[test]
+    fn development_allows_unbound_rule_when_authority_grants_action_type() {
+        assert_eq!(
+            delete_with_read_capability(vec!["read_data".into(), "delete_data".into()]),
+            DecisionOutcome::Allow
+        );
     }
 
     #[test]
@@ -1905,7 +1929,7 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
         let action = test_action().with_capability("write:data");
         let request = AuthorizationRequest::new(agent, authority, action).unwrap();
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
 
@@ -1935,7 +1959,7 @@ mod tests {
                 )),
             ],
         );
-        let engine = AuthorizationEngine::new(policy);
+        let engine = AuthorizationEngine::development(policy);
 
         let mut evidence = engine.evaluate(request).unwrap();
 
@@ -1957,7 +1981,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::with_clock(
+        let engine = AuthorizationEngine::development_with_clock(
             allow_policy(),
             FixedClock::new("2026-06-01T12:00:00Z"),
         );
@@ -1980,7 +2004,7 @@ mod tests {
 
         let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
 
-        let engine = AuthorizationEngine::with_clock(
+        let engine = AuthorizationEngine::development_with_clock(
             allow_policy(),
             FixedClock::new("2026-06-01T12:00:00Z"),
         );
@@ -2001,7 +2025,7 @@ mod tests {
 
         request.agent.public_key.clear();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         assert!(matches!(
             engine.evaluate(request),
@@ -2019,7 +2043,7 @@ mod tests {
 
         request.action.parameters = json!("invalid");
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         assert!(matches!(
             engine.evaluate(request),
@@ -2989,7 +3013,7 @@ mod tests {
 
     #[test]
     fn concurrent_engine_evaluations_keep_decisions_isolated() {
-        let engine = Arc::new(AuthorizationEngine::new(allow_policy()));
+        let engine = Arc::new(AuthorizationEngine::development(allow_policy()));
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         let action = test_action();
@@ -3019,7 +3043,7 @@ mod tests {
         let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
         request.sign_intent(&agent_key).unwrap();
         request.agent_signature = Some("00".repeat(64));
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         assert!(matches!(
             engine.evaluate(request),
@@ -3036,7 +3060,7 @@ mod tests {
 
         request.agent.id = AgentId::new();
 
-        let engine = AuthorizationEngine::new(allow_policy());
+        let engine = AuthorizationEngine::development(allow_policy());
 
         assert!(matches!(
             engine.evaluate(request),
