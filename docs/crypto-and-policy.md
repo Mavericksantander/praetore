@@ -51,9 +51,8 @@ signatures, mismatched issuer names or subject keys, malformed Ed25519 agent
 keys, and authorities outside their validity window.
 
 `AuthorizationEngine::development` is the explicit development constructor.
-`AuthorizationEngine::new` and `with_clock` remain development-mode
-compatibility constructors for the unsigned model and are deprecated. Use
-`strict` or
+`development_with_clock` is its fixed-clock variant; there is no implicit
+default mode. Use `strict` or
 `strict_with_clock` when signed authority and signed intent verification are
 needed. For the production profile, use `AuthorizationEngine::production` with
 a `HighAssuranceConfig`: it requires a pinned policy digest, non-empty
@@ -310,8 +309,8 @@ otherwise the compatibility fallback requires an additional capability named
 
 ## Migration from unsigned authorities
 
-Existing code using `AuthorizationEngine::new` continues to run in
-`Development` mode and can use unsigned authorities. For production migration:
+Code that used the removed `AuthorizationEngine::new` must call
+`AuthorizationEngine::development`, which keeps unsigned authorities. For production migration:
 
 1. Generate and protect agent and issuer Ed25519 keypairs.
 2. Sign each authority for its agent with `Authority::sign_for_agent` and

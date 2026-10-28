@@ -96,7 +96,8 @@ grants capabilities; it does not grant policy permission by itself.
 Set the capability required by the action explicitly with
 `Action::with_capability`. Strict and HighAssurance evaluation reject actions
 without an explicit capability. Development retains a legacy fallback where
-the action type is treated as the required capability. A policy rule's
+the action type is treated as the required capability; a rule without
+`with_capability` then also requires the authority to grant the action type. A policy rule's
 `with_capability` is an additional rule match condition, not a grant: the
 authority must contain that capability, and the action's own required
 capability must also be granted by the engine.
