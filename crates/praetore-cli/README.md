@@ -37,8 +37,52 @@ cp crates/praetore-cli/examples/policies/deny.json ./praetore-deny/policy.json
 praetore run ./praetore-deny
 ```
 
-The local demo has no command or endpoint to grant a human approval yet, so a
-`requires_approval` action stays held and is never executed.
+A `requires_approval` action stays held until it is resolved with
+`praetore approve` / `praetore reject` (see Human approval below).
+
+### Human approval
+
+`init` also creates a local human approver key (`approver.key`, owner-only)
+and its public pin (`approver-pin.json`, approver id `local-approver`). The
+gateway loads only the pin; without it, approval is disabled and every
+approval attempt is refused (`approval_not_configured`).
+
+When a policy rule has effect `RequireApproval`, `praetore demo` returns
+`requires_approval` / `not_dispatched` and prints the commands to resolve it:
+
+```sh
+praetore approve ./praetore-local <request_id> --approver local-approver
+praetore reject  ./praetore-local <request_id> --approver local-approver
+```
+
+`<request_id>` is `evidence.request_id` from the demo receipt. Pass
+`--agent <evidence.agent.id>` to address the endpoint's tenant/agent/request
+triple directly; otherwise the CLI looks up the agent id in the local journal
+(parameterized SQL, tenant-scoped, fails unless exactly one row). It then fetches
+the challenge from the existing `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}`
+endpoint, signs it with `approver.key`, and posts it to the same path. The
+gateway verifies the Ed25519 signature against the pin, records the decision
+in `praetore.human_approvals` (append-only, one decision per execution) and
+only then dispatches. A decision cannot be reused, a rejection is final, an
+approver key equal to the requesting agent key is refused, and the approval
+window is short: it ends at the earlier of the intent expiry (60 s) and the
+local freshness lease (30 s), after which the gateway answers
+`approval_expired` (HTTP 410).
+
+Approval state is observable without retrying. `GET
+/v1/approvals/{tenant_id}/{agent_id}/{request_id}/status` returns
+`{"resolution": "pending" | "approved" | "rejected" | "expired"}`, and the
+409 (`approval_not_pending`) and 410 (`approval_expired`) responses of the
+challenge and decision endpoints include the same `resolution` field. The
+lookup is scoped to the exact tenant/agent/request key; unknown keys (including
+another tenant's) return 404 `execution_not_found`, and executions that never
+required approval return 409 without `resolution`. The field is additive, so
+clients that only read `code` are unaffected. The challenge endpoint now also
+returns 410 once the approval window has passed (previously only the decision
+POST did).
+
+The approver key sits next to the other demo keys; this is a local
+demonstration of the protocol, not separation of duties or key custody.
 
 `init` creates fresh Ed25519 keys and configures their secret files with
 owner-only permissions on Unix systems. Key initialization intentionally fails
@@ -48,7 +92,8 @@ the workspace's replay and execution journal migrations at startup. Do not put
 production credentials or production trust anchors in the generated demo
 directory.
 
-The HTTP API has no authentication or TLS and binds to IPv4 loopback only.
+The HTTP API has no transport authentication or TLS (approval decisions are
+authenticated by their Ed25519 signature) and binds to IPv4 loopback only.
 The built-in policy allows only `demo:set_value` with capability `demo:write`
 against `demo-state`; every non-matching action is denied. The adapter has no
 network access, and its key/value effects live in memory and disappear when
