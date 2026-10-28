@@ -45,6 +45,31 @@ a server restart between `PRAETORE_TEST_RESTART_PHASE=before` and
 `PRAETORE_TEST_RESTART_PHASE=after`. Run it only against a disposable cluster
 that you can stop and restart; CI does not orchestrate this service lifecycle.
 
+A second staged test,
+`postgres_journal_survives_server_restart_without_automatic_dispatch`, works
+the same way with `PRAETORE_TEST_JOURNAL_RESTART_PHASE`: run it with
+`PRAETORE_TEST_JOURNAL_RESTART_PHASE=before`, restart the PostgreSQL server,
+then run it with `PRAETORE_TEST_JOURNAL_RESTART_PHASE=after`. The same
+disposable-cluster requirement applies.
+
+Running `cargo test -- --ignored` without the phase variables exits with code
+101, because both restart tests intentionally abort when their phase variable
+is unset. For a bulk run, skip them, then run each restart test in two phases:
+
+```sh
+cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored \
+  --skip replay_claim_survives_server_restart \
+  --skip postgres_journal_survives_server_restart_without_automatic_dispatch
+
+PRAETORE_TEST_RESTART_PHASE=before cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact replay_claim_survives_server_restart
+# restart the PostgreSQL server
+PRAETORE_TEST_RESTART_PHASE=after cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact replay_claim_survives_server_restart
+
+PRAETORE_TEST_JOURNAL_RESTART_PHASE=before cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_journal_survives_server_restart_without_automatic_dispatch
+# restart the PostgreSQL server
+PRAETORE_TEST_JOURNAL_RESTART_PHASE=after cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_journal_survives_server_restart_without_automatic_dispatch
+```
+
 To refresh the standalone fuzzer lockfile when its manifest changes, run
 `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`, then audit and fuzz
 the resulting locked dependency graph.
