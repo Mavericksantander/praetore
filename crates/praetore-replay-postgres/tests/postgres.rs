@@ -350,7 +350,7 @@ fn replay_claim_survives_server_restart() {
                 .execute(
                     "DELETE FROM praetore.replay_claims \
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
-                    &[&Uuid::nil(), &agent_id, &request_id],
+                    &[&TEST_TENANT_ID, &agent_id, &request_id],
                 )
                 .expect("clear only the fixed restart-test claim");
             assert_eq!(
@@ -367,7 +367,7 @@ fn replay_claim_survives_server_restart() {
                 .execute(
                     "DELETE FROM praetore.replay_claims \
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
-                    &[&Uuid::nil(), &agent_id, &request_id],
+                    &[&TEST_TENANT_ID, &agent_id, &request_id],
                 )
                 .expect("remove only the fixed restart-test claim");
         }
