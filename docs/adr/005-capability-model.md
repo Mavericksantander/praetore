@@ -5,14 +5,16 @@ Status: accepted
 ## Decision
 
 Authority capabilities are explicit names and are not intrinsically action
-types. An action may declare its required capability. A missing capability
-uses the historical action-type fallback only in Development mode. Strict
-profiles reject actions without an explicit capability.
+types. An action may declare its required capability. An action without
+an explicit capability is denied in Development mode (it is never mapped to
+its action type or any other grant). Strict profiles reject such actions as
+invalid requests.
 
 Recommended names are resource-verb pairs such as `data:read`, `data:write`,
 `shell:execute`, `api:call`, and `deployment:create`.
 
 ## Consequences
 
-Existing development integrations remain compatible. Production policies and
-requests must migrate to explicit capability names to avoid ambiguity.
+Development integrations that relied on the removed action-type fallback must
+set `Action::with_capability`. All policies and requests use explicit
+capability names to avoid ambiguity.
