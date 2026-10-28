@@ -1564,6 +1564,65 @@ mod tests {
     }
 
     #[test]
+    fn high_assurance_denies_allow_rule_without_required_capability() {
+        let policy = Policy::new_v2(
+            "unbound-capability",
+            1,
+            vec![PolicyRule::new(
+                "allow-delete-data",
+                "delete_data",
+                crate::policy::PolicyEffect::Allow,
+            )],
+        );
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(high_assurance_validity());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let action = Action::new(
+            "delete_data",
+            Some("database".into()),
+            json!({"table":"users"}),
+        )
+        .unwrap()
+        .with_capability("read_data");
+        let policy_digest = policy.digest().unwrap();
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + time::Duration::minutes(1),
+                policy_digest.clone(),
+            )
+            .unwrap();
+        let config = HighAssuranceConfig::new(
+            policy_digest,
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_audience("test-gateway")
+        .with_replay_guard(test_replay_guard())
+        .with_freshness_provider(test_freshness_provider());
+        let engine = AuthorizationEngine::production_with_clock(
+            policy,
+            config,
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        )
+        .unwrap();
+
+        let decision = engine.evaluate(request).unwrap().decision;
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.reason.contains("required_capability"));
+    }
+
+    #[test]
     fn high_assurance_tenant_issuer_binding_accepts_configured_tenant() {
         let tenant_id = Uuid::from_u128(100);
         let (engine, request) = production_engine_with_tenant_binding(
