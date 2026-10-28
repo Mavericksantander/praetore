@@ -1256,18 +1256,17 @@ impl AuthorizationEngine {
         // rule's required_capability binds the authority to the action_type.
         if self.mode != EvaluationMode::Development
             && decision.outcome != crate::decision::DecisionOutcome::Deny
-        {
-            if let Some(contribution) = decision.contributions.iter().find(|contribution| {
+            && let Some(contribution) = decision.contributions.iter().find(|contribution| {
                 contribution.outcome != crate::decision::DecisionOutcome::Deny
                     && self.policy.rules.iter().any(|rule| {
                         rule.id == contribution.rule_id && rule.required_capability.is_none()
                     })
-            }) {
-                return Ok(Decision::deny(format!(
-                    "policy rule '{}' must declare required_capability",
-                    contribution.rule_id
-                )));
-            }
+            })
+        {
+            return Ok(Decision::deny(format!(
+                "policy rule '{}' must declare required_capability",
+                contribution.rule_id
+            )));
         }
 
         Ok(decision)
