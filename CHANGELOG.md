@@ -81,6 +81,10 @@
   Add `with_capability(...)` (or `required_capability` in policy JSON) to
   those rules before upgrading. Development mode is unchanged.
 - `AuthorizationEngine::evaluate(request) -> Result<Evidence>` is unchanged.
+- **Breaking (fail-closed):** in Development, an action without an explicit
+  capability is now denied ("action does not declare a required capability")
+  instead of falling back to its `action_type` as the required capability.
+  Set `Action::with_capability(...)` on every action.
 - **Breaking:** the deprecated `AuthorizationEngine::new` and `with_clock`
   constructors were removed. Use `development`/`development_with_clock`
   explicitly, or `production` with `HighAssuranceConfig` for production.
