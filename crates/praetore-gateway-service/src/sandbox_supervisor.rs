@@ -10,6 +10,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use praetore_core::{Action, Authority, canonical::parse_json_rejecting_duplicates};
 use praetore_gateway::{DispatchReport, ExecutionKey, action_digest, authority_tenant_id};
 use reqwest::{Client, StatusCode as ClientStatus, Url};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer,
+    pem::{Error as PemError, PemObject},
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -904,6 +908,20 @@ fn read_small_secret(path: &str, max_bytes: usize) -> Result<Vec<u8>, std::io::E
     fs::read(path)
 }
 
+fn parse_pem_certificates(
+    pem: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, Box<dyn std::error::Error>> {
+    Ok(CertificateDer::pem_slice_iter(pem).collect::<Result<Vec<_>, _>>()?)
+}
+
+fn parse_pem_private_key(pem: &[u8]) -> Result<PrivateKeyDer<'static>, Box<dyn std::error::Error>> {
+    match PrivateKeyDer::from_pem_slice(pem) {
+        Ok(key) => Ok(key),
+        Err(PemError::NoItemsFound) => Err("supervisor TLS private key is missing".into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub fn load_server_tls(
     certificate_path: &str,
     private_key_path: &str,
@@ -914,18 +932,9 @@ pub fn load_server_tls(
             .install_default()
             .map_err(|_| std::io::Error::other("failed to install the ring crypto provider"))?;
     }
-    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(std::io::Cursor::new(
-        read_small_secret(certificate_path, 1_048_576)?,
-    )))
-    .collect::<Result<Vec<_>, _>>()?;
-    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::io::Cursor::new(read_small_secret(private_key_path, 1_048_576)?),
-    ))?
-    .ok_or("supervisor TLS private key is missing")?;
-    let ca_certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(
-        std::io::Cursor::new(read_small_secret(client_ca_path, 1_048_576)?),
-    ))
-    .collect::<Result<Vec<_>, _>>()?;
+    let certificates = parse_pem_certificates(&read_small_secret(certificate_path, 1_048_576)?)?;
+    let private_key = parse_pem_private_key(&read_small_secret(private_key_path, 1_048_576)?)?;
+    let ca_certificates = parse_pem_certificates(&read_small_secret(client_ca_path, 1_048_576)?)?;
     if certificates.is_empty() || ca_certificates.is_empty() {
         return Err("supervisor TLS certificate or client CA is empty".into());
     }
@@ -945,14 +954,8 @@ pub fn load_worker_tls(
     certificate_path: &str,
     private_key_path: &str,
 ) -> Result<Arc<rustls::ServerConfig>, Box<dyn std::error::Error>> {
-    let certificates = rustls_pemfile::certs(&mut std::io::BufReader::new(std::io::Cursor::new(
-        read_small_secret(certificate_path, 1_048_576)?,
-    )))
-    .collect::<Result<Vec<_>, _>>()?;
-    let private_key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
-        std::io::Cursor::new(read_small_secret(private_key_path, 1_048_576)?),
-    ))?
-    .ok_or("supervisor TLS private key is missing")?;
+    let certificates = parse_pem_certificates(&read_small_secret(certificate_path, 1_048_576)?)?;
+    let private_key = parse_pem_private_key(&read_small_secret(private_key_path, 1_048_576)?)?;
     if certificates.is_empty() {
         return Err("supervisor TLS certificate is empty".into());
     }
@@ -1049,6 +1052,21 @@ mod tests {
         assert_eq!(execution_id(key), execution_id(key));
         assert_eq!(execution_id(key).len(), 52);
         assert!(execution_id(key).bytes().all(is_lowercase_hex));
+    }
+
+    #[test]
+    fn pem_parsing_keeps_rustls_pemfile_outcomes() {
+        assert_eq!(
+            parse_pem_private_key(b"not pem\n").unwrap_err().to_string(),
+            "supervisor TLS private key is missing"
+        );
+        assert!(parse_pem_certificates(b"not pem\n").unwrap().is_empty());
+        assert!(
+            parse_pem_certificates(
+                b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
