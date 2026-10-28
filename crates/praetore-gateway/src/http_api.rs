@@ -17,9 +17,22 @@ const MAX_REQUEST_BYTES: usize = 65_536;
 #[derive(Serialize)]
 struct ErrorResponse {
     code: &'static str,
+    /// Present only on approval endpoints when the execution key exists and
+    /// required approval: `pending`, `approved`, `rejected` or `expired`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<crate::ApprovalResolution>,
+}
+
+#[derive(Serialize)]
+struct ResolutionResponse {
+    resolution: crate::ApprovalResolution,
 }
 
 /// Creates the local HTTP API for signed tool authorization requests.
+///
+/// `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}/status` reports the
+/// human-approval state (`pending`, `approved`, `rejected`, `expired`) for that
+/// exact key; 409/410 approval errors carry the same `resolution` field.
 ///
 /// `POST /v1/execute` accepts the serialized `AuthorizationRequest`. The
 /// gateway returns its signed receipt for every completed policy decision,
@@ -32,6 +45,10 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route(
             "/v1/approvals/{tenant_id}/{agent_id}/{request_id}",
             get(approval_challenge).post(resolve_approval),
+        )
+        .route(
+            "/v1/approvals/{tenant_id}/{agent_id}/{request_id}/status",
+            get(approval_status),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(gateway)
@@ -90,9 +107,15 @@ async fn approval_challenge(
         agent_id,
         request_id,
     };
-    match tokio::task::spawn_blocking(move || gateway.approval_challenge(key)).await {
+    match tokio::task::spawn_blocking(move || {
+        gateway
+            .approval_challenge(key)
+            .map_err(|error| with_resolution(&gateway, key, error))
+    })
+    .await
+    {
         Ok(Ok(challenge)) => (StatusCode::OK, Json(challenge)).into_response(),
-        Ok(Err(error)) => gateway_error_response(error),
+        Ok(Err((error, resolution))) => approval_error_response(error, resolution),
         Err(error) => {
             tracing::error!(error = %error, "approval challenge task failed");
             error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_unavailable")
@@ -118,13 +141,90 @@ async fn resolve_approval(
     {
         return error_response(StatusCode::BAD_REQUEST, "approval_challenge_mismatch");
     }
-    match tokio::task::spawn_blocking(move || gateway.resolve_human_approval(decision)).await {
+    let key = crate::ExecutionKey {
+        tenant_id,
+        agent_id,
+        request_id,
+    };
+    match tokio::task::spawn_blocking(move || {
+        gateway
+            .resolve_human_approval(decision)
+            .map_err(|error| with_resolution(&gateway, key, error))
+    })
+    .await
+    {
         Ok(Ok(resolution)) => (StatusCode::OK, Json(resolution)).into_response(),
-        Ok(Err(error)) => gateway_error_response(error),
+        Ok(Err((error, resolution))) => approval_error_response(error, resolution),
         Err(error) => {
             tracing::error!(error = %error, "human approval task failed");
             error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_unavailable")
         }
+    }
+}
+
+/// Read-only approval state for one tenant/agent/request key.
+async fn approval_status(
+    State(gateway): State<Arc<Gateway>>,
+    Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    let key = crate::ExecutionKey {
+        tenant_id,
+        agent_id,
+        request_id,
+    };
+    match tokio::task::spawn_blocking(move || gateway.approval_resolution(key)).await {
+        Ok(Ok(resolution)) => {
+            (StatusCode::OK, Json(ResolutionResponse { resolution })).into_response()
+        }
+        Ok(Err(error)) => gateway_error_response(error),
+        Err(error) => {
+            tracing::error!(error = %error, "approval status task failed");
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_unavailable")
+        }
+    }
+}
+
+/// For conflicts and expiry on the approval endpoints, looks up the state of
+/// the same (path-scoped) key so the caller can tell approve from reject.
+/// Lookup failures simply omit the field; the error itself is unchanged.
+fn with_resolution(
+    gateway: &Gateway,
+    key: crate::ExecutionKey,
+    error: GatewayError,
+) -> (GatewayError, Option<crate::ApprovalResolution>) {
+    let reportable = matches!(
+        error,
+        GatewayError::Approval(crate::ApprovalError::NotPending | crate::ApprovalError::Expired)
+            | GatewayError::Journal(JournalError::ApprovalAlreadyRecorded)
+    );
+    let resolution = if reportable {
+        gateway.approval_resolution(key).ok()
+    } else {
+        None
+    };
+    (error, resolution)
+}
+
+fn approval_error_response(
+    error: GatewayError,
+    resolution: Option<crate::ApprovalResolution>,
+) -> Response {
+    let response = gateway_error_response(error);
+    let code = match response.status() {
+        StatusCode::CONFLICT => "approval_not_pending",
+        StatusCode::GONE => "approval_expired",
+        _ => return response,
+    };
+    match resolution {
+        Some(resolution) => (
+            response.status(),
+            Json(ErrorResponse {
+                code,
+                resolution: Some(resolution),
+            }),
+        )
+            .into_response(),
+        None => response,
     }
 }
 
@@ -196,7 +296,14 @@ fn gateway_error_response(error: GatewayError) -> Response {
 }
 
 fn error_response(status: StatusCode, code: &'static str) -> Response {
-    (status, Json(ErrorResponse { code })).into_response()
+    (
+        status,
+        Json(ErrorResponse {
+            code,
+            resolution: None,
+        }),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
