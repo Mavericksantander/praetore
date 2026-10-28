@@ -799,6 +799,52 @@ mod tests {
     }
 
     #[test]
+    fn example_policies_produce_their_documented_outcomes() {
+        use praetore_core::DecisionOutcome;
+        let cases = [
+            (
+                include_str!("../examples/policies/allow.json"),
+                "allow-demo-set",
+                DecisionOutcome::Allow,
+            ),
+            (
+                include_str!("../examples/policies/deny.json"),
+                "deny-demo-set",
+                DecisionOutcome::Deny,
+            ),
+            (
+                include_str!("../examples/policies/require-approval.json"),
+                "approval-demo-set",
+                DecisionOutcome::RequireApproval,
+            ),
+        ];
+        for (json, rule_id, expected) in cases {
+            let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+            initialize(&directory, 8080).unwrap();
+            fs::write(directory.join(POLICY_FILE), json).unwrap();
+            let config = load_config(&directory).unwrap();
+            let policy = load_policy(&directory).unwrap();
+            assert_eq!(policy.rules.len(), 1);
+            assert_eq!(policy.rules[0].id, rule_id);
+            let request =
+                build_demo_request(&directory, &config, &policy, "greeting", "hello").unwrap();
+            assert_eq!(request.action.action_type, "demo:set_value");
+            assert_eq!(request.action.capability.as_deref(), Some("demo:write"));
+            let decision = policy
+                .evaluate(&request.agent, &request.authority, &request.action)
+                .unwrap();
+            assert_eq!(decision.outcome, expected, "policy rule {rule_id}");
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn default_policy_matches_the_allow_example() {
+        let example = Policy::from_json(include_str!("../examples/policies/allow.json")).unwrap();
+        assert_eq!(example.digest().unwrap(), demo_policy().digest().unwrap());
+    }
+
+    #[test]
     fn secret_files_with_group_or_other_permissions_are_rejected() {
         let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
         fs::create_dir(&directory).unwrap();
