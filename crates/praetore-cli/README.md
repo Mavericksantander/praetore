@@ -16,6 +16,30 @@ In another terminal, execute the only supported demo action:
 praetore demo ./praetore-local set greeting hello
 ```
 
+### Example policies
+
+`crates/praetore-cli/examples/policies/` contains three ready-to-use policies
+for the demo action (`demo:set_value`, capability `demo:write`, target
+`demo-state`):
+
+| File | Rule id | Outcome |
+| --- | --- | --- |
+| `allow.json` | `allow-demo-set` | `allowed`, executed (same as the `init` default) |
+| `deny.json` | `deny-demo-set` | `denied`, not dispatched, HTTP 403 |
+| `require-approval.json` | `approval-demo-set` | `requires_approval`, not dispatched |
+
+Copy one over the generated policy **before** `praetore run` (the gateway loads
+the policy at startup, and the CLI signs requests against the policy digest):
+
+```sh
+praetore init ./praetore-deny --port 8081
+cp crates/praetore-cli/examples/policies/deny.json ./praetore-deny/policy.json
+praetore run ./praetore-deny
+```
+
+The local demo has no command or endpoint to grant a human approval yet, so a
+`requires_approval` action stays held and is never executed.
+
 `init` creates fresh Ed25519 keys and configures their secret files with
 owner-only permissions on Unix systems. Key initialization intentionally fails
 on platforms where the CLI cannot verify those permissions. The database URL
