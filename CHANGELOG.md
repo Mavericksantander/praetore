@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.2.0 (not yet tagged or published)
+
+Version bump from 0.1.0 to 0.2.0. Under Cargo's SemVer rules for `0.x`
+releases, a minor-version bump is the breaking (major) bump; it is required
+because #6 removed public API.
+
+### Changes merged since the previous entries (#7, #5, #8, #6)
+
+- **Breaking (#6):** removed the deprecated `AuthorizationEngine::new` and
+  `AuthorizationEngine::with_clock` constructors. Use `development` /
+  `development_with_clock`, or `production` with `HighAssuranceConfig`.
+- **Breaking behavior (#6):** in Development mode, a matching `Allow` or
+  `RequireApproval` rule without `required_capability` is denied unless the
+  authority also grants the action's `action_type`; a caller-chosen
+  capability alone no longer suffices.
+- **Dependencies (#5):** `praetore-gateway-service` no longer depends on
+  `rustls-pemfile` (RUSTSEC-2025-0134); PEM parsing uses the
+  `rustls-pki-types` PEM API.
+- **Tests (#8):** the PostgreSQL replay-claim restart test now cleans up its
+  claim using `TEST_TENANT_ID`.
+- **Docs (#7):** added proposal SAF-09 (pre-authorized safety actions and
+  audited break-glass), an optional opt-in extension outside the core with no
+  roadmap or date commitment.
+
+### Earlier changes (previously listed as Unreleased)
+
 ### Added
 
 - A runnable end-to-end quick start covering signed identity, authority,
