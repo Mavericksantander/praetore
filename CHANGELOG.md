@@ -4,11 +4,11 @@
 
 ## 0.2.0 (not yet tagged or published)
 
-Version bump from 0.1.0 to 0.2.0. Under Cargo's SemVer rules for `0.x`
+Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`
 releases, a minor-version bump is the breaking (major) bump; it is required
 because #6 removed public API.
 
-### Changes merged since the previous entries (#7, #5, #8, #6)
+### Changes merged since the previous entries (#5, #6, #7, #8, #10, #11)
 
 - **Breaking (#6):** removed the deprecated `AuthorizationEngine::new` and
   `AuthorizationEngine::with_clock` constructors. Use `development` /
@@ -17,6 +17,8 @@ because #6 removed public API.
   `RequireApproval` rule without `required_capability` is denied unless the
   authority also grants the action's `action_type`; a caller-chosen
   capability alone no longer suffices.
+- **Breaking (#11):** actions without an explicit capability are denied in all
+  modes; the `action_type` fallback in Development is removed.
 - **Dependencies (#5):** `praetore-gateway-service` no longer depends on
   `rustls-pemfile` (RUSTSEC-2025-0134); PEM parsing uses the
   `rustls-pki-types` PEM API.
@@ -25,10 +27,11 @@ because #6 removed public API.
 - **Docs (#7):** added proposal SAF-09 (pre-authorized safety actions and
   audited break-glass), an optional opt-in extension outside the core with no
   roadmap or date commitment.
+- **Release (#10):** version bump from 0.1.0 to 0.2.0.
 
 ### Earlier changes (previously listed as Unreleased)
 
-### Added
+#### Added
 
 - A runnable end-to-end quick start covering signed identity, authority,
   request intents, Strict and HighAssurance evaluation, and evidence
@@ -85,8 +88,6 @@ because #6 removed public API.
 - Offline evidence-verifier output now explicitly marks its scope as historical
   receipt integrity/attestation and reports that it is not current
   authorization.
-- Fixed the HighAssurance fuzz fixture to supply the required audience so
-  fuzzing reaches request evaluation instead of panicking during setup.
 - Added a synchronous reference tool gateway that requires HighAssurance,
   dispatches the exact action from fresh ALLOW evidence, and fails closed on
   replay, journal, and adapter ambiguity. It includes adversarial tests but no
@@ -100,29 +101,29 @@ because #6 removed public API.
   one transaction, verifies uncertain commit acknowledgements before
   dispatch, and blocks legacy orphan claims without reconstructing evidence.
 
-### Compatibility notes
+#### Fixed
+
+- Fixed the HighAssurance fuzz fixture to supply the required audience so
+  fuzzing reaches request evaluation instead of panicking during setup.
+
+#### Compatibility notes
 
 - **Breaking:** in Strict and HighAssurance, a matching `Allow` or
   `RequireApproval` rule without `required_capability` now yields `Deny`.
   Add `with_capability(...)` (or `required_capability` in policy JSON) to
-  those rules before upgrading. Development mode is unchanged.
+  those rules before upgrading. For Development rule handling, see #6 below.
 - `AuthorizationEngine::evaluate(request) -> Result<Evidence>` is unchanged.
-- **Breaking (fail-closed):** in Development, an action without an explicit
+- **Breaking (fail-closed, #11):** in Development, an action without an explicit
   capability is now denied ("action does not declare a required capability")
   instead of falling back to its `action_type` as the required capability.
   Set `Action::with_capability(...)` on every action.
-- **Breaking:** the deprecated `AuthorizationEngine::new` and `with_clock`
-  constructors were removed. Use `development`/`development_with_clock`
-  explicitly, or `production` with `HighAssuranceConfig` for production.
-- **Breaking:** in Development, a matching `Allow` or `RequireApproval` rule
-  without `required_capability` is denied unless the authority also grants the
-  action's `action_type`; a caller-chosen capability alone no longer suffices.
+- **Breaking (#6):** constructor removal and the Development rule-capability
+  change are described under "Changes merged since the previous entries" above.
 - Public structs gained fields. Struct-literal construction may require source
   changes; constructors and builders are the preferred API ahead of v1.
 - `Action::with_capability` separates action type from required authority
-  capability. Existing actions without an explicit capability retain the
-  legacy action-type capability mapping in Development; Strict and
-  HighAssurance require an explicit capability.
+  capability. Actions without an explicit capability are denied in all modes
+  (#11); Strict and HighAssurance already required an explicit capability.
 - `Evidence::new` and `Evidence::new_with_context` return `Result` so oversized
   or invalid evidence cannot be constructed with an empty fallback integrity
   hash.
@@ -141,7 +142,7 @@ because #6 removed public API.
   construction, TLS, database provisioning, synchronous replication, backups,
   capacity monitoring, and application-role privileges.
 
-### Not yet delivered
+#### Not yet delivered
 
 - Python policy evaluation / authority issuance, signed release artifact
   attestations, and long-running fuzz campaigns remain follow-up work. The
