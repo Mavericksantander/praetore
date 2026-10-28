@@ -95,12 +95,12 @@ impl Validity {
 
         let not_after = self.not_after.as_deref().map(parse_timestamp).transpose()?;
 
-        if let (Some(not_before), Some(not_after)) = (not_before, not_after) {
-            if not_after < not_before {
-                return Err(PraetoreError::InvalidRequest(
-                    "authority validity not_before cannot be after not_after".into(),
-                ));
-            }
+        if let (Some(not_before), Some(not_after)) = (not_before, not_after)
+            && not_after < not_before
+        {
+            return Err(PraetoreError::InvalidRequest(
+                "authority validity not_before cannot be after not_after".into(),
+            ));
         }
 
         Ok(())

@@ -898,24 +898,24 @@ impl Gateway {
     }
 
     fn attest_record(&self, record: &mut ExecutionRecord) -> Result<GatewayReceipt, GatewayError> {
-        if let Some(attestation) = &record.execution_attestation {
-            if attestation.execution == record.execution {
-                attestation
-                    .validate_binding(
-                        &record.evidence,
-                        record.authorization,
-                        record.execution,
-                        record.output.as_ref(),
-                    )
-                    .map_err(|_| GatewayError::Journal(JournalError::InvalidRecord))?;
-                return Ok(Self::receipt(
-                    record.evidence.clone(),
+        if let Some(attestation) = &record.execution_attestation
+            && attestation.execution == record.execution
+        {
+            attestation
+                .validate_binding(
+                    &record.evidence,
                     record.authorization,
                     record.execution,
-                    record.output.clone(),
-                    attestation.clone(),
-                ));
-            }
+                    record.output.as_ref(),
+                )
+                .map_err(|_| GatewayError::Journal(JournalError::InvalidRecord))?;
+            return Ok(Self::receipt(
+                record.evidence.clone(),
+                record.authorization,
+                record.execution,
+                record.output.clone(),
+                attestation.clone(),
+            ));
         }
 
         let attestation = self.create_execution_attestation(
