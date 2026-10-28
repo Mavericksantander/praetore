@@ -992,7 +992,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "praetore-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-gateway"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "ed25519-dalek",
@@ -1048,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-gateway-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-observe"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "hex",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "praetore-core",
@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-replay-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "praetore-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "praetore-core",
