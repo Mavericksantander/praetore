@@ -204,7 +204,7 @@ PRÆTORE Core is written in Rust.
 
 Requirements:
 
-* Rust 1.85 or newer
+* Rust 1.88 or newer
 * Cargo
 
 Run the test suite:

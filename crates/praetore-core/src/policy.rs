@@ -271,16 +271,16 @@ impl PolicyRule {
             return false;
         }
 
-        if let Some(required_capability) = &self.required_capability {
-            if !authority.permits(required_capability) {
-                return false;
-            }
+        if let Some(required_capability) = &self.required_capability
+            && !authority.permits(required_capability)
+        {
+            return false;
         }
 
-        if let Some(required_target) = &self.target {
-            if action.target.as_deref() != Some(required_target.as_str()) {
-                return false;
-            }
+        if let Some(required_target) = &self.target
+            && action.target.as_deref() != Some(required_target.as_str())
+        {
+            return false;
         }
 
         let restrictive = semantics_version >= 2 && self.effect != PolicyEffect::Allow;
@@ -322,13 +322,13 @@ impl PolicyRule {
             )));
         }
 
-        if let Some(capability) = &self.required_capability {
-            if capability.trim().is_empty() || capability != capability.trim() {
-                return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                    "policy rule '{}' has invalid capability",
-                    self.id
-                )));
-            }
+        if let Some(capability) = &self.required_capability
+            && (capability.trim().is_empty() || capability != capability.trim())
+        {
+            return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                "policy rule '{}' has invalid capability",
+                self.id
+            )));
         }
 
         if let Some(target) = &self.target {
