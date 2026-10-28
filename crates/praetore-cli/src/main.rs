@@ -203,13 +203,27 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             };
             let directory = required_argument(&mut args, "directory")?;
             let execution_id = required_argument(&mut args, "execution_id")?;
-            let flag = required_argument(&mut args, "--approver")?;
-            if flag != "--approver" {
-                return Err(format!("expected --approver, found: {flag}").into());
+            let mut approver = None;
+            let mut agent = None;
+            while let Some(flag) = args.next() {
+                let slot = match flag.as_str() {
+                    "--approver" => &mut approver,
+                    "--agent" => &mut agent,
+                    _ => return Err(format!("unexpected argument: {flag}").into()),
+                };
+                if slot.is_some() {
+                    return Err(format!("{flag} given more than once").into());
+                }
+                *slot = Some(required_argument(&mut args, &flag)?);
             }
-            let approver = required_argument(&mut args, "approver")?;
-            ensure_no_arguments(args)?;
-            resolve_approval(Path::new(&directory), &execution_id, &approver, outcome)
+            let approver = approver.ok_or("missing --approver argument")?;
+            resolve_approval(
+                Path::new(&directory),
+                &execution_id,
+                agent.as_deref(),
+                &approver,
+                outcome,
+            )
         }
         "help" | "--help" | "-h" => {
             print_usage();
@@ -248,8 +262,8 @@ fn print_usage() {
            praetore doctor <directory>\n\
            praetore run <directory>\n\
            praetore demo <directory> set <key> <value>\n\
-           praetore approve <directory> <execution_id> --approver <id>\n\
-           praetore reject <directory> <execution_id> --approver <id>\n\
+           praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>]\n\
+           praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>]\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
@@ -765,9 +779,26 @@ fn build_demo_request(
     key: &str,
     value: &str,
 ) -> Result<AuthorizationRequest, Box<dyn std::error::Error>> {
+    build_demo_request_with_agent_key(
+        directory,
+        config,
+        policy,
+        key,
+        value,
+        &AgentKeyPair::generate(),
+    )
+}
+
+fn build_demo_request_with_agent_key(
+    directory: &Path,
+    config: &LocalConfig,
+    policy: &Policy,
+    key: &str,
+    value: &str,
+    agent_key: &AgentKeyPair,
+) -> Result<AuthorizationRequest, Box<dyn std::error::Error>> {
     let policy_digest = policy.digest()?;
     let issuer_key = AgentKeyPair::from_secret_bytes(&read_secret(directory, ISSUER_KEY_FILE)?);
-    let agent_key = AgentKeyPair::generate();
     let agent = agent_key.identity(AgentId::new());
     let now = OffsetDateTime::now_utc();
     let mut authority = Authority::new(
@@ -789,7 +820,7 @@ fn build_demo_request(
     .with_capability("demo:write");
     let mut request = AuthorizationRequest::new(agent, authority, action)?;
     request.sign_intent_v2(
-        &agent_key,
+        agent_key,
         AUDIENCE,
         now,
         now + Duration::seconds(60),
@@ -891,6 +922,7 @@ fn sign_decision(
 fn resolve_approval(
     directory: &Path,
     execution_id: &str,
+    agent_id: Option<&str>,
     approver_id: &str,
     outcome: HumanApprovalOutcome,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -911,9 +943,20 @@ fn resolve_approval(
         return Err("approver.key does not match the approver pin".into());
     }
     let config = load_config(directory)?;
-    let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL")
-        .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
-    let agent_id = find_pending_agent(&database_url, config.tenant_id, request_id)?;
+    // The endpoint is addressed by tenant/agent/request. The tenant comes from
+    // config.json; the agent is either given explicitly or looked up.
+    let agent_id = match agent_id {
+        Some(agent) => Uuid::parse_str(agent)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or("--agent must be the evidence.agent.id UUID from the demo receipt")?,
+        None => {
+            let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL").map_err(|_| {
+                "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL (or pass --agent)"
+            })?;
+            find_pending_agent(&database_url, config.tenant_id, request_id)?
+        }
+    };
 
     let url = format!(
         "http://127.0.0.1:{}/v1/approvals/{}/{}/{}",
@@ -1087,6 +1130,7 @@ mod tests {
         let error = resolve_approval(
             &directory,
             &Uuid::new_v4().to_string(),
+            None,
             LOCAL_APPROVER_ID,
             HumanApprovalOutcome::Approve,
         )
@@ -1108,6 +1152,7 @@ mod tests {
                 resolve_approval(
                     &directory,
                     id,
+                    None,
                     LOCAL_APPROVER_ID,
                     HumanApprovalOutcome::Approve
                 )
@@ -1117,6 +1162,16 @@ mod tests {
         let error = resolve_approval(
             &directory,
             &Uuid::new_v4().to_string(),
+            Some("not-a-uuid"),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--agent must be"));
+        let error = resolve_approval(
+            &directory,
+            &Uuid::new_v4().to_string(),
+            None,
             "someone-else",
             HumanApprovalOutcome::Approve,
         )
@@ -1229,6 +1284,62 @@ mod tests {
 
         // Unknown execution id is not found.
         assert!(find_pending_agent(&database_url, config.tenant_id, Uuid::new_v4()).is_err());
+
+        // Fail closed: a gateway built without an approver pin refuses even a
+        // correctly signed decision and never dispatches.
+        let key = pending("unconfigured");
+        let challenge = gateway.approval_challenge(key).unwrap();
+        let pin_path = directory.join(APPROVER_PIN_FILE);
+        let pin_backup = fs::read(&pin_path).unwrap();
+        fs::remove_file(&pin_path).unwrap();
+        let unconfigured = build_gateway(&directory, &config, &database_url).unwrap();
+        fs::write(&pin_path, pin_backup).unwrap();
+        let decision = sign_decision(
+            challenge,
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+        assert!(matches!(
+            unconfigured.resolve_human_approval(decision),
+            Err(GatewayError::Approval(ApprovalError::NotConfigured))
+        ));
+        assert!(gateway.approval_challenge(key).is_ok(), "still pending");
+
+        // Self-approval: the approver pin is the requesting agent's own key.
+        let agent_key = AgentKeyPair::from_secret_bytes(&[9; 32]);
+        let request = build_demo_request_with_agent_key(
+            &directory, &config, &policy, "k", "self", &agent_key,
+        )
+        .unwrap();
+        let receipt = gateway.execute(request).unwrap();
+        let key = ExecutionKey {
+            tenant_id: config.tenant_id,
+            agent_id: *receipt.evidence.agent.id.as_uuid(),
+            request_id: receipt.evidence.request_id,
+        };
+        let self_pin = ApproverPin {
+            schema_version: 1,
+            key_id: LOCAL_APPROVER_ID.into(),
+            public_key_hex: hex::encode(agent_key.public_key().as_bytes()),
+        };
+        let original_pin = fs::read(&pin_path).unwrap();
+        fs::write(&pin_path, serde_json::to_vec(&self_pin).unwrap()).unwrap();
+        let self_gateway = build_gateway(&directory, &config, &database_url).unwrap();
+        fs::write(&pin_path, original_pin).unwrap();
+        let self_decision = sign_decision(
+            self_gateway.approval_challenge(key).unwrap(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &SigningKey::from_bytes(&[9; 32]),
+        )
+        .unwrap();
+        assert!(matches!(
+            self_gateway.resolve_human_approval(self_decision),
+            Err(GatewayError::Approval(ApprovalError::SelfApproval))
+        ));
+        assert!(gateway.approval_challenge(key).is_ok(), "still pending");
 
         // human_approvals holds exactly the two accepted decisions.
         let mut client = connect_local_database(&database_url).unwrap();
