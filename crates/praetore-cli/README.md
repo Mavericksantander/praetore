@@ -45,6 +45,18 @@ window is short: it ends at the earlier of the intent expiry (60 s) and the
 local freshness lease (30 s), after which the gateway answers
 `approval_expired` (HTTP 410).
 
+Approval state is observable without retrying. `GET
+/v1/approvals/{tenant_id}/{agent_id}/{request_id}/status` returns
+`{"resolution": "pending" | "approved" | "rejected" | "expired"}`, and the
+409 (`approval_not_pending`) and 410 (`approval_expired`) responses of the
+challenge and decision endpoints include the same `resolution` field. The
+lookup is scoped to the exact tenant/agent/request key; unknown keys (including
+another tenant's) return 404 `execution_not_found`, and executions that never
+required approval return 409 without `resolution`. The field is additive, so
+clients that only read `code` are unaffected. The challenge endpoint now also
+returns 410 once the approval window has passed (previously only the decision
+POST did).
+
 The approver key sits next to the other demo keys; this is a local
 demonstration of the protocol, not separation of duties or key custody.
 

@@ -173,6 +173,17 @@ pub enum HumanApprovalOutcome {
     Reject,
 }
 
+/// Externally visible state of a human-approval request, scoped to one
+/// tenant/agent/request execution key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalResolution {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HumanApprovalDecision {
@@ -800,10 +811,46 @@ impl Gateway {
         {
             return Err(ApprovalError::NotPending.into());
         }
+        self.validate_approval_time_bounds(&record.evidence)?;
         Ok(ApprovalChallenge::from_evidence(
             &record.evidence,
             &record.action_digest,
         )?)
+    }
+
+    /// Reports the human-approval state of exactly one execution key. Read
+    /// only; it never changes journal state or dispatches. Returns
+    /// `ApprovalError::NotPending` for executions that never required
+    /// approval, and `ExecutionNotFound` for unknown keys.
+    pub fn approval_resolution(
+        &self,
+        key: ExecutionKey,
+    ) -> Result<ApprovalResolution, GatewayError> {
+        let record = self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?;
+        if record.authorization != AuthorizationStatus::RequiresApproval {
+            return Err(ApprovalError::NotPending.into());
+        }
+        match &record.human_approval {
+            Some(decision) => Ok(match decision.outcome {
+                HumanApprovalOutcome::Approve => ApprovalResolution::Approved,
+                HumanApprovalOutcome::Reject => ApprovalResolution::Rejected,
+            }),
+            None if record.execution != ExecutionStatus::NotDispatched => {
+                // A dispatched requires_approval record without a stored
+                // decision is inconsistent; never report it as pending.
+                Err(GatewayError::Journal(JournalError::InvalidRecord))
+            }
+            None => match self.validate_approval_time_bounds(&record.evidence) {
+                Ok(()) => Ok(ApprovalResolution::Pending),
+                Err(GatewayError::Approval(ApprovalError::Expired)) => {
+                    Ok(ApprovalResolution::Expired)
+                }
+                Err(error) => Err(error),
+            },
+        }
     }
 
     /// Validates and consumes a signed human decision exactly once. Approval

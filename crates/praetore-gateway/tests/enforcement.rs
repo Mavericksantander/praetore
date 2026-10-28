@@ -1857,3 +1857,214 @@ fn approval_for_unknown_execution_is_rejected_without_dispatch() {
     ));
     assert_eq!(tool.invocations(), 0);
 }
+
+fn pending_key(gateway: &Gateway, request: AuthorizationRequest) -> ExecutionKey {
+    let pending = gateway.execute(request).unwrap();
+    ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    }
+}
+
+#[test]
+fn approval_resolution_reports_pending_then_approved() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Pending
+    );
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Approved
+    );
+    assert_eq!(tool.invocations(), 1);
+}
+
+#[test]
+fn approval_resolution_reports_rejected_without_dispatch() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Reject,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Rejected
+    );
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn approval_resolution_reports_expired_and_challenge_is_refused() {
+    let captured_clock = Arc::new(Mutex::new(None));
+    let capture = captured_clock.clone();
+    let (gateway, request, tool, _, _) = approval_fixture_with_provider(move |clock| {
+        *capture.lock().unwrap() = Some(clock);
+        Arc::new(CurrentFreshness)
+    });
+    let key = pending_key(&gateway, request);
+    let clock = captured_clock.lock().unwrap().clone().unwrap();
+    *clock.lock().unwrap() += Duration::seconds(21);
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+    assert!(matches!(
+        gateway.approval_challenge(key),
+        Err(GatewayError::Approval(ApprovalError::Expired))
+    ));
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn approval_resolution_is_scoped_to_the_exact_key() {
+    let (gateway, request, _, _, _) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    for other in [
+        ExecutionKey {
+            tenant_id: Uuid::from_u128(2),
+            ..key
+        },
+        ExecutionKey {
+            agent_id: Uuid::new_v4(),
+            ..key
+        },
+        ExecutionKey {
+            request_id: Uuid::new_v4(),
+            ..key
+        },
+    ] {
+        assert!(matches!(
+            gateway.approval_resolution(other),
+            Err(GatewayError::ExecutionNotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn approval_resolution_is_not_reported_for_actions_that_never_required_approval() {
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    let receipt = fixture.gateway.execute(fixture.request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *receipt.evidence.agent.id.as_uuid(),
+        request_id: receipt.evidence.request_id,
+    };
+    assert!(matches!(
+        fixture.gateway.approval_resolution(key),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+}
+
+async fn json_response(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: String,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(http_body_request(method, uri, body))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn http_conflicts_and_status_report_the_resolution() {
+    for (outcome, expected) in [
+        (HumanApprovalOutcome::Approve, "approved"),
+        (HumanApprovalOutcome::Reject, "rejected"),
+    ] {
+        let (gateway, request, _, _, approver_key) = approval_fixture();
+        let gateway = Arc::new(gateway);
+        let key = pending_key(&gateway, request);
+        let app = http_api::router(gateway.clone());
+        let path = format!(
+            "/v1/approvals/{}/{}/{}",
+            key.tenant_id, key.agent_id, key.request_id
+        );
+        let (status, body) =
+            json_response(&app, "GET", &format!("{path}/status"), String::new()).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({"resolution": "pending"}))
+        );
+
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            outcome,
+            &approver_key,
+        );
+        let decision_json = serde_json::to_string(&decision).unwrap();
+        let (status, _) = json_response(&app, "POST", &path, decision_json.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let conflict = json!({"code": "approval_not_pending", "resolution": expected});
+        let (status, body) = json_response(&app, "GET", &path, String::new()).await;
+        assert_eq!((status, body), (StatusCode::CONFLICT, conflict.clone()));
+        let (status, body) = json_response(&app, "POST", &path, decision_json).await;
+        assert_eq!((status, body), (StatusCode::CONFLICT, conflict));
+        let (status, body) =
+            json_response(&app, "GET", &format!("{path}/status"), String::new()).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({"resolution": expected}))
+        );
+
+        let other_tenant = format!(
+            "/v1/approvals/{}/{}/{}/status",
+            Uuid::from_u128(2),
+            key.agent_id,
+            key.request_id
+        );
+        let (status, body) = json_response(&app, "GET", &other_tenant, String::new()).await;
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::NOT_FOUND,
+                json!({"code": "execution_not_found"})
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn http_expired_approval_reports_expired_resolution() {
+    let captured_clock = Arc::new(Mutex::new(None));
+    let capture = captured_clock.clone();
+    let (gateway, request, _, _, _) = approval_fixture_with_provider(move |clock| {
+        *capture.lock().unwrap() = Some(clock);
+        Arc::new(CurrentFreshness)
+    });
+    let gateway = Arc::new(gateway);
+    let key = pending_key(&gateway, request);
+    let clock = captured_clock.lock().unwrap().clone().unwrap();
+    *clock.lock().unwrap() += Duration::seconds(21);
+    let app = http_api::router(gateway);
+    let path = format!(
+        "/v1/approvals/{}/{}/{}",
+        key.tenant_id, key.agent_id, key.request_id
+    );
+    let (status, body) = json_response(&app, "GET", &path, String::new()).await;
+    assert_eq!(
+        (status, body),
+        (
+            StatusCode::GONE,
+            json!({"code": "approval_expired", "resolution": "expired"})
+        )
+    );
+}

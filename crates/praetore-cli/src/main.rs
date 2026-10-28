@@ -1199,7 +1199,9 @@ mod tests {
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_approval_dispatches_once_and_rejection_is_final() {
-        use praetore_gateway::{ApprovalError, ExecutionKey, ExecutionStatus, GatewayError};
+        use praetore_gateway::{
+            ApprovalError, ApprovalResolution, ExecutionKey, ExecutionStatus, GatewayError,
+        };
         let database_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
         apply_migrations(&database_url).unwrap();
         let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
@@ -1239,8 +1241,16 @@ mod tests {
             &approver,
         )
         .unwrap();
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            ApprovalResolution::Pending
+        );
         let resolution = gateway.resolve_human_approval(decision.clone()).unwrap();
         assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            ApprovalResolution::Approved
+        );
         assert!(gateway.resolve_human_approval(decision).is_err());
         assert!(matches!(
             gateway.approval_challenge(key),
@@ -1259,6 +1269,10 @@ mod tests {
         .unwrap();
         let resolution = gateway.resolve_human_approval(reject).unwrap();
         assert_eq!(resolution.receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            ApprovalResolution::Rejected
+        );
         let late_approve = sign_decision(
             challenge,
             LOCAL_APPROVER_ID,
@@ -1340,6 +1354,40 @@ mod tests {
             Err(GatewayError::Approval(ApprovalError::SelfApproval))
         ));
         assert!(gateway.approval_challenge(key).is_ok(), "still pending");
+
+        // Expiry uses the real clock here: the local approval window is at most
+        // 30 s (freshness lease), so wait it out and confirm fail-closed.
+        let key = pending("expires");
+        let challenge = gateway.approval_challenge(key).unwrap();
+        std::thread::sleep(StdDuration::from_secs(31));
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            ApprovalResolution::Expired
+        );
+        assert!(matches!(
+            gateway.approval_challenge(key),
+            Err(GatewayError::Approval(ApprovalError::Expired))
+        ));
+        let late = sign_decision(
+            challenge,
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+        assert!(gateway.resolve_human_approval(late).is_err());
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            ApprovalResolution::Expired
+        );
+        assert!(
+            gateway
+                .approval_resolution(ExecutionKey {
+                    tenant_id: Uuid::new_v4(),
+                    ..key
+                })
+                .is_err()
+        );
 
         // human_approvals holds exactly the two accepted decisions.
         let mut client = connect_local_database(&database_url).unwrap();
