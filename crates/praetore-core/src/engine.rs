@@ -1211,11 +1211,13 @@ impl AuthorizationEngine {
             }
         }
 
-        let capability = request
-            .action
-            .capability
-            .as_deref()
-            .unwrap_or(&request.action.action_type);
+        // Fail closed: an action without an explicit capability is never
+        // mapped onto its action_type (or any other) grant.
+        let Some(capability) = request.action.capability.as_deref() else {
+            return Ok(Decision::deny(
+                "action does not declare a required capability",
+            ));
+        };
         if !request.authority.permits(capability) {
             return Ok(Decision::deny(format!(
                 "authority does not permit capability: {}",
@@ -1233,7 +1235,7 @@ impl AuthorizationEngine {
         // The authority check above uses a caller-chosen capability; only a
         // rule's required_capability binds the authority to the action_type.
         // Development still accepts such a rule when the authority grants the
-        // action_type itself, which is what the implicit fallback meant.
+        // action_type itself in addition to the action's capability.
         if decision.outcome != crate::decision::DecisionOutcome::Deny
             && (self.mode != EvaluationMode::Development
                 || !request.authority.permits(&request.action.action_type))
@@ -1921,6 +1923,75 @@ mod tests {
             delete_with_read_capability(vec!["read_data".into(), "delete_data".into()]),
             DecisionOutcome::Allow
         );
+    }
+
+    fn evaluate_development(capabilities: &[&str], action: Action) -> Decision {
+        let agent = test_agent();
+        let authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            capabilities.iter().map(|c| (*c).to_string()).collect(),
+        );
+        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        AuthorizationEngine::development(allow_policy())
+            .evaluate(request)
+            .unwrap()
+            .decision
+    }
+
+    #[test]
+    fn missing_capability_is_denied_even_when_action_type_is_granted() {
+        let mut action = test_action();
+        action.capability = None;
+
+        let decision = evaluate_development(&["read_data"], action);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(
+            decision
+                .reason
+                .contains("does not declare a required capability")
+        );
+    }
+
+    #[test]
+    fn unknown_capability_is_denied() {
+        let action = test_action().with_capability("data:exfiltrate");
+
+        let decision = evaluate_development(&["read_data", "data:read"], action);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert!(decision.reason.contains("data:exfiltrate"));
+    }
+
+    #[test]
+    fn granted_capability_matches_exactly() {
+        let action = test_action().with_capability("read_data");
+
+        assert_eq!(
+            evaluate_development(&["read_data"], action).outcome,
+            DecisionOutcome::Allow
+        );
+    }
+
+    #[test]
+    fn capability_grants_do_not_widen_by_prefix_wildcard_or_case() {
+        for requested in ["read_data:admin", "read_data*", "READ_DATA", "read_dat"] {
+            let action = test_action().with_capability(requested);
+            assert_eq!(
+                evaluate_development(&["read_data"], action).outcome,
+                DecisionOutcome::Deny,
+                "capability {requested:?} must not be satisfied by grant 'read_data'"
+            );
+        }
+        for granted in ["*", "read_*", "read", "read_data:*"] {
+            let action = test_action().with_capability("read_data");
+            assert_eq!(
+                evaluate_development(&[granted], action).outcome,
+                DecisionOutcome::Deny,
+                "grant {granted:?} must not satisfy capability 'read_data'"
+            );
+        }
     }
 
     #[test]

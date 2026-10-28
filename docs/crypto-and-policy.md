@@ -274,9 +274,8 @@ let policy = Policy::new_v2(
 
 This example does not grant any authority by itself. The authority must also
 contain the capability required by the action and policy rule. The caller
-should set `Action::with_capability("data:read")` for the read action;
-otherwise the compatibility fallback requires an additional capability named
-`read_data`.
+must set `Action::with_capability("data:read")` for the read action; an
+action without a capability is denied.
 
 ## Threat model and guarantees
 
