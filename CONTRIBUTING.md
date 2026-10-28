@@ -2,7 +2,7 @@
 
 ## Local validation
 
-Use Rust 1.85 or newer for workspace builds. Run these checks before opening a
+Use Rust 1.88 or newer for workspace builds. Run these checks before opening a
 pull request:
 
 ```sh
