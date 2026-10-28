@@ -238,7 +238,10 @@ Authority capabilities use explicit names such as `data:read`, `data:write`,
 `shell:execute`, `api:call`, and `deployment:create`. An action can select its
 required authority capability with `Action::with_capability`; if omitted,
 `action_type` is used for compatibility. A policy rule's optional
-`with_capability` is an additional authority requirement.
+`with_capability` is an additional authority requirement. In Strict and
+HighAssurance modes it is mandatory for `Allow` and `RequireApproval` rules: a
+matching rule without it is denied, because the action's capability is chosen
+by the caller and only the rule binds it to the `action_type`.
 
 Example deny-by-default policy for common operations:
 
@@ -254,8 +257,10 @@ let policy = Policy::new_v2(
     vec![
         PolicyRule::new("deny-shell", "execute_shell", PolicyEffect::Deny),
         PolicyRule::new("deny-api", "call_external_api", PolicyEffect::Deny),
-        PolicyRule::new("approve-write", "write_data", PolicyEffect::RequireApproval),
-        PolicyRule::new("approve-deploy", "deploy", PolicyEffect::RequireApproval),
+        PolicyRule::new("approve-write", "write_data", PolicyEffect::RequireApproval)
+            .with_capability("data:write"),
+        PolicyRule::new("approve-deploy", "deploy", PolicyEffect::RequireApproval)
+            .with_capability("deployment:create"),
         PolicyRule::new("allow-public-read", "read_data", PolicyEffect::Allow)
             .with_capability("data:read")
             .with_parameter_condition(PolicyCondition::exact("classification", json!("public")))
