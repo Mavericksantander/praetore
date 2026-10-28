@@ -81,9 +81,12 @@
   Add `with_capability(...)` (or `required_capability` in policy JSON) to
   those rules before upgrading. Development mode is unchanged.
 - `AuthorizationEngine::evaluate(request) -> Result<Evidence>` is unchanged.
-- `new` and `with_clock` remain deprecated development-mode compatibility
-  constructors and continue to permit unsigned authorities. Production callers
-  should use `AuthorizationEngine::production` with `HighAssuranceConfig`.
+- **Breaking:** the deprecated `AuthorizationEngine::new` and `with_clock`
+  constructors were removed. Use `development`/`development_with_clock`
+  explicitly, or `production` with `HighAssuranceConfig` for production.
+- **Breaking:** in Development, a matching `Allow` or `RequireApproval` rule
+  without `required_capability` is denied unless the authority also grants the
+  action's `action_type`; a caller-chosen capability alone no longer suffices.
 - Public structs gained fields. Struct-literal construction may require source
   changes; constructors and builders are the preferred API ahead of v1.
 - `Action::with_capability` separates action type from required authority
