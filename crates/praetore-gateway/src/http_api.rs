@@ -177,6 +177,9 @@ fn gateway_error_response(error: GatewayError) -> Response {
         GatewayError::Approval(crate::ApprovalError::InvalidSignature) => {
             error_response(StatusCode::FORBIDDEN, "invalid_approval_signature")
         }
+        GatewayError::Approval(crate::ApprovalError::SelfApproval) => {
+            error_response(StatusCode::FORBIDDEN, "self_approval_forbidden")
+        }
         GatewayError::Approval(crate::ApprovalError::Expired) => {
             error_response(StatusCode::GONE, "approval_expired")
         }

@@ -824,6 +824,19 @@ fn approval_fixture_with_provider(
     Arc<MemoryJournal>,
     SigningKey,
 ) {
+    approval_fixture_with_approver(build_provider, [34; 32])
+}
+
+fn approval_fixture_with_approver(
+    build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
+    approver_secret: [u8; 32],
+) -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
     let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[32; 32]);
     let attester = EvidenceAttesterKey::from_secret_bytes(&[33; 32]);
@@ -882,7 +895,7 @@ fn approval_fixture_with_provider(
         AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock)).unwrap();
     let tool = Arc::new(LocalSetTool::default());
     let journal = Arc::new(MemoryJournal::default());
-    let approver_key = SigningKey::from_bytes(&[34; 32]);
+    let approver_key = SigningKey::from_bytes(&approver_secret);
     let verifier = HumanApprovalVerifier::new(
         "test-human-approver-v1",
         VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap(),
@@ -1785,4 +1798,62 @@ fn journal_backend_failure_fails_closed_before_effect() {
     ));
     assert_eq!(fixture.tool.value("mode"), None);
     assert_eq!(fixture.tool.invocations(), 0);
+}
+
+#[test]
+fn requesting_agent_key_cannot_approve_its_own_action() {
+    // The fixture agent key is derived from [31; 32]; configure the approver
+    // verifier with that same key so the signature is valid but self-issued.
+    let (gateway, request, tool, journal, approver_key) =
+        approval_fixture_with_approver(|_| Arc::new(CurrentFreshness), [31; 32]);
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::SelfApproval))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert!(record.human_approval.is_none());
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn approval_for_unknown_execution_is_rejected_without_dispatch() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let mut decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    decision.challenge.request_id = Uuid::new_v4();
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::ExecutionNotFound(_))
+    ));
+    let unknown = ExecutionKey {
+        request_id: Uuid::new_v4(),
+        ..key
+    };
+    assert!(matches!(
+        gateway.approval_challenge(unknown),
+        Err(GatewayError::ExecutionNotFound(_))
+    ));
+    assert_eq!(tool.invocations(), 0);
 }

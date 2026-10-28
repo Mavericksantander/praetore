@@ -278,6 +278,8 @@ pub enum ApprovalError {
     Expired,
     #[error("execution is not awaiting human approval")]
     NotPending,
+    #[error("the requesting agent cannot approve its own action")]
+    SelfApproval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -837,6 +839,11 @@ impl Gateway {
         }
         self.validate_approval_time_bounds(&record.evidence)?;
         verifier.verify(&decision)?;
+        if verifier.public_key.as_bytes().as_slice() == record.evidence.agent.public_key.as_slice()
+            || decision.approver_key_id == record.evidence.agent.id.as_uuid().to_string()
+        {
+            return Err(ApprovalError::SelfApproval.into());
+        }
         if decision.outcome == HumanApprovalOutcome::Approve {
             self.engine
                 .validate_evidence_for_dispatch(&record.evidence)
