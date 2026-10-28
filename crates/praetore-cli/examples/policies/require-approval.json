@@ -1,0 +1,17 @@
+{
+  "id": "praetore-local-demo",
+  "version": 1,
+  "canonical_version": 1,
+  "semantics_version": 2,
+  "rules": [
+    {
+      "id": "approval-demo-set",
+      "action_type": "demo:set_value",
+      "effect": "RequireApproval",
+      "required_capability": "demo:write",
+      "target": "demo-state",
+      "parameter_conditions": [],
+      "context_conditions": []
+    }
+  ]
+}

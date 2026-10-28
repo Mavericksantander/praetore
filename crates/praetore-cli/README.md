@@ -16,6 +16,30 @@ In another terminal, execute the only supported demo action:
 praetore demo ./praetore-local set greeting hello
 ```
 
+### Example policies
+
+`crates/praetore-cli/examples/policies/` contains three ready-to-use policies
+for the demo action (`demo:set_value`, capability `demo:write`, target
+`demo-state`):
+
+| File | Rule id | Outcome |
+| --- | --- | --- |
+| `allow.json` | `allow-demo-set` | `allowed`, executed (same as the `init` default) |
+| `deny.json` | `deny-demo-set` | `denied`, not dispatched, HTTP 403 |
+| `require-approval.json` | `approval-demo-set` | `requires_approval`, not dispatched |
+
+Copy one over the generated policy **before** `praetore run` (the gateway loads
+the policy at startup, and the CLI signs requests against the policy digest):
+
+```sh
+praetore init ./praetore-deny --port 8081
+cp crates/praetore-cli/examples/policies/deny.json ./praetore-deny/policy.json
+praetore run ./praetore-deny
+```
+
+A `requires_approval` action stays held until it is resolved with
+`praetore approve` / `praetore reject` (see Human approval below).
+
 ### Human approval
 
 `init` also creates a local human approver key (`approver.key`, owner-only)
