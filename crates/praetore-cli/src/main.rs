@@ -1,4 +1,4 @@
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use postgres::{Client, NoTls};
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, AuthorizationRequest, EvidenceAttesterKey,
@@ -7,7 +7,8 @@ use praetore_core::{
     identity::AgentKeyFingerprint,
 };
 use praetore_gateway::{
-    ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway, http_api,
+    ActionDispatcher, ApprovalChallenge, ExecutionAttestationError, ExecutionAttestationSigner,
+    Gateway, HumanApprovalDecision, HumanApprovalOutcome, HumanApprovalVerifier, http_api,
     local_demo::LocalDemoDispatcher,
 };
 use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
@@ -33,6 +34,9 @@ const ISSUER_KEY_FILE: &str = "issuer.key";
 const EVIDENCE_KEY_FILE: &str = "evidence-attester.key";
 const EXECUTION_KEY_FILE: &str = "execution-attester.key";
 const CONFIG_FILE: &str = "config.json";
+const APPROVER_KEY_FILE: &str = "approver.key";
+const APPROVER_PIN_FILE: &str = "approver-pin.json";
+const LOCAL_APPROVER_ID: &str = "local-approver";
 const MAX_POLICY_BYTES: u64 = 1_048_576;
 const AUDIENCE: &str = "praetore-local-demo";
 const REQUIRED_DATABASE_TABLES: [&str; 5] = [
@@ -60,6 +64,16 @@ struct LocalConfig {
     schema_version: u8,
     tenant_id: Uuid,
     port: u16,
+}
+
+/// Public pin of the human approver key. The gateway only needs this pin; the
+/// private `approver.key` is used solely by `praetore approve` / `reject`.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproverPin {
+    schema_version: u8,
+    key_id: String,
+    public_key_hex: String,
 }
 
 struct LocalFreshnessProvider {
@@ -181,6 +195,22 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             ensure_no_arguments(args)?;
             execute_demo(Path::new(&directory), &key, &value)
         }
+        "approve" | "reject" => {
+            let outcome = if command == "approve" {
+                HumanApprovalOutcome::Approve
+            } else {
+                HumanApprovalOutcome::Reject
+            };
+            let directory = required_argument(&mut args, "directory")?;
+            let execution_id = required_argument(&mut args, "execution_id")?;
+            let flag = required_argument(&mut args, "--approver")?;
+            if flag != "--approver" {
+                return Err(format!("expected --approver, found: {flag}").into());
+            }
+            let approver = required_argument(&mut args, "approver")?;
+            ensure_no_arguments(args)?;
+            resolve_approval(Path::new(&directory), &execution_id, &approver, outcome)
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -218,6 +248,8 @@ fn print_usage() {
            praetore doctor <directory>\n\
            praetore run <directory>\n\
            praetore demo <directory> set <key> <value>\n\
+           praetore approve <directory> <execution_id> --approver <id>\n\
+           praetore reject <directory> <execution_id> --approver <id>\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
@@ -233,6 +265,7 @@ fn initialize(directory: &Path, port: u16) -> Result<(), Box<dyn std::error::Err
     let issuer_key_bytes = random_secret()?;
     let evidence_key_bytes = random_secret()?;
     let execution_key_bytes = random_secret()?;
+    let approver_key_bytes = random_secret()?;
     let issuer_key = AgentKeyPair::from_secret_bytes(&issuer_key_bytes);
     let issuer_pin =
         TrustedAuthorityIssuer::new("praetore-local-demo-issuer", issuer_key.public_key())?
@@ -273,7 +306,26 @@ fn initialize(directory: &Path, port: u16) -> Result<(), Box<dyn std::error::Err
         hex::encode(execution_key_bytes).as_bytes(),
     )?;
 
+    write_private_file(
+        &directory.join(APPROVER_KEY_FILE),
+        hex::encode(approver_key_bytes).as_bytes(),
+    )?;
+    let approver_pin = ApproverPin {
+        schema_version: 1,
+        key_id: LOCAL_APPROVER_ID.into(),
+        public_key_hex: hex::encode(
+            SigningKey::from_bytes(&approver_key_bytes)
+                .verifying_key()
+                .to_bytes(),
+        ),
+    };
+    write_private_file(
+        &directory.join(APPROVER_PIN_FILE),
+        &serde_json::to_vec_pretty(&approver_pin)?,
+    )?;
+
     println!("Initialized local demo at {}", directory.display());
+    println!("Human approver id: {LOCAL_APPROVER_ID}");
     println!("Private keys were generated locally with owner-only file permissions.");
     println!("Next, set PRAETORE_GATEWAY_DATABASE_URL to a local PostgreSQL database URL.");
     println!("Then run: praetore doctor {}", directory.display());
@@ -456,6 +508,32 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    match load_approver_pin(directory) {
+        Ok(Some(pin)) => {
+            println!("[ok] approver pin is valid (approver id: {})", pin.key_id);
+            match read_secret(directory, APPROVER_KEY_FILE) {
+                Ok(secret)
+                    if hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes())
+                        == pin.public_key_hex =>
+                {
+                    println!("[ok] {APPROVER_KEY_FILE} matches the approver pin");
+                }
+                Ok(_) => {
+                    println!("[failed] {APPROVER_KEY_FILE} does not match the approver pin");
+                    healthy = false;
+                }
+                Err(error) => println!("[info] {APPROVER_KEY_FILE} not usable here: {error}"),
+            }
+        }
+        Ok(None) => {
+            println!("[info] no {APPROVER_PIN_FILE}; human approval is disabled (fail-closed)")
+        }
+        Err(error) => {
+            println!("[failed] approver pin: {error}");
+            healthy = false;
+        }
+    }
+
     if let (Some(pin), Ok(secret)) = (issuer_pin.as_ref(), read_secret(directory, ISSUER_KEY_FILE))
     {
         if AgentKeyPair::from_secret_bytes(&secret)
@@ -601,7 +679,13 @@ fn build_gateway(
     let execution_secret = read_secret(directory, EXECUTION_KEY_FILE)?;
     let signer = Arc::new(LocalExecutionSigner::from_secret(&execution_secret));
     let dispatcher: Arc<dyn ActionDispatcher> = Arc::new(LocalDemoDispatcher::new());
-    Ok(Gateway::new(engine, journal, dispatcher, signer)?)
+    let gateway = Gateway::new(engine, journal, dispatcher, signer)?;
+    // Fail closed: without an approver pin the gateway has no verifier and
+    // every approval attempt is refused with `approval_not_configured`.
+    Ok(match load_approver_verifier(directory)? {
+        Some(verifier) => gateway.with_human_approval_verifier(verifier),
+        None => gateway,
+    })
 }
 
 fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
@@ -658,6 +742,19 @@ fn execute_demo(
     if !status.is_success() {
         return Err(format!("gateway returned HTTP {status}; review the receipt above").into());
     }
+    if let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&body)
+        && receipt["authorization"] == "requires_approval"
+        && let Some(request_id) = receipt["evidence"]["request_id"].as_str()
+    {
+        eprintln!(
+            "Held for human approval. Approval window ends at {} (UTC). Resolve with:\n  praetore approve {} {request_id} --approver {LOCAL_APPROVER_ID}\n  praetore reject {} {request_id} --approver {LOCAL_APPROVER_ID}",
+            receipt["evidence"]["freshness_valid_until"]
+                .as_str()
+                .unwrap_or("unknown"),
+            directory.display(),
+            directory.display(),
+        );
+    }
     Ok(())
 }
 
@@ -699,6 +796,164 @@ fn build_demo_request(
         policy_digest,
     )?;
     Ok(request)
+}
+
+fn valid_approver_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn load_approver_pin(directory: &Path) -> Result<Option<ApproverPin>, Box<dyn std::error::Error>> {
+    let path = directory.join(APPROVER_PIN_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(format!(
+            "{APPROVER_PIN_FILE} must be a regular file no larger than 4096 bytes"
+        )
+        .into());
+    }
+    let pin: ApproverPin = serde_json::from_str(&fs::read_to_string(path)?)?;
+    if pin.schema_version != 1 || !valid_approver_id(&pin.key_id) {
+        return Err(
+            format!("{APPROVER_PIN_FILE} has an unsupported schema or invalid key_id").into(),
+        );
+    }
+    let bytes = hex::decode(&pin.public_key_hex)?;
+    if bytes.len() != 32 {
+        return Err(format!("{APPROVER_PIN_FILE} public key must be 32 bytes").into());
+    }
+    praetore_core::VerifiedPublicKey::from_bytes(&bytes)?;
+    Ok(Some(pin))
+}
+
+fn load_approver_verifier(
+    directory: &Path,
+) -> Result<Option<HumanApprovalVerifier>, Box<dyn std::error::Error>> {
+    let Some(pin) = load_approver_pin(directory)? else {
+        return Ok(None);
+    };
+    let public_key =
+        praetore_core::VerifiedPublicKey::from_bytes(&hex::decode(&pin.public_key_hex)?)?;
+    Ok(Some(HumanApprovalVerifier::new(pin.key_id, public_key)?))
+}
+
+/// Looks up the pending execution for `request_id` in this demo's tenant.
+/// Fails closed unless exactly one journal row matches.
+fn find_pending_agent(
+    database_url: &str,
+    tenant_id: Uuid,
+    request_id: Uuid,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    let mut client = connect_local_database(database_url)?;
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.query_one(
+        "SELECT set_config('praetore.tenant_id', $1, true)",
+        &[&tenant_id.to_string()],
+    )?;
+    let rows = transaction.query(
+        "SELECT agent_id FROM praetore.execution_journal \
+         WHERE tenant_id = $1 AND request_id = $2 LIMIT 2",
+        &[&tenant_id, &request_id],
+    )?;
+    transaction.commit()?;
+    match rows.as_slice() {
+        [row] => Ok(row.get(0)),
+        [] => Err("execution not found for this demo tenant".into()),
+        _ => Err("execution id is ambiguous; refusing to resolve approval".into()),
+    }
+}
+
+fn sign_decision(
+    challenge: ApprovalChallenge,
+    approver_id: &str,
+    outcome: HumanApprovalOutcome,
+    signing_key: &SigningKey,
+) -> Result<HumanApprovalDecision, Box<dyn std::error::Error>> {
+    let mut decision = HumanApprovalDecision {
+        schema_version: 1,
+        approval_id: Uuid::new_v4(),
+        approver_key_id: approver_id.to_owned(),
+        challenge,
+        outcome,
+        signature: String::new(),
+    };
+    decision.signature = hex::encode(signing_key.sign(&decision.signing_message()?).to_bytes());
+    Ok(decision)
+}
+
+fn resolve_approval(
+    directory: &Path,
+    execution_id: &str,
+    approver_id: &str,
+    outcome: HumanApprovalOutcome,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_id = Uuid::parse_str(execution_id)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .ok_or("execution_id must be the request_id UUID from the demo receipt")?;
+    if !valid_approver_id(approver_id) {
+        return Err("approver id must be 1-64 characters of [a-z0-9-]".into());
+    }
+    let pin = load_approver_pin(directory)?
+        .ok_or("this demo directory has no approver pin; human approval is disabled")?;
+    if pin.key_id != approver_id {
+        return Err("unknown approver id for this demo directory".into());
+    }
+    let signing_key = SigningKey::from_bytes(&read_secret(directory, APPROVER_KEY_FILE)?);
+    if hex::encode(signing_key.verifying_key().to_bytes()) != pin.public_key_hex {
+        return Err("approver.key does not match the approver pin".into());
+    }
+    let config = load_config(directory)?;
+    let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL")
+        .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
+    let agent_id = find_pending_agent(&database_url, config.tenant_id, request_id)?;
+
+    let url = format!(
+        "http://127.0.0.1:{}/v1/approvals/{}/{}/{}",
+        config.port, config.tenant_id, agent_id, request_id
+    );
+    let client = http_client()?;
+    let response = client.get(&url).send()?;
+    let status = response.status();
+    let body = response.text()?;
+    if !status.is_success() {
+        println!("{body}");
+        return Err(format!("gateway refused the approval challenge (HTTP {status})").into());
+    }
+    let challenge: ApprovalChallenge = serde_json::from_str(&body)?;
+    if challenge.tenant_id != config.tenant_id
+        || challenge.agent_id != agent_id
+        || challenge.request_id != request_id
+    {
+        return Err("gateway returned a challenge for a different execution".into());
+    }
+    let decision = sign_decision(challenge, approver_id, outcome, &signing_key)?;
+    let response = client
+        .post(&url)
+        .json(&decision)
+        .send()
+        .map_err(|error| {
+            format!(
+                "could not confirm the gateway response ({error}); the decision may have been recorded and the CLI did not retry. Inspect praetore.human_approvals before taking further action"
+            )
+        })?;
+    let status = response.status();
+    let body = response.text()?;
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+        Err(_) => println!("{body}"),
+    }
+    if !status.is_success() {
+        return Err(format!("gateway returned HTTP {status}; review the response above").into());
+    }
+    Ok(())
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
@@ -796,6 +1051,204 @@ mod tests {
                 .outcome,
             praetore_core::DecisionOutcome::Deny
         );
+    }
+
+    #[test]
+    fn approver_ids_are_strictly_validated() {
+        assert!(valid_approver_id("local-approver"));
+        for bad in ["", "Local", "a b", "x;drop", "../key", &"a".repeat(65)] {
+            assert!(!valid_approver_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn init_creates_approver_pin_and_owner_only_approver_key() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let metadata = fs::metadata(directory.join(APPROVER_KEY_FILE)).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let pin = load_approver_pin(&directory).unwrap().unwrap();
+        assert_eq!(pin.key_id, LOCAL_APPROVER_ID);
+        let secret = read_secret(&directory, APPROVER_KEY_FILE).unwrap();
+        assert_eq!(
+            hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes()),
+            pin.public_key_hex
+        );
+        assert!(load_approver_verifier(&directory).unwrap().is_some());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_approver_pin_disables_approval_and_cli_refuses() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        fs::remove_file(directory.join(APPROVER_PIN_FILE)).unwrap();
+        assert!(load_approver_verifier(&directory).unwrap().is_none());
+        let error = resolve_approval(
+            &directory,
+            &Uuid::new_v4().to_string(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("human approval is disabled"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn approve_rejects_malformed_ids_and_unknown_approvers_before_any_io() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        for id in [
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "'; drop table x;--",
+        ] {
+            assert!(
+                resolve_approval(
+                    &directory,
+                    id,
+                    LOCAL_APPROVER_ID,
+                    HumanApprovalOutcome::Approve
+                )
+                .is_err()
+            );
+        }
+        let error = resolve_approval(
+            &directory,
+            &Uuid::new_v4().to_string(),
+            "someone-else",
+            HumanApprovalOutcome::Approve,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown approver"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn tampered_approver_pin_is_rejected() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        fs::write(
+            directory.join(APPROVER_PIN_FILE),
+            r#"{"schema_version":1,"key_id":"local-approver","public_key_hex":"zz"}"#,
+        )
+        .unwrap();
+        assert!(load_approver_pin(&directory).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Real PostgreSQL end-to-end test of the approval flow through the same
+    /// gateway the CLI runs. Run with:
+    /// `PRAETORE_TEST_DATABASE_URL=postgresql://user@127.0.0.1:port/db cargo test -p praetore-cli -- --ignored`
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_approval_dispatches_once_and_rejection_is_final() {
+        use praetore_gateway::{ApprovalError, ExecutionKey, ExecutionStatus, GatewayError};
+        let database_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        apply_migrations(&database_url).unwrap();
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let mut policy = load_policy(&directory).unwrap();
+        policy.rules[0].effect = PolicyEffect::RequireApproval;
+        fs::write(
+            directory.join(POLICY_FILE),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+        let config = load_config(&directory).unwrap();
+        let policy = load_policy(&directory).unwrap();
+        let gateway = build_gateway(&directory, &config, &database_url).unwrap();
+        let approver = SigningKey::from_bytes(&read_secret(&directory, APPROVER_KEY_FILE).unwrap());
+
+        let pending = |value: &str| {
+            let request = build_demo_request(&directory, &config, &policy, "k", value).unwrap();
+            let receipt = gateway.execute(request).unwrap();
+            assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            let request_id = receipt.evidence.request_id;
+            let agent_id = find_pending_agent(&database_url, config.tenant_id, request_id).unwrap();
+            assert_eq!(agent_id, *receipt.evidence.agent.id.as_uuid());
+            ExecutionKey {
+                tenant_id: config.tenant_id,
+                agent_id,
+                request_id,
+            }
+        };
+
+        // Approve: dispatched exactly once, then the decision cannot be reused.
+        let key = pending("approved");
+        let decision = sign_decision(
+            gateway.approval_challenge(key).unwrap(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+        let resolution = gateway.resolve_human_approval(decision.clone()).unwrap();
+        assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+        assert!(gateway.resolve_human_approval(decision).is_err());
+        assert!(matches!(
+            gateway.approval_challenge(key),
+            Err(GatewayError::Approval(ApprovalError::NotPending))
+        ));
+
+        // Reject: never dispatched, and a later approval is refused.
+        let key = pending("rejected");
+        let challenge = gateway.approval_challenge(key).unwrap();
+        let reject = sign_decision(
+            challenge.clone(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Reject,
+            &approver,
+        )
+        .unwrap();
+        let resolution = gateway.resolve_human_approval(reject).unwrap();
+        assert_eq!(resolution.receipt.execution, ExecutionStatus::NotDispatched);
+        let late_approve = sign_decision(
+            challenge,
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+        assert!(gateway.resolve_human_approval(late_approve).is_err());
+
+        // A signature from a key that is not the pinned approver is refused.
+        let key = pending("forged");
+        let forged = sign_decision(
+            gateway.approval_challenge(key).unwrap(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &SigningKey::from_bytes(&[7; 32]),
+        )
+        .unwrap();
+        assert!(matches!(
+            gateway.resolve_human_approval(forged),
+            Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+        ));
+
+        // Unknown execution id is not found.
+        assert!(find_pending_agent(&database_url, config.tenant_id, Uuid::new_v4()).is_err());
+
+        // human_approvals holds exactly the two accepted decisions.
+        let mut client = connect_local_database(&database_url).unwrap();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .query_one(
+                "SELECT set_config('praetore.tenant_id', $1, true)",
+                &[&config.tenant_id.to_string()],
+            )
+            .unwrap();
+        let rows = transaction
+            .query(
+                "SELECT outcome FROM praetore.human_approvals WHERE tenant_id = $1 ORDER BY created_at",
+                &[&config.tenant_id],
+            )
+            .unwrap();
+        let outcomes: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+        assert_eq!(outcomes, ["approve", "reject"]);
+        transaction.commit().unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
