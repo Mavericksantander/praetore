@@ -76,6 +76,10 @@
 
 ### Compatibility notes
 
+- **Breaking:** in Strict and HighAssurance, a matching `Allow` or
+  `RequireApproval` rule without `required_capability` now yields `Deny`.
+  Add `with_capability(...)` (or `required_capability` in policy JSON) to
+  those rules before upgrading. Development mode is unchanged.
 - `AuthorizationEngine::evaluate(request) -> Result<Evidence>` is unchanged.
 - `new` and `with_clock` remain deprecated development-mode compatibility
   constructors and continue to permit unsigned authorities. Production callers
