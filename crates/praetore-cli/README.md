@@ -31,8 +31,10 @@ praetore approve ./praetore-local <request_id> --approver local-approver
 praetore reject  ./praetore-local <request_id> --approver local-approver
 ```
 
-`<request_id>` is `evidence.request_id` from the demo receipt. The CLI looks up
-the agent id in the local journal (parameterized SQL, tenant-scoped), fetches
+`<request_id>` is `evidence.request_id` from the demo receipt. Pass
+`--agent <evidence.agent.id>` to address the endpoint's tenant/agent/request
+triple directly; otherwise the CLI looks up the agent id in the local journal
+(parameterized SQL, tenant-scoped, fails unless exactly one row). It then fetches
 the challenge from the existing `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}`
 endpoint, signs it with `approver.key`, and posts it to the same path. The
 gateway verifies the Ed25519 signature against the pin, records the decision
