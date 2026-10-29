@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Policy size and complexity limits are now public, documented constants in
+  `praetore_core::policy`, and exceeding any of them rejects the whole policy
+  with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`
+  (error code unchanged: `POLICY_EVALUATION_FAIL`). Nothing is ignored or
+  partially applied.
+  - Existing, now public: `MAX_CONDITIONS_PER_RULE` = 128 (per scope),
+    `MAX_POLICY_TEXT_BYTES` = 1024 (ids, action type, target, condition key),
+    canonical policy size `MAX_JSON_VALUE_BYTES` = 65 536.
+  - Breaking: `MAX_POLICY_RULES` lowered from 1024 to 256. 1024 rules could
+    never fit in 64 KiB of canonical JSON, so the old value was unreachable.
+  - New: capability length (`MAX_POLICY_TEXT_BYTES`),
+    `MAX_CONDITION_STRING_BYTES` = 1024 (strings and object keys inside
+    expected values), `MAX_CONDITION_SET_VALUES` = 256 (array values),
+    `MAX_CONDITION_VALUE_DEPTH` = 8.
+  - Breaking: new `PraetoreError` variant; limit violations no longer surface
+    as `PolicyEvaluationFailed(String)`.
+  - The policy engine has no regular expressions, so there is no pattern limit.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`
