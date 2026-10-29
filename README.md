@@ -105,9 +105,23 @@ cargo test -p praetore-gateway --test enforcement human_approval
   - `executed` and `confirmed` record what the dispatcher adapter reported.
     The strength of `confirmed` depends on that adapter
     ([`DispatchReport`](crates/praetore-gateway/src/lib.rs)).
+- **A client that executes an action by itself** (as the current test agent
+  does) can leave a journal state that does not reflect who actually
+  executed it. [#16](https://github.com/Mavericksantander/praetore/pull/16)
+  addresses this; it is in development and not merged.
 - **No fuzzing campaign has been run** on the new path operators. The
   repository's bounded fuzz targets do not cover them specifically.
 - **Not yet tested on macOS.**
+
+## Not verified
+
+The following were **not** exercised when this README was last checked:
+
+- the local CLI guide that needs PostgreSQL
+  ([`crates/praetore-cli/README.md`](crates/praetore-cli/README.md):
+  `praetore init`, `run`, `demo`, `approve` / `reject`);
+- `cargo install` (the verifier was built with `cargo build` instead);
+- the Python package ([`packages/praetore-python/`](packages/praetore-python/)).
 
 ## In development
 
@@ -378,23 +392,46 @@ lowercase hex (32 bytes); it is provisioned separately from the evidence.
 Issuer pin files are JSON Lines: one exported `TrustedAuthorityIssuer` pin
 document per line.
 
+The fixtures in [`examples/verify/`](examples/verify/) are generated with
+fixed, public, test-only keys by
+[`scripts/gen-verify-fixtures.sh`](scripts/gen-verify-fixtures.sh)
+([`crates/praetore-core/examples/verify_fixtures.rs`](crates/praetore-core/examples/verify_fixtures.rs)).
+They are not trust anchors for anything real. From the repository root:
+
 ```sh
-praetore-verify evidence \
-  --evidence evidence.json \
-  --attester-pin attester-public-key.hex \
-  --issuer-pins issuer-pins.jsonl \
+cargo build --release --locked --package praetore-verify
+
+# Valid receipt: integrity, attester signature, issuer-pinned authority and
+# signed agent intent. Prints {"ok":true,...} and exits 0.
+target/release/praetore-verify evidence \
+  --evidence examples/verify/evidence.json \
+  --attester-pin examples/verify/attester-public-key.hex \
+  --issuer-pins examples/verify/issuer-pins.jsonl \
   --require-intent \
   --format json
 
-praetore-verify policy-digest --policy policy.json --format json
+# Tampered receipt (decision reason changed): prints
+# {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"} and exits 1.
+target/release/praetore-verify evidence \
+  --evidence examples/verify/evidence-tampered.json \
+  --attester-pin examples/verify/attester-public-key.hex \
+  --issuer-pins examples/verify/issuer-pins.jsonl \
+  --require-intent \
+  --format json
 
-praetore-verify authority \
-  --authority authority.json \
-  --issuer-pins issuer-pins.jsonl \
-  --agent agent.json \
+target/release/praetore-verify policy-digest --policy examples/verify/policy.json --format json
+
+target/release/praetore-verify authority \
+  --authority examples/verify/authority.json \
+  --issuer-pins examples/verify/issuer-pins.jsonl \
+  --agent examples/verify/agent.json \
   --now 2026-10-24T00:00:00Z \
   --format json
 ```
+
+The fixture authority is valid from 2026-01-01 to 2036-01-01. The `evidence`
+command checks it against the current time, so regenerate the fixtures after
+that date.
 
 The optional `--agent` enables explicit subject-key binding verification for
 standalone authority documents. When omitted, the verifier checks the issuer

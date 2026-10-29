@@ -1,0 +1,1 @@
+{"id":"example-verify-policy","version":1,"canonical_version":1,"rules":[{"id":"allow-read","action_type":"read_data","effect":"Allow","required_capability":"data:read","target":null,"parameter_conditions":[],"context_conditions":[]}]}
