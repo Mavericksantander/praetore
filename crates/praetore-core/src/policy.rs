@@ -239,9 +239,11 @@ impl Policy {
                 continue;
             }
             match (self.max_approval_ms, rule.control_loop, rule.delta_ms) {
-                (None, Some(ControlLoop::Fast), _) => {
+                // Fail closed (CTO, 29-oct-2026): on the fast loop both bounds
+                // must be declared, and delta_ms must cover max_approval_ms.
+                (None, Some(ControlLoop::Fast), _) | (_, Some(ControlLoop::Fast), None) => {
                     return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                        "policy rule '{}' requires approval on the fast control loop without max_approval_ms",
+                        "policy rule '{}' requires approval on the fast control loop without both max_approval_ms and delta_ms",
                         rule.id
                     )));
                 }

@@ -21,6 +21,16 @@ struct ErrorResponse {
     /// required approval: `pending`, `approved`, `rejected` or `expired`.
     #[serde(skip_serializing_if = "Option::is_none")]
     resolution: Option<crate::ApprovalResolution>,
+    /// SAF-10: on 410 `approval_expired`, the `receipt_id` of the signed
+    /// `ApprovalExpiredReceipt` persisted for this key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiration_receipt_id: Option<uuid::Uuid>,
+}
+
+/// State of the same key reported alongside approval errors.
+struct ApprovalErrorContext {
+    resolution: Option<crate::ApprovalResolution>,
+    expiration_receipt_id: Option<uuid::Uuid>,
 }
 
 #[derive(Serialize)]
@@ -32,7 +42,8 @@ struct ResolutionResponse {
 ///
 /// `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}/status` reports the
 /// human-approval state (`pending`, `approved`, `rejected`, `expired`) for that
-/// exact key; 409/410 approval errors carry the same `resolution` field.
+/// exact key; 409/410 approval errors carry the same `resolution` field, and
+/// 410 also carries `expiration_receipt_id`.
 ///
 /// `POST /v1/execute` accepts the serialized `AuthorizationRequest`. The
 /// gateway returns its signed receipt for every completed policy decision,
@@ -191,7 +202,7 @@ fn with_resolution(
     gateway: &Gateway,
     key: crate::ExecutionKey,
     error: GatewayError,
-) -> (GatewayError, Option<crate::ApprovalResolution>) {
+) -> (GatewayError, ApprovalErrorContext) {
     let reportable = matches!(
         error,
         GatewayError::Approval(crate::ApprovalError::NotPending | crate::ApprovalError::Expired)
@@ -202,30 +213,44 @@ fn with_resolution(
     } else {
         None
     };
-    (error, resolution)
+    let expiration_receipt_id =
+        if matches!(error, GatewayError::Approval(crate::ApprovalError::Expired)) {
+            gateway
+                .approval_expiration(key)
+                .ok()
+                .flatten()
+                .map(|receipt| receipt.receipt_id)
+        } else {
+            None
+        };
+    (
+        error,
+        ApprovalErrorContext {
+            resolution,
+            expiration_receipt_id,
+        },
+    )
 }
 
-fn approval_error_response(
-    error: GatewayError,
-    resolution: Option<crate::ApprovalResolution>,
-) -> Response {
+fn approval_error_response(error: GatewayError, context: ApprovalErrorContext) -> Response {
     let response = gateway_error_response(error);
     let code = match response.status() {
         StatusCode::CONFLICT => "approval_not_pending",
         StatusCode::GONE => "approval_expired",
         _ => return response,
     };
-    match resolution {
-        Some(resolution) => (
-            response.status(),
-            Json(ErrorResponse {
-                code,
-                resolution: Some(resolution),
-            }),
-        )
-            .into_response(),
-        None => response,
+    if context.resolution.is_none() && context.expiration_receipt_id.is_none() {
+        return response;
     }
+    (
+        response.status(),
+        Json(ErrorResponse {
+            code,
+            resolution: context.resolution,
+            expiration_receipt_id: context.expiration_receipt_id,
+        }),
+    )
+        .into_response()
 }
 
 fn gateway_error_response(error: GatewayError) -> Response {
@@ -301,6 +326,7 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
         Json(ErrorResponse {
             code,
             resolution: None,
+            expiration_receipt_id: None,
         }),
     )
         .into_response()
