@@ -26,6 +26,146 @@ verifier, verify-only Python bindings, a reference tool-gateway crate, a
 PostgreSQL-backed local CLI demo, bounded fuzz targets, and an optional
 PostgreSQL replay-guard adapter.
 
+## Current state on `main`
+
+This section lists only what is merged on `main`. Each item points to the
+code or test that backs it. None of it is a security or production guarantee.
+
+- **Signed human approve/reject (#14).** For a `RequireApproval` decision,
+  `praetore approve` / `praetore reject` sign the gateway's approval challenge
+  with a local Ed25519 approver key. The gateway verifies the signature
+  against a pinned approver key, records the decision append-only in
+  `praetore.human_approvals`, and only then dispatches. A decision cannot be
+  reused, and a rejection is final. See the
+  [CLI guide](crates/praetore-cli/README.md#human-approval) and the tests in
+  [`crates/praetore-gateway/tests/enforcement.rs`](crates/praetore-gateway/tests/enforcement.rs)
+  (for example `signed_human_approval_dispatches_the_exact_persisted_action_once`
+  and `rejected_human_approval_is_persisted_without_dispatch`).
+- **Policy digest in the receipt.** The engine binds the SHA-256 digest of
+  the active policy's canonical JSON (`Policy::digest`) into the evidence
+  `policy_digest` field. That field is part of the evidence integrity hash
+  and of the payload covered by the Ed25519 attester signature. See
+  [`crates/praetore-core/src/evidence.rs`](crates/praetore-core/src/evidence.rs)
+  (test `policy_digest_is_bound_to_integrity_hash`). The engine binds the
+  digest in every mode, and `HighAssurance` additionally requires it to
+  equal the pinned policy digest. `Evidence::sign` itself does not yet
+  require the field;
+  [#17](https://github.com/Mavericksantander/praetore/pull/17) (draft)
+  extends that requirement to all signing.
+- **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
+  A policy that exceeds any limit is rejected when it loads with the typed
+  error `PolicyLimitExceeded`; nothing is skipped or treated as allow.
+  Raw policy JSON over 64 KiB, or deeper than the parser limit
+  (`MAX_JSON_DEPTH` = 32), fails closed in `Policy::from_json` with an
+  untyped `PolicyEvaluationFailed` (see
+  [#23](https://github.com/Mavericksantander/praetore/issues/23)). The
+  public constants in
+  [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs)
+  (tests in [`crates/praetore-core/tests/policy_limits.rs`](crates/praetore-core/tests/policy_limits.rs)):
+  - `MAX_POLICY_RULES` = 512 rules. The 64 KiB canonical JSON limit
+    (`MAX_JSON_VALUE_BYTES` = 65,536) is reached first, at fewer than 480 minimal rules (468 measured).
+  - `MAX_CONDITIONS_PER_RULE` = 128 parameter conditions, and separately 128
+    context conditions, per rule.
+  - `MAX_POLICY_TEXT_BYTES` = 1024 UTF-8 bytes for a policy id, rule id,
+    action type, capability, target or condition key.
+  - `MAX_CONDITION_STRING_BYTES` = 1024 UTF-8 bytes for any string inside a
+    condition's expected value, including a `Prefix` / `PathPrefix` prefix.
+  - `MAX_CONDITION_SET_VALUES` = 256 values in an `In` condition.
+  - `MAX_CONDITION_VALUE_DEPTH` = 8 levels of nesting in an expected value
+    (a scalar is 1).
+  - The engine has no regex operator, so there is no regex limit.
+- **`PathPrefix` condition operator.** A lexical, whole-segment path prefix
+  (`/srv/agent` matches `/srv/agent/x`, not `/srv/agentx`).
+  - Rule prefixes must be absolute and normalized. An invalid prefix rejects
+    the policy when it loads.
+  - A value that is not absolute and normalized is *unsafe*. That covers
+    `.`, `..`, `//`, `\`, NUL, any `%`, and relative paths. An unsafe value
+    never matches an `Allow` rule, and always matches `Deny` and
+    `RequireApproval` rules, under both policy semantics versions.
+  - `Prefix` applies the same unsafe rule to values containing a `..`
+    segment, `%`, or NUL.
+  - Pairs of `PathPrefix` / `PathPrefix`, `PathPrefix` / `Exact` and
+    `PathPrefix` / `Prefix` conditions on the same key that have no lexical
+    relation to each other are rejected. The check is conservative, not
+    exhaustive.
+  - **Lexical limits:** nothing is normalized. Fullwidth `．．` (U+FF0E), the
+    division slash `∕` (U+2215), spaces (`" .."`), and `...` are ordinary
+    characters. No layer downstream may NFKC-normalize or percent-decode a
+    value after it was authorized.
+  - **Over-restriction (accepted, fail closed):** an unsafe value triggers a
+    `Deny` or `RequireApproval` rule even when it lies outside the rule's
+    prefix. For example, a deny on `/srv/secret` also denies `/home/50%.txt`.
+  - See [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs),
+    [`tests/path_prefix.rs`](crates/praetore-core/tests/path_prefix.rs) and
+    [`tests/path_prefix_followups.rs`](crates/praetore-core/tests/path_prefix_followups.rs).
+- **Tests ported from Canopy.**
+  [`crates/praetore-core/tests/canopy_port.rs`](crates/praetore-core/tests/canopy_port.rs)
+  rewrites the applicable behaviour cases of the earlier Canopy library
+  (Apache-2.0) as Rust tests.
+  - Where Canopy allowed by default, the expected result here is a default
+    deny, and each test documents the difference.
+  - Not ported: fixed-key HMAC witnesses, overwritable approvals, substring
+    heuristics, reputation, and shell execution.
+
+Run the tests listed above:
+
+```sh
+cargo test -p praetore-core --test canopy_port --test path_prefix --test path_prefix_followups
+cargo test -p praetore-core --lib evidence::tests::policy_digest_is_bound_to_integrity_hash
+cargo test -p praetore-gateway --test enforcement human_approval
+```
+
+## Limitations
+
+- **Cooperative enforcement.** PRÆTORE governs only the actions an agent
+  submits to it. It cannot stop an agent, or any other process, from
+  performing an action directly. Any client that executes an action itself
+  after an `allowed` answer does so outside PRÆTORE's control.
+- **Path protection is local and lexical only.** `Prefix` and `PathPrefix`
+  compare strings and never consult the filesystem. **Symlinks are out of
+  scope.**
+- **The journal does not separate approval from dispatch, and does not
+  independently confirm execution.**
+  - In `praetore.execution_journal`, an approval moves an execution directly
+    from `not_dispatched` to `dispatched` in the same transaction that
+    records the decision in `praetore.human_approvals`
+    ([`crates/praetore-replay-postgres/src/execution.rs`](crates/praetore-replay-postgres/src/execution.rs)).
+    There is no separate "approved but not yet dispatched" state.
+  - `executed` and `confirmed` record what the dispatcher adapter reported.
+    The strength of `confirmed` depends on that adapter
+    ([`DispatchReport`](crates/praetore-gateway/src/lib.rs)).
+- **A client that executes an action by itself** (as the current test agent
+  does) can leave a journal state that does not reflect who actually
+  executed it. [#16](https://github.com/Mavericksantander/praetore/pull/16)
+  addresses this; it is in development and not merged.
+- **No fuzzing campaign has been run** on the new path operators. The
+  repository's bounded fuzz targets do not cover them specifically.
+- **Not yet tested on macOS.**
+
+## Not verified
+
+The following were **not** exercised when this README was last checked:
+
+- the local CLI guide that needs PostgreSQL
+  ([`crates/praetore-cli/README.md`](crates/praetore-cli/README.md):
+  `praetore init`, `run`, `demo`, `approve` / `reject`);
+- `cargo install` (the verifier was built with `cargo build` instead);
+- the Python package ([`packages/praetore-python/`](packages/praetore-python/));
+- the 21 PostgreSQL tests in
+  [`crates/praetore-replay-postgres/tests/postgres.rs`](crates/praetore-replay-postgres/tests/postgres.rs),
+  which are ignored without a database (`PRAETORE_TEST_DATABASE_URL`);
+- Windows.
+
+## In development
+
+The following are **open pull requests, not merged** and not available on
+`main`:
+
+- [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
+- [#16](https://github.com/Mavericksantander/praetore/pull/16): `SandboxDispatcher` executed by the gateway, and the `praetore-exec-mode` header.
+- [#17](https://github.com/Mavericksantander/praetore/pull/17): require the active policy digest before a receipt can be signed.
+- [#18](https://github.com/Mavericksantander/praetore/pull/18): `praetore-verify evidence --policy` (depends on #17).
+
 ## What it is — and is not
 
 **PRÆTORE is:**
@@ -161,11 +301,14 @@ praetore/
 │   ├── praetore-python/
 │   ├── praetore-replay-postgres/
 │   ├── praetore-gateway/
+│   ├── praetore-gateway-service/
 │   ├── praetore-cli/
 │   └── praetore-observe/
 ├── fuzz/
 ├── packages/praetore-python/
 ├── docs/
+├── examples/
+├── scripts/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE
@@ -284,23 +427,47 @@ lowercase hex (32 bytes); it is provisioned separately from the evidence.
 Issuer pin files are JSON Lines: one exported `TrustedAuthorityIssuer` pin
 document per line.
 
+The fixtures in [`examples/verify/`](examples/verify/) are generated with
+fixed, public, test-only keys by
+[`scripts/gen-verify-fixtures.sh`](scripts/gen-verify-fixtures.sh)
+([`crates/praetore-core/examples/verify_fixtures.rs`](crates/praetore-core/examples/verify_fixtures.rs)).
+They are not trust anchors for anything real. From the repository root:
+
 ```sh
-praetore-verify evidence \
-  --evidence evidence.json \
-  --attester-pin attester-public-key.hex \
-  --issuer-pins issuer-pins.jsonl \
+cargo build --release --locked --package praetore-verify
+
+# Valid receipt: integrity, attester signature, issuer-pinned authority and
+# signed agent intent. Prints {"ok":true,...} and exits 0.
+target/release/praetore-verify evidence \
+  --evidence examples/verify/evidence.json \
+  --attester-pin examples/verify/attester-public-key.hex \
+  --issuer-pins examples/verify/issuer-pins.jsonl \
   --require-intent \
   --format json
 
-praetore-verify policy-digest --policy policy.json --format json
+# Tampered receipt (decision reason changed): prints
+# {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"} and exits 1.
+target/release/praetore-verify evidence \
+  --evidence examples/verify/evidence-tampered.json \
+  --attester-pin examples/verify/attester-public-key.hex \
+  --issuer-pins examples/verify/issuer-pins.jsonl \
+  --require-intent \
+  --format json
 
-praetore-verify authority \
-  --authority authority.json \
-  --issuer-pins issuer-pins.jsonl \
-  --agent agent.json \
+target/release/praetore-verify policy-digest --policy examples/verify/policy.json --format json
+
+target/release/praetore-verify authority \
+  --authority examples/verify/authority.json \
+  --issuer-pins examples/verify/issuer-pins.jsonl \
+  --agent examples/verify/agent.json \
   --now 2026-10-24T00:00:00Z \
   --format json
 ```
+
+Regenerating the fixtures changes `evidence.json` and
+`evidence-tampered.json`, because `evidence_id` is random. The fixture authority is valid from 2026-01-01 to 2036-01-01. The `evidence`
+command checks it against the current time, so regenerate the fixtures after
+that date.
 
 The optional `--agent` enables explicit subject-key binding verification for
 standalone authority documents. When omitted, the verifier checks the issuer
