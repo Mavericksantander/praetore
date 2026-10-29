@@ -15,7 +15,7 @@ pub mod replay;
 pub use action::Action;
 pub use authority::{Authority, AuthorityId};
 pub use authorization::{AuthorizationIntentV2, AuthorizationRequest};
-pub use decision::{Decision, DecisionOutcome};
+pub use decision::{DecidedBy, Decision, DecisionOutcome};
 pub use engine::{
     AtomicEvaluationError, EvaluationMode, HighAssuranceConfig, TrustedAuthorityIssuer,
     TrustedClock, TrustedClockError,

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `Decision` gains `decided_by` (`DecidedBy::Rule { rule_id }`, `DefaultDeny`,
+  `EngineGuard { guard }`), set by policy evaluation and engine guards. It is
+  part of the hashed and Ed25519-signed evidence payload. Omitted from the
+  canonical form when absent, so receipts signed before this change still verify.
+  Adding a public field to `Decision` breaks struct-literal construction.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`

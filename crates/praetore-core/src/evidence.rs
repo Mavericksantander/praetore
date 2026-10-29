@@ -468,6 +468,11 @@ impl Evidence {
             || self.decision.contributions.iter().any(|contribution| {
                 contribution.rule_id.len() > 1024 || contribution.reason.len() > 4096
             })
+            || match &self.decision.decided_by {
+                Some(crate::decision::DecidedBy::Rule { rule_id }) => rule_id.len() > 1024,
+                Some(crate::decision::DecidedBy::EngineGuard { guard }) => guard.len() > 1024,
+                Some(crate::decision::DecidedBy::DefaultDeny) | None => false,
+            }
         {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence decision exceeds configured limits".into(),

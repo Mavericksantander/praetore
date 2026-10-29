@@ -9,7 +9,7 @@ use crate::{
     canonical::{
         MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
     },
-    decision::{Decision, DecisionContribution},
+    decision::{DecidedBy, Decision, DecisionContribution},
     error::{PraetoreError, Result},
     identity::AgentIdentity,
 };
@@ -114,7 +114,9 @@ impl Policy {
                 rule_decision.reason.clone(),
             );
 
-            let rule_decision = rule_decision.with_contribution(contribution);
+            let rule_decision = rule_decision
+                .with_contribution(contribution)
+                .decided_by(DecidedBy::rule(rule.id.clone()));
 
             decision = Some(match decision {
                 Some(current) => current.strongest(rule_decision),
@@ -127,6 +129,7 @@ impl Policy {
                 "Policy '{}' v{}: no matching rule; default deny",
                 self.id, self.version
             ))
+            .decided_by(DecidedBy::DefaultDeny)
         }))
     }
 
