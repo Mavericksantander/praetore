@@ -11,6 +11,10 @@
 - New `Evidence::verify_policy(&Policy)` checks that a receipt was decided
   under a given policy (digest present and equal). Legacy receipts without a
   digest return an error.
+- Known limitation (accepted): legacy receipts whose `policy_digest` was
+  recorded in uppercase hex still deserialize and verify, but cannot be
+  re-signed, because `Evidence::sign` only accepts the lowercase SHA-256 hex
+  produced by `Policy::digest()`.
 
 ## 0.2.0 (not yet tagged or published)
 
