@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **T-013:** `praetore_gateway::sandbox::SandboxDispatcher` (Unix), an
+  `ActionDispatcher` executed by the gateway with a closed allowlist
+  (`fs:write_file`, `fs:delete_file`) confined to a canonical root via
+  `openat`/`O_NOFOLLOW` (no symlinks, no `..`, no absolute paths, size limits).
+  `praetore init --sandbox-root <dir>` / `sandbox_root` in `config.json`
+  enables it in `praetore run` (fail-closed if the root is invalid);
+  `demo:set_value` is kept unchanged. No `exec`.
+- New `ActionDispatcher::preflight` (default: admit). Refused actions are
+  recorded `not_dispatched` with a signed attestation and answered 403
+  `action_not_dispatchable`, never `outcome_unknown`; held approvals for
+  refused actions cannot be approved.
+- **Breaking:** new `GatewayError::DispatchRefused` variant.
+- HTTP: `router_with_options` / `serve_local_with_options` with
+  `HttpOptions::gateway_executes_effects`: `/status` of an approved action
+  the gateway executed answers 409 `cooperative_exec_rejected`; receipts of
+  gateway-executed effects carry `praetore-executed-by: gateway`.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`

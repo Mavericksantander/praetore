@@ -1034,6 +1034,7 @@ dependencies = [
  "axum",
  "ed25519-dalek",
  "hex",
+ "libc",
  "praetore-core",
  "serde",
  "serde_json",
