@@ -46,16 +46,24 @@ code or test that backs it. None of it is a security or production guarantee.
   `policy_digest` field. That field is part of the evidence integrity hash
   and of the payload covered by the Ed25519 attester signature. See
   [`crates/praetore-core/src/evidence.rs`](crates/praetore-core/src/evidence.rs)
-  (test `policy_digest_is_bound_to_integrity_hash`). On `main`, signing does
-  **not** yet require the field to be present (see *In development*).
+  (test `policy_digest_is_bound_to_integrity_hash`). The engine binds the
+  digest in every mode, and `HighAssurance` additionally requires it to
+  equal the pinned policy digest. `Evidence::sign` itself does not yet
+  require the field;
+  [#17](https://github.com/Mavericksantander/praetore/pull/17) (draft)
+  extends that requirement to all signing.
 - **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
   A policy that exceeds any limit is rejected when it loads with the typed
-  error `PolicyLimitExceeded`; nothing is skipped or treated as allow. The
+  error `PolicyLimitExceeded`; nothing is skipped or treated as allow.
+  Raw policy JSON over 64 KiB, or deeper than the parser limit
+  (`MAX_JSON_DEPTH` = 32), fails closed in `Policy::from_json` with an
+  untyped `PolicyEvaluationFailed` (see
+  [#23](https://github.com/Mavericksantander/praetore/issues/23)). The
   public constants in
   [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs)
   (tests in [`crates/praetore-core/tests/policy_limits.rs`](crates/praetore-core/tests/policy_limits.rs)):
   - `MAX_POLICY_RULES` = 512 rules. The 64 KiB canonical JSON limit
-    (`MAX_JSON_VALUE_BYTES` = 65,536) is reached first, at 468 minimal rules.
+    (`MAX_JSON_VALUE_BYTES` = 65,536) is reached first, at fewer than 480 minimal rules (468 measured).
   - `MAX_CONDITIONS_PER_RULE` = 128 parameter conditions, and separately 128
     context conditions, per rule.
   - `MAX_POLICY_TEXT_BYTES` = 1024 UTF-8 bytes for a policy id, rule id,
@@ -76,7 +84,10 @@ code or test that backs it. None of it is a security or production guarantee.
     `RequireApproval` rules, under both policy semantics versions.
   - `Prefix` applies the same unsafe rule to values containing a `..`
     segment, `%`, or NUL.
-  - Conflicting `PathPrefix` conditions on the same key are rejected.
+  - Pairs of `PathPrefix` / `PathPrefix`, `PathPrefix` / `Exact` and
+    `PathPrefix` / `Prefix` conditions on the same key that have no lexical
+    relation to each other are rejected. The check is conservative, not
+    exhaustive.
   - **Lexical limits:** nothing is normalized. Fullwidth `．．` (U+FF0E), the
     division slash `∕` (U+2215), spaces (`" .."`), and `...` are ordinary
     characters. No layer downstream may NFKC-normalize or percent-decode a
@@ -139,7 +150,11 @@ The following were **not** exercised when this README was last checked:
   ([`crates/praetore-cli/README.md`](crates/praetore-cli/README.md):
   `praetore init`, `run`, `demo`, `approve` / `reject`);
 - `cargo install` (the verifier was built with `cargo build` instead);
-- the Python package ([`packages/praetore-python/`](packages/praetore-python/)).
+- the Python package ([`packages/praetore-python/`](packages/praetore-python/));
+- the 21 PostgreSQL tests in
+  [`crates/praetore-replay-postgres/tests/postgres.rs`](crates/praetore-replay-postgres/tests/postgres.rs),
+  which are ignored without a database (`PRAETORE_TEST_DATABASE_URL`);
+- Windows.
 
 ## In development
 
@@ -286,11 +301,14 @@ praetore/
 │   ├── praetore-python/
 │   ├── praetore-replay-postgres/
 │   ├── praetore-gateway/
+│   ├── praetore-gateway-service/
 │   ├── praetore-cli/
 │   └── praetore-observe/
 ├── fuzz/
 ├── packages/praetore-python/
 ├── docs/
+├── examples/
+├── scripts/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE
@@ -446,7 +464,8 @@ target/release/praetore-verify authority \
   --format json
 ```
 
-The fixture authority is valid from 2026-01-01 to 2036-01-01. The `evidence`
+Regenerating the fixtures changes `evidence.json` and
+`evidence-tampered.json`, because `evidence_id` is random. The fixture authority is valid from 2026-01-01 to 2036-01-01. The `evidence`
 command checks it against the current time, so regenerate the fixtures after
 that date.
 
