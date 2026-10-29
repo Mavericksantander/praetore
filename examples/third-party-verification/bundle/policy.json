@@ -1,0 +1,1 @@
+{"id":"DEMO-third-party-policy","version":1,"canonical_version":1,"rules":[{"id":"allow-read-report","action_type":"read_report","effect":"Allow","required_capability":"reports:read","target":null,"parameter_conditions":[],"context_conditions":[]}]}
