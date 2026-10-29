@@ -2626,6 +2626,61 @@ mod apd {
         ));
     }
 
+    /// Receipts consumed by the external verifiers (praetore-verify and the
+    /// Python package). `UPDATE_RECEIPT_FIXTURES=1` regenerates them; by
+    /// default the committed files must still verify.
+    #[test]
+    fn receipt_fixtures_for_external_verifiers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/praetore-python/tests/fixtures");
+        let key_id = "test-execution-attester-v1";
+        let public_key = execution_attester_public_key();
+        if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some() {
+            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            let closed = gateway.reconcile(key).unwrap();
+            assert_eq!(closed.execution_attestation.schema_version, 3);
+            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            let dispatched = gateway.dispatch_approved(key).unwrap();
+            assert_eq!(dispatched.execution_attestation.schema_version, 2);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, receipt) in [
+                ("receipt-v3-crash-recovered.json", &closed),
+                ("receipt-v2-confirmed.json", &dispatched),
+            ] {
+                std::fs::write(dir.join(name), serde_json::to_string(receipt).unwrap()).unwrap();
+            }
+            std::fs::write(
+                dir.join("execution-attester-public-key.hex"),
+                hex::encode(public_key.as_bytes()),
+            )
+            .unwrap();
+        }
+        let v3 = std::fs::read_to_string(dir.join("receipt-v3-crash-recovered.json")).unwrap();
+        let receipt =
+            praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id).unwrap();
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(NotDispatchedReason::CrashRecovered)
+        );
+        let v2 = std::fs::read_to_string(dir.join("receipt-v2-confirmed.json")).unwrap();
+        praetore_gateway::verify_gateway_receipt_json(&v2, &public_key, key_id).unwrap();
+        // Unknown reason: rejected at parse time.
+        let unknown = v3.replace("\"crash_recovered\"", "\"operator_override\"");
+        assert_ne!(unknown, v3);
+        assert!(matches!(
+            praetore_gateway::verify_gateway_receipt_json(&unknown, &public_key, key_id),
+            Err(ExecutionAttestationError::InvalidPayload)
+        ));
+        // A different known reason breaks the signature.
+        let swapped = v3.replace("\"crash_recovered\"", "\"approval_expired\"");
+        assert!(matches!(
+            praetore_gateway::verify_gateway_receipt_json(&swapped, &public_key, key_id),
+            Err(ExecutionAttestationError::InvalidSignature)
+        ));
+    }
+
     #[test]
     fn reconcile_closes_apd_as_crash_recovered_without_the_adapter() {
         let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();

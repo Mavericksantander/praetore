@@ -115,6 +115,16 @@ should have `USAGE` on the `praetore` schema, `INSERT` on the `agent_id` and
 PostgreSQL for the `ON CONFLICT` key). Do not grant table-wide `SELECT`,
 `UPDATE`, `DELETE`, or `TRUNCATE`.
 
+Migrations are applied by `praetore_replay_postgres::apply_migrations` (the
+gateway service and CLI call it at startup). Each migration runs once and is
+recorded with its SHA-256 in `praetore.schema_migrations`; a recorded
+migration whose text changed is refused. A database migrated before the
+control table existed is adopted only if its schema matches 0009 exactly:
+0001-0009 are then recorded without executing and only 0010+ run. A partial or
+unrecognized `praetore` schema is refused, and a binary refuses to start if
+`schema_migrations` records a version it does not know (for example after a
+rollback to an older binary).
+
 The adapter accepts an already-created PostgreSQL client so the deployment
 controls TLS, credentials, connection lifecycle, and pool topology. It sets
 `synchronous_commit = on` for each claim. This flushes the primary's WAL, but
@@ -174,8 +184,17 @@ canonical policy digest. This command computes a digest; it does not establish
 that the policy is approved. Compare the result with the independently
 provisioned production pin.
 
+`praetore-verify receipt --receipt receipt.json --execution-pin key.hex
+--key-id ID --format json` verifies a gateway receipt's signed execution
+attestation (schema v1, v2 or v3). A v3 attestation carries
+`not_dispatched_reason` (`approval_expired`, `dispatch_failed` or
+`crash_recovered`); unknown reasons fail with `RECEIPT_INVALID`, a reason that
+does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
+`evidence`, this is historical verification only (`current_authorization=false`).
+
 The Python package provides Rust-backed integrity and attester signature
-verification only. It does not evaluate policies or establish trust in a
+verification only (`verify_gateway_receipt` covers execution attestations,
+including v3). It does not evaluate policies or establish trust in a
 public key supplied by an untrusted caller.
 
 ## Release artifact integrity

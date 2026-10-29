@@ -510,6 +510,10 @@ struct CommitFaultJournal {
     lose_acknowledgement: AtomicBool,
     fail_verification: AtomicBool,
     fail_terminal: AtomicBool,
+    /// Fails `record_human_approval` before anything is written.
+    fail_approval: AtomicBool,
+    /// Commits `claim_dispatch`, then reports the journal as unavailable.
+    lose_claim_acknowledgement: AtomicBool,
 }
 
 impl AtomicAuthorizationCommit for CommitFaultJournal {
@@ -590,11 +594,21 @@ impl ExecutionJournal for CommitFaultJournal {
         decision: &praetore_gateway::HumanApprovalDecision,
         now: OffsetDateTime,
     ) -> Result<(), JournalError> {
+        if self.fail_approval.swap(false, Ordering::SeqCst) {
+            return Err(JournalError::Unavailable);
+        }
         self.inner.record_human_approval(key, decision, now)
     }
 
     fn claim_dispatch(&self, key: ExecutionKey, now: OffsetDateTime) -> Result<(), JournalError> {
-        self.inner.claim_dispatch(key, now)
+        self.inner.claim_dispatch(key, now)?;
+        if self
+            .lose_claim_acknowledgement
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(JournalError::Unavailable);
+        }
+        Ok(())
     }
 
     fn record_approval_expiration(
@@ -1140,6 +1154,8 @@ fn postgres_lost_commit_ack_is_verified_before_dispatch() {
         lose_acknowledgement: AtomicBool::new(true),
         fail_verification: AtomicBool::new(false),
         fail_terminal: AtomicBool::new(false),
+        fail_approval: AtomicBool::new(false),
+        lose_claim_acknowledgement: AtomicBool::new(false),
     });
     let gateway = Gateway::new(
         create_test_engine(
@@ -1175,6 +1191,8 @@ fn postgres_unverifiable_commit_acknowledgement_blocks_dispatch() {
         lose_acknowledgement: AtomicBool::new(true),
         fail_verification: AtomicBool::new(true),
         fail_terminal: AtomicBool::new(false),
+        fail_approval: AtomicBool::new(false),
+        lose_claim_acknowledgement: AtomicBool::new(false),
     });
     let gateway = Gateway::new(
         create_test_engine(
@@ -1348,6 +1366,8 @@ fn postgres_journal_failure_before_dispatch_prevents_effect() {
         lose_acknowledgement: AtomicBool::new(false),
         fail_verification: AtomicBool::new(false),
         fail_terminal: AtomicBool::new(false),
+        fail_approval: AtomicBool::new(false),
+        lose_claim_acknowledgement: AtomicBool::new(false),
     });
     let adapter = Arc::new(PostgresTestAdapter::new(None));
     let gateway = Gateway::new(
@@ -1477,6 +1497,8 @@ fn postgres_effect_survives_failed_terminal_write_and_is_reconciled_without_retr
         lose_acknowledgement: AtomicBool::new(false),
         fail_verification: AtomicBool::new(false),
         fail_terminal: AtomicBool::new(true),
+        fail_approval: AtomicBool::new(false),
+        lose_claim_acknowledgement: AtomicBool::new(false),
     });
     let adapter = Arc::new(PostgresTestAdapter::new(None));
     let gateway = Gateway::new(
@@ -2807,4 +2829,572 @@ fn postgres_apd_and_migrations_survive_restart() {
         }
         _ => panic!("PRAETORE_TEST_APD_RESTART_PHASE must be before or after"),
     }
+}
+
+/// A throwaway database on the test server, dropped on `Drop`.
+struct ScratchDatabase {
+    name: String,
+}
+
+impl ScratchDatabase {
+    fn create() -> Self {
+        let name = format!("praetore_mig_{}", Uuid::new_v4().simple());
+        connect_client()
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .expect("create scratch database");
+        Self { name }
+    }
+
+    fn connect(&self) -> Client {
+        let url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        let mut config: postgres::Config = url.parse().unwrap();
+        config.dbname(&self.name);
+        config.connect(NoTls).expect("connect to scratch database")
+    }
+}
+
+impl Drop for ScratchDatabase {
+    fn drop(&mut self) {
+        let _ = connect_client().batch_execute(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            self.name
+        ));
+    }
+}
+
+/// Runs migrations the way the pre-runner code did: plain SQL, no record.
+fn apply_legacy_migrations_through(client: &mut Client, last: usize) {
+    for (_, sql) in &praetore_replay_postgres::MIGRATIONS[..last] {
+        client.batch_execute(sql).expect("apply legacy migration");
+    }
+}
+
+fn recorded_versions(client: &mut Client) -> Vec<String> {
+    client
+        .query(
+            "SELECT version FROM praetore.schema_migrations ORDER BY version",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+fn all_versions() -> Vec<String> {
+    praetore_replay_postgres::MIGRATIONS
+        .iter()
+        .map(|(version, _)| (*version).to_owned())
+        .collect()
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_empty_database_applies_everything_once() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    assert_eq!(applied.len(), praetore_replay_postgres::MIGRATIONS.len());
+    assert!(
+        praetore_replay_postgres::apply_migrations(&mut client)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(recorded_versions(&mut client), all_versions());
+    assert_0010_schema_present(&mut client);
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    // 0007 drops and re-adds this FK and 0008 drops and re-creates the
+    // policies on every run, so their OIDs change if 0001-0009 execute again.
+    let oids = |client: &mut Client| -> (u32, Vec<u32>) {
+        let fk: u32 = client
+            .query_one(
+                "SELECT oid FROM pg_constraint WHERE conname = 'execution_journal_replay_claim_fk'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let policies = client
+            .query(
+                "SELECT p.oid FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = 'praetore' ORDER BY c.relname",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        (fk, policies)
+    };
+    let before = oids(&mut client);
+    let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    assert_eq!(applied, vec!["0010_approved_pending_dispatch"]);
+    assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
+    assert_eq!(recorded_versions(&mut client), all_versions());
+    assert_0010_schema_present(&mut client);
+    assert!(
+        praetore_replay_postgres::apply_migrations(&mut client)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_partial_schema_fails_closed() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 5);
+    let error = praetore_replay_postgres::apply_migrations(&mut client).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            praetore_replay_postgres::MigrationError::UnrecognizedSchema(_)
+        ),
+        "{error}"
+    );
+    let control: bool = client
+        .query_one(
+            "SELECT to_regclass('praetore.schema_migrations') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!control, "a refused baseline must not record anything");
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_unknown_version_refuses_to_start() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    client
+        .execute(
+            "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
+            &[&"9999_from_the_future", &"0".repeat(64)],
+        )
+        .unwrap();
+    let error = praetore_replay_postgres::apply_migrations(&mut client).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            praetore_replay_postgres::MigrationError::UnknownVersion(version)
+                if version == "9999_from_the_future"
+        ),
+        "{error}"
+    );
+}
+
+fn fault_journal() -> Arc<CommitFaultJournal> {
+    Arc::new(CommitFaultJournal {
+        inner: connect_journal(),
+        fail_before_commit: AtomicBool::new(false),
+        lose_acknowledgement: AtomicBool::new(false),
+        fail_verification: AtomicBool::new(false),
+        fail_terminal: AtomicBool::new(false),
+        fail_approval: AtomicBool::new(false),
+        lose_claim_acknowledgement: AtomicBool::new(false),
+    })
+}
+
+fn gateway_with_fault_journal(
+    fixture: &PostgresApprovalFixture,
+    journal: Arc<CommitFaultJournal>,
+) -> (Gateway, Arc<PostgresTestAdapter>) {
+    let adapter = Arc::new(PostgresTestAdapter::new(None));
+    let gateway = Gateway::new(
+        fixture.engine.clone(),
+        journal,
+        adapter.clone(),
+        execution_attester(),
+    )
+    .unwrap()
+    .with_human_approval_verifier(
+        HumanApprovalVerifier::new(
+            "postgres-human-approver-v1",
+            VerifiedPublicKey::from_bytes(&fixture.approver_key.verifying_key().to_bytes())
+                .unwrap(),
+        )
+        .unwrap(),
+    );
+    (gateway, adapter)
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_apd_failed_approval_commit_leaves_the_request_pending_and_undispatched() {
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let journal = fault_journal();
+    journal.fail_approval.store(true, Ordering::SeqCst);
+    let (gateway, adapter) = gateway_with_fault_journal(&fixture, journal);
+    let decision = sign_approval(&fixture, key);
+
+    assert!(matches!(
+        gateway.resolve_human_approval(decision.clone()),
+        Err(GatewayError::Journal(JournalError::Unavailable))
+    ));
+    let record = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert!(record.human_approval.is_none());
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(
+            praetore_gateway::ApprovalError::NotPending
+        ))
+    ));
+    assert_eq!(adapter.invocation_count(), 0);
+    assert_eq!(database_invocation_count(key), 0);
+
+    // The fault was transient: the same signed decision now records APD,
+    // still without dispatching.
+    assert!(matches!(
+        gateway.resolve_human_approval(decision).unwrap(),
+        HumanApprovalResult::ApprovedPendingDispatch { .. }
+    ));
+    assert_eq!(adapter.invocation_count(), 0);
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_apd_lost_claim_acknowledgement_never_invokes_the_adapter() {
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let key = approved_pending(&fixture);
+    let journal = fault_journal();
+    journal
+        .lose_claim_acknowledgement
+        .store(true, Ordering::SeqCst);
+    let (gateway, adapter) = gateway_with_fault_journal(&fixture, journal);
+
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Journal(JournalError::Unavailable))
+    ));
+    // The claim committed but the gateway never saw it, so no permit existed
+    // and the adapter never ran.
+    assert_eq!(adapter.invocation_count(), 0);
+    assert_eq!(fixture.adapter.invocation_count(), 0);
+    assert_eq!(database_invocation_count(key), 0);
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::Dispatched
+    );
+    // Durable `dispatched` cannot be claimed again. Reconcile asks the
+    // adapter, which proves the effect absent (`Failed`, never re-run); an
+    // adapter that cannot tell yields outcome_unknown.
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(
+            praetore_gateway::ApprovalError::NotPending
+        ))
+    ));
+    let receipt = gateway.reconcile(key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(adapter.invocation_count(), 0);
+    assert_eq!(database_invocation_count(key), 0);
+}
+
+const COPIED_TABLES: [&str; 5] = [
+    "replay_claims",
+    "execution_journal",
+    "execution_attestations",
+    "human_approvals",
+    "human_approval_expirations",
+];
+
+/// Copies every row of `key` from the shared test database into `scratch`
+/// verbatim, bypassing triggers and foreign keys (`replica`).
+fn copy_execution_rows(scratch: &mut Client, key: ExecutionKey) {
+    let mut source = connect_client();
+    scratch
+        .batch_execute("SET session_replication_role = replica")
+        .unwrap();
+    for table in COPIED_TABLES {
+        let rows = source
+            .query(
+                &format!(
+                    "SELECT row_to_json(t)::text FROM praetore.{table} t \
+                     WHERE agent_id = $1 AND request_id = $2"
+                ),
+                &[&key.agent_id, &key.request_id],
+            )
+            .unwrap();
+        for row in rows {
+            let json: String = row.get(0);
+            scratch
+                .execute(
+                    &format!(
+                        "INSERT INTO praetore.{table} \
+                         SELECT * FROM json_populate_record(NULL::praetore.{table}, $1::text::json)"
+                    ),
+                    &[&json],
+                )
+                .unwrap();
+        }
+    }
+}
+
+fn scratch_journal(scratch: &ScratchDatabase) -> PostgresExecutionJournal {
+    let url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+    let name = scratch.name.clone();
+    PostgresExecutionJournal::from_connection_factory(move || {
+        let mut config: postgres::Config = url.parse()?;
+        config.dbname(&name);
+        config.connect(NoTls)
+    })
+    .unwrap()
+}
+
+/// `parse_record` must reject APD rows the SQL constraints would never
+/// allow. The rows are forged in a scratch copy with those constraints and
+/// triggers removed, so only the Rust check stands between them and use.
+#[test]
+#[ignore = "requires a PostgreSQL superuser; run in assurance CI"]
+fn postgres_apd_parse_record_rejects_forged_apd_rows() {
+    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
+        OffsetDateTime::now_utc() + Duration::seconds(1),
+    )));
+    let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let approved = approved_pending(&fixture);
+
+    // A second request that is signed-for but expires while pending, so it
+    // carries a genuine ApprovalExpiredReceipt.
+    let other = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let pending = fixture.gateway.execute(other.request.clone()).unwrap();
+    let expired = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = sign_approval(&fixture, expired);
+    *clock.0.lock().unwrap() += Duration::seconds(25);
+    assert!(matches!(
+        fixture.gateway.resolve_human_approval(decision.clone()),
+        Err(GatewayError::Approval(
+            praetore_gateway::ApprovalError::Expired
+        ))
+    ));
+    assert!(
+        connect_journal()
+            .get(expired)
+            .unwrap()
+            .unwrap()
+            .approval_expiration
+            .is_some()
+    );
+
+    let scratch_db = ScratchDatabase::create();
+    let mut scratch = scratch_db.connect();
+    praetore_replay_postgres::apply_migrations(&mut scratch).unwrap();
+    copy_execution_rows(&mut scratch, approved);
+    copy_execution_rows(&mut scratch, expired);
+    let journal = scratch_journal(&scratch_db);
+    // Controls: the faithful copies parse.
+    assert_eq!(
+        journal.get(approved).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+    assert!(
+        journal
+            .get(expired)
+            .unwrap()
+            .unwrap()
+            .approval_expiration
+            .is_some()
+    );
+
+    scratch
+        .batch_execute(
+            "ALTER TABLE praetore.execution_journal \
+                 DROP CONSTRAINT execution_journal_authorization_execution_v2",
+        )
+        .unwrap();
+    let where_key = "WHERE agent_id = $1 AND request_id = $2";
+
+    // APD with an `allowed` authorization.
+    scratch
+        .execute(
+            &format!(
+                "UPDATE praetore.execution_journal SET authorization_status = 'allowed' {where_key}"
+            ),
+            &[&approved.agent_id, &approved.request_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.get(approved),
+        Err(JournalError::InvalidRecord)
+    ));
+
+    // APD with an approve decision *and* an expiration receipt.
+    scratch
+        .execute(
+            &format!(
+                "INSERT INTO praetore.human_approvals (approval_id, tenant_id, agent_id, request_id, \
+                     evidence_id, evidence_hash, action_digest, policy_digest, outcome, \
+                     approver_key_id, expires_at, decision_json) \
+                 SELECT $3, tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+                     action_digest, policy_digest, 'approve', $4, expires_at, $5::text::jsonb \
+                 FROM praetore.human_approval_expirations {where_key}"
+            ),
+            &[
+                &expired.agent_id,
+                &expired.request_id,
+                &decision.approval_id,
+                &decision.approver_key_id,
+                &serde_json::to_string(&decision).unwrap(),
+            ],
+        )
+        .unwrap();
+    scratch
+        .execute(
+            &format!(
+                "UPDATE praetore.execution_journal \
+                 SET execution_status = 'approved_pending_dispatch' {where_key}"
+            ),
+            &[&expired.agent_id, &expired.request_id],
+        )
+        .unwrap();
+    assert!(matches!(
+        journal.get(expired),
+        Err(JournalError::InvalidRecord)
+    ));
+}
+
+const CRASH_CHILD_ENV: &str = "PRAETORE_APD_CRASH_CHILD";
+const CRASH_RECONCILE_ENV: &str = "PRAETORE_APD_CRASH_RECONCILE";
+
+/// Re-runs this test binary to execute exactly one helper test.
+fn helper_process(test: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(env::current_exe().unwrap());
+    command.args([
+        "--ignored",
+        "--exact",
+        test,
+        "--nocapture",
+        "--test-threads=1",
+    ]);
+    command
+}
+
+/// Child half of the real-crash test: approves, reports the key, then hangs
+/// forever before claiming so the parent can SIGKILL it. A no-op unless the
+/// parent sets `PRAETORE_APD_CRASH_CHILD`.
+#[test]
+#[ignore = "helper process for postgres_apd_sigkill_between_approve_and_claim"]
+fn crash_helper_approve_then_hang() {
+    let Ok(request_id) = env::var(CRASH_CHILD_ENV) else {
+        return;
+    };
+    let fixture = create_postgres_approval_gateway(request_id.parse().unwrap());
+    let key = approved_pending(&fixture);
+    println!("APD_READY {} {}", key.agent_id, key.request_id);
+    loop {
+        thread::park();
+    }
+}
+
+/// Second process of the real-crash test: reconciles the orphaned APD row.
+#[test]
+#[ignore = "helper process for postgres_apd_sigkill_between_approve_and_claim"]
+fn crash_helper_reconcile() {
+    let Ok(value) = env::var(CRASH_RECONCILE_ENV) else {
+        return;
+    };
+    let (agent_id, request_id) = value.split_once(' ').unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: agent_id.parse().unwrap(),
+        request_id: request_id.parse().unwrap(),
+    };
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let (gateway, adapter) = second_gateway(&fixture);
+    let receipt = gateway.reconcile(key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        receipt.execution_attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::CrashRecovered)
+    );
+    assert_eq!(adapter.invocation_count(), 0);
+    println!("RECONCILED not_dispatched crash_recovered");
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_apd_sigkill_between_approve_and_claim() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    initialize_test_database();
+    let mut child = helper_process("crash_helper_approve_then_hang")
+        .env(CRASH_CHILD_ENV, Uuid::new_v4().to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = None;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let line = line.unwrap();
+        // libtest prints "test <name> ... " on the same line first.
+        if let Some((_, rest)) = line.split_once("APD_READY ") {
+            ready = Some(rest.trim().to_owned());
+            break;
+        }
+    }
+    let ready = ready.expect("child must report APD before it is killed");
+    let (agent_id, request_id) = ready.split_once(' ').unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: agent_id.parse().unwrap(),
+        request_id: request_id.parse().unwrap(),
+    };
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+    child.kill().unwrap(); // SIGKILL on Unix
+    let status = child.wait().unwrap();
+    assert_eq!(status.signal(), Some(9), "child must die by SIGKILL");
+
+    let output = helper_process("crash_helper_reconcile")
+        .env(CRASH_RECONCILE_ENV, ready.clone())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("RECONCILED not_dispatched crash_recovered"),
+        "reconcile process failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        database_not_dispatched_reason(key).as_deref(),
+        Some("crash_recovered")
+    );
+    // The effect never happened in any process.
+    assert_eq!(database_invocation_count(key), 0);
+    assert_eq!(database_effect_count(key), 0);
+    assert!(
+        !database_transitions(key)
+            .iter()
+            .any(|(_, to)| to == "dispatched")
+    );
 }
