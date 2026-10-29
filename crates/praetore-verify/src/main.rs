@@ -59,6 +59,11 @@ enum Command {
     PolicyDigest {
         policy: PathBuf,
     },
+    Receipt {
+        receipt: PathBuf,
+        execution_pin: PathBuf,
+        key_id: String,
+    },
     Authority {
         authority: PathBuf,
         agent: Option<PathBuf>,
@@ -71,7 +76,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -197,6 +202,23 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 require_intent: values.contains_key("--require-intent"),
             }
         }
+        "receipt" => {
+            if values
+                .keys()
+                .any(|key| !matches!(key.as_str(), "--receipt" | "--execution-pin" | "--key-id"))
+            {
+                return Err(CliError::usage());
+            }
+            Command::Receipt {
+                receipt: path("--receipt")?,
+                execution_pin: path("--execution-pin")?,
+                key_id: values
+                    .get("--key-id")
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .ok_or_else(CliError::usage)?,
+            }
+        }
         "policy-digest" => {
             if values.keys().any(|key| key != "--policy") {
                 return Err(CliError::usage());
@@ -272,6 +294,48 @@ fn execute(command: Command) -> Result<Summary, CliError> {
                 serde_json::Value::String(evidence.evidence_id.to_string()),
             );
             "evidence"
+        }
+        Command::Receipt {
+            receipt,
+            execution_pin,
+            key_id,
+        } => {
+            let public_key = read_attester_pin(&execution_pin)?;
+            let receipt = praetore_gateway::verify_gateway_receipt_json(
+                &read_limited(&receipt)?,
+                &public_key,
+                &key_id,
+            )
+            .map_err(|error| CliError {
+                code: match error {
+                    praetore_gateway::ExecutionAttestationError::InvalidPayload => {
+                        "RECEIPT_INVALID"
+                    }
+                    _ => "RECEIPT_SIGNATURE_INVALID",
+                },
+            })?;
+            let attestation = &receipt.execution_attestation;
+            details.insert(
+                "schema_version".into(),
+                serde_json::Value::Number(attestation.schema_version.into()),
+            );
+            details.insert(
+                "execution".into(),
+                serde_json::to_value(receipt.execution).unwrap_or_default(),
+            );
+            details.insert(
+                "not_dispatched_reason".into(),
+                serde_json::to_value(attestation.not_dispatched_reason).unwrap_or_default(),
+            );
+            details.insert(
+                "verification_scope".into(),
+                serde_json::Value::String("historical_execution_attestation".into()),
+            );
+            details.insert(
+                "current_authorization".into(),
+                serde_json::Value::Bool(false),
+            );
+            "receipt"
         }
         Command::PolicyDigest { policy } => {
             let policy = Policy::from_json(&read_limited(&policy)?).map_err(CliError::from_core)?;
@@ -428,6 +492,7 @@ fn command_name(args: &[String]) -> &'static str {
         Some("evidence") => "evidence",
         Some("policy-digest") => "policy-digest",
         Some("authority") => "authority",
+        Some("receipt") => "receipt",
         _ => "unknown",
     }
 }

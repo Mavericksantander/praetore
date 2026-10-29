@@ -41,6 +41,72 @@
 //!     action.parameters["value"] = serde_json::json!("changed");
 //! }
 //! ```
+//!
+//! Dispatching an approved action requires a [`DispatchPermit`], which only
+//! [`Gateway::claim_dispatch`] can produce by consuming an
+//! [`ApprovedPendingDispatch`]. Neither type is `Clone`, and neither can be
+//! built outside this crate.
+//!
+//! ```
+//! use praetore_gateway::{ApprovedPendingDispatch, Gateway, GatewayError, GatewayReceipt};
+//!
+//! fn approved_dispatch(
+//!     gateway: &Gateway,
+//!     pending: ApprovedPendingDispatch,
+//! ) -> Result<GatewayReceipt, GatewayError> {
+//!     let permit = gateway.claim_dispatch(pending)?;
+//!     gateway.dispatch(permit)
+//! }
+//! ```
+//!
+//! Dispatching without a permit does not compile:
+//!
+//! ```compile_fail
+//! use praetore_gateway::{ApprovedPendingDispatch, Gateway};
+//!
+//! fn dispatch_without_claim(gateway: &Gateway, pending: ApprovedPendingDispatch) {
+//!     let _ = gateway.dispatch(pending);
+//! }
+//! ```
+//!
+//! A permit cannot be forged outside the crate:
+//!
+//! ```compile_fail
+//! use praetore_gateway::{DispatchPermit, Gateway};
+//!
+//! fn forged_permit(gateway: &Gateway) {
+//!     let _ = gateway.dispatch(DispatchPermit {});
+//! }
+//! ```
+//!
+//! A permit is consumed by its single dispatch:
+//!
+//! ```compile_fail
+//! use praetore_gateway::{DispatchPermit, Gateway};
+//!
+//! fn dispatch_twice(gateway: &Gateway, permit: DispatchPermit) {
+//!     let _ = gateway.dispatch(permit);
+//!     let _ = gateway.dispatch(permit);
+//! }
+//! ```
+//!
+//! Neither typestate can be cloned:
+//!
+//! ```compile_fail
+//! use praetore_gateway::DispatchPermit;
+//!
+//! fn clone_permit(permit: DispatchPermit) -> (DispatchPermit, DispatchPermit) {
+//!     (permit.clone(), permit)
+//! }
+//! ```
+//!
+//! ```compile_fail
+//! use praetore_gateway::ApprovedPendingDispatch;
+//!
+//! fn clone_pending(pending: ApprovedPendingDispatch) -> (ApprovedPendingDispatch, ApprovedPendingDispatch) {
+//!     (pending.clone(), pending)
+//! }
+//! ```
 
 use praetore_core::{
     Action, AtomicAuthorizationCommit, AtomicEvaluationError, Authority, AuthorizationCommitError,
@@ -103,16 +169,34 @@ pub enum AuthorizationStatus {
 
 /// Final gateway-side state. `Dispatched` means the gateway durably committed
 /// to invoking the adapter; it does not prove a remote system received a call.
+///
+/// `ApprovedPendingDispatch` exists only for `RequiresApproval`: a human
+/// approved, and no dispatch has been claimed yet. Like `Authorized`, it is
+/// intermediate and never appears in a [`GatewayReceipt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStatus {
     NotDispatched,
     Authorized,
+    ApprovedPendingDispatch,
     Dispatched,
     Executed,
     Confirmed,
     OutcomeUnknown,
     Failed,
+}
+
+/// Why an approved execution was closed as `NotDispatched` without ever
+/// reaching the adapter. Signed into the closing [`ExecutionAttestation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotDispatchedReason {
+    /// The approval window closed before dispatch was claimed.
+    ApprovalExpired,
+    /// Revalidation before the claim failed for a reason other than expiry.
+    DispatchFailed,
+    /// Reconciliation found the approval unclaimed after a restart.
+    CrashRecovered,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +604,10 @@ pub struct ExecutionAttestation {
     pub action_digest: String,
     pub output_digest: Option<String>,
     pub observed_at: String,
+    /// Present only on schema version 3: the closing attestation of an
+    /// approved execution that was never dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_dispatched_reason: Option<NotDispatchedReason>,
     pub signature: String,
 }
 
@@ -539,6 +627,8 @@ struct ExecutionAttestationPayload<'a> {
     action_digest: &'a str,
     output_digest: Option<&'a str>,
     observed_at: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_dispatched_reason: Option<NotDispatchedReason>,
 }
 
 impl ExecutionAttestation {
@@ -547,12 +637,31 @@ impl ExecutionAttestation {
         authorization: AuthorizationStatus,
         execution: ExecutionStatus,
         output: Option<&Value>,
+        not_dispatched_reason: Option<NotDispatchedReason>,
         signer: &dyn ExecutionAttestationSigner,
     ) -> Result<Self, ExecutionAttestationError> {
         let key_id = signer.key_id();
         if key_id.is_empty() || key_id.len() > 256 || key_id.trim() != key_id {
             return Err(ExecutionAttestationError::InvalidKeyId);
         }
+        // Intermediate states are never attested, and a reason is only
+        // meaningful when closing an approved execution without dispatch.
+        if matches!(
+            execution,
+            ExecutionStatus::Authorized
+                | ExecutionStatus::ApprovedPendingDispatch
+                | ExecutionStatus::Dispatched
+        ) || not_dispatched_reason.is_some()
+            && (execution != ExecutionStatus::NotDispatched
+                || authorization != AuthorizationStatus::RequiresApproval)
+        {
+            return Err(ExecutionAttestationError::InvalidPayload);
+        }
+        let schema_version = if not_dispatched_reason.is_some() {
+            3
+        } else {
+            2
+        };
         if !evidence.verify_integrity()
             || !evidence.is_high_assurance_shape()
             || evidence.evaluation_mode.as_deref() != Some("high_assurance")
@@ -573,7 +682,7 @@ impl ExecutionAttestation {
             .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
         let output_digest = output.map(output_digest).transpose()?;
         let payload = ExecutionAttestationPayload {
-            schema_version: 2,
+            schema_version,
             tenant_id: Some(tenant_id),
             key_id,
             evidence_id: evidence.evidence_id,
@@ -586,6 +695,7 @@ impl ExecutionAttestation {
             action_digest: &action_digest,
             output_digest: output_digest.as_deref(),
             observed_at: &observed_at,
+            not_dispatched_reason,
         };
         let canonical = attestation_payload_bytes(&payload)?;
         let mut message = Vec::with_capacity(EXECUTION_ATTESTATION_DOMAIN.len() + canonical.len());
@@ -599,7 +709,7 @@ impl ExecutionAttestation {
         }
 
         Ok(Self {
-            schema_version: 2,
+            schema_version,
             tenant_id: Some(tenant_id),
             key_id: key_id.to_owned(),
             evidence_id: evidence.evidence_id,
@@ -612,6 +722,7 @@ impl ExecutionAttestation {
             action_digest,
             output_digest,
             observed_at,
+            not_dispatched_reason,
             signature: hex::encode(signature),
         })
     }
@@ -644,6 +755,7 @@ impl ExecutionAttestation {
             action_digest: &self.action_digest,
             output_digest: self.output_digest.as_deref(),
             observed_at: &self.observed_at,
+            not_dispatched_reason: self.not_dispatched_reason,
         };
         let canonical = attestation_payload_bytes(&payload)?;
         let signature = hex::decode(&self.signature)
@@ -661,10 +773,17 @@ impl ExecutionAttestation {
         output: Option<&Value>,
     ) -> Result<(), ExecutionAttestationError> {
         if !matches!(
-            (self.schema_version, self.tenant_id),
-            (1, None) | (2, Some(_))
-        ) || self.schema_version == 2
+            (
+                self.schema_version,
+                self.tenant_id,
+                self.not_dispatched_reason
+            ),
+            (1, None, None) | (2, Some(_), None) | (3, Some(_), Some(_))
+        ) || self.schema_version >= 2
             && self.tenant_id != authority_tenant_id(&evidence.authority)
+            || self.not_dispatched_reason.is_some()
+                && (authorization != AuthorizationStatus::RequiresApproval
+                    || execution != ExecutionStatus::NotDispatched)
             || self.evidence_id != evidence.evidence_id
             || self.request_id != evidence.request_id
             || self.agent_id != *evidence.agent.id.as_uuid()
@@ -687,7 +806,9 @@ impl ExecutionAttestation {
                 )
             || matches!(
                 execution,
-                ExecutionStatus::Authorized | ExecutionStatus::Dispatched
+                ExecutionStatus::Authorized
+                    | ExecutionStatus::ApprovedPendingDispatch
+                    | ExecutionStatus::Dispatched
             )
             || output.is_some()
                 != matches!(
@@ -771,6 +892,26 @@ impl GatewayReceipt {
     }
 }
 
+/// Parses a serialized [`GatewayReceipt`] and verifies its execution
+/// attestation (schema v1, v2 or v3) against a pinned key.
+///
+/// Duplicate JSON keys, unknown fields and unknown `not_dispatched_reason`
+/// values are rejected, as is a reason on anything but an approval closed
+/// without dispatch. This proves historical integrity only; it never
+/// authorizes an action.
+pub fn verify_gateway_receipt_json(
+    json: &str,
+    public_key: &praetore_core::VerifiedPublicKey,
+    expected_key_id: &str,
+) -> Result<GatewayReceipt, ExecutionAttestationError> {
+    let value = praetore_core::canonical::parse_json_rejecting_duplicates(json)
+        .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    let receipt: GatewayReceipt =
+        serde_json::from_value(value).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    receipt.verify_execution_attestation(public_key, expected_key_id)?;
+    Ok(receipt)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum JournalError {
     #[error("execution key has already been recorded")]
@@ -787,6 +928,8 @@ pub enum JournalError {
     InvalidRecord,
     #[error("human approval decision has already been recorded")]
     ApprovalAlreadyRecorded,
+    #[error("approval window closed before dispatch was claimed")]
+    ApprovalExpired,
 }
 
 #[derive(Debug, Clone)]
@@ -840,19 +983,35 @@ pub trait ExecutionJournal: AtomicAuthorizationCommit + Send + Sync {
 
     fn get(&self, key: ExecutionKey) -> Result<Option<ExecutionRecord>, JournalError>;
 
+    /// Closes without dispatch: `Authorized` (allowed path) or
+    /// `ApprovedPendingDispatch` (approval path, which requires an
+    /// attestation carrying a [`NotDispatchedReason`]). Never dispatches.
     fn mark_not_dispatched_attested(
         &self,
         key: ExecutionKey,
         attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError>;
 
-    /// Must fail with `ApprovalAlreadyRecorded` when an approval expiration
-    /// is already stored for the key.
+    /// Stores the decision. `Approve` moves `NotDispatched` to
+    /// `ApprovedPendingDispatch` in the same transaction and never to
+    /// `Dispatched`. `now` is the engine's trusted clock; the decision is
+    /// rejected when `expires_at <= now`. Must fail with
+    /// `ApprovalAlreadyRecorded` when an approval expiration is already
+    /// stored for the key.
     fn record_human_approval(
         &self,
         key: ExecutionKey,
         decision: &HumanApprovalDecision,
+        now: OffsetDateTime,
     ) -> Result<(), JournalError>;
+
+    /// The only transition to `Dispatched` for `RequiresApproval`: an atomic
+    /// compare-and-set from `ApprovedPendingDispatch`, holding the row lock
+    /// while the stored approval is revalidated against `now` (the engine's
+    /// trusted clock). Fails with `ApprovalExpired` when the approval's
+    /// `expires_at <= now`, and with `InvalidTransition` unless exactly one
+    /// row changed. Of concurrent claims at most one succeeds.
+    fn claim_dispatch(&self, key: ExecutionKey, now: OffsetDateTime) -> Result<(), JournalError>;
 
     /// SAF-10: persists the single expiration receipt for a pending approval
     /// (append-only). Idempotent: an existing receipt for the key is kept and
@@ -928,11 +1087,50 @@ pub enum GatewayError {
     Approval(#[from] ApprovalError),
 }
 
+/// Result of a signed human decision. An approval only records intent: the
+/// execution is `approved_pending_dispatch` and nothing has run yet. A
+/// rejection is final and carries its signed `not_dispatched` receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HumanApprovalReceipt {
-    pub decision: HumanApprovalDecision,
-    pub receipt: GatewayReceipt,
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HumanApprovalResult {
+    ApprovedPendingDispatch {
+        decision: HumanApprovalDecision,
+    },
+    Rejected {
+        decision: HumanApprovalDecision,
+        receipt: Box<GatewayReceipt>,
+    },
+}
+
+/// An approved execution whose dispatch has not been claimed. Only
+/// [`Gateway::pending_dispatch`] creates it; [`Gateway::claim_dispatch`]
+/// consumes it. Not `Clone`.
+#[derive(Debug)]
+pub struct ApprovedPendingDispatch {
+    record: ExecutionRecord,
+}
+
+impl ApprovedPendingDispatch {
+    pub fn key(&self) -> ExecutionKey {
+        self.record.key
+    }
+}
+
+/// The single right to invoke the adapter for one execution key, obtained
+/// after the journal durably moved it to `Dispatched`. Only the gateway
+/// creates it; [`Gateway::dispatch`] consumes it. Not `Clone`.
+#[derive(Debug)]
+pub struct DispatchPermit {
+    key: ExecutionKey,
+    evidence: Evidence,
+    authorization: AuthorizationStatus,
+    action_digest: String,
+}
+
+impl DispatchPermit {
+    pub fn key(&self) -> ExecutionKey {
+        self.key
+    }
 }
 
 /// A synchronous gateway that binds a current authorization result to one
@@ -982,8 +1180,36 @@ impl Gateway {
             authorization,
             execution,
             output,
+            None,
             self.execution_attester.as_ref(),
         )?)
+    }
+
+    /// Closes `ApprovedPendingDispatch` as `NotDispatched` with a signed
+    /// reason. Never invokes the adapter.
+    fn close_not_dispatched(
+        &self,
+        mut record: ExecutionRecord,
+        reason: NotDispatchedReason,
+    ) -> Result<GatewayReceipt, GatewayError> {
+        let attestation = ExecutionAttestation::create(
+            &record.evidence,
+            record.authorization,
+            ExecutionStatus::NotDispatched,
+            None,
+            Some(reason),
+            self.execution_attester.as_ref(),
+        )?;
+        self.journal
+            .mark_not_dispatched_attested(record.key, &attestation)?;
+        record.execution = ExecutionStatus::NotDispatched;
+        Ok(Self::receipt(
+            record.evidence,
+            record.authorization,
+            record.execution,
+            None,
+            attestation,
+        ))
     }
 
     fn receipt(
@@ -1074,13 +1300,14 @@ impl Gateway {
         }
     }
 
-    /// Validates and consumes a signed human decision exactly once. Approval
-    /// and the transition to `Dispatched` are committed atomically before the
-    /// exact persisted evidence action is passed to the dispatcher.
+    /// Validates and consumes a signed human decision exactly once. It never
+    /// dispatches: an approval moves the execution to
+    /// `ApprovedPendingDispatch`, and only [`Gateway::claim_dispatch`] can
+    /// move it to `Dispatched`.
     pub fn resolve_human_approval(
         &self,
         decision: HumanApprovalDecision,
-    ) -> Result<HumanApprovalReceipt, GatewayError> {
+    ) -> Result<HumanApprovalResult, GatewayError> {
         let verifier = self
             .approval_verifier
             .as_ref()
@@ -1118,46 +1345,136 @@ impl Gateway {
                 .map_err(GatewayError::Authorization)?;
         }
         self.check_pending_approval_window(&record)?;
-        self.journal.record_human_approval(key, &decision)?;
+        let now = self
+            .engine
+            .trusted_now()
+            .map_err(GatewayError::Authorization)?;
+        self.journal.record_human_approval(key, &decision, now)?;
         record.human_approval = Some(decision.clone());
 
-        if decision.outcome == HumanApprovalOutcome::Reject {
-            let receipt = self.attest_record(&mut record)?;
-            return Ok(HumanApprovalReceipt { decision, receipt });
+        match decision.outcome {
+            HumanApprovalOutcome::Approve => {
+                Ok(HumanApprovalResult::ApprovedPendingDispatch { decision })
+            }
+            HumanApprovalOutcome::Reject => {
+                let receipt = self.attest_record(&mut record)?;
+                Ok(HumanApprovalResult::Rejected {
+                    decision,
+                    receipt: Box::new(receipt),
+                })
+            }
         }
+    }
 
-        record.execution = ExecutionStatus::Dispatched;
-        if let Err(error) = self.engine.validate_evidence_for_dispatch(&record.evidence) {
-            self.record_terminal_attested(&mut record, ExecutionStatus::Failed, None)?;
-            return Err(GatewayError::Authorization(error));
+    /// Loads an approved execution that has not been claimed yet. Fails with
+    /// `ApprovalError::NotPending` for any other state.
+    pub fn pending_dispatch(
+        &self,
+        key: ExecutionKey,
+    ) -> Result<ApprovedPendingDispatch, GatewayError> {
+        let record = self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?;
+        let approved = record
+            .human_approval
+            .as_ref()
+            .is_some_and(|decision| decision.outcome == HumanApprovalOutcome::Approve);
+        if record.authorization != AuthorizationStatus::RequiresApproval
+            || record.execution != ExecutionStatus::ApprovedPendingDispatch
+            || !approved
+            || record.approval_expiration.is_some()
+        {
+            return Err(ApprovalError::NotPending.into());
         }
+        Ok(ApprovedPendingDispatch { record })
+    }
+
+    /// Revalidates the evidence with the engine clock and claims the single
+    /// dispatch in the journal. On an expired window or a failed
+    /// revalidation the execution is closed as `NotDispatched` with a signed
+    /// reason, and the error is returned. Never retries.
+    pub fn claim_dispatch(
+        &self,
+        pending: ApprovedPendingDispatch,
+    ) -> Result<DispatchPermit, GatewayError> {
+        let record = pending.record;
+        if let Err(error) = self.engine.validate_evidence_for_dispatch(&record.evidence) {
+            let reason = match error {
+                PraetoreError::IntentInvalid
+                | PraetoreError::FreshnessCheckFailed(FreshnessError::Expired) => {
+                    NotDispatchedReason::ApprovalExpired
+                }
+                _ => NotDispatchedReason::DispatchFailed,
+            };
+            self.close_not_dispatched(record, reason)?;
+            return Err(match reason {
+                NotDispatchedReason::ApprovalExpired => ApprovalError::Expired.into(),
+                _ => GatewayError::Authorization(error),
+            });
+        }
+        let now = self
+            .engine
+            .trusted_now()
+            .map_err(GatewayError::Authorization)?;
+        match self.journal.claim_dispatch(record.key, now) {
+            Ok(()) => Ok(DispatchPermit {
+                key: record.key,
+                evidence: record.evidence,
+                authorization: record.authorization,
+                action_digest: record.action_digest,
+            }),
+            Err(JournalError::ApprovalExpired) => {
+                self.close_not_dispatched(record, NotDispatchedReason::ApprovalExpired)?;
+                Err(ApprovalError::Expired.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Invokes the adapter once for a claimed execution and records the
+    /// attested outcome. Adapter errors become `OutcomeUnknown`; never
+    /// retries.
+    pub fn dispatch(&self, permit: DispatchPermit) -> Result<GatewayReceipt, GatewayError> {
+        let DispatchPermit {
+            key,
+            evidence,
+            authorization,
+            action_digest,
+        } = permit;
         let (execution, output) = match self.dispatcher.dispatch(
             key,
-            &record.evidence.authority,
-            &record.evidence.action,
-            &record.action_digest,
+            &evidence.authority,
+            &evidence.action,
+            &action_digest,
         ) {
             Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
             Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
             Err(_) => (ExecutionStatus::OutcomeUnknown, None),
         };
         let execution_attestation = self.create_execution_attestation(
-            &record.evidence,
-            record.authorization,
+            &evidence,
+            authorization,
             execution,
             output.as_ref(),
         )?;
         self.journal
             .record_terminal_attested(key, execution, output.as_ref(), &execution_attestation)
             .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
-        let receipt = Self::receipt(
-            record.evidence,
-            record.authorization,
+        Ok(Self::receipt(
+            evidence,
+            authorization,
             execution,
             output,
             execution_attestation,
-        );
-        Ok(HumanApprovalReceipt { decision, receipt })
+        ))
+    }
+
+    /// `pending_dispatch`, `claim_dispatch` and `dispatch` in sequence.
+    pub fn dispatch_approved(&self, key: ExecutionKey) -> Result<GatewayReceipt, GatewayError> {
+        let pending = self.pending_dispatch(key)?;
+        let permit = self.claim_dispatch(pending)?;
+        self.dispatch(permit)
     }
 
     /// Fails with `ApprovalError::Expired` once the window is closed. The
@@ -1349,34 +1666,12 @@ impl Gateway {
             return Err(GatewayError::Authorization(error));
         }
         let action_digest = action_digest(&evidence.action)?;
-        let (execution, output) = match self.dispatcher.dispatch(
+        self.dispatch(DispatchPermit {
             key,
-            &evidence.authority,
-            &evidence.action,
-            &action_digest,
-        ) {
-            Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
-            Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
-            Err(_) => (ExecutionStatus::OutcomeUnknown, None),
-        };
-
-        let execution_attestation = self.create_execution_attestation(
-            &evidence,
-            authorization,
-            execution,
-            output.as_ref(),
-        )?;
-        self.journal
-            .record_terminal_attested(key, execution, output.as_ref(), &execution_attestation)
-            .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
-
-        Ok(Self::receipt(
             evidence,
             authorization,
-            execution,
-            output,
-            execution_attestation,
-        ))
+            action_digest,
+        })
     }
 
     /// Resolves persisted execution state without dispatching an action.
@@ -1412,6 +1707,11 @@ impl Gateway {
                     None,
                     execution_attestation,
                 ));
+            }
+            ExecutionStatus::ApprovedPendingDispatch => {
+                // Approved but never claimed: provably not dispatched. Closed
+                // without retrying; a new request is required to run it.
+                return self.close_not_dispatched(record, NotDispatchedReason::CrashRecovered);
             }
             ExecutionStatus::Dispatched | ExecutionStatus::OutcomeUnknown => {
                 match self.dispatcher.reconcile(

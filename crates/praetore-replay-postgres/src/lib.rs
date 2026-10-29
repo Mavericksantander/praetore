@@ -4,9 +4,11 @@ use std::sync::Mutex;
 use uuid::Uuid;
 
 mod execution;
+mod migrations;
 mod observability;
 
 pub use execution::PostgresExecutionJournal;
+pub use migrations::{MIGRATIONS, MigrationError, apply_migrations};
 pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,

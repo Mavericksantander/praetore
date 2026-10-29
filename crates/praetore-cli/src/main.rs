@@ -48,18 +48,6 @@ const REQUIRED_DATABASE_TABLES: [&str; 6] = [
     "praetore.human_approval_expirations",
 ];
 
-const MIGRATIONS: [&str; 9] = [
-    include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0004_execution_journal_events.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0005_execution_attestations.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0008_tenant_row_level_security.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0009_human_approval_expirations.sql"),
-];
-
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LocalConfig {
@@ -227,6 +215,17 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 outcome,
             )
         }
+        "dispatch" => {
+            let directory = required_argument(&mut args, "directory")?;
+            let execution_id = required_argument(&mut args, "execution_id")?;
+            let agent = match args.next().as_deref() {
+                None => None,
+                Some("--agent") => Some(required_argument(&mut args, "--agent")?),
+                Some(flag) => return Err(format!("unexpected argument: {flag}").into()),
+            };
+            ensure_no_arguments(args)?;
+            dispatch_approved(Path::new(&directory), &execution_id, agent.as_deref())
+        }
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -266,6 +265,7 @@ fn print_usage() {
            praetore demo <directory> set <key> <value>\n\
            praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>]\n\
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>]\n\
+           praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
@@ -652,9 +652,7 @@ fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::err
 
 fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect_local_database(database_url)?;
-    for migration in MIGRATIONS {
-        client.batch_execute(migration)?;
-    }
+    praetore_replay_postgres::apply_migrations(&mut client)?;
     Ok(())
 }
 
@@ -945,20 +943,7 @@ fn resolve_approval(
         return Err("approver.key does not match the approver pin".into());
     }
     let config = load_config(directory)?;
-    // The endpoint is addressed by tenant/agent/request. The tenant comes from
-    // config.json; the agent is either given explicitly or looked up.
-    let agent_id = match agent_id {
-        Some(agent) => Uuid::parse_str(agent)
-            .ok()
-            .filter(|id| !id.is_nil())
-            .ok_or("--agent must be the evidence.agent.id UUID from the demo receipt")?,
-        None => {
-            let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL").map_err(|_| {
-                "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL (or pass --agent)"
-            })?;
-            find_pending_agent(&database_url, config.tenant_id, request_id)?
-        }
-    };
+    let agent_id = resolve_agent_id(&config, request_id, agent_id)?;
 
     let url = format!(
         "http://127.0.0.1:{}/v1/approvals/{}/{}/{}",
@@ -989,6 +974,70 @@ fn resolve_approval(
                 "could not confirm the gateway response ({error}); the decision may have been recorded and the CLI did not retry. Inspect praetore.human_approvals before taking further action"
             )
         })?;
+    let status = response.status();
+    let body = response.text()?;
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    match &value {
+        Some(value) => println!("{}", serde_json::to_string_pretty(value)?),
+        None => println!("{body}"),
+    }
+    if !status.is_success() {
+        return Err(format!("gateway returned HTTP {status}; review the response above").into());
+    }
+    if value.as_ref().and_then(|value| value["status"].as_str())
+        == Some("approved_pending_dispatch")
+    {
+        println!(
+            "approved_pending_dispatch: the approval is recorded and the action has NOT run. Dispatch it once with:\n  praetore dispatch {} {request_id} --agent {agent_id}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
+/// The endpoint is addressed by tenant/agent/request. The tenant comes from
+/// config.json; the agent is either given explicitly or looked up.
+fn resolve_agent_id(
+    config: &LocalConfig,
+    request_id: Uuid,
+    agent_id: Option<&str>,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    match agent_id {
+        Some(agent) => Ok(Uuid::parse_str(agent)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or("--agent must be the evidence.agent.id UUID from the demo receipt")?),
+        None => {
+            let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL").map_err(|_| {
+                "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL (or pass --agent)"
+            })?;
+            find_pending_agent(&database_url, config.tenant_id, request_id)
+        }
+    }
+}
+
+/// Claims and performs the single dispatch of an approved execution. Never
+/// retried by the CLI: on a lost response, inspect the journal first.
+fn dispatch_approved(
+    directory: &Path,
+    execution_id: &str,
+    agent_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_id = Uuid::parse_str(execution_id)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .ok_or("execution_id must be the request_id UUID from the demo receipt")?;
+    let config = load_config(directory)?;
+    let agent_id = resolve_agent_id(&config, request_id, agent_id)?;
+    let url = format!(
+        "http://127.0.0.1:{}/v1/approvals/{}/{}/{}/dispatch",
+        config.port, config.tenant_id, agent_id, request_id
+    );
+    let response = http_client()?.post(&url).send().map_err(|error| {
+        format!(
+            "could not confirm the gateway response ({error}); the action may have been dispatched and the CLI did not retry. Inspect praetore.execution_journal before taking further action"
+        )
+    })?;
     let status = response.status();
     let body = response.text()?;
     match serde_json::from_str::<serde_json::Value>(&body) {
@@ -1203,6 +1252,7 @@ mod tests {
     fn postgres_approval_dispatches_once_and_rejection_is_final() {
         use praetore_gateway::{
             ApprovalError, ApprovalResolution, ExecutionKey, ExecutionStatus, GatewayError,
+            HumanApprovalResult,
         };
         let database_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
         apply_migrations(&database_url).unwrap();
@@ -1248,12 +1298,22 @@ mod tests {
             ApprovalResolution::Pending
         );
         let resolution = gateway.resolve_human_approval(decision.clone()).unwrap();
-        assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+        assert!(matches!(
+            resolution,
+            HumanApprovalResult::ApprovedPendingDispatch { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(&resolution).unwrap()["status"],
+            "approved_pending_dispatch"
+        );
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),
             ApprovalResolution::Approved
         );
         assert!(gateway.resolve_human_approval(decision).is_err());
+        let receipt = gateway.dispatch_approved(key).unwrap();
+        assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+        assert!(gateway.dispatch_approved(key).is_err());
         assert!(matches!(
             gateway.approval_challenge(key),
             Err(GatewayError::Approval(ApprovalError::NotPending))
@@ -1269,8 +1329,12 @@ mod tests {
             &approver,
         )
         .unwrap();
-        let resolution = gateway.resolve_human_approval(reject).unwrap();
-        assert_eq!(resolution.receipt.execution, ExecutionStatus::NotDispatched);
+        let HumanApprovalResult::Rejected { receipt, .. } =
+            gateway.resolve_human_approval(reject).unwrap()
+        else {
+            panic!("a rejection must return its receipt");
+        };
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),
             ApprovalResolution::Rejected
