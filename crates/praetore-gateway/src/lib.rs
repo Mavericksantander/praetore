@@ -57,6 +57,8 @@ use uuid::Uuid;
 
 pub mod http_api;
 pub mod local_demo;
+#[cfg(unix)]
+pub mod sandbox;
 
 const ACTION_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ACTION_V1\0";
 const EXECUTION_ATTESTATION_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ATTESTATION_V1\0";
@@ -688,7 +690,23 @@ pub trait ActionDispatcher: Send + Sync {
     ) -> ReconciliationReport {
         ReconciliationReport::Unknown
     }
+
+    /// Side-effect-free admission check run by the gateway before an action
+    /// is dispatched or offered for human approval. An adapter that returns
+    /// `Err` guarantees it would not perform the action; the gateway then
+    /// records the execution as `not_dispatched` (never `outcome_unknown`)
+    /// and refuses it explicitly. The default admits every action, which
+    /// preserves the behaviour of existing adapters.
+    fn preflight(&self, _action: &Action) -> Result<(), DispatchRefused> {
+        Ok(())
+    }
 }
+
+/// An explicit, pre-dispatch refusal: the adapter did not and will not
+/// perform the action. The reason is a stable machine-readable code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("dispatcher refused the action before any effect: {0}")]
+pub struct DispatchRefused(pub &'static str);
 
 /// The adapter may report that it performed an operation or that it performed
 /// and independently confirmed it. The strength of `Confirmed` depends on
@@ -724,6 +742,11 @@ pub enum GatewayError {
     ExecutionNotFound(ExecutionKey),
     #[error("human approval failed: {0}")]
     Approval(#[from] ApprovalError),
+    #[error("dispatcher refused {key:?} before any effect: {reason}")]
+    DispatchRefused {
+        key: ExecutionKey,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -800,6 +823,25 @@ impl Gateway {
         }
     }
 
+    fn preflight(&self, key: ExecutionKey, action: &Action) -> Result<(), GatewayError> {
+        self.dispatcher
+            .preflight(action)
+            .map_err(|refusal| GatewayError::DispatchRefused {
+                key,
+                reason: refusal.0,
+            })
+    }
+
+    /// Read-only execution status of one key, for transports that must tell
+    /// whether the gateway itself already performed the effect.
+    pub fn execution_status(&self, key: ExecutionKey) -> Result<ExecutionStatus, GatewayError> {
+        Ok(self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?
+            .execution)
+    }
+
     pub fn approval_challenge(&self, key: ExecutionKey) -> Result<ApprovalChallenge, GatewayError> {
         let record = self
             .journal
@@ -812,6 +854,7 @@ impl Gateway {
             return Err(ApprovalError::NotPending.into());
         }
         self.validate_approval_time_bounds(&record.evidence)?;
+        self.preflight(key, &record.evidence.action)?;
         Ok(ApprovalChallenge::from_evidence(
             &record.evidence,
             &record.action_digest,
@@ -844,7 +887,10 @@ impl Gateway {
                 Err(GatewayError::Journal(JournalError::InvalidRecord))
             }
             None => match self.validate_approval_time_bounds(&record.evidence) {
-                Ok(()) => Ok(ApprovalResolution::Pending),
+                Ok(()) => {
+                    self.preflight(key, &record.evidence.action)?;
+                    Ok(ApprovalResolution::Pending)
+                }
                 Err(GatewayError::Approval(ApprovalError::Expired)) => {
                     Ok(ApprovalResolution::Expired)
                 }
@@ -895,6 +941,9 @@ impl Gateway {
             self.engine
                 .validate_evidence_for_dispatch(&record.evidence)
                 .map_err(GatewayError::Authorization)?;
+            // Refuse before the approval is consumed, so an action the
+            // adapter cannot perform is never recorded as dispatched.
+            self.preflight(key, &record.evidence.action)?;
         }
         self.validate_approval_time_bounds(&record.evidence)?;
         self.journal.record_human_approval(key, &decision)?;
@@ -1069,6 +1118,27 @@ impl Gateway {
             DecisionOutcome::RequireApproval => AuthorizationStatus::RequiresApproval,
             DecisionOutcome::Deny => AuthorizationStatus::Denied,
         };
+
+        if authorization != AuthorizationStatus::Denied
+            && let Err(refusal) = self.dispatcher.preflight(&evidence.action)
+        {
+            // Explicit refusal: nothing was dispatched, and the signed
+            // attestation says so. Never left as outcome_unknown.
+            let execution = ExecutionStatus::NotDispatched;
+            let attestation =
+                self.create_execution_attestation(&evidence, authorization, execution, None)?;
+            if authorization == AuthorizationStatus::Allowed {
+                self.journal
+                    .mark_not_dispatched_attested(key, &attestation)?;
+            } else {
+                self.journal
+                    .record_attestation(key, execution, None, &attestation)?;
+            }
+            return Err(GatewayError::DispatchRefused {
+                key,
+                reason: refusal.0,
+            });
+        }
 
         if authorization != AuthorizationStatus::Allowed {
             let execution = ExecutionStatus::NotDispatched;

@@ -39,16 +39,40 @@ struct ResolutionResponse {
 /// including denials and approval requirements. Request bodies are size
 /// limited and parsed through PRÆTORE's duplicate-key rejecting parser.
 pub fn router(gateway: Arc<Gateway>) -> Router {
+    router_with_options(gateway, HttpOptions::default())
+}
+
+/// Transport options for [`router_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HttpOptions {
+    /// Set when the configured dispatcher performs the effects itself (for
+    /// example the filesystem [`crate::sandbox::SandboxDispatcher`]). The
+    /// API then refuses cooperative execution: `/status` of an approved
+    /// action that the gateway already executed answers 409
+    /// `cooperative_exec_rejected` instead of `approved`, so a polling agent
+    /// never runs the effect a second time. Receipts of effects performed by
+    /// the gateway carry the header `praetore-executed-by: gateway`.
+    pub gateway_executes_effects: bool,
+}
+
+const EXECUTED_BY_HEADER: &str = "praetore-executed-by";
+
+/// Like [`router`], with explicit transport options.
+pub fn router_with_options(gateway: Arc<Gateway>, options: HttpOptions) -> Router {
     Router::new()
         .route("/healthz", get(health))
-        .route("/v1/execute", post(execute))
+        .route(
+            "/v1/execute",
+            post(move |state, body| execute(state, body, options)),
+        )
         .route(
             "/v1/approvals/{tenant_id}/{agent_id}/{request_id}",
-            get(approval_challenge).post(resolve_approval),
+            get(approval_challenge)
+                .post(move |state, path, body| resolve_approval(state, path, body, options)),
         )
         .route(
             "/v1/approvals/{tenant_id}/{agent_id}/{request_id}/status",
-            get(approval_status),
+            get(move |state, path| approval_status(state, path, options)),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(gateway)
@@ -57,16 +81,37 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
 /// Runs the service on IPv4 loopback only; this endpoint has no network
 /// authentication or TLS and must not be exposed beyond local development.
 pub async fn serve_local(port: u16, gateway: Arc<Gateway>) -> io::Result<()> {
+    serve_local_with_options(port, gateway, HttpOptions::default()).await
+}
+
+/// Like [`serve_local`], with explicit transport options.
+pub async fn serve_local_with_options(
+    port: u16,
+    gateway: Arc<Gateway>,
+    options: HttpOptions,
+) -> io::Result<()> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(address).await?;
-    axum::serve(listener, router(gateway)).await
+    axum::serve(listener, router_with_options(gateway, options)).await
+}
+
+fn executed_by_gateway(options: HttpOptions, execution: crate::ExecutionStatus) -> bool {
+    options.gateway_executes_effects
+        && matches!(
+            execution,
+            crate::ExecutionStatus::Executed | crate::ExecutionStatus::Confirmed
+        )
 }
 
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-async fn execute(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
+async fn execute(
+    State(gateway): State<Arc<Gateway>>,
+    body: Bytes,
+    options: HttpOptions,
+) -> Response {
     let request = match std::str::from_utf8(&body)
         .ok()
         .and_then(|json| AuthorizationRequest::from_json(json).ok())
@@ -95,6 +140,9 @@ async fn execute(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
         AuthorizationStatus::RequiresApproval => StatusCode::ACCEPTED,
         AuthorizationStatus::Denied => StatusCode::FORBIDDEN,
     };
+    if executed_by_gateway(options, receipt.execution) {
+        return (status, [(EXECUTED_BY_HEADER, "gateway")], Json(receipt)).into_response();
+    }
     (status, Json(receipt)).into_response()
 }
 
@@ -127,6 +175,7 @@ async fn resolve_approval(
     State(gateway): State<Arc<Gateway>>,
     Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
     body: Bytes,
+    options: HttpOptions,
 ) -> Response {
     let decision = match std::str::from_utf8(&body)
         .ok()
@@ -153,6 +202,12 @@ async fn resolve_approval(
     })
     .await
     {
+        Ok(Ok(resolution)) if executed_by_gateway(options, resolution.receipt.execution) => (
+            StatusCode::OK,
+            [(EXECUTED_BY_HEADER, "gateway")],
+            Json(resolution),
+        )
+            .into_response(),
         Ok(Ok(resolution)) => (StatusCode::OK, Json(resolution)).into_response(),
         Ok(Err((error, resolution))) => approval_error_response(error, resolution),
         Err(error) => {
@@ -166,14 +221,33 @@ async fn resolve_approval(
 async fn approval_status(
     State(gateway): State<Arc<Gateway>>,
     Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
+    options: HttpOptions,
 ) -> Response {
     let key = crate::ExecutionKey {
         tenant_id,
         agent_id,
         request_id,
     };
-    match tokio::task::spawn_blocking(move || gateway.approval_resolution(key)).await {
-        Ok(Ok(resolution)) => {
+    let result = tokio::task::spawn_blocking(move || {
+        let resolution = gateway.approval_resolution(key)?;
+        let execution = match resolution {
+            crate::ApprovalResolution::Approved => Some(gateway.execution_status(key)?),
+            _ => None,
+        };
+        Ok::<_, GatewayError>((resolution, execution))
+    })
+    .await;
+    match result {
+        Ok(Ok((resolution, Some(execution)))) if executed_by_gateway(options, execution) => (
+            StatusCode::CONFLICT,
+            [(EXECUTED_BY_HEADER, "gateway")],
+            Json(ErrorResponse {
+                code: "cooperative_exec_rejected",
+                resolution: Some(resolution),
+            }),
+        )
+            .into_response(),
+        Ok(Ok((resolution, _))) => {
             (StatusCode::OK, Json(ResolutionResponse { resolution })).into_response()
         }
         Ok(Err(error)) => gateway_error_response(error),
@@ -270,6 +344,9 @@ fn gateway_error_response(error: GatewayError) -> Response {
         ),
         GatewayError::TenantIdentityInvalid => {
             error_response(StatusCode::BAD_REQUEST, "tenant_identity_invalid")
+        }
+        GatewayError::DispatchRefused { .. } => {
+            error_response(StatusCode::FORBIDDEN, "action_not_dispatchable")
         }
         GatewayError::ExecutionNotFound(_) => {
             error_response(StatusCode::NOT_FOUND, "execution_not_found")
