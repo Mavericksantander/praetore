@@ -14,9 +14,98 @@ use crate::{
     identity::AgentIdentity,
 };
 
-const MAX_POLICY_RULES: usize = 1024;
-const MAX_CONDITIONS_PER_RULE: usize = 128;
-const MAX_POLICY_TEXT_BYTES: usize = 1024;
+// Policy size and complexity limits. A policy that exceeds any of them is
+// rejected when it is built or loaded (`Policy::validate`, `Policy::from_json`)
+// with `PraetoreError::PolicyLimitExceeded`; nothing is skipped or ignored.
+// The policy engine has no regular expressions, so there is no pattern limit.
+
+/// Maximum number of rules in a policy, checked before the canonical size.
+/// Set above what fits in `MAX_JSON_VALUE_BYTES` (468 minimal rules with ids
+/// `r0`..`r467`), so the canonical size stays the binding limit and no policy
+/// that was valid before this constant became public is rejected by it.
+pub const MAX_POLICY_RULES: usize = 512;
+/// Maximum parameter conditions, and separately context conditions, per rule.
+pub const MAX_CONDITIONS_PER_RULE: usize = 128;
+/// Maximum UTF-8 bytes of a policy id, rule id, action type, capability,
+/// target or condition key.
+pub const MAX_POLICY_TEXT_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes of any string inside a condition's expected value.
+pub const MAX_CONDITION_STRING_BYTES: usize = 1024;
+/// Maximum number of values in an `In` condition.
+pub const MAX_CONDITION_SET_VALUES: usize = 256;
+/// Maximum nesting depth of a condition's expected value (a scalar is 1).
+pub const MAX_CONDITION_VALUE_DEPTH: usize = 8;
+
+/// Which policy limit was exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyLimit {
+    PolicyIdBytes,
+    Rules,
+    RuleIdBytes,
+    ActionTypeBytes,
+    CapabilityBytes,
+    TargetBytes,
+    ConditionsPerRule,
+    ConditionKeyBytes,
+    ConditionStringBytes,
+    ConditionSetValues,
+    ConditionValueDepth,
+    CanonicalBytes,
+}
+
+impl std::fmt::Display for PolicyLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PolicyIdBytes => "policy id bytes",
+            Self::Rules => "rules per policy",
+            Self::RuleIdBytes => "rule id bytes",
+            Self::ActionTypeBytes => "action type bytes",
+            Self::CapabilityBytes => "capability bytes",
+            Self::TargetBytes => "target bytes",
+            Self::ConditionsPerRule => "conditions per rule scope",
+            Self::ConditionKeyBytes => "condition key bytes",
+            Self::ConditionStringBytes => "condition string bytes",
+            Self::ConditionSetValues => "values in an In condition",
+            Self::ConditionValueDepth => "condition value nesting depth",
+            Self::CanonicalBytes => "canonical policy bytes",
+        })
+    }
+}
+
+fn check_limit(limit: PolicyLimit, actual: usize, max: usize) -> Result<()> {
+    if actual > max {
+        return Err(PraetoreError::PolicyLimitExceeded { limit, max });
+    }
+    Ok(())
+}
+
+/// Checks string length, `In` cardinality and nesting depth of a value.
+fn check_condition_value(value: &Value, depth: usize) -> Result<()> {
+    check_limit(
+        PolicyLimit::ConditionValueDepth,
+        depth,
+        MAX_CONDITION_VALUE_DEPTH,
+    )?;
+    match value {
+        Value::String(text) => check_limit(
+            PolicyLimit::ConditionStringBytes,
+            text.len(),
+            MAX_CONDITION_STRING_BYTES,
+        ),
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| check_condition_value(value, depth + 1)),
+        Value::Object(values) => values.iter().try_for_each(|(key, value)| {
+            check_limit(
+                PolicyLimit::ConditionStringBytes,
+                key.len(),
+                MAX_CONDITION_STRING_BYTES,
+            )?;
+            check_condition_value(value, depth + 1)
+        }),
+        _ => Ok(()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -173,11 +262,12 @@ impl Policy {
             ));
         }
 
-        if self.id.len() > MAX_POLICY_TEXT_BYTES || self.rules.len() > MAX_POLICY_RULES {
-            return Err(PraetoreError::PolicyEvaluationFailed(
-                "policy exceeds configured input limits".into(),
-            ));
-        }
+        check_limit(
+            PolicyLimit::PolicyIdBytes,
+            self.id.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        check_limit(PolicyLimit::Rules, self.rules.len(), MAX_POLICY_RULES)?;
 
         for rule in &self.rules {
             rule.validate()?;
@@ -196,15 +286,23 @@ impl Policy {
         }
 
         let canonical = canonical_json(self).map_err(|error| {
-            PraetoreError::PolicyEvaluationFailed(format!(
-                "policy exceeds canonical input limits: {error}"
-            ))
+            let message = error.to_string();
+            if message.contains("exceeds maximum size") {
+                PraetoreError::PolicyLimitExceeded {
+                    limit: PolicyLimit::CanonicalBytes,
+                    max: MAX_JSON_VALUE_BYTES,
+                }
+            } else {
+                PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy exceeds canonical input limits: {message}"
+                ))
+            }
         })?;
-        if canonical.len() > MAX_JSON_VALUE_BYTES {
-            return Err(PraetoreError::PolicyEvaluationFailed(
-                "policy exceeds maximum canonical size".into(),
-            ));
-        }
+        check_limit(
+            PolicyLimit::CanonicalBytes,
+            canonical.len(),
+            MAX_JSON_VALUE_BYTES,
+        )?;
 
         Ok(())
     }
@@ -327,11 +425,22 @@ impl PolicyRule {
                 self.id
             )));
         }
-        if self.id.len() > MAX_POLICY_TEXT_BYTES || self.action_type.len() > MAX_POLICY_TEXT_BYTES {
-            return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                "policy rule '{}' exceeds maximum text length",
-                self.id
-            )));
+        check_limit(
+            PolicyLimit::RuleIdBytes,
+            self.id.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        check_limit(
+            PolicyLimit::ActionTypeBytes,
+            self.action_type.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        if let Some(capability) = &self.required_capability {
+            check_limit(
+                PolicyLimit::CapabilityBytes,
+                capability.len(),
+                MAX_POLICY_TEXT_BYTES,
+            )?;
         }
 
         if let Some(capability) = &self.required_capability
@@ -350,22 +459,20 @@ impl PolicyRule {
                     self.id
                 )));
             }
-            if target.len() > MAX_POLICY_TEXT_BYTES {
-                return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                    "policy rule '{}' target exceeds maximum length",
-                    self.id
-                )));
-            }
+            check_limit(
+                PolicyLimit::TargetBytes,
+                target.len(),
+                MAX_POLICY_TEXT_BYTES,
+            )?;
         }
 
-        if self.parameter_conditions.len() > MAX_CONDITIONS_PER_RULE
-            || self.context_conditions.len() > MAX_CONDITIONS_PER_RULE
-        {
-            return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                "policy rule '{}' has too many conditions",
-                self.id
-            )));
-        }
+        check_limit(
+            PolicyLimit::ConditionsPerRule,
+            self.parameter_conditions
+                .len()
+                .max(self.context_conditions.len()),
+            MAX_CONDITIONS_PER_RULE,
+        )?;
 
         validate_conditions(&self.id, "parameter", &self.parameter_conditions)?;
         validate_conditions(&self.id, "context", &self.context_conditions)?;
@@ -513,10 +620,20 @@ impl PolicyCondition {
     }
 
     fn validate(&self, rule_id: &str, scope: &str) -> Result<()> {
-        if self.key.trim().is_empty()
-            || self.key != self.key.trim()
-            || self.key.len() > MAX_POLICY_TEXT_BYTES
-        {
+        check_limit(
+            PolicyLimit::ConditionKeyBytes,
+            self.key.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        if let Some(values) = self.expected.as_array() {
+            check_limit(
+                PolicyLimit::ConditionSetValues,
+                values.len(),
+                MAX_CONDITION_SET_VALUES,
+            )?;
+        }
+        check_condition_value(&self.expected, 1)?;
+        if self.key.trim().is_empty() || self.key != self.key.trim() {
             return Err(PraetoreError::PolicyEvaluationFailed(format!(
                 "policy rule '{rule_id}' has invalid {scope} condition key"
             )));

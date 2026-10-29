@@ -52,6 +52,14 @@ pub enum PraetoreError {
     #[error("policy evaluation failed: {0}")]
     PolicyEvaluationFailed(String),
 
+    /// A policy document exceeds a size or complexity limit and was rejected
+    /// as a whole (never partially applied).
+    #[error("policy limit exceeded: {limit} (maximum {max})")]
+    PolicyLimitExceeded {
+        limit: crate::policy::PolicyLimit,
+        max: usize,
+    },
+
     #[error("policy integrity verification failed")]
     PolicyIntegrityFailed,
 
@@ -84,7 +92,9 @@ impl PraetoreError {
             Self::AuthorizationDenied(_) => ErrorKind::PolicyDenied,
             Self::InvalidRequest(_) => ErrorKind::InvalidRequest,
             Self::PolicyIntegrityFailed => ErrorKind::PolicyIntegrityFailure,
-            Self::PolicyEvaluationFailed(_) => ErrorKind::PolicyEvaluationFailure,
+            Self::PolicyEvaluationFailed(_) | Self::PolicyLimitExceeded { .. } => {
+                ErrorKind::PolicyEvaluationFailure
+            }
             Self::EvidenceError(_) => ErrorKind::EvidenceFailure,
             Self::ReplayDetected => ErrorKind::ReplayDetected,
             Self::ReplayGuardUnavailable => ErrorKind::ReplayGuardFailure,
