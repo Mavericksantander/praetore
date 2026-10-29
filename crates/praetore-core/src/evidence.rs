@@ -15,7 +15,7 @@ use crate::{
     canonical::{
         MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
     },
-    decision::{Decision, DecisionOutcome},
+    decision::{Decision, DecisionOutcome, RecordedDecision},
     identity::{AgentIdentity, VerifiedPublicKey},
     key_rotation::KeyRotationProof,
 };
@@ -40,7 +40,7 @@ pub struct Evidence {
     pub agent: AgentIdentity,
     pub authority: Authority,
     pub action: Action,
-    pub decision: Decision,
+    pub decision: RecordedDecision,
     pub trace_id: Option<String>,
     pub context: BTreeMap<String, Value>,
     pub agent_signature: Option<String>,
@@ -149,7 +149,7 @@ impl Evidence {
             agent,
             authority,
             action,
-            decision,
+            decision: decision.into(),
             trace_id,
             context,
             agent_signature: None,
@@ -405,7 +405,7 @@ impl Evidence {
         Ok(())
     }
 
-    fn compute_context_hash(&self) -> Option<String> {
+    pub(crate) fn compute_context_hash(&self) -> Option<String> {
         self.validate_integrity_inputs().ok()?;
         let payload = EvidenceIntegrityPayload {
             evidence_schema_version: self.evidence_schema_version,
@@ -468,7 +468,7 @@ impl Evidence {
             || self.decision.contributions.iter().any(|contribution| {
                 contribution.rule_id.len() > 1024 || contribution.reason.len() > 4096
             })
-            || match &self.decision.decided_by {
+            || match self.decision.decided_by() {
                 Some(crate::decision::DecidedBy::Rule { rule_id }) => rule_id.len() > 1024,
                 Some(crate::decision::DecidedBy::EngineGuard { guard }) => guard.len() > 1024,
                 Some(crate::decision::DecidedBy::DefaultDeny) | None => false,
@@ -646,7 +646,7 @@ struct EvidenceIntegrityPayload<'a> {
     agent: &'a AgentIdentity,
     authority: &'a Authority,
     action: &'a Action,
-    decision: &'a Decision,
+    decision: &'a RecordedDecision,
     trace_id: &'a Option<String>,
     context: &'a BTreeMap<String, Value>,
     agent_signature: &'a Option<String>,
@@ -703,7 +703,10 @@ mod tests {
     }
 
     fn test_decision() -> Decision {
-        Decision::allow("policy permitted action")
+        Decision::allow(
+            "policy permitted action",
+            crate::DecidedBy::rule("test-rule"),
+        )
     }
 
     fn test_evidence() -> Evidence {
@@ -890,7 +893,12 @@ mod tests {
                 policy_digest.clone(),
             )
             .unwrap();
-        let mut evidence = request.attest(Decision::allow("v2 allow")).unwrap();
+        let mut evidence = request
+            .attest(Decision::allow(
+                "v2 allow",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
         evidence.bind_policy_digest(policy_digest).unwrap();
         evidence
             .bind_high_assurance_metadata(
@@ -911,7 +919,8 @@ mod tests {
         document["future_field"] = json!(true);
         assert!(Evidence::from_json(&document.to_string()).is_err());
 
-        evidence.decision = Decision::deny("tampered decision");
+        evidence.decision =
+            Decision::deny("tampered decision", crate::DecidedBy::rule("test-rule")).into();
         evidence.context_hash = evidence.compute_context_hash().unwrap();
 
         assert!(evidence.verify_integrity());
@@ -946,7 +955,21 @@ mod tests {
         let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
         request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
         request.sign_intent(&agent_key).unwrap();
-        let mut evidence = request.attest(Decision::allow("golden allow")).unwrap();
+        // The golden vector predates `decided_by`: it is a legacy receipt.
+        // New decisions cannot be built without `decided_by`, so the legacy
+        // decision is taken from the read path (deserialization) and every
+        // other field is regenerated deterministically.
+        let legacy = Evidence::from_json(golden["evidence_json"].as_str().unwrap()).unwrap();
+        assert_eq!(legacy.decision.decided_by(), None);
+        assert!(legacy.verify_integrity());
+        let mut evidence = request
+            .attest(Decision::allow(
+                "golden allow",
+                crate::DecidedBy::rule("golden-rule"),
+            ))
+            .unwrap();
+        assert!(evidence.decision.decided_by().is_some());
+        evidence.decision = legacy.decision.clone();
         evidence.evidence_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
         evidence.context_hash = evidence.compute_context_hash().unwrap();
 
@@ -1156,7 +1179,11 @@ mod tests {
     fn tampering_with_decision_invalidates_evidence() {
         let mut evidence = test_evidence();
 
-        evidence.decision = Decision::deny("policy rejected action");
+        evidence.decision = Decision::deny(
+            "policy rejected action",
+            crate::DecidedBy::rule("test-rule"),
+        )
+        .into();
 
         assert!(!evidence.verify_integrity());
     }

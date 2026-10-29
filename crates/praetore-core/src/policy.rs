@@ -114,9 +114,7 @@ impl Policy {
                 rule_decision.reason.clone(),
             );
 
-            let rule_decision = rule_decision
-                .with_contribution(contribution)
-                .decided_by(DecidedBy::rule(rule.id.clone()));
+            let rule_decision = rule_decision.with_contribution(contribution);
 
             decision = Some(match decision {
                 Some(current) => current.strongest(rule_decision),
@@ -125,11 +123,13 @@ impl Policy {
         }
 
         Ok(decision.unwrap_or_else(|| {
-            Decision::deny(format!(
-                "Policy '{}' v{}: no matching rule; default deny",
-                self.id, self.version
-            ))
-            .decided_by(DecidedBy::DefaultDeny)
+            Decision::deny(
+                format!(
+                    "Policy '{}' v{}: no matching rule; default deny",
+                    self.id, self.version
+                ),
+                DecidedBy::DefaultDeny,
+            )
         }))
     }
 
@@ -297,11 +297,12 @@ impl PolicyRule {
 
     fn decision(&self) -> Result<Decision> {
         let reason = format!("Policy rule '{}' matched", self.id);
+        let decided_by = DecidedBy::rule(self.id.clone());
 
         match self.effect {
-            PolicyEffect::Allow => Ok(Decision::allow(reason)),
-            PolicyEffect::Deny => Ok(Decision::deny(reason)),
-            PolicyEffect::RequireApproval => Ok(Decision::require_approval(reason)),
+            PolicyEffect::Allow => Ok(Decision::allow(reason, decided_by)),
+            PolicyEffect::Deny => Ok(Decision::deny(reason, decided_by)),
+            PolicyEffect::RequireApproval => Ok(Decision::require_approval(reason, decided_by)),
         }
     }
 

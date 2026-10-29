@@ -2,11 +2,18 @@
 
 ## Unreleased
 
-- `Decision` gains `decided_by` (`DecidedBy::Rule { rule_id }`, `DefaultDeny`,
-  `EngineGuard { guard }`), set by policy evaluation and engine guards. It is
-  part of the hashed and Ed25519-signed evidence payload. Omitted from the
-  canonical form when absent, so receipts signed before this change still verify.
-  Adding a public field to `Decision` breaks struct-literal construction.
+- New receipts always record what decided them (`DecidedBy::Rule { rule_id }`,
+  `DefaultDeny`, `EngineGuard { guard }`), as part of the hashed and
+  Ed25519-signed evidence payload. Enforced by types:
+  - `Decision` (the write path: evaluation output and `attest` input) has a
+    required `decided_by: DecidedBy`; `Decision::allow/deny/require_approval`
+    take it as a second argument, and JSON without it does not deserialize.
+  - `Evidence.decision` is now a `RecordedDecision` (the read path) whose
+    `decided_by` is optional, crate-private and read via `decided_by()`. It is
+    absent only in receipts signed before this change, is omitted from the
+    canonical form, and those receipts keep verifying.
+  - Breaking: constructor signatures change, and `Evidence.decision` changes
+    type (`Decision` converts with `.into()`).
 
 ## 0.2.0 (not yet tagged or published)
 

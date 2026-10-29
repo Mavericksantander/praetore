@@ -98,54 +98,55 @@ impl DecisionContribution {
     }
 }
 
+/// A decision produced by evaluation. This is the only type that can be
+/// attested into new evidence, and it cannot exist without `decided_by`:
+/// every constructor requires it and the field is not optional.
+///
+/// ```compile_fail
+/// // A new decision cannot be built without saying who decided it.
+/// let _ = praetore_core::Decision::allow("ok");
+/// ```
+///
+/// ```compile_fail
+/// // Nor can a recorded decision be stripped of it outside praetore-core.
+/// fn strip(evidence: &mut praetore_core::Evidence) {
+///     evidence.decision.decided_by = None;
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Decision {
     pub outcome: DecisionOutcome,
     pub reason: String,
     pub contributions: Vec<DecisionContribution>,
-    /// What determined `outcome`. Absent only in evidence produced before
-    /// this field existed; omitted from the canonical form when `None` so
-    /// those receipts keep verifying.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decided_by: Option<DecidedBy>,
+    /// What determined `outcome`. Always present on newly produced decisions.
+    pub decided_by: DecidedBy,
 }
 
 impl Decision {
-    pub fn allow(reason: impl Into<String>) -> Self {
+    pub fn new(outcome: DecisionOutcome, reason: impl Into<String>, decided_by: DecidedBy) -> Self {
         Self {
-            outcome: DecisionOutcome::Allow,
+            outcome,
             reason: reason.into(),
             contributions: Vec::new(),
-            decided_by: None,
+            decided_by,
         }
     }
 
-    pub fn require_approval(reason: impl Into<String>) -> Self {
-        Self {
-            outcome: DecisionOutcome::RequireApproval,
-            reason: reason.into(),
-            contributions: Vec::new(),
-            decided_by: None,
-        }
+    pub fn allow(reason: impl Into<String>, decided_by: DecidedBy) -> Self {
+        Self::new(DecisionOutcome::Allow, reason, decided_by)
     }
 
-    pub fn deny(reason: impl Into<String>) -> Self {
-        Self {
-            outcome: DecisionOutcome::Deny,
-            reason: reason.into(),
-            contributions: Vec::new(),
-            decided_by: None,
-        }
+    pub fn require_approval(reason: impl Into<String>, decided_by: DecidedBy) -> Self {
+        Self::new(DecisionOutcome::RequireApproval, reason, decided_by)
+    }
+
+    pub fn deny(reason: impl Into<String>, decided_by: DecidedBy) -> Self {
+        Self::new(DecisionOutcome::Deny, reason, decided_by)
     }
 
     pub fn with_contribution(mut self, contribution: DecisionContribution) -> Self {
         self.contributions.push(contribution);
-        self
-    }
-
-    pub fn decided_by(mut self, decided_by: DecidedBy) -> Self {
-        self.decided_by = Some(decided_by);
         self
     }
 
@@ -172,9 +173,69 @@ impl Decision {
     }
 }
 
+/// The decision as recorded inside a receipt (`Evidence`). This is the read
+/// side: receipts produced before `decided_by` existed deserialize with it
+/// absent and keep verifying, because `None` is omitted from the canonical
+/// form. A `RecordedDecision` can only be obtained from a [`Decision`]
+/// (which always carries `decided_by`) or by deserializing an existing
+/// receipt; `decided_by` is crate-private, so callers outside
+/// `praetore-core` cannot strip it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedDecision {
+    pub outcome: DecisionOutcome,
+    pub reason: String,
+    pub contributions: Vec<DecisionContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) decided_by: Option<DecidedBy>,
+}
+
+impl RecordedDecision {
+    /// `None` only for legacy receipts produced before the field existed.
+    pub fn decided_by(&self) -> Option<&DecidedBy> {
+        self.decided_by.as_ref()
+    }
+}
+
+impl From<Decision> for RecordedDecision {
+    fn from(decision: Decision) -> Self {
+        Self {
+            outcome: decision.outcome,
+            reason: decision.reason,
+            contributions: decision.contributions,
+            decided_by: Some(decision.decided_by),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_decision_json_requires_decided_by() {
+        let legacy = r#"{"outcome":"Allow","reason":"ok","contributions":[]}"#;
+        assert!(serde_json::from_str::<Decision>(legacy).is_err());
+        let recorded: RecordedDecision = serde_json::from_str(legacy).unwrap();
+        assert_eq!(recorded.decided_by(), None);
+        // Legacy form round-trips byte-identically (keeps signatures valid).
+        assert_eq!(serde_json::to_string(&recorded).unwrap(), legacy);
+    }
+
+    #[test]
+    fn recorded_decision_from_new_decision_always_has_decided_by() {
+        for decision in [
+            Decision::allow("a", DecidedBy::rule("r")),
+            Decision::require_approval("b", DecidedBy::engine_guard("g")),
+            Decision::deny("c", DecidedBy::DefaultDeny),
+        ] {
+            let expected = decision.decided_by.clone();
+            let recorded = RecordedDecision::from(decision);
+            assert_eq!(recorded.decided_by(), Some(&expected));
+            let json = serde_json::to_value(&recorded).unwrap();
+            assert!(json.get("decided_by").is_some());
+        }
+    }
 
     #[test]
     fn deny_beats_everything() {
@@ -215,7 +276,7 @@ mod tests {
 
     #[test]
     fn decision_preserves_reason() {
-        let decision = Decision::deny("Policy violation");
+        let decision = Decision::deny("Policy violation", DecidedBy::rule("test-rule"));
 
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert_eq!(decision.reason, "Policy violation");
@@ -223,22 +284,32 @@ mod tests {
 
     #[test]
     fn decision_helpers_construct_expected_outcomes() {
-        assert!(Decision::allow("ok").outcome.is_allowed());
         assert!(
-            Decision::require_approval("review")
+            Decision::allow("ok", DecidedBy::rule("test-rule"))
+                .outcome
+                .is_allowed()
+        );
+        assert!(
+            Decision::require_approval("review", DecidedBy::rule("test-rule"))
                 .outcome
                 .requires_approval()
         );
-        assert!(Decision::deny("blocked").outcome.is_denied());
+        assert!(
+            Decision::deny("blocked", DecidedBy::rule("test-rule"))
+                .outcome
+                .is_denied()
+        );
     }
 
     #[test]
     fn decision_can_record_contribution() {
-        let decision = Decision::deny("blocked").with_contribution(DecisionContribution::new(
-            "deny-delete",
-            DecisionOutcome::Deny,
-            "delete operations are forbidden",
-        ));
+        let decision = Decision::deny("blocked", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new(
+                "deny-delete",
+                DecisionOutcome::Deny,
+                "delete operations are forbidden",
+            ),
+        );
 
         assert_eq!(decision.contributions.len(), 1);
         assert_eq!(decision.contributions[0].rule_id, "deny-delete");
@@ -247,17 +318,13 @@ mod tests {
 
     #[test]
     fn strongest_combines_contributions_for_equal_outcomes() {
-        let first = Decision::allow("first").with_contribution(DecisionContribution::new(
-            "allow-read",
-            DecisionOutcome::Allow,
-            "read permitted",
-        ));
+        let first = Decision::allow("first", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new("allow-read", DecisionOutcome::Allow, "read permitted"),
+        );
 
-        let second = Decision::allow("second").with_contribution(DecisionContribution::new(
-            "allow-users",
-            DecisionOutcome::Allow,
-            "users permitted",
-        ));
+        let second = Decision::allow("second", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new("allow-users", DecisionOutcome::Allow, "users permitted"),
+        );
 
         let combined = first.strongest(second);
 
@@ -267,21 +334,19 @@ mod tests {
 
     #[test]
     fn strongest_preserves_reason_of_stronger_decision() {
-        let allow = Decision::allow("read operation permitted").with_contribution(
-            DecisionContribution::new(
+        let allow = Decision::allow("read operation permitted", DecidedBy::rule("test-rule"))
+            .with_contribution(DecisionContribution::new(
                 "allow-read",
                 DecisionOutcome::Allow,
                 "read operation permitted",
-            ),
-        );
+            ));
 
-        let deny = Decision::deny("read operation forbidden").with_contribution(
-            DecisionContribution::new(
+        let deny = Decision::deny("read operation forbidden", DecidedBy::rule("test-rule"))
+            .with_contribution(DecisionContribution::new(
                 "deny-read",
                 DecisionOutcome::Deny,
                 "read operation forbidden",
-            ),
-        );
+            ));
 
         let combined = allow.strongest(deny);
 
@@ -292,25 +357,21 @@ mod tests {
 
     #[test]
     fn strongest_is_associative_for_outcome_and_contributions() {
-        let allow = Decision::allow("allowed").with_contribution(DecisionContribution::new(
-            "allow-read",
-            DecisionOutcome::Allow,
-            "allowed",
-        ));
-
-        let approval = Decision::require_approval("approval required").with_contribution(
-            DecisionContribution::new(
-                "approval-read",
-                DecisionOutcome::RequireApproval,
-                "approval required",
-            ),
+        let allow = Decision::allow("allowed", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new("allow-read", DecisionOutcome::Allow, "allowed"),
         );
 
-        let deny = Decision::deny("denied").with_contribution(DecisionContribution::new(
-            "deny-read",
-            DecisionOutcome::Deny,
-            "denied",
-        ));
+        let approval =
+            Decision::require_approval("approval required", DecidedBy::rule("test-rule"))
+                .with_contribution(DecisionContribution::new(
+                    "approval-read",
+                    DecisionOutcome::RequireApproval,
+                    "approval required",
+                ));
+
+        let deny = Decision::deny("denied", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new("deny-read", DecisionOutcome::Deny, "denied"),
+        );
 
         let left = allow
             .clone()
@@ -338,17 +399,13 @@ mod tests {
 
     #[test]
     fn strongest_is_commutative_for_outcome_and_contributions() {
-        let allow = Decision::allow("allowed").with_contribution(DecisionContribution::new(
-            "allow-read",
-            DecisionOutcome::Allow,
-            "allowed",
-        ));
+        let allow = Decision::allow("allowed", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new("allow-read", DecisionOutcome::Allow, "allowed"),
+        );
 
-        let deny = Decision::deny("denied").with_contribution(DecisionContribution::new(
-            "deny-read",
-            DecisionOutcome::Deny,
-            "denied",
-        ));
+        let deny = Decision::deny("denied", DecidedBy::rule("test-rule")).with_contribution(
+            DecisionContribution::new("deny-read", DecisionOutcome::Deny, "denied"),
+        );
 
         let first = allow.clone().strongest(deny.clone());
         let second = deny.strongest(allow);

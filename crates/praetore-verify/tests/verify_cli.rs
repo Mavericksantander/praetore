@@ -57,7 +57,12 @@ impl TestFiles {
             .with_capability("data:read");
         let mut request = AuthorizationRequest::new(agent, authority.clone(), action).unwrap();
         request.sign_intent(&agent_key).unwrap();
-        let mut evidence = request.attest(Decision::allow("fixture decision")).unwrap();
+        let mut evidence = request
+            .attest(Decision::allow(
+                "fixture decision",
+                praetore_core::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
         evidence.bind_policy_digest("ab".repeat(32)).unwrap();
         evidence.sign(&attester).unwrap();
 

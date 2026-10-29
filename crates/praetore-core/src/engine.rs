@@ -3,7 +3,7 @@ use crate::{
     authority::Validity,
     authorization::AuthorizationRequest,
     canonical::parse_json_rejecting_duplicates,
-    decision::{DecidedBy, Decision},
+    decision::{DecidedBy, Decision, RecordedDecision},
     evidence::{Evidence, EvidenceAttesterKey},
     freshness::{FreshnessError, FreshnessProvider},
     identity::VerifiedPublicKey,
@@ -804,7 +804,7 @@ impl AuthorizationEngine {
         self.validate_production_configuration(now, false)?;
         self.validate_high_assurance_request(&request, now)?;
         let decision = self.evaluate_request(&request, now)?;
-        if decision != evidence.decision {
+        if RecordedDecision::from(decision) != evidence.decision {
             return Err(PraetoreError::PolicyIntegrityFailed);
         }
         if freshness_valid_until <= now {
@@ -864,7 +864,7 @@ impl AuthorizationEngine {
             ));
         }
         let final_decision = self.evaluate_request(&request, final_now)?;
-        if final_decision != evidence.decision {
+        if RecordedDecision::from(final_decision) != evidence.decision {
             return Err(PraetoreError::PolicyIntegrityFailed);
         }
         Ok(())
@@ -1005,7 +1005,7 @@ impl AuthorizationEngine {
                 .ok_or(PraetoreError::PolicyIntegrityFailed)?;
             self.validate_high_assurance_request(request, commit_now)?;
             let current_decision = self.evaluate_request(request, commit_now)?;
-            if current_decision != evidence.decision {
+            if RecordedDecision::from(current_decision) != evidence.decision {
                 return Err(PraetoreError::PolicyIntegrityFailed.into());
             }
             let lease = freshness.ok_or(PraetoreError::FreshnessCheckFailed(
@@ -1204,28 +1204,29 @@ impl AuthorizationEngine {
             };
 
             if !satisfied {
-                return Ok(Decision::deny(format!(
-                    "authority constraint '{}' was not satisfied",
-                    constraint.key
-                ))
-                .decided_by(DecidedBy::engine_guard("authority_constraint")));
+                return Ok(Decision::deny(
+                    format!(
+                        "authority constraint '{}' was not satisfied",
+                        constraint.key
+                    ),
+                    DecidedBy::engine_guard("authority_constraint"),
+                ));
             }
         }
 
         // Fail closed: an action without an explicit capability is never
         // mapped onto its action_type (or any other) grant.
         let Some(capability) = request.action.capability.as_deref() else {
-            return Ok(
-                Decision::deny("action does not declare a required capability")
-                    .decided_by(DecidedBy::engine_guard("missing_capability")),
-            );
+            return Ok(Decision::deny(
+                "action does not declare a required capability",
+                DecidedBy::engine_guard("missing_capability"),
+            ));
         };
         if !request.authority.permits(capability) {
-            return Ok(Decision::deny(format!(
-                "authority does not permit capability: {}",
-                capability
-            ))
-            .decided_by(DecidedBy::engine_guard("authority_capability")));
+            return Ok(Decision::deny(
+                format!("authority does not permit capability: {}", capability),
+                DecidedBy::engine_guard("authority_capability"),
+            ));
         }
 
         let decision = self.policy.evaluate_with_context(
@@ -1249,11 +1250,13 @@ impl AuthorizationEngine {
                     })
             })
         {
-            return Ok(Decision::deny(format!(
-                "policy rule '{}' must declare required_capability",
-                contribution.rule_id
-            ))
-            .decided_by(DecidedBy::engine_guard("unbound_rule_capability")));
+            return Ok(Decision::deny(
+                format!(
+                    "policy rule '{}' must declare required_capability",
+                    contribution.rule_id
+                ),
+                DecidedBy::engine_guard("unbound_rule_capability"),
+            ));
         }
 
         Ok(decision)
@@ -1830,6 +1833,183 @@ mod tests {
         }
     }
 
+    /// Evaluates, signs and exports a receipt, then returns the raw exported
+    /// `decision` JSON object after checking the signed receipt verifies.
+    fn exported_decision_json(
+        policy: Policy,
+        authority_capabilities: &[&str],
+        constraint: Option<(&str, &str)>,
+        action: Action,
+    ) -> serde_json::Value {
+        let agent = test_agent();
+        let mut authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            authority_capabilities
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+        );
+        if let Some((key, value)) = constraint {
+            authority = authority.with_constraint(key, value);
+        }
+        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut evidence = AuthorizationEngine::development(policy)
+            .evaluate(request)
+            .unwrap();
+        let attester = crate::EvidenceAttesterKey::from_secret_bytes(&[91; 32]);
+        evidence.sign(&attester).unwrap();
+        let exported = evidence.to_json().unwrap();
+        let imported = Evidence::from_json(&exported).unwrap();
+        assert!(imported.verify());
+        assert!(
+            imported
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_ok()
+        );
+        let document: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        document["decision"].clone()
+    }
+
+    fn action_with_capability(action_type: &str, capability: &str) -> Action {
+        Action::new(action_type, Some("database".into()), json!({}))
+            .unwrap()
+            .with_capability(capability)
+    }
+
+    #[test]
+    fn every_new_receipt_exports_decided_by_in_json() {
+        use crate::policy::PolicyEffect;
+        let all = ["read_data", "delete_data", "write_data", "export_data"];
+        let unbound_policy = Policy::new_v2(
+            "unbound",
+            1,
+            vec![PolicyRule::new(
+                "allow-unbound",
+                "read_data",
+                PolicyEffect::Allow,
+            )],
+        );
+        let cases: Vec<(&str, serde_json::Value, DecisionOutcome, serde_json::Value)> = vec![
+            (
+                "allow",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &all,
+                    None,
+                    action_with_capability("read_data", "read_data"),
+                ),
+                DecisionOutcome::Allow,
+                json!({"kind": "rule", "rule_id": "allow-read"}),
+            ),
+            (
+                "deny",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &all,
+                    None,
+                    action_with_capability("delete_data", "delete_data"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "rule", "rule_id": "deny-delete"}),
+            ),
+            (
+                "require_approval",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &all,
+                    None,
+                    action_with_capability("write_data", "write_data"),
+                ),
+                DecisionOutcome::RequireApproval,
+                json!({"kind": "rule", "rule_id": "approve-write"}),
+            ),
+            (
+                "default_deny",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &all,
+                    None,
+                    action_with_capability("export_data", "export_data"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "default_deny"}),
+            ),
+            (
+                "guard_authority_constraint",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &all,
+                    Some(("target", "other-database")),
+                    action_with_capability("read_data", "read_data"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "engine_guard", "guard": "authority_constraint"}),
+            ),
+            (
+                "guard_missing_capability",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &all,
+                    None,
+                    Action::new("read_data", Some("database".into()), json!({})).unwrap(),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "engine_guard", "guard": "missing_capability"}),
+            ),
+            (
+                "guard_authority_capability",
+                exported_decision_json(
+                    decided_by_policy(),
+                    &["other"],
+                    None,
+                    action_with_capability("read_data", "read_data"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "engine_guard", "guard": "authority_capability"}),
+            ),
+            (
+                "guard_unbound_rule_capability",
+                exported_decision_json(
+                    unbound_policy,
+                    &["data:read"],
+                    None,
+                    action_with_capability("read_data", "data:read"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "engine_guard", "guard": "unbound_rule_capability"}),
+            ),
+        ];
+        for (name, decision, outcome, expected) in cases {
+            assert_eq!(
+                decision["outcome"],
+                serde_json::to_value(outcome).unwrap(),
+                "{name}"
+            );
+            assert_eq!(decision.get("decided_by"), Some(&expected), "{name}");
+        }
+    }
+
+    #[test]
+    fn legacy_signed_receipt_without_decided_by_still_verifies() {
+        let (evidence, attester) = signed_evidence_for("read_data");
+        let key = attester.public_key().unwrap();
+        // Reproduce a receipt signed before `decided_by` existed: the field is
+        // absent from both the signed payload and the exported JSON.
+        let mut legacy = evidence.clone();
+        legacy.decision.decided_by = None;
+        legacy.context_hash = legacy.compute_context_hash().unwrap();
+        legacy.sign(&attester).unwrap();
+        let exported = legacy.to_json().unwrap();
+        let document: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert!(document["decision"].get("decided_by").is_none());
+
+        let imported = Evidence::from_json(&exported).unwrap();
+        assert_eq!(imported.decision.decided_by(), None);
+        assert!(imported.verify());
+        assert!(imported.verify_attester_signature(&key).is_ok());
+    }
+
     #[test]
     fn engine_allows_authorized_action() {
         let agent = test_agent();
@@ -2096,7 +2276,7 @@ mod tests {
         );
     }
 
-    fn evaluate_development(capabilities: &[&str], action: Action) -> Decision {
+    fn evaluate_development(capabilities: &[&str], action: Action) -> RecordedDecision {
         let agent = test_agent();
         let authority = Authority::new(
             agent.id.clone(),
