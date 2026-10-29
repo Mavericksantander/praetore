@@ -3,7 +3,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -57,22 +57,56 @@ pub struct HttpOptions {
 
 const EXECUTED_BY_HEADER: &str = "praetore-executed-by";
 
+/// Request header a client must send, with the exact value `gateway`, on
+/// every execution-path request (`POST /v1/execute`, approval challenge,
+/// approval decision and `/status`) when
+/// [`HttpOptions::gateway_executes_effects`] is set. It declares that the
+/// client will not perform the effect itself.
+pub const EXEC_MODE_HEADER: &str = "praetore-exec-mode";
+pub const EXEC_MODE_GATEWAY: &str = "gateway";
+const MAX_EXEC_MODE_BYTES: usize = 16;
+
+/// Fail-closed check of [`EXEC_MODE_HEADER`]. Without gateway-executed
+/// effects the header is ignored (unchanged behaviour). Otherwise exactly
+/// one header with the exact value `gateway` (at most 16 bytes) is accepted;
+/// a missing, repeated, oversized, `cooperative` or any other value is
+/// refused (see `exec_mode_refused`) with 409 `exec_mode_gateway_required` before the gateway is
+/// called, so nothing is evaluated, journaled, approved or executed.
+fn exec_mode_accepted(options: HttpOptions, headers: &HeaderMap) -> bool {
+    if !options.gateway_executes_effects {
+        return true;
+    }
+    let mut values = headers.get_all(EXEC_MODE_HEADER).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => {
+            value.len() <= MAX_EXEC_MODE_BYTES && value.as_bytes() == EXEC_MODE_GATEWAY.as_bytes()
+        }
+        _ => false,
+    }
+}
+
+fn exec_mode_refused() -> Response {
+    error_response(StatusCode::CONFLICT, "exec_mode_gateway_required")
+}
+
 /// Like [`router`], with explicit transport options.
 pub fn router_with_options(gateway: Arc<Gateway>, options: HttpOptions) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route(
             "/v1/execute",
-            post(move |state, body| execute(state, body, options)),
+            post(move |state, headers, body| execute(state, headers, body, options)),
         )
         .route(
             "/v1/approvals/{tenant_id}/{agent_id}/{request_id}",
-            get(approval_challenge)
-                .post(move |state, path, body| resolve_approval(state, path, body, options)),
+            get(move |state, path, headers| approval_challenge(state, path, headers, options))
+                .post(move |state, path, headers, body| {
+                    resolve_approval(state, path, headers, body, options)
+                }),
         )
         .route(
             "/v1/approvals/{tenant_id}/{agent_id}/{request_id}/status",
-            get(move |state, path| approval_status(state, path, options)),
+            get(move |state, path, headers| approval_status(state, path, headers, options)),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(gateway)
@@ -109,9 +143,13 @@ async fn health() -> StatusCode {
 
 async fn execute(
     State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
     body: Bytes,
     options: HttpOptions,
 ) -> Response {
+    if !exec_mode_accepted(options, &headers) {
+        return exec_mode_refused();
+    }
     let request = match std::str::from_utf8(&body)
         .ok()
         .and_then(|json| AuthorizationRequest::from_json(json).ok())
@@ -149,7 +187,12 @@ async fn execute(
 async fn approval_challenge(
     State(gateway): State<Arc<Gateway>>,
     Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
+    headers: HeaderMap,
+    options: HttpOptions,
 ) -> Response {
+    if !exec_mode_accepted(options, &headers) {
+        return exec_mode_refused();
+    }
     let key = crate::ExecutionKey {
         tenant_id,
         agent_id,
@@ -174,9 +217,13 @@ async fn approval_challenge(
 async fn resolve_approval(
     State(gateway): State<Arc<Gateway>>,
     Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
+    headers: HeaderMap,
     body: Bytes,
     options: HttpOptions,
 ) -> Response {
+    if !exec_mode_accepted(options, &headers) {
+        return exec_mode_refused();
+    }
     let decision = match std::str::from_utf8(&body)
         .ok()
         .and_then(|json| crate::HumanApprovalDecision::from_json(json).ok())
@@ -221,8 +268,12 @@ async fn resolve_approval(
 async fn approval_status(
     State(gateway): State<Arc<Gateway>>,
     Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
+    headers: HeaderMap,
     options: HttpOptions,
 ) -> Response {
+    if !exec_mode_accepted(options, &headers) {
+        return exec_mode_refused();
+    }
     let key = crate::ExecutionKey {
         tenant_id,
         agent_id,
@@ -387,6 +438,41 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
 mod tests {
     use super::*;
     use praetore_core::PraetoreError;
+
+    fn headers(values: &[&[u8]]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for value in values {
+            map.append(
+                EXEC_MODE_HEADER,
+                axum::http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn exec_mode_header_is_validated_strictly_only_with_gateway_effects() {
+        let on = HttpOptions {
+            gateway_executes_effects: true,
+        };
+        assert!(exec_mode_accepted(on, &headers(&[b"gateway"])));
+        for bad in [
+            &[][..],
+            &[&b"cooperative"[..]][..],
+            &[&b"Gateway"[..]][..],
+            &[&b"gateway "[..]][..],
+            &[&b""[..]][..],
+            &[&b"gatewaygatewaygateway"[..]][..],
+            &[&b"gateway"[..], &b"gateway"[..]][..],
+            &[&b"gateway"[..], &b"cooperative"[..]][..],
+        ] {
+            assert!(!exec_mode_accepted(on, &headers(bad)), "{bad:?}");
+        }
+        let off = HttpOptions::default();
+        assert!(exec_mode_accepted(off, &headers(&[])));
+        assert_eq!(exec_mode_refused().status(), StatusCode::CONFLICT);
+        assert!(exec_mode_accepted(off, &headers(&[b"cooperative"])));
+    }
 
     #[test]
     fn trusted_clock_failure_maps_to_service_unavailable() {

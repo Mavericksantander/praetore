@@ -18,6 +18,16 @@
   `HttpOptions::gateway_executes_effects`: `/status` of an approved action
   the gateway executed answers 409 `cooperative_exec_rejected`; receipts of
   gateway-executed effects carry `praetore-executed-by: gateway`.
+- **T-013 (exec mode):** with `gateway_executes_effects` (i.e. `sandbox_root`
+  set), `POST /v1/execute`, the approval challenge (`GET`), the approval
+  decision (`POST`) and `/status` require exactly one header
+  `praetore-exec-mode: gateway` (exact value, at most 16 bytes). Missing,
+  repeated, `cooperative` or any other value is answered 409
+  `exec_mode_gateway_required` before the gateway is called: on execute no
+  evaluation or journal row is created; a refused approve leaves the action
+  `requires_approval/not_dispatched` (still pending, no decision consumed).
+  Without `sandbox_root` the header is ignored. The `praetore` CLI always
+  sends it.
 
 ## 0.2.0 (not yet tagged or published)
 
