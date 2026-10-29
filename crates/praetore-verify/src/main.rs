@@ -6,7 +6,9 @@ use praetore_core::{
     identity::{AgentIdentity, VerifiedPublicKey},
     policy::Policy,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
@@ -17,6 +19,10 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_INPUT_BYTES: usize = 65_536;
+const MAX_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_JOURNAL_ENTRIES: usize = 4_096;
+const JOURNAL_LINK_DOMAIN: &[u8] = b"PRAETORE_JOURNAL_LINK_V1\0";
+const JOURNAL_GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
@@ -55,6 +61,12 @@ enum Command {
         attester_pin: PathBuf,
         issuer_pins: Option<PathBuf>,
         require_intent: bool,
+        policy: Option<PathBuf>,
+    },
+    Journal {
+        journal: PathBuf,
+        attester_pin: PathBuf,
+        policy: Option<PathBuf>,
     },
     PolicyDigest {
         policy: PathBuf,
@@ -71,7 +83,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--policy PATH] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). The journal command verifies a hash-linked JSONL export (one JSON object per line with seq, prev and evidence, seq from 0, prev of the first entry all zeros) and every receipt's signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -185,7 +197,11 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             if values.keys().any(|key| {
                 !matches!(
                     key.as_str(),
-                    "--evidence" | "--attester-pin" | "--issuer-pins" | "--require-intent"
+                    "--evidence"
+                        | "--attester-pin"
+                        | "--issuer-pins"
+                        | "--require-intent"
+                        | "--policy"
                 )
             }) {
                 return Err(CliError::usage());
@@ -195,6 +211,20 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 attester_pin: path("--attester-pin")?,
                 issuer_pins: optional_path("--issuer-pins"),
                 require_intent: values.contains_key("--require-intent"),
+                policy: optional_path("--policy"),
+            }
+        }
+        "journal" => {
+            if values
+                .keys()
+                .any(|key| !matches!(key.as_str(), "--journal" | "--attester-pin" | "--policy"))
+            {
+                return Err(CliError::usage());
+            }
+            Command::Journal {
+                journal: path("--journal")?,
+                attester_pin: path("--attester-pin")?,
+                policy: optional_path("--policy"),
             }
         }
         "policy-digest" => {
@@ -234,13 +264,19 @@ fn execute(command: Command) -> Result<Summary, CliError> {
             attester_pin,
             issuer_pins,
             require_intent,
+            policy,
         } => {
+            let policy = policy.as_deref().map(read_policy).transpose()?;
             let evidence =
                 Evidence::from_json(&read_limited(&evidence)?).map_err(CliError::from_core)?;
             let attester = read_attester_pin(&attester_pin)?;
             evidence
                 .verify_attester_signature(&attester)
                 .map_err(CliError::from_core)?;
+            if let Some(policy) = &policy {
+                verify_receipt_policy(&evidence, policy)?;
+                details.insert("policy_verified".into(), serde_json::Value::Bool(true));
+            }
             if let Some(pin_path) = issuer_pins {
                 let now = OffsetDateTime::now_utc();
                 verify_evidence_authority(&evidence, &read_issuer_pins(&pin_path)?, now)?;
@@ -272,6 +308,27 @@ fn execute(command: Command) -> Result<Summary, CliError> {
                 serde_json::Value::String(evidence.evidence_id.to_string()),
             );
             "evidence"
+        }
+        Command::Journal {
+            journal,
+            attester_pin,
+            policy,
+        } => {
+            let policy = policy.as_deref().map(read_policy).transpose()?;
+            let attester = read_attester_pin(&attester_pin)?;
+            let text = read_limited_to(&journal, MAX_JOURNAL_BYTES)?;
+            let (entries, head) = verify_journal(&text, &attester, policy.as_ref())?;
+            details.insert("entries".into(), serde_json::Value::Number(entries.into()));
+            details.insert("head".into(), serde_json::Value::String(head));
+            details.insert(
+                "policy_verified".into(),
+                serde_json::Value::Bool(policy.is_some()),
+            );
+            details.insert(
+                "verification_scope".into(),
+                serde_json::Value::String("historical_journal_integrity_and_attestation".into()),
+            );
+            "journal"
         }
         Command::PolicyDigest { policy } => {
             let policy = Policy::from_json(&read_limited(&policy)?).map_err(CliError::from_core)?;
@@ -326,13 +383,98 @@ fn execute(command: Command) -> Result<Summary, CliError> {
     })
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalEntry<'a> {
+    seq: u64,
+    prev: String,
+    #[serde(borrow)]
+    evidence: &'a RawValue,
+}
+
+/// Link hash of one journal entry. Covers the position, the previous link
+/// and the receipt's context hash and attester signature, so reordering,
+/// dropping, inserting or swapping receipts breaks the chain.
+fn journal_link(seq: u64, prev: &str, evidence: &Evidence) -> Result<String, CliError> {
+    let signature = evidence
+        .attester_signature
+        .as_deref()
+        .ok_or(CliError { code: "AUTH_FAIL" })?;
+    let mut hasher = Sha256::new();
+    hasher.update(JOURNAL_LINK_DOMAIN);
+    hasher.update(seq.to_be_bytes());
+    hasher.update(prev.as_bytes());
+    hasher.update(evidence.context_hash.as_bytes());
+    hasher.update(signature.as_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn verify_journal(
+    text: &str,
+    attester: &VerifiedPublicKey,
+    policy: Option<&Policy>,
+) -> Result<(u64, String), CliError> {
+    let chain_fail = || CliError {
+        code: "JOURNAL_CHAIN_FAIL",
+    };
+    let mut prev = JOURNAL_GENESIS.to_owned();
+    let mut seen = HashSet::new();
+    let mut count: u64 = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            return Err(chain_fail());
+        }
+        if count as usize >= MAX_JOURNAL_ENTRIES {
+            return Err(CliError {
+                code: "INPUT_TOO_LARGE",
+            });
+        }
+        let entry: JournalEntry<'_> = serde_json::from_str(line).map_err(|_| CliError {
+            code: "INVALID_REQUEST",
+        })?;
+        if entry.seq != count || entry.prev != prev {
+            return Err(chain_fail());
+        }
+        let evidence = Evidence::from_json(entry.evidence.get()).map_err(CliError::from_core)?;
+        evidence
+            .verify_attester_signature(attester)
+            .map_err(CliError::from_core)?;
+        if !seen.insert(evidence.evidence_id) {
+            return Err(chain_fail());
+        }
+        if let Some(policy) = policy {
+            verify_receipt_policy(&evidence, policy)?;
+        }
+        prev = journal_link(entry.seq, &prev, &evidence)?;
+        count += 1;
+    }
+    if count == 0 {
+        return Err(chain_fail());
+    }
+    Ok((count, prev))
+}
+
+fn read_policy(path: &Path) -> Result<Policy, CliError> {
+    Policy::from_json(&read_limited(path)?).map_err(CliError::from_core)
+}
+
+fn verify_receipt_policy(evidence: &Evidence, policy: &Policy) -> Result<(), CliError> {
+    evidence.verify_policy(policy).map_err(|_| CliError {
+        code: "POLICY_MISMATCH",
+    })
+}
+
 fn read_limited(path: &Path) -> Result<String, CliError> {
+    read_limited_to(path, MAX_INPUT_BYTES)
+}
+
+fn read_limited_to(path: &Path, limit: usize) -> Result<String, CliError> {
     let file = fs::File::open(path).map_err(|_| CliError { code: "INPUT_IO" })?;
-    let mut bytes = Vec::with_capacity(MAX_INPUT_BYTES + 1);
-    file.take((MAX_INPUT_BYTES + 1) as u64)
+    let mut bytes = Vec::with_capacity(limit.min(MAX_INPUT_BYTES) + 1);
+    file.take((limit + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|_| CliError { code: "INPUT_IO" })?;
-    if bytes.len() > MAX_INPUT_BYTES {
+    if bytes.len() > limit {
         return Err(CliError {
             code: "INPUT_TOO_LARGE",
         });
@@ -426,6 +568,7 @@ fn parse_now(value: Option<&str>) -> Result<OffsetDateTime, CliError> {
 fn command_name(args: &[String]) -> &'static str {
     match args.first().map(String::as_str) {
         Some("evidence") => "evidence",
+        Some("journal") => "journal",
         Some("policy-digest") => "policy-digest",
         Some("authority") => "authority",
         _ => "unknown",
