@@ -1,16 +1,11 @@
-//! SAF-10 property tests (docs/proposals/saf-10-recover-y-vencimiento-de-aprobaciones.md §8).
+//! SAF-10 property tests (docs/proposals/SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md §8).
 //!
 //! Decision 5: the properties are written before the implementation.
-//! - The `today` module runs against the current API (a797bea) and checks
-//!   the parts of each property that already hold without `Recover`.
-//! - The `pending` module targets the SAF-10 API decided by the CTO
+//! - The `today` module checks the parts that already held on a797bea.
+//! - The `full` module covers the SAF-10 API decided by the CTO
 //!   (29-oct-2026): one `Policy`, no layers; `Decision::recovery`,
 //!   `RecoveryObligation`, `Severity`, `PolicyEffect::Recover`,
-//!   `Policy::max_approval_ms`, rule `control_loop` / `delta_ms`. It is gated
-//!   behind the `saf10-pending` feature and does NOT compile until step 3.
-
-// `PolicyEffect` stops being `Copy` once `Recover` carries data (SAF-10 step 3).
-#![allow(clippy::clone_on_copy)]
+//!   `Policy::max_approval_ms`, rule `control_loop` / `delta_ms`.
 
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, DecisionOutcome, Policy, PolicyEffect, PolicyRule,
@@ -167,10 +162,9 @@ mod today {
     }
 }
 
-/// Written against the SAF-10 API decided by the CTO. Does not compile until
-/// step 3.
-#[cfg(feature = "saf10-pending")]
-mod pending {
+/// SAF-10 properties that need the implementation (Recover, severity,
+/// control-loop validation).
+mod full {
     use super::*;
     use praetore_core::decision::Severity;
 
@@ -274,6 +268,83 @@ mod pending {
             let rejected = Policy::from_json(&doc.to_string()).is_err();
             let expected = (fast && max.is_none()) || max.is_some_and(|max| delta < max);
             prop_assert_eq!(rejected, expected);
+        }
+    }
+
+    fn evidence(decision: praetore_core::Decision) -> praetore_core::Evidence {
+        let agent = AgentKeyPair::from_secret_bytes(&[7; 32]).identity(AgentId::new());
+        let authority = Authority::new(agent.id.clone(), "i", vec![]);
+        let action = Action::new("a", None, json!({})).unwrap();
+        praetore_core::Evidence::new(
+            uuid::Uuid::new_v4(),
+            agent,
+            authority,
+            action,
+            decision,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn obligation() -> praetore_core::RecoveryObligation {
+        praetore_core::RecoveryObligation {
+            recovery_id: "safe-hold".into(),
+            rule_id: "r".into(),
+            reason: "x".into(),
+            deadline_ms: 500,
+        }
+    }
+
+    /// Evidence v3: a recovery obligation is carried only by v3; v1 evidence
+    /// keeps verifying, and recovery cannot be smuggled into v1 or removed
+    /// from v3 without breaking integrity.
+    #[test]
+    fn p8_evidence_v3_and_v1_coexist() {
+        let v1 = evidence(praetore_core::Decision::deny("x"));
+        assert_eq!(v1.evidence_schema_version, 1);
+        assert!(v1.verify_integrity());
+        let v1_json = serde_json::to_string(&v1).unwrap();
+        assert!(!v1_json.contains("recovery"));
+        assert!(praetore_core::Evidence::from_json(&v1_json).is_ok());
+
+        let v3 = evidence(praetore_core::Decision::recover("x", obligation()));
+        assert_eq!(v3.evidence_schema_version, 3);
+        assert!(v3.verify_integrity());
+        let v3_json = serde_json::to_string(&v3).unwrap();
+        assert!(
+            praetore_core::Evidence::from_json(&v3_json)
+                .unwrap()
+                .verify_integrity()
+        );
+
+        let mut smuggled = v1.clone();
+        smuggled.decision.recovery = Some(obligation());
+        assert!(!smuggled.verify_integrity());
+        let mut relabeled = v3.clone();
+        relabeled.evidence_schema_version = 1;
+        assert!(!relabeled.verify_integrity());
+        let mut stripped = v3;
+        stripped.decision.recovery = None;
+        assert!(!stripped.verify_integrity());
+    }
+
+    /// Validation of the Recover effect itself at load time.
+    #[test]
+    fn recover_effect_requires_positive_deadline_and_identifier() {
+        for (id, deadline) in [("", 500), (" x", 500), ("safe-hold", 0)] {
+            let policy = Policy::new(
+                "p",
+                1,
+                vec![PolicyRule::new(
+                    "r",
+                    "a",
+                    PolicyEffect::Recover {
+                        recovery_id: id.into(),
+                        deadline_ms: deadline,
+                    },
+                )],
+            );
+            assert!(policy.validate().is_err(), "{id:?} {deadline}");
         }
     }
 

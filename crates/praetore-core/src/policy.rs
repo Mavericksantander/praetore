@@ -9,7 +9,7 @@ use crate::{
     canonical::{
         MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
     },
-    decision::{Decision, DecisionContribution},
+    decision::{Decision, DecisionContribution, RecoveryObligation},
     error::{PraetoreError, Result},
     identity::AgentIdentity,
 };
@@ -137,6 +137,11 @@ pub struct Policy {
     )]
     pub semantics_version: u8,
     pub rules: Vec<PolicyRule>,
+    /// SAF-10: upper bound for a human-approval window, in milliseconds.
+    /// A RequireApproval request whose signed intent window is longer is
+    /// rejected. Omitted when `None`, so existing digests do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_approval_ms: Option<u64>,
 }
 
 fn legacy_policy_semantics_version() -> u8 {
@@ -155,6 +160,7 @@ impl Policy {
             canonical_version: crate::canonical::CANONICAL_VERSION,
             semantics_version: 1,
             rules,
+            max_approval_ms: None,
         }
     }
 
@@ -219,6 +225,38 @@ impl Policy {
         }))
     }
 
+    /// SAF-10 decision 4 (CTO, 29-oct-2026): load-time coherence of human
+    /// approval against the declared control loop. Checks declarations only;
+    /// it does not measure real timings.
+    fn validate_approval_loops(&self) -> Result<()> {
+        if self.max_approval_ms == Some(0) {
+            return Err(PraetoreError::PolicyEvaluationFailed(
+                "max_approval_ms must be greater than zero".into(),
+            ));
+        }
+        for rule in &self.rules {
+            if rule.effect != PolicyEffect::RequireApproval {
+                continue;
+            }
+            match (self.max_approval_ms, rule.control_loop, rule.delta_ms) {
+                (None, Some(ControlLoop::Fast), _) => {
+                    return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                        "policy rule '{}' requires approval on the fast control loop without max_approval_ms",
+                        rule.id
+                    )));
+                }
+                (Some(max), _, Some(delta)) if delta < max => {
+                    return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                        "policy rule '{}' requires approval with delta_ms {delta} below max_approval_ms {max}",
+                        rule.id
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn digest(&self) -> Result<String> {
         self.validate()?;
         let canonical = canonical_json(self).map_err(|error| {
@@ -272,6 +310,7 @@ impl Policy {
         for rule in &self.rules {
             rule.validate()?;
         }
+        self.validate_approval_loops()?;
 
         for (index, rule) in self.rules.iter().enumerate() {
             if self.rules[..index]
@@ -318,6 +357,21 @@ pub struct PolicyRule {
     pub target: Option<String>,
     pub parameter_conditions: Vec<PolicyCondition>,
     pub context_conditions: Vec<PolicyCondition>,
+    /// SAF-10: control loop the rule governs. Omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_loop: Option<ControlLoop>,
+    /// SAF-10: declared reaction budget δ of the governed loop, in ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_ms: Option<u64>,
+}
+
+/// SAF-10: the control loop a rule governs. Human approval is never
+/// coherent on the fast loop without a declared approval bound.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlLoop {
+    Fast,
+    Slow,
 }
 
 impl PolicyRule {
@@ -334,7 +388,19 @@ impl PolicyRule {
             target: None,
             parameter_conditions: Vec::new(),
             context_conditions: Vec::new(),
+            control_loop: None,
+            delta_ms: None,
         }
+    }
+
+    pub fn with_control_loop(mut self, control_loop: ControlLoop) -> Self {
+        self.control_loop = Some(control_loop);
+        self
+    }
+
+    pub fn with_delta_ms(mut self, delta_ms: u64) -> Self {
+        self.delta_ms = Some(delta_ms);
+        self
     }
 
     pub fn with_capability(mut self, capability: impl Into<String>) -> Self {
@@ -405,10 +471,25 @@ impl PolicyRule {
     fn decision(&self) -> Result<Decision> {
         let reason = format!("Policy rule '{}' matched", self.id);
 
-        match self.effect {
+        match &self.effect {
             PolicyEffect::Allow => Ok(Decision::allow(reason)),
             PolicyEffect::Deny => Ok(Decision::deny(reason)),
             PolicyEffect::RequireApproval => Ok(Decision::require_approval(reason)),
+            PolicyEffect::Recover {
+                recovery_id,
+                deadline_ms,
+            } => {
+                let recovery = RecoveryObligation {
+                    recovery_id: recovery_id.clone(),
+                    rule_id: self.id.clone(),
+                    reason: reason.clone(),
+                    deadline_ms: *deadline_ms,
+                };
+                recovery
+                    .validate()
+                    .map_err(|message| PraetoreError::PolicyEvaluationFailed(message.into()))?;
+                Ok(Decision::recover(reason, recovery))
+            }
         }
     }
 
@@ -476,6 +557,31 @@ impl PolicyRule {
 
         validate_conditions(&self.id, "parameter", &self.parameter_conditions)?;
         validate_conditions(&self.id, "context", &self.context_conditions)?;
+
+        if let PolicyEffect::Recover {
+            recovery_id,
+            deadline_ms,
+        } = &self.effect
+        {
+            check_limit(
+                PolicyLimit::RuleIdBytes,
+                recovery_id.len(),
+                MAX_POLICY_TEXT_BYTES,
+            )?;
+            RecoveryObligation {
+                recovery_id: recovery_id.clone(),
+                rule_id: self.id.clone(),
+                reason: String::new(),
+                deadline_ms: *deadline_ms,
+            }
+            .validate()
+            .map_err(|message| {
+                PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{}': {message}",
+                    self.id
+                ))
+            })?;
+        }
 
         Ok(())
     }
@@ -921,11 +1027,17 @@ fn conditions_conflict(left: &PolicyCondition, right: &PolicyCondition) -> bool 
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PolicyEffect {
     Allow,
     Deny,
     RequireApproval,
+    /// SAF-10: deny the proposed action and oblige entry into the
+    /// predeclared safe mode `recovery_id` within `deadline_ms`.
+    Recover {
+        recovery_id: String,
+        deadline_ms: u64,
+    },
 }
 
 #[cfg(test)]
@@ -1374,8 +1486,8 @@ mod tests {
                     "precedence-test",
                     1,
                     vec![
-                        PolicyRule::new("rule-left", "read_data", *left_effect),
-                        PolicyRule::new("rule-right", "read_data", *right_effect),
+                        PolicyRule::new("rule-left", "read_data", left_effect.clone()),
+                        PolicyRule::new("rule-right", "read_data", right_effect.clone()),
                     ],
                 );
 

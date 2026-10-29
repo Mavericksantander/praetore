@@ -4,9 +4,9 @@ use praetore_core::{
     canonical::canonicalize_json, replay::AtomicAuthorizationCommit,
 };
 use praetore_gateway::{
-    ApprovalChallenge, AuthorizationStatus, ExecutionAttestation, ExecutionJournal, ExecutionKey,
-    ExecutionRecord, ExecutionStatus, HumanApprovalDecision, HumanApprovalOutcome, JournalError,
-    action_digest, authority_tenant_id,
+    ApprovalChallenge, ApprovalExpiredReceipt, AuthorizationStatus, ExecutionAttestation,
+    ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus, HumanApprovalDecision,
+    HumanApprovalOutcome, JournalError, action_digest, authority_tenant_id,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -121,7 +121,11 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
                      (SELECT decision_json FROM praetore.human_approvals ha \
                       WHERE ha.tenant_id = execution_journal.tenant_id \
                         AND ha.agent_id = execution_journal.agent_id \
-                        AND ha.request_id = execution_journal.request_id) \
+                        AND ha.request_id = execution_journal.request_id), \
+                     (SELECT receipt_json FROM praetore.human_approval_expirations hx \
+                      WHERE hx.tenant_id = execution_journal.tenant_id \
+                        AND hx.agent_id = execution_journal.agent_id \
+                        AND hx.request_id = execution_journal.request_id) \
                      FROM praetore.execution_journal \
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
                     &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -279,6 +283,17 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let evidence = Evidence::from_json(&row.get::<_, String>(2))
             .map_err(|_| JournalError::InvalidRecord)?;
         let stored_action_digest: String = row.get(3);
+        if transaction
+            .query_opt(
+                "SELECT 1 FROM praetore.human_approval_expirations \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .map_err(|_| JournalError::Unavailable)?
+            .is_some()
+        {
+            return Err(JournalError::ApprovalAlreadyRecorded);
+        }
         if authorization != AuthorizationStatus::RequiresApproval
             || execution != ExecutionStatus::NotDispatched
             || decision.challenge.tenant_id != key.tenant_id
@@ -338,6 +353,95 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 return Err(JournalError::InvalidTransition);
             }
         }
+        transaction
+            .commit()
+            .map_err(|_| JournalError::Unavailable)?;
+        Ok(())
+    }
+
+    fn record_approval_expiration(
+        &self,
+        key: ExecutionKey,
+        receipt: &ApprovalExpiredReceipt,
+    ) -> Result<(), JournalError> {
+        if receipt.key() != key {
+            return Err(JournalError::InvalidRecord);
+        }
+        let receipt_json =
+            serde_json::to_value(receipt).map_err(|_| JournalError::InvalidRecord)?;
+        let rfc3339 = &time::format_description::well_known::Rfc3339;
+        let expires_at = time::OffsetDateTime::parse(&receipt.expires_at, rfc3339)
+            .map_err(|_| JournalError::InvalidRecord)?;
+        let observed_at = time::OffsetDateTime::parse(&receipt.observed_at, rfc3339)
+            .map_err(|_| JournalError::InvalidRecord)?;
+        let mut client = self.client.lock().map_err(|_| JournalError::Unavailable)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| JournalError::Unavailable)?;
+        transaction
+            .batch_execute("SET LOCAL synchronous_commit = on")
+            .map_err(|_| JournalError::Unavailable)?;
+        set_tenant_context(&mut transaction, key.tenant_id)
+            .map_err(|_| JournalError::Unavailable)?;
+        let row = transaction
+            .query_opt(
+                "SELECT authorization_status, execution_status, evidence_json, \
+                 EXISTS (SELECT 1 FROM praetore.human_approvals ha \
+                         WHERE ha.tenant_id = execution_journal.tenant_id \
+                           AND ha.agent_id = execution_journal.agent_id \
+                           AND ha.request_id = execution_journal.request_id), \
+                 EXISTS (SELECT 1 FROM praetore.human_approval_expirations hx \
+                         WHERE hx.tenant_id = execution_journal.tenant_id \
+                           AND hx.agent_id = execution_journal.agent_id \
+                           AND hx.request_id = execution_journal.request_id) \
+                 FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .map_err(|_| JournalError::Unavailable)?
+            .ok_or(JournalError::InvalidTransition)?;
+        let authorization = parse_authorization(&row.get::<_, String>(0))?;
+        let execution = parse_execution(&row.get::<_, String>(1))?;
+        let evidence = Evidence::from_json(&row.get::<_, String>(2))
+            .map_err(|_| JournalError::InvalidRecord)?;
+        let decided: bool = row.get(3);
+        let expired: bool = row.get(4);
+        if decided {
+            return Err(JournalError::ApprovalAlreadyRecorded);
+        }
+        if expired {
+            // Idempotent: the first receipt is kept unchanged.
+            return transaction.commit().map_err(|_| JournalError::Unavailable);
+        }
+        if authorization != AuthorizationStatus::RequiresApproval
+            || execution != ExecutionStatus::NotDispatched
+            || receipt.validate_binding(&evidence).is_err()
+        {
+            return Err(JournalError::InvalidRecord);
+        }
+        transaction
+            .execute(
+                "INSERT INTO praetore.human_approval_expirations \
+                     (tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+                      action_digest, policy_digest, expires_at, observed_at, \
+                      gateway_key_id, signature, receipt_json) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                &[
+                    &key.tenant_id,
+                    &key.agent_id,
+                    &key.request_id,
+                    &receipt.evidence_id,
+                    &receipt.evidence_hash,
+                    &receipt.action_digest,
+                    &receipt.policy_digest,
+                    &expires_at,
+                    &observed_at,
+                    &receipt.gateway_key_id,
+                    &receipt.signature,
+                    &receipt_json,
+                ],
+            )
+            .map_err(|_| JournalError::Unavailable)?;
         transaction
             .commit()
             .map_err(|_| JournalError::Unavailable)?;
@@ -535,7 +639,11 @@ impl ExecutionJournal for PostgresExecutionJournal {
                  (SELECT decision_json FROM praetore.human_approvals ha \
                   WHERE ha.tenant_id = execution_journal.tenant_id \
                     AND ha.agent_id = execution_journal.agent_id \
-                    AND ha.request_id = execution_journal.request_id) \
+                    AND ha.request_id = execution_journal.request_id), \
+                 (SELECT receipt_json FROM praetore.human_approval_expirations hx \
+                  WHERE hx.tenant_id = execution_journal.tenant_id \
+                    AND hx.agent_id = execution_journal.agent_id \
+                    AND hx.request_id = execution_journal.request_id) \
                  FROM praetore.execution_journal \
                  WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -667,7 +775,11 @@ fn verify_authorization_pair(
              (SELECT decision_json FROM praetore.human_approvals ha \
               WHERE ha.tenant_id = execution_journal.tenant_id \
                 AND ha.agent_id = execution_journal.agent_id \
-                AND ha.request_id = execution_journal.request_id) \
+                AND ha.request_id = execution_journal.request_id), \
+             (SELECT receipt_json FROM praetore.human_approval_expirations hx \
+              WHERE hx.tenant_id = execution_journal.tenant_id \
+                AND hx.agent_id = execution_journal.agent_id \
+                AND hx.request_id = execution_journal.request_id) \
              FROM praetore.execution_journal \
              WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
             &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -715,7 +827,7 @@ pub(super) fn validate_evidence(
         || key.request_id != evidence.request_id
         || Some(key.tenant_id) != authority_tenant_id(&evidence.authority)
         || evidence.decision.outcome != expected
-        || evidence.evidence_schema_version != 2
+        || !evidence.is_high_assurance_shape()
         || evidence.evaluation_mode.as_deref() != Some("high_assurance")
         || !evidence.verify_integrity()
     {
@@ -728,7 +840,7 @@ fn validate_atomic_evidence(
     evidence: &Evidence,
     trusted_attester: &VerifiedPublicKey,
 ) -> Result<(), AuthorizationCommitError> {
-    if evidence.evidence_schema_version != 2
+    if !evidence.is_high_assurance_shape()
         || evidence.evaluation_mode.as_deref() != Some("high_assurance")
         || evidence.policy_digest.is_none()
         || authority_tenant_id(&evidence.authority).is_none()
@@ -812,7 +924,18 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
         .get::<_, Option<Value>>(7)
         .map(|value| serde_json::from_value(value).map_err(|_| JournalError::InvalidRecord))
         .transpose()?;
+    let approval_expiration: Option<ApprovalExpiredReceipt> = row
+        .get::<_, Option<Value>>(8)
+        .map(|value| serde_json::from_value(value).map_err(|_| JournalError::InvalidRecord))
+        .transpose()?;
     validate_evidence(key, &evidence, authorization)?;
+    if let Some(receipt) = &approval_expiration
+        && (human_approval.is_some()
+            || receipt.key() != key
+            || receipt.validate_binding(&evidence).is_err())
+    {
+        return Err(JournalError::InvalidRecord);
+    }
     let (expected_request_digest, expected_action_digest) = execution_digests(&evidence)?;
     if expected_request_digest != request_digest || expected_action_digest != action_digest {
         return Err(JournalError::InvalidRecord);
@@ -826,6 +949,7 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
         output,
         execution_attestation,
         human_approval,
+        approval_expiration,
     })
 }
 

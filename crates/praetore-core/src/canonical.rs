@@ -9,7 +9,7 @@ pub const CANONICAL_VERSION: u8 = 1;
 pub const MAX_JSON_DEPTH: usize = 32;
 pub const MAX_JSON_VALUE_BYTES: usize = 65_536;
 const MAX_JSON_NODES: usize = 16_384;
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 pub fn parse_json_rejecting_duplicates(input: &str) -> Result<Value, String> {
     if input.len() > MAX_JSON_VALUE_BYTES {

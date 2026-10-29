@@ -212,6 +212,7 @@ struct JournalEntry {
     output: Option<Value>,
     execution_attestations: Vec<praetore_gateway::ExecutionAttestation>,
     human_approval: Option<HumanApprovalDecision>,
+    approval_expiration: Option<praetore_gateway::ApprovalExpiredReceipt>,
 }
 
 impl Default for JournalEntry {
@@ -225,6 +226,7 @@ impl Default for JournalEntry {
             output: None,
             execution_attestations: Vec::new(),
             human_approval: None,
+            approval_expiration: None,
         }
     }
 }
@@ -274,6 +276,7 @@ impl MemoryJournal {
                 output: None,
                 execution_attestations: Vec::new(),
                 human_approval: None,
+                approval_expiration: None,
             },
         );
         Ok(())
@@ -498,6 +501,7 @@ impl ExecutionJournal for MemoryJournal {
             output: entry.output.clone(),
             execution_attestation: entry.execution_attestations.last().cloned(),
             human_approval: entry.human_approval.clone(),
+            approval_expiration: entry.approval_expiration.clone(),
         }))
     }
 
@@ -549,7 +553,7 @@ impl ExecutionJournal for MemoryJournal {
         {
             return Err(JournalError::InvalidTransition);
         }
-        if entry.human_approval.is_some() {
+        if entry.human_approval.is_some() || entry.approval_expiration.is_some() {
             return Err(JournalError::ApprovalAlreadyRecorded);
         }
         if decision.outcome == HumanApprovalOutcome::Approve {
@@ -557,6 +561,36 @@ impl ExecutionJournal for MemoryJournal {
             entry.execution = ExecutionStatus::Dispatched;
         }
         entry.human_approval = Some(decision.clone());
+        Ok(())
+    }
+
+    fn record_approval_expiration(
+        &self,
+        key: ExecutionKey,
+        receipt: &praetore_gateway::ApprovalExpiredReceipt,
+    ) -> Result<(), JournalError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(JournalError::Unavailable);
+        }
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
+        let entry = entries
+            .get_mut(&key)
+            .ok_or(JournalError::InvalidTransition)?;
+        if entry.human_approval.is_some() {
+            return Err(JournalError::ApprovalAlreadyRecorded);
+        }
+        if entry.approval_expiration.is_some() {
+            return Ok(());
+        }
+        let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
+        if entry.authorization != Some(AuthorizationStatus::RequiresApproval)
+            || entry.execution != ExecutionStatus::NotDispatched
+            || receipt.key() != key
+            || receipt.validate_binding(evidence).is_err()
+        {
+            return Err(JournalError::InvalidRecord);
+        }
+        entry.approval_expiration = Some(receipt.clone());
         Ok(())
     }
 }
@@ -827,9 +861,35 @@ fn approval_fixture_with_provider(
     approval_fixture_with_approver(build_provider, [34; 32])
 }
 
+fn approval_fixture_with_policy(
+    edit: impl FnOnce(&mut Policy),
+) -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
+    approval_fixture_with_approver_and_policy(|_| Arc::new(CurrentFreshness), [34; 32], edit)
+}
+
 fn approval_fixture_with_approver(
     build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
     approver_secret: [u8; 32],
+) -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
+    approval_fixture_with_approver_and_policy(build_provider, approver_secret, |_| {})
+}
+
+fn approval_fixture_with_approver_and_policy(
+    build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
+    approver_secret: [u8; 32],
+    edit: impl FnOnce(&mut Policy),
 ) -> (
     Gateway,
     AuthorizationRequest,
@@ -856,7 +916,7 @@ fn approval_fixture_with_approver(
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let mut policy = Policy::new_v2(
         "human-approval-test",
         1,
         vec![
@@ -868,6 +928,7 @@ fn approval_fixture_with_approver(
             .with_capability("local:write"),
         ],
     );
+    edit(&mut policy);
     let now = OffsetDateTime::now_utc();
     let clock = Arc::new(Mutex::new(now));
     let policy_digest = policy.digest().unwrap();
@@ -2069,9 +2130,9 @@ async fn http_expired_approval_reports_expired_resolution() {
     );
 }
 
-// SAF-10 property tests (docs/proposals/saf-10-recover-y-vencimiento-de-aprobaciones.md §8).
-// `saf10_today` runs against a797bea; `saf10_pending` targets the proposed
-// API (ApprovalExpiredReceipt, Recover) and is gated behind `saf10-pending`.
+// SAF-10 property tests (docs/proposals/SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md §8).
+// `saf10_today` holds on a797bea already; `saf10_full` needs the SAF-10
+// implementation (ApprovalExpiredReceipt, Recover, max_approval_ms).
 mod saf10_today {
     use super::*;
     use proptest::prelude::*;
@@ -2150,21 +2211,21 @@ mod saf10_today {
     }
 }
 
-/// Written against the SAF-10 gateway API decided by the CTO (29-oct-2026).
-/// Does not compile until step 3.
-#[cfg(feature = "saf10-pending")]
-mod saf10_pending {
+/// SAF-10 properties against the implemented gateway API.
+mod saf10_full {
     use super::*;
     use praetore_gateway::{ApprovalExpiredReceipt, ExpiredOutcome};
 
-    fn expired_fixture() -> (
+    type ExpiredFixture = (
         Gateway,
         ExecutionKey,
         Arc<LocalSetTool>,
         Arc<MemoryJournal>,
         SigningKey,
         Arc<Mutex<OffsetDateTime>>,
-    ) {
+    );
+
+    fn expired_fixture() -> ExpiredFixture {
         let captured_clock = Arc::new(Mutex::new(None));
         let capture = captured_clock.clone();
         let (gateway, request, tool, journal, approver_key) =
@@ -2225,7 +2286,7 @@ mod saf10_pending {
                 &time::format_description::well_known::Rfc3339
             )
             .unwrap(),
-            observed.replace_nanosecond(0).unwrap()
+            observed
         );
         assert!(record.human_approval.is_none());
         assert_eq!(record.execution, ExecutionStatus::NotDispatched);
