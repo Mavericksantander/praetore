@@ -215,11 +215,16 @@ externally protected signing/trust keys, database access controls and backups,
 and preventing the agent from reaching alternate execution paths.
 
 Apply migrations `0001_replay_claims.sql` through
-`0008_tenant_row_level_security.sql` in numeric order. Migration 0007 converts
+`0009_human_approval_expirations.sql` in numeric order. Migration 0007 converts
 execution keys and foreign keys to include the tenant UUID while retaining
 legacy unscoped claims under the reserved nil tenant. Migration 0008 enables
 and forces RLS on tenant-keyed execution tables; each database operation sets
 the verified tenant UUID transaction-locally.
+Migration 0009 (SAF-10, forward-only) adds the append-only, tenant-isolated
+`praetore.human_approval_expirations` table holding one signed
+`ApprovalExpiredReceipt` per execution key, and triggers that make a human
+decision and an expiration mutually exclusive. The journal role needs
+`SELECT, INSERT` on that table.
 Legacy orphan claims are explicitly detected by the atomic provider. Each
 authorization transaction uses the default `READ COMMITTED` isolation level,
 the replay table's `(tenant_id, agent_id, request_id)` primary key to serialize

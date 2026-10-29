@@ -25,7 +25,7 @@ use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
@@ -34,6 +34,7 @@ const MIGRATIONS: [&str; 8] = [
     include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0008_tenant_row_level_security.sql"),
+    include_str!("../../praetore-replay-postgres/migrations/0009_human_approval_expirations.sql"),
 ];
 
 struct LocalFreshnessProvider {

@@ -39,15 +39,16 @@ const APPROVER_PIN_FILE: &str = "approver-pin.json";
 const LOCAL_APPROVER_ID: &str = "local-approver";
 const MAX_POLICY_BYTES: u64 = 1_048_576;
 const AUDIENCE: &str = "praetore-local-demo";
-const REQUIRED_DATABASE_TABLES: [&str; 5] = [
+const REQUIRED_DATABASE_TABLES: [&str; 6] = [
     "praetore.replay_claims",
     "praetore.execution_journal",
     "praetore.execution_journal_events",
     "praetore.execution_attestations",
     "praetore.human_approvals",
+    "praetore.human_approval_expirations",
 ];
 
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 9] = [
     include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
@@ -56,6 +57,7 @@ const MIGRATIONS: [&str; 8] = [
     include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
     include_str!("../../praetore-replay-postgres/migrations/0008_tenant_row_level_security.sql"),
+    include_str!("../../praetore-replay-postgres/migrations/0009_human_approval_expirations.sql"),
 ];
 
 #[derive(Debug, Serialize, Deserialize)]

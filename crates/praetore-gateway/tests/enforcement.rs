@@ -212,6 +212,7 @@ struct JournalEntry {
     output: Option<Value>,
     execution_attestations: Vec<praetore_gateway::ExecutionAttestation>,
     human_approval: Option<HumanApprovalDecision>,
+    approval_expiration: Option<praetore_gateway::ApprovalExpiredReceipt>,
 }
 
 impl Default for JournalEntry {
@@ -225,6 +226,7 @@ impl Default for JournalEntry {
             output: None,
             execution_attestations: Vec::new(),
             human_approval: None,
+            approval_expiration: None,
         }
     }
 }
@@ -235,6 +237,9 @@ struct MemoryJournal {
     fail_dispatched: AtomicBool,
     fail_terminal: AtomicBool,
     unavailable: AtomicBool,
+    /// SAF-10 test hook: once an expiration receipt is stored, reads of that
+    /// record fail as if the stored receipt were unreadable.
+    unreadable_expiration: AtomicBool,
 }
 
 impl MemoryJournal {
@@ -274,6 +279,7 @@ impl MemoryJournal {
                 output: None,
                 execution_attestations: Vec::new(),
                 human_approval: None,
+                approval_expiration: None,
             },
         );
         Ok(())
@@ -489,6 +495,10 @@ impl ExecutionJournal for MemoryJournal {
         let Some(entry) = entries.get(&key) else {
             return Ok(None);
         };
+        if self.unreadable_expiration.load(Ordering::SeqCst) && entry.approval_expiration.is_some()
+        {
+            return Err(JournalError::InvalidRecord);
+        }
         Ok(Some(ExecutionRecord {
             key,
             evidence: entry.evidence.clone().ok_or(JournalError::InvalidRecord)?,
@@ -498,6 +508,7 @@ impl ExecutionJournal for MemoryJournal {
             output: entry.output.clone(),
             execution_attestation: entry.execution_attestations.last().cloned(),
             human_approval: entry.human_approval.clone(),
+            approval_expiration: entry.approval_expiration.clone(),
         }))
     }
 
@@ -549,7 +560,7 @@ impl ExecutionJournal for MemoryJournal {
         {
             return Err(JournalError::InvalidTransition);
         }
-        if entry.human_approval.is_some() {
+        if entry.human_approval.is_some() || entry.approval_expiration.is_some() {
             return Err(JournalError::ApprovalAlreadyRecorded);
         }
         if decision.outcome == HumanApprovalOutcome::Approve {
@@ -557,6 +568,36 @@ impl ExecutionJournal for MemoryJournal {
             entry.execution = ExecutionStatus::Dispatched;
         }
         entry.human_approval = Some(decision.clone());
+        Ok(())
+    }
+
+    fn record_approval_expiration(
+        &self,
+        key: ExecutionKey,
+        receipt: &praetore_gateway::ApprovalExpiredReceipt,
+    ) -> Result<(), JournalError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(JournalError::Unavailable);
+        }
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
+        let entry = entries
+            .get_mut(&key)
+            .ok_or(JournalError::InvalidTransition)?;
+        if entry.human_approval.is_some() {
+            return Err(JournalError::ApprovalAlreadyRecorded);
+        }
+        if entry.approval_expiration.is_some() {
+            return Ok(());
+        }
+        let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
+        if entry.authorization != Some(AuthorizationStatus::RequiresApproval)
+            || entry.execution != ExecutionStatus::NotDispatched
+            || receipt.key() != key
+            || receipt.validate_binding(evidence).is_err()
+        {
+            return Err(JournalError::InvalidRecord);
+        }
+        entry.approval_expiration = Some(receipt.clone());
         Ok(())
     }
 }
@@ -827,9 +868,35 @@ fn approval_fixture_with_provider(
     approval_fixture_with_approver(build_provider, [34; 32])
 }
 
+fn approval_fixture_with_policy(
+    edit: impl FnOnce(&mut Policy),
+) -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
+    approval_fixture_with_approver_and_policy(|_| Arc::new(CurrentFreshness), [34; 32], edit)
+}
+
 fn approval_fixture_with_approver(
     build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
     approver_secret: [u8; 32],
+) -> (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+) {
+    approval_fixture_with_approver_and_policy(build_provider, approver_secret, |_| {})
+}
+
+fn approval_fixture_with_approver_and_policy(
+    build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
+    approver_secret: [u8; 32],
+    edit: impl FnOnce(&mut Policy),
 ) -> (
     Gateway,
     AuthorizationRequest,
@@ -856,7 +923,7 @@ fn approval_fixture_with_approver(
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let mut policy = Policy::new_v2(
         "human-approval-test",
         1,
         vec![
@@ -868,6 +935,7 @@ fn approval_fixture_with_approver(
             .with_capability("local:write"),
         ],
     );
+    edit(&mut policy);
     let now = OffsetDateTime::now_utc();
     let clock = Arc::new(Mutex::new(now));
     let policy_digest = policy.digest().unwrap();
@@ -2060,11 +2128,335 @@ async fn http_expired_approval_reports_expired_resolution() {
         key.tenant_id, key.agent_id, key.request_id
     );
     let (status, body) = json_response(&app, "GET", &path, String::new()).await;
-    assert_eq!(
-        (status, body),
-        (
-            StatusCode::GONE,
-            json!({"code": "approval_expired", "resolution": "expired"})
-        )
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "approval_expired");
+    assert_eq!(body["resolution"], "expired");
+}
+
+// SAF-10 property tests (docs/proposals/SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md §8).
+// `saf10_today` holds on a797bea already; `saf10_full` needs the SAF-10
+// implementation (ApprovalExpiredReceipt, Recover, max_approval_ms).
+mod saf10_today {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// Property 5 (current subset): with no signed human decision and
+        /// the engine clock past `expires_at`, nothing is dispatched, the
+        /// resolution is Expired, and a late approval is refused and not
+        /// stored. (The single signed `ApprovalExpiredReceipt` is pending.)
+        #[test]
+        fn p5_no_approval_by_silence(advance in 21i64..86_400) {
+            let captured_clock = Arc::new(Mutex::new(None));
+            let capture = captured_clock.clone();
+            let (gateway, request, tool, journal, approver_key) =
+                approval_fixture_with_provider(move |clock| {
+                    *capture.lock().unwrap() = Some(clock);
+                    Arc::new(CurrentFreshness)
+                });
+            let key = pending_key(&gateway, request);
+            let late = human_approval_decision(
+                gateway.approval_challenge(key).unwrap(),
+                HumanApprovalOutcome::Approve,
+                &approver_key,
+            );
+            let clock = captured_clock.lock().unwrap().clone().unwrap();
+            *clock.lock().unwrap() += Duration::seconds(advance);
+
+            prop_assert_eq!(
+                gateway.approval_resolution(key).unwrap(),
+                praetore_gateway::ApprovalResolution::Expired
+            );
+            prop_assert!(matches!(
+                gateway.resolve_human_approval(late),
+                Err(GatewayError::Approval(ApprovalError::Expired))
+            ));
+            let record = journal.get(key).unwrap().unwrap();
+            prop_assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+            prop_assert!(record.human_approval.is_none());
+            prop_assert_eq!(tool.invocations(), 0);
+        }
+
+        /// Property 2 (dispatch part): a Deny never reaches the adapter.
+        #[test]
+        fn p2_deny_never_dispatches(_case in 0u8..4) {
+            let fixture = fixture(Some(PolicyEffect::Deny), false);
+            let receipt = fixture.gateway.execute(fixture.request).unwrap();
+            prop_assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
+            prop_assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            prop_assert_eq!(fixture.tool.invocations(), 0);
+        }
+
+        /// Property 8 (current subset): v2 evidence produced today keeps
+        /// verifying after a JSON round trip, for every outcome. There is no
+        /// frozen v2 golden vector in the repo yet (review note 5).
+        #[test]
+        fn p8_v2_evidence_round_trip_verifies(
+            effect in prop_oneof![
+                Just(Some(PolicyEffect::Allow)),
+                Just(Some(PolicyEffect::RequireApproval)),
+                Just(Some(PolicyEffect::Deny)),
+                Just(None),
+            ]
+        ) {
+            let fixture = fixture(effect, false);
+            let receipt = fixture.gateway.execute(fixture.request).unwrap();
+            let evidence = receipt.evidence;
+            prop_assert_eq!(evidence.evidence_schema_version, 2);
+            prop_assert!(evidence.verify_integrity());
+            let json = serde_json::to_string(&evidence).unwrap();
+            let parsed: Evidence = serde_json::from_str(&json).unwrap();
+            prop_assert!(parsed.verify_integrity());
+            prop_assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
+    }
+}
+
+/// SAF-10 properties against the implemented gateway API.
+mod saf10_full {
+    use super::*;
+    use praetore_gateway::{ApprovalExpiredReceipt, ExpiredOutcome};
+
+    type ExpiredFixture = (
+        Gateway,
+        ExecutionKey,
+        Arc<LocalSetTool>,
+        Arc<MemoryJournal>,
+        SigningKey,
+        Arc<Mutex<OffsetDateTime>>,
     );
+
+    fn expired_fixture() -> ExpiredFixture {
+        let captured_clock = Arc::new(Mutex::new(None));
+        let capture = captured_clock.clone();
+        let (gateway, request, tool, journal, approver_key) =
+            approval_fixture_with_provider(move |clock| {
+                *capture.lock().unwrap() = Some(clock);
+                Arc::new(CurrentFreshness)
+            });
+        let key = pending_key(&gateway, request);
+        let clock = captured_clock.lock().unwrap().clone().unwrap();
+        (gateway, key, tool, journal, approver_key, clock)
+    }
+
+    fn receipt(journal: &MemoryJournal, key: ExecutionKey) -> Option<ApprovalExpiredReceipt> {
+        journal.get(key).unwrap().unwrap().approval_expiration
+    }
+
+    /// Property 5 (full): after expiry there is no dispatch and exactly one
+    /// valid signed `ApprovalExpiredReceipt`, stable across every detection
+    /// path (status query, challenge, late resolution).
+    #[test]
+    fn p5_exactly_one_expiration_receipt() {
+        let (gateway, key, tool, journal, approver_key, clock) = expired_fixture();
+        let late = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        assert!(receipt(&journal, key).is_none());
+        *clock.lock().unwrap() += Duration::seconds(21);
+        let observed = *clock.lock().unwrap();
+
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            praetore_gateway::ApprovalResolution::Expired
+        );
+        let first = receipt(&journal, key).expect("receipt on first detection");
+        assert!(gateway.approval_challenge(key).is_err());
+        assert!(gateway.resolve_human_approval(late).is_err());
+        gateway.approval_resolution(key).unwrap();
+        let again = receipt(&journal, key).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&again).unwrap()
+        );
+
+        let record = journal.get(key).unwrap().unwrap();
+        first
+            .verify(
+                &record.evidence,
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
+        assert_eq!(first.effective_outcome, ExpiredOutcome::Deny);
+        assert_eq!(
+            OffsetDateTime::parse(
+                &first.observed_at,
+                &time::format_description::well_known::Rfc3339
+            )
+            .unwrap(),
+            observed
+        );
+        assert!(record.human_approval.is_none());
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(tool.invocations(), 0);
+
+        let mut forged = first.clone();
+        forged.request_id = Uuid::from_u128(9);
+        assert!(
+            forged
+                .verify(
+                    &record.evidence,
+                    &execution_attester_public_key(),
+                    "test-execution-attester-v1"
+                )
+                .is_err()
+        );
+    }
+
+    /// Property 6: a human decision and an expiration never coexist.
+    #[test]
+    fn p6_decision_then_expiry_keeps_only_the_decision() {
+        let (gateway, key, _, journal, approver_key, clock) = expired_fixture();
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Reject,
+            &approver_key,
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        *clock.lock().unwrap() += Duration::seconds(21);
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            praetore_gateway::ApprovalResolution::Rejected
+        );
+        let record = journal.get(key).unwrap().unwrap();
+        assert!(record.human_approval.is_some());
+        assert!(record.approval_expiration.is_none());
+    }
+
+    #[test]
+    fn p6_expiry_then_decision_is_refused_by_the_journal() {
+        let (gateway, key, _, journal, approver_key, clock) = expired_fixture();
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        *clock.lock().unwrap() += Duration::seconds(21);
+        gateway.approval_resolution(key).unwrap();
+        assert!(journal.record_human_approval(key, &decision).is_err());
+        let record = journal.get(key).unwrap().unwrap();
+        assert!(record.human_approval.is_none());
+        assert!(record.approval_expiration.is_some());
+    }
+
+    /// Property 4: a decision with recovery is NotDispatched with zero
+    /// adapter invocations, even though a signed denial attestation exists.
+    #[test]
+    fn p4_recover_never_dispatches() {
+        let fixture = fixture(
+            Some(PolicyEffect::Recover {
+                recovery_id: "safe-hold".into(),
+                deadline_ms: 500,
+            }),
+            false,
+        );
+        let receipt = fixture.gateway.execute(fixture.request).unwrap();
+        let recovery = receipt.evidence.decision.recovery.as_ref().unwrap();
+        assert_eq!(recovery.recovery_id, "safe-hold");
+        assert_eq!(receipt.evidence.evidence_schema_version, 3);
+        assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        receipt
+            .verify_execution_attestation(
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
+        assert_eq!(fixture.tool.invocations(), 0);
+        let reparsed = Evidence::from_json(&serde_json::to_string(&receipt.evidence).unwrap());
+        assert!(reparsed.unwrap().verify_integrity());
+    }
+
+    /// HTTP 410 carries the id of the persisted `ApprovalExpiredReceipt`,
+    /// both on the challenge read and on a late signed decision.
+    #[tokio::test]
+    async fn http_410_carries_the_expiration_receipt_id() {
+        let (gateway, key, tool, journal, approver_key, clock) = expired_fixture();
+        let late = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        *clock.lock().unwrap() += Duration::seconds(21);
+        let app = http_api::router(Arc::new(gateway));
+        let path = format!(
+            "/v1/approvals/{}/{}/{}",
+            key.tenant_id, key.agent_id, key.request_id
+        );
+
+        let (status, body) = json_response(&app, "GET", &path, String::new()).await;
+        let receipt = receipt(&journal, key).expect("receipt persisted on first detection");
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::GONE,
+                json!({
+                    "code": "approval_expired",
+                    "resolution": "expired",
+                    "expiration_receipt_id": receipt.receipt_id.to_string(),
+                })
+            )
+        );
+        let (status, body) =
+            json_response(&app, "POST", &path, serde_json::to_string(&late).unwrap()).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body["expiration_receipt_id"],
+            json!(receipt.receipt_id.to_string())
+        );
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// A 410 whose receipt cannot be read back omits
+    /// `expiration_receipt_id` and still dispatches nothing.
+    #[tokio::test]
+    async fn http_410_with_unreadable_receipt_omits_the_id() {
+        let (gateway, key, tool, journal, _, clock) = expired_fixture();
+        journal.unreadable_expiration.store(true, Ordering::SeqCst);
+        *clock.lock().unwrap() += Duration::seconds(21);
+        let app = http_api::router(Arc::new(gateway));
+        let path = format!(
+            "/v1/approvals/{}/{}/{}",
+            key.tenant_id, key.agent_id, key.request_id
+        );
+        let (status, body) = json_response(&app, "GET", &path, String::new()).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::GONE, json!({"code": "approval_expired"}))
+        );
+        // The receipt was persisted; only reading it back fails.
+        journal.unreadable_expiration.store(false, Ordering::SeqCst);
+        assert!(receipt(&journal, key).is_some());
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// Decision 2 (CTO): a request whose approval window exceeds
+    /// `max_approval_ms` is rejected before any record or dispatch.
+    #[test]
+    fn approval_window_longer_than_policy_bound_is_rejected() {
+        let (gateway, request, tool, journal, _) =
+            approval_fixture_with_policy(|policy| policy.max_approval_ms = Some(5_000));
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *request.agent.id.as_uuid(),
+            request_id: request.request_id,
+        };
+        assert!(gateway.execute(request).is_err());
+        assert!(journal.get(key).unwrap().is_none());
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    #[test]
+    fn approval_window_within_policy_bound_is_pending() {
+        let (gateway, request, tool, _, _) =
+            approval_fixture_with_policy(|policy| policy.max_approval_ms = Some(60_000));
+        let receipt = gateway.execute(request).unwrap();
+        assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+        assert_eq!(tool.invocations(), 0);
+    }
 }
