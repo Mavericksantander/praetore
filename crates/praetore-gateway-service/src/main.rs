@@ -25,18 +25,6 @@ use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-const MIGRATIONS: [&str; 9] = [
-    include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0004_execution_journal_events.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0005_execution_attestations.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0008_tenant_row_level_security.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0009_human_approval_expirations.sql"),
-];
-
 struct LocalFreshnessProvider {
     policy_digest: String,
 }
@@ -214,9 +202,7 @@ fn parse_tenant_issuer_bindings(
 fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_local_database_url(database_url)?;
     let mut client = Client::connect(database_url, NoTls)?;
-    for migration in MIGRATIONS {
-        client.batch_execute(migration)?;
-    }
+    praetore_replay_postgres::apply_migrations(&mut client)?;
     Ok(())
 }
 

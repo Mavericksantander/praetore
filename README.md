@@ -35,7 +35,8 @@ code or test that backs it. None of it is a security or production guarantee.
   `praetore approve` / `praetore reject` sign the gateway's approval challenge
   with a local Ed25519 approver key. The gateway verifies the signature
   against a pinned approver key, records the decision append-only in
-  `praetore.human_approvals`, and only then dispatches. A decision cannot be
+  `praetore.human_approvals` as `approved_pending_dispatch`; a separate
+  claim (`praetore dispatch`) performs the single dispatch. A decision cannot be
   reused, and a rejection is final. See the
   [CLI guide](crates/praetore-cli/README.md#human-approval) and the tests in
   [`crates/praetore-gateway/tests/enforcement.rs`](crates/praetore-gateway/tests/enforcement.rs)
