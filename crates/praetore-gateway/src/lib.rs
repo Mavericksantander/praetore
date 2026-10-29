@@ -892,6 +892,26 @@ impl GatewayReceipt {
     }
 }
 
+/// Parses a serialized [`GatewayReceipt`] and verifies its execution
+/// attestation (schema v1, v2 or v3) against a pinned key.
+///
+/// Duplicate JSON keys, unknown fields and unknown `not_dispatched_reason`
+/// values are rejected, as is a reason on anything but an approval closed
+/// without dispatch. This proves historical integrity only; it never
+/// authorizes an action.
+pub fn verify_gateway_receipt_json(
+    json: &str,
+    public_key: &praetore_core::VerifiedPublicKey,
+    expected_key_id: &str,
+) -> Result<GatewayReceipt, ExecutionAttestationError> {
+    let value = praetore_core::canonical::parse_json_rejecting_duplicates(json)
+        .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    let receipt: GatewayReceipt =
+        serde_json::from_value(value).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
+    receipt.verify_execution_attestation(public_key, expected_key_id)?;
+    Ok(receipt)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum JournalError {
     #[error("execution key has already been recorded")]
