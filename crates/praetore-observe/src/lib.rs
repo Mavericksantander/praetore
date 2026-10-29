@@ -1141,6 +1141,7 @@ mod tests {
         .unwrap();
         let attester = EvidenceAttesterKey::from_secret_bytes(&[0x32; 32]);
         let trusted_attester = attester.public_key().unwrap();
+        evidence.bind_policy_digest("cd".repeat(32)).unwrap();
         evidence.sign(&attester).unwrap();
         if !evidence_valid {
             evidence.action.parameters = json!({"value": "tampered-secret"});

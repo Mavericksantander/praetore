@@ -18,6 +18,7 @@ use crate::{
     decision::{Decision, DecisionOutcome},
     identity::{AgentIdentity, VerifiedPublicKey},
     key_rotation::KeyRotationProof,
+    policy::Policy,
 };
 
 const EVIDENCE_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V1\0";
@@ -296,7 +297,50 @@ impl Evidence {
         Ok(())
     }
 
+    /// Signs the evidence with the attester key.
+    ///
+    /// Write path: new receipts must record the full SHA-256 digest of the
+    /// active policy (see [`Policy::digest`] and [`Self::bind_policy_digest`])
+    /// before signing, so the Ed25519 signature covers which policy decided.
+    /// Receipts signed before this rule existed may lack the digest; they
+    /// still load and verify (read path), but [`Self::verify_policy`] reports
+    /// them as unbound.
     pub fn sign(&mut self, attester: &EvidenceAttesterKey) -> crate::Result<()> {
+        if !self
+            .policy_digest
+            .as_deref()
+            .is_some_and(Self::is_sha256_hex)
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence must bind the active policy digest before signing".into(),
+            ));
+        }
+        self.sign_unchecked(attester)
+    }
+
+    /// Checks that this receipt was decided under `policy`: the recorded
+    /// policy digest must be present and equal to `policy.digest()`.
+    ///
+    /// This only compares digests. Call [`Self::verify_attester_signature`]
+    /// against a pinned key to know the digest was not altered.
+    pub fn verify_policy(&self, policy: &Policy) -> crate::Result<()> {
+        let recorded = self.policy_digest.as_deref().ok_or_else(|| {
+            crate::PraetoreError::EvidenceError(
+                "evidence does not record a policy digest (legacy receipt)".into(),
+            )
+        })?;
+        let expected = policy.digest()?;
+        if recorded.len() != expected.len()
+            || !bool::from(recorded.as_bytes().ct_eq(expected.as_bytes()))
+        {
+            return Err(crate::PraetoreError::EvidenceError(
+                "evidence policy digest does not match the given policy".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn sign_unchecked(&mut self, attester: &EvidenceAttesterKey) -> crate::Result<()> {
         if !self.verify_integrity() {
             return Err(crate::PraetoreError::EvidenceError(
                 "cannot sign evidence with invalid integrity hash".into(),
@@ -840,10 +884,140 @@ mod tests {
         );
     }
 
+    fn digest_test_policy(effect: crate::policy::PolicyEffect) -> Policy {
+        Policy::new(
+            "receipt-policy",
+            3,
+            vec![crate::policy::PolicyRule::new("read", "read_data", effect)],
+        )
+    }
+
+    #[test]
+    fn signing_requires_a_bound_policy_digest() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[61; 32]);
+        let mut evidence = test_evidence();
+
+        assert!(matches!(
+            evidence.sign(&attester),
+            Err(crate::PraetoreError::EvidenceError(_))
+        ));
+        assert!(evidence.attester_signature.is_none());
+
+        evidence.policy_digest = Some("A".repeat(64));
+        evidence.context_hash = evidence.compute_context_hash().unwrap();
+        assert!(evidence.sign(&attester).is_err());
+    }
+
+    #[test]
+    fn signed_receipt_binds_the_active_policy_digest() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[62; 32]);
+        let policy = digest_test_policy(crate::policy::PolicyEffect::Allow);
+        let other = digest_test_policy(crate::policy::PolicyEffect::Deny);
+        let mut evidence = test_evidence();
+        evidence
+            .bind_policy_digest(policy.digest().unwrap())
+            .unwrap();
+        evidence.sign(&attester).unwrap();
+
+        let restored = Evidence::from_json(&evidence.to_json().unwrap()).unwrap();
+        assert!(
+            restored
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_ok()
+        );
+        assert!(restored.verify_policy(&policy).is_ok());
+        assert_ne!(policy.digest().unwrap(), other.digest().unwrap());
+        assert!(restored.verify_policy(&other).is_err());
+    }
+
+    #[test]
+    fn tampering_with_policy_digest_invalidates_attester_signature() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[63; 32]);
+        let policy = digest_test_policy(crate::policy::PolicyEffect::Allow);
+        let other = digest_test_policy(crate::policy::PolicyEffect::Deny);
+        let mut evidence = test_evidence();
+        evidence
+            .bind_policy_digest(policy.digest().unwrap())
+            .unwrap();
+        evidence.sign(&attester).unwrap();
+
+        // Swap the digest and even recompute the integrity hash: the
+        // signature must still fail because it covers the original digest.
+        let mut tampered = evidence.clone();
+        tampered.policy_digest = Some(other.digest().unwrap());
+        tampered.context_hash = tampered.compute_context_hash().unwrap();
+        assert!(tampered.verify_integrity());
+        assert!(
+            tampered
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_err()
+        );
+
+        let mut stripped = evidence;
+        stripped.policy_digest = None;
+        stripped.context_hash = stripped.compute_context_hash().unwrap();
+        assert!(
+            stripped
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn policy_digest_ignores_json_key_order_but_not_policy_content() {
+        let policy_a = digest_test_policy(crate::policy::PolicyEffect::Allow);
+        let value: Value = serde_json::to_value(&policy_a).unwrap();
+        let object = value.as_object().unwrap();
+        let mut keys: Vec<&String> = object.keys().collect();
+        keys.reverse();
+        let reordered = format!(
+            "{{{}}}",
+            keys.iter()
+                .map(|key| format!(
+                    "{}:{}",
+                    serde_json::to_string(key).unwrap(),
+                    serde_json::to_string(&object[*key]).unwrap()
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let policy_b = Policy::from_json(&reordered).unwrap();
+        assert_eq!(policy_a.digest().unwrap(), policy_b.digest().unwrap());
+
+        let mut bumped = policy_a.clone();
+        bumped.version += 1;
+        assert_ne!(policy_a.digest().unwrap(), bumped.digest().unwrap());
+    }
+
+    #[test]
+    fn legacy_signed_receipt_without_policy_digest_still_reads_and_verifies() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[64; 32]);
+        let mut legacy = test_evidence();
+        // Reproduces how receipts were signed before the digest was required.
+        legacy.sign_unchecked(&attester).unwrap();
+        let json = legacy.to_json().unwrap();
+        assert!(!json.contains("\"policy_digest\":\""));
+
+        let restored = Evidence::from_json(&json).unwrap();
+        assert!(restored.policy_digest.is_none());
+        assert!(restored.verify_integrity());
+        assert!(
+            restored
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_ok()
+        );
+        assert!(
+            restored
+                .verify_policy(&digest_test_policy(crate::policy::PolicyEffect::Allow))
+                .is_err()
+        );
+    }
+
     #[test]
     fn evidence_round_trip_exports_versioned_stable_json() {
         let attester = EvidenceAttesterKey::generate();
         let mut evidence = test_evidence();
+        evidence.bind_policy_digest(hex::encode([54; 32])).unwrap();
         evidence.sign(&attester).unwrap();
 
         let json = evidence.to_json().unwrap();
