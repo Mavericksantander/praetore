@@ -757,7 +757,31 @@ pub enum MatchOperator {
     /// Callers must therefore pass the exact path that will be used, and no
     /// downstream layer may apply NFKC normalization or percent-decoding to
     /// a value after it was authorized.
+    ///
+    /// Over-restriction (accepted, fail closed): the unsafe check runs before
+    /// the prefix comparison, so an unsafe value matches a `Deny` or
+    /// `RequireApproval` rule even when it lies outside the rule's prefix.
+    /// For example a deny rule on `/srv/secret` also denies `/home/50%.txt`
+    /// and `/home/a/../b`. The same applies to [`Self::Prefix`].
     PathPrefix,
+}
+
+fn path_prefix_segments(condition: &PolicyCondition) -> Option<Vec<&str>> {
+    condition.expected.as_str().and_then(path_segments)
+}
+
+/// An `Exact` value that is a safe path outside the `PathPrefix` can never
+/// satisfy both conditions. Unsafe exact values are not a conflict: they make
+/// the path condition unsafe, which still matches restrictive rules.
+fn exact_outside_path_prefix(exact: &PolicyCondition, prefix: &PolicyCondition) -> bool {
+    let Some(prefix) = path_prefix_segments(prefix) else {
+        return false;
+    };
+    exact
+        .expected
+        .as_str()
+        .and_then(path_segments)
+        .is_some_and(|exact| !exact.starts_with(&prefix))
 }
 
 fn is_unsafe_prefix_value(value: &str) -> bool {
@@ -880,6 +904,19 @@ fn conditions_conflict(left: &PolicyCondition, right: &PolicyCondition) -> bool 
             .as_str()
             .zip(right.expected.as_str())
             .is_some_and(|(prefix, exact)| !exact.starts_with(prefix)),
+        (MatchOperator::PathPrefix, MatchOperator::PathPrefix) => path_prefix_segments(left)
+            .zip(path_prefix_segments(right))
+            .is_some_and(|(left, right)| !left.starts_with(&right) && !right.starts_with(&left)),
+        (MatchOperator::Exact, MatchOperator::PathPrefix) => exact_outside_path_prefix(left, right),
+        (MatchOperator::PathPrefix, MatchOperator::Exact) => exact_outside_path_prefix(right, left),
+        // Conservative: only flag prefixes that are lexically unrelated, so a
+        // policy is never rejected for a satisfiable pair.
+        (MatchOperator::PathPrefix, MatchOperator::Prefix)
+        | (MatchOperator::Prefix, MatchOperator::PathPrefix) => left
+            .expected
+            .as_str()
+            .zip(right.expected.as_str())
+            .is_some_and(|(left, right)| !left.starts_with(right) && !right.starts_with(left)),
         _ => false,
     }
 }
