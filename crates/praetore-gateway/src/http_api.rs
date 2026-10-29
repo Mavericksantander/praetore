@@ -45,6 +45,11 @@ struct ResolutionResponse {
 /// exact key; 409/410 approval errors carry the same `resolution` field, and
 /// 410 also carries `expiration_receipt_id`.
 ///
+/// `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}` with a signed
+/// approval answers `{"status": "approved_pending_dispatch", ...}`: nothing
+/// has run yet. `POST .../dispatch` claims and performs the single dispatch
+/// and returns the signed receipt; it never retries.
+///
 /// `POST /v1/execute` accepts the serialized `AuthorizationRequest`. The
 /// gateway returns its signed receipt for every completed policy decision,
 /// including denials and approval requirements. Request bodies are size
@@ -60,6 +65,10 @@ pub fn router(gateway: Arc<Gateway>) -> Router {
         .route(
             "/v1/approvals/{tenant_id}/{agent_id}/{request_id}/status",
             get(approval_status),
+        )
+        .route(
+            "/v1/approvals/{tenant_id}/{agent_id}/{request_id}/dispatch",
+            post(dispatch_approved),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(gateway)
@@ -168,6 +177,26 @@ async fn resolve_approval(
         Ok(Err((error, resolution))) => approval_error_response(error, resolution),
         Err(error) => {
             tracing::error!(error = %error, "human approval task failed");
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_unavailable")
+        }
+    }
+}
+
+/// Claims and performs the single dispatch of an approved execution.
+async fn dispatch_approved(
+    State(gateway): State<Arc<Gateway>>,
+    Path((tenant_id, agent_id, request_id)): Path<(uuid::Uuid, uuid::Uuid, uuid::Uuid)>,
+) -> Response {
+    let key = crate::ExecutionKey {
+        tenant_id,
+        agent_id,
+        request_id,
+    };
+    match tokio::task::spawn_blocking(move || gateway.dispatch_approved(key)).await {
+        Ok(Ok(receipt)) => (StatusCode::OK, Json(receipt)).into_response(),
+        Ok(Err(error)) => gateway_error_response(error),
+        Err(error) => {
+            tracing::error!(error = %error, "approved dispatch task failed");
             error_response(StatusCode::SERVICE_UNAVAILABLE, "gateway_unavailable")
         }
     }
@@ -282,6 +311,12 @@ fn gateway_error_response(error: GatewayError) -> Response {
         }
         GatewayError::Journal(JournalError::ApprovalAlreadyRecorded) => {
             error_response(StatusCode::CONFLICT, "approval_not_pending")
+        }
+        GatewayError::Journal(JournalError::InvalidTransition) => {
+            error_response(StatusCode::CONFLICT, "execution_state_conflict")
+        }
+        GatewayError::Journal(JournalError::ApprovalExpired) => {
+            error_response(StatusCode::GONE, "approval_expired")
         }
         GatewayError::Journal(_)
         | GatewayError::OutcomeNotRecorded(_)

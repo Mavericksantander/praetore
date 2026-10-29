@@ -53,6 +53,7 @@ When a policy rule has effect `RequireApproval`, `praetore demo` returns
 ```sh
 praetore approve ./praetore-local <request_id> --approver local-approver
 praetore reject  ./praetore-local <request_id> --approver local-approver
+praetore dispatch ./praetore-local <request_id>   # after approve, runs it once
 ```
 
 `<request_id>` is `evidence.request_id` from the demo receipt. Pass
@@ -63,7 +64,9 @@ the challenge from the existing `GET /v1/approvals/{tenant_id}/{agent_id}/{reque
 endpoint, signs it with `approver.key`, and posts it to the same path. The
 gateway verifies the Ed25519 signature against the pin, records the decision
 in `praetore.human_approvals` (append-only, one decision per execution) and
-only then dispatches. A decision cannot be reused, a rejection is final, an
+answers `approved_pending_dispatch`: the action has not run. `praetore
+dispatch` then claims and performs the single dispatch (never retried; an
+expired or already-claimed approval is refused). A decision cannot be reused, a rejection is final, an
 approver key equal to the requesting agent key is refused, and the approval
 window is short: it ends at the earlier of the intent expiry (60 s) and the
 local freshness lease (30 s), after which the gateway answers
