@@ -115,6 +115,16 @@ fn initialize_test_database() {
             ))
             .expect("reapply tenant row-level security migration safely");
         client
+            .batch_execute(include_str!(
+                "../migrations/0009_human_approval_expirations.sql"
+            ))
+            .expect("install append-only approval expirations");
+        client
+            .batch_execute(include_str!(
+                "../migrations/0009_human_approval_expirations.sql"
+            ))
+            .expect("reapply approval expiration migration safely");
+        client
             .batch_execute(
                 "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
                      tenant_id UUID NOT NULL, agent_id UUID NOT NULL, request_id UUID NOT NULL, \
@@ -167,7 +177,11 @@ fn initialize_test_database() {
                      TO praetore_replay_test; \
                  GRANT SELECT, INSERT ON praetore.execution_attestations \
                      TO praetore_replay_test; \
+                 REVOKE ALL ON TABLE praetore.human_approval_expirations \
+                     FROM praetore_replay_test; \
                  GRANT SELECT, INSERT ON praetore.human_approvals \
+                     TO praetore_replay_test; \
+                 GRANT SELECT, INSERT ON praetore.human_approval_expirations \
                      TO praetore_replay_test; \
                  GRANT SELECT ON praetore.execution_journal_events \
                      TO praetore_replay_test; \
@@ -622,6 +636,14 @@ impl ExecutionJournal for CommitFaultJournal {
     ) -> Result<(), JournalError> {
         self.inner.record_human_approval(key, decision)
     }
+
+    fn record_approval_expiration(
+        &self,
+        key: ExecutionKey,
+        receipt: &praetore_gateway::ApprovalExpiredReceipt,
+    ) -> Result<(), JournalError> {
+        self.inner.record_approval_expiration(key, receipt)
+    }
 }
 
 struct PostgresGatewayFixture {
@@ -637,6 +659,7 @@ struct PostgresGatewayFixture {
 
 struct PostgresApprovalFixture {
     gateway: Gateway,
+    engine: AuthorizationEngine,
     request: AuthorizationRequest,
     adapter: Arc<PostgresTestAdapter>,
     approver_key: SigningKey,
@@ -715,6 +738,23 @@ fn create_postgres_gateway(request_id: Uuid) -> PostgresGatewayFixture {
 }
 
 fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture {
+    create_postgres_approval_gateway_with_clock(request_id, None)
+}
+
+/// Advanceable engine clock for SAF-10 expiry tests.
+#[derive(Clone)]
+struct SharedClock(Arc<std::sync::Mutex<OffsetDateTime>>);
+
+impl praetore_core::engine::Clock for SharedClock {
+    fn now(&self) -> OffsetDateTime {
+        *self.0.lock().unwrap()
+    }
+}
+
+fn create_postgres_approval_gateway_with_clock(
+    request_id: Uuid,
+    clock: Option<SharedClock>,
+) -> PostgresApprovalFixture {
     initialize_test_database();
     let agent_key = AgentKeyPair::from_secret_bytes(&[81; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[82; 32]);
@@ -769,7 +809,11 @@ fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture
         .with_audience("postgres-test-gateway")
         .with_replay_guard(Arc::new(connect_guard()))
         .with_freshness_provider(Arc::new(TestFreshness));
-    let engine = AuthorizationEngine::production(policy, config).unwrap();
+    let engine = match clock {
+        Some(clock) => AuthorizationEngine::production_with_clock(policy, config, clock),
+        None => AuthorizationEngine::production(policy, config),
+    }
+    .unwrap();
     let adapter = Arc::new(PostgresTestAdapter::new(None));
     let approver_key = SigningKey::from_bytes(&[84; 32]);
     let verifier = HumanApprovalVerifier::new(
@@ -778,7 +822,7 @@ fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture
     )
     .unwrap();
     let gateway = Gateway::new(
-        engine,
+        engine.clone(),
         Arc::new(connect_journal()),
         adapter.clone(),
         execution_attester(),
@@ -787,6 +831,7 @@ fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture
     .with_human_approval_verifier(verifier);
     PostgresApprovalFixture {
         gateway,
+        engine,
         request,
         adapter,
         approver_key,
@@ -954,7 +999,9 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
 
 fn database_rows_for_request(table: &str, request_id: Uuid) -> i64 {
     let query = match table {
-        "praetore.replay_claims" | "praetore.execution_journal" => {
+        "praetore.replay_claims"
+        | "praetore.execution_journal"
+        | "praetore.human_approval_expirations" => {
             format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1 AND request_id = $2")
         }
         _ => panic!("unsupported test table"),
@@ -1894,5 +1941,265 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
             ]);
         }
         _ => panic!("PRAETORE_TEST_JOURNAL_RESTART_PHASE must be before or after"),
+    }
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_approval_expiration_is_signed_unique_exclusive_and_append_only() {
+    // Start slightly ahead so the intent (signed at host time) is already valid.
+    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
+        OffsetDateTime::now_utc() + Duration::seconds(1),
+    )));
+    let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let pending = fixture.gateway.execute(fixture.request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let challenge = fixture.gateway.approval_challenge(key).unwrap();
+    let mut late = HumanApprovalDecision {
+        schema_version: 1,
+        approval_id: Uuid::new_v4(),
+        approver_key_id: "postgres-human-approver-v1".into(),
+        challenge,
+        outcome: HumanApprovalOutcome::Approve,
+        signature: String::new(),
+    };
+    late.signature = hex::encode(
+        fixture
+            .approver_key
+            .sign(&late.signing_message().unwrap())
+            .to_bytes(),
+    );
+    *clock.0.lock().unwrap() += Duration::seconds(21);
+
+    assert_eq!(
+        fixture.gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+    assert!(
+        fixture
+            .gateway
+            .resolve_human_approval(late.clone())
+            .is_err()
+    );
+    assert!(fixture.gateway.approval_challenge(key).is_err());
+    assert_eq!(
+        fixture.gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+
+    let record = connect_journal().get(key).unwrap().unwrap();
+    let receipt = record
+        .approval_expiration
+        .clone()
+        .expect("expiration receipt");
+    receipt
+        .verify(
+            &record.evidence,
+            &execution_attester_public_key(),
+            "postgres-test-execution-attester-v1",
+        )
+        .unwrap();
+    assert!(record.human_approval.is_none());
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        database_rows_for_request("praetore.human_approval_expirations", key.request_id),
+        1
+    );
+
+    // Idempotent re-record keeps the first receipt; a late human decision is
+    // refused by the journal and by the database trigger.
+    connect_journal()
+        .record_approval_expiration(key, &receipt)
+        .unwrap();
+    assert!(matches!(
+        connect_journal().record_human_approval(key, &late),
+        Err(JournalError::ApprovalAlreadyRecorded)
+    ));
+    let mut admin = connect_client();
+    assert!(
+        admin
+            .execute(
+                "INSERT INTO praetore.human_approvals \
+                     (approval_id, tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+                      action_digest, policy_digest, outcome, approver_key_id, expires_at, \
+                      decision_json) \
+                 SELECT $1, tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+                      action_digest, policy_digest, 'approve', 'x', expires_at, receipt_json \
+                 FROM praetore.human_approval_expirations \
+                 WHERE tenant_id = $2 AND agent_id = $3 AND request_id = $4",
+                &[
+                    &Uuid::new_v4(),
+                    &key.tenant_id,
+                    &key.agent_id,
+                    &key.request_id
+                ],
+            )
+            .is_err()
+    );
+    for statement in [
+        "UPDATE praetore.human_approval_expirations SET gateway_key_id = 'x' \
+         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+        "DELETE FROM praetore.human_approval_expirations \
+         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+    ] {
+        assert!(
+            admin
+                .execute(statement, &[&key.tenant_id, &key.agent_id, &key.request_id])
+                .is_err(),
+            "{statement}"
+        );
+    }
+    assert!(
+        admin
+            .batch_execute("TRUNCATE praetore.human_approval_expirations")
+            .is_err()
+    );
+
+    assert_eq!(
+        receipt.receipt_id,
+        connect_journal()
+            .get(key)
+            .unwrap()
+            .unwrap()
+            .approval_expiration
+            .unwrap()
+            .receipt_id
+    );
+
+    // Row-level security: the least-privilege role sees the row only under
+    // its own tenant context.
+    let mut client = connect_journal_client();
+    let count = |client: &mut Client, tenant: Uuid| -> i64 {
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .execute(
+                "SELECT set_config('praetore.tenant_id', $1, true)",
+                &[&tenant.to_string()],
+            )
+            .unwrap();
+        let rows: i64 = transaction
+            .query_one(
+                "SELECT count(*) FROM praetore.human_approval_expirations \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .unwrap()
+            .get(0);
+        transaction.commit().unwrap();
+        rows
+    };
+    assert_eq!(count(&mut client, TEST_TENANT_ID), 1);
+    assert_eq!(count(&mut client, Uuid::from_u128(2)), 0);
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_journal_row_with_expiration_receipt_cannot_be_deleted() {
+    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
+        OffsetDateTime::now_utc() + Duration::seconds(1),
+    )));
+    let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let pending = fixture.gateway.execute(fixture.request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    *clock.0.lock().unwrap() += Duration::seconds(21);
+    assert_eq!(
+        fixture.gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+
+    // RESTRICT semantics without a FK (0009 trigger): blocked even for the
+    // owner role, and before any FK check from other tables runs.
+    let error = connect_client()
+        .execute(
+            "DELETE FROM praetore.execution_journal \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .expect_err("journal delete must be blocked");
+    assert!(
+        error.as_db_error().is_some_and(|db| db
+            .message()
+            .contains("referenced by an approval expiration")),
+        "{error:?}"
+    );
+    assert_eq!(database_journal_count(key), 1);
+    assert_eq!(
+        database_rows_for_request("praetore.human_approval_expirations", key.request_id),
+        1
+    );
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_concurrent_expiration_detection_records_exactly_one_receipt() {
+    for _ in 0..20 {
+        let clock = SharedClock(Arc::new(std::sync::Mutex::new(
+            OffsetDateTime::now_utc() + Duration::seconds(1),
+        )));
+        let fixture =
+            create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+        let pending = fixture.gateway.execute(fixture.request).unwrap();
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        *clock.0.lock().unwrap() += Duration::seconds(21);
+        // Two gateways, each with its own journal connection, same database.
+        let second = Gateway::new(
+            fixture.engine.clone(),
+            Arc::new(connect_journal()),
+            fixture.adapter.clone(),
+            execution_attester(),
+        )
+        .unwrap();
+        let gateways = [fixture.gateway.clone(), second];
+        let barrier = Arc::new(std::sync::Barrier::new(gateways.len()));
+        let results: Vec<_> = gateways
+            .into_iter()
+            .map(|gateway| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    gateway.approval_resolution(key)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        for result in &results {
+            assert_eq!(
+                result.as_ref().ok(),
+                Some(&praetore_gateway::ApprovalResolution::Expired),
+                "{results:?}"
+            );
+        }
+        assert_eq!(
+            database_rows_for_request("praetore.human_approval_expirations", key.request_id),
+            1
+        );
+        let record = connect_journal().get(key).unwrap().unwrap();
+        record
+            .approval_expiration
+            .expect("one receipt")
+            .verify(
+                &record.evidence,
+                &execution_attester_public_key(),
+                "postgres-test-execution-attester-v1",
+            )
+            .unwrap();
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(database_invocation_count(key), 0);
     }
 }

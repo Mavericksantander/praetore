@@ -23,6 +23,7 @@ tracing = "0.1"
 uuid = "1.18"
 
 [dev-dependencies]
+proptest = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
