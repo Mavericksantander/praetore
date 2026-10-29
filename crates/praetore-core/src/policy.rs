@@ -283,13 +283,25 @@ impl PolicyRule {
             return false;
         }
 
-        let restrictive = semantics_version >= 2 && self.effect != PolicyEffect::Allow;
-        self.parameter_conditions.iter().all(|condition| {
-            condition.matches(&action.parameters, restrictive) != ConditionMatch::False
-        }) && self
-            .context_conditions
+        // Deny and RequireApproval rules are "restrictive".
+        let deny_like = self.effect != PolicyEffect::Allow;
+        let restrictive = semantics_version >= 2 && deny_like;
+        let holds = |result: ConditionMatch| match result {
+            ConditionMatch::True => true,
+            ConditionMatch::False => false,
+            // Missing or mistyped value: matches restrictive rules under v2 only.
+            ConditionMatch::Unknown => restrictive,
+            // Unsafe path-like value: always matches Deny/RequireApproval and
+            // never matches Allow, in every semantics version (fail closed).
+            ConditionMatch::UnsafeValue => deny_like,
+        };
+        self.parameter_conditions
             .iter()
-            .all(|condition| condition.matches_map(context, restrictive) != ConditionMatch::False)
+            .all(|condition| holds(condition.matches(&action.parameters, restrictive)))
+            && self
+                .context_conditions
+                .iter()
+                .all(|condition| holds(condition.matches_map(context, restrictive)))
     }
 
     fn decision(&self) -> Result<Decision> {
@@ -387,6 +399,15 @@ impl PolicyCondition {
         Self::new(key, MatchOperator::Prefix, Value::String(expected.into()))
     }
 
+    /// Path-aware prefix match. See [`MatchOperator::PathPrefix`].
+    pub fn path_prefix(key: impl Into<String>, expected: impl Into<String>) -> Self {
+        Self::new(
+            key,
+            MatchOperator::PathPrefix,
+            Value::String(expected.into()),
+        )
+    }
+
     pub fn one_of(key: impl Into<String>, expected: Vec<Value>) -> Self {
         Self::new(key, MatchOperator::In, Value::Array(expected))
     }
@@ -423,8 +444,28 @@ impl PolicyCondition {
                 }
             }
             MatchOperator::Prefix => match (actual.as_str(), self.expected.as_str()) {
+                // Mitigation: values that may escape the prefix as a path
+                // (`..` segment, any `%`, NUL) are unsafe, see `holds`.
+                (Some(actual), Some(_)) if is_unsafe_prefix_value(actual) => {
+                    ConditionMatch::UnsafeValue
+                }
                 (Some(actual), Some(prefix)) if actual.starts_with(prefix) => ConditionMatch::True,
                 (Some(_), Some(_)) => ConditionMatch::False,
+                _ => ConditionMatch::Unknown,
+            },
+            MatchOperator::PathPrefix => match (actual.as_str(), self.expected.as_str()) {
+                (Some(actual), Some(prefix)) => {
+                    match (path_segments(actual), path_segments(prefix)) {
+                        (Some(actual), Some(prefix)) if actual.starts_with(&prefix) => {
+                            ConditionMatch::True
+                        }
+                        (Some(_), Some(_)) => ConditionMatch::False,
+                        (None, _) => ConditionMatch::UnsafeValue,
+                        // Rule prefixes are validated on load; unreachable in
+                        // a validated policy, and never matches Allow.
+                        (Some(_), None) => ConditionMatch::Unknown,
+                    }
+                }
                 _ => ConditionMatch::Unknown,
             },
             MatchOperator::In => {
@@ -498,6 +539,14 @@ impl PolicyCondition {
                     "policy rule '{rule_id}' prefix condition must use a non-empty string"
                 )));
             }
+            MatchOperator::PathPrefix
+                if self.expected.as_str().and_then(path_segments).is_none() =>
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{rule_id}' path prefix must be an absolute, normalized path \
+                     without '.', '..', empty segments, '\\', '%' or NUL"
+                )));
+            }
             MatchOperator::In
                 if self
                     .expected
@@ -530,6 +579,8 @@ enum ConditionMatch {
     True,
     False,
     Unknown,
+    /// A string value that is unsafe for a path-like operator.
+    UnsafeValue,
 }
 
 fn same_json_type(left: &Value, right: &Value) -> bool {
@@ -549,14 +600,75 @@ fn same_json_type(left: &Value, right: &Value) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatchOperator {
     Exact,
+    /// Lexical string prefix. Not path-aware: use [`Self::PathPrefix`] for
+    /// paths.
+    ///
+    /// Mitigation against path traversal: a value with a `..` segment (split
+    /// on `/` or `\\`), any `%` (upper, lower or mixed case escapes; the
+    /// engine does not percent-decode) or a NUL is treated as unsafe. An
+    /// unsafe value always matches `Deny` and `RequireApproval` rules and
+    /// never matches `Allow` rules, under every semantics version.
+    ///
+    /// See [`Self::PathPrefix`] for the lexical limits that also apply here.
     Prefix,
     In,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
     LessThanOrEqual,
+    /// Path prefix on whole segments, purely lexical.
+    ///
+    /// Both the rule prefix and the value must be absolute (`/`-rooted) and
+    /// already normalized: no `.` or `..` segments, no empty segments
+    /// (`//`), no `\\`, no NUL and no `%` at all. A single trailing `/` is
+    /// allowed. `/srv/agent` matches `/srv/agent` and `/srv/agent/x`, not
+    /// `/srv/agentx`. A rule prefix that breaks these rules is rejected when
+    /// the policy loads. A value that breaks them is unsafe: it always
+    /// matches `Deny` and `RequireApproval` rules and never matches `Allow`
+    /// rules, under every semantics version.
+    ///
+    /// Lexical limits (the check is byte/char based, nothing is normalized):
+    /// - the filesystem is never consulted, so symlinks are out of scope;
+    /// - Unicode look-alikes are not folded: fullwidth `．．` (U+FF0E),
+    ///   division slash `∕` (U+2215) and similar are ordinary characters;
+    /// - spaces are significant (`" .."` and `".. "` are not `..`);
+    /// - `...` is an ordinary segment name.
+    ///
+    /// Callers must therefore pass the exact path that will be used, and no
+    /// downstream layer may apply NFKC normalization or percent-decoding to
+    /// a value after it was authorized.
+    PathPrefix,
+}
+
+fn is_unsafe_prefix_value(value: &str) -> bool {
+    has_dot_dot_segment(value) || value.contains(['%', '\0'])
+}
+
+fn has_dot_dot_segment(value: &str) -> bool {
+    value.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Segments of an absolute, normalized path, or `None` if it is not one.
+fn path_segments(path: &str) -> Option<Vec<&str>> {
+    if !path.starts_with('/') || path.contains(['\\', '%', '\0']) {
+        return None;
+    }
+    let body = &path[1..];
+    let body = body.strip_suffix('/').unwrap_or(body);
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let segments: Vec<&str> = body.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+    {
+        return None;
+    }
+    Some(segments)
 }
 
 fn compare_numeric(actual: &Value, expected: &Value) -> Option<Ordering> {
