@@ -188,4 +188,4 @@ Discrepancias:
 
 ### Limitación conocida
 
-- Los checks previos a la política niegan **sin evaluar las reglas Recover**: por ejemplo, una autoridad que no permite la capacidad, una intención inválida o un fallo de frescura. En esos casos la decisión es Deny sin `recovery`, aunque la política tenga una regla Recover que habría coincidido. No hay paso a modo seguro por esa vía.
+- Los checks previos a la política niegan **sin evaluar las reglas Recover**. Si la autoridad no permite la capacidad pedida, la decisión es Deny sin `recovery`, aunque la política tenga una regla Recover que habría coincidido. Los fallos de identidad, intención, frescura o reloj rechazan la solicitud con error antes de evaluar la política y tampoco producen obligación. No hay paso a modo seguro por esas vías.
