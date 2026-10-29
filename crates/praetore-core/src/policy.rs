@@ -19,9 +19,11 @@ use crate::{
 // with `PraetoreError::PolicyLimitExceeded`; nothing is skipped or ignored.
 // The policy engine has no regular expressions, so there is no pattern limit.
 
-/// Maximum number of rules in a policy. Chosen so that a policy at the limit
-/// still fits in `MAX_JSON_VALUE_BYTES` of canonical JSON.
-pub const MAX_POLICY_RULES: usize = 256;
+/// Maximum number of rules in a policy, checked before the canonical size.
+/// Set above what fits in `MAX_JSON_VALUE_BYTES` (468 minimal rules with ids
+/// `r0`..`r467`), so the canonical size stays the binding limit and no policy
+/// that was valid before this constant became public is rejected by it.
+pub const MAX_POLICY_RULES: usize = 512;
 /// Maximum parameter conditions, and separately context conditions, per rule.
 pub const MAX_CONDITIONS_PER_RULE: usize = 128;
 /// Maximum UTF-8 bytes of a policy id, rule id, action type, capability,

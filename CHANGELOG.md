@@ -10,8 +10,10 @@
   - Existing, now public: `MAX_CONDITIONS_PER_RULE` = 128 (per scope),
     `MAX_POLICY_TEXT_BYTES` = 1024 (ids, action type, target, condition key),
     canonical policy size `MAX_JSON_VALUE_BYTES` = 65 536.
-  - Breaking: `MAX_POLICY_RULES` lowered from 1024 to 256. 1024 rules could
-    never fit in 64 KiB of canonical JSON, so the old value was unreachable.
+  - `MAX_POLICY_RULES` = 512 (was 1024, unreachable). It sits above what
+    fits in 64 KiB of canonical JSON (468 minimal rules), so the canonical
+    size remains the binding limit and no previously valid policy is
+    rejected by the rule count.
   - New: capability length (`MAX_POLICY_TEXT_BYTES`),
     `MAX_CONDITION_STRING_BYTES` = 1024 (strings and object keys inside
     expected values), `MAX_CONDITION_SET_VALUES` = 256 (array values),
