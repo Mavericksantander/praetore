@@ -1210,6 +1210,7 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "praetore-core",
+ "praetore-gateway",
  "pyo3",
 ]
 
@@ -1234,6 +1235,7 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "praetore-core",
+ "praetore-gateway",
  "serde",
  "serde_json",
  "time",

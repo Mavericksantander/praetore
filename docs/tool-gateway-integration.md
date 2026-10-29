@@ -487,11 +487,24 @@ The HTTP flow is:
    challenge, path IDs, and expiration. PostgreSQL rechecks the pending
    execution and expiry while holding the journal row lock.
 5. PostgreSQL stores the decision append-only. For `approve`, it records the
-   approval and moves the journal to `Dispatched` in the same transaction.
-   Only then does the gateway invoke the adapter with the action in persisted
-   evidence. `reject` is recorded and never dispatches. The original
+   approval and moves the journal to `approved_pending_dispatch` in the same
+   transaction. Nothing runs yet: the response is
+   `{"status": "approved_pending_dispatch", "decision": ...}`. `reject` is
+   recorded, never dispatches, and returns
+   `{"status": "rejected", "decision": ..., "receipt": ...}`. The original
    authorization remains `RequiresApproval`; the human decision does not
    rewrite it as `ALLOW`.
+6. `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}/dispatch` claims the
+   single dispatch: under the row lock it revalidates the stored approval
+   against the engine clock and moves `approved_pending_dispatch` to
+   `dispatched` only if exactly one row changes. Only then is the adapter
+   invoked; the response is the signed receipt. A concurrent or repeated claim
+   gets 409. If the window closed first, or revalidation fails, the execution
+   is closed as `not_dispatched` with a signed attestation (schema version 3)
+   whose `not_dispatched_reason` is `approval_expired` or `dispatch_failed`.
+   `Gateway::reconcile` closes an unclaimed approval left by a crash the same
+   way with `crash_recovered`. There is no re-dispatch: a closed approval
+   cannot be claimed again; submit a new request.
 
 An approval is valid only until the earlier of the signed intent expiration
 and the freshness lease expiration. Once expired, the request cannot be

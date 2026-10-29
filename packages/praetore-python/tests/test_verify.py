@@ -47,5 +47,44 @@ class EvidenceVerificationTests(unittest.TestCase):
         )
 
 
+class GatewayReceiptVerificationTests(unittest.TestCase):
+    KEY_ID = "test-execution-attester-v1"
+
+    def setUp(self) -> None:
+        self.v3 = (FIXTURES / "receipt-v3-crash-recovered.json").read_text(
+            encoding="utf-8"
+        )
+        self.v2 = (FIXTURES / "receipt-v2-confirmed.json").read_text(encoding="utf-8")
+        self.pin = (FIXTURES / "execution-attester-public-key.hex").read_text(
+            encoding="ascii"
+        ).strip()
+
+    def verify(self, receipt: str) -> bool:
+        return praetore.verify_gateway_receipt(receipt, self.pin, self.KEY_ID)
+
+    def test_accepts_v3_with_reason_and_v2(self) -> None:
+        self.assertIn('"schema_version":3', self.v3)
+        self.assertIn('"not_dispatched_reason":"crash_recovered"', self.v3)
+        self.assertTrue(self.verify(self.v3))
+        self.assertTrue(self.verify(self.v2))
+
+    def test_rejects_unknown_reason(self) -> None:
+        forged = self.v3.replace('"crash_recovered"', '"operator_override"')
+        self.assertNotEqual(forged, self.v3)
+        self.assertFalse(self.verify(forged))
+
+    def test_rejects_swapped_or_missing_reason(self) -> None:
+        swapped = self.v3.replace('"crash_recovered"', '"approval_expired"')
+        self.assertFalse(self.verify(swapped))
+        missing = self.v3.replace(',"not_dispatched_reason":"crash_recovered"', "")
+        self.assertNotEqual(missing, self.v3)
+        self.assertFalse(self.verify(missing))
+
+    def test_rejects_wrong_key_and_malformed_input(self) -> None:
+        self.assertFalse(praetore.verify_gateway_receipt(self.v3, "00" * 32, self.KEY_ID))
+        self.assertFalse(praetore.verify_gateway_receipt(self.v3, self.pin, "other-key"))
+        self.assertFalse(self.verify("{"))
+
+
 if __name__ == "__main__":
     unittest.main()

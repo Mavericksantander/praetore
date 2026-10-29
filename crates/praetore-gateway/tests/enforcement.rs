@@ -20,8 +20,8 @@ use praetore_gateway::{
     ActionDispatcher, ApprovalError, AuthorizationStatus, DispatchError, DispatchReport,
     ExecutionAttestationError, ExecutionAttestationSigner, ExecutionJournal, ExecutionKey,
     ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
-    HumanApprovalOutcome, HumanApprovalVerifier, JournalError, ReconciliationReport,
-    authority_tenant_id,
+    HumanApprovalOutcome, HumanApprovalResult, HumanApprovalVerifier, JournalError,
+    NotDispatchedReason, ReconciliationReport, authority_tenant_id,
 };
 use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
@@ -335,7 +335,9 @@ impl AtomicAuthorizationCommit for MemoryJournal {
                 JournalError::ConflictingRequest => AuthorizationCommitError::ConflictingRequest,
                 JournalError::OrphanedReplayClaim => AuthorizationCommitError::OrphanedReplayClaim,
                 JournalError::Unavailable => AuthorizationCommitError::Unavailable,
-                JournalError::ApprovalAlreadyRecorded => AuthorizationCommitError::InvalidRecord,
+                JournalError::ApprovalAlreadyRecorded | JournalError::ApprovalExpired => {
+                    AuthorizationCommitError::InvalidRecord
+                }
                 JournalError::InvalidTransition | JournalError::InvalidRecord => {
                     AuthorizationCommitError::InvalidRecord
                 }
@@ -524,11 +526,18 @@ impl ExecutionJournal for MemoryJournal {
         let entry = entries
             .get_mut(&key)
             .ok_or(JournalError::InvalidTransition)?;
-        if entry.execution != ExecutionStatus::Authorized {
-            return Err(JournalError::InvalidTransition);
-        }
         let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
         let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
+        let from = match (authorization, attestation.not_dispatched_reason) {
+            (AuthorizationStatus::Allowed, None) => ExecutionStatus::Authorized,
+            (AuthorizationStatus::RequiresApproval, Some(_)) => {
+                ExecutionStatus::ApprovedPendingDispatch
+            }
+            _ => return Err(JournalError::InvalidTransition),
+        };
+        if entry.execution != from {
+            return Err(JournalError::InvalidTransition);
+        }
         attestation
             .validate_binding(
                 evidence,
@@ -547,9 +556,18 @@ impl ExecutionJournal for MemoryJournal {
         &self,
         key: ExecutionKey,
         decision: &HumanApprovalDecision,
+        now: OffsetDateTime,
     ) -> Result<(), JournalError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
+        }
+        let expires_at = OffsetDateTime::parse(
+            &decision.challenge.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| JournalError::InvalidRecord)?;
+        if expires_at <= now {
+            return Err(JournalError::InvalidRecord);
         }
         let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
         let entry = entries
@@ -564,10 +582,41 @@ impl ExecutionJournal for MemoryJournal {
             return Err(JournalError::ApprovalAlreadyRecorded);
         }
         if decision.outcome == HumanApprovalOutcome::Approve {
-            entry.states.push(ExecutionStatus::Dispatched);
-            entry.execution = ExecutionStatus::Dispatched;
+            entry.states.push(ExecutionStatus::ApprovedPendingDispatch);
+            entry.execution = ExecutionStatus::ApprovedPendingDispatch;
         }
         entry.human_approval = Some(decision.clone());
+        Ok(())
+    }
+
+    fn claim_dispatch(&self, key: ExecutionKey, now: OffsetDateTime) -> Result<(), JournalError> {
+        if self.unavailable.load(Ordering::SeqCst) {
+            return Err(JournalError::Unavailable);
+        }
+        let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
+        let entry = entries
+            .get_mut(&key)
+            .ok_or(JournalError::InvalidTransition)?;
+        if entry.authorization != Some(AuthorizationStatus::RequiresApproval)
+            || entry.execution != ExecutionStatus::ApprovedPendingDispatch
+        {
+            return Err(JournalError::InvalidTransition);
+        }
+        let decision = entry
+            .human_approval
+            .as_ref()
+            .filter(|decision| decision.outcome == HumanApprovalOutcome::Approve)
+            .ok_or(JournalError::InvalidRecord)?;
+        let expires_at = OffsetDateTime::parse(
+            &decision.challenge.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| JournalError::InvalidRecord)?;
+        if expires_at <= now {
+            return Err(JournalError::ApprovalExpired);
+        }
+        entry.states.push(ExecutionStatus::Dispatched);
+        entry.execution = ExecutionStatus::Dispatched;
         Ok(())
     }
 
@@ -1070,30 +1119,52 @@ fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
     let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
     let resolution = gateway.resolve_human_approval(decision.clone()).unwrap();
 
-    assert_eq!(resolution.decision, decision);
+    // Approval only records intent: nothing ran yet.
+    let HumanApprovalResult::ApprovedPendingDispatch {
+        decision: approved_decision,
+    } = resolution
+    else {
+        panic!("approval must report approved_pending_dispatch");
+    };
+    assert_eq!(approved_decision, decision);
+    assert_eq!(tool.invocations(), 0);
     assert_eq!(
-        resolution.receipt.authorization,
-        AuthorizationStatus::RequiresApproval
+        journal.get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
     );
-    assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+
+    let receipt = gateway.dispatch_approved(key).unwrap();
+    assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     assert_eq!(tool.value("mode"), Some(json!("approved")));
     assert_eq!(tool.invocations(), 1);
     assert_eq!(
         journal.get(key).unwrap().unwrap().human_approval,
         Some(decision.clone())
     );
-    resolution
-        .receipt
+    receipt
         .verify_execution_attestation(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
         .unwrap();
     assert!(matches!(
-        gateway.resolve_human_approval(resolution.decision),
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+    assert!(matches!(
+        gateway.dispatch_approved(key),
         Err(GatewayError::Approval(ApprovalError::NotPending))
     ));
     assert_eq!(tool.invocations(), 1);
+    assert_eq!(
+        journal.entry(key).unwrap().states,
+        vec![
+            ExecutionStatus::ApprovedPendingDispatch,
+            ExecutionStatus::Dispatched,
+            ExecutionStatus::Confirmed
+        ]
+    );
 }
 
 #[test]
@@ -1121,18 +1192,32 @@ fn approved_action_is_not_dispatched_if_freshness_expires_during_approval_commit
 
     assert!(matches!(
         gateway.resolve_human_approval(decision.clone()),
-        Err(GatewayError::Authorization(
-            PraetoreError::FreshnessCheckFailed(FreshnessError::Expired)
-        ))
+        Ok(HumanApprovalResult::ApprovedPendingDispatch { .. })
+    ));
+    // The window closes before the claim: never dispatched, closed with a
+    // signed approval_expired reason instead of a failed execution.
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::Expired))
     ));
     assert_eq!(tool.value("mode"), None);
     assert_eq!(tool.invocations(), 0);
     let record = journal.get(key).unwrap().unwrap();
-    assert_eq!(record.execution, ExecutionStatus::Failed);
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
     assert_eq!(record.human_approval, Some(decision.clone()));
+    let attestation = record.execution_attestation.unwrap();
+    assert_eq!(attestation.execution, ExecutionStatus::NotDispatched);
     assert_eq!(
-        record.execution_attestation.unwrap().execution,
-        ExecutionStatus::Failed
+        attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalExpired)
+    );
+    assert_eq!(attestation.schema_version, 3);
+    assert!(
+        !journal
+            .entry(key)
+            .unwrap()
+            .states
+            .contains(&ExecutionStatus::Dispatched)
     );
     assert!(matches!(
         gateway.resolve_human_approval(decision),
@@ -1176,15 +1261,23 @@ fn rejected_human_approval_is_persisted_without_dispatch() {
         HumanApprovalOutcome::Reject,
         &approver_key,
     );
-    let resolution = gateway.resolve_human_approval(decision).unwrap();
+    let HumanApprovalResult::Rejected { decision, receipt } =
+        gateway.resolve_human_approval(decision).unwrap()
+    else {
+        panic!("a rejection must return its receipt");
+    };
 
-    assert_eq!(resolution.receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
     assert_eq!(tool.value("mode"), None);
     assert_eq!(tool.invocations(), 0);
     assert_eq!(
         journal.get(key).unwrap().unwrap().human_approval.unwrap(),
-        resolution.decision
+        decision
     );
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
     assert!(matches!(
         gateway.approval_challenge(key),
         Err(GatewayError::Approval(ApprovalError::NotPending))
@@ -1293,6 +1386,7 @@ async fn http_human_approval_resumes_the_pending_execution() {
     assert_eq!(tool.invocations(), 0);
 
     let response = app
+        .clone()
         .oneshot(http_body_request(
             "POST",
             &format!(
@@ -1305,9 +1399,34 @@ async fn http_human_approval_resumes_the_pending_execution() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 65_536).await.unwrap();
-    let resolution: praetore_gateway::HumanApprovalReceipt = serde_json::from_slice(&body).unwrap();
-    assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+    let resolution: Value = serde_json::from_slice(&body).unwrap();
+    // The approval response never suggests the action ran.
+    assert_eq!(resolution["status"], "approved_pending_dispatch");
+    assert!(resolution.get("receipt").is_none());
+    assert!(resolution.get("execution").is_none());
+    assert_eq!(tool.invocations(), 0);
+
+    let dispatch_path = format!(
+        "/v1/approvals/{}/{}/{}/dispatch",
+        key.tenant_id, key.agent_id, key.request_id
+    );
+    let response = app
+        .clone()
+        .oneshot(http_body_request("POST", &dispatch_path, String::new()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 65_536).await.unwrap();
+    let receipt: praetore_gateway::GatewayReceipt = serde_json::from_slice(&body).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     assert_eq!(tool.value("mode"), Some(json!("approved")));
+    assert_eq!(tool.invocations(), 1);
+
+    let response = app
+        .oneshot(http_body_request("POST", &dispatch_path, String::new()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(tool.invocations(), 1);
 }
 
@@ -1953,6 +2072,12 @@ fn approval_resolution_reports_pending_then_approved() {
         gateway.approval_resolution(key).unwrap(),
         praetore_gateway::ApprovalResolution::Approved
     );
+    assert_eq!(tool.invocations(), 0);
+    gateway.dispatch_approved(key).unwrap();
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Approved
+    );
     assert_eq!(tool.invocations(), 1);
 }
 
@@ -2338,7 +2463,8 @@ mod saf10_full {
         );
         *clock.lock().unwrap() += Duration::seconds(21);
         gateway.approval_resolution(key).unwrap();
-        assert!(journal.record_human_approval(key, &decision).is_err());
+        let now = *clock.lock().unwrap();
+        assert!(journal.record_human_approval(key, &decision, now).is_err());
         let record = journal.get(key).unwrap().unwrap();
         assert!(record.human_approval.is_none());
         assert!(record.approval_expiration.is_some());
@@ -2458,5 +2584,292 @@ mod saf10_full {
         let receipt = gateway.execute(request).unwrap();
         assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
         assert_eq!(tool.invocations(), 0);
+    }
+}
+
+/// approved_pending_dispatch (APD) against the in-memory journal.
+mod apd {
+    use super::*;
+    use proptest::prelude::*;
+
+    type ClockedFixture = (
+        Gateway,
+        ExecutionKey,
+        Arc<LocalSetTool>,
+        Arc<MemoryJournal>,
+        SigningKey,
+        Arc<Mutex<OffsetDateTime>>,
+    );
+
+    fn clocked_fixture() -> ClockedFixture {
+        let captured_clock = Arc::new(Mutex::new(None));
+        let capture = captured_clock.clone();
+        let (gateway, request, tool, journal, approver_key) =
+            approval_fixture_with_provider(move |clock| {
+                *capture.lock().unwrap() = Some(clock);
+                Arc::new(CurrentFreshness)
+            });
+        let key = pending_key(&gateway, request);
+        let clock = captured_clock.lock().unwrap().clone().unwrap();
+        (gateway, key, tool, journal, approver_key, clock)
+    }
+
+    fn approve(gateway: &Gateway, key: ExecutionKey, approver_key: &SigningKey) {
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            approver_key,
+        );
+        assert!(matches!(
+            gateway.resolve_human_approval(decision),
+            Ok(HumanApprovalResult::ApprovedPendingDispatch { .. })
+        ));
+    }
+
+    /// Receipts consumed by the external verifiers (praetore-verify and the
+    /// Python package). `UPDATE_RECEIPT_FIXTURES=1` regenerates them; by
+    /// default the committed files must still verify.
+    #[test]
+    fn receipt_fixtures_for_external_verifiers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/praetore-python/tests/fixtures");
+        let key_id = "test-execution-attester-v1";
+        let public_key = execution_attester_public_key();
+        if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some() {
+            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            let closed = gateway.reconcile(key).unwrap();
+            assert_eq!(closed.execution_attestation.schema_version, 3);
+            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            let dispatched = gateway.dispatch_approved(key).unwrap();
+            assert_eq!(dispatched.execution_attestation.schema_version, 2);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, receipt) in [
+                ("receipt-v3-crash-recovered.json", &closed),
+                ("receipt-v2-confirmed.json", &dispatched),
+            ] {
+                std::fs::write(dir.join(name), serde_json::to_string(receipt).unwrap()).unwrap();
+            }
+            std::fs::write(
+                dir.join("execution-attester-public-key.hex"),
+                hex::encode(public_key.as_bytes()),
+            )
+            .unwrap();
+        }
+        let v3 = std::fs::read_to_string(dir.join("receipt-v3-crash-recovered.json")).unwrap();
+        let receipt =
+            praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id).unwrap();
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(NotDispatchedReason::CrashRecovered)
+        );
+        let v2 = std::fs::read_to_string(dir.join("receipt-v2-confirmed.json")).unwrap();
+        praetore_gateway::verify_gateway_receipt_json(&v2, &public_key, key_id).unwrap();
+        // Unknown reason: rejected at parse time.
+        let unknown = v3.replace("\"crash_recovered\"", "\"operator_override\"");
+        assert_ne!(unknown, v3);
+        assert!(matches!(
+            praetore_gateway::verify_gateway_receipt_json(&unknown, &public_key, key_id),
+            Err(ExecutionAttestationError::InvalidPayload)
+        ));
+        // A different known reason breaks the signature.
+        let swapped = v3.replace("\"crash_recovered\"", "\"approval_expired\"");
+        assert!(matches!(
+            praetore_gateway::verify_gateway_receipt_json(&swapped, &public_key, key_id),
+            Err(ExecutionAttestationError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn reconcile_closes_apd_as_crash_recovered_without_the_adapter() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        let receipt = gateway.reconcile(key).unwrap();
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(NotDispatchedReason::CrashRecovered)
+        );
+        receipt
+            .verify_execution_attestation(
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
+        assert_eq!(tool.invocations(), 0);
+        assert_eq!(
+            journal.entry(key).unwrap().states,
+            vec![
+                ExecutionStatus::ApprovedPendingDispatch,
+                ExecutionStatus::NotDispatched
+            ]
+        );
+        // No re-dispatch after recovery.
+        assert!(matches!(
+            gateway.dispatch_approved(key),
+            Err(GatewayError::Approval(ApprovalError::NotPending))
+        ));
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    #[test]
+    fn engine_clock_expiry_before_claim_closes_as_approval_expired() {
+        let (gateway, key, tool, journal, approver_key, clock) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        *clock.lock().unwrap() += Duration::seconds(21);
+        assert!(matches!(
+            gateway.dispatch_approved(key),
+            Err(GatewayError::Approval(ApprovalError::Expired))
+        ));
+        let record = journal.get(key).unwrap().unwrap();
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert!(record.approval_expiration.is_none());
+        assert_eq!(
+            record.execution_attestation.unwrap().not_dispatched_reason,
+            Some(NotDispatchedReason::ApprovalExpired)
+        );
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    #[test]
+    fn receipts_and_attestations_never_carry_apd_or_a_stray_reason() {
+        let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        let closed = gateway.reconcile(key).unwrap();
+        let key_id = "test-execution-attester-v1";
+        let public_key = execution_attester_public_key();
+
+        let mut forged = closed.clone();
+        forged.execution = ExecutionStatus::ApprovedPendingDispatch;
+        forged.execution_attestation.execution = ExecutionStatus::ApprovedPendingDispatch;
+        assert!(
+            forged
+                .verify_execution_attestation(&public_key, key_id)
+                .is_err()
+        );
+
+        // The reason is signed: changing or removing it breaks verification.
+        let mut changed = closed.clone();
+        changed.execution_attestation.not_dispatched_reason =
+            Some(NotDispatchedReason::DispatchFailed);
+        assert!(
+            changed
+                .verify_execution_attestation(&public_key, key_id)
+                .is_err()
+        );
+        let mut removed = closed.clone();
+        removed.execution_attestation.not_dispatched_reason = None;
+        assert!(
+            removed
+                .verify_execution_attestation(&public_key, key_id)
+                .is_err()
+        );
+        let mut downgraded = closed;
+        downgraded.execution_attestation.schema_version = 2;
+        assert!(
+            downgraded
+                .verify_execution_attestation(&public_key, key_id)
+                .is_err()
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Op {
+        Approve,
+        Reject,
+        Expire,
+        Claim,
+        Reconcile,
+        Crash,
+    }
+
+    fn op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            Just(Op::Approve),
+            Just(Op::Reject),
+            Just(Op::Expire),
+            Just(Op::Claim),
+            Just(Op::Reconcile),
+            Just(Op::Crash),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// For arbitrary sequences of approve, reject, expire, claim,
+        /// reconcile and crash (a crash drops in-flight work; recovery is a
+        /// reconcile): the adapter runs at most once, `Dispatched` is always
+        /// preceded by `ApprovedPendingDispatch`, an expiry before the claim
+        /// never reaches `Dispatched`, and a closed APD never reopens.
+        #[test]
+        fn apd_sequences_dispatch_at_most_once(ops in prop::collection::vec(op(), 1..12)) {
+            let (gateway, key, tool, journal, approver_key, clock) = clocked_fixture();
+            let challenge = gateway.approval_challenge(key).unwrap();
+            let mut expired_before_claim = false;
+            for op in ops {
+                let claimed = journal
+                    .entry(key)
+                    .unwrap()
+                    .states
+                    .contains(&ExecutionStatus::Dispatched);
+                match op {
+                    Op::Approve | Op::Reject => {
+                        let outcome = if matches!(op, Op::Approve) {
+                            HumanApprovalOutcome::Approve
+                        } else {
+                            HumanApprovalOutcome::Reject
+                        };
+                        let decision =
+                            human_approval_decision(challenge.clone(), outcome, &approver_key);
+                        let _ = gateway.resolve_human_approval(decision);
+                    }
+                    Op::Expire => {
+                        *clock.lock().unwrap() += Duration::seconds(21);
+                        if !claimed {
+                            expired_before_claim = true;
+                        }
+                    }
+                    Op::Claim => {
+                        let _ = gateway.dispatch_approved(key);
+                    }
+                    Op::Crash => {
+                        // A crash may strike after the claim but before the
+                        // adapter call: claim with the journal only.
+                        if let Ok(pending) = gateway.pending_dispatch(key) {
+                            let _ = gateway.claim_dispatch(pending);
+                        }
+                        let _ = gateway.reconcile(key);
+                    }
+                    Op::Reconcile => {
+                        let _ = gateway.reconcile(key);
+                    }
+                }
+                let states = journal.entry(key).unwrap().states;
+                prop_assert!(tool.invocations() <= 1);
+                if let Some(dispatched) =
+                    states.iter().position(|s| *s == ExecutionStatus::Dispatched)
+                {
+                    prop_assert!(dispatched > 0);
+                    prop_assert_eq!(
+                        states[dispatched - 1],
+                        ExecutionStatus::ApprovedPendingDispatch
+                    );
+                    prop_assert!(!expired_before_claim);
+                }
+                prop_assert!(
+                    states
+                        .iter()
+                        .filter(|s| **s == ExecutionStatus::ApprovedPendingDispatch)
+                        .count()
+                        <= 1
+                );
+                // The adapter only ever runs after a durable claim.
+                if tool.invocations() == 1 {
+                    prop_assert!(states.contains(&ExecutionStatus::Dispatched));
+                }
+            }
+        }
     }
 }
