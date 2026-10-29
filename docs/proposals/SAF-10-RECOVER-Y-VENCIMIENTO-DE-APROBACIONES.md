@@ -34,39 +34,42 @@ Alcance: semántica de decisión y evidencia. Para autonomía física aplica sol
   - Revisado en `3db7b5e`, en `origin/main` (`a797bea`) y en las ramas `feat/receipt-decided-by`, `feat/receipt-policy-hash-v2` y `feat/t013-sandbox-dispatcher`.
   - Ninguna tiene migraciones posteriores a `0008`.
 
-## 3. Cambios de tipos propuestos (pseudocódigo, sin implementar)
+## 3. Cambios de tipos (revisado por el CTO, 29-oct-2026: una sola Policy, sin capas)
 
 ```text
 // praetore-core (sin cambios en el enum)
 enum DecisionOutcome { Allow, RequireApproval, Deny }
 
 struct RecoveryObligation {
-    recovery_id: String,        // modo seguro predeclarado en el piso o el tenant
-    source_layer: Floor | Tenant,
-    rule_id: String,
+    recovery_id: String,   // modo seguro predeclarado en la política
+    rule_id: String,       // regla Recover que la originó
     reason: String,
-    deadline: Duration,         // T_recover_max, acotado
+    deadline_ms: u64,      // T_recover_max, > 0
 }
 
 struct Decision {
     outcome: DecisionOutcome,
     reason: String,
     contributions: Vec<DecisionContribution>,
-    recovery: Option<RecoveryObligation>,   // nuevo
+    recovery: Option<RecoveryObligation>,   // nuevo; omitido si None
 }
-// Invariante: recovery.is_some()  =>  outcome != Allow
+// Invariante: recovery.is_some()  =>  outcome == Deny (rechazado al deserializar)
 // Severidad efectiva: sev(d) = Recover si recovery.is_some(), si no, outcome
 //                     Recover > Deny > RequireApproval > Allow
 
-enum PolicyEffect { Allow, Deny, RequireApproval, Recover { recovery_id, deadline } }
+enum PolicyEffect { Allow, Deny, RequireApproval, Recover { recovery_id, deadline_ms } }
 // Recover como efecto de regla produce outcome = Deny + recovery = Some(..)
 
-// Composición
-fn compose(floor: Decision, tenant: Decision) -> Decision {
-    outcome  = strongest(floor.outcome, tenant.outcome)   // deny gana en admisión
-    recovery = floor.recovery.or(tenant.recovery)          // la del piso gana; nunca se descarta
-    if recovery.is_some() && outcome == Allow { outcome = Deny }
-}
+struct Policy { ..., max_approval_ms: Option<u64> }          // nuevo, opcional
+struct PolicyRule { ..., control_loop: Option<fast|slow>, delta_ms: Option<u64> }  // nuevos, opcionales
+// Los campos nuevos llevan skip_serializing_if = None: el digest de una política
+// sin ellos no cambia y no se sube canonical_version ni semantics_version.
+
+// Combinación entre reglas que coinciden dentro de una sola Policy
+strongest(a, b):
+    outcome  = a.outcome.strongest(b.outcome)
+    recovery = a.recovery.or(b.recovery)        // una obligación nunca se descarta
+    if recovery.is_some() { outcome = Deny }
 
 // Gateway
 enum ApprovalResolution { Pending, Approved, Rejected, Expired }   // sin cambios
@@ -80,20 +83,20 @@ struct ApprovalExpiredReceipt {
 }
 ```
 
-- Compatibilidad: `Decision` y `Evidence` usan `deny_unknown_fields`. El campo `recovery` exige subir la versión del schema de evidencia, y la evidencia v2 sin `recovery` tiene que seguir verificando.
+- Compatibilidad: `Decision` y `Evidence` usan `deny_unknown_fields`. La evidencia que lleva `recovery` es v3; la evidencia v1 y v2 sin `recovery` sigue verificando.
 
-## 4. Composición piso × tenant
+## 4. Combinación entre reglas de una sola Policy
 
-| piso \ tenant | Allow | RequireApproval | Deny | Recover |
+| regla A \ regla B | Allow | RequireApproval | Deny | Recover |
 |---|---|---|---|---|
-| Allow | Allow | RequireApproval | Deny | Deny + recovery(tenant) |
-| RequireApproval | RequireApproval | RequireApproval | Deny | Deny + recovery(tenant) |
-| Deny | Deny | Deny | Deny | Deny + recovery(tenant) |
-| Recover | Deny + recovery(piso) | Deny + recovery(piso) | Deny + recovery(piso) | Deny + recovery(piso) |
+| Allow | Allow | RequireApproval | Deny | Deny + recovery(B) |
+| RequireApproval | RequireApproval | RequireApproval | Deny | Deny + recovery(B) |
+| Deny | Deny | Deny | Deny | Deny + recovery(B) |
+| Recover | Deny + recovery(A) | Deny + recovery(A) | Deny + recovery(A) | Deny + recovery |
 
-- La admisión de la acción propuesta sigue `strongest`, de modo que deny gana.
-- La obligación de recuperación del piso **no se descarta** por un Deny de otra capa (decisión 2, alternativa A). Es una divergencia deliberada con XACML 3.0 §7.18, que descarta las obligaciones de la rama perdedora.
-- El tenant puede agregar una recuperación, pero no puede quitar ni reemplazar la del piso.
+- La admisión sigue `strongest`, de modo que deny gana.
+- Una regla Recover conserva su obligación aunque otra regla niegue (decisión 2, alternativa A). Es una divergencia deliberada con XACML 3.0 §7.18.
+- **Trabajo futuro:** la composición piso × tenant (dos capas de política) no se implementa en SAF-10.
 
 ## 5. Semántica del timeout de aprobación
 
@@ -114,26 +117,27 @@ struct ApprovalExpiredReceipt {
 - Restricción de exclusión: una misma `(agent_id, request_id)` no puede tener a la vez una fila en `human_approvals` y otra en `human_approval_expirations`. Esto se verifica en la transacción con la fila del journal bloqueada.
 - Hay que definir si es reversible; la nota 06 señala que hoy las migraciones no lo son.
 
-## 7. Validación (decisión 4)
+## 7. Validación (decisión 4; revisada por el CTO, 29-oct-2026)
 
-- Las reglas declaran `loop: fast | slow` (por defecto `slow`) y, opcionalmente, `delta_ms`.
+- `Policy.max_approval_ms: Option<u64>` acota el plazo de aprobación. Una solicitud cuyo plazo pedido es mayor se rechaza.
+- Las reglas declaran opcionalmente `control_loop: fast | slow` y `delta_ms`.
 - Errores al cargar la política:
-  - Una regla `RequireApproval` con `loop: fast`.
-  - Una regla `RequireApproval` con `delta_ms < T_approval_ms`.
+  - Una regla `RequireApproval` con `control_loop = fast` cuando `max_approval_ms` es None.
+  - Una regla `RequireApproval` con `delta_ms < max_approval_ms`.
   - Una regla `Deny` o `RequireApproval` sobre una acción `safety:*`. Esto queda como **aviso** si se mantiene el lint externo de SAF-09.
 - La validación no prueba tiempos reales. Solo verifica que lo declarado sea coherente.
 
 ## 8. Tests de propiedad (van primero, decisión 5)
 
-1. **Endurecimiento:** para todo `r`, piso y `T`, `sev(compose(piso,T)(r)) ≥ sev(piso(r))`.
-2. **Deny gana en admisión:** si alguna capa da Deny, entonces `outcome == Deny` y no hay despacho.
-3. **Recover del piso no se suprime:** si `piso(r).recovery == Some(x)`, entonces `compose(piso,T)(r).recovery == Some(x)` para todo `T`.
-4. **Recover nunca despacha:** `recovery.is_some()` implica que no existe ningún recibo de ejecución de `action_digest`.
+1. **Endurecimiento:** para toda política y regla adicional `x`, `sev(eval(P + x)) ≥ sev(eval(P))`.
+2. **Deny gana en admisión:** si alguna regla que coincide da Deny, entonces `outcome == Deny` y no hay despacho.
+3. **Recover no se suprime:** si alguna regla que coincide es Recover, entonces `recovery.is_some()` aunque otra regla niegue.
+4. **Recover nunca despacha:** `recovery.is_some()` implica `ExecutionStatus::NotDispatched` y cero invocaciones del adaptador, aunque exista la attestation de negación.
 5. **No hay aprobación por silencio:** para toda traza sin decisión humana firmada en la que `now > expires_at`, no hay despacho y existe exactamente un `ApprovalExpiredReceipt` válido.
 6. **Exclusión:** nunca coexisten una decisión humana y un vencimiento para la misma clave.
-7. **Álgebra de `compose`:** asociativa e idempotente, y conmutativa en `outcome`.
-8. **Compatibilidad:** la evidencia v2 existente verifica sin cambios.
-9. **Validación:** se rechaza `RequireApproval` con `loop: fast` o con `delta_ms < T_approval_ms`.
+7. **Álgebra de la combinación de reglas:** `strongest` es asociativa e idempotente y conmutativa en `outcome`; el orden de las reglas no cambia el outcome.
+8. **Compatibilidad:** la evidencia v2 existente verifica sin cambios, y el digest de una política sin campos nuevos es el mismo que en main (vector fijo).
+9. **Validación:** se rechaza `RequireApproval` con `control_loop = fast` sin `max_approval_ms`, o con `delta_ms < max_approval_ms`.
 
 ## 9. Pendientes
 
@@ -162,13 +166,13 @@ Confirmado:
 - `Decision`, `DecisionContribution`, `Evidence` y `PolicyRule` usan `deny_unknown_fields`.
 
 Discrepancias:
-1. **[decisión] No existe composición piso × tenant.** En `a797bea` hay una sola `Policy` por motor (`Policy::evaluate_with_context` combina reglas con `Decision::strongest`). No hay tipos `Floor`/`Tenant`, ni `compose`, ni dos capas de política. §3, §4 y los tests 1, 3 y 7 suponen una capa de piso que no existe; falta decidir dónde vive (motor, gateway o configuración) y cómo se carga.
-2. **[decisión] No existe `T_approval_ms` como valor configurable.** El plazo de aprobación se deriva por solicitud de `intent.expires_at` y `freshness_valid_until`; no se conoce al cargar la política. La validación de §7 (`delta_ms < T_approval_ms`, test 9) necesita una cota estática que hoy no existe.
-3. **`loop` es palabra reservada en Rust.** El campo de regla `loop: fast | slow` requiere otro nombre en Rust (p. ej. `r#loop` o `loop_kind` con `#[serde(rename = "loop")]`). Como `PolicyRule` usa `deny_unknown_fields` y entra en `Policy::digest`, agregar `loop`/`delta_ms` cambia el formato de política: hay que decidir si sube `canonical_version`/`semantics_version` o si los campos son opcionales y omitidos al serializar (para no cambiar el digest de políticas existentes). **[decisión]**
+1. **RESUELTA por el CTO (29-oct-2026): sin compose ni capas; una sola Policy, piso × tenant queda como trabajo futuro (§3, §4, §8).** ~~No existe composición piso × tenant.** En `a797bea` hay una sola `Policy` por motor (`Policy::evaluate_with_context` combina reglas con `Decision::strongest`). No hay tipos `Floor`/`Tenant`, ni `compose`, ni dos capas de política. §3, §4 y los tests 1, 3 y 7 suponen una capa de piso que no existe; falta decidir dónde vive (motor, gateway o configuración) y cómo se carga.~~
+2. **RESUELTA por el CTO: `Policy.max_approval_ms: Option<u64>` (§7).** ~~No existe `T_approval_ms` como valor configurable.** El plazo de aprobación se deriva por solicitud de `intent.expires_at` y `freshness_valid_until`; no se conoce al cargar la política. La validación de §7 (`delta_ms < T_approval_ms`, test 9) necesita una cota estática que hoy no existe.~~
+3. **RESUELTA por el CTO: el campo se llama `control_loop`; campos nuevos opcionales con `skip_serializing_if`, sin subir versión, con test de vector fijo del digest.** ~~`loop` es palabra reservada en Rust.~~ El campo de regla `loop: fast | slow` requiere otro nombre en Rust (p. ej. `r#loop` o `loop_kind` con `#[serde(rename = "loop")]`). Como `PolicyRule` usa `deny_unknown_fields` y entra en `Policy::digest`, agregar `loop`/`delta_ms` cambia el formato de política: hay que decidir si sube `canonical_version`/`semantics_version` o si los campos son opcionales y omitidos al serializar (para no cambiar el digest de políticas existentes). **[decisión]**
 4. **Versionado de evidencia.** La evidencia actual es `evidence_schema_version` 1 o 2 (`evidence.rs:184-187`; `engine.rs:697,748` exigen 2 en HighAssurance). Agregar `recovery` a `Decision` (con `deny_unknown_fields`) implica v3 y cambios en `has_v2_fields`/`has_complete_v2_fields` y en las comprobaciones de `engine.rs`. Consistente con §3; se anota la ubicación.
 5. **No hay fixture de evidencia v2 en el repo.** `docs/golden/` contiene `agent-key-fingerprint-v1`, `canonical-policy-v1` y `trust-chain-v1`; no hay evidencia v2 congelada. El test 8 ("la evidencia v2 existente verifica sin cambios") hoy solo puede ejercitarse con evidencia v2 generada en el test, no con un vector dorado. Conviene agregar `docs/golden/evidence-v2.json` antes del paso 3.
 6. **`safety:*` no existe en el código.** No hay acciones `safety:` ni el lint de SAF-09 en `a797bea`; el aviso de §7 depende de SAF-09.
-7. **"Recibo de ejecución" (test 4)** corresponde hoy a `ExecutionAttestation`/`GatewayReceipt` (`gateway/src/lib.rs:321,562`); el gateway emite una attestation firmada también para Deny/NotDispatched. El test 4 debe formularse como "no hay despacho (`ExecutionStatus::NotDispatched`, cero invocaciones del adaptador)", no como "no existe recibo". **[decisión menor de redacción]**
+7. **RESUELTA por el CTO: test 4 = "NotDispatched y cero invocaciones", aunque exista la attestation de negación.** ~~"Recibo de ejecución" (test 4)~~ corresponde hoy a `ExecutionAttestation`/`GatewayReceipt` (`gateway/src/lib.rs:321,562`); el gateway emite una attestation firmada también para Deny/NotDispatched. El test 4 debe formularse como "no hay despacho (`ExecutionStatus::NotDispatched`, cero invocaciones del adaptador)", no como "no existe recibo". **[decisión menor de redacción]**
 8. **Lazo rápido.** No existe noción de lazo rápido/lento en el código; RequireApproval hoy siempre pasa por el journal y por aprobación humana asíncrona. La decisión 4 se apoya íntegramente en la declaración nueva de §7.
 9. Orden de variantes: `PolicyEffect` es `{Allow, Deny, RequireApproval}` (`policy.rs:925`), no `{Allow, Deny, RequireApproval, Recover}` en otro orden; sin efecto semántico, se anota.
-10. Nombre del archivo: SAF-09 usa `SAF-09-…` en mayúsculas; esta copia usa kebab-case en minúsculas por instrucción. Unificar si se prefiere. **[decisión menor]**
+10. **RESUELTA por el CTO: el archivo se llama `SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md`.** ~~Nombre del archivo: SAF-09 usa `SAF-09-…` en mayúsculas; esta copia usa kebab-case en minúsculas por instrucción. Unificar si se prefiere. **[decisión menor]**~~
