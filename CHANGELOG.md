@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Security: `MatchOperator::Prefix` no longer matches a value containing a
+  `..` segment (split on `/` or `\`). Previously an allow rule with prefix
+  `/srv/agent/` matched `/srv/agent/../../etc/passwd`. Such values are now
+  "unknown": they never satisfy an allow rule, and under semantics v2 they
+  still trigger restrictive (deny / require-approval) rules.
+- New `MatchOperator::PathPrefix` (`PolicyCondition::path_prefix`): purely
+  lexical, whole-segment path prefix. Rule prefix and value must be absolute
+  and normalized (no `.`, `..`, empty segments, `\`, NUL or `%`; the engine
+  does not percent-decode, so encoded dots/slashes are rejected). Invalid rule
+  prefixes are rejected when the policy loads. Does not resolve the
+  filesystem, so it does not cover symlinks.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`

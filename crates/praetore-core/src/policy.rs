@@ -387,6 +387,15 @@ impl PolicyCondition {
         Self::new(key, MatchOperator::Prefix, Value::String(expected.into()))
     }
 
+    /// Path-aware prefix match. See [`MatchOperator::PathPrefix`].
+    pub fn path_prefix(key: impl Into<String>, expected: impl Into<String>) -> Self {
+        Self::new(
+            key,
+            MatchOperator::PathPrefix,
+            Value::String(expected.into()),
+        )
+    }
+
     pub fn one_of(key: impl Into<String>, expected: Vec<Value>) -> Self {
         Self::new(key, MatchOperator::In, Value::Array(expected))
     }
@@ -423,8 +432,23 @@ impl PolicyCondition {
                 }
             }
             MatchOperator::Prefix => match (actual.as_str(), self.expected.as_str()) {
+                // Mitigation: a value with a `..` segment never satisfies a
+                // lexical prefix (it may escape the prefix as a path).
+                (Some(actual), Some(_)) if has_dot_dot_segment(actual) => ConditionMatch::Unknown,
                 (Some(actual), Some(prefix)) if actual.starts_with(prefix) => ConditionMatch::True,
                 (Some(_), Some(_)) => ConditionMatch::False,
+                _ => ConditionMatch::Unknown,
+            },
+            MatchOperator::PathPrefix => match (actual.as_str(), self.expected.as_str()) {
+                (Some(actual), Some(prefix)) => {
+                    match (path_segments(actual), path_segments(prefix)) {
+                        (Some(actual), Some(prefix)) if actual.starts_with(&prefix) => {
+                            ConditionMatch::True
+                        }
+                        (Some(_), Some(_)) => ConditionMatch::False,
+                        _ => ConditionMatch::Unknown,
+                    }
+                }
                 _ => ConditionMatch::Unknown,
             },
             MatchOperator::In => {
@@ -498,6 +522,14 @@ impl PolicyCondition {
                     "policy rule '{rule_id}' prefix condition must use a non-empty string"
                 )));
             }
+            MatchOperator::PathPrefix
+                if self.expected.as_str().and_then(path_segments).is_none() =>
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{rule_id}' path prefix must be an absolute, normalized path \
+                     without '.', '..', empty segments, '\\', '%' or NUL"
+                )));
+            }
             MatchOperator::In
                 if self
                     .expected
@@ -551,12 +583,49 @@ fn same_json_type(left: &Value, right: &Value) -> bool {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MatchOperator {
     Exact,
+    /// Lexical string prefix. Not path-aware: use [`Self::PathPrefix`] for
+    /// paths. As a mitigation, any value containing a `..` segment (split on
+    /// `/` or `\\`) never satisfies it.
     Prefix,
     In,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
     LessThanOrEqual,
+    /// Path prefix on whole segments, purely lexical (the filesystem is
+    /// never consulted, so symlinks are out of scope). Both the rule prefix
+    /// and the value must be absolute (`/`-rooted) and already normalized:
+    /// no `.` or `..` segments, no empty segments (`//`), no `\\`, no NUL and
+    /// no `%` at all. The engine does not percent-decode; rejecting `%`
+    /// fail-closes encoded forms such as `%2e%2e` or `%2f`. A single trailing
+    /// `/` is allowed. `/srv/agent` matches `/srv/agent` and `/srv/agent/x`,
+    /// not `/srv/agentx`. A value that breaks these rules never satisfies an
+    /// allow rule; a rule prefix that breaks them is rejected when loading.
+    PathPrefix,
+}
+
+fn has_dot_dot_segment(value: &str) -> bool {
+    value.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Segments of an absolute, normalized path, or `None` if it is not one.
+fn path_segments(path: &str) -> Option<Vec<&str>> {
+    if !path.starts_with('/') || path.contains(['\\', '%', '\0']) {
+        return None;
+    }
+    let body = &path[1..];
+    let body = body.strip_suffix('/').unwrap_or(body);
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let segments: Vec<&str> = body.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+    {
+        return None;
+    }
+    Some(segments)
 }
 
 fn compare_numeric(actual: &Value, expected: &Value) -> Option<Ordering> {
