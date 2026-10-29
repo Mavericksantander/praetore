@@ -172,7 +172,10 @@ mod tests {
         });
         request.sign_intent(&old_key).unwrap();
         request
-            .attest(Decision::allow("rotation permitted"))
+            .attest(Decision::allow(
+                "rotation permitted",
+                crate::DecidedBy::rule("test-rule"),
+            ))
             .unwrap()
     }
 

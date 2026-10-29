@@ -1134,7 +1134,7 @@ mod tests {
             agent,
             authority,
             action,
-            Decision::allow("reason-secret"),
+            Decision::allow("reason-secret", praetore_core::DecidedBy::rule("test-rule")),
             None,
             context,
         )
