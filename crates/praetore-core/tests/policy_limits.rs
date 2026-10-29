@@ -155,6 +155,23 @@ fn condition_key_and_string_bytes() {
 }
 
 #[test]
+fn path_prefix_counts_against_condition_string_bytes() {
+    // "/" followed by n-1 bytes: a valid normalized path of exactly n bytes.
+    edge(
+        |n| {
+            one(
+                rule().with_parameter_condition(PolicyCondition::path_prefix(
+                    "k",
+                    format!("/{}", "p".repeat(n - 1)),
+                )),
+            )
+        },
+        MAX_CONDITION_STRING_BYTES,
+        PolicyLimit::ConditionStringBytes,
+    );
+}
+
+#[test]
 fn values_in_set_condition() {
     edge(
         |n| {
