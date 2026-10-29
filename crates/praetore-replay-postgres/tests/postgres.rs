@@ -637,6 +637,8 @@ struct PostgresGatewayFixture {
 
 struct PostgresApprovalFixture {
     gateway: Gateway,
+    engine: AuthorizationEngine,
+    verifier: HumanApprovalVerifier,
     request: AuthorizationRequest,
     adapter: Arc<PostgresTestAdapter>,
     approver_key: SigningKey,
@@ -778,15 +780,17 @@ fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture
     )
     .unwrap();
     let gateway = Gateway::new(
-        engine,
+        engine.clone(),
         Arc::new(connect_journal()),
         adapter.clone(),
         execution_attester(),
     )
     .unwrap()
-    .with_human_approval_verifier(verifier);
+    .with_human_approval_verifier(verifier.clone());
     PostgresApprovalFixture {
         gateway,
+        engine,
+        verifier,
         request,
         adapter,
         approver_key,
@@ -954,7 +958,7 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
 
 fn database_rows_for_request(table: &str, request_id: Uuid) -> i64 {
     let query = match table {
-        "praetore.replay_claims" | "praetore.execution_journal" => {
+        "praetore.replay_claims" | "praetore.execution_journal" | "praetore.human_approvals" => {
             format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1 AND request_id = $2")
         }
         _ => panic!("unsupported test table"),
@@ -1894,5 +1898,72 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
             ]);
         }
         _ => panic!("PRAETORE_TEST_JOURNAL_RESTART_PHASE must be before or after"),
+    }
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_concurrent_human_approval_dispatches_exactly_once() {
+    for _ in 0..20 {
+        let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+        let pending = fixture.gateway.execute(fixture.request).unwrap();
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        let challenge = fixture.gateway.approval_challenge(key).unwrap();
+        let mut decision = HumanApprovalDecision {
+            schema_version: 1,
+            approval_id: Uuid::new_v4(),
+            approver_key_id: "postgres-human-approver-v1".into(),
+            challenge,
+            outcome: HumanApprovalOutcome::Approve,
+            signature: String::new(),
+        };
+        decision.signature = hex::encode(
+            fixture
+                .approver_key
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        // Two gateways, each with its own journal connection, same database.
+        let second = Gateway::new(
+            fixture.engine.clone(),
+            Arc::new(connect_journal()),
+            fixture.adapter.clone(),
+            execution_attester(),
+        )
+        .unwrap()
+        .with_human_approval_verifier(fixture.verifier.clone());
+        let gateways = [fixture.gateway.clone(), second];
+        let barrier = Arc::new(std::sync::Barrier::new(gateways.len()));
+        let results: Vec<_> = gateways
+            .into_iter()
+            .map(|gateway| {
+                let barrier = barrier.clone();
+                let decision = decision.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    gateway.resolve_human_approval(decision)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        let winners: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "{results:?}");
+        assert_eq!(winners[0].receipt.execution, ExecutionStatus::Confirmed);
+        assert_eq!(
+            database_rows_for_request("praetore.human_approvals", key.request_id),
+            1
+        );
+        let record = connect_journal().get(key).unwrap().unwrap();
+        assert_eq!(record.execution, ExecutionStatus::Confirmed);
+        assert_eq!(record.human_approval, Some(decision));
+        assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(database_invocation_count(key), 1);
+        assert_eq!(database_effect_count(key), 1);
     }
 }
