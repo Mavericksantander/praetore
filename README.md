@@ -48,6 +48,24 @@ code or test that backs it. None of it is a security or production guarantee.
   [`crates/praetore-core/src/evidence.rs`](crates/praetore-core/src/evidence.rs)
   (test `policy_digest_is_bound_to_integrity_hash`). On `main`, signing does
   **not** yet require the field to be present (see *In development*).
+- **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
+  A policy that exceeds any limit is rejected when it loads with the typed
+  error `PolicyLimitExceeded`; nothing is skipped or treated as allow. The
+  public constants in
+  [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs)
+  (tests in [`crates/praetore-core/tests/policy_limits.rs`](crates/praetore-core/tests/policy_limits.rs)):
+  - `MAX_POLICY_RULES` = 512 rules. The 64 KiB canonical JSON limit
+    (`MAX_JSON_VALUE_BYTES` = 65,536) is reached first, at 468 minimal rules.
+  - `MAX_CONDITIONS_PER_RULE` = 128 parameter conditions, and separately 128
+    context conditions, per rule.
+  - `MAX_POLICY_TEXT_BYTES` = 1024 UTF-8 bytes for a policy id, rule id,
+    action type, capability, target or condition key.
+  - `MAX_CONDITION_STRING_BYTES` = 1024 UTF-8 bytes for any string inside a
+    condition's expected value, including a `Prefix` / `PathPrefix` prefix.
+  - `MAX_CONDITION_SET_VALUES` = 256 values in an `In` condition.
+  - `MAX_CONDITION_VALUE_DEPTH` = 8 levels of nesting in an expected value
+    (a scalar is 1).
+  - The engine has no regex operator, so there is no regex limit.
 - **`PathPrefix` condition operator.** A lexical, whole-segment path prefix
   (`/srv/agent` matches `/srv/agent/x`, not `/srv/agentx`).
   - Rule prefixes must be absolute and normalized. An invalid prefix rejects
@@ -132,7 +150,6 @@ The following are **open pull requests, not merged** and not available on
 - [#16](https://github.com/Mavericksantander/praetore/pull/16): `SandboxDispatcher` executed by the gateway, and the `praetore-exec-mode` header.
 - [#17](https://github.com/Mavericksantander/praetore/pull/17): require the active policy digest before a receipt can be signed.
 - [#18](https://github.com/Mavericksantander/praetore/pull/18): `praetore-verify evidence --policy` (depends on #17).
-- [#21](https://github.com/Mavericksantander/praetore/pull/21): public, typed policy size and complexity limits.
 
 ## What it is — and is not
 
