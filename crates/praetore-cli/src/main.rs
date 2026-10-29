@@ -1116,7 +1116,15 @@ fn resolve_approval(
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    // Declare gateway execution: required by a gateway with `sandbox_root`,
+    // ignored otherwise. The CLI never performs effects itself.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        http_api::EXEC_MODE_HEADER,
+        reqwest::header::HeaderValue::from_static(http_api::EXEC_MODE_GATEWAY),
+    );
     reqwest::blocking::Client::builder()
+        .default_headers(headers)
         .no_proxy()
         .timeout(StdDuration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
@@ -2058,6 +2066,34 @@ mod tests {
         }
         assert!(up, "gateway did not start");
 
+        // EXEC MODE: without the header, or with `cooperative`/other values,
+        // the gateway answers 409 before evaluating: no effect on disk and
+        // no journal row.
+        let bare = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(StdDuration::from_secs(5))
+            .build()
+            .unwrap();
+        for mode in [
+            None,
+            Some("cooperative"),
+            Some("Gateway"),
+            Some("gateway,cooperative"),
+        ] {
+            let mut request = bare
+                .post(format!("{base}/v1/execute"))
+                .json(&fx.write("coop.txt", "x"));
+            if let Some(mode) = mode {
+                request = request.header(http_api::EXEC_MODE_HEADER, mode);
+            }
+            let response = request.send().unwrap();
+            assert_eq!(response.status().as_u16(), 409, "{mode:?}");
+            let body: serde_json::Value = response.json().unwrap();
+            assert_eq!(body["code"], "exec_mode_gateway_required");
+        }
+        assert!(!fx.root.join("coop.txt").exists());
+        assert!(fx.journal_counts().is_empty(), "nothing journaled");
+
         // ALLOW over HTTP: 200, confirmed, header marks gateway execution.
         let response = client
             .post(format!("{base}/v1/execute"))
@@ -2125,6 +2161,26 @@ mod tests {
             &approver,
         )
         .unwrap();
+        for request in [
+            bare.get(format!("{path}/status")),
+            bare.get(&path)
+                .header(http_api::EXEC_MODE_HEADER, "cooperative"),
+            bare.post(&path).json(&decision),
+            bare.post(&path)
+                .header(http_api::EXEC_MODE_HEADER, "cooperative")
+                .json(&decision),
+        ] {
+            assert_eq!(request.send().unwrap().status().as_u16(), 409);
+        }
+        assert!(
+            fx.root.join("aprobar.txt").exists(),
+            "refused approve has no effect"
+        );
+        assert_eq!(
+            fx.journal(held.evidence.request_id),
+            ("requires_approval".into(), "not_dispatched".into()),
+            "refused approve leaves the action pending"
+        );
         let response = client.post(&path).json(&decision).send().unwrap();
         assert_eq!(response.status().as_u16(), 200);
         assert_eq!(response.headers()["praetore-executed-by"], "gateway");
