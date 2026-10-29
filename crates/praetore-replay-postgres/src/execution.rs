@@ -424,8 +424,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 "INSERT INTO praetore.human_approval_expirations \
                      (tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
                       action_digest, policy_digest, expires_at, observed_at, \
-                      gateway_key_id, signature, receipt_json) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                      gateway_key_id, signature, receipt_json, receipt_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                 &[
                     &key.tenant_id,
                     &key.agent_id,
@@ -439,6 +439,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
                     &receipt.gateway_key_id,
                     &receipt.signature,
                     &receipt_json,
+                    &receipt.receipt_id,
                 ],
             )
             .map_err(|_| JournalError::Unavailable)?;

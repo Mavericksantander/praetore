@@ -254,6 +254,8 @@ pub enum ExpiredOutcome {
 #[serde(deny_unknown_fields)]
 pub struct ApprovalExpiredReceipt {
     pub schema_version: u8,
+    /// Unique identifier of this receipt (UUID v4), reported on HTTP 410.
+    pub receipt_id: Uuid,
     pub tenant_id: Uuid,
     pub agent_id: Uuid,
     pub request_id: Uuid,
@@ -273,6 +275,7 @@ pub struct ApprovalExpiredReceipt {
 #[derive(Serialize)]
 struct ApprovalExpiredPayload<'a> {
     schema_version: u8,
+    receipt_id: Uuid,
     tenant_id: Uuid,
     agent_id: Uuid,
     request_id: Uuid,
@@ -298,6 +301,7 @@ impl ApprovalExpiredReceipt {
     fn payload(&self) -> ApprovalExpiredPayload<'_> {
         ApprovalExpiredPayload {
             schema_version: self.schema_version,
+            receipt_id: self.receipt_id,
             tenant_id: self.tenant_id,
             agent_id: self.agent_id,
             request_id: self.request_id,
@@ -336,6 +340,7 @@ impl ApprovalExpiredReceipt {
             .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
         let mut receipt = Self {
             schema_version: 1,
+            receipt_id: Uuid::new_v4(),
             tenant_id: challenge.tenant_id,
             agent_id: challenge.agent_id,
             request_id: challenge.request_id,
@@ -378,6 +383,7 @@ impl ApprovalExpiredReceipt {
         let observed_at = OffsetDateTime::parse(&self.observed_at, &Rfc3339)
             .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
         if self.schema_version != 1
+            || self.receipt_id.is_nil()
             || evidence.decision.outcome != DecisionOutcome::RequireApproval
             || self.tenant_id != expected.tenant_id
             || self.agent_id != expected.agent_id
@@ -994,6 +1000,17 @@ impl Gateway {
             output,
             execution_attestation,
         }
+    }
+
+    /// Returns the persisted SAF-10 expiration receipt for a key, if any.
+    pub fn approval_expiration(
+        &self,
+        key: ExecutionKey,
+    ) -> Result<Option<ApprovalExpiredReceipt>, GatewayError> {
+        Ok(self
+            .journal
+            .get(key)?
+            .and_then(|record| record.approval_expiration))
     }
 
     pub fn approval_challenge(&self, key: ExecutionKey) -> Result<ApprovalChallenge, GatewayError> {

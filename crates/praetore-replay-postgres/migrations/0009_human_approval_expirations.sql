@@ -5,6 +5,7 @@
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS praetore.human_approval_expirations (
+    receipt_id UUID NOT NULL UNIQUE,
     tenant_id UUID NOT NULL,
     agent_id UUID NOT NULL,
     request_id UUID NOT NULL,

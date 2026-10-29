@@ -2121,13 +2121,9 @@ async fn http_expired_approval_reports_expired_resolution() {
         key.tenant_id, key.agent_id, key.request_id
     );
     let (status, body) = json_response(&app, "GET", &path, String::new()).await;
-    assert_eq!(
-        (status, body),
-        (
-            StatusCode::GONE,
-            json!({"code": "approval_expired", "resolution": "expired"})
-        )
-    );
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(body["code"], "approval_expired");
+    assert_eq!(body["resolution"], "expired");
 }
 
 // SAF-10 property tests (docs/proposals/SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md §8).
@@ -2367,6 +2363,46 @@ mod saf10_full {
         assert_eq!(fixture.tool.invocations(), 0);
         let reparsed = Evidence::from_json(&serde_json::to_string(&receipt.evidence).unwrap());
         assert!(reparsed.unwrap().verify_integrity());
+    }
+
+    /// HTTP 410 carries the id of the persisted `ApprovalExpiredReceipt`,
+    /// both on the challenge read and on a late signed decision.
+    #[tokio::test]
+    async fn http_410_carries_the_expiration_receipt_id() {
+        let (gateway, key, tool, journal, approver_key, clock) = expired_fixture();
+        let late = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        *clock.lock().unwrap() += Duration::seconds(21);
+        let app = http_api::router(Arc::new(gateway));
+        let path = format!(
+            "/v1/approvals/{}/{}/{}",
+            key.tenant_id, key.agent_id, key.request_id
+        );
+
+        let (status, body) = json_response(&app, "GET", &path, String::new()).await;
+        let receipt = receipt(&journal, key).expect("receipt persisted on first detection");
+        assert_eq!(
+            (status, body),
+            (
+                StatusCode::GONE,
+                json!({
+                    "code": "approval_expired",
+                    "resolution": "expired",
+                    "expiration_receipt_id": receipt.receipt_id.to_string(),
+                })
+            )
+        );
+        let (status, body) =
+            json_response(&app, "POST", &path, serde_json::to_string(&late).unwrap()).await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body["expiration_receipt_id"],
+            json!(receipt.receipt_id.to_string())
+        );
+        assert_eq!(tool.invocations(), 0);
     }
 
     /// Decision 2 (CTO): a request whose approval window exceeds

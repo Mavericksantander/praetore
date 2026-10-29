@@ -250,25 +250,78 @@ mod full {
         /// max_approval_ms, or with delta_ms < max_approval_ms, fails to load.
         #[test]
         fn p9_load_validation(
-            delta in 0u64..10_000,
+            delta in prop::option::of(0u64..10_000),
             max in prop::option::of(1u64..10_000),
             fast in any::<bool>(),
         ) {
-            let rule = json!({
-                "id": "r", "action_type": "a", "effect": "RequireApproval",
-                "required_capability": null, "target": null,
-                "parameter_conditions": [], "context_conditions": [],
-                "control_loop": if fast { "fast" } else { "slow" },
-                "delta_ms": delta,
-            });
-            let mut doc = json!({"id": "p", "version": 1, "canonical_version": 1, "rules": [rule]});
-            if let Some(max) = max {
-                doc["max_approval_ms"] = json!(max);
-            }
-            let rejected = Policy::from_json(&doc.to_string()).is_err();
-            let expected = (fast && max.is_none()) || max.is_some_and(|max| delta < max);
-            prop_assert_eq!(rejected, expected);
+            prop_assert_eq!(
+                Policy::from_json(&p9_doc(fast, max, delta)).is_err(),
+                p9_expected_rejection(fast, max, delta)
+            );
         }
+    }
+
+    fn p9_doc(fast: bool, max: Option<u64>, delta: Option<u64>) -> String {
+        let mut rule = json!({
+            "id": "r", "action_type": "a", "effect": "RequireApproval",
+            "required_capability": null, "target": null,
+            "parameter_conditions": [], "context_conditions": [],
+            "control_loop": if fast { "fast" } else { "slow" },
+        });
+        if let Some(delta) = delta {
+            rule["delta_ms"] = json!(delta);
+        }
+        let mut doc = json!({"id": "p", "version": 1, "canonical_version": 1, "rules": [rule]});
+        if let Some(max) = max {
+            doc["max_approval_ms"] = json!(max);
+        }
+        doc.to_string()
+    }
+
+    /// Fail closed on the fast loop: both bounds required and delta >= max.
+    fn p9_expected_rejection(fast: bool, max: Option<u64>, delta: Option<u64>) -> bool {
+        let below = matches!((max, delta), (Some(max), Some(delta)) if delta < max);
+        below || (fast && (max.is_none() || delta.is_none()))
+    }
+
+    #[test]
+    fn fast_loop_approval_without_max_is_a_load_error() {
+        assert!(Policy::from_json(&p9_doc(true, None, Some(5_000))).is_err());
+    }
+
+    #[test]
+    fn fast_loop_approval_without_delta_is_a_load_error() {
+        assert!(Policy::from_json(&p9_doc(true, Some(5_000), None)).is_err());
+    }
+
+    #[test]
+    fn fast_loop_approval_with_delta_below_max_is_a_load_error() {
+        assert!(Policy::from_json(&p9_doc(true, Some(5_000), Some(4_999))).is_err());
+    }
+
+    #[test]
+    fn fast_loop_approval_with_delta_covering_max_loads() {
+        let policy = Policy::from_json(&p9_doc(true, Some(5_000), Some(5_000))).unwrap();
+        assert_eq!(policy.max_approval_ms, Some(5_000));
+        assert_eq!(policy.rules[0].delta_ms, Some(5_000));
+    }
+
+    /// Several matching Recover rules: the first in rule order keeps its
+    /// obligation, regardless of other effects in between.
+    #[test]
+    fn first_matching_recover_rule_wins() {
+        let policy = policy(&[
+            (true, PolicyEffect::Allow),
+            (false, recover("unmatched")),
+            (true, recover("first")),
+            (true, PolicyEffect::Deny),
+            (true, recover("second")),
+        ]);
+        let decision = decide(&policy);
+        let recovery = decision.recovery.expect("recovery");
+        assert_eq!(recovery.recovery_id, "first");
+        assert_eq!(recovery.rule_id, "r2");
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
     }
 
     fn evidence(decision: praetore_core::Decision) -> praetore_core::Evidence {

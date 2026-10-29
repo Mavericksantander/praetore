@@ -2058,6 +2058,17 @@ fn postgres_approval_expiration_is_signed_unique_exclusive_and_append_only() {
             .is_err()
     );
 
+    assert_eq!(
+        receipt.receipt_id,
+        connect_journal()
+            .get(key)
+            .unwrap()
+            .unwrap()
+            .approval_expiration
+            .unwrap()
+            .receipt_id
+    );
+
     // Row-level security: the least-privilege role sees the row only under
     // its own tenant context.
     let mut client = connect_journal_client();
@@ -2082,4 +2093,45 @@ fn postgres_approval_expiration_is_signed_unique_exclusive_and_append_only() {
     };
     assert_eq!(count(&mut client, TEST_TENANT_ID), 1);
     assert_eq!(count(&mut client, Uuid::from_u128(2)), 0);
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_journal_row_with_expiration_receipt_cannot_be_deleted() {
+    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
+        OffsetDateTime::now_utc() + Duration::seconds(1),
+    )));
+    let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let pending = fixture.gateway.execute(fixture.request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    *clock.0.lock().unwrap() += Duration::seconds(21);
+    assert_eq!(
+        fixture.gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+
+    // RESTRICT semantics without a FK (0009 trigger): blocked even for the
+    // owner role, and before any FK check from other tables runs.
+    let error = connect_client()
+        .execute(
+            "DELETE FROM praetore.execution_journal \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .expect_err("journal delete must be blocked");
+    assert!(
+        error.as_db_error().is_some_and(|db| db
+            .message()
+            .contains("referenced by an approval expiration")),
+        "{error:?}"
+    );
+    assert_eq!(database_journal_count(key), 1);
+    assert_eq!(
+        database_rows_for_request("praetore.human_approval_expirations", key.request_id),
+        1
+    );
 }
