@@ -141,8 +141,9 @@ impl Evidence {
         trace_id: Option<String>,
         context: BTreeMap<String, Value>,
     ) -> crate::Result<Self> {
+        let evidence_schema_version = if decision.recovery.is_some() { 3 } else { 1 };
         let mut evidence = Self {
-            evidence_schema_version: 1,
+            evidence_schema_version,
             canonical_version: crate::canonical::CANONICAL_VERSION,
             evidence_id: Uuid::new_v4(),
             request_id,
@@ -181,10 +182,19 @@ impl Evidence {
     /// recorded SHA-256 context hash. It does not authenticate the issuer
     /// cryptographically and does not provide non-repudiation.
     pub fn verify_integrity(&self) -> bool {
-        if !matches!(self.evidence_schema_version, 1 | 2)
+        let has_recovery = self.decision.recovery.is_some();
+        let shape_ok = match self.evidence_schema_version {
+            1 => !self.has_v2_fields() && !has_recovery,
+            2 => self.has_complete_v2_fields() && !has_recovery,
+            // SAF-10: v3 is the only version that may carry a recovery
+            // obligation; it is either a complete HighAssurance record or a
+            // record without any v2 field.
+            3 => has_recovery && (self.has_complete_v2_fields() || !self.has_v2_fields()),
+            _ => false,
+        };
+        if !shape_ok
             || self.canonical_version != crate::canonical::CANONICAL_VERSION
-            || (self.evidence_schema_version == 1 && self.has_v2_fields())
-            || (self.evidence_schema_version == 2 && !self.has_complete_v2_fields())
+            || self.decision.validate_recovery().is_err()
         {
             return false;
         }
@@ -284,7 +294,11 @@ impl Evidence {
                 "HighAssurance evidence metadata is incomplete".into(),
             ));
         }
-        self.evidence_schema_version = 2;
+        self.evidence_schema_version = if self.decision.recovery.is_some() {
+            3
+        } else {
+            2
+        };
         self.decided_at = Some(decided_at);
         self.evaluation_mode = Some("high_assurance".into());
         self.freshness_valid_until = Some(freshness_valid_until);
@@ -379,7 +393,7 @@ impl Evidence {
                 "evidence integrity verification failed".into(),
             ));
         }
-        if evidence.evidence_schema_version == 2
+        if evidence.is_high_assurance_shape()
             && (evidence.attester_signature.is_none()
                 || evidence.attester_key_id.is_none()
                 || evidence.attester_algorithm.as_deref() != Some("ed25519"))
@@ -502,7 +516,12 @@ impl Evidence {
                 "evidence cryptographic metadata is malformed".into(),
             ));
         }
-        if self.evidence_schema_version == 2 {
+        // v3 records without HighAssurance metadata (and the intermediate
+        // state during attestation) are checked by `verify_integrity`'s shape
+        // rule instead.
+        if self.evidence_schema_version == 2
+            || (self.evidence_schema_version == 3 && self.has_complete_v2_fields())
+        {
             let intent = self.intent_v2.as_ref().ok_or_else(|| {
                 crate::PraetoreError::EvidenceError("v2 intent metadata is missing".into())
             })?;
@@ -603,8 +622,14 @@ impl Evidence {
             && self.agent_signature.is_some()
     }
 
+    /// True for v2, or v3 with complete HighAssurance metadata. Use this
+    /// instead of comparing `evidence_schema_version` to 2.
+    pub fn is_high_assurance_shape(&self) -> bool {
+        matches!(self.evidence_schema_version, 2 | 3) && self.has_complete_v2_fields()
+    }
+
     fn attestation_domain(&self) -> &'static [u8] {
-        if self.evidence_schema_version == 2 {
+        if self.is_high_assurance_shape() {
             EVIDENCE_V2_SIGNATURE_DOMAIN
         } else {
             EVIDENCE_SIGNATURE_DOMAIN

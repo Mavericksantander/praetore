@@ -28,7 +28,3 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-[features]
-# SAF-10: property tests written against the not-yet-implemented API.
-# Enabling this is expected to fail to compile until SAF-10 step 3 lands.
-saf10-pending = []
