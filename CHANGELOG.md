@@ -12,7 +12,7 @@
     canonical policy size `MAX_JSON_VALUE_BYTES` = 65 536.
   - `MAX_POLICY_RULES` = 512 (was 1024, unreachable). It sits above what
     fits in 64 KiB of canonical JSON (468 minimal rules with ids
-    `r0`..`r467`; with 1-2 byte ids the maximum is 475, still below 512), so
+    `r0`..`r467`; with minimal ids the canonical size limits it to fewer than 480 rules, below 512), so
     the canonical size remains the binding limit and no previously valid
     policy is rejected by the rule count.
   - Breaking: new `PraetoreError` variant; limit violations no longer surface
