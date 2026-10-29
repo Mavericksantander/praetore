@@ -9,6 +9,9 @@
 //!   `Policy::max_approval_ms`, rule `control_loop` / `delta_ms`. It is gated
 //!   behind the `saf10-pending` feature and does NOT compile until step 3.
 
+// `PolicyEffect` stops being `Copy` once `Recover` carries data (SAF-10 step 3).
+#![allow(clippy::clone_on_copy)]
+
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, DecisionOutcome, Policy, PolicyEffect, PolicyRule,
 };
