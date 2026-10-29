@@ -659,6 +659,7 @@ struct PostgresGatewayFixture {
 
 struct PostgresApprovalFixture {
     gateway: Gateway,
+    engine: AuthorizationEngine,
     request: AuthorizationRequest,
     adapter: Arc<PostgresTestAdapter>,
     approver_key: SigningKey,
@@ -821,7 +822,7 @@ fn create_postgres_approval_gateway_with_clock(
     )
     .unwrap();
     let gateway = Gateway::new(
-        engine,
+        engine.clone(),
         Arc::new(connect_journal()),
         adapter.clone(),
         execution_attester(),
@@ -830,6 +831,7 @@ fn create_postgres_approval_gateway_with_clock(
     .with_human_approval_verifier(verifier);
     PostgresApprovalFixture {
         gateway,
+        engine,
         request,
         adapter,
         approver_key,
@@ -2134,4 +2136,70 @@ fn postgres_journal_row_with_expiration_receipt_cannot_be_deleted() {
         database_rows_for_request("praetore.human_approval_expirations", key.request_id),
         1
     );
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_concurrent_expiration_detection_records_exactly_one_receipt() {
+    for _ in 0..20 {
+        let clock = SharedClock(Arc::new(std::sync::Mutex::new(
+            OffsetDateTime::now_utc() + Duration::seconds(1),
+        )));
+        let fixture =
+            create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+        let pending = fixture.gateway.execute(fixture.request).unwrap();
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        *clock.0.lock().unwrap() += Duration::seconds(21);
+        // Two gateways, each with its own journal connection, same database.
+        let second = Gateway::new(
+            fixture.engine.clone(),
+            Arc::new(connect_journal()),
+            fixture.adapter.clone(),
+            execution_attester(),
+        )
+        .unwrap();
+        let gateways = [fixture.gateway.clone(), second];
+        let barrier = Arc::new(std::sync::Barrier::new(gateways.len()));
+        let results: Vec<_> = gateways
+            .into_iter()
+            .map(|gateway| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    gateway.approval_resolution(key)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        for result in &results {
+            assert_eq!(
+                result.as_ref().ok(),
+                Some(&praetore_gateway::ApprovalResolution::Expired),
+                "{results:?}"
+            );
+        }
+        assert_eq!(
+            database_rows_for_request("praetore.human_approval_expirations", key.request_id),
+            1
+        );
+        let record = connect_journal().get(key).unwrap().unwrap();
+        record
+            .approval_expiration
+            .expect("one receipt")
+            .verify(
+                &record.evidence,
+                &execution_attester_public_key(),
+                "postgres-test-execution-attester-v1",
+            )
+            .unwrap();
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
+        assert_eq!(database_invocation_count(key), 0);
+    }
 }

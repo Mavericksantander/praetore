@@ -385,15 +385,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT authorization_status, execution_status, evidence_json, \
-                 EXISTS (SELECT 1 FROM praetore.human_approvals ha \
-                         WHERE ha.tenant_id = execution_journal.tenant_id \
-                           AND ha.agent_id = execution_journal.agent_id \
-                           AND ha.request_id = execution_journal.request_id), \
-                 EXISTS (SELECT 1 FROM praetore.human_approval_expirations hx \
-                         WHERE hx.tenant_id = execution_journal.tenant_id \
-                           AND hx.agent_id = execution_journal.agent_id \
-                           AND hx.request_id = execution_journal.request_id) \
+                "SELECT authorization_status, execution_status, evidence_json \
                  FROM praetore.execution_journal \
                  WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -404,8 +396,22 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let execution = parse_execution(&row.get::<_, String>(1))?;
         let evidence = Evidence::from_json(&row.get::<_, String>(2))
             .map_err(|_| JournalError::InvalidRecord)?;
-        let decided: bool = row.get(3);
-        let expired: bool = row.get(4);
+        // Read the resolution state in a separate statement, after the row
+        // lock is held: under READ COMMITTED a subquery in the locking
+        // statement keeps the snapshot taken before waiting for the lock,
+        // so a concurrent expiration committed meanwhile would be missed.
+        let resolution = transaction
+            .query_one(
+                "SELECT \
+                 EXISTS (SELECT 1 FROM praetore.human_approvals \
+                         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3), \
+                 EXISTS (SELECT 1 FROM praetore.human_approval_expirations \
+                         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3)",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .map_err(|_| JournalError::Unavailable)?;
+        let decided: bool = resolution.get(0);
+        let expired: bool = resolution.get(1);
         if decided {
             return Err(JournalError::ApprovalAlreadyRecorded);
         }
