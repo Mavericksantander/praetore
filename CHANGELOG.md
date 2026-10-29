@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- Policy size and complexity limits are now public, documented constants in
+  `praetore_core::policy`, and exceeding any of them rejects the whole policy
+  with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`
+  (error code unchanged: `POLICY_EVALUATION_FAIL`). Nothing is ignored or
+  partially applied.
+  - Existing, now public: `MAX_CONDITIONS_PER_RULE` = 128 (per scope),
+    `MAX_POLICY_TEXT_BYTES` = 1024 (ids, action type, target, condition key),
+    canonical policy size `MAX_JSON_VALUE_BYTES` = 65 536.
+  - `MAX_POLICY_RULES` = 512 (was 1024, unreachable). It sits above what
+    fits in 64 KiB of canonical JSON (468 minimal rules with ids
+    `r0`..`r467`; with minimal ids the canonical size limits it to fewer than 480 rules, below 512), so
+    the canonical size remains the binding limit and no previously valid
+    policy is rejected by the rule count.
+  - Breaking: new `PraetoreError` variant; limit violations no longer surface
+    as `PolicyEvaluationFailed(String)`.
+  - Breaking: new limits that reject policies valid before this release:
+    - capability longer than 1024 bytes (`MAX_POLICY_TEXT_BYTES`);
+    - condition string (string or object key inside an expected value)
+      longer than 1024 bytes (`MAX_CONDITION_STRING_BYTES`);
+    - `In` (array value) with more than 256 values
+      (`MAX_CONDITION_SET_VALUES`);
+    - expected value nested deeper than 8 (`MAX_CONDITION_VALUE_DEPTH`).
+  - The policy engine has no regular expressions, so there is no pattern limit.
 - Policy validation now rejects contradictory `PathPrefix` conditions on the
   same key using segment semantics: two unrelated path prefixes (`/a` and
   `/b`), or an `Exact` safe path outside a `PathPrefix` (`/b/x` with `/a`).
