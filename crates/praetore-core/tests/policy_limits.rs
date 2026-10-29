@@ -61,21 +61,47 @@ fn policy_id_bytes() {
     );
 }
 
+fn minimal_rules(n: usize) -> Policy {
+    Policy::new(
+        "p",
+        1,
+        (0..n)
+            .map(|i| PolicyRule::new(format!("r{i}"), "a", PolicyEffect::Allow))
+            .collect(),
+    )
+}
+
+/// Largest number of minimal rules (ids `r0`, `r1`, ...) that fits in
+/// 64 KiB of canonical JSON: 468 (65 464 bytes; 469 rules need 65 604).
+const MAX_MINIMAL_RULES_THAT_FIT: usize = 468;
+
 #[test]
 fn rules_per_policy() {
-    edge(
-        |n| {
-            Policy::new(
-                "p",
-                1,
-                (0..n)
-                    .map(|i| PolicyRule::new(format!("r{i}"), "a", PolicyEffect::Allow))
-                    .collect(),
-            )
-        },
-        MAX_POLICY_RULES,
-        PolicyLimit::Rules,
+    // The canonical size is the binding limit for minimal rules...
+    assert_eq!(
+        serde_json::to_string(&minimal_rules(MAX_MINIMAL_RULES_THAT_FIT))
+            .unwrap()
+            .len(),
+        65_464
     );
+    assert_ok(&minimal_rules(MAX_MINIMAL_RULES_THAT_FIT));
+    for n in [MAX_MINIMAL_RULES_THAT_FIT + 1, MAX_POLICY_RULES] {
+        assert!(matches!(
+            minimal_rules(n).validate(),
+            Err(PraetoreError::PolicyLimitExceeded {
+                limit: PolicyLimit::CanonicalBytes,
+                ..
+            })
+        ));
+    }
+    // ...and the rule count is checked first, right above MAX_POLICY_RULES.
+    assert!(matches!(
+        minimal_rules(MAX_POLICY_RULES + 1).validate(),
+        Err(PraetoreError::PolicyLimitExceeded {
+            limit: PolicyLimit::Rules,
+            max: MAX_POLICY_RULES
+        })
+    ));
 }
 
 #[test]
