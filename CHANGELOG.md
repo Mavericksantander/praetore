@@ -15,6 +15,60 @@
   - Breaking: constructor signatures change, and `Evidence.decision` changes
     type (`Decision` converts with `.into()`).
 
+- Policy size and complexity limits are now public, documented constants in
+  `praetore_core::policy`, and exceeding any of them rejects the whole policy
+  with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`
+  (error code unchanged: `POLICY_EVALUATION_FAIL`). Nothing is ignored or
+  partially applied.
+  - Existing, now public: `MAX_CONDITIONS_PER_RULE` = 128 (per scope),
+    `MAX_POLICY_TEXT_BYTES` = 1024 (ids, action type, target, condition key),
+    canonical policy size `MAX_JSON_VALUE_BYTES` = 65 536.
+  - `MAX_POLICY_RULES` = 512 (was 1024, unreachable). It sits above what
+    fits in 64 KiB of canonical JSON (468 minimal rules with ids
+    `r0`..`r467`; with minimal ids the canonical size limits it to fewer than 480 rules, below 512), so
+    the canonical size remains the binding limit and no previously valid
+    policy is rejected by the rule count.
+  - Breaking: new `PraetoreError` variant; limit violations no longer surface
+    as `PolicyEvaluationFailed(String)`.
+  - Breaking: new limits that reject policies valid before this release:
+    - capability longer than 1024 bytes (`MAX_POLICY_TEXT_BYTES`);
+    - condition string (string or object key inside an expected value)
+      longer than 1024 bytes (`MAX_CONDITION_STRING_BYTES`);
+    - `In` (array value) with more than 256 values
+      (`MAX_CONDITION_SET_VALUES`);
+    - expected value nested deeper than 8 (`MAX_CONDITION_VALUE_DEPTH`).
+  - The policy engine has no regular expressions, so there is no pattern limit.
+- Policy validation now rejects contradictory `PathPrefix` conditions on the
+  same key using segment semantics: two unrelated path prefixes (`/a` and
+  `/b`), or an `Exact` safe path outside a `PathPrefix` (`/b/x` with `/a`).
+  `PathPrefix` against `Prefix` is rejected only when the two are lexically
+  unrelated (conservative).
+- Documented over-restriction (fail closed): an unsafe value (`%`, `..`, and
+  for `PathPrefix` anything not absolute and normalized) matches `Deny` and
+  `RequireApproval` rules on `Prefix`/`PathPrefix` even if it lies outside the
+  rule's prefix; for example a deny on `/srv/secret` also denies
+  `/home/50%.txt`. Pinned by tests.
+
+- Security: `MatchOperator::Prefix` treats a value with a `..` segment
+  (split on `/` or `\`), any `%`, or a NUL as unsafe. Previously an allow
+  rule with prefix `/srv/agent/` matched `/srv/agent/../../etc/passwd`.
+- New `MatchOperator::PathPrefix` (`PolicyCondition::path_prefix`): purely
+  lexical, whole-segment path prefix. Rule prefix and value must be absolute
+  and normalized (no `.`, `..`, empty segments, `\`, NUL or `%`; the engine
+  does not percent-decode). Invalid rule prefixes are rejected when the policy
+  loads.
+- Unsafe values for `Prefix` and `PathPrefix` always match `Deny` and
+  `RequireApproval` rules and never match `Allow` rules, in both semantics
+  v1 and v2 (fail closed; keeps v1 deny rules effective).
+- Lexical limits, documented and pinned by tests: no filesystem access
+  (symlinks out of scope), no Unicode folding (fullwidth `．．`, U+2215),
+  spaces are significant, `...` is an ordinary name. No downstream layer may
+  NFKC-normalize or percent-decode an authorized value.
+- Behaviour change: allow rules using `Prefix` on values that contain `%`
+  (for example percent-encoded URLs) no longer match.
+- Breaking: `MatchOperator` is now `#[non_exhaustive]`; exhaustive `match`es
+  outside `praetore-core` need a wildcard arm.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`
