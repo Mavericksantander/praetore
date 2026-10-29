@@ -176,10 +176,9 @@ fn safe_path_prefix_allows_only_inside_prefix() {
 }
 
 // Derived from test_safe_paths (not a Canopy test: Canopy's `startswith` has
-// the same flaw). `Prefix` is a lexical string prefix, so `..` segments escape
-// the safe directory and the Allow rule still matches.
+// the same flaw). Fixed in #20: values with a `..` segment never satisfy an
+// Allow `Prefix` rule. Duplicated in tests/path_prefix.rs on purpose.
 #[test]
-#[ignore = "bug: MatchOperator::Prefix is lexical; '/srv/agent/../../etc/passwd' matches an Allow rule for '/srv/agent/' (path traversal). Not fixed in this PR"]
 fn safe_path_prefix_rejects_dot_dot_traversal() {
     let decision = evaluate(
         &safe_path_policy(),
