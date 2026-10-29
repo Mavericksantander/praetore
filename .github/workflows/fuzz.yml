@@ -1,0 +1,62 @@
+name: Continuous fuzzing
+
+on:
+  schedule:
+    # Daily at 06:17 UTC.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per fuzz target"
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - canonical_json
+          - policy_parse
+          - authority_verify
+          - evidence_verify
+          - engine_evaluate_dev
+          - engine_evaluate_high_assurance
+          - path_prefix
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview
+      - run: cargo +nightly install cargo-fuzz --locked
+      - name: Refresh evidence corpus seed
+        if: matrix.target == 'evidence_verify'
+        run: UPDATE_FUZZ_CORPUS=1 cargo test -p praetore-verify --test verify_cli evidence_command_verifies_trusted_signature_intent_and_authority --locked
+      - name: Run ${{ matrix.target }}
+        run: |
+          case "$FUZZ_SECONDS" in ''|*[!0-9]*) echo "seconds must be an integer"; exit 1;; esac
+          cargo +nightly fuzz run --fuzz-dir fuzz "${{ matrix.target }}" -- \
+            -max_total_time="$FUZZ_SECONDS" -print_final_stats=1
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
