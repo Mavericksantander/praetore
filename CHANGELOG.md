@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `praetore-verify evidence` accepts `--policy PATH`: the receipt must record
+  that policy's digest (`Evidence::verify_policy`); receipts without a digest
+  fail with `POLICY_MISMATCH`.
+- New `praetore-verify journal --journal JSONL --attester-pin HEX [--policy]`
+  verifies a hash-linked export: one `{"seq","prev","evidence"}` object per
+  line, `seq` from 0, first `prev` all zeros, each link
+  `SHA-256("PRAETORE_JOURNAL_LINK_V1\0" || seq_be64 || prev || context_hash || attester_signature)`.
+  Every receipt's Ed25519 signature is checked against the pinned key;
+  reordered, dropped, broken or duplicated entries fail (`JOURNAL_CHAIN_FAIL`).
+  Limits: 8 MiB, 4096 entries. No component produces this export yet.
+
 - `Evidence::sign` now refuses to sign a receipt that does not record the
   full SHA-256 digest of the active policy (`policy_digest`, from
   `Policy::digest()` over the canonical JSON). The engine already bound it in
