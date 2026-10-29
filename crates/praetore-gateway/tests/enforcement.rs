@@ -237,6 +237,9 @@ struct MemoryJournal {
     fail_dispatched: AtomicBool,
     fail_terminal: AtomicBool,
     unavailable: AtomicBool,
+    /// SAF-10 test hook: once an expiration receipt is stored, reads of that
+    /// record fail as if the stored receipt were unreadable.
+    unreadable_expiration: AtomicBool,
 }
 
 impl MemoryJournal {
@@ -492,6 +495,10 @@ impl ExecutionJournal for MemoryJournal {
         let Some(entry) = entries.get(&key) else {
             return Ok(None);
         };
+        if self.unreadable_expiration.load(Ordering::SeqCst) && entry.approval_expiration.is_some()
+        {
+            return Err(JournalError::InvalidRecord);
+        }
         Ok(Some(ExecutionRecord {
             key,
             evidence: entry.evidence.clone().ok_or(JournalError::InvalidRecord)?,
@@ -2402,6 +2409,29 @@ mod saf10_full {
             body["expiration_receipt_id"],
             json!(receipt.receipt_id.to_string())
         );
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// A 410 whose receipt cannot be read back omits
+    /// `expiration_receipt_id` and still dispatches nothing.
+    #[tokio::test]
+    async fn http_410_with_unreadable_receipt_omits_the_id() {
+        let (gateway, key, tool, journal, _, clock) = expired_fixture();
+        journal.unreadable_expiration.store(true, Ordering::SeqCst);
+        *clock.lock().unwrap() += Duration::seconds(21);
+        let app = http_api::router(Arc::new(gateway));
+        let path = format!(
+            "/v1/approvals/{}/{}/{}",
+            key.tenant_id, key.agent_id, key.request_id
+        );
+        let (status, body) = json_response(&app, "GET", &path, String::new()).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::GONE, json!({"code": "approval_expired"}))
+        );
+        // The receipt was persisted; only reading it back fails.
+        journal.unreadable_expiration.store(false, Ordering::SeqCst);
+        assert!(receipt(&journal, key).is_some());
         assert_eq!(tool.invocations(), 0);
     }
 
