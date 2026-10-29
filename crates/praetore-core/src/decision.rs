@@ -45,6 +45,36 @@ impl DecisionOutcome {
     }
 }
 
+/// What determined the final outcome of a decision.
+///
+/// Recorded inside [`Decision`], so it is covered by the evidence context
+/// hash and the Ed25519 attester signature.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DecidedBy {
+    /// A policy rule matched and its effect determined the outcome.
+    Rule { rule_id: String },
+    /// No policy rule matched; the policy denied by default.
+    DefaultDeny,
+    /// An engine check outside the policy rules denied the request
+    /// (for example an unsatisfied authority constraint).
+    EngineGuard { guard: String },
+}
+
+impl DecidedBy {
+    pub fn rule(rule_id: impl Into<String>) -> Self {
+        Self::Rule {
+            rule_id: rule_id.into(),
+        }
+    }
+
+    pub fn engine_guard(guard: impl Into<String>) -> Self {
+        Self::EngineGuard {
+            guard: guard.into(),
+        }
+    }
+}
+
 /// A single policy rule that contributed to a decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +104,11 @@ pub struct Decision {
     pub outcome: DecisionOutcome,
     pub reason: String,
     pub contributions: Vec<DecisionContribution>,
+    /// What determined `outcome`. Absent only in evidence produced before
+    /// this field existed; omitted from the canonical form when `None` so
+    /// those receipts keep verifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<DecidedBy>,
 }
 
 impl Decision {
@@ -82,6 +117,7 @@ impl Decision {
             outcome: DecisionOutcome::Allow,
             reason: reason.into(),
             contributions: Vec::new(),
+            decided_by: None,
         }
     }
 
@@ -90,6 +126,7 @@ impl Decision {
             outcome: DecisionOutcome::RequireApproval,
             reason: reason.into(),
             contributions: Vec::new(),
+            decided_by: None,
         }
     }
 
@@ -98,6 +135,7 @@ impl Decision {
             outcome: DecisionOutcome::Deny,
             reason: reason.into(),
             contributions: Vec::new(),
+            decided_by: None,
         }
     }
 
@@ -106,13 +144,20 @@ impl Decision {
         self
     }
 
+    pub fn decided_by(mut self, decided_by: DecidedBy) -> Self {
+        self.decided_by = Some(decided_by);
+        self
+    }
+
+    /// Combines two decisions. The stronger outcome wins; on a tie the
+    /// left-hand (earlier) decision keeps its reason and `decided_by`.
     pub fn strongest(self, other: Self) -> Self {
         let outcome = self.outcome.strongest(other.outcome);
 
-        let reason = if self.outcome == outcome {
-            self.reason.clone()
+        let (reason, decided_by) = if self.outcome == outcome {
+            (self.reason.clone(), self.decided_by.clone())
         } else {
-            other.reason.clone()
+            (other.reason.clone(), other.decided_by.clone())
         };
 
         let mut contributions = self.contributions;
@@ -122,6 +167,7 @@ impl Decision {
             outcome,
             reason,
             contributions,
+            decided_by,
         }
     }
 }

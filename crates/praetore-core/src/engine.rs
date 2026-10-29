@@ -3,7 +3,7 @@ use crate::{
     authority::Validity,
     authorization::AuthorizationRequest,
     canonical::parse_json_rejecting_duplicates,
-    decision::Decision,
+    decision::{DecidedBy, Decision},
     evidence::{Evidence, EvidenceAttesterKey},
     freshness::{FreshnessError, FreshnessProvider},
     identity::VerifiedPublicKey,
@@ -1207,22 +1207,25 @@ impl AuthorizationEngine {
                 return Ok(Decision::deny(format!(
                     "authority constraint '{}' was not satisfied",
                     constraint.key
-                )));
+                ))
+                .decided_by(DecidedBy::engine_guard("authority_constraint")));
             }
         }
 
         // Fail closed: an action without an explicit capability is never
         // mapped onto its action_type (or any other) grant.
         let Some(capability) = request.action.capability.as_deref() else {
-            return Ok(Decision::deny(
-                "action does not declare a required capability",
-            ));
+            return Ok(
+                Decision::deny("action does not declare a required capability")
+                    .decided_by(DecidedBy::engine_guard("missing_capability")),
+            );
         };
         if !request.authority.permits(capability) {
             return Ok(Decision::deny(format!(
                 "authority does not permit capability: {}",
                 capability
-            )));
+            ))
+            .decided_by(DecidedBy::engine_guard("authority_capability")));
         }
 
         let decision = self.policy.evaluate_with_context(
@@ -1249,7 +1252,8 @@ impl AuthorizationEngine {
             return Ok(Decision::deny(format!(
                 "policy rule '{}' must declare required_capability",
                 contribution.rule_id
-            )));
+            ))
+            .decided_by(DecidedBy::engine_guard("unbound_rule_capability")));
         }
 
         Ok(decision)
@@ -1657,6 +1661,173 @@ mod tests {
                 .with_capability("read_data"),
             ],
         )
+    }
+
+    fn decided_by_policy() -> Policy {
+        use crate::policy::PolicyEffect;
+        Policy::new_v2(
+            "decided-by-policy",
+            1,
+            vec![
+                PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+                    .with_capability("read_data"),
+                PolicyRule::new("deny-delete", "delete_data", PolicyEffect::Deny)
+                    .with_capability("delete_data"),
+                PolicyRule::new("approve-write", "write_data", PolicyEffect::RequireApproval)
+                    .with_capability("write_data"),
+            ],
+        )
+    }
+
+    fn signed_evidence_for(action_type: &str) -> (Evidence, crate::EvidenceAttesterKey) {
+        let agent = test_agent();
+        let authority = Authority::new(
+            agent.id.clone(),
+            "praetore-root",
+            vec![
+                "read_data".into(),
+                "delete_data".into(),
+                "write_data".into(),
+                "export_data".into(),
+            ],
+        );
+        let action = Action::new(action_type, Some("database".into()), json!({}))
+            .unwrap()
+            .with_capability(action_type);
+        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut evidence = AuthorizationEngine::development(decided_by_policy())
+            .evaluate(request)
+            .unwrap();
+        let attester = crate::EvidenceAttesterKey::from_secret_bytes(&[77; 32]);
+        evidence.sign(&attester).unwrap();
+        (evidence, attester)
+    }
+
+    fn assert_signed_decided_by(
+        action_type: &str,
+        outcome: DecisionOutcome,
+        decided_by: crate::DecidedBy,
+    ) {
+        let (evidence, attester) = signed_evidence_for(action_type);
+        assert_eq!(evidence.decision.outcome, outcome);
+        assert_eq!(evidence.decision.decided_by, Some(decided_by.clone()));
+        assert!(evidence.verify());
+        let key = attester.public_key().unwrap();
+        assert!(evidence.verify_attester_signature(&key).is_ok());
+        // The decider survives the exported, signed receipt.
+        let imported = Evidence::from_json(&evidence.to_json().unwrap()).unwrap();
+        assert_eq!(imported.decision.decided_by, Some(decided_by));
+        assert!(imported.verify_attester_signature(&key).is_ok());
+    }
+
+    #[test]
+    fn allow_receipt_records_deciding_rule() {
+        assert_signed_decided_by(
+            "read_data",
+            DecisionOutcome::Allow,
+            crate::DecidedBy::rule("allow-read"),
+        );
+    }
+
+    #[test]
+    fn deny_receipt_records_deciding_rule() {
+        assert_signed_decided_by(
+            "delete_data",
+            DecisionOutcome::Deny,
+            crate::DecidedBy::rule("deny-delete"),
+        );
+    }
+
+    #[test]
+    fn require_approval_receipt_records_deciding_rule() {
+        assert_signed_decided_by(
+            "write_data",
+            DecisionOutcome::RequireApproval,
+            crate::DecidedBy::rule("approve-write"),
+        );
+    }
+
+    #[test]
+    fn unmatched_action_receipt_records_default_deny() {
+        assert_signed_decided_by(
+            "export_data",
+            DecisionOutcome::Deny,
+            crate::DecidedBy::DefaultDeny,
+        );
+    }
+
+    #[test]
+    fn deny_rule_beats_allow_rule_and_is_recorded_as_decider() {
+        use crate::policy::PolicyEffect;
+        let policy = Policy::new_v2(
+            "overlap",
+            1,
+            vec![
+                PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+                    .with_capability("read_data"),
+                PolicyRule::new("deny-read", "read_data", PolicyEffect::Deny)
+                    .with_capability("read_data"),
+            ],
+        );
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let evidence = AuthorizationEngine::development(policy)
+            .evaluate(request)
+            .unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            evidence.decision.decided_by,
+            Some(crate::DecidedBy::rule("deny-read"))
+        );
+    }
+
+    #[test]
+    fn engine_guard_denial_records_guard_as_decider() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["other".into()]);
+        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let evidence = AuthorizationEngine::development(allow_policy())
+            .evaluate(request)
+            .unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            evidence.decision.decided_by,
+            Some(crate::DecidedBy::engine_guard("authority_capability"))
+        );
+    }
+
+    #[test]
+    fn tampering_with_decided_by_invalidates_signature() {
+        for (action_type, forged) in [
+            ("read_data", crate::DecidedBy::rule("deny-delete")),
+            ("delete_data", crate::DecidedBy::DefaultDeny),
+            ("write_data", crate::DecidedBy::rule("allow-read")),
+            ("export_data", crate::DecidedBy::rule("allow-read")),
+        ] {
+            let (evidence, attester) = signed_evidence_for(action_type);
+            let key = attester.public_key().unwrap();
+
+            let mut forged_evidence = evidence.clone();
+            forged_evidence.decision.decided_by = Some(forged.clone());
+            assert!(!forged_evidence.verify());
+            assert!(forged_evidence.verify_attester_signature(&key).is_err());
+
+            let mut stripped = evidence.clone();
+            stripped.decision.decided_by = None;
+            assert!(!stripped.verify());
+            assert!(stripped.verify_attester_signature(&key).is_err());
+
+            // Same forgery applied to the exported JSON receipt.
+            let mut document: serde_json::Value =
+                serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+            document["decision"]["decided_by"] = serde_json::to_value(&forged).unwrap();
+            let rejected = match Evidence::from_json(&document.to_string()) {
+                Err(_) => true,
+                Ok(imported) => imported.verify_attester_signature(&key).is_err(),
+            };
+            assert!(rejected, "forged decided_by accepted for {action_type}");
+        }
     }
 
     #[test]
