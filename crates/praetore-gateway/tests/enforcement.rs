@@ -2068,3 +2068,147 @@ async fn http_expired_approval_reports_expired_resolution() {
         )
     );
 }
+
+// SAF-10 property tests (docs/proposals/saf-10-recover-y-vencimiento-de-aprobaciones.md §8).
+// `saf10_today` runs against a797bea; `saf10_pending` targets the proposed
+// API (ApprovalExpiredReceipt, Recover) and is gated behind `saf10-pending`.
+mod saf10_today {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        /// Property 5 (current subset): with no signed human decision and
+        /// the engine clock past `expires_at`, nothing is dispatched, the
+        /// resolution is Expired, and a late approval is refused and not
+        /// stored. (The single signed `ApprovalExpiredReceipt` is pending.)
+        #[test]
+        fn p5_no_approval_by_silence(advance in 21i64..86_400) {
+            let captured_clock = Arc::new(Mutex::new(None));
+            let capture = captured_clock.clone();
+            let (gateway, request, tool, journal, approver_key) =
+                approval_fixture_with_provider(move |clock| {
+                    *capture.lock().unwrap() = Some(clock);
+                    Arc::new(CurrentFreshness)
+                });
+            let key = pending_key(&gateway, request);
+            let late = human_approval_decision(
+                gateway.approval_challenge(key).unwrap(),
+                HumanApprovalOutcome::Approve,
+                &approver_key,
+            );
+            let clock = captured_clock.lock().unwrap().clone().unwrap();
+            *clock.lock().unwrap() += Duration::seconds(advance);
+
+            prop_assert_eq!(
+                gateway.approval_resolution(key).unwrap(),
+                praetore_gateway::ApprovalResolution::Expired
+            );
+            prop_assert!(matches!(
+                gateway.resolve_human_approval(late),
+                Err(GatewayError::Approval(ApprovalError::Expired))
+            ));
+            let record = journal.get(key).unwrap().unwrap();
+            prop_assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+            prop_assert!(record.human_approval.is_none());
+            prop_assert_eq!(tool.invocations(), 0);
+        }
+
+        /// Property 2 (dispatch part): a Deny never reaches the adapter.
+        #[test]
+        fn p2_deny_never_dispatches(_case in 0u8..4) {
+            let fixture = fixture(Some(PolicyEffect::Deny), false);
+            let receipt = fixture.gateway.execute(fixture.request).unwrap();
+            prop_assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
+            prop_assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            prop_assert_eq!(fixture.tool.invocations(), 0);
+        }
+
+        /// Property 8 (current subset): v2 evidence produced today keeps
+        /// verifying after a JSON round trip, for every outcome. There is no
+        /// frozen v2 golden vector in the repo yet (review note 5).
+        #[test]
+        fn p8_v2_evidence_round_trip_verifies(
+            effect in prop_oneof![
+                Just(Some(PolicyEffect::Allow)),
+                Just(Some(PolicyEffect::RequireApproval)),
+                Just(Some(PolicyEffect::Deny)),
+                Just(None),
+            ]
+        ) {
+            let fixture = fixture(effect, false);
+            let receipt = fixture.gateway.execute(fixture.request).unwrap();
+            let evidence = receipt.evidence;
+            prop_assert_eq!(evidence.evidence_schema_version, 2);
+            prop_assert!(evidence.verify_integrity());
+            let json = serde_json::to_string(&evidence).unwrap();
+            let parsed: Evidence = serde_json::from_str(&json).unwrap();
+            prop_assert!(parsed.verify_integrity());
+            prop_assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
+    }
+}
+
+/// Written against the proposed SAF-10 gateway API. Does not compile until
+/// step 3 lands; names are provisional.
+#[cfg(feature = "saf10-pending")]
+mod saf10_pending {
+    use super::*;
+
+    /// Property 5 (full): exactly one valid `ApprovalExpiredReceipt`,
+    /// idempotent across repeated detection.
+    #[test]
+    fn p5_exactly_one_expiration_receipt() {
+        let captured_clock = Arc::new(Mutex::new(None));
+        let capture = captured_clock.clone();
+        let (gateway, request, tool, journal, _) = approval_fixture_with_provider(move |clock| {
+            *capture.lock().unwrap() = Some(clock);
+            Arc::new(CurrentFreshness)
+        });
+        let key = pending_key(&gateway, request);
+        let clock = captured_clock.lock().unwrap().clone().unwrap();
+        *clock.lock().unwrap() += Duration::seconds(21);
+        gateway.approval_resolution(key).unwrap();
+        gateway.approval_resolution(key).unwrap();
+        let receipts = journal.approval_expirations(key);
+        assert_eq!(receipts.len(), 1);
+        receipts[0]
+            .verify(&execution_attester_public_key())
+            .unwrap();
+        assert_eq!(receipts[0].effective_outcome, DecisionOutcome::Deny);
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// Property 6: a human decision and an expiration never coexist.
+    #[test]
+    fn p6_human_decision_and_expiration_are_exclusive() {
+        let (gateway, request, _, journal, approver_key) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Reject,
+            &approver_key,
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        let record = journal.get(key).unwrap().unwrap();
+        assert!(record.human_approval.is_some());
+        assert!(journal.approval_expirations(key).is_empty());
+    }
+
+    /// Property 4: a decision with recovery never dispatches the action.
+    #[test]
+    fn p4_recover_never_dispatches() {
+        let fixture = fixture(
+            Some(PolicyEffect::Recover {
+                recovery_id: "safe-hold".into(),
+                deadline_ms: 500,
+            }),
+            false,
+        );
+        let receipt = fixture.gateway.execute(fixture.request).unwrap();
+        assert!(receipt.evidence.decision.recovery.is_some());
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(fixture.tool.invocations(), 0);
+    }
+}
