@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `Evidence::sign` now refuses to sign a receipt that does not record the
+  full SHA-256 digest of the active policy (`policy_digest`, from
+  `Policy::digest()` over the canonical JSON). The engine already bound it in
+  every mode; this makes it a hard requirement of the write path, so the
+  Ed25519 attester signature always covers which policy decided. Receipts
+  signed before this change (no `policy_digest`) still deserialize and verify.
+- New `Evidence::verify_policy(&Policy)` checks that a receipt was decided
+  under a given policy (digest present and equal). Legacy receipts without a
+  digest return an error.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`
