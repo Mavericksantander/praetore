@@ -1,4 +1,4 @@
-//! SAF-10 property tests (docs/proposals/saf-10-recover-y-vencimiento-de-aprobaciones.md §8).
+//! SAF-10 property tests (docs/proposals/SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md §8).
 //!
 //! Decision 5: the properties are written before the implementation.
 //! - The `today` module runs against the current API (a797bea) and checks

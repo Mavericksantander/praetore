@@ -2069,7 +2069,7 @@ async fn http_expired_approval_reports_expired_resolution() {
     );
 }
 
-// SAF-10 property tests (docs/proposals/saf-10-recover-y-vencimiento-de-aprobaciones.md §8).
+// SAF-10 property tests (docs/proposals/SAF-10-RECOVER-Y-VENCIMIENTO-DE-APROBACIONES.md §8).
 // `saf10_today` runs against a797bea; `saf10_pending` targets the proposed
 // API (ApprovalExpiredReceipt, Recover) and is gated behind `saf10-pending`.
 mod saf10_today {
