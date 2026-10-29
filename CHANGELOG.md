@@ -2,17 +2,25 @@
 
 ## Unreleased
 
-- Security: `MatchOperator::Prefix` no longer matches a value containing a
-  `..` segment (split on `/` or `\`). Previously an allow rule with prefix
-  `/srv/agent/` matched `/srv/agent/../../etc/passwd`. Such values are now
-  "unknown": they never satisfy an allow rule, and under semantics v2 they
-  still trigger restrictive (deny / require-approval) rules.
+- Security: `MatchOperator::Prefix` treats a value with a `..` segment
+  (split on `/` or `\`), any `%`, or a NUL as unsafe. Previously an allow
+  rule with prefix `/srv/agent/` matched `/srv/agent/../../etc/passwd`.
 - New `MatchOperator::PathPrefix` (`PolicyCondition::path_prefix`): purely
   lexical, whole-segment path prefix. Rule prefix and value must be absolute
   and normalized (no `.`, `..`, empty segments, `\`, NUL or `%`; the engine
-  does not percent-decode, so encoded dots/slashes are rejected). Invalid rule
-  prefixes are rejected when the policy loads. Does not resolve the
-  filesystem, so it does not cover symlinks.
+  does not percent-decode). Invalid rule prefixes are rejected when the policy
+  loads.
+- Unsafe values for `Prefix` and `PathPrefix` always match `Deny` and
+  `RequireApproval` rules and never match `Allow` rules, in both semantics
+  v1 and v2 (fail closed; keeps v1 deny rules effective).
+- Lexical limits, documented and pinned by tests: no filesystem access
+  (symlinks out of scope), no Unicode folding (fullwidth `．．`, U+2215),
+  spaces are significant, `...` is an ordinary name. No downstream layer may
+  NFKC-normalize or percent-decode an authorized value.
+- Behaviour change: allow rules using `Prefix` on values that contain `%`
+  (for example percent-encoded URLs) no longer match.
+- Breaking: `MatchOperator` is now `#[non_exhaustive]`; exhaustive `match`es
+  outside `praetore-core` need a wildcard arm.
 
 ## 0.2.0 (not yet tagged or published)
 
