@@ -1,0 +1,188 @@
+//! CLI tests for `praetore-verify evidence --policy`.
+
+use praetore_core::{
+    action::Action,
+    authority::Authority,
+    authorization::AuthorizationRequest,
+    decision::Decision,
+    evidence::{Evidence, EvidenceAttesterKey},
+    identity::{AgentId, AgentKeyPair},
+    policy::{Policy, PolicyEffect, PolicyRule},
+};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    path::PathBuf,
+    process::{Command, Output},
+};
+
+/// Regenerate with scripts/regen-legacy-evidence-fixture.sh (signed by
+/// praetore-core 3db7b5e, attester secret [3; 32], no policy_digest).
+const LEGACY: &str = include_str!("fixtures/legacy-evidence-no-policy-digest.json");
+
+struct Dir(PathBuf);
+
+impl Dir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "praetore-verify-policy-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    fn write(&self, name: &str, contents: impl AsRef<[u8]>) -> String {
+        let path = self.0.join(name);
+        fs::write(&path, contents).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn policy(effect: PolicyEffect) -> Policy {
+    Policy::new(
+        "receipt-policy",
+        1,
+        vec![PolicyRule::new("read", "read_data", effect)],
+    )
+}
+
+fn attester() -> EvidenceAttesterKey {
+    EvidenceAttesterKey::from_secret_bytes(&[3; 32])
+}
+
+fn pin(key: &EvidenceAttesterKey) -> String {
+    format!("{}\n", hex::encode(key.public_key().unwrap().as_bytes()))
+}
+
+fn receipt(policy: &Policy) -> Evidence {
+    let agent_key = AgentKeyPair::from_secret_bytes(&[1; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[2; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(agent.id.clone(), "test-issuer", vec!["data:read".into()]);
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+    let action = Action::new("read_data", Some("db".into()), json!({}))
+        .unwrap()
+        .with_capability("data:read");
+    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    request.sign_intent(&agent_key).unwrap();
+    let mut evidence = request.attest(Decision::allow("policy fixture")).unwrap();
+    evidence
+        .bind_policy_digest(policy.digest().unwrap())
+        .unwrap();
+    evidence.sign(&attester()).unwrap();
+    evidence
+}
+
+fn verify(evidence: &str, pin_file: &str, policy: Option<&str>) -> Output {
+    let mut args = vec![
+        "evidence",
+        "--evidence",
+        evidence,
+        "--attester-pin",
+        pin_file,
+    ];
+    if let Some(policy) = policy {
+        args.extend(["--policy", policy]);
+    }
+    args.extend(["--format", "json"]);
+    Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args(&args)
+        .output()
+        .unwrap()
+}
+
+fn summary(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn assert_fails(output: &Output, expected: &str) {
+    assert!(!output.status.success(), "expected failure {expected}");
+    assert_eq!(summary(output)["code"], expected);
+}
+
+#[test]
+fn matching_policy_verifies() {
+    let dir = Dir::new();
+    let allow = policy(PolicyEffect::Allow);
+    let evidence = dir.write("e.json", receipt(&allow).to_json().unwrap());
+    let pin_file = dir.write("pin.hex", pin(&attester()));
+    let policy_file = dir.write("p.json", serde_json::to_vec(&allow).unwrap());
+
+    let output = verify(&evidence, &pin_file, Some(&policy_file));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(summary(&output)["details"]["policy_verified"], true);
+}
+
+#[test]
+fn other_or_invalid_policy_fails() {
+    let dir = Dir::new();
+    let evidence = dir.write(
+        "e.json",
+        receipt(&policy(PolicyEffect::Allow)).to_json().unwrap(),
+    );
+    let pin_file = dir.write("pin.hex", pin(&attester()));
+    let other = dir.write(
+        "other.json",
+        serde_json::to_vec(&policy(PolicyEffect::Deny)).unwrap(),
+    );
+    assert_fails(
+        &verify(&evidence, &pin_file, Some(&other)),
+        "POLICY_MISMATCH",
+    );
+
+    let invalid = dir.write("invalid.json", "{\"id\":\"x\"}");
+    assert!(
+        !verify(&evidence, &pin_file, Some(&invalid))
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn wrong_key_still_fails_before_policy_check() {
+    let dir = Dir::new();
+    let allow = policy(PolicyEffect::Allow);
+    let evidence = dir.write("e.json", receipt(&allow).to_json().unwrap());
+    let wrong = dir.write(
+        "w.hex",
+        pin(&EvidenceAttesterKey::from_secret_bytes(&[4; 32])),
+    );
+    let policy_file = dir.write("p.json", serde_json::to_vec(&allow).unwrap());
+    assert_fails(&verify(&evidence, &wrong, Some(&policy_file)), "AUTH_FAIL");
+}
+
+#[test]
+fn legacy_receipt_without_policy_digest_verifies_but_fails_with_policy() {
+    let dir = Dir::new();
+    let legacy = Evidence::from_json(LEGACY.trim()).unwrap();
+    assert!(legacy.policy_digest.is_none());
+    let evidence = dir.write("legacy.json", LEGACY.trim());
+    let pin_file = dir.write("pin.hex", pin(&attester()));
+    let policy_file = dir.write(
+        "p.json",
+        serde_json::to_vec(&policy(PolicyEffect::Allow)).unwrap(),
+    );
+
+    let plain = verify(&evidence, &pin_file, None);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stdout)
+    );
+    assert_fails(
+        &verify(&evidence, &pin_file, Some(&policy_file)),
+        "POLICY_MISMATCH",
+    );
+}
