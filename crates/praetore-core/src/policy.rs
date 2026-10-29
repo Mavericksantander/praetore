@@ -14,9 +14,98 @@ use crate::{
     identity::AgentIdentity,
 };
 
-const MAX_POLICY_RULES: usize = 1024;
-const MAX_CONDITIONS_PER_RULE: usize = 128;
-const MAX_POLICY_TEXT_BYTES: usize = 1024;
+// Policy size and complexity limits. A policy that exceeds any of them is
+// rejected when it is built or loaded (`Policy::validate`, `Policy::from_json`)
+// with `PraetoreError::PolicyLimitExceeded`; nothing is skipped or ignored.
+// The policy engine has no regular expressions, so there is no pattern limit.
+
+/// Maximum number of rules in a policy, checked before the canonical size.
+/// Set above what fits in `MAX_JSON_VALUE_BYTES` (468 minimal rules with ids
+/// `r0`..`r467`), so the canonical size stays the binding limit and no policy
+/// that was valid before this constant became public is rejected by it.
+pub const MAX_POLICY_RULES: usize = 512;
+/// Maximum parameter conditions, and separately context conditions, per rule.
+pub const MAX_CONDITIONS_PER_RULE: usize = 128;
+/// Maximum UTF-8 bytes of a policy id, rule id, action type, capability,
+/// target or condition key.
+pub const MAX_POLICY_TEXT_BYTES: usize = 1024;
+/// Maximum UTF-8 bytes of any string inside a condition's expected value.
+pub const MAX_CONDITION_STRING_BYTES: usize = 1024;
+/// Maximum number of values in an `In` condition.
+pub const MAX_CONDITION_SET_VALUES: usize = 256;
+/// Maximum nesting depth of a condition's expected value (a scalar is 1).
+pub const MAX_CONDITION_VALUE_DEPTH: usize = 8;
+
+/// Which policy limit was exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyLimit {
+    PolicyIdBytes,
+    Rules,
+    RuleIdBytes,
+    ActionTypeBytes,
+    CapabilityBytes,
+    TargetBytes,
+    ConditionsPerRule,
+    ConditionKeyBytes,
+    ConditionStringBytes,
+    ConditionSetValues,
+    ConditionValueDepth,
+    CanonicalBytes,
+}
+
+impl std::fmt::Display for PolicyLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PolicyIdBytes => "policy id bytes",
+            Self::Rules => "rules per policy",
+            Self::RuleIdBytes => "rule id bytes",
+            Self::ActionTypeBytes => "action type bytes",
+            Self::CapabilityBytes => "capability bytes",
+            Self::TargetBytes => "target bytes",
+            Self::ConditionsPerRule => "conditions per rule scope",
+            Self::ConditionKeyBytes => "condition key bytes",
+            Self::ConditionStringBytes => "condition string bytes",
+            Self::ConditionSetValues => "values in an In condition",
+            Self::ConditionValueDepth => "condition value nesting depth",
+            Self::CanonicalBytes => "canonical policy bytes",
+        })
+    }
+}
+
+fn check_limit(limit: PolicyLimit, actual: usize, max: usize) -> Result<()> {
+    if actual > max {
+        return Err(PraetoreError::PolicyLimitExceeded { limit, max });
+    }
+    Ok(())
+}
+
+/// Checks string length, `In` cardinality and nesting depth of a value.
+fn check_condition_value(value: &Value, depth: usize) -> Result<()> {
+    check_limit(
+        PolicyLimit::ConditionValueDepth,
+        depth,
+        MAX_CONDITION_VALUE_DEPTH,
+    )?;
+    match value {
+        Value::String(text) => check_limit(
+            PolicyLimit::ConditionStringBytes,
+            text.len(),
+            MAX_CONDITION_STRING_BYTES,
+        ),
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| check_condition_value(value, depth + 1)),
+        Value::Object(values) => values.iter().try_for_each(|(key, value)| {
+            check_limit(
+                PolicyLimit::ConditionStringBytes,
+                key.len(),
+                MAX_CONDITION_STRING_BYTES,
+            )?;
+            check_condition_value(value, depth + 1)
+        }),
+        _ => Ok(()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -173,11 +262,12 @@ impl Policy {
             ));
         }
 
-        if self.id.len() > MAX_POLICY_TEXT_BYTES || self.rules.len() > MAX_POLICY_RULES {
-            return Err(PraetoreError::PolicyEvaluationFailed(
-                "policy exceeds configured input limits".into(),
-            ));
-        }
+        check_limit(
+            PolicyLimit::PolicyIdBytes,
+            self.id.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        check_limit(PolicyLimit::Rules, self.rules.len(), MAX_POLICY_RULES)?;
 
         for rule in &self.rules {
             rule.validate()?;
@@ -196,15 +286,23 @@ impl Policy {
         }
 
         let canonical = canonical_json(self).map_err(|error| {
-            PraetoreError::PolicyEvaluationFailed(format!(
-                "policy exceeds canonical input limits: {error}"
-            ))
+            let message = error.to_string();
+            if message.contains("exceeds maximum size") {
+                PraetoreError::PolicyLimitExceeded {
+                    limit: PolicyLimit::CanonicalBytes,
+                    max: MAX_JSON_VALUE_BYTES,
+                }
+            } else {
+                PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy exceeds canonical input limits: {message}"
+                ))
+            }
         })?;
-        if canonical.len() > MAX_JSON_VALUE_BYTES {
-            return Err(PraetoreError::PolicyEvaluationFailed(
-                "policy exceeds maximum canonical size".into(),
-            ));
-        }
+        check_limit(
+            PolicyLimit::CanonicalBytes,
+            canonical.len(),
+            MAX_JSON_VALUE_BYTES,
+        )?;
 
         Ok(())
     }
@@ -283,13 +381,25 @@ impl PolicyRule {
             return false;
         }
 
-        let restrictive = semantics_version >= 2 && self.effect != PolicyEffect::Allow;
-        self.parameter_conditions.iter().all(|condition| {
-            condition.matches(&action.parameters, restrictive) != ConditionMatch::False
-        }) && self
-            .context_conditions
+        // Deny and RequireApproval rules are "restrictive".
+        let deny_like = self.effect != PolicyEffect::Allow;
+        let restrictive = semantics_version >= 2 && deny_like;
+        let holds = |result: ConditionMatch| match result {
+            ConditionMatch::True => true,
+            ConditionMatch::False => false,
+            // Missing or mistyped value: matches restrictive rules under v2 only.
+            ConditionMatch::Unknown => restrictive,
+            // Unsafe path-like value: always matches Deny/RequireApproval and
+            // never matches Allow, in every semantics version (fail closed).
+            ConditionMatch::UnsafeValue => deny_like,
+        };
+        self.parameter_conditions
             .iter()
-            .all(|condition| condition.matches_map(context, restrictive) != ConditionMatch::False)
+            .all(|condition| holds(condition.matches(&action.parameters, restrictive)))
+            && self
+                .context_conditions
+                .iter()
+                .all(|condition| holds(condition.matches_map(context, restrictive)))
     }
 
     fn decision(&self) -> Result<Decision> {
@@ -315,11 +425,22 @@ impl PolicyRule {
                 self.id
             )));
         }
-        if self.id.len() > MAX_POLICY_TEXT_BYTES || self.action_type.len() > MAX_POLICY_TEXT_BYTES {
-            return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                "policy rule '{}' exceeds maximum text length",
-                self.id
-            )));
+        check_limit(
+            PolicyLimit::RuleIdBytes,
+            self.id.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        check_limit(
+            PolicyLimit::ActionTypeBytes,
+            self.action_type.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        if let Some(capability) = &self.required_capability {
+            check_limit(
+                PolicyLimit::CapabilityBytes,
+                capability.len(),
+                MAX_POLICY_TEXT_BYTES,
+            )?;
         }
 
         if let Some(capability) = &self.required_capability
@@ -338,22 +459,20 @@ impl PolicyRule {
                     self.id
                 )));
             }
-            if target.len() > MAX_POLICY_TEXT_BYTES {
-                return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                    "policy rule '{}' target exceeds maximum length",
-                    self.id
-                )));
-            }
+            check_limit(
+                PolicyLimit::TargetBytes,
+                target.len(),
+                MAX_POLICY_TEXT_BYTES,
+            )?;
         }
 
-        if self.parameter_conditions.len() > MAX_CONDITIONS_PER_RULE
-            || self.context_conditions.len() > MAX_CONDITIONS_PER_RULE
-        {
-            return Err(PraetoreError::PolicyEvaluationFailed(format!(
-                "policy rule '{}' has too many conditions",
-                self.id
-            )));
-        }
+        check_limit(
+            PolicyLimit::ConditionsPerRule,
+            self.parameter_conditions
+                .len()
+                .max(self.context_conditions.len()),
+            MAX_CONDITIONS_PER_RULE,
+        )?;
 
         validate_conditions(&self.id, "parameter", &self.parameter_conditions)?;
         validate_conditions(&self.id, "context", &self.context_conditions)?;
@@ -385,6 +504,15 @@ impl PolicyCondition {
 
     pub fn prefix(key: impl Into<String>, expected: impl Into<String>) -> Self {
         Self::new(key, MatchOperator::Prefix, Value::String(expected.into()))
+    }
+
+    /// Path-aware prefix match. See [`MatchOperator::PathPrefix`].
+    pub fn path_prefix(key: impl Into<String>, expected: impl Into<String>) -> Self {
+        Self::new(
+            key,
+            MatchOperator::PathPrefix,
+            Value::String(expected.into()),
+        )
     }
 
     pub fn one_of(key: impl Into<String>, expected: Vec<Value>) -> Self {
@@ -423,8 +551,28 @@ impl PolicyCondition {
                 }
             }
             MatchOperator::Prefix => match (actual.as_str(), self.expected.as_str()) {
+                // Mitigation: values that may escape the prefix as a path
+                // (`..` segment, any `%`, NUL) are unsafe, see `holds`.
+                (Some(actual), Some(_)) if is_unsafe_prefix_value(actual) => {
+                    ConditionMatch::UnsafeValue
+                }
                 (Some(actual), Some(prefix)) if actual.starts_with(prefix) => ConditionMatch::True,
                 (Some(_), Some(_)) => ConditionMatch::False,
+                _ => ConditionMatch::Unknown,
+            },
+            MatchOperator::PathPrefix => match (actual.as_str(), self.expected.as_str()) {
+                (Some(actual), Some(prefix)) => {
+                    match (path_segments(actual), path_segments(prefix)) {
+                        (Some(actual), Some(prefix)) if actual.starts_with(&prefix) => {
+                            ConditionMatch::True
+                        }
+                        (Some(_), Some(_)) => ConditionMatch::False,
+                        (None, _) => ConditionMatch::UnsafeValue,
+                        // Rule prefixes are validated on load; unreachable in
+                        // a validated policy, and never matches Allow.
+                        (Some(_), None) => ConditionMatch::Unknown,
+                    }
+                }
                 _ => ConditionMatch::Unknown,
             },
             MatchOperator::In => {
@@ -472,10 +620,20 @@ impl PolicyCondition {
     }
 
     fn validate(&self, rule_id: &str, scope: &str) -> Result<()> {
-        if self.key.trim().is_empty()
-            || self.key != self.key.trim()
-            || self.key.len() > MAX_POLICY_TEXT_BYTES
-        {
+        check_limit(
+            PolicyLimit::ConditionKeyBytes,
+            self.key.len(),
+            MAX_POLICY_TEXT_BYTES,
+        )?;
+        if let Some(values) = self.expected.as_array() {
+            check_limit(
+                PolicyLimit::ConditionSetValues,
+                values.len(),
+                MAX_CONDITION_SET_VALUES,
+            )?;
+        }
+        check_condition_value(&self.expected, 1)?;
+        if self.key.trim().is_empty() || self.key != self.key.trim() {
             return Err(PraetoreError::PolicyEvaluationFailed(format!(
                 "policy rule '{rule_id}' has invalid {scope} condition key"
             )));
@@ -496,6 +654,14 @@ impl PolicyCondition {
             {
                 return Err(PraetoreError::PolicyEvaluationFailed(format!(
                     "policy rule '{rule_id}' prefix condition must use a non-empty string"
+                )));
+            }
+            MatchOperator::PathPrefix
+                if self.expected.as_str().and_then(path_segments).is_none() =>
+            {
+                return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{rule_id}' path prefix must be an absolute, normalized path \
+                     without '.', '..', empty segments, '\\', '%' or NUL"
                 )));
             }
             MatchOperator::In
@@ -530,6 +696,8 @@ enum ConditionMatch {
     True,
     False,
     Unknown,
+    /// A string value that is unsafe for a path-like operator.
+    UnsafeValue,
 }
 
 fn same_json_type(left: &Value, right: &Value) -> bool {
@@ -549,14 +717,99 @@ fn same_json_type(left: &Value, right: &Value) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatchOperator {
     Exact,
+    /// Lexical string prefix. Not path-aware: use [`Self::PathPrefix`] for
+    /// paths.
+    ///
+    /// Mitigation against path traversal: a value with a `..` segment (split
+    /// on `/` or `\\`), any `%` (upper, lower or mixed case escapes; the
+    /// engine does not percent-decode) or a NUL is treated as unsafe. An
+    /// unsafe value always matches `Deny` and `RequireApproval` rules and
+    /// never matches `Allow` rules, under every semantics version.
+    ///
+    /// See [`Self::PathPrefix`] for the lexical limits that also apply here.
     Prefix,
     In,
     GreaterThan,
     GreaterThanOrEqual,
     LessThan,
     LessThanOrEqual,
+    /// Path prefix on whole segments, purely lexical.
+    ///
+    /// Both the rule prefix and the value must be absolute (`/`-rooted) and
+    /// already normalized: no `.` or `..` segments, no empty segments
+    /// (`//`), no `\\`, no NUL and no `%` at all. A single trailing `/` is
+    /// allowed. `/srv/agent` matches `/srv/agent` and `/srv/agent/x`, not
+    /// `/srv/agentx`. A rule prefix that breaks these rules is rejected when
+    /// the policy loads. A value that breaks them is unsafe: it always
+    /// matches `Deny` and `RequireApproval` rules and never matches `Allow`
+    /// rules, under every semantics version.
+    ///
+    /// Lexical limits (the check is byte/char based, nothing is normalized):
+    /// - the filesystem is never consulted, so symlinks are out of scope;
+    /// - Unicode look-alikes are not folded: fullwidth `．．` (U+FF0E),
+    ///   division slash `∕` (U+2215) and similar are ordinary characters;
+    /// - spaces are significant (`" .."` and `".. "` are not `..`);
+    /// - `...` is an ordinary segment name.
+    ///
+    /// Callers must therefore pass the exact path that will be used, and no
+    /// downstream layer may apply NFKC normalization or percent-decoding to
+    /// a value after it was authorized.
+    ///
+    /// Over-restriction (accepted, fail closed): the unsafe check runs before
+    /// the prefix comparison, so an unsafe value matches a `Deny` or
+    /// `RequireApproval` rule even when it lies outside the rule's prefix.
+    /// For example a deny rule on `/srv/secret` also denies `/home/50%.txt`
+    /// and `/home/a/../b`. The same applies to [`Self::Prefix`].
+    PathPrefix,
+}
+
+fn path_prefix_segments(condition: &PolicyCondition) -> Option<Vec<&str>> {
+    condition.expected.as_str().and_then(path_segments)
+}
+
+/// An `Exact` value that is a safe path outside the `PathPrefix` can never
+/// satisfy both conditions. Unsafe exact values are not a conflict: they make
+/// the path condition unsafe, which still matches restrictive rules.
+fn exact_outside_path_prefix(exact: &PolicyCondition, prefix: &PolicyCondition) -> bool {
+    let Some(prefix) = path_prefix_segments(prefix) else {
+        return false;
+    };
+    exact
+        .expected
+        .as_str()
+        .and_then(path_segments)
+        .is_some_and(|exact| !exact.starts_with(&prefix))
+}
+
+fn is_unsafe_prefix_value(value: &str) -> bool {
+    has_dot_dot_segment(value) || value.contains(['%', '\0'])
+}
+
+fn has_dot_dot_segment(value: &str) -> bool {
+    value.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+/// Segments of an absolute, normalized path, or `None` if it is not one.
+fn path_segments(path: &str) -> Option<Vec<&str>> {
+    if !path.starts_with('/') || path.contains(['\\', '%', '\0']) {
+        return None;
+    }
+    let body = &path[1..];
+    let body = body.strip_suffix('/').unwrap_or(body);
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    let segments: Vec<&str> = body.split('/').collect();
+    if segments
+        .iter()
+        .any(|segment| segment.is_empty() || *segment == "." || *segment == "..")
+    {
+        return None;
+    }
+    Some(segments)
 }
 
 fn compare_numeric(actual: &Value, expected: &Value) -> Option<Ordering> {
@@ -651,6 +904,19 @@ fn conditions_conflict(left: &PolicyCondition, right: &PolicyCondition) -> bool 
             .as_str()
             .zip(right.expected.as_str())
             .is_some_and(|(prefix, exact)| !exact.starts_with(prefix)),
+        (MatchOperator::PathPrefix, MatchOperator::PathPrefix) => path_prefix_segments(left)
+            .zip(path_prefix_segments(right))
+            .is_some_and(|(left, right)| !left.starts_with(&right) && !right.starts_with(&left)),
+        (MatchOperator::Exact, MatchOperator::PathPrefix) => exact_outside_path_prefix(left, right),
+        (MatchOperator::PathPrefix, MatchOperator::Exact) => exact_outside_path_prefix(right, left),
+        // Conservative: only flag prefixes that are lexically unrelated, so a
+        // policy is never rejected for a satisfiable pair.
+        (MatchOperator::PathPrefix, MatchOperator::Prefix)
+        | (MatchOperator::Prefix, MatchOperator::PathPrefix) => left
+            .expected
+            .as_str()
+            .zip(right.expected.as_str())
+            .is_some_and(|(left, right)| !left.starts_with(right) && !right.starts_with(left)),
         _ => false,
     }
 }
