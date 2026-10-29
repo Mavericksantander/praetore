@@ -156,3 +156,159 @@ fn path_prefix_rule_prefix_is_validated_on_load() {
         .replace("\"/srv\"", "\"/srv/../etc\"");
     assert!(Policy::from_json(&json).is_err());
 }
+
+// ---- Regression: unsafe values must match restrictive rules in v1 and v2 ----
+
+fn allow_all_plus(restrictive: PolicyRule, v2: bool) -> Policy {
+    let rules = vec![
+        PolicyRule::new("allow-all", "modify_file", PolicyEffect::Allow),
+        restrictive,
+    ];
+    if v2 {
+        Policy::new_v2("path-policy", 1, rules)
+    } else {
+        Policy::new("path-policy", 1, rules)
+    }
+}
+
+#[test]
+fn prefix_deny_still_applies_to_dot_dot_values_in_v1_and_v2() {
+    for v2 in [false, true] {
+        let policy = allow_all_plus(
+            PolicyRule::new("secret", "modify_file", PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::prefix("path", "/srv/secret/")),
+            v2,
+        );
+        for value in [
+            "/srv/secret/../secret/key",
+            "/srv/secret/x/../key",
+            "/srv/secret%2fkey",
+            "/srv/%2E%2e/secret",
+            "/srv/secret\u{0}",
+        ] {
+            assert_eq!(
+                outcome(&policy, json!(value)),
+                DecisionOutcome::Deny,
+                "v2={v2} {value}"
+            );
+        }
+        assert_eq!(
+            outcome(&policy, json!("/srv/public/x")),
+            DecisionOutcome::Allow
+        );
+    }
+}
+
+#[test]
+fn path_prefix_deny_applies_to_unsafe_values_in_v1_and_v2() {
+    for v2 in [false, true] {
+        let policy = allow_all_plus(
+            PolicyRule::new("secret", "modify_file", PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix("path", "/srv/secret")),
+            v2,
+        );
+        for value in [
+            "/srv/secret/../x",
+            "/srv/secret//key",
+            "/srv/%73ecret/key",
+            "/srv/x/../secret",
+            "srv/secret/key",
+        ] {
+            assert_eq!(
+                outcome(&policy, json!(value)),
+                DecisionOutcome::Deny,
+                "v2={v2} {value}"
+            );
+        }
+        assert_eq!(
+            outcome(&policy, json!("/srv/secret/key")),
+            DecisionOutcome::Deny
+        );
+        assert_eq!(
+            outcome(&policy, json!("/srv/public/key")),
+            DecisionOutcome::Allow
+        );
+    }
+}
+
+#[test]
+fn require_approval_holds_unsafe_values_in_v1_and_v2() {
+    for v2 in [false, true] {
+        for condition in [
+            PolicyCondition::prefix("path", "/srv/agent/"),
+            PolicyCondition::path_prefix("path", "/srv/agent"),
+        ] {
+            let policy = allow_all_plus(
+                PolicyRule::new("review", "modify_file", PolicyEffect::RequireApproval)
+                    .with_parameter_condition(condition),
+                v2,
+            );
+            assert_eq!(
+                outcome(&policy, json!("/srv/agent/../etc/passwd")),
+                DecisionOutcome::RequireApproval,
+                "v2={v2}"
+            );
+        }
+    }
+}
+
+#[test]
+fn allow_never_matches_unsafe_values_in_v1_and_v2() {
+    for v2 in [false, true] {
+        for condition in [
+            PolicyCondition::prefix("path", "/srv/agent/"),
+            PolicyCondition::path_prefix("path", "/srv/agent"),
+        ] {
+            let rules = vec![
+                PolicyRule::new("safe", "modify_file", PolicyEffect::Allow)
+                    .with_parameter_condition(condition),
+            ];
+            let policy = if v2 {
+                Policy::new_v2("path-policy", 1, rules)
+            } else {
+                Policy::new("path-policy", 1, rules)
+            };
+            for value in [
+                "/srv/agent/../etc",
+                "/srv/agent/%2e%2e/etc",
+                "/srv/agent/x\u{0}",
+            ] {
+                assert_eq!(
+                    outcome(&policy, json!(value)),
+                    DecisionOutcome::Deny,
+                    "{value:?}"
+                );
+            }
+        }
+    }
+}
+
+// ---- Lexical limits: pin the current, documented behaviour ----
+// Nothing below is normalized: these are ordinary characters for the engine.
+// Downstream layers must not NFKC-normalize or percent-decode authorized paths.
+
+#[test]
+fn lexical_limits_are_not_normalized() {
+    let policy = allow_with(PolicyCondition::path_prefix("path", "/srv/agent"));
+    for literal in [
+        "/srv/agent/\u{FF0E}\u{FF0E}/etc",   // fullwidth full stops "．．"
+        "/srv/agent/x\u{2215}..\u{2215}etc", // U+2215 division slash
+        "/srv/agent/ ../etc",
+        "/srv/agent/.. /etc",
+        "/srv/agent/.../etc",
+    ] {
+        assert_eq!(
+            outcome(&policy, json!(literal)),
+            DecisionOutcome::Allow,
+            "{literal:?}"
+        );
+    }
+    let prefix = allow_with(PolicyCondition::prefix("path", "/srv/agent/"));
+    for literal in ["/srv/agent/\u{FF0E}\u{FF0E}/etc", "/srv/agent/.../etc"] {
+        assert_eq!(
+            outcome(&prefix, json!(literal)),
+            DecisionOutcome::Allow,
+            "{literal:?}"
+        );
+    }
+}
