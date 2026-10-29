@@ -21,6 +21,17 @@
   - Breaking: new `PraetoreError` variant; limit violations no longer surface
     as `PolicyEvaluationFailed(String)`.
   - The policy engine has no regular expressions, so there is no pattern limit.
+- Policy validation now rejects contradictory `PathPrefix` conditions on the
+  same key using segment semantics: two unrelated path prefixes (`/a` and
+  `/b`), or an `Exact` safe path outside a `PathPrefix` (`/b/x` with `/a`).
+  `PathPrefix` against `Prefix` is rejected only when the two are lexically
+  unrelated (conservative).
+- Documented over-restriction (fail closed): an unsafe value (`%`, `..`, and
+  for `PathPrefix` anything not absolute and normalized) matches `Deny` and
+  `RequireApproval` rules on `Prefix`/`PathPrefix` even if it lies outside the
+  rule's prefix; for example a deny on `/srv/secret` also denies
+  `/home/50%.txt`. Pinned by tests.
+
 - Security: `MatchOperator::Prefix` treats a value with a `..` segment
   (split on `/` or `\`), any `%`, or a NUL as unsafe. Previously an allow
   rule with prefix `/srv/agent/` matched `/srv/agent/../../etc/passwd`.
