@@ -11,15 +11,19 @@
     `MAX_POLICY_TEXT_BYTES` = 1024 (ids, action type, target, condition key),
     canonical policy size `MAX_JSON_VALUE_BYTES` = 65 536.
   - `MAX_POLICY_RULES` = 512 (was 1024, unreachable). It sits above what
-    fits in 64 KiB of canonical JSON (468 minimal rules), so the canonical
-    size remains the binding limit and no previously valid policy is
-    rejected by the rule count.
-  - New: capability length (`MAX_POLICY_TEXT_BYTES`),
-    `MAX_CONDITION_STRING_BYTES` = 1024 (strings and object keys inside
-    expected values), `MAX_CONDITION_SET_VALUES` = 256 (array values),
-    `MAX_CONDITION_VALUE_DEPTH` = 8.
+    fits in 64 KiB of canonical JSON (468 minimal rules with ids
+    `r0`..`r467`; with 1-2 byte ids the maximum is 475, still below 512), so
+    the canonical size remains the binding limit and no previously valid
+    policy is rejected by the rule count.
   - Breaking: new `PraetoreError` variant; limit violations no longer surface
     as `PolicyEvaluationFailed(String)`.
+  - Breaking: new limits that reject policies valid before this release:
+    - capability longer than 1024 bytes (`MAX_POLICY_TEXT_BYTES`);
+    - condition string (string or object key inside an expected value)
+      longer than 1024 bytes (`MAX_CONDITION_STRING_BYTES`);
+    - `In` (array value) with more than 256 values
+      (`MAX_CONDITION_SET_VALUES`);
+    - expected value nested deeper than 8 (`MAX_CONDITION_VALUE_DEPTH`).
   - The policy engine has no regular expressions, so there is no pattern limit.
 - Policy validation now rejects contradictory `PathPrefix` conditions on the
   same key using segment semantics: two unrelated path prefixes (`/a` and
