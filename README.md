@@ -26,6 +26,100 @@ verifier, verify-only Python bindings, a reference tool-gateway crate, a
 PostgreSQL-backed local CLI demo, bounded fuzz targets, and an optional
 PostgreSQL replay-guard adapter.
 
+## Current state on `main`
+
+This section lists only what is merged on `main`. Each item points to the
+code or test that backs it. None of it is a security or production guarantee.
+
+- **Signed human approve/reject (#14).** For a `RequireApproval` decision,
+  `praetore approve` / `praetore reject` sign the gateway's approval challenge
+  with a local Ed25519 approver key. The gateway verifies the signature
+  against a pinned approver key, records the decision append-only in
+  `praetore.human_approvals`, and only then dispatches. A decision cannot be
+  reused, and a rejection is final. See the
+  [CLI guide](crates/praetore-cli/README.md#human-approval) and the tests in
+  [`crates/praetore-gateway/tests/enforcement.rs`](crates/praetore-gateway/tests/enforcement.rs)
+  (for example `signed_human_approval_dispatches_the_exact_persisted_action_once`
+  and `rejected_human_approval_is_persisted_without_dispatch`).
+- **Policy digest in the receipt.** The engine binds the SHA-256 digest of
+  the active policy's canonical JSON (`Policy::digest`) into the evidence
+  `policy_digest` field. That field is part of the evidence integrity hash
+  and of the payload covered by the Ed25519 attester signature. See
+  [`crates/praetore-core/src/evidence.rs`](crates/praetore-core/src/evidence.rs)
+  (test `policy_digest_is_bound_to_integrity_hash`). On `main`, signing does
+  **not** yet require the field to be present (see *In development*).
+- **`PathPrefix` condition operator.** A lexical, whole-segment path prefix
+  (`/srv/agent` matches `/srv/agent/x`, not `/srv/agentx`).
+  - Rule prefixes must be absolute and normalized. An invalid prefix rejects
+    the policy when it loads.
+  - A value that is not absolute and normalized is *unsafe*. That covers
+    `.`, `..`, `//`, `\`, NUL, any `%`, and relative paths. An unsafe value
+    never matches an `Allow` rule, and always matches `Deny` and
+    `RequireApproval` rules, under both policy semantics versions.
+  - `Prefix` applies the same unsafe rule to values containing a `..`
+    segment, `%`, or NUL.
+  - Conflicting `PathPrefix` conditions on the same key are rejected.
+  - **Lexical limits:** nothing is normalized. Fullwidth `．．` (U+FF0E), the
+    division slash `∕` (U+2215), spaces (`" .."`), and `...` are ordinary
+    characters. No layer downstream may NFKC-normalize or percent-decode a
+    value after it was authorized.
+  - **Over-restriction (accepted, fail closed):** an unsafe value triggers a
+    `Deny` or `RequireApproval` rule even when it lies outside the rule's
+    prefix. For example, a deny on `/srv/secret` also denies `/home/50%.txt`.
+  - See [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs),
+    [`tests/path_prefix.rs`](crates/praetore-core/tests/path_prefix.rs) and
+    [`tests/path_prefix_followups.rs`](crates/praetore-core/tests/path_prefix_followups.rs).
+- **Tests ported from Canopy.**
+  [`crates/praetore-core/tests/canopy_port.rs`](crates/praetore-core/tests/canopy_port.rs)
+  rewrites the applicable behaviour cases of the earlier Canopy library
+  (Apache-2.0) as Rust tests.
+  - Where Canopy allowed by default, the expected result here is a default
+    deny, and each test documents the difference.
+  - Not ported: fixed-key HMAC witnesses, overwritable approvals, substring
+    heuristics, reputation, and shell execution.
+
+Run the tests listed above:
+
+```sh
+cargo test -p praetore-core --test canopy_port --test path_prefix --test path_prefix_followups
+cargo test -p praetore-core --lib evidence::tests::policy_digest_is_bound_to_integrity_hash
+cargo test -p praetore-gateway --test enforcement human_approval
+```
+
+## Limitations
+
+- **Cooperative enforcement.** PRÆTORE governs only the actions an agent
+  submits to it. It cannot stop an agent, or any other process, from
+  performing an action directly. Any client that executes an action itself
+  after an `allowed` answer does so outside PRÆTORE's control.
+- **Path protection is local and lexical only.** `Prefix` and `PathPrefix`
+  compare strings and never consult the filesystem. **Symlinks are out of
+  scope.**
+- **The journal does not separate approval from dispatch, and does not
+  independently confirm execution.**
+  - In `praetore.execution_journal`, an approval moves an execution directly
+    from `not_dispatched` to `dispatched` in the same transaction that
+    records the decision in `praetore.human_approvals`
+    ([`crates/praetore-replay-postgres/src/execution.rs`](crates/praetore-replay-postgres/src/execution.rs)).
+    There is no separate "approved but not yet dispatched" state.
+  - `executed` and `confirmed` record what the dispatcher adapter reported.
+    The strength of `confirmed` depends on that adapter
+    ([`DispatchReport`](crates/praetore-gateway/src/lib.rs)).
+- **No fuzzing campaign has been run** on the new path operators. The
+  repository's bounded fuzz targets do not cover them specifically.
+- **Not yet tested on macOS.**
+
+## In development
+
+The following are **open pull requests, not merged** and not available on
+`main`:
+
+- [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
+- [#16](https://github.com/Mavericksantander/praetore/pull/16): `SandboxDispatcher` executed by the gateway, and the `praetore-exec-mode` header.
+- [#17](https://github.com/Mavericksantander/praetore/pull/17): require the active policy digest before a receipt can be signed.
+- [#18](https://github.com/Mavericksantander/praetore/pull/18): `praetore-verify evidence --policy` (depends on #17).
+- [#21](https://github.com/Mavericksantander/praetore/pull/21): public, typed policy size and complexity limits.
+
 ## What it is — and is not
 
 **PRÆTORE is:**
