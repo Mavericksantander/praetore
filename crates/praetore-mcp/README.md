@@ -35,6 +35,16 @@ praetore-mcp receipts --tail 20
 
 # 6. Verify every receipt (integrity, attester signature, intent, authority, mode)
 praetore-mcp verify
+
+# 7. Add rules (no JSON editing), check them, then restart the client
+praetore-mcp policy deny --id deny-delete --server filesystem --tool delete_file
+praetore-mcp policy require-approval --id approve-ssh --tool read_file --arg-path-prefix path=/Users/me/.ssh
+praetore-mcp policy list
+praetore-mcp policy check
+
+# 8. Switch to enforce (install skips entries that are already wrapped, so uninstall first)
+praetore-mcp uninstall --client claude-desktop --yes
+praetore-mcp install --client claude-desktop --mode enforce --yes
 ```
 
 `install` turns each stdio entry such as
@@ -136,45 +146,67 @@ receipts still verify after the local authority expires.
 ## Writing policy
 
 `DIR/policy.json` is a PRÆTORE v2 policy (see
-[`docs/policy-language.md`](../../docs/policy-language.md)). The default has one
-rule:
+[`docs/policy-language.md`](../../docs/policy-language.md)). The default policy
+has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`.
+Manage rules with `praetore-mcp policy` instead of editing JSON by hand:
 
-```json
-{"id": "allow-all-mcp-tool-calls", "action_type": "mcp.tools/call", "effect": "Allow",
- "required_capability": "mcp:tools/call", "target": null,
- "parameter_conditions": [], "context_conditions": []}
+```sh
+praetore-mcp policy list                     # id, effect, server, tool, other conditions
+praetore-mcp policy check                    # validate, print digest, lint; exit 1 if invalid
+praetore-mcp policy deny             --id ID [--server NAME] [--tool NAME] [conditions...]
+praetore-mcp policy require-approval --id ID [--server NAME] [--tool NAME] [conditions...]
+praetore-mcp policy allow            --id ID [--server NAME] [--tool NAME] [conditions...]
+praetore-mcp policy remove --id ID
+
+# conditions (repeatable, all ANDed; KEY is a top-level tool argument):
+#   --arg-exact KEY=VALUE          VALUE is JSON if it parses (5, true, "5", [1]), else a string
+#   --arg-path-prefix KEY=/abs/dir segment-aware path prefix (rejects .., %, NUL)
+#   --arg-prefix KEY=VALUE         plain string prefix
+#   --any-tool                     allow a rule with no --server/--tool (see below)
 ```
 
-Add DENY or REQUIRE_APPROVAL rules keyed on `server`, `tool`, `arguments` (the
-whole object, `Exact` only) or `arguments.<key>` (top-level argument fields):
+`--server` matches the name given to `wrap --name` (the receipt's `target`).
+`--tool` matches `params.name`. Argument conditions apply to
+`arguments.<KEY>`.
 
-```json
-{"id": "deny-delete", "action_type": "mcp.tools/call", "effect": "Deny",
- "required_capability": null, "target": "filesystem",
- "parameter_conditions": [{"key": "tool", "operator": "Exact", "expected": "delete_file"}],
- "context_conditions": []},
-{"id": "approve-secrets", "action_type": "mcp.tools/call", "effect": "RequireApproval",
- "required_capability": "mcp:tools/call", "target": null,
- "parameter_conditions": [
-   {"key": "tool", "operator": "Exact", "expected": "read_file"},
-   {"key": "arguments.path", "operator": "PathPrefix", "expected": "/Users/me/.ssh"}],
- "context_conditions": []}
-```
+Every generated rule is complete: action `mcp.tools/call`,
+`required_capability` `mcp:tools/call`, and every field present. The local
+authority grants that capability and the proxy always sets the server as the
+target, so generated rules are always *bound*. In current core, a restrictive
+match that is unbound (the authority lacks the rule's capability, or the action
+has no target) always contributes DENY. A hand-written REQUIRE_APPROVAL rule
+without `required_capability` would therefore never produce approval.
+
+Each command validates the whole resulting policy with `Policy::from_json`
+before writing. It then writes the file atomically, keeps a timestamped backup
+next to it, bumps the policy `version`, and prints the new digest. Invalid
+input (a duplicate id, a malformed `KEY=VALUE`, a relative path prefix, an
+unknown flag) never writes anything. `policy check` also starts the same
+HighAssurance engine `wrap` uses, and warns about rules that will behave in
+surprising ways.
+
+**Running wrappers do not reload the policy.** Each `wrap` process reads
+`policy.json` once, when it starts. Every `policy` command prints a reminder to
+restart the MCP client (or the wrapped servers). In enforce mode, an invalid
+policy makes every `tools/call` fail closed. Run `policy check` before
+restarting.
 
 Things to know:
 
 * **v2 treats a missing or mistyped field as unknown, and unknown matches DENY
-  and REQUIRE_APPROVAL rules.** A rule on `arguments.path` with no `tool`
-  condition also matches every call that has no `path` argument. Pair argument
-  conditions with a `tool` (or `target`) condition.
+  and REQUIRE_APPROVAL rules.** A rule on `arguments.path` with no tool
+  selector also matches every call that has no `path` argument. For this
+  reason `policy deny|require-approval|allow` refuses `--arg-*` without
+  `--tool` or `--server`, and refuses rules with no selector at all, unless
+  you pass `--any-tool`. Even with `--tool read_file`, a `read_file` call that
+  omits `path` matches the rule; that is the fail-safe direction.
 * The outcome folds as DENY > REQUIRE_APPROVAL > ALLOW. If no rule matches, the
-  result is DENY.
-* REQUIRE_APPROVAL rules must set `required_capability` in HighAssurance.
-* A policy can also match on the mode, for example with
-  `context_conditions: [{"key": "praetore.mode", ...}]`.
-* Every receipt records the policy digest. Running wrappers load the policy
-  when they start, so restart the MCP client after you edit it. In enforce
-  mode, an invalid policy makes every `tools/call` fail closed.
+  result is DENY. `policy allow` rules only matter after you
+  `policy remove --id allow-all-mcp-tool-calls`.
+* A hand-written rule can also match on the mode through
+  `context_conditions` on `praetore.mode`.
+* Every receipt records the policy digest. Compare it with
+  `praetore-mcp policy check` or `praetore-verify policy-digest`.
 
 ## Message handling
 

@@ -13,7 +13,11 @@
   and errors fail closed. The mode is bound into the signed evidence as
   `context["praetore.mode"]`. `install` / `uninstall` rewrite and restore
   client configs, writing a backup and asking for confirmation first.
-  `receipts` and `verify` read and check the journal. Limitations: stdio
+  `receipts` and `verify` read and check the journal. `policy
+  list|check|deny|require-approval|allow|remove` manage rules without
+  hand-written JSON. Each change is validated, written atomically with a
+  backup, and refused when it would create an unscoped argument rule unless
+  `--any-tool` is given. Limitations: stdio
   only, REQUIRE_APPROVAL is not supported, LOCAL/DEV keys only, and receipts
   attest the proxy's view of a call, not the upstream agent's intent. See
   `crates/praetore-mcp/README.md`. `praetore-core` is unchanged.
