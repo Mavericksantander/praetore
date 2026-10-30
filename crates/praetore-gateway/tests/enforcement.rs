@@ -37,6 +37,34 @@ use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+/// `verify_execution_attestation` also checks the evidence signature, so it
+/// needs the evidence attester key. These tests use several fixtures; pick
+/// the test attester whose key id the evidence names.
+trait VerifyWithTestEvidenceAttester {
+    fn verify_with_test_evidence_attester(
+        &self,
+        public_key: &VerifiedPublicKey,
+        expected_key_id: &str,
+    ) -> Result<(), ExecutionAttestationError>;
+}
+
+impl VerifyWithTestEvidenceAttester for praetore_gateway::GatewayReceipt {
+    fn verify_with_test_evidence_attester(
+        &self,
+        public_key: &VerifiedPublicKey,
+        expected_key_id: &str,
+    ) -> Result<(), ExecutionAttestationError> {
+        let evidence_key = [13, 23, 33]
+            .into_iter()
+            .map(|secret| EvidenceAttesterKey::from_secret_bytes(&[secret; 32]))
+            .find(|key| self.evidence.attester_key_id.as_deref() == Some(key.key_id().as_str()))
+            .expect("evidence signed by a known test attester")
+            .public_key()
+            .unwrap();
+        self.verify_execution_attestation(public_key, expected_key_id, &evidence_key)
+    }
+}
+
 const NOW: &str = "2026-06-01T12:00:00Z";
 const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
@@ -1040,7 +1068,7 @@ async fn http_gateway_returns_receipt_and_dispatches_allowed_action_once() {
 
     let receipt: praetore_gateway::GatewayReceipt = serde_json::from_value(receipt).unwrap();
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
@@ -1052,7 +1080,7 @@ async fn http_gateway_returns_receipt_and_dispatches_allowed_action_once() {
     let mut reassigned_attestation = receipt.clone();
     reassigned_attestation.execution_attestation.tenant_id = Some(Uuid::from_u128(2));
     assert!(matches!(
-        reassigned_attestation.verify_execution_attestation(
+        reassigned_attestation.verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1"
         ),
@@ -1143,7 +1171,7 @@ fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
         Some(decision.clone())
     );
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
@@ -1497,7 +1525,7 @@ async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
     let body = to_bytes(response.into_body(), 65_536).await.unwrap();
     let receipt: praetore_gateway::GatewayReceipt = serde_json::from_slice(&body).unwrap();
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
@@ -1537,7 +1565,7 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
     assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
@@ -1564,14 +1592,15 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
     let mut tampered = receipt.clone();
     tampered.output = Some(json!({"key": "mode", "value": "changed"}));
     assert_eq!(
-        tampered.verify_execution_attestation(
+        tampered.verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         ),
         Err(ExecutionAttestationError::InvalidPayload)
     );
     assert_eq!(
-        receipt.verify_execution_attestation(&execution_attester_public_key(), "wrong-key-id",),
+        receipt
+            .verify_with_test_evidence_attester(&execution_attester_public_key(), "wrong-key-id",),
         Err(ExecutionAttestationError::KeyMismatch)
     );
     assert_eq!(fixture.tool.value("mode"), Some(json!("safe")));
@@ -1597,7 +1626,7 @@ fn denied_or_unmatched_action_has_no_observable_tool_effect() {
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
         assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
         receipt
-            .verify_execution_attestation(
+            .verify_with_test_evidence_attester(
                 &execution_attester_public_key(),
                 "test-execution-attester-v1",
             )
@@ -1614,7 +1643,7 @@ fn approval_required_is_not_permission_to_dispatch() {
     assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
     assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
@@ -1876,7 +1905,7 @@ fn signer_failure_after_execution_is_recoverable_without_redispatch() {
     let receipt = fixture.gateway.reconcile(key).unwrap();
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "test-execution-attester-v1",
         )
@@ -2488,7 +2517,7 @@ mod saf10_full {
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
         assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
         receipt
-            .verify_execution_attestation(
+            .verify_with_test_evidence_attester(
                 &execution_attester_public_key(),
                 "test-execution-attester-v1",
             )
@@ -2635,6 +2664,21 @@ mod apd {
             .join("../../packages/praetore-python/tests/fixtures");
         let key_id = "test-execution-attester-v1";
         let public_key = execution_attester_public_key();
+        // The evidence attester used by `approval_fixture_with_approver_and_policy`.
+        let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap();
+        let evidence_key_path = dir.join("receipt-evidence-attester-public-key.hex");
+        if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some()
+            || std::env::var_os("UPDATE_RECEIPT_V1_FIXTURE").is_some()
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&evidence_key_path, hex::encode(evidence_key.as_bytes())).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&evidence_key_path).unwrap().trim(),
+            hex::encode(evidence_key.as_bytes())
+        );
         if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some() {
             let (gateway, key, _, _, approver_key, _) = clocked_fixture();
             approve(&gateway, key, &approver_key);
@@ -2686,34 +2730,53 @@ mod apd {
         }
         let v1 = std::fs::read_to_string(dir.join("receipt-v1-confirmed.json")).unwrap();
         let receipt =
-            praetore_gateway::verify_gateway_receipt_json(&v1, &public_key, key_id).unwrap();
+            praetore_gateway::verify_gateway_receipt_json(&v1, &public_key, key_id, &evidence_key)
+                .unwrap();
         assert_eq!(receipt.execution_attestation.schema_version, 1);
         assert_eq!(receipt.execution_attestation.tenant_id, None);
         let tampered = v1.replacen("\"confirmed\"", "\"failed\"", 1);
         assert_ne!(tampered, v1);
         assert!(
-            praetore_gateway::verify_gateway_receipt_json(&tampered, &public_key, key_id).is_err()
+            praetore_gateway::verify_gateway_receipt_json(
+                &tampered,
+                &public_key,
+                key_id,
+                &evidence_key
+            )
+            .is_err()
         );
         let v3 = std::fs::read_to_string(dir.join("receipt-v3-crash-recovered.json")).unwrap();
         let receipt =
-            praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id).unwrap();
+            praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id, &evidence_key)
+                .unwrap();
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::CrashRecovered)
         );
         let v2 = std::fs::read_to_string(dir.join("receipt-v2-confirmed.json")).unwrap();
-        praetore_gateway::verify_gateway_receipt_json(&v2, &public_key, key_id).unwrap();
+        praetore_gateway::verify_gateway_receipt_json(&v2, &public_key, key_id, &evidence_key)
+            .unwrap();
         // Unknown reason: rejected at parse time.
         let unknown = v3.replace("\"crash_recovered\"", "\"operator_override\"");
         assert_ne!(unknown, v3);
         assert!(matches!(
-            praetore_gateway::verify_gateway_receipt_json(&unknown, &public_key, key_id),
+            praetore_gateway::verify_gateway_receipt_json(
+                &unknown,
+                &public_key,
+                key_id,
+                &evidence_key
+            ),
             Err(ExecutionAttestationError::InvalidPayload)
         ));
         // A different known reason breaks the signature.
         let swapped = v3.replace("\"crash_recovered\"", "\"approval_expired\"");
         assert!(matches!(
-            praetore_gateway::verify_gateway_receipt_json(&swapped, &public_key, key_id),
+            praetore_gateway::verify_gateway_receipt_json(
+                &swapped,
+                &public_key,
+                key_id,
+                &evidence_key
+            ),
             Err(ExecutionAttestationError::InvalidSignature)
         ));
     }
@@ -2729,7 +2792,7 @@ mod apd {
             Some(NotDispatchedReason::CrashRecovered)
         );
         receipt
-            .verify_execution_attestation(
+            .verify_with_test_evidence_attester(
                 &execution_attester_public_key(),
                 "test-execution-attester-v1",
             )
@@ -2782,7 +2845,7 @@ mod apd {
         forged.execution_attestation.execution = ExecutionStatus::ApprovedPendingDispatch;
         assert!(
             forged
-                .verify_execution_attestation(&public_key, key_id)
+                .verify_with_test_evidence_attester(&public_key, key_id)
                 .is_err()
         );
 
@@ -2792,21 +2855,21 @@ mod apd {
             Some(NotDispatchedReason::DispatchFailed);
         assert!(
             changed
-                .verify_execution_attestation(&public_key, key_id)
+                .verify_with_test_evidence_attester(&public_key, key_id)
                 .is_err()
         );
         let mut removed = closed.clone();
         removed.execution_attestation.not_dispatched_reason = None;
         assert!(
             removed
-                .verify_execution_attestation(&public_key, key_id)
+                .verify_with_test_evidence_attester(&public_key, key_id)
                 .is_err()
         );
         let mut downgraded = closed;
         downgraded.execution_attestation.schema_version = 2;
         assert!(
             downgraded
-                .verify_execution_attestation(&public_key, key_id)
+                .verify_with_test_evidence_attester(&public_key, key_id)
                 .is_err()
         );
     }
