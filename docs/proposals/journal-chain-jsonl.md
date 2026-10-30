@@ -61,10 +61,46 @@ fail-closed.
 
 ## Qué NO prueba
 
-- Solo prueba la integridad del export: que nadie reordenó, quitó, insertó,
-  duplicó ni alteró recibos después de generarlo.
-- No prueba que el orden registrado sea el orden real original en que se
-  tomaron las decisiones. Ese orden lo fija el productor.
-- No prueba que el export esté completo respecto del journal.
-- No dice nada sobre la autorización vigente, la frescura ni el estado de
-  replay.
+El link es un SHA-256 **sin clave** y nadie firma ni publica el `head`. Por
+eso el formato, tal como está, **no** prueba que no se borró un recibo:
+
+- **Borrado en el medio, reordenamiento, inserción de recibos firmados
+  válidos:** no se detectan. Quien tenga el archivo puede quitar o mover
+  líneas y recalcular `seq` y `prev` de las siguientes; el verificador
+  acepta el resultado. Solo detecta ediciones de alguien que no recalcula
+  la cadena (errores accidentales, no un adversario).
+- **Truncado del final:** no se detecta. Un prefijo de una cadena válida es
+  una cadena válida, y no hay `head` esperado contra el cual comparar.
+- **Fork / equivocación:** no se detecta. El productor puede entregar
+  cadenas distintas a distintos auditores; cada una verifica.
+- **Reemplazo completo por una cadena recalculada:** no se detecta mientras
+  use recibos firmados por el atestador (cualquier subconjunto, en cualquier
+  orden). Lo único que no se puede es fabricar recibos: eso ya lo impide la
+  firma de cada recibo, no la cadena.
+- Tampoco prueba que el export esté completo respecto del journal, ni que el
+  orden registrado sea el orden real de las decisiones, ni nada sobre la
+  autorización vigente, la frescura o el estado de replay.
+
+## Qué falta para que un tercero pruebe que no se borró nada
+
+1. **Cadena calculada al escribir, no al exportar.** El link (o una hoja de
+   un árbol de Merkle) se calcula en la misma transacción que inserta el
+   recibo en el journal, con `seq` asignado por la base sin huecos.
+2. **Head firmado.** El atestador (o la clave del gateway) firma
+   periódicamente `(seq, head, timestamp)` con un dominio propio, y el
+   verificador exige `--expected-head` o un head firmado contra la clave
+   fijada. Sin esto el truncado y el recálculo pasan.
+3. **Mejor aún, ligar el `prev` dentro del recibo firmado**, para que la
+   firma de cada recibo cubra su posición y no se pueda reencadenar sin la
+   clave del atestador.
+4. **Consistencia append-only entre heads** (árbol de Merkle estilo
+   RFC 6962/9162, pruebas de consistencia e inclusión), para que un auditor
+   con un head antiguo verifique que el nuevo lo extiende.
+5. **Anclaje externo contra fork:** publicar los heads firmados fuera del
+   control del operador (testigos que cofirman, un log de transparencia o un
+   canal público) y que los auditores comparen heads entre sí.
+6. **Liveness:** que la ausencia de un head nuevo dentro de un plazo sea en sí
+   una falla visible; si no, el operador puede dejar de publicar.
+
+Incluso con todo esto, la cadena solo cubre lo que entra al journal: no
+prueba que una decisión tomada fuera del gateway quede registrada.
