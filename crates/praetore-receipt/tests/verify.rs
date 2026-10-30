@@ -222,6 +222,89 @@ fn rejects_v2_relabelled_as_v1_even_without_tenant() {
     );
 }
 
+/// Re-signs the v2 confirmed fixture with a fresh key after `edit`, and
+/// returns the receipt JSON plus the new public key.
+fn resigned(edit: impl FnOnce(&mut serde_json::Value)) -> (String, VerifiedPublicKey) {
+    use ed25519_dalek::Signer;
+
+    let mut receipt: serde_json::Value =
+        serde_json::from_str(&fixture("receipt-v2-confirmed.json")).unwrap();
+    edit(&mut receipt);
+    let attestation = receipt["execution_attestation"].as_object_mut().unwrap();
+    attestation.remove("signature");
+    let payload =
+        praetore_core::canonical::canonicalize_json(&serde_json::to_string(&attestation).unwrap())
+            .unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+    let mut message = b"PRAETORE_EXECUTION_ATTESTATION_V1\0".to_vec();
+    message.extend_from_slice(&payload);
+    attestation.insert(
+        "signature".into(),
+        hex::encode(key.sign(&message).to_bytes()).into(),
+    );
+    let public = VerifiedPublicKey::from_bytes(key.verifying_key().as_bytes()).unwrap();
+    (serde_json::to_string(&receipt).unwrap(), public)
+}
+
+fn null_output_digest() -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"PRAETORE_EXECUTION_OUTPUT_V1\0");
+    hash.update(b"null");
+    hex::encode(hash.finalize())
+}
+
+// Regression: a confirmed execution whose adapter returned JSON `null` was
+// signed with the digest of `null`, but `"output": null` deserialized to
+// `None` and the receipt never verified.
+#[test]
+fn accepts_a_confirmed_receipt_whose_output_is_json_null() {
+    let (json, public) = resigned(|receipt| {
+        receipt["output"] = serde_json::Value::Null;
+        receipt["execution_attestation"]["output_digest"] = null_output_digest().into();
+    });
+    assert!(json.contains("\"output\":null"));
+    let receipt = verify_gateway_receipt_json(&json, &public, KEY_ID, &evidence_key()).unwrap();
+    assert_eq!(receipt.output, None);
+    // The same receipt with the `output` field omitted is the same document.
+    let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    value.as_object_mut().unwrap().remove("output");
+    assert!(
+        verify_gateway_receipt_json(&value.to_string(), &public, KEY_ID, &evidence_key()).is_ok()
+    );
+    // Re-serialization is unchanged: `null`, as before.
+    assert!(
+        serde_json::to_string(&receipt)
+            .unwrap()
+            .contains("\"output\":null")
+    );
+}
+
+#[test]
+fn rejects_a_null_output_against_a_different_or_missing_output_digest() {
+    for digest in [serde_json::Value::Null, fixture_output_digest().into()] {
+        let (json, public) = resigned(|receipt| {
+            receipt["output"] = serde_json::Value::Null;
+            receipt["execution_attestation"]["output_digest"] = digest;
+        });
+        assert_eq!(
+            verify_gateway_receipt_json(&json, &public, KEY_ID, &evidence_key()).map(|_| ()),
+            Err(ExecutionAttestationError::InvalidPayload)
+        );
+    }
+    // A not-dispatched receipt still requires no output digest.
+    assert_eq!(verify(&fixture("receipt-v3-crash-recovered.json")), Ok(3));
+}
+
+fn fixture_output_digest() -> String {
+    let value: serde_json::Value =
+        serde_json::from_str(&fixture("receipt-v2-confirmed.json")).unwrap();
+    value["execution_attestation"]["output_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 fn with_evidence_signature(json: &str, signature: serde_json::Value) -> String {
     let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
     value["evidence"]["attester_signature"] = signature;
