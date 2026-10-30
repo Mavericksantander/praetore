@@ -1,5 +1,4 @@
 use ed25519_dalek::{Signer, SigningKey};
-use postgres::{Client, NoTls};
 use praetore_core::{
     EvidenceAttesterKey, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
     Policy, TrustedAuthorityIssuer, VerifiedPublicKey, canonical::parse_json_rejecting_duplicates,
@@ -10,14 +9,13 @@ use praetore_gateway::{
     HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
 };
 use praetore_gateway_service::chrony_clock::ChronyClock;
-use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
+use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::Path,
-    str::FromStr,
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -199,34 +197,53 @@ fn parse_tenant_issuer_bindings(
     Ok(tenants)
 }
 
-fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    validate_local_database_url(database_url)?;
-    let mut client = Client::connect(database_url, NoTls)?;
-    praetore_replay_postgres::apply_migrations(&mut client)?;
+fn apply_migrations(database: &DatabaseConnector) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = database.connect()?;
+    let applied = praetore_replay_postgres::apply_migrations(&mut client)?;
+    tracing::info!(?applied, "database migrations applied");
     Ok(())
 }
 
-fn validate_local_database_url(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = postgres::Config::from_str(database_url)?;
-    if config.get_hosts().is_empty()
-        || config.get_hosts().iter().any(|host| match host {
-            postgres::config::Host::Tcp(host) => {
-                host != "localhost"
-                    && !host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
-            }
-            #[cfg(unix)]
-            postgres::config::Host::Unix(_) => false,
-        })
-    {
-        return Err("local demo gateway requires a loopback or Unix-socket PostgreSQL host".into());
+/// Validates both database URLs (including TLS: non-loopback hosts need
+/// sslmode=verify-full) before any connection is opened, migrates with the
+/// owner URL, then checks the runtime connection.
+///
+/// Production adapters (`http`, `sandbox`) never migrate with the runtime
+/// URL and refuse a runtime role that could bypass row-level security or
+/// the append-only triggers. The local demo falls back to migrating with the
+/// runtime URL and only warns (development only).
+fn prepare_database(
+    runtime_url: &str,
+    migration_url: Option<&str>,
+    production: bool,
+) -> Result<DatabaseConnector, Box<dyn std::error::Error>> {
+    let runtime = DatabaseConnector::from_url(runtime_url)?;
+    let migration = migration_url.map(DatabaseConnector::from_url).transpose()?;
+    match (&migration, production) {
+        (Some(migration), _) => apply_migrations(migration)?,
+        (None, false) => apply_migrations(&runtime)?,
+        (None, true) => {}
     }
-    Ok(())
+    let mut client = runtime.connect()?;
+    if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
+        if production {
+            return Err(error.into());
+        }
+        tracing::warn!(%error, "local demo database role is not least-privilege; development only");
+    }
+    praetore_replay_postgres::verify_schema_current(&mut client)?;
+    Ok(runtime)
+}
+
+/// `praetore-gateway-demo migrate`: applies migrations with
+/// PRAETORE_GATEWAY_MIGRATION_DATABASE_URL (the schema owner) and exits.
+fn migrate_command() -> Result<(), Box<dyn std::error::Error>> {
+    let url = required_env("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")?;
+    apply_migrations(&DatabaseConnector::from_url(&url)?)
 }
 
 fn build_gateway(
-    database_url: &str,
+    database: &DatabaseConnector,
     dispatcher: Arc<dyn ActionDispatcher>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: &str,
@@ -249,10 +266,9 @@ fn build_gateway(
     let mut config =
         HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_attester)?
             .with_audience(audience)
-            .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(Client::connect(
-                database_url,
-                NoTls,
-            )?)))
+            .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(
+                database.connect()?,
+            )))
             .with_freshness_provider(Arc::new(LocalFreshnessProvider { policy_digest }));
     if let Some(bindings) = tenant_issuer_bindings {
         config = config.with_tenant_issuer_bindings(bindings);
@@ -271,8 +287,8 @@ fn build_gateway(
     };
 
     let journal = Arc::new(PostgresExecutionJournal::from_connection_factory({
-        let database_url = database_url.to_owned();
-        move || Client::connect(&database_url, NoTls)
+        let database = database.clone();
+        move || database.connect()
     })?);
     let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
         "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
@@ -291,6 +307,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    if env::args().nth(1).as_deref() == Some("migrate") {
+        return migrate_command();
+    }
 
     let database_url = required_env("PRAETORE_GATEWAY_DATABASE_URL")?;
     let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
@@ -344,14 +363,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
         }
     };
+    let production = matches!(
+        env::var("PRAETORE_GATEWAY_ADAPTER").as_deref(),
+        Ok("http" | "sandbox")
+    );
+    let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL").ok();
+    let database = prepare_database(&database_url, migration_url.as_deref(), production)?;
     let gateway = Arc::new(build_gateway(
-        &database_url,
+        &database,
         adapter_setup.dispatcher,
         adapter_setup.tenant_issuer_bindings,
         &adapter_setup.audience,
         adapter_setup.require_trusted_clock,
     )?);
-    apply_migrations(&database_url)?;
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
         Ok(address) => address.parse::<std::net::SocketAddr>()?,
         Err(_) => {
@@ -480,9 +504,63 @@ mod tests {
     }
 
     #[test]
-    fn remote_database_hosts_are_rejected_by_local_demo() {
-        assert!(validate_local_database_url("postgres://localhost/praetore").is_ok());
-        assert!(validate_local_database_url("postgres://127.0.0.1/praetore").is_ok());
-        assert!(validate_local_database_url("postgres://db.internal/praetore").is_err());
+    fn database_urls_are_validated_before_any_connection() {
+        use praetore_replay_postgres::DatabaseUrlError;
+        // Unresolvable hosts: an error other than DatabaseUrlError would mean
+        // a connection was attempted.
+        for (runtime, migration) in [
+            ("postgres://gateway@db.invalid/praetore", None),
+            (
+                "postgres://gateway@127.0.0.1:1/praetore",
+                Some("postgres://owner@db.invalid/praetore"),
+            ),
+            (
+                "postgres://gateway@db.invalid/praetore?sslmode=require",
+                Some("postgres://owner@127.0.0.1:1/praetore"),
+            ),
+        ] {
+            for production in [false, true] {
+                let error = prepare_database(runtime, migration, production).unwrap_err();
+                assert!(
+                    error.downcast_ref::<DatabaseUrlError>().is_some(),
+                    "{runtime}: {error}"
+                );
+            }
+        }
+    }
+
+    fn test_database_url() -> String {
+        env::var("PRAETORE_TEST_DATABASE_URL").expect("PRAETORE_TEST_DATABASE_URL")
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL (superuser)"]
+    fn production_refuses_a_privileged_runtime_role_and_local_demo_warns() {
+        let url = test_database_url();
+        let error = prepare_database(&url, Some(&url), true).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<praetore_replay_postgres::RuntimeRoleError>()
+                .is_some(),
+            "{error}"
+        );
+        assert!(prepare_database(&url, None, false).is_ok());
+
+        // A login member of praetore_runtime is accepted in production.
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(
+                "DO $$ BEGIN CREATE ROLE praetore_storage_runtime; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; \
+                 ALTER ROLE praetore_storage_runtime LOGIN PASSWORD 'praetore-storage-test'; \
+                 GRANT praetore_runtime TO praetore_storage_runtime",
+            )
+            .unwrap();
+        let host_and_database = url.rsplit_once('@').unwrap().1;
+        let runtime = format!(
+            "postgres://praetore_storage_runtime:praetore-storage-test@{host_and_database}"
+        );
+        prepare_database(&runtime, Some(&url), true).unwrap();
+        prepare_database(&runtime, None, true).unwrap();
     }
 }
