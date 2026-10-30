@@ -97,9 +97,19 @@ impl FreshnessProvider for DemoFreshness {
     }
 }
 
+/// Public keys a verifier pins. Contains no seed and no private key.
+struct DemoPublicKeys {
+    /// Execution attestation key (pinned with `DEMO_ONLY_KEY_ID`).
+    execution: [u8; 32],
+    /// Evidence attester key. On `main`, `verify_gateway_receipt_json` does
+    /// not take it; with PR #35 it is passed as the fourth argument.
+    evidence_attester: [u8; 32],
+}
+
 /// Issues and signs a fictitious receipt. Returns the receipt JSON and the
-/// execution public key; the private key is dropped when this returns.
-fn issue_receipt() -> DemoResult<(String, [u8; 32])> {
+/// public keys, already computed; all private keys are dropped when this
+/// returns.
+fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
     let clock = FixedClock::new(NOW);
     let now = clock.now();
     let validity = Validity {
@@ -125,14 +135,14 @@ fn issue_receipt() -> DemoResult<(String, [u8; 32])> {
     let policy_digest = policy.digest()?;
     let issuer_pin = TrustedAuthorityIssuer::new("demo-issuer", issuer_key.public_key())?
         .with_validity(validity)?;
-    let config = HighAssuranceConfig::new(
-        policy_digest.clone(),
-        vec![issuer_pin],
-        EvidenceAttesterKey::from_secret_bytes(&DEMO_ONLY_EVIDENCE_ATTESTER_SEED),
-    )?
-    .with_audience("demo-gateway")
-    .with_replay_guard(Arc::new(DemoReplayGuard(Mutex::new(HashSet::new()))))
-    .with_freshness_provider(Arc::new(DemoFreshness));
+    let evidence_attester =
+        EvidenceAttesterKey::from_secret_bytes(&DEMO_ONLY_EVIDENCE_ATTESTER_SEED);
+    let evidence_attester_public = evidence_attester.public_key()?.as_bytes();
+    let config =
+        HighAssuranceConfig::new(policy_digest.clone(), vec![issuer_pin], evidence_attester)?
+            .with_audience("demo-gateway")
+            .with_replay_guard(Arc::new(DemoReplayGuard(Mutex::new(HashSet::new()))))
+            .with_freshness_provider(Arc::new(DemoFreshness));
     let engine = AuthorizationEngine::production_with_clock(policy, config, clock)?;
 
     let action = Action::new(
@@ -172,12 +182,17 @@ fn issue_receipt() -> DemoResult<(String, [u8; 32])> {
         output: Some(output),
         execution_attestation,
     };
-    Ok((serde_json::to_string_pretty(&receipt)?, public_key))
+    let keys = DemoPublicKeys {
+        execution: public_key,
+        evidence_attester: evidence_attester_public,
+    };
+    Ok((serde_json::to_string_pretty(&receipt)?, keys))
 }
 
-/// Verification path: receives only the receipt bytes and the public key.
-fn verify(json: &str, public_key: &[u8; 32]) -> Result<(), ExecutionAttestationError> {
-    let key = VerifiedPublicKey::from_bytes(public_key)
+/// Verification path: receives only the receipt bytes and public keys. It
+/// never sees a seed or a private key.
+fn verify(json: &str, keys: &DemoPublicKeys) -> Result<(), ExecutionAttestationError> {
+    let key = VerifiedPublicKey::from_bytes(&keys.execution)
         .map_err(|_| ExecutionAttestationError::InvalidSignature)?;
     verify_gateway_receipt_json(json, &key, DEMO_ONLY_KEY_ID).map(|_| ())
 }
@@ -211,10 +226,10 @@ const ATTESTATION_SIGNATURE: &str = "\"signature\": \"";
 fn check_rejected(
     step: &str,
     json: &str,
-    key: &[u8; 32],
+    keys: &DemoPublicKeys,
     expected: ExecutionAttestationError,
 ) -> bool {
-    match verify(json, key) {
+    match verify(json, keys) {
         Ok(()) => {
             println!("    FAIL  {step}: tampered receipt was ACCEPTED");
             false
@@ -240,8 +255,15 @@ fn run() -> DemoResult<bool> {
 
     println!("[1/4] Generate DEMO/TEST-ONLY Ed25519 key from fixed seed");
     let (receipt_json, public_key) = issue_receipt()?;
-    println!("    key_id     : {DEMO_ONLY_KEY_ID}");
-    println!("    public key : {}", hex::encode(public_key));
+    println!("    key_id                       : {DEMO_ONLY_KEY_ID}");
+    println!(
+        "    execution public key         : {}",
+        hex::encode(public_key.execution)
+    );
+    println!(
+        "    evidence attester public key : {}",
+        hex::encode(public_key.evidence_attester)
+    );
     println!();
 
     println!("[2/4] Issue and sign a fictitious receipt");
@@ -249,11 +271,11 @@ fn run() -> DemoResult<bool> {
         "    receipt    : {} bytes, authorization=allowed, execution=executed",
         receipt_json.len()
     );
-    println!("    private key dropped; only public key and receipt are kept");
+    println!("    private keys dropped; only public keys and receipt are kept");
     println!();
 
     let mut ok = true;
-    println!("[3/4] Verify with the public key only");
+    println!("[3/4] Verify with public keys only");
     match verify(&receipt_json, &public_key) {
         Ok(()) => println!("    PASS  valid receipt verified"),
         Err(error) => {
@@ -268,7 +290,7 @@ fn run() -> DemoResult<bool> {
     let sig_marker = ATTESTATION_SIGNATURE;
     let sig_offset = sig_marker.len() + 10;
     let original =
-        receipt_json.as_bytes()[receipt_json.find(sig_marker).ok_or("no signature")? + sig_offset];
+        receipt_json.as_bytes()[marker_position(&receipt_json, sig_marker)? + sig_offset];
     let replacement = if original == b'0' { b'1' } else { b'0' };
     let tampered_sig = flip_one_byte(&receipt_json, sig_marker, sig_offset, replacement)?;
     ok &= check_rejected(
