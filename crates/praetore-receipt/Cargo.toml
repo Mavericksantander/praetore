@@ -9,6 +9,12 @@ repository.workspace = true
 
 description = "Signed PRÆTORE gateway receipts and execution attestations, without server dependencies."
 
+[features]
+default = []
+# Enables `ExecutionAttestation::create`. Only the gateway should enable it;
+# offline verifiers never need to sign.
+signing = []
+
 [dependencies]
 hex = "0.4.3"
 praetore-core = { path = "../praetore-core" }
