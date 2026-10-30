@@ -2657,6 +2657,43 @@ mod apd {
             )
             .unwrap();
         }
+        // The gateway no longer emits v1 (it always binds a tenant), so the v1
+        // fixture re-signs the committed v2 receipt as a legacy v1
+        // attestation with the same test key and canonical payload rules.
+        if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some()
+            || std::env::var_os("UPDATE_RECEIPT_V1_FIXTURE").is_some()
+        {
+            let v2 = std::fs::read_to_string(dir.join("receipt-v2-confirmed.json")).unwrap();
+            let mut receipt: Value = serde_json::from_str(&v2).unwrap();
+            let attestation = receipt["execution_attestation"].as_object_mut().unwrap();
+            attestation.insert("schema_version".into(), json!(1));
+            attestation.remove("tenant_id");
+            attestation.remove("signature");
+            let canonical = praetore_core::canonical::canonicalize_json(
+                &serde_json::to_string(attestation).unwrap(),
+            )
+            .unwrap();
+            let mut message = b"PRAETORE_EXECUTION_ATTESTATION_V1\0".to_vec();
+            message.extend_from_slice(&canonical);
+            let signature = TestExecutionAttester::new().signing_key.sign(&message);
+            attestation.insert("tenant_id".into(), Value::Null);
+            attestation.insert("signature".into(), json!(hex::encode(signature.to_bytes())));
+            std::fs::write(
+                dir.join("receipt-v1-confirmed.json"),
+                serde_json::to_string(&receipt).unwrap(),
+            )
+            .unwrap();
+        }
+        let v1 = std::fs::read_to_string(dir.join("receipt-v1-confirmed.json")).unwrap();
+        let receipt =
+            praetore_gateway::verify_gateway_receipt_json(&v1, &public_key, key_id).unwrap();
+        assert_eq!(receipt.execution_attestation.schema_version, 1);
+        assert_eq!(receipt.execution_attestation.tenant_id, None);
+        let tampered = v1.replacen("\"confirmed\"", "\"failed\"", 1);
+        assert_ne!(tampered, v1);
+        assert!(
+            praetore_gateway::verify_gateway_receipt_json(&tampered, &public_key, key_id).is_err()
+        );
         let v3 = std::fs::read_to_string(dir.join("receipt-v3-crash-recovered.json")).unwrap();
         let receipt =
             praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id).unwrap();
