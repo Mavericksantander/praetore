@@ -12,10 +12,31 @@ Rust code.
 * **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
   forwarded; the client gets an MCP tool error instead.
 
+## Install
+
+`praetore-mcp` is not published on crates.io and there are no prebuilt
+binaries yet. Install it with Cargo, without cloning the repository. The
+workspace declares `rust-version = "1.88"` (checked with Rust 1.94); building
+praetore-mcp needs no PostgreSQL, Node or Python.
+
+```sh
+cargo install --git https://github.com/Mavericksantander/praetore praetore-mcp --locked
+praetore-mcp --version
+```
+
+`--locked` builds with the repository's `Cargo.lock`. To pin an exact
+revision, add `--rev <commit>` (or `--tag <tag>` once releases are tagged).
+The binary goes to `~/.cargo/bin` (or `--root DIR`); `cargo uninstall
+praetore-mcp` removes it. `praetore-mcp install` writes the absolute path of
+the running binary into client configs, so run `install` again after moving
+or reinstalling it to a different location.
+
+From a clone of the repository: `cargo install --locked --path
+crates/praetore-mcp`, or `cargo build --release -p praetore-mcp`.
+
 ## 5-minute quickstart
 
 ```sh
-cargo install --locked --path crates/praetore-mcp   # or: cargo build --release -p praetore-mcp
 
 # 1. Create LOCAL/DEV keys, a signed authority, trust pins and a default policy
 praetore-mcp init                     # ~/.praetore/mcp, or $PRAETORE_MCP_HOME, or --dir DIR

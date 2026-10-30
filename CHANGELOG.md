@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The praetore-mcp README documents installing without a clone:
+  `cargo install --git https://github.com/Mavericksantander/praetore
+  praetore-mcp --locked` (checked on macOS arm64 against `9735974`).
 - New receipts always record what decided them in `decision.decided_by`, as
   part of the hashed and Ed25519-signed evidence payload, in the new
   **evidence schema v4**:
