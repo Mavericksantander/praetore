@@ -458,7 +458,7 @@ impl Evidence {
     }
 
     pub fn bind_policy_digest(&mut self, digest: String) -> crate::Result<()> {
-        if digest.len() != 64 || decode_lower_hex(&digest).is_none() {
+        if !Self::is_sha256_hex(&digest) {
             return Err(crate::PraetoreError::EvidenceError(
                 "policy digest must be a 32-byte SHA-256 hex value".into(),
             ));
@@ -693,10 +693,10 @@ impl Evidence {
         Some(hex::encode(Sha256::digest(serialized)))
     }
 
+    /// Exactly 64 lowercase hex characters (32 bytes), the only encoding
+    /// `Policy::digest` and `Authority::content_digest` produce.
     fn is_sha256_hex(value: &str) -> bool {
-        value.len() == 64
-            && hex::decode(value)
-                .is_ok_and(|decoded| decoded.len() == 32 && hex::encode(decoded) == value)
+        value.len() == 64 && decode_lower_hex(value).is_some_and(|decoded| decoded.len() == 32)
     }
 }
 
@@ -939,6 +939,49 @@ mod tests {
         evidence.policy_digest = Some("A".repeat(64));
         evidence.context_hash = evidence.compute_context_hash().unwrap();
         assert!(evidence.sign(&attester).is_err());
+    }
+
+    #[test]
+    fn signing_rejects_non_canonical_policy_digests() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[65; 32]);
+        let lower = hex::encode([0xab; 32]);
+        let mut mixed = lower.clone();
+        mixed.replace_range(0..1, "A");
+        for digest in [
+            lower.to_uppercase(),
+            mixed,
+            "g".repeat(64),
+            "+a".repeat(32),
+            lower[..62].to_owned() + "  ",
+        ] {
+            let mut evidence = test_evidence();
+            assert!(evidence.bind_policy_digest(digest.clone()).is_err());
+            // Bypass `bind_policy_digest` the way a caller holding the public
+            // field could, keeping the integrity hash consistent.
+            evidence.policy_digest = Some(digest.clone());
+            evidence.context_hash = evidence.compute_context_hash().unwrap();
+            assert!(evidence.sign(&attester).is_err(), "{digest}");
+            assert!(evidence.attester_signature.is_none());
+        }
+    }
+
+    #[test]
+    fn verify_policy_rejects_legacy_uppercase_digest_of_the_same_policy() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[66; 32]);
+        let policy = digest_test_policy(crate::policy::PolicyEffect::Allow);
+        let mut legacy = test_evidence();
+        legacy.policy_digest = Some(policy.digest().unwrap().to_uppercase());
+        legacy.context_hash = legacy.compute_context_hash().unwrap();
+        legacy.sign_unchecked(&attester).unwrap();
+
+        let restored = Evidence::from_json(&legacy.to_json().unwrap()).unwrap();
+        assert!(
+            restored
+                .verify_attester_signature(&attester.public_key().unwrap())
+                .is_ok()
+        );
+        // Only the exact lowercase digest from `Policy::digest` matches.
+        assert!(restored.verify_policy(&policy).is_err());
     }
 
     #[test]
