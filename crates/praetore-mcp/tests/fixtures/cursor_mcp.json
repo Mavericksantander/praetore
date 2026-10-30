@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "my-server": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["server.js"],
+      "env": { "API_KEY": "${env:MY_API_KEY}" },
+      "envFile": "${workspaceFolder}/.env"
+    },
+    "my-remote": {
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${env:MY_TOKEN}" }
+    },
+    "python tool": {
+      "command": "uv",
+      "args": ["run", "--with", "mcp", "my tool.py"]
+    }
+  }
+}
