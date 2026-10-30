@@ -134,6 +134,18 @@ and Windows paths are the documented ones. The Linux Claude Desktop path and
 the VS Code user-profile paths follow each app's standard config directory;
 they are assumptions.
 
+Checked with the real apps on macOS (arm64): Claude Desktop
+(`~/Library/Application Support/Claude/claude_desktop_config.json`) and
+Cursor (`~/.cursor/mcp.json`), each with `install --mode enforce` in front of
+`@modelcontextprotocol/server-filesystem@2.1.0` launched with `npx`, and a
+`deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused
+with the rule and evidence id shown in the chat, the file was not created,
+and `verify` checked every receipt. Not checked: Windows, Linux, VS Code.
+
+A config file that two default paths resolve to (for example Cursor's
+`~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
+symlink) is processed once.
+
 ## What a receipt is
 
 Each `tools/call` produces one JSON line in
