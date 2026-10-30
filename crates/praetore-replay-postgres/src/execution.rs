@@ -418,6 +418,21 @@ impl ExecutionJournal for PostgresExecutionJournal {
         if expires_at <= now {
             return Err(JournalError::ApprovalExpired);
         }
+        // The SQL trigger from 0012 re-checks expiry against this instant
+        // (the injected clock), not against the database clock.
+        // Truncated to PostgreSQL's microsecond precision so rounding can
+        // never make the SQL check stricter or looser than the Rust one.
+        let observed_at = now
+            .replace_nanosecond(now.nanosecond() / 1_000 * 1_000)
+            .map_err(|_| JournalError::InvalidRecord)?
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| JournalError::InvalidRecord)?;
+        transaction
+            .query_one(
+                "SELECT set_config('praetore.dispatch_observed_at', $1, true)",
+                &[&observed_at],
+            )
+            .map_err(|_| JournalError::Unavailable)?;
         let changed = transaction
             .execute(
                 "UPDATE praetore.execution_journal \
