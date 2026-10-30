@@ -83,3 +83,37 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: praetore-sandbox-supervisor
+---
+# Operator-owned retention job for execution claims. It may delete claims
+# only after checking that the PostgreSQL journal row for the execution key
+# is terminal (see docs/runtime-security-scaffold.md). The ServiceAccount
+# lives outside praetore-sandbox so the supervisor cannot use it; admission
+# (praetore-sandbox-execution-claims) names this exact identity.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: praetore-sandbox-claim-retention
+  namespace: praetore-sandbox
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    verbs:
+      - get
+      - list
+      - delete
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: praetore-sandbox-claim-retention
+  namespace: praetore-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: claim-retention
+    namespace: praetore-security
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: praetore-sandbox-claim-retention

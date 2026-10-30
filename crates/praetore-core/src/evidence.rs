@@ -13,7 +13,8 @@ use crate::{
     authority::Authority,
     authorization::{AuthorizationIntentV2, AuthorizationRequest},
     canonical::{
-        MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
+        MAX_JSON_VALUE_BYTES, canonical_json, decode_lower_hex, parse_json_rejecting_duplicates,
+        validate_json_value,
     },
     decision::{Decision, DecisionOutcome, RecordedDecision},
     identity::{AgentIdentity, VerifiedPublicKey},
@@ -141,8 +142,13 @@ impl Evidence {
         trace_id: Option<String>,
         context: BTreeMap<String, Value>,
     ) -> crate::Result<Self> {
+        decision
+            .validate()
+            .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+        // Every new decision records `decided_by`, which only v4 may carry.
+        let evidence_schema_version = 4;
         let mut evidence = Self {
-            evidence_schema_version: 1,
+            evidence_schema_version,
             canonical_version: crate::canonical::CANONICAL_VERSION,
             evidence_id: Uuid::new_v4(),
             request_id,
@@ -181,10 +187,29 @@ impl Evidence {
     /// recorded SHA-256 context hash. It does not authenticate the issuer
     /// cryptographically and does not provide non-repudiation.
     pub fn verify_integrity(&self) -> bool {
-        if !matches!(self.evidence_schema_version, 1 | 2)
+        let has_recovery = self.decision.recovery.is_some();
+        let has_decided_by = self.decision.decided_by.is_some();
+        let shape_ok = match self.evidence_schema_version {
+            // v1-v3 predate `decided_by` and must not carry it.
+            1 => !self.has_v2_fields() && !has_recovery && !has_decided_by,
+            2 => self.has_complete_v2_fields() && !has_recovery && !has_decided_by,
+            // SAF-10: v3 is the only legacy version that may carry a recovery
+            // obligation; it is either a complete HighAssurance record or a
+            // record without any v2 field.
+            3 => {
+                has_recovery
+                    && !has_decided_by
+                    && (self.has_complete_v2_fields() || !self.has_v2_fields())
+            }
+            // v4 always records `decided_by` (covered by the context hash and
+            // the attester signature); recovery is optional and, like v3, it
+            // is either complete HighAssurance or has no v2 field.
+            4 => has_decided_by && (self.has_complete_v2_fields() || !self.has_v2_fields()),
+            _ => false,
+        };
+        if !shape_ok
             || self.canonical_version != crate::canonical::CANONICAL_VERSION
-            || (self.evidence_schema_version == 1 && self.has_v2_fields())
-            || (self.evidence_schema_version == 2 && !self.has_complete_v2_fields())
+            || self.decision.validate().is_err()
         {
             return false;
         }
@@ -215,12 +240,18 @@ impl Evidence {
         .verify_intent_signature()
     }
 
-    pub fn verify_key_rotation(&self) -> crate::Result<KeyRotationProof> {
-        if !self.verify_integrity() {
-            return Err(crate::PraetoreError::EvidenceError(
-                "evidence integrity verification failed".into(),
-            ));
-        }
+    /// Verifies a key rotation receipt: the attester signature against
+    /// `trusted_attester` (an externally pinned key), evidence integrity, the
+    /// old-key request intent, the action type, an ALLOW decision and the
+    /// new-key proof of possession.
+    ///
+    /// The attester signature is required because the `context_hash` alone
+    /// is unkeyed: anyone can rewrite a DENY into an ALLOW and recompute it.
+    pub fn verify_key_rotation(
+        &self,
+        trusted_attester: &VerifiedPublicKey,
+    ) -> crate::Result<KeyRotationProof> {
+        self.verify_attester_signature(trusted_attester)?;
         if self.action.action_type != "identity:rotate_key" {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence does not describe a key rotation action".into(),
@@ -284,7 +315,13 @@ impl Evidence {
                 "HighAssurance evidence metadata is incomplete".into(),
             ));
         }
-        self.evidence_schema_version = 2;
+        self.evidence_schema_version = if self.decision.decided_by.is_some() {
+            4
+        } else if self.decision.recovery.is_some() {
+            3
+        } else {
+            2
+        };
         self.decided_at = Some(decided_at);
         self.evaluation_mode = Some("high_assurance".into());
         self.freshness_valid_until = Some(freshness_valid_until);
@@ -333,9 +370,10 @@ impl Evidence {
         let signature = self
             .attester_signature
             .as_deref()
+            .filter(|signature| crate::canonical::is_canonical_signature_hex(signature))
             .ok_or(crate::PraetoreError::IdentityVerificationFailed)
             .and_then(|signature| {
-                hex::decode(signature).map_err(|_| crate::PraetoreError::IdentityVerificationFailed)
+                decode_lower_hex(signature).ok_or(crate::PraetoreError::IdentityVerificationFailed)
             })?;
         let signature = Signature::from_slice(&signature)
             .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)?;
@@ -379,7 +417,7 @@ impl Evidence {
                 "evidence integrity verification failed".into(),
             ));
         }
-        if evidence.evidence_schema_version == 2
+        if evidence.is_high_assurance_shape()
             && (evidence.attester_signature.is_none()
                 || evidence.attester_key_id.is_none()
                 || evidence.attester_algorithm.as_deref() != Some("ed25519"))
@@ -392,7 +430,7 @@ impl Evidence {
     }
 
     pub fn bind_policy_digest(&mut self, digest: String) -> crate::Result<()> {
-        if digest.len() != 64 || hex::decode(&digest).is_err() {
+        if digest.len() != 64 || decode_lower_hex(&digest).is_none() {
             return Err(crate::PraetoreError::EvidenceError(
                 "policy digest must be a 32-byte SHA-256 hex value".into(),
             ));
@@ -468,11 +506,7 @@ impl Evidence {
             || self.decision.contributions.iter().any(|contribution| {
                 contribution.rule_id.len() > 1024 || contribution.reason.len() > 4096
             })
-            || match self.decision.decided_by() {
-                Some(crate::decision::DecidedBy::Rule { rule_id }) => rule_id.len() > 1024,
-                Some(crate::decision::DecidedBy::EngineGuard { guard }) => guard.len() > 1024,
-                Some(crate::decision::DecidedBy::DefaultDeny) | None => false,
-            }
+            || self.decision.validate().is_err()
         {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence decision exceeds configured limits".into(),
@@ -507,7 +541,12 @@ impl Evidence {
                 "evidence cryptographic metadata is malformed".into(),
             ));
         }
-        if self.evidence_schema_version == 2 {
+        // v3/v4 records without HighAssurance metadata (and the intermediate
+        // state during attestation) are checked by `verify_integrity`'s shape
+        // rule instead.
+        if self.evidence_schema_version == 2
+            || (matches!(self.evidence_schema_version, 3 | 4) && self.has_complete_v2_fields())
+        {
             let intent = self.intent_v2.as_ref().ok_or_else(|| {
                 crate::PraetoreError::EvidenceError("v2 intent metadata is missing".into())
             })?;
@@ -608,8 +647,14 @@ impl Evidence {
             && self.agent_signature.is_some()
     }
 
+    /// True for v2, or v3/v4 with complete HighAssurance metadata. Use this
+    /// instead of comparing `evidence_schema_version` to 2.
+    pub fn is_high_assurance_shape(&self) -> bool {
+        matches!(self.evidence_schema_version, 2..=4) && self.has_complete_v2_fields()
+    }
+
     fn attestation_domain(&self) -> &'static [u8] {
-        if self.evidence_schema_version == 2 {
+        if self.is_high_assurance_shape() {
             EVIDENCE_V2_SIGNATURE_DOMAIN
         } else {
             EVIDENCE_SIGNATURE_DOMAIN
@@ -849,6 +894,34 @@ mod tests {
     }
 
     #[test]
+    fn evidence_attester_signature_must_be_canonical_lowercase_hex() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[51; 32]);
+        let mut evidence = test_evidence();
+        evidence.sign(&attester).unwrap();
+        let key = attester.public_key().unwrap();
+        let canonical = evidence.attester_signature.clone().unwrap();
+        assert!(evidence.verify_attester_signature(&key).is_ok());
+        let first_letter = canonical.find(|c: char| c.is_ascii_lowercase()).unwrap();
+        let mut mixed = canonical.clone();
+        mixed.replace_range(
+            first_letter..=first_letter,
+            &canonical[first_letter..=first_letter].to_ascii_uppercase(),
+        );
+        for altered in [
+            canonical.to_ascii_uppercase(),
+            mixed,
+            canonical[..126].to_owned(),
+            canonical[..127].to_owned(),
+        ] {
+            evidence.attester_signature = Some(altered);
+            assert!(matches!(
+                evidence.verify_attester_signature(&key),
+                Err(crate::PraetoreError::IdentityVerificationFailed)
+            ));
+        }
+    }
+
+    #[test]
     fn evidence_round_trip_exports_versioned_stable_json() {
         let attester = EvidenceAttesterKey::generate();
         let mut evidence = test_evidence();
@@ -857,7 +930,13 @@ mod tests {
         let json = evidence.to_json().unwrap();
         let restored = Evidence::from_json(&json).unwrap();
 
-        assert_eq!(restored.evidence_schema_version, 1);
+        // New evidence records `decided_by`, which only schema v4 carries.
+        assert_eq!(restored.evidence_schema_version, 4);
+        assert!(!restored.is_high_assurance_shape());
+        assert_eq!(
+            restored.decision.decided_by(),
+            Some(&crate::DecidedBy::rule("test-rule"))
+        );
         assert_eq!(
             restored.canonical_version,
             crate::canonical::CANONICAL_VERSION
@@ -911,7 +990,9 @@ mod tests {
         evidence.sign(&attester).unwrap();
         let pinned_attester = attester.public_key().unwrap();
 
-        assert_eq!(evidence.evidence_schema_version, 2);
+        // HighAssurance metadata on a decision with `decided_by`: v4.
+        assert_eq!(evidence.evidence_schema_version, 4);
+        assert!(evidence.is_high_assurance_shape());
         assert!(evidence.verify_integrity());
         assert!(evidence.verify_attester_signature(&pinned_attester).is_ok());
         assert!(Evidence::from_json(&evidence.to_json().unwrap()).is_ok());
@@ -969,7 +1050,9 @@ mod tests {
             ))
             .unwrap();
         assert!(evidence.decision.decided_by().is_some());
+        assert_eq!(evidence.evidence_schema_version, 4);
         evidence.decision = legacy.decision.clone();
+        evidence.evidence_schema_version = 1;
         evidence.evidence_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
         evidence.context_hash = evidence.compute_context_hash().unwrap();
 

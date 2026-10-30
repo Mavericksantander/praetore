@@ -2,7 +2,7 @@ use crate::{
     PraetoreError, Result,
     authority::Validity,
     authorization::AuthorizationRequest,
-    canonical::parse_json_rejecting_duplicates,
+    canonical::{decode_lower_hex, parse_json_rejecting_duplicates},
     decision::{DecidedBy, Decision, RecordedDecision},
     evidence::{Evidence, EvidenceAttesterKey},
     freshness::{FreshnessError, FreshnessProvider},
@@ -197,7 +197,7 @@ impl TrustedAuthorityIssuer {
             return Err(PraetoreError::TrustStoreFailure);
         }
         let key_bytes =
-            hex::decode(&document.public_key).map_err(|_| PraetoreError::TrustStoreFailure)?;
+            decode_lower_hex(&document.public_key).ok_or(PraetoreError::TrustStoreFailure)?;
         let public_key = VerifiedPublicKey::from_bytes(&key_bytes)
             .map_err(|_| PraetoreError::TrustStoreFailure)?;
         let pin = Self::new(document.issuer, public_key)
@@ -689,12 +689,18 @@ impl AuthorizationEngine {
         self.mode
     }
 
+    /// Current time from the engine's configured (trusted) clock. Gateways
+    /// use it to timestamp approval expirations instead of the host clock.
+    pub fn trusted_now(&self) -> Result<OffsetDateTime> {
+        self.clock.now()
+    }
+
     /// Checks the signed authorization's time bounds using the configured
     /// clock. This is useful for decisions that do not dispatch an action but
     /// still must not be consumed after their challenge has expired.
     pub fn validate_evidence_time_bounds(&self, evidence: &Evidence) -> Result<()> {
         if self.mode != EvaluationMode::HighAssurance
-            || evidence.evidence_schema_version != 2
+            || !evidence.is_high_assurance_shape()
             || evidence.evaluation_mode.as_deref() != Some("high_assurance")
             || !evidence.verify_integrity()
         {
@@ -741,11 +747,30 @@ impl AuthorizationEngine {
         Ok(())
     }
 
+    /// Like [`Self::validate_evidence_for_dispatch`], but also requires an
+    /// ALLOW decision. Use it on any dispatch path that has no verified human
+    /// approval.
+    pub fn validate_allow_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
+        if evidence.decision.outcome != crate::decision::DecisionOutcome::Allow {
+            return Err(PraetoreError::EvidenceError(
+                "evidence is not a valid HighAssurance allow decision".into(),
+            ));
+        }
+        self.validate_evidence_for_dispatch(evidence)
+    }
+
     /// Revalidates an attested HighAssurance authorization immediately before
     /// a gateway dispatches its bound action.
+    ///
+    /// Accepts both ALLOW and REQUIRE_APPROVAL evidence (DENY is rejected):
+    /// the gateway also calls it on the post-approval path, after a human
+    /// approved a REQUIRE_APPROVAL decision. This function does **not** check
+    /// that approval. A caller that dispatches without a verified human
+    /// approval must use [`Self::validate_allow_evidence_for_dispatch`],
+    /// which also requires an ALLOW decision.
     pub fn validate_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
         if self.mode != EvaluationMode::HighAssurance
-            || evidence.evidence_schema_version != 2
+            || !evidence.is_high_assurance_shape()
             || evidence.evaluation_mode.as_deref() != Some("high_assurance")
             || !matches!(
                 evidence.decision.outcome,
@@ -755,7 +780,7 @@ impl AuthorizationEngine {
             || !evidence.verify_integrity()
         {
             return Err(PraetoreError::EvidenceError(
-                "evidence is not a valid HighAssurance allow decision".into(),
+                "evidence is not a valid HighAssurance allow or require-approval decision".into(),
             ));
         }
 
@@ -804,7 +829,7 @@ impl AuthorizationEngine {
         self.validate_production_configuration(now, false)?;
         self.validate_high_assurance_request(&request, now)?;
         let decision = self.evaluate_request(&request, now)?;
-        if RecordedDecision::from(decision) != evidence.decision {
+        if !evidence.decision.records(decision) {
             return Err(PraetoreError::PolicyIntegrityFailed);
         }
         if freshness_valid_until <= now {
@@ -864,7 +889,7 @@ impl AuthorizationEngine {
             ));
         }
         let final_decision = self.evaluate_request(&request, final_now)?;
-        if RecordedDecision::from(final_decision) != evidence.decision {
+        if !evidence.decision.records(final_decision) {
             return Err(PraetoreError::PolicyIntegrityFailed);
         }
         Ok(())
@@ -933,6 +958,9 @@ impl AuthorizationEngine {
             self.validate_production_configuration(now, atomic_commit.is_none())?;
         }
         let decision = self.evaluate_request(&request, now)?;
+        if decision.outcome == crate::decision::DecisionOutcome::RequireApproval {
+            self.validate_approval_window(intent_v2.as_ref(), now)?;
+        }
         let freshness = if self.mode == EvaluationMode::HighAssurance {
             let freshness = self
                 .freshness_provider
@@ -1042,6 +1070,28 @@ impl AuthorizationEngine {
             }
         }
         Ok(evidence)
+    }
+
+    /// SAF-10 (CTO, 29-oct-2026): a RequireApproval request whose signed
+    /// intent asks for an approval window longer than the policy's
+    /// `max_approval_ms` is rejected before any replay claim or record.
+    fn validate_approval_window(
+        &self,
+        intent: Option<&crate::authorization::AuthorizationIntentV2>,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let (Some(max_ms), Some(intent)) = (self.policy.max_approval_ms, intent) else {
+            return Ok(());
+        };
+        let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
+            .map_err(|_| PraetoreError::IntentInvalid)?;
+        let max = Duration::milliseconds(
+            i64::try_from(max_ms).map_err(|_| PraetoreError::PolicyIntegrityFailed)?,
+        );
+        if expires_at - now > max {
+            return Err(PraetoreError::IntentInvalid);
+        }
+        Ok(())
     }
 
     fn validate_high_assurance_request(
@@ -1412,7 +1462,14 @@ mod tests {
         provider: Arc<dyn FreshnessProvider>,
         tenant_binding: Option<(Uuid, Uuid)>,
     ) -> (AuthorizationEngine, AuthorizationRequest) {
-        let policy = allow_policy();
+        production_engine_with_policy(allow_policy(), provider, tenant_binding)
+    }
+
+    fn production_engine_with_policy(
+        policy: Policy,
+        provider: Arc<dyn FreshnessProvider>,
+        tenant_binding: Option<(Uuid, Uuid)>,
+    ) -> (AuthorizationEngine, AuthorizationRequest) {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let issuer_key = AgentKeyPair::generate();
@@ -1890,6 +1947,29 @@ mod tests {
                 PolicyEffect::Allow,
             )],
         );
+        let scoped_policy = || {
+            Policy::new_v2(
+                "scoped",
+                1,
+                vec![
+                    PolicyRule::new("approve-prod", "deploy", PolicyEffect::RequireApproval)
+                        .with_capability("deploy:prod"),
+                    PolicyRule::new(
+                        "recover-prod",
+                        "halt",
+                        PolicyEffect::Recover {
+                            recovery_id: "safe-hold".into(),
+                            deadline_ms: 500,
+                        },
+                    )
+                    .with_capability("halt:prod"),
+                    PolicyRule::new("allow-deploy", "deploy", PolicyEffect::Allow)
+                        .with_capability("deploy:write"),
+                    PolicyRule::new("allow-halt", "halt", PolicyEffect::Allow)
+                        .with_capability("halt:write"),
+                ],
+            )
+        };
         let cases: Vec<(&str, serde_json::Value, DecisionOutcome, serde_json::Value)> = vec![
             (
                 "allow",
@@ -1979,6 +2059,50 @@ mod tests {
                 DecisionOutcome::Deny,
                 json!({"kind": "engine_guard", "guard": "unbound_rule_capability"}),
             ),
+            (
+                "recover",
+                exported_decision_json(
+                    scoped_policy(),
+                    &["halt:write", "halt:prod"],
+                    None,
+                    action_with_capability("halt", "halt:write"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "rule", "rule_id": "recover-prod"}),
+            ),
+            (
+                "unbound_recover",
+                exported_decision_json(
+                    scoped_policy(),
+                    &["halt:write"],
+                    None,
+                    action_with_capability("halt", "halt:write"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "unbound_rule", "rule_id": "recover-prod"}),
+            ),
+            (
+                "unbound_require_approval",
+                exported_decision_json(
+                    scoped_policy(),
+                    &["deploy:write"],
+                    None,
+                    action_with_capability("deploy", "deploy:write"),
+                ),
+                DecisionOutcome::Deny,
+                json!({"kind": "unbound_rule", "rule_id": "approve-prod"}),
+            ),
+            (
+                "bound_require_approval",
+                exported_decision_json(
+                    scoped_policy(),
+                    &["deploy:write", "deploy:prod"],
+                    None,
+                    action_with_capability("deploy", "deploy:write"),
+                ),
+                DecisionOutcome::RequireApproval,
+                json!({"kind": "rule", "rule_id": "approve-prod"}),
+            ),
         ];
         for (name, decision, outcome, expected) in cases {
             assert_eq!(
@@ -1987,6 +2111,85 @@ mod tests {
                 "{name}"
             );
             assert_eq!(decision.get("decided_by"), Some(&expected), "{name}");
+            // Only a bound Recover match carries an obligation, and it names
+            // the same rule as decided_by.
+            match name {
+                "recover" => assert_eq!(decision["recovery"]["rule_id"], "recover-prod"),
+                _ => assert!(decision.get("recovery").is_none(), "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn inconsistent_decided_by_is_rejected_even_with_a_recomputed_hash() {
+        // The context hash is unkeyed, so anyone can recompute it; the
+        // integrity check still rejects a decider that contradicts the
+        // recorded decision. (A fully consistent rewrite is only caught by
+        // the attester signature, see the tests around this one.)
+        for (action_type, forged) in [
+            ("read_data", crate::DecidedBy::rule("deny-delete")),
+            ("read_data", crate::DecidedBy::DefaultDeny),
+            (
+                "read_data",
+                crate::DecidedBy::engine_guard("authority_capability"),
+            ),
+            ("read_data", crate::DecidedBy::unbound_rule("allow-read")),
+            ("delete_data", crate::DecidedBy::rule("allow-read")),
+            ("delete_data", crate::DecidedBy::DefaultDeny),
+            ("write_data", crate::DecidedBy::rule("allow-read")),
+            (
+                "write_data",
+                crate::DecidedBy::unbound_rule("approve-write"),
+            ),
+            ("write_data", crate::DecidedBy::DefaultDeny),
+        ] {
+            let (evidence, _) = signed_evidence_for(action_type);
+            let mut forged_evidence = evidence.clone();
+            forged_evidence.decision.decided_by = Some(forged.clone());
+            assert!(
+                forged_evidence.compute_context_hash().is_none(),
+                "{action_type} {forged:?}"
+            );
+            assert!(
+                !forged_evidence.verify_integrity(),
+                "{action_type} {forged:?}"
+            );
+            let mut document: serde_json::Value =
+                serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+            document["decision"]["decided_by"] = serde_json::to_value(&forged).unwrap();
+            assert!(
+                Evidence::from_json(&document.to_string()).is_err(),
+                "{action_type} {forged:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_v4_receipt_cannot_be_downgraded_to_legacy_shape() {
+        for action_type in ["read_data", "delete_data", "write_data", "export_data"] {
+            let (evidence, attester) = signed_evidence_for(action_type);
+            let key = attester.public_key().unwrap();
+            assert_eq!(evidence.evidence_schema_version, 4);
+            // Strip decided_by and relabel as v1 with a recomputed hash: the
+            // unkeyed integrity check passes, the attester signature does not.
+            let mut downgraded = evidence.clone();
+            downgraded.decision.decided_by = None;
+            downgraded.evidence_schema_version = 1;
+            downgraded.context_hash = downgraded.compute_context_hash().unwrap();
+            assert!(downgraded.verify_integrity());
+            assert!(downgraded.verify_attester_signature(&key).is_err());
+            // Stripping it while keeping v4 fails integrity outright.
+            let mut stripped = evidence.clone();
+            stripped.decision.decided_by = None;
+            stripped.context_hash = stripped.compute_context_hash().unwrap();
+            assert!(!stripped.verify_integrity());
+            // Keeping it under a legacy version label fails as well.
+            for version in [1, 2, 3] {
+                let mut relabeled = evidence.clone();
+                relabeled.evidence_schema_version = version;
+                relabeled.context_hash = relabeled.compute_context_hash().unwrap_or_default();
+                assert!(!relabeled.verify_integrity(), "v{version}");
+            }
         }
     }
 
@@ -1997,7 +2200,9 @@ mod tests {
         // Reproduce a receipt signed before `decided_by` existed: the field is
         // absent from both the signed payload and the exported JSON.
         let mut legacy = evidence.clone();
+        assert_eq!(legacy.evidence_schema_version, 4);
         legacy.decision.decided_by = None;
+        legacy.evidence_schema_version = 1;
         legacy.context_hash = legacy.compute_context_hash().unwrap();
         legacy.sign(&attester).unwrap();
         let exported = legacy.to_json().unwrap();
@@ -2815,7 +3020,8 @@ mod tests {
         assert_eq!(engine.mode(), EvaluationMode::HighAssurance);
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
         assert!(evidence.verify_integrity());
-        assert_eq!(evidence.evidence_schema_version, 2);
+        assert_eq!(evidence.evidence_schema_version, 4);
+        assert!(evidence.is_high_assurance_shape());
         assert_eq!(evidence.evaluation_mode.as_deref(), Some("high_assurance"));
         assert_eq!(
             evidence.authority_digest.as_deref(),
@@ -3227,6 +3433,91 @@ mod tests {
         assert!(matches!(
             engine.validate_evidence_for_dispatch(&evidence),
             Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
+        ));
+    }
+
+    #[test]
+    fn dispatch_validation_distinguishes_allow_from_require_approval() {
+        let (engine, request) = production_engine_with_provider(test_freshness_provider());
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
+        engine.validate_evidence_for_dispatch(&evidence).unwrap();
+        engine
+            .validate_allow_evidence_for_dispatch(&evidence)
+            .unwrap();
+
+        let approval_policy = Policy::new_v2(
+            "test-policy",
+            1,
+            vec![
+                PolicyRule::new(
+                    "approve-read-data",
+                    "read_data",
+                    crate::policy::PolicyEffect::RequireApproval,
+                )
+                .with_capability("read_data"),
+            ],
+        );
+        let (engine, request) =
+            production_engine_with_policy(approval_policy, test_freshness_provider(), None);
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::RequireApproval);
+        // The post-approval path relies on this accepting RequireApproval.
+        engine.validate_evidence_for_dispatch(&evidence).unwrap();
+        assert!(matches!(
+            engine.validate_allow_evidence_for_dispatch(&evidence),
+            Err(PraetoreError::EvidenceError(message)) if message.contains("allow decision")
+        ));
+    }
+
+    /// An approval pending across the upgrade carries legacy v2 evidence
+    /// (no `decided_by`); dispatch revalidation still accepts it when every
+    /// other decision field matches, and still rejects any other difference.
+    #[test]
+    fn dispatch_revalidation_accepts_legacy_pending_approval_evidence() {
+        let approval_policy = Policy::new_v2(
+            "test-policy",
+            1,
+            vec![
+                PolicyRule::new(
+                    "approve-read-data",
+                    "read_data",
+                    crate::policy::PolicyEffect::RequireApproval,
+                )
+                .with_capability("read_data"),
+            ],
+        );
+        let (engine, request) =
+            production_engine_with_policy(approval_policy, test_freshness_provider(), None);
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.evidence_schema_version, 4);
+        let attester = engine.evidence_attester.as_ref().unwrap();
+        let legacy = |mutate: &dyn Fn(&mut Evidence)| {
+            let mut legacy = evidence.clone();
+            legacy.decision.decided_by = None;
+            legacy.evidence_schema_version = 2;
+            mutate(&mut legacy);
+            legacy.context_hash = legacy.compute_context_hash().unwrap();
+            legacy.sign(attester).unwrap();
+            legacy
+        };
+        let unchanged = legacy(&|_| {});
+        assert!(unchanged.is_high_assurance_shape());
+        engine.validate_evidence_for_dispatch(&unchanged).unwrap();
+        let altered = legacy(&|evidence| evidence.decision.reason.push_str(" altered"));
+        assert!(matches!(
+            engine.validate_evidence_for_dispatch(&altered),
+            Err(PraetoreError::PolicyIntegrityFailed)
+        ));
+        // A v4 record must match decided_by too.
+        let mut forged = evidence.clone();
+        forged.decision.decided_by = Some(crate::DecidedBy::rule("approve-read-data-2"));
+        forged.decision.contributions[0].rule_id = "approve-read-data-2".into();
+        forged.context_hash = forged.compute_context_hash().unwrap();
+        forged.sign(attester).unwrap();
+        assert!(matches!(
+            engine.validate_evidence_for_dispatch(&forged),
+            Err(PraetoreError::PolicyIntegrityFailed)
         ));
     }
 

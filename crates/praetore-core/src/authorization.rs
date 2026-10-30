@@ -7,7 +7,7 @@ use crate::{
     Result,
     action::Action,
     authority::Authority,
-    canonical::{MAX_JSON_VALUE_BYTES, canonical_json, validate_json_value},
+    canonical::{MAX_JSON_VALUE_BYTES, canonical_json, decode_lower_hex, validate_json_value},
     decision::Decision,
     evidence::Evidence,
     identity::{AgentIdentity, AgentKeyPair, REQUEST_INTENT_DOMAIN},
@@ -149,7 +149,7 @@ impl AuthorizationRequest {
             .as_deref()
             .ok_or(crate::PraetoreError::IdentityVerificationFailed)
             .and_then(|value| {
-                hex::decode(value).map_err(|_| crate::PraetoreError::IdentityVerificationFailed)
+                decode_lower_hex(value).ok_or(crate::PraetoreError::IdentityVerificationFailed)
             })?;
         let payload = self.canonical_intent_bytes()?;
 

@@ -152,10 +152,11 @@ struct KeyRotationPayload<'a> {
 mod tests {
     use super::*;
     use crate::{
-        action::Action, authorization::AuthorizationRequest, decision::Decision, identity::AgentId,
+        action::Action, authorization::AuthorizationRequest, decision::Decision,
+        evidence::EvidenceAttesterKey, identity::AgentId,
     };
 
-    fn make_rotation_evidence() -> crate::evidence::Evidence {
+    fn make_rotation_request() -> AuthorizationRequest {
         let old_key = AgentKeyPair::from_secret_bytes(&[11; 32]);
         let new_key = AgentKeyPair::from_secret_bytes(&[12; 32]);
         let agent = old_key.identity(AgentId::new());
@@ -172,17 +173,31 @@ mod tests {
         });
         request.sign_intent(&old_key).unwrap();
         request
+    }
+
+    fn attester() -> EvidenceAttesterKey {
+        EvidenceAttesterKey::from_secret_bytes(&[13; 32])
+    }
+
+    fn attester_key() -> crate::identity::VerifiedPublicKey {
+        attester().public_key().unwrap()
+    }
+
+    fn make_rotation_evidence() -> crate::evidence::Evidence {
+        let mut evidence = make_rotation_request()
             .attest(Decision::allow(
                 "rotation permitted",
                 crate::DecidedBy::rule("test-rule"),
             ))
-            .unwrap()
+            .unwrap();
+        evidence.sign(&attester()).unwrap();
+        evidence
     }
 
     #[test]
     fn rotation_evidence_verifies_new_key_possession() {
         let evidence = make_rotation_evidence();
-        let proof = evidence.verify_key_rotation().unwrap();
+        let proof = evidence.verify_key_rotation(&attester_key()).unwrap();
         assert_eq!(proof.request_id, evidence.request_id);
         assert_eq!(proof.subject, evidence.agent.id);
         assert_eq!(proof.authority_id, evidence.authority.id);
@@ -191,7 +206,7 @@ mod tests {
     #[test]
     fn rotation_proof_rejects_missing_or_wrong_signature_and_modified_payload() {
         let evidence = make_rotation_evidence();
-        let mut proof = evidence.verify_key_rotation().unwrap();
+        let mut proof = evidence.verify_key_rotation(&attester_key()).unwrap();
 
         proof.signature.clear();
         assert!(
@@ -204,7 +219,7 @@ mod tests {
                 .is_err()
         );
 
-        let mut proof = evidence.verify_key_rotation().unwrap();
+        let mut proof = evidence.verify_key_rotation(&attester_key()).unwrap();
         proof.new_public_key = hex::encode(
             AgentKeyPair::from_secret_bytes(&[99; 32])
                 .public_key()
@@ -220,7 +235,7 @@ mod tests {
                 .is_err()
         );
 
-        let mut proof = evidence.verify_key_rotation().unwrap();
+        let mut proof = evidence.verify_key_rotation(&attester_key()).unwrap();
         proof.new_key_fingerprint = hex::encode([0x42; 32]);
         assert!(
             proof
@@ -236,7 +251,7 @@ mod tests {
     #[test]
     fn rotation_proof_cannot_be_replayed_for_another_request() {
         let evidence = make_rotation_evidence();
-        let proof = evidence.verify_key_rotation().unwrap();
+        let proof = evidence.verify_key_rotation(&attester_key()).unwrap();
         assert!(
             proof
                 .verify_new_key_possession(&evidence.agent, &evidence.authority, Uuid::new_v4())
@@ -249,7 +264,49 @@ mod tests {
         let mut evidence = make_rotation_evidence();
         evidence.action.parameters["key_rotation_proof"]["request_id"] =
             serde_json::json!(Uuid::new_v4());
-        assert!(evidence.verify_key_rotation().is_err());
+        assert!(evidence.verify_key_rotation(&attester_key()).is_err());
         assert!(!evidence.verify_integrity());
+    }
+
+    // Regression: an ALLOW protected only by the unkeyed context_hash was
+    // accepted, so a DENY could be rewritten into an ALLOW.
+    #[test]
+    fn rotation_evidence_requires_a_trusted_attester_signature() {
+        let request = make_rotation_request();
+
+        let unsigned = request
+            .clone()
+            .attest(Decision::allow(
+                "forged",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
+        assert!(unsigned.verify_integrity());
+        assert!(unsigned.verify_key_rotation(&attester_key()).is_err());
+
+        let mut other_attester = request
+            .clone()
+            .attest(Decision::allow(
+                "other attester",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
+        other_attester
+            .sign(&EvidenceAttesterKey::from_secret_bytes(&[14; 32]))
+            .unwrap();
+        assert!(other_attester.verify_key_rotation(&attester_key()).is_err());
+
+        let mut denied = request
+            .attest(Decision::deny(
+                "denied",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
+        denied.sign(&attester()).unwrap();
+        assert!(denied.verify_key_rotation(&attester_key()).is_err());
+        // Flip the signed DENY into an ALLOW, keeping the attester signature.
+        let mut flipped = make_rotation_evidence();
+        flipped.decision = Decision::deny("flipped", crate::DecidedBy::rule("test-rule")).into();
+        assert!(flipped.verify_key_rotation(&attester_key()).is_err());
     }
 }

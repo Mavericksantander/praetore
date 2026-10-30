@@ -1,7 +1,6 @@
-use postgres::{Client, NoTls};
 use praetore_core::VerifiedPublicKey;
 use praetore_observe::{ObserveState, parse_tenant_token_hashes, validate_bind_address};
-use praetore_replay_postgres::PostgresObservabilityReader;
+use praetore_replay_postgres::{DatabaseConnector, PostgresObservabilityReader};
 use std::{env, fs, net::SocketAddr, path::Path, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
@@ -17,8 +16,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("tenant token file must be a file no larger than 1048576 bytes".into());
     }
     let tenant_token_hashes = parse_tenant_token_hashes(&fs::read_to_string(token_file)?)?;
-    let database_url = env::var("PRAETORE_OBSERVE_DATABASE_URL")
-        .map_err(|_| "PRAETORE_OBSERVE_DATABASE_URL is required")?;
+    // Validated (TLS policy included) before any connection is opened.
+    let database = DatabaseConnector::from_url(
+        &env::var("PRAETORE_OBSERVE_DATABASE_URL")
+            .map_err(|_| "PRAETORE_OBSERVE_DATABASE_URL is required")?,
+    )?;
     let address: SocketAddr = env::var("PRAETORE_OBSERVE_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8088".into())
         .parse()?;
@@ -30,10 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VerifiedPublicKey::from_bytes(&bytes).map_err(|error| error.to_string())
         })
         .transpose()?;
-    let reader = Arc::new(PostgresObservabilityReader::from_client(Client::connect(
-        &database_url,
-        NoTls,
-    )?)?);
+    let reader = Arc::new(PostgresObservabilityReader::from_client(
+        database.connect()?,
+    )?);
     let state = ObserveState::new(reader, tenant_token_hashes, trusted_attester)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
