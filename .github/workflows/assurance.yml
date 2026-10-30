@@ -24,6 +24,8 @@ jobs:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
       - run: cargo run --locked --package praetore-core --example high_assurance
+      - name: Receipt verification demo (DEMO/TEST-ONLY keys)
+        run: ./demo/verify-receipt.sh
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
