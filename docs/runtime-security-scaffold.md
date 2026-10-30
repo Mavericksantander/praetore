@@ -71,10 +71,19 @@ receives Kubernetes API credentials; its Role is limited to creating, reading,
 patching, and deleting Jobs, and creating Secrets and ConfigMaps. ConfigMaps
 are immutable, payload-free execution claims that remain after Job TTL cleanup;
 their deterministic names prevent the same key from creating a second Job
-after restart or TTL expiry. The namespace quota caps these claims at 10,000;
-when exhausted, new invocations fail closed. Claims cannot be updated or
-deleted through the API. Capacity may only be expanded without removing claims
-after a storage/capacity review. Deletion is used only to
+after restart or TTL expiry. The namespace quota caps ConfigMaps at 10,000;
+when exhausted, new invocations fail closed. Claims cannot be updated, and the
+supervisor cannot delete them. Claims are a second, Kubernetes-side duplicate
+guard: the PostgreSQL journal is the authority for dispatch uniqueness (a key
+whose journal row has left `authorized`/`approved_pending_dispatch` is never
+dispatched again). Reclaim capacity with an operator-owned retention job
+running as `system:serviceaccount:praetore-security:claim-retention` (Role
+`praetore-sandbox-claim-retention`, the only identity admission lets delete a
+claim besides namespace deletion). It must delete a claim only after
+confirming, with a read-only journal query, that the matching execution key is
+terminal (`executed`, `confirmed`, `failed`, or `not_dispatched` with a
+reason) and never for `dispatched` or `outcome_unknown`. The retention job is
+not part of this repository. The supervisor's Job deletion is used only to
 clean up a still-suspended Job when input provisioning fails. It cannot list
 workloads or read Secret contents through the API; invocation Secrets are
 immutable and Kubernetes garbage collection owns their cleanup. The gateway
@@ -103,7 +112,18 @@ before enabling supervisor credentials. Its fail-closed
 `ValidatingAdmissionPolicy` rules require single-shot immutable Jobs, the
 Firecracker RuntimeClass, a fixed command, a digest-pinned approved runner
 image, non-root/read-only execution, strict volume mounts, immutable
-invocation Secrets, and namespace quotas/limits. The policy is intentionally
+invocation Secrets, and namespace quotas/limits. Rules that inspect objects
+read `oldObject` on DELETE (where `object` is null). The ConfigMap policy only
+governs execution claims (`claim-*` names or the `execution-claim` label), the
+`praetore-sandbox-supervisor-ca` ConfigMap (TLS provisioner only) and the
+supervisor's own requests (create claims only); `kube-root-ca.crt` and other
+operator ConfigMaps are left to RBAC. The Job policy does not apply to updates
+by the garbage collector, TTL-after-finished or Job controllers that only
+remove finalizers from a Job that is being deleted, so Foreground deletion
+(used by the TTL controller and by supervisor cleanup) can complete. Replace
+those controller identities with the ones the cluster actually uses
+(`system:kube-controller-manager` when controllers do not use per-controller
+ServiceAccounts). The policy is intentionally
 bound to Kubernetes 1.30+ and the example runner image pattern must be changed
 to the exact reviewed image repository before use. It also prevents the
 supervisor ServiceAccount from creating its own TLS certificate and restricts
@@ -118,13 +138,23 @@ principal used by the cluster. Rotate the immutable Secret by deleting and
 recreating it, then restart the supervisor and gateway so they reload keys.
 Test CEL evaluation with
 the target API server; YAML parsing alone does not validate admission rules.
+These admission and network templates have not been tested on a cluster; CI
+checks YAML syntax only.
 Add supervisor-side request/concurrency limits as well, because namespace
 quotas are shared capacity limits, not per-tenant fairness controls.
 
 [`sandbox-network-policy.yaml`](../deploy/kubernetes/sandbox-network-policy.yaml)
 provides a portable NetworkPolicy baseline: sandbox ingress is denied except
 gateway mTLS on supervisor port 8443 and worker callbacks over TLS on port
-8444. Workers can egress only to the callback, egress proxy, and cluster DNS.
+8444. Workers can egress only to the callback, their egress proxy, and cluster
+DNS. Workers and the gateway use different proxies: workers use
+`egress-proxy` (the Service name fixed in the supervisor Job spec and in
+admission), which accepts only `tool-invocation` pods and may reach only
+public addresses (generic profile) or the listed FQDNs (Cilium profile); the
+gateway uses `gateway-egress-proxy`, which accepts only the gateway and is the
+only source the `praetore-tools` policies accept. A tool runner therefore
+cannot reach a protected tool through a proxy. Run the two proxies as
+separate Deployments with distinct `app.kubernetes.io/name` labels.
 The main
 [`mandatory-enforcement.yaml`](../deploy/kubernetes/mandatory-enforcement.yaml)
 also allows the gateway to reach the supervisor on port 8443. The generic
@@ -171,8 +201,8 @@ The repository now includes a supervisor binary and a Kubernetes-backed
 single-shot Job path. Before creating a Job, the supervisor writes an
 immutable ConfigMap claim for the execution key and action digest. Claims
 survive Job TTL cleanup; duplicate keys fail closed, and quota exhaustion
-blocks new runs until a reviewed capacity expansion or a validated ledger
-migration. Gateway mTLS is isolated on supervisor port 8443; the
+blocks new runs until the claim-retention job (above) removes claims of
+terminal executions or capacity is expanded after review. Gateway mTLS is isolated on supervisor port 8443; the
 worker result callback uses server-authenticated TLS plus its one-time token
 on port 8444. The Job is created suspended, its immutable owner-referenced
 input Secret is created, then the supervisor starts the Job. This ordering

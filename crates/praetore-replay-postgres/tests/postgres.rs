@@ -123,23 +123,10 @@ fn initialize_test_database() {
                      FROM praetore_replay_test; \
                  REVOKE ALL ON TABLE praetore.human_approvals \
                      FROM praetore_replay_test; \
-                 GRANT USAGE ON SCHEMA praetore TO praetore_replay_test; \
-                 GRANT SELECT (tenant_id, agent_id, request_id) ON praetore.replay_claims \
-                     TO praetore_replay_test; \
-                 GRANT INSERT (tenant_id, agent_id, request_id) ON praetore.replay_claims \
-                     TO praetore_replay_test; \
-                 GRANT SELECT, INSERT, UPDATE ON praetore.execution_journal \
-                     TO praetore_replay_test; \
-                 GRANT SELECT, INSERT ON praetore.execution_attestations \
-                     TO praetore_replay_test; \
                  REVOKE ALL ON TABLE praetore.human_approval_expirations \
                      FROM praetore_replay_test; \
-                 GRANT SELECT, INSERT ON praetore.human_approvals \
-                     TO praetore_replay_test; \
-                 GRANT SELECT, INSERT ON praetore.human_approval_expirations \
-                     TO praetore_replay_test; \
-                 GRANT SELECT ON praetore.execution_journal_events \
-                     TO praetore_replay_test; \
+                 REVOKE ALL ON SCHEMA praetore FROM praetore_replay_test; \
+                 GRANT praetore_runtime TO praetore_replay_test; \
                  GRANT USAGE ON SCHEMA praetore TO praetore_observe_test; \
                  REVOKE ALL ON TABLE praetore.execution_journal \
                      FROM praetore_observe_test; \
@@ -2935,7 +2922,14 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
     };
     let before = oids(&mut client);
     let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
-    assert_eq!(applied, vec!["0010_approved_pending_dispatch"]);
+    assert_eq!(
+        applied,
+        vec![
+            "0010_approved_pending_dispatch",
+            "0011_runtime_role",
+            "0012_dispatch_requires_live_approval"
+        ]
+    );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
     assert_eq!(recorded_versions(&mut client), all_versions());
     assert_0010_schema_present(&mut client);
@@ -2991,6 +2985,73 @@ fn postgres_migrations_unknown_version_refuses_to_start() {
         ),
         "{error}"
     );
+}
+
+fn column_exists(client: &mut Client, table: &str, column: &str) -> bool {
+    client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'praetore' AND table_name = $1 AND column_name = $2)",
+            &[&table, &column],
+        )
+        .unwrap()
+        .get(0)
+}
+
+/// 0007 is written as `BEGIN; ... COMMIT;`. Its effects and its
+/// schema_migrations row must commit together: if recording the version
+/// fails (here: an injected trigger, standing in for a crash after the body
+/// ran), nothing of 0007 may remain.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migration_effects_and_record_commit_atomically() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    client
+        .batch_execute(
+            "CREATE SCHEMA praetore; \
+             CREATE TABLE praetore.schema_migrations (\
+                 version TEXT PRIMARY KEY, \
+                 checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()); \
+             CREATE FUNCTION public.fail_0007_record() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+                 IF NEW.version = '0007_tenant_scoped_execution' THEN \
+                     RAISE EXCEPTION 'injected failure after the 0007 body'; \
+                 END IF; \
+                 RETURN NEW; \
+             END $$; \
+             CREATE TRIGGER fail_0007_record BEFORE INSERT ON praetore.schema_migrations \
+             FOR EACH ROW EXECUTE FUNCTION public.fail_0007_record();",
+        )
+        .unwrap();
+
+    let error = praetore_replay_postgres::apply_migrations(&mut client).unwrap_err();
+    assert!(
+        matches!(error, praetore_replay_postgres::MigrationError::Database(_)),
+        "{error}"
+    );
+    assert_eq!(recorded_versions(&mut client), all_versions()[..6].to_vec());
+    assert!(
+        !column_exists(&mut client, "replay_claims", "tenant_id"),
+        "0007 effects committed without its schema_migrations row"
+    );
+    assert!(matches!(
+        praetore_replay_postgres::verify_schema_current(&mut client),
+        Err(praetore_replay_postgres::MigrationError::Pending(
+            "0007_tenant_scoped_execution"
+        ))
+    ));
+
+    client
+        .batch_execute("DROP TRIGGER fail_0007_record ON praetore.schema_migrations")
+        .unwrap();
+    let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    assert_eq!(applied.first(), Some(&"0007_tenant_scoped_execution"));
+    assert_eq!(recorded_versions(&mut client), all_versions());
+    assert!(column_exists(&mut client, "replay_claims", "tenant_id"));
+    assert_0010_schema_present(&mut client);
+    praetore_replay_postgres::verify_schema_current(&mut client).unwrap();
 }
 
 fn fault_journal() -> Arc<CommitFaultJournal> {
@@ -3397,4 +3458,242 @@ fn postgres_apd_sigkill_between_approve_and_claim() {
             .iter()
             .any(|(_, to)| to == "dispatched")
     );
+}
+
+/// APD -> dispatched through raw SQL with an optional
+/// `praetore.dispatch_observed_at`.
+fn sql_claim(
+    client: &mut Client,
+    key: ExecutionKey,
+    observed_at: Option<OffsetDateTime>,
+) -> Result<u64, postgres::Error> {
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&key.tenant_id.to_string()],
+        )
+        .unwrap();
+    if let Some(observed_at) = observed_at {
+        let observed_at = observed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        transaction
+            .query_one(
+                "SELECT set_config('praetore.dispatch_observed_at', $1, true)",
+                &[&observed_at],
+            )
+            .unwrap();
+    }
+    let changed = transaction.execute(
+        "UPDATE praetore.execution_journal \
+         SET execution_status = 'dispatched', updated_at = clock_timestamp() \
+         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+        &[&key.tenant_id, &key.agent_id, &key.request_id],
+    )?;
+    transaction.commit()?;
+    Ok(changed)
+}
+
+fn approval_expires_at(key: ExecutionKey) -> OffsetDateTime {
+    connect_client()
+        .query_one(
+            "SELECT expires_at FROM praetore.human_approvals \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap()
+        .get(0)
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_sql_refuses_dispatch_of_an_expired_or_expiration_receipted_approval() {
+    let mut admin = connect_client();
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let key = approved_pending(&fixture);
+    let expires_at = approval_expires_at(key);
+
+    // Bypassing claim_dispatch: no observation time, or one at/after expiry.
+    for observed_at in [None, Some(expires_at), Some(expires_at + Duration::days(1))] {
+        assert!(
+            sql_claim(&mut admin, key, observed_at).is_err(),
+            "dispatch accepted with observed_at {observed_at:?}"
+        );
+    }
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+
+    // An expiration receipt blocks dispatch even with a valid observation
+    // time. APD and a receipt are exclusive under the 0009 triggers, so the
+    // receipt is planted with triggers disabled (replica role).
+    admin
+        .batch_execute("SET session_replication_role = replica")
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO praetore.human_approval_expirations \
+                 (tenant_id, agent_id, request_id, evidence_id, evidence_hash, action_digest, \
+                  policy_digest, expires_at, observed_at, gateway_key_id, signature, \
+                  receipt_json, receipt_id) \
+             VALUES ($1, $2, $3, $4, $5, $5, $5, $6, $6, 'planted', $7, '{}'::jsonb, $4)",
+            &[
+                &key.tenant_id,
+                &key.agent_id,
+                &key.request_id,
+                &Uuid::new_v4(),
+                &"0".repeat(64),
+                &expires_at,
+                &"0".repeat(128),
+            ],
+        )
+        .unwrap();
+    admin
+        .batch_execute("SET session_replication_role = origin")
+        .unwrap();
+    assert!(sql_claim(&mut admin, key, Some(expires_at - Duration::seconds(1))).is_err());
+    admin
+        .batch_execute("SET session_replication_role = replica")
+        .unwrap();
+    admin
+        .execute(
+            "DELETE FROM praetore.human_approval_expirations \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap();
+    admin
+        .batch_execute("SET session_replication_role = origin")
+        .unwrap();
+
+    // Live approval, no receipt, observation before expiry: allowed.
+    assert_eq!(
+        sql_claim(&mut admin, key, Some(expires_at - Duration::seconds(1))).unwrap(),
+        1
+    );
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::Dispatched
+    );
+}
+
+/// Password for the role-separation test roles (CI uses password auth).
+const TEST_ROLE_PASSWORD: &str = "praetore-storage-test";
+
+/// Creates (once) a cluster role for role-separation tests. All names are
+/// prefixed `praetore_storage_`.
+fn ensure_test_role(admin: &mut Client, name: &str, options: &str) {
+    admin
+        .batch_execute(&format!(
+            "DO $$ BEGIN CREATE ROLE {name} {options}; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; \
+             ALTER ROLE {name} {options} PASSWORD '{TEST_ROLE_PASSWORD}'"
+        ))
+        .unwrap();
+}
+
+fn connect_scratch_as(scratch: &ScratchDatabase, user: &str) -> Client {
+    let url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+    let mut config: postgres::Config = url.parse().unwrap();
+    config
+        .dbname(&scratch.name)
+        .user(user)
+        .password(TEST_ROLE_PASSWORD);
+    config.connect(NoTls).expect("connect as test role")
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
+    use praetore_replay_postgres::{RuntimeRoleError, verify_runtime_role};
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    ensure_test_role(&mut admin, "praetore_storage_runtime", "LOGIN NOBYPASSRLS");
+    ensure_test_role(&mut admin, "praetore_storage_owner", "LOGIN NOBYPASSRLS");
+    ensure_test_role(
+        &mut admin,
+        "praetore_storage_owner_member",
+        "LOGIN NOBYPASSRLS",
+    );
+    ensure_test_role(&mut admin, "praetore_storage_bypass", "LOGIN BYPASSRLS");
+    ensure_test_role(&mut admin, "praetore_storage_creator", "LOGIN NOBYPASSRLS");
+    admin
+        .batch_execute(
+            "GRANT praetore_runtime TO praetore_storage_runtime; \
+             GRANT praetore_runtime TO praetore_storage_bypass; \
+             GRANT praetore_runtime TO praetore_storage_creator; \
+             GRANT praetore_storage_owner TO praetore_storage_owner_member; \
+             GRANT USAGE ON SCHEMA praetore TO praetore_storage_owner; \
+             CREATE TABLE praetore.owner_probe (id INT); \
+             ALTER TABLE praetore.owner_probe OWNER TO praetore_storage_owner; \
+             GRANT CREATE ON SCHEMA praetore TO praetore_storage_creator",
+        )
+        .unwrap();
+
+    // Superuser, also when it SET ROLEs to a least-privilege role.
+    assert!(matches!(
+        verify_runtime_role(&mut admin),
+        Err(RuntimeRoleError::PrivilegedRole(_))
+    ));
+    admin
+        .batch_execute("SET ROLE praetore_storage_runtime")
+        .unwrap();
+    assert!(matches!(
+        verify_runtime_role(&mut admin),
+        Err(RuntimeRoleError::PrivilegedRole(role)) if role == "postgres"
+    ));
+    admin.batch_execute("RESET ROLE").unwrap();
+
+    for (user, expected) in [
+        ("praetore_storage_bypass", "privileged"),
+        ("praetore_storage_owner", "owner"),
+        ("praetore_storage_owner_member", "owner"),
+        ("praetore_storage_creator", "create"),
+    ] {
+        let result = verify_runtime_role(&mut connect_scratch_as(&scratch, user));
+        let matched = matches!(
+            (&result, expected),
+            (Err(RuntimeRoleError::PrivilegedRole(_)), "privileged")
+                | (Err(RuntimeRoleError::OwnsSchemaObjects(_)), "owner")
+                | (Err(RuntimeRoleError::CanCreateInSchema(_)), "create")
+        );
+        assert!(matched, "{user}: {result:?}");
+    }
+
+    // A login member of praetore_runtime passes and has the grants the
+    // runtime needs: schema check and a replay claim.
+    let mut runtime = connect_scratch_as(&scratch, "praetore_storage_runtime");
+    verify_runtime_role(&mut runtime).unwrap();
+    praetore_replay_postgres::verify_schema_current(&mut runtime).unwrap();
+    assert!(praetore_replay_postgres::apply_migrations(&mut runtime).is_ok_and(|v| v.is_empty()));
+    let guard = PostgresReplayGuard::from_client(runtime);
+    let (agent, request) = (Uuid::new_v4(), Uuid::new_v4());
+    guard.claim_once(TEST_TENANT_ID, agent, request).unwrap();
+    assert!(matches!(
+        guard.claim_once(TEST_TENANT_ID, agent, request),
+        Err(ReplayGuardError::AlreadyClaimed)
+    ));
+    // The runtime role cannot defeat the append-only design.
+    let mut runtime = connect_scratch_as(&scratch, "praetore_storage_runtime");
+    for statement in [
+        "ALTER TABLE praetore.execution_journal NO FORCE ROW LEVEL SECURITY",
+        "ALTER TABLE praetore.execution_journal_events DISABLE TRIGGER USER",
+        "DELETE FROM praetore.replay_claims",
+        "TRUNCATE praetore.human_approvals",
+        "CREATE TABLE praetore.runtime_probe (id INT)",
+        "UPDATE praetore.execution_journal SET evidence_json = evidence_json",
+    ] {
+        assert!(runtime.batch_execute(statement).is_err(), "{statement}");
+    }
+    drop(runtime);
+    drop(guard);
+    admin
+        .batch_execute(
+            "DROP TABLE praetore.owner_probe; \
+             REVOKE CREATE ON SCHEMA praetore FROM praetore_storage_creator",
+        )
+        .unwrap();
 }
