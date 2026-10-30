@@ -122,7 +122,7 @@ fn rejects_any_single_hex_char_change_in_the_signature() {
 
 #[test]
 fn rejects_uppercase_and_mixed_case_signatures() {
-    for name in FIXTURES {
+    for (version, name) in (1u8..).zip(FIXTURES) {
         let original = fixture(name);
         let sig = signature(&original);
         assert!(
@@ -147,7 +147,11 @@ fn rejects_uppercase_and_mixed_case_signatures() {
             "{name}: one uppercase char"
         );
         // Lowercase original still verifies after the same JSON round trip.
-        assert!(verify(&with_signature(&original, sig)).is_ok(), "{name}");
+        assert_eq!(
+            verify(&with_signature(&original, sig)),
+            Ok(version),
+            "{name}"
+        );
     }
 }
 
