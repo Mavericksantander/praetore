@@ -81,8 +81,13 @@ When constructing conditions directly, `PolicyCondition::new` accepts a
 | `GreaterThan`, `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual` | Numeric comparison | JSON number |
 
 Prefix matching is string-only. Membership compares JSON values exactly.
-Numeric comparisons require compatible number representations; incompatible
-types are unknown in v2. Non-finite numbers are not JSON values. The core does
+Numeric comparisons require JSON numbers; a non-number is unknown in v2.
+An integer against a floating-point number (`50000` vs `50000.0`) is compared
+exactly, without casting the integer to `f64`, and fails closed in every
+semantics version: the exact result applies to DENY and REQUIRE_APPROVAL rules
+(also for `Exact` and `In`, where `10000.0` equals `10000`), and an ALLOW rule
+never matches a mixed integer/float representation. Non-finite numbers are
+not JSON values. The core does
 not coerce strings to numbers or otherwise normalize values to make a
 condition match.
 

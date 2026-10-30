@@ -221,8 +221,14 @@ Rules can match action parameters and request context with `PolicyCondition`:
 * `In` compares against a non-empty JSON array of permitted values.
 * Numeric operators require JSON numbers on both sides. Integer comparisons
   retain integer precision; floating-point numbers compare as represented by
-  `serde_json`. Comparisons between integer and floating-point representations
-  fail closed.
+  `serde_json`. An integer compared with a floating-point number (for
+  example `50000` against `50000.0`) uses the exact mathematical order; the
+  integer is never cast to `f64`. Such a mixed comparison, and an `Exact` or
+  `In` comparison between an integer and a numerically equal float, fails
+  closed in every semantics version: it applies its exact result to DENY and
+  REQUIRE_APPROVAL rules and never makes an ALLOW rule match. So
+  `Deny if amount > 10000` denies `50000.0` under v1 and v2, while an ALLOW
+  rule for `amount <= 100` does not match `50.0`.
 
 For v1 policies, missing fields and operator/type mismatches do not match. In
 v2, an unknown condition value on a DENY or REQUIRE_APPROVAL rule is treated

@@ -460,6 +460,10 @@ impl PolicyRule {
             // Unsafe path-like value: always matches Deny/RequireApproval and
             // never matches Allow, in every semantics version (fail closed).
             ConditionMatch::UnsafeValue => deny_like,
+            // Integer against floating-point representation: restrictive rules
+            // use the exact numeric result in every semantics version; Allow
+            // never matches a mixed representation (fail closed).
+            ConditionMatch::MixedNumber(result) => deny_like && result,
         };
         self.parameter_conditions
             .iter()
@@ -652,6 +656,8 @@ impl PolicyCondition {
             MatchOperator::Exact => {
                 if actual == &self.expected {
                     ConditionMatch::True
+                } else if let Some((order, true)) = compare_numeric(actual, &self.expected) {
+                    ConditionMatch::MixedNumber(order == Ordering::Equal)
                 } else if same_json_type(actual, &self.expected) {
                     ConditionMatch::False
                 } else {
@@ -687,10 +693,21 @@ impl PolicyCondition {
                 let Some(values) = self.expected.as_array() else {
                     return ConditionMatch::Unknown;
                 };
+                let mixed = |equal: bool| {
+                    values.iter().any(|value| {
+                        compare_numeric(actual, value).is_some_and(|(order, mixed)| {
+                            mixed && (order == Ordering::Equal) == equal
+                        })
+                    })
+                };
                 if values.contains(actual) {
                     ConditionMatch::True
+                } else if mixed(true) {
+                    ConditionMatch::MixedNumber(true)
                 } else if values.iter().any(|value| same_json_type(actual, value)) {
                     ConditionMatch::False
+                } else if mixed(false) {
+                    ConditionMatch::MixedNumber(false)
                 } else {
                     ConditionMatch::Unknown
                 }
@@ -699,7 +716,7 @@ impl PolicyCondition {
             | MatchOperator::GreaterThanOrEqual
             | MatchOperator::LessThan
             | MatchOperator::LessThanOrEqual => {
-                let Some(order) = compare_numeric(actual, &self.expected) else {
+                let Some((order, mixed)) = compare_numeric(actual, &self.expected) else {
                     return if restrictive {
                         ConditionMatch::Unknown
                     } else {
@@ -713,7 +730,9 @@ impl PolicyCondition {
                     MatchOperator::LessThanOrEqual => order != Ordering::Greater,
                     _ => unreachable!(),
                 };
-                if matches {
+                if mixed {
+                    ConditionMatch::MixedNumber(matches)
+                } else if matches {
                     ConditionMatch::True
                 } else {
                     ConditionMatch::False
@@ -806,6 +825,9 @@ enum ConditionMatch {
     Unknown,
     /// A string value that is unsafe for a path-like operator.
     UnsafeValue,
+    /// Exact numeric result of comparing an integer with a floating-point
+    /// number; see `holds` in `PolicyRule::matches`.
+    MixedNumber(bool),
 }
 
 fn same_json_type(left: &Value, right: &Value) -> bool {
@@ -920,41 +942,66 @@ fn path_segments(path: &str) -> Option<Vec<&str>> {
     Some(segments)
 }
 
-fn compare_numeric(actual: &Value, expected: &Value) -> Option<Ordering> {
-    let actual = actual.as_number()?;
-    let expected = expected.as_number()?;
-
-    if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_i64()) {
-        return Some(actual.cmp(&expected));
+/// Exact numeric ordering of two JSON numbers, and whether one side is an
+/// integer and the other a floating-point number. No lossy cast is used: an
+/// integer is never converted to `f64`.
+fn compare_numeric(actual: &Value, expected: &Value) -> Option<(Ordering, bool)> {
+    match (json_number(actual)?, json_number(expected)?) {
+        (JsonNumber::Integer(actual), JsonNumber::Integer(expected)) => {
+            Some((actual.cmp(&expected), false))
+        }
+        (JsonNumber::Float(actual), JsonNumber::Float(expected)) => {
+            Some((actual.partial_cmp(&expected)?, false))
+        }
+        (JsonNumber::Integer(actual), JsonNumber::Float(expected)) => {
+            Some((compare_integer_float(actual, expected)?, true))
+        }
+        (JsonNumber::Float(actual), JsonNumber::Integer(expected)) => {
+            Some((compare_integer_float(expected, actual)?.reverse(), true))
+        }
     }
+}
 
-    if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_u64()) {
-        return Some(actual.cmp(&expected));
+enum JsonNumber {
+    Integer(i128),
+    Float(f64),
+}
+
+fn json_number(value: &Value) -> Option<JsonNumber> {
+    let number = value.as_number()?;
+    if let Some(integer) = number.as_i64() {
+        Some(JsonNumber::Integer(integer.into()))
+    } else if let Some(integer) = number.as_u64() {
+        Some(JsonNumber::Integer(integer.into()))
+    } else {
+        number.as_f64().map(JsonNumber::Float)
     }
+}
 
-    if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_u64()) {
-        return Some(if actual < 0 {
-            Ordering::Less
-        } else {
-            (actual as u64).cmp(&expected)
-        });
-    }
-
-    if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_i64()) {
-        return Some(if expected < 0 {
-            Ordering::Greater
-        } else {
-            actual.cmp(&(expected as u64))
-        });
-    }
-
-    let actual_is_float = actual.as_i64().is_none() && actual.as_u64().is_none();
-    let expected_is_float = expected.as_i64().is_none() && expected.as_u64().is_none();
-    if !actual_is_float || !expected_is_float {
+/// Exact ordering of `integer` relative to `float`.
+fn compare_integer_float(integer: i128, float: f64) -> Option<Ordering> {
+    // 2^127; every finite f64 in [-2^127, 2^127) has an integral part that
+    // fits in i128 exactly, so the cast below is lossless.
+    const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if float.is_nan() {
         return None;
     }
-
-    actual.as_f64()?.partial_cmp(&expected.as_f64()?)
+    if float >= LIMIT {
+        return Some(Ordering::Less);
+    }
+    if float < -LIMIT {
+        return Some(Ordering::Greater);
+    }
+    let whole = float.trunc();
+    // `float - whole` is exact for f64; only its sign matters.
+    let fraction = float - whole;
+    Some(integer.cmp(&(whole as i128)).then(if fraction > 0.0 {
+        Ordering::Less
+    } else if fraction < 0.0 {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }))
 }
 
 fn validate_conditions(rule_id: &str, scope: &str, conditions: &[PolicyCondition]) -> Result<()> {
@@ -1769,12 +1816,56 @@ mod tests {
         );
         assert_eq!(
             mixed_type.matches(&json!({"count": 1}), false),
-            ConditionMatch::False
+            ConditionMatch::MixedNumber(false)
+        );
+        assert_eq!(
+            mixed_type.matches(&json!({"count": 2}), false),
+            ConditionMatch::MixedNumber(true)
         );
         assert_eq!(
             mixed_type.matches(&json!({"count": "2"}), true),
             ConditionMatch::Unknown
         );
+    }
+
+    #[test]
+    fn integer_float_comparison_is_exact_without_lossy_casts() {
+        let cases: &[(i128, f64, Ordering)] = &[
+            (10_000, 10_000.0, Ordering::Equal),
+            (10_000, 10_000.5, Ordering::Less),
+            (10_001, 10_000.5, Ordering::Greater),
+            (-3, -2.5, Ordering::Less),
+            (-2, -2.5, Ordering::Greater),
+            (0, -0.0, Ordering::Equal),
+            // 2^53 + 1 is not representable as f64; a lossy cast would say Equal.
+            (
+                9_007_199_254_740_993,
+                9_007_199_254_740_992.0,
+                Ordering::Greater,
+            ),
+            (i64::MAX.into(), 9_223_372_036_854_775_808.0, Ordering::Less),
+            (
+                u64::MAX.into(),
+                18_446_744_073_709_551_616.0,
+                Ordering::Less,
+            ),
+            (
+                i64::MIN.into(),
+                -9_223_372_036_854_775_808.0,
+                Ordering::Equal,
+            ),
+            (u64::MAX.into(), 1e300, Ordering::Less),
+            (i64::MIN.into(), -1e300, Ordering::Greater),
+            (0, f64::MIN_POSITIVE, Ordering::Less),
+        ];
+        for &(integer, float, expected) in cases {
+            assert_eq!(
+                compare_integer_float(integer, float),
+                Some(expected),
+                "{integer} vs {float}"
+            );
+        }
+        assert_eq!(compare_integer_float(0, f64::NAN), None);
     }
 
     #[test]

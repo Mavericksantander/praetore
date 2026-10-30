@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Security (behavior change, more restrictive): an integer compared with a
+  floating-point number no longer fails open in v1 policies. Previously a v1
+  `Deny if amount > 10000` was bypassed with `"amount": 50000.0`, because
+  every mixed integer/float comparison was "no match". Numeric operators now
+  compare integer and float exactly (no lossy `f64` cast); `Exact`/`In`
+  treat a numerically equal float as equal. In every semantics version the
+  exact result applies to DENY/REQUIRE_APPROVAL/RECOVER rules, and an ALLOW
+  rule never matches a mixed representation (unchanged). In v2 a mixed value
+  that is definitively on the safe side of a restrictive rule (`5.0` against
+  `> 10000`) no longer counts as unknown.
 - Policy size and complexity limits are now public, documented constants in
   `praetore_core::policy`, and exceeding any of them rejects the whole policy
   with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`
