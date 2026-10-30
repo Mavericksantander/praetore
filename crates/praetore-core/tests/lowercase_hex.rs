@@ -96,7 +96,13 @@ fn request_intent_signature_must_be_lowercase() {
 #[test]
 fn evidence_attester_signature_must_be_lowercase() {
     let attester = EvidenceAttesterKey::from_secret_bytes(&[6; 32]);
-    let mut evidence: Evidence = fixture().request.attest(Decision::allow("ok")).unwrap();
+    let mut evidence: Evidence = fixture()
+        .request
+        .attest(Decision::allow(
+            "ok",
+            praetore_core::DecidedBy::rule("test-rule"),
+        ))
+        .unwrap();
     evidence.bind_policy_digest("ab".repeat(32)).unwrap();
     evidence.sign(&attester).unwrap();
     let key = attester.public_key().unwrap();
@@ -112,7 +118,13 @@ fn evidence_attester_signature_must_be_lowercase() {
 #[test]
 fn evidence_policy_digest_must_be_lowercase() {
     let digest = "ab".repeat(32);
-    let mut evidence = fixture().request.attest(Decision::allow("ok")).unwrap();
+    let mut evidence = fixture()
+        .request
+        .attest(Decision::allow(
+            "ok",
+            praetore_core::DecidedBy::rule("test-rule"),
+        ))
+        .unwrap();
     for altered in [upper(&digest), mixed(&digest)] {
         assert!(evidence.clone().bind_policy_digest(altered).is_err());
     }

@@ -9,8 +9,8 @@
 //! obligation (Recover) for an agent the rule was never scoped to.
 
 use praetore_core::{
-    Action, AgentId, AgentKeyPair, Authority, Decision, DecisionOutcome, Policy, PolicyCondition,
-    PolicyEffect, PolicyRule,
+    Action, AgentId, AgentKeyPair, Authority, DecidedBy, Decision, DecisionOutcome, Policy,
+    PolicyCondition, PolicyEffect, PolicyRule,
 };
 use serde_json::json;
 
@@ -183,5 +183,60 @@ fn allow_rules_keep_requiring_capability_and_exact_target() {
             outcome(&policy, &["db:read"], &prod),
             DecisionOutcome::Allow
         );
+    }
+}
+
+// An unbound RequireApproval/Recover match did not apply its declared effect,
+// so it is recorded as `UnboundRule`; an unbound Deny applied its effect and
+// is an ordinary `Rule`. The same rule bound to the authority and target is
+// a `Rule` with its declared effect.
+#[test]
+fn unbound_restrictive_match_records_unbound_rule_as_decider() {
+    let recover = PolicyEffect::Recover {
+        recovery_id: "safe-hold".into(),
+        deadline_ms: 500,
+    };
+    for effect in [PolicyEffect::RequireApproval, recover, PolicyEffect::Deny] {
+        for scoped in [
+            PolicyRule::new("restrict", "deploy", effect.clone()).with_capability("deploy:prod"),
+            PolicyRule::new("restrict", "deploy", effect.clone()).with_target("prod"),
+        ] {
+            for policy in versions(vec![
+                scoped.clone(),
+                PolicyRule::new("allow-deploy", "deploy", PolicyEffect::Allow)
+                    .with_capability("deploy:write"),
+            ]) {
+                let no_target = Action::new("deploy", None, json!({})).unwrap();
+                let prod = Action::new("deploy", Some("prod".into()), json!({})).unwrap();
+                let unbound_capabilities: &[&str] = if scoped.target.is_some() {
+                    &["deploy:write", "deploy:prod"]
+                } else {
+                    &["deploy:write"]
+                };
+                let unbound_action = if scoped.target.is_some() {
+                    &no_target
+                } else {
+                    &prod
+                };
+                let unbound = decision(&policy, unbound_capabilities, unbound_action);
+                assert_eq!(unbound.outcome, DecisionOutcome::Deny, "{effect:?}");
+                assert_eq!(unbound.recovery, None, "{effect:?}");
+                let expected = if effect == PolicyEffect::Deny {
+                    DecidedBy::rule("restrict")
+                } else {
+                    DecidedBy::unbound_rule("restrict")
+                };
+                assert_eq!(unbound.decided_by, expected, "{effect:?}");
+                unbound.validate().unwrap();
+
+                let bound = decision(&policy, &["deploy:write", "deploy:prod"], &prod);
+                assert_eq!(bound.decided_by, DecidedBy::rule("restrict"), "{effect:?}");
+                assert_eq!(
+                    bound.recovery.is_some(),
+                    matches!(effect, PolicyEffect::Recover { .. })
+                );
+                bound.validate().unwrap();
+            }
+        }
     }
 }

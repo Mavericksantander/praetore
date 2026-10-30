@@ -12,7 +12,7 @@ use praetore_core::{
     action::Action,
     authority::{Authority, Validity},
     authorization::AuthorizationRequest,
-    decision::Decision,
+    decision::{DecidedBy, Decision},
     engine::TrustedAuthorityIssuer,
     evidence::EvidenceAttesterKey,
     identity::{AgentId, AgentKeyPair},
@@ -65,7 +65,10 @@ fn main() {
     request.request_id = "00000000-0000-0000-0000-00000000d003".parse().unwrap();
     request.sign_intent(&agent_key).unwrap();
     let mut evidence = request
-        .attest(Decision::allow("DEMO allow: capability reports:read"))
+        .attest(Decision::allow(
+            "DEMO allow: capability reports:read",
+            DecidedBy::rule("allow-read-report"),
+        ))
         .unwrap();
     evidence.evidence_id = "00000000-0000-0000-0000-00000000d004".parse().unwrap();
     // Recomputes the context hash, which also covers the fixed evidence_id.

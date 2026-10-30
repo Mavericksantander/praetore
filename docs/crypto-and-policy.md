@@ -194,7 +194,8 @@ is strict at every typed object boundary, so unknown fields are rejected
 rather than ignored.
 
 Evidence v1 is frozen: its existing payload fields and canonical bytes are
-unchanged. HighAssurance emits evidence schema v2, which adds the signed v2
+unchanged. HighAssurance introduced evidence schema v2 (it now emits v4, see
+below), which adds the signed v2
 intent metadata, decision timestamp, `high_assurance` mode marker, freshness
 lease deadline, authority content digest, and policy semantics version. The
 v2 integrity payload and attester signature bind these fields. Import rejects
@@ -202,6 +203,34 @@ unknown fields for both schema versions, and v2 verification checks metadata
 consistency; authenticity still requires checking the attester key against an
 external pin. The `canonical_version` remains 1 because the canonical JSON
 codec itself is unchanged.
+
+Evidence v3 (SAF-10) is the legacy version that carries a recovery
+obligation (`decision.recovery`). Evidence v4 adds `decision.decided_by`,
+what determined the outcome: `rule` (a policy rule whose declared effect
+applied; for a RECOVER rule it names the obligation's `rule_id`),
+`unbound_rule` (a REQUIRE_APPROVAL or RECOVER rule matched without its
+required capability or target and denied instead), `default_deny` or
+`engine_guard` (an engine check outside the policy, such as
+`authority_capability`). Every newly produced decision has it, so new
+evidence is always v4, with or without HighAssurance metadata (signature
+domain V2 or V1 respectively) and with or without recovery. `decided_by` is
+part of the integrity payload and of the attester signature. Verification
+enforces the shape: v1-v3 must not carry `decided_by` (their payloads and
+bytes are unchanged and they keep verifying), v4 must carry it, unknown
+`kind` values or fields fail closed, and it must be consistent with the
+decision (only `rule` may decide a non-DENY outcome or a recovery; a `rule`
+or `unbound_rule` decider, when contributions are present, is one of them
+with the final outcome, which is the strongest contributed one; a
+`default_deny` has no contributions). On combination the decider of the
+higher effective severity (`Recover > Deny > RequireApproval > Allow`) is
+kept; on a tie the earlier-matching rule's.
+
+These checks catch internally inconsistent receipts only. A `rule` decider on
+a decision with no contributions, or any fully consistent rewrite of outcome,
+contributions and decider, passes integrity verification; only the attester
+signature authenticates `decided_by`, and confirming that the named rule
+really produced the decision requires the policy whose digest the receipt
+records (`praetore-verify evidence --policy`).
 
 `AgentId` remains a UUID alias and is not an authenticator. The key-derived
 `AgentKeyFingerprint` is SHA-256 over
