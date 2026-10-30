@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Fix: a gateway receipt for an executed or confirmed action whose adapter
+  output was JSON `null` now verifies. `"output": null` deserializes to
+  `None`, which verification rejected for those statuses although the
+  attestation signs the digest of `null`. For `executed`/`confirmed`, an
+  absent or `null` output is now verified as the JSON value `null`; other
+  statuses still require no output. Serialization is unchanged, so existing
+  receipts and fixtures are byte-identical.
 - Security (behavior change, more restrictive, all semantics versions):
   DENY/REQUIRE_APPROVAL/RECOVER rules no longer stop applying because of
   their `required_capability` or `target`. An authority that lacks the rule's
