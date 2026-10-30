@@ -638,3 +638,22 @@ fn receipt_command_rejects_unknown_and_tampered_reasons() {
     assert!(!output.status.success());
     let _ = fs::remove_dir_all(&directory);
 }
+
+#[test]
+fn receipt_command_verifies_v1_and_rejects_a_tampered_copy() {
+    let output = run_receipt(&receipt_fixture("receipt-v1-confirmed.json"));
+    assert!(output.status.success());
+    let summary = json_output(&output);
+    assert_eq!(summary["details"]["schema_version"], 1);
+    assert_eq!(summary["details"]["execution"], "confirmed");
+
+    let v1 = fs::read_to_string(receipt_fixture("receipt-v1-confirmed.json")).unwrap();
+    let tampered = v1.replacen("\"confirmed\"", "\"failed\"", 1);
+    assert_ne!(tampered, v1);
+    let path = std::env::temp_dir().join(format!("praetore-receipt-v1-{}.json", Uuid::new_v4()));
+    fs::write(&path, tampered).unwrap();
+    let output = run_receipt(&path);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success());
+    assert_eq!(json_output(&output)["ok"], false);
+}

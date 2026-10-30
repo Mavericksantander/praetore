@@ -68,6 +68,14 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
         self.assertTrue(self.verify(self.v3))
         self.assertTrue(self.verify(self.v2))
 
+    def test_accepts_v1_and_rejects_tampered_copy(self) -> None:
+        v1 = (FIXTURES / "receipt-v1-confirmed.json").read_text(encoding="utf-8")
+        self.assertIn('"schema_version":1', v1)
+        self.assertTrue(self.verify(v1))
+        tampered = v1.replace('"confirmed"', '"failed"', 1)
+        self.assertNotEqual(tampered, v1)
+        self.assertFalse(self.verify(tampered))
+
     def test_rejects_unknown_reason(self) -> None:
         forged = self.v3.replace('"crash_recovered"', '"operator_override"')
         self.assertNotEqual(forged, self.v3)

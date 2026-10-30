@@ -177,6 +177,7 @@ jobs:
       - run: cargo install cargo-cyclonedx --version 0.5.9 --locked
       - run: cargo cyclonedx --manifest-path crates/praetore-core/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-verify/Cargo.toml --format json --all
+      - run: cargo cyclonedx --manifest-path crates/praetore-receipt/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-python/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-replay-postgres/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-gateway/Cargo.toml --format json --all
