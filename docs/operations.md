@@ -123,8 +123,19 @@ Use two database roles:
   It must not be `SUPERUSER` or `BYPASSRLS` (both ignore row-level security),
   must not own or be a member of the owner of anything in `praetore` (an owner
   can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY` or `DISABLE TRIGGER`, which
-  defeats tenant isolation and the append-only triggers), and must not have
-  `CREATE` on the schema.
+  defeats tenant isolation and the append-only triggers), must not have
+  `CREATE` on the schema, must not be `CREATEROLE` (on PostgreSQL 15 and
+  older it can grant itself the owner role), and must not hold `DELETE`,
+  `TRUNCATE`, table-wide `UPDATE`, `TRIGGER` or `REFERENCES` on any
+  `praetore` table, including through `pg_write_all_data` or a leftover
+  `GRANT ALL` from an install where the gateway owned the tables.
+  `verify_runtime_role` refuses each of these at startup in `http` and
+  `sandbox` modes.
+- `praetore_runtime` is a cluster-wide role, so a login member of it can
+  connect to every database on the cluster that ran migration 0011. Use one
+  PostgreSQL cluster per environment (staging and production never share a
+  cluster), or `REVOKE CONNECT ON DATABASE ... FROM PUBLIC` and grant
+  `CONNECT` per runtime role.
 
 Migration 0011 grants `praetore_runtime` exactly what the code uses:
 

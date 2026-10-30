@@ -350,13 +350,19 @@ impl TlsStream for RustlsStream {
 #[derive(Debug)]
 pub enum RuntimeRoleError {
     Database(postgres::Error),
-    /// The role is, or can become, a superuser or a BYPASSRLS role.
+    /// The role is, or can become, a superuser, BYPASSRLS or CREATEROLE role
+    /// (CREATEROLE can grant itself membership in the owner role on older
+    /// PostgreSQL versions).
     PrivilegedRole(String),
     /// The role owns (or can act as the owner of) the `praetore` schema or
     /// objects in it, so it could disable RLS or the append-only triggers.
     OwnsSchemaObjects(String),
     /// The role may create objects in the `praetore` schema.
     CanCreateInSchema(String),
+    /// The role holds a table privilege the runtime never needs (DELETE,
+    /// TRUNCATE, table-wide UPDATE, TRIGGER or REFERENCES) on a `praetore`
+    /// table, e.g. a leftover `GRANT ALL` or membership in `pg_write_all_data`.
+    ExcessTablePrivilege(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -365,7 +371,7 @@ impl fmt::Display for RuntimeRoleError {
             Self::Database(error) => write!(f, "runtime role check failed: {error}"),
             Self::PrivilegedRole(role) => write!(
                 f,
-                "runtime database role {role} is (or is a member of) a SUPERUSER or BYPASSRLS role; \
+                "runtime database role {role} is (or is a member of) a SUPERUSER, BYPASSRLS or CREATEROLE role; \
                  tenant isolation would not apply"
             ),
             Self::OwnsSchemaObjects(role) => write!(
@@ -379,6 +385,11 @@ impl fmt::Display for RuntimeRoleError {
                     "runtime database role {role} has CREATE on schema praetore"
                 )
             }
+            Self::ExcessTablePrivilege(role) => write!(
+                f,
+                "runtime database role {role} holds DELETE, TRUNCATE, table-wide UPDATE, TRIGGER or \
+                 REFERENCES on a praetore table; grant it only membership in praetore_runtime"
+            ),
         }
     }
 }
@@ -394,8 +405,10 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// Refuses a runtime connection whose session or current role could bypass
 /// row-level security or the append-only triggers: superuser or BYPASSRLS
 /// (directly or through membership), owner of the `praetore` schema, of any
-/// relation or function in it (directly or through membership), or holder of
-/// CREATE on the schema.
+/// relation or function in it (directly or through membership), holder of
+/// CREATE on the schema, CREATEROLE, or holder of a table privilege beyond
+/// `praetore_runtime`'s grants (DELETE, TRUNCATE, table-wide UPDATE, TRIGGER,
+/// REFERENCES) on any `praetore` table.
 pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> {
     let row = client.query_one("SELECT session_user::text, current_user::text", &[])?;
     let mut roles: Vec<String> = vec![row.get(0), row.get(1)];
@@ -404,7 +417,8 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
         let row = client.query_one(
             "SELECT \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_roles privileged \
-                         WHERE (privileged.rolsuper OR privileged.rolbypassrls) \
+                         WHERE (privileged.rolsuper OR privileged.rolbypassrls \
+                                OR privileged.rolcreaterole) \
                            AND pg_catalog.pg_has_role($1, privileged.oid, 'MEMBER')), \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n \
                          WHERE n.nspname = 'praetore' \
@@ -418,7 +432,12 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
                          WHERE n.nspname = 'praetore' \
                            AND pg_catalog.pg_has_role($1, p.proowner, 'MEMBER')), \
                  COALESCE((SELECT pg_catalog.has_schema_privilege($1, n.oid, 'CREATE') \
-                           FROM pg_catalog.pg_namespace n WHERE n.nspname = 'praetore'), false)",
+                           FROM pg_catalog.pg_namespace n WHERE n.nspname = 'praetore'), false), \
+                 EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
+                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                         WHERE n.nspname = 'praetore' AND c.relkind IN ('r', 'p') \
+                           AND pg_catalog.has_table_privilege($1, c.oid, \
+                               'DELETE, TRUNCATE, UPDATE, TRIGGER, REFERENCES'))",
             &[&role],
         )?;
         if row.get::<_, bool>(0) {
@@ -429,6 +448,9 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
         }
         if row.get::<_, bool>(2) {
             return Err(RuntimeRoleError::CanCreateInSchema(role));
+        }
+        if row.get::<_, bool>(3) {
+            return Err(RuntimeRoleError::ExcessTablePrivilege(role));
         }
     }
     Ok(())
