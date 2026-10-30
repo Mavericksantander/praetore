@@ -3603,3 +3603,26 @@ fn api_credentials_file_is_strictly_validated() {
         .is_err()
     );
 }
+
+// Signatures are lowercase hex only: an uppercase copy of a valid approval
+// signature is another encoding of the same bytes and is refused.
+#[test]
+fn uppercase_human_approval_signature_is_refused() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let mut decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    assert!(decision.signature.bytes().any(|b| b.is_ascii_lowercase()));
+    let lowercase = decision.signature.clone();
+    decision.signature = lowercase.to_ascii_uppercase();
+    assert!(matches!(
+        gateway.resolve_human_approval(decision.clone()),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+    decision.signature = lowercase;
+    gateway.resolve_human_approval(decision).unwrap();
+    assert_eq!(tool.invocations(), 0);
+}

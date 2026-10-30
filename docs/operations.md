@@ -50,8 +50,9 @@ profile and an authenticated configuration channel.
 The gateway service authenticates callers with tenant-scoped bearer tokens
 listed by SHA-256 digest in `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` (format in
 [Tool gateway integration](tool-gateway-integration.md#http-api-authentication)).
-It refuses to start without this file with the `http` or `sandbox` adapter or
-on a non-loopback listen address.
+It refuses to start without this file with the `http` or `sandbox` adapter.
+The `local-demo` adapter listens on loopback only, with or without
+credentials.
 
 1. Issue one credential per agent workload and one per approver/operator
    system, each bound to a single tenant. Never give an agent workload an

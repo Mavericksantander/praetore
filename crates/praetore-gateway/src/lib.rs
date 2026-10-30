@@ -492,6 +492,10 @@ impl ApprovalExpiredReceipt {
             return Err(ExecutionAttestationError::KeyMismatch);
         }
         self.validate_binding(evidence)?;
+        // Lowercase hex only, so a signature has a single valid encoding.
+        if !is_lower_hex(&self.signature) {
+            return Err(ExecutionAttestationError::InvalidSignature);
+        }
         let signature = hex::decode(&self.signature)
             .map_err(|_| ExecutionAttestationError::InvalidSignature)?;
         if signature.len() != 64 {
@@ -567,6 +571,9 @@ impl HumanApprovalVerifier {
             || decision.approver_key_id != self.key_id
             || decision.approval_id.is_nil()
         {
+            return Err(ApprovalError::InvalidSignature);
+        }
+        if !is_lower_hex(&decision.signature) {
             return Err(ApprovalError::InvalidSignature);
         }
         let signature =
@@ -1559,4 +1566,10 @@ impl Gateway {
 
         self.attest_record(&mut record)
     }
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
