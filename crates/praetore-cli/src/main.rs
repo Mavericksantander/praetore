@@ -2267,7 +2267,7 @@ mod tests {
 
     fn refused_key(error: praetore_gateway::GatewayError) -> (Uuid, &'static str) {
         match error {
-            praetore_gateway::GatewayError::DispatchRefused { key, reason } => {
+            praetore_gateway::GatewayError::DispatchRefused { key, reason, .. } => {
                 (key.request_id, reason)
             }
             other => panic!("expected an explicit dispatch refusal, got {other:?}"),
@@ -2531,14 +2531,70 @@ mod tests {
                 request_id,
             }
         };
+        // Closed for good with a signed dispatch_refused reason: never
+        // offered for approval, and status reports it as not dispatched.
         assert!(matches!(
             gateway.approval_challenge(exec_key),
-            Err(praetore_gateway::GatewayError::DispatchRefused { .. })
+            Err(praetore_gateway::GatewayError::Approval(
+                praetore_gateway::ApprovalError::NotPending
+            ))
         ));
-        assert!(matches!(
-            gateway.approval_resolution(exec_key),
-            Err(praetore_gateway::GatewayError::DispatchRefused { .. })
-        ));
+        assert_eq!(
+            gateway.approval_resolution(exec_key).unwrap(),
+            ApprovalResolution::NotDispatched
+        );
+        assert_eq!(
+            gateway
+                .approval_state(exec_key)
+                .unwrap()
+                .not_dispatched_reason,
+            Some(NotDispatchedReason::DispatchRefused)
+        );
+        // Defense in depth (migration 0013): the database itself refuses a
+        // decision or a move to approved_pending_dispatch for it.
+        {
+            let mut client = connect_local_database(&fx.database_url).unwrap();
+            let sql_error = |client: &mut Client, sql: &str| {
+                let mut transaction = client.transaction().unwrap();
+                transaction
+                    .query_one(
+                        "SELECT set_config('praetore.tenant_id', $1, true)",
+                        &[&fx.config.tenant_id.to_string()],
+                    )
+                    .unwrap();
+                let error = transaction
+                    .batch_execute(sql)
+                    .expect_err("closed execution must be immutable");
+                error.as_db_error().unwrap().message().to_owned()
+            };
+            let digest = "a".repeat(64);
+            let message = sql_error(
+                &mut client,
+                &format!(
+                    "INSERT INTO praetore.human_approvals (approval_id, tenant_id, agent_id, \
+                     request_id, evidence_id, evidence_hash, action_digest, policy_digest, \
+                     outcome, approver_key_id, expires_at, decision_json) VALUES \
+                     ('{}', '{}', '{}', '{}', '{}', '{digest}', '{digest}', '{digest}', \
+                     'approve', 'local-approver', now() + interval '1 minute', '{{}}')",
+                    Uuid::new_v4(),
+                    exec_key.tenant_id,
+                    exec_key.agent_id,
+                    exec_key.request_id,
+                    Uuid::new_v4(),
+                ),
+            );
+            assert!(message.contains("closed without dispatch"), "{message}");
+            let message = sql_error(
+                &mut client,
+                &format!(
+                    "UPDATE praetore.execution_journal SET \
+                     execution_status = 'approved_pending_dispatch', not_dispatched_reason = NULL \
+                     WHERE tenant_id = '{}' AND request_id = '{}'",
+                    exec_key.tenant_id, exec_key.request_id
+                ),
+            );
+            assert!(message.contains("write-once"), "{message}");
+        }
         assert!(!fx.root.join("pwned").exists());
 
         // A file swapped for a symlink while held is refused at approval
@@ -2582,7 +2638,7 @@ mod tests {
         );
         assert_eq!(
             gateway.approval_state(key).unwrap().not_dispatched_reason,
-            Some(NotDispatchedReason::DispatchFailed)
+            Some(NotDispatchedReason::DispatchRefused)
         );
         assert!(fx.outside_untouched());
         assert!(
@@ -2700,6 +2756,14 @@ mod tests {
         assert_eq!(response.status().as_u16(), 403);
         let body: serde_json::Value = response.json().unwrap();
         assert_eq!(body["code"], "action_not_dispatchable");
+        assert_eq!(body["reason"], "path_traversal");
+        let refused: praetore_gateway::GatewayReceipt =
+            serde_json::from_value(body["receipt"].clone()).unwrap();
+        assert_eq!(
+            refused.execution_attestation.not_dispatched_reason,
+            Some(praetore_gateway::NotDispatchedReason::DispatchRefused)
+        );
+        fx.verify(&refused);
 
         // APPROVAL over HTTP: approve records intent only, the approver's
         // dispatch makes the gateway execute; /status never tells the agent

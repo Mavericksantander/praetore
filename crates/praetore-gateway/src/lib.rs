@@ -689,9 +689,11 @@ pub trait ExecutionJournal: AtomicAuthorizationCommit + Send + Sync {
 
     fn get(&self, key: ExecutionKey) -> Result<Option<ExecutionRecord>, JournalError>;
 
-    /// Closes without dispatch: `Authorized` (allowed path) or
-    /// `ApprovedPendingDispatch` (approval path, which requires an
-    /// attestation carrying a [`NotDispatchedReason`]). Never dispatches.
+    /// Closes without dispatch: `Authorized` (allowed path; no reason or
+    /// `DispatchRefused`), `ApprovedPendingDispatch` (approval path, which
+    /// requires an attestation carrying a [`NotDispatchedReason`]), or an
+    /// undecided `NotDispatched` approval (only with `DispatchRefused`; no
+    /// decision may be recorded afterwards). Never dispatches.
     fn mark_not_dispatched_attested(
         &self,
         key: ExecutionKey,
@@ -758,20 +760,51 @@ pub trait ActionDispatcher: Send + Sync {
 
     /// Side-effect-free admission check run by the gateway before an action
     /// is dispatched or offered for human approval. An adapter that returns
-    /// `Err` guarantees it would not perform the action; the gateway then
-    /// records the execution as `not_dispatched` (never `outcome_unknown`)
-    /// and refuses it explicitly. The default admits every action, which
-    /// preserves the behaviour of existing adapters.
+    /// `Err` guarantees it would not perform the action now. A terminal
+    /// refusal at submission or at the dispatch claim closes the execution
+    /// as `not_dispatched` with the signed reason `dispatch_refused` (never
+    /// `outcome_unknown`); a transient refusal at the dispatch claim leaves an
+    /// approved execution `approved_pending_dispatch`. The default admits
+    /// every action, which preserves the behaviour of existing adapters.
     fn preflight(&self, _action: &Action) -> Result<(), DispatchRefused> {
         Ok(())
     }
 }
 
-/// An explicit, pre-dispatch refusal: the adapter did not and will not
-/// perform the action. The reason is a stable machine-readable code.
+/// An explicit, pre-dispatch refusal: the adapter did not perform the
+/// action. The reason is a stable machine-readable code. A transient refusal
+/// (for example a descriptor limit or an I/O error while inspecting the
+/// target) may succeed later; a terminal one will not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("dispatcher refused the action before any effect: {0}")]
-pub struct DispatchRefused(pub &'static str);
+#[error("dispatcher refused the action before any effect: {reason}")]
+pub struct DispatchRefused {
+    reason: &'static str,
+    transient: bool,
+}
+
+impl DispatchRefused {
+    pub const fn terminal(reason: &'static str) -> Self {
+        Self {
+            reason,
+            transient: false,
+        }
+    }
+
+    pub const fn transient(reason: &'static str) -> Self {
+        Self {
+            reason,
+            transient: true,
+        }
+    }
+
+    pub const fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    pub const fn is_transient(&self) -> bool {
+        self.transient
+    }
+}
 
 /// The adapter may report that it performed an operation or that it performed
 /// and independently confirmed it. The strength of `Confirmed` depends on
@@ -807,10 +840,16 @@ pub enum GatewayError {
     ExecutionNotFound(ExecutionKey),
     #[error("human approval failed: {0}")]
     Approval(#[from] ApprovalError),
+    /// The adapter refused before any effect. `receipt` is the signed
+    /// `not_dispatched` / `dispatch_refused` receipt when the refusal closed
+    /// the execution; `None` when nothing changed (a refused challenge or
+    /// decision, or a transient refusal at the dispatch claim).
     #[error("dispatcher refused {key:?} before any effect: {reason}")]
     DispatchRefused {
         key: ExecutionKey,
         reason: &'static str,
+        transient: bool,
+        receipt: Option<Box<GatewayReceipt>>,
     },
 }
 
@@ -1016,8 +1055,21 @@ impl Gateway {
             .preflight(action)
             .map_err(|refusal| GatewayError::DispatchRefused {
                 key,
-                reason: refusal.0,
+                reason: refusal.reason(),
+                transient: refusal.is_transient(),
+                receipt: None,
             })
+    }
+
+    /// The signed reason of an execution closed without dispatch, if any.
+    fn closed_reason(record: &ExecutionRecord) -> Option<NotDispatchedReason> {
+        match record.execution {
+            ExecutionStatus::NotDispatched => record
+                .execution_attestation
+                .as_ref()
+                .and_then(|attestation| attestation.not_dispatched_reason),
+            _ => None,
+        }
     }
 
     /// Read-only execution status of one key, for transports that must tell
@@ -1049,6 +1101,7 @@ impl Gateway {
         if record.authorization != AuthorizationStatus::RequiresApproval
             || record.execution != ExecutionStatus::NotDispatched
             || record.human_approval.is_some()
+            || Self::closed_reason(&record).is_some()
         {
             return Err(ApprovalError::NotPending.into());
         }
@@ -1143,11 +1196,12 @@ impl Gateway {
                 // decision is inconsistent; never report it as pending.
                 Err(GatewayError::Journal(JournalError::InvalidRecord))
             }
+            // Closed before any decision (dispatch_refused): final.
+            None if Self::closed_reason(record).is_some() => Ok(ApprovalResolution::NotDispatched),
+            // Status never consults the adapter: it reports journal state
+            // only, so it cannot reveal live filesystem state.
             None => match self.check_pending_approval_window(record) {
-                Ok(()) => {
-                    self.preflight(record.key, &record.evidence.action)?;
-                    Ok(ApprovalResolution::Pending)
-                }
+                Ok(()) => Ok(ApprovalResolution::Pending),
                 Err(GatewayError::Approval(ApprovalError::Expired)) => {
                     Ok(ApprovalResolution::Expired)
                 }
@@ -1179,6 +1233,7 @@ impl Gateway {
         if record.authorization != AuthorizationStatus::RequiresApproval
             || record.execution != ExecutionStatus::NotDispatched
             || record.human_approval.is_some()
+            || Self::closed_reason(&record).is_some()
         {
             return Err(ApprovalError::NotPending.into());
         }
@@ -1279,12 +1334,23 @@ impl Gateway {
         // and before the single dispatch is claimed: an action it would refuse
         // (for example a target replaced by a symlink while the approval was
         // pending) is closed as `NotDispatched`, never claimed or dispatched.
+        // A transient refusal leaves it approved_pending_dispatch, like the
+        // other transient revalidation failures above.
         if let Err(refusal) = self.dispatcher.preflight(&record.evidence.action) {
             let key = record.key;
-            self.close_not_dispatched(record, NotDispatchedReason::DispatchFailed)?;
+            let receipt = if refusal.is_transient() {
+                None
+            } else {
+                Some(Box::new(self.close_not_dispatched(
+                    record,
+                    NotDispatchedReason::DispatchRefused,
+                )?))
+            };
             return Err(GatewayError::DispatchRefused {
                 key,
-                reason: refusal.0,
+                reason: refusal.reason(),
+                transient: refusal.is_transient(),
+                receipt,
             });
         }
         let now = self
@@ -1517,21 +1583,32 @@ impl Gateway {
         if authorization != AuthorizationStatus::Denied
             && let Err(refusal) = self.dispatcher.preflight(&evidence.action)
         {
-            // Explicit refusal: nothing was dispatched, and the signed
-            // attestation says so. Never left as outcome_unknown.
+            // Explicit, terminal refusal: nothing was dispatched, and the
+            // signed `dispatch_refused` attestation says so. Never left as
+            // outcome_unknown, and a held approval closed this way can never
+            // be approved (the agent must submit a new request).
             let execution = ExecutionStatus::NotDispatched;
-            let attestation =
-                self.create_execution_attestation(&evidence, authorization, execution, None)?;
-            if authorization == AuthorizationStatus::Allowed {
-                self.journal
-                    .mark_not_dispatched_attested(key, &attestation)?;
-            } else {
-                self.journal
-                    .record_attestation(key, execution, None, &attestation)?;
-            }
+            let attestation = ExecutionAttestation::create(
+                &evidence,
+                authorization,
+                execution,
+                None,
+                Some(NotDispatchedReason::DispatchRefused),
+                self.execution_attester.as_ref(),
+            )?;
+            self.journal
+                .mark_not_dispatched_attested(key, &attestation)?;
             return Err(GatewayError::DispatchRefused {
                 key,
-                reason: refusal.0,
+                reason: refusal.reason(),
+                transient: refusal.is_transient(),
+                receipt: Some(Box::new(Self::receipt(
+                    evidence,
+                    authorization,
+                    execution,
+                    None,
+                    attestation,
+                ))),
             });
         }
 

@@ -2227,7 +2227,7 @@ const APD_CHECKS: [(&str, &str); 6] = [
     ),
     (
         "praetore.execution_journal",
-        "execution_journal_not_dispatched_reason_v1",
+        "execution_journal_not_dispatched_reason_v2",
     ),
     (
         "praetore.execution_journal_events",
@@ -2239,12 +2239,13 @@ const APD_CHECKS: [(&str, &str); 6] = [
     ),
     (
         "praetore.execution_attestations",
-        "execution_attestations_not_dispatched_reason_v1",
+        "execution_attestations_not_dispatched_reason_v2",
     ),
 ];
 
-/// Fails unless every CHECK added by 0010 exists, the replaced constraints
-/// are gone, and only the v2 transition trigger is installed.
+/// Fails unless every CHECK added by 0010 (reason CHECKs as replaced by
+/// 0013) exists, the replaced constraints are gone, and only the latest
+/// (0013, v3) transition trigger is installed.
 fn assert_0010_schema_present(client: &mut Client) {
     for (table, name) in APD_CHECKS {
         let found: i64 = client
@@ -2270,6 +2271,15 @@ fn assert_0010_schema_present(client: &mut Client) {
             "praetore.execution_attestations",
             "execution_attestations_identity_status_key",
         ),
+        // Replaced by 0013.
+        (
+            "praetore.execution_journal",
+            "execution_journal_not_dispatched_reason_v1",
+        ),
+        (
+            "praetore.execution_attestations",
+            "execution_attestations_not_dispatched_reason_v1",
+        ),
     ] {
         let found: i64 = client
             .query_one(
@@ -2292,7 +2302,7 @@ fn assert_0010_schema_present(client: &mut Client) {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(triggers, vec!["execution_journal_transition_v2".to_owned()]);
+    assert_eq!(triggers, vec!["execution_journal_transition_v3".to_owned()]);
     let recorded: i64 = client
         .query_one("SELECT count(*) FROM praetore.schema_migrations", &[])
         .unwrap()
@@ -2956,7 +2966,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
         vec![
             "0010_approved_pending_dispatch",
             "0011_runtime_role",
-            "0012_dispatch_requires_live_approval"
+            "0012_dispatch_requires_live_approval",
+            "0013_dispatch_refused"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");

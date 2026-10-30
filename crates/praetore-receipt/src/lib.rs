@@ -64,8 +64,10 @@ pub enum ExecutionStatus {
     Failed,
 }
 
-/// Why an approved execution was closed as `NotDispatched` without ever
-/// reaching the adapter. Signed into the closing [`ExecutionAttestation`].
+/// Why an execution was closed as `NotDispatched` without ever reaching the
+/// adapter. Signed into the closing [`ExecutionAttestation`]. All reasons
+/// require `requires_approval`, except [`NotDispatchedReason::DispatchRefused`],
+/// which may also close an `allowed` execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotDispatchedReason {
@@ -75,6 +77,28 @@ pub enum NotDispatchedReason {
     DispatchFailed,
     /// Reconciliation found the approval unclaimed after a restart.
     CrashRecovered,
+    /// The adapter refused the action before any effect (its preflight
+    /// check). Terminal: a held approval closed this way cannot be approved.
+    DispatchRefused,
+}
+
+impl NotDispatchedReason {
+    /// Whether this reason may be signed for an execution with the given
+    /// authorization and execution state.
+    pub fn applies_to(
+        self,
+        authorization: AuthorizationStatus,
+        execution: ExecutionStatus,
+    ) -> bool {
+        execution == ExecutionStatus::NotDispatched
+            && match self {
+                Self::DispatchRefused => matches!(
+                    authorization,
+                    AuthorizationStatus::Allowed | AuthorizationStatus::RequiresApproval
+                ),
+                _ => authorization == AuthorizationStatus::RequiresApproval,
+            }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -175,9 +199,8 @@ impl ExecutionAttestation {
             ExecutionStatus::Authorized
                 | ExecutionStatus::ApprovedPendingDispatch
                 | ExecutionStatus::Dispatched
-        ) || not_dispatched_reason.is_some()
-            && (execution != ExecutionStatus::NotDispatched
-                || authorization != AuthorizationStatus::RequiresApproval)
+        ) || not_dispatched_reason
+            .is_some_and(|reason| !reason.applies_to(authorization, execution))
         {
             return Err(ExecutionAttestationError::InvalidPayload);
         }
@@ -305,9 +328,9 @@ impl ExecutionAttestation {
             (1, None, None) | (2, Some(_), None) | (3, Some(_), Some(_))
         ) || self.schema_version >= 2
             && self.tenant_id != authority_tenant_id(&evidence.authority)
-            || self.not_dispatched_reason.is_some()
-                && (authorization != AuthorizationStatus::RequiresApproval
-                    || execution != ExecutionStatus::NotDispatched)
+            || self
+                .not_dispatched_reason
+                .is_some_and(|reason| !reason.applies_to(authorization, execution))
             || self.evidence_id != evidence.evidence_id
             || self.request_id != evidence.request_id
             || self.agent_id != *evidence.agent.id.as_uuid()
