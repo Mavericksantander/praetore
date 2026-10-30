@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-10-30
+
 - The praetore-mcp README documents installing without a clone:
   `cargo install --git https://github.com/Mavericksantander/praetore
   praetore-mcp --locked` (checked on macOS arm64 against `9735974`).
