@@ -10,6 +10,7 @@ members = [
     "crates/praetore-gateway-service",
     "crates/praetore-cli",
     "crates/praetore-observe",
+    "crates/praetore-mcp",
 ]
 
 [workspace.package]

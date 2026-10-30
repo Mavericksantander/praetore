@@ -33,7 +33,8 @@ esperado. Hace lo siguiente:
 2. Verifica `bundle/evidence.json` con
    `praetore-verify evidence --attester-pin ... --issuer-pins ... --require-intent`.
 3. Calcula el digest de `bundle/policy.json` con `praetore-verify policy-digest`
-   y comprueba que es igual al `policy_digest` ligado en la evidencia.
+   y comprueba que es igual al `policy_digest` ligado en la evidencia; luego
+   repite la comprobación con `praetore-verify evidence --policy bundle/policy.json`.
 4. Verifica `bundle/authority.json` con `praetore-verify authority --agent ...`
    en una fecha fija (`2026-10-24T00:00:00Z`).
 5. Copia la evidencia, cambia **un byte** (una letra de `decision.reason`) y
@@ -50,7 +51,7 @@ esperado. Hace lo siguiente:
 | Firma del atestador | `praetore-verify evidence`, Python | Firma Ed25519 sobre el recibo, con la clave pineada en `attester-public-key.hex`; el `attester_key_id` debe corresponder a esa clave. |
 | Autoridad del agente | `praetore-verify evidence --issuer-pins` | La autoridad embebida está firmada por el emisor pineado en `issuer-pins.jsonl` (mismo `issuer` y `issuer_key_id`), está dentro de su ventana de validez **a la hora actual**, y su sujeto corresponde a la clave del agente embebido. |
 | Intención del agente | `praetore-verify evidence --require-intent` | La solicitud está firmada por la clave del agente. |
-| Digest de la política | `policy-digest` más comparación en `verify.sh` | La política publicada en `policy.json` es la misma cuyo digest quedó ligado en la evidencia. La comparación la hace el script, no el comando `evidence`. |
+| Digest de la política | `praetore-verify evidence --policy`; también `policy-digest` más comparación en `verify.sh` | La política publicada en `policy.json` es la misma cuyo digest quedó ligado en la evidencia, y la firma del atestador cubre ese digest. Un recibo sin `policy_digest` falla con `POLICY_MISMATCH`. |
 | Autoridad sola | `praetore-verify authority --agent` | Firma del emisor, ventana de validez en la fecha `--now` y ligadura con la identidad del agente. |
 
 El verificador Python solo cubre integridad y firma del atestador. No
