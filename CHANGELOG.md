@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `praetore-mcp <command> --help` / `-h` prints that command's usage and
+  exits 0 (it used to fail with `unexpected argument "--help"`). `--help`
+  after `wrap ... --` is still passed to the MCP server. `praetore-mcp
+  version` is an alias of `--version`. Exit codes (0, 1, 2, and `wrap`'s
+  server code / 127) are documented in `--help` and the praetore-mcp README.
 - New receipts always record what decided them in `decision.decided_by`, as
   part of the hashed and Ed25519-signed evidence payload, in the new
   **evidence schema v4**:
