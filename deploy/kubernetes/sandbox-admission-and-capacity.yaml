@@ -19,6 +19,28 @@ spec:
   matchConditions:
     - name: sandbox-namespace
       expression: request.namespace == "praetore-sandbox"
+    # Garbage collection of a Job deleted with Foreground propagation (TTL
+    # controller, supervisor cleanup) ends with a kube-controller-manager
+    # UPDATE that only removes the foregroundDeletion finalizer. Such
+    # metadata-only updates by the listed controllers are exempt; any change
+    # to spec, labels, annotations or owner references, or any added
+    # finalizer, still goes through every rule below. Use the identities your
+    # control plane actually uses (--use-service-account-credentials=true
+    # gives the per-controller ServiceAccounts).
+    - name: not-controller-finalizer-removal
+      expression: >-
+        !(request.operation == "UPDATE"
+        && request.userInfo.username in [
+        "system:serviceaccount:kube-system:generic-garbage-collector",
+        "system:serviceaccount:kube-system:ttl-after-finished-controller",
+        "system:serviceaccount:kube-system:job-controller",
+        "system:kube-controller-manager"]
+        && object.spec == oldObject.spec
+        && has(object.metadata.deletionTimestamp)
+        && (has(object.metadata.labels) ? (has(oldObject.metadata.labels) && object.metadata.labels == oldObject.metadata.labels) : !has(oldObject.metadata.labels))
+        && (has(object.metadata.annotations) ? (has(oldObject.metadata.annotations) && object.metadata.annotations == oldObject.metadata.annotations) : !has(oldObject.metadata.annotations))
+        && (has(object.metadata.ownerReferences) ? (has(oldObject.metadata.ownerReferences) && object.metadata.ownerReferences == oldObject.metadata.ownerReferences) : !has(oldObject.metadata.ownerReferences))
+        && (!has(object.metadata.finalizers) || (has(oldObject.metadata.finalizers) && object.metadata.finalizers.all(f, f in oldObject.metadata.finalizers))))
   validations:
     - expression: request.userInfo.username == "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
       message: Only the sandbox supervisor ServiceAccount may create or start sandbox Jobs.
@@ -156,15 +178,67 @@ spec:
   matchConditions:
     - name: sandbox-namespace
       expression: request.namespace == "praetore-sandbox"
+  # `object` is null on DELETE and `oldObject` is null on CREATE; every rule
+  # below reads only the one that exists. Rules apply to execution claims
+  # (claim-* names or the execution-claim label, on either version), to the
+  # supervisor CA ConfigMap, and to everything the supervisor does. Other
+  # ConfigMaps (kube-root-ca.crt published by kube-controller-manager,
+  # operator configuration) are left to RBAC.
+  variables:
+    - name: supervisor
+      expression: request.userInfo.username == "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
+    - name: newClaim
+      expression: >-
+        object != null
+        && ((has(object.metadata.name) && object.metadata.name.startsWith("claim-"))
+        || (has(object.metadata.labels) && "praetore.io/component" in object.metadata.labels
+        && object.metadata.labels["praetore.io/component"] == "execution-claim"))
+    - name: oldClaim
+      expression: >-
+        oldObject != null
+        && (oldObject.metadata.name.startsWith("claim-")
+        || (has(oldObject.metadata.labels) && "praetore.io/component" in oldObject.metadata.labels
+        && oldObject.metadata.labels["praetore.io/component"] == "execution-claim"))
+    - name: claim
+      expression: variables.newClaim || variables.oldClaim
+    - name: supervisorCa
+      expression: >-
+        (object != null && has(object.metadata.name) && object.metadata.name == "praetore-sandbox-supervisor-ca")
+        || (oldObject != null && oldObject.metadata.name == "praetore-sandbox-supervisor-ca")
   validations:
-    - expression: request.userInfo.username == "system:serviceaccount:praetore-sandbox:praetore-sandbox-supervisor"
+    - expression: '!variables.supervisor || (request.operation == "CREATE" && variables.newClaim)'
+      message: The sandbox supervisor ServiceAccount may only create execution claims.
+    - expression: '!variables.claim || request.operation != "CREATE" || variables.supervisor'
       message: Only the sandbox supervisor ServiceAccount may reserve execution identities.
-    - expression: request.operation == "CREATE" && object.immutable == true
-      message: Execution claims must be immutable and create-only.
-    - expression: object.metadata.name == "claim-" + object.metadata.labels["praetore.io/execution-id"] && object.metadata.labels["praetore.io/component"] == "execution-claim" && object.metadata.labels["praetore.io/execution-id"].matches("^[a-f0-9]{52}$") && object.metadata.labels["praetore.io/action-digest"].matches("^[a-f0-9]{52}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].startsWith(object.metadata.labels["praetore.io/execution-id"]) && object.metadata.annotations["praetore.io/action-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/action-sha256"].startsWith(object.metadata.labels["praetore.io/action-digest"])
+    - expression: '!variables.claim || request.operation != "UPDATE"'
+      message: Execution claims are immutable and cannot be updated.
+    # Claims are a second, Kubernetes-side duplicate guard; the PostgreSQL
+    # journal is the authority for dispatch uniqueness. Deletion is reserved
+    # for an operator-owned retention identity (see docs/runtime-security-scaffold.md:
+    # only claims whose journal row is terminal may be removed) and for
+    # namespace deletion. The supervisor itself can never delete a claim.
+    - expression: >-
+        !variables.claim || request.operation != "DELETE"
+        || request.userInfo.username in [
+        "system:serviceaccount:praetore-security:claim-retention",
+        "system:serviceaccount:kube-system:namespace-controller",
+        "system:kube-controller-manager"]
+      message: Only the claim-retention identity may delete execution claims.
+    - expression: >-
+        !variables.claim || request.operation != "CREATE"
+        || (has(object.immutable) && object.immutable == true)
+      message: Execution claims must be immutable.
+    - expression: >-
+        !variables.claim || request.operation != "CREATE"
+        || (has(object.metadata.labels) && has(object.metadata.annotations)
+        && object.metadata.name == "claim-" + object.metadata.labels["praetore.io/execution-id"] && object.metadata.labels["praetore.io/component"] == "execution-claim" && object.metadata.labels["praetore.io/execution-id"].matches("^[a-f0-9]{52}$") && object.metadata.labels["praetore.io/action-digest"].matches("^[a-f0-9]{52}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/execution-key-sha256"].startsWith(object.metadata.labels["praetore.io/execution-id"]) && object.metadata.annotations["praetore.io/action-sha256"].matches("^[a-f0-9]{64}$") && object.metadata.annotations["praetore.io/action-sha256"].startsWith(object.metadata.labels["praetore.io/action-digest"]))
       message: Execution claims must persist the deterministic execution identity and exact action digest.
-    - expression: (!has(object.data) || object.data.size() == 0) && (!has(object.binaryData) || object.binaryData.size() == 0)
+    - expression: >-
+        !variables.claim || request.operation != "CREATE"
+        || ((!has(object.data) || object.data.size() == 0) && (!has(object.binaryData) || object.binaryData.size() == 0))
       message: Execution claims must not contain request payloads or credentials.
+    - expression: '!variables.supervisorCa || request.userInfo.username == "system:serviceaccount:praetore-security:tls-provisioner"'
+      message: Only the dedicated TLS provisioner ServiceAccount may create, rotate or delete the supervisor CA ConfigMap.
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
@@ -188,6 +262,9 @@ spec:
   hard:
     count/jobs.batch: "50"
     count/secrets: "100"
+    # Execution claims plus kube-root-ca.crt and the supervisor CA. Claims are
+    # reclaimed only by the claim-retention identity; when the quota is
+    # exhausted new sandbox runs fail closed until retention runs.
     count/configmaps: "10000"
     count/pods: "50"
     count/services: "10"

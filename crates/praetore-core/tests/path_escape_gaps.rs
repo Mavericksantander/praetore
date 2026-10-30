@@ -1,8 +1,10 @@
 //! T-014 path-restriction escapes against `PathPrefix`.
 //!
-//! Lexical `..` and an absolute path outside the prefix are denied. A symlink
-//! whose path string stays inside the prefix is still allowed; that test is
-//! ignored because running it fails.
+//! A symlink whose path string stays inside the prefix is still allowed; that
+//! test is ignored because running it fails. The lexical `..` and
+//! absolute-path-outside-the-prefix cases are covered on main by
+//! `tests/path_prefix.rs` (`path_prefix_allows_only_normalized_paths_inside_prefix`,
+//! `safe_path_prefix_rejects_dot_dot_traversal`), so they are not repeated here.
 
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, DecisionOutcome, Policy, PolicyCondition,
@@ -62,43 +64,7 @@ fn outcome(prefix: &str, path: &str) -> DecisionOutcome {
 }
 
 #[test]
-fn path_prefix_denies_dotdot_that_resolves_outside_the_prefix() {
-    let tree = TempTree::new();
-    let sandbox = tree.root().join("sandbox");
-    fs::create_dir_all(sandbox.join("sub")).unwrap();
-    let escaped = sandbox
-        .join("sub")
-        .join("..")
-        .join("..")
-        .join("outside")
-        .join("secret");
-    let resolved = fs::canonicalize(&escaped).unwrap();
-    let sandbox_canon = fs::canonicalize(&sandbox).unwrap();
-    assert!(
-        !resolved.starts_with(&sandbox_canon),
-        "fixture path must resolve outside the prefix"
-    );
-    assert_eq!(
-        outcome(sandbox.to_str().unwrap(), escaped.to_str().unwrap()),
-        DecisionOutcome::Deny
-    );
-}
-
-#[test]
-fn path_prefix_denies_absolute_path_outside_the_prefix() {
-    let tree = TempTree::new();
-    let sandbox = tree.root().join("sandbox");
-    let outside = tree.root().join("outside").join("secret");
-    assert!(outside.is_absolute());
-    assert!(!outside.starts_with(&sandbox));
-    assert_eq!(
-        outcome(sandbox.to_str().unwrap(), outside.to_str().unwrap()),
-        DecisionOutcome::Deny
-    );
-}
-
-#[test]
-#[ignore = "T-014: PathPrefix is lexical and allows a symlink inside the prefix whose target is outside (policy.rs path_segments; no filesystem check). Running this fails with Allow."]
+#[ignore = "T-014 KNOWN LIMITATION, not a regression: PathPrefix is lexical and allows a symlink inside the prefix whose target is outside. Documented as out of scope on main (README 'Symlinks are out of scope', MatchOperator::PathPrefix docs); confinement must happen in the dispatcher. Running this fails with Allow."]
 fn path_prefix_allow_rejects_symlink_that_leaves_the_prefix() {
     let tree = TempTree::new();
     let sandbox = tree.root().join("sandbox");

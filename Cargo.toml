@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/praetore-core",
+    "crates/praetore-receipt",
     "crates/praetore-verify",
     "crates/praetore-python",
     "crates/praetore-replay-postgres",

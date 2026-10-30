@@ -61,7 +61,7 @@ spec:
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: praetore-egress
-            app.kubernetes.io/name: egress-proxy
+            app.kubernetes.io/name: gateway-egress-proxy
       toPorts:
         - ports:
             - port: "3128"
@@ -87,26 +87,28 @@ spec:
           rules:
             dns:
               - matchPattern: "postgres.praetore-data.svc.cluster.local."
-              - matchPattern: "egress-proxy.praetore-egress.svc.cluster.local."
+              - matchPattern: "gateway-egress-proxy.praetore-egress.svc.cluster.local."
               - matchPattern: "praetore-sandbox-supervisor.praetore-sandbox.svc.cluster.local."
 ---
+# Two proxies with separate identities. The gateway proxy is the only path to
+# protected tools and is reachable only from the gateway. Sandbox tool runners
+# use their own proxy (the egress-proxy Service name is fixed in the
+# supervisor's Job spec and in admission), which can reach only explicitly
+# allowed external destinations and never praetore-tools.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: praetore-egress-proxy-allowlist
+  name: praetore-gateway-egress-proxy-allowlist
   namespace: praetore-egress
 spec:
   endpointSelector:
     matchLabels:
-      app.kubernetes.io/name: egress-proxy
+      app.kubernetes.io/name: gateway-egress-proxy
   ingress:
     - fromEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: praetore-gateway
             app.kubernetes.io/name: praetore-gateway
-        - matchLabels:
-            k8s:io.kubernetes.pod.namespace: praetore-sandbox
-            praetore.io/component: tool-invocation
       toPorts:
         - ports:
             - port: "3128"
@@ -138,6 +140,47 @@ spec:
     - toFQDNs:
         - matchName: api.example.com
         - matchPattern: "*.api.example.com"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-sandbox-egress-proxy-allowlist
+  namespace: praetore-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: egress-proxy
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: praetore-sandbox
+            praetore.io/component: tool-invocation
+      toPorts:
+        - ports:
+            - port: "3128"
+              protocol: TCP
+  # Replace runner-tools.example.com with the exact destinations the approved
+  # tool profiles need. No in-cluster endpoint is allowed.
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+          rules:
+            dns:
+              - matchName: runner-tools.example.com
+    - toFQDNs:
+        - matchName: runner-tools.example.com
       toPorts:
         - ports:
             - port: "443"
@@ -256,7 +299,7 @@ spec:
     - fromEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: praetore-egress
-            app.kubernetes.io/name: egress-proxy
+            app.kubernetes.io/name: gateway-egress-proxy
       toPorts:
         - ports:
             - port: "443"
