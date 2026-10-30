@@ -3,6 +3,7 @@
 //! journals the attested evidence. See the crate README for the trust model.
 
 pub mod gate;
+pub mod install;
 pub mod json;
 pub mod proxy;
 pub mod store;
