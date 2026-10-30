@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` on every run, runs
+  `scripts/mcp-smoke.py` on each (a real allowed and a real denied
+  `tools/call` through `@modelcontextprotocol/server-filesystem@2.1.0`, then
+  `verify`), and uploads `.tar.gz` archives with `.sha256` files as workflow
+  artifacts. On `v*` tags, `Release checksums` re-checks them and includes
+  them in `SHA256SUMS`. The macOS binaries are not signed or notarized.
 ## 0.3.0 - 2026-10-30
 
 - The gateway-service sandbox supervisor rejects a dispatch request when any

@@ -230,20 +230,85 @@ jobs:
             fuzz/*.cdx.json
           if-no-files-found: error
 
+  mcp-binaries:
+    name: praetore-mcp ${{ matrix.target }} build and smoke
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # Cross-built on Apple silicon; the smoke test runs it under Rosetta 2.
+          - os: macos-14
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: cargo build --release --locked --package praetore-mcp --target ${{ matrix.target }}
+      - name: Install Rosetta 2 for the x86_64 smoke test
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
+      - name: Show binary architecture
+        run: file target/${{ matrix.target }}/release/praetore-mcp
+      # A real tools/call allowed and one denied, through npx and
+      # @modelcontextprotocol/server-filesystem@2.1.0, then `verify`.
+      - name: End-to-end smoke test of the release binary
+        run: python3 -I scripts/mcp-smoke.py target/${{ matrix.target }}/release/praetore-mcp
+      - name: Package binary with its checksum
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then version="${GITHUB_SHA::12}"; fi
+          name="praetore-mcp-${version}-${{ matrix.target }}"
+          mkdir -p "mcp-assets/${name}"
+          cp target/${{ matrix.target }}/release/praetore-mcp "mcp-assets/${name}/"
+          cp LICENSE NOTICE "mcp-assets/${name}/"
+          tar -C mcp-assets -czf "mcp-assets/${name}.tar.gz" "${name}"
+          cd mcp-assets
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          cat "${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-${{ matrix.target }}
+          path: |
+            mcp-assets/*.tar.gz
+            mcp-assets/*.tar.gz.sha256
+          if-no-files-found: error
+
   release-integrity:
     name: Release checksums
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: mcp-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked --package praetore-verify
-      - name: Prepare checksummed release asset
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mcp-*
+          path: mcp-assets
+          merge-multiple: true
+      - name: Prepare checksummed release assets
         run: |
           mkdir release-assets
           cp target/release/praetore-verify release-assets/
+          cp mcp-assets/*.tar.gz release-assets/
           cd release-assets
-          sha256sum praetore-verify > SHA256SUMS
+          # Each archive was checksummed on the runner that built it.
+          for archive in praetore-mcp-*.tar.gz; do
+            (cd ../mcp-assets && shasum -a 256 -c "${archive}.sha256")
+          done
+          sha256sum praetore-verify praetore-mcp-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets-${{ github.ref_name }}
