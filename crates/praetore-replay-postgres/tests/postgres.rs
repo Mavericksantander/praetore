@@ -2993,6 +2993,73 @@ fn postgres_migrations_unknown_version_refuses_to_start() {
     );
 }
 
+fn column_exists(client: &mut Client, table: &str, column: &str) -> bool {
+    client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+             WHERE table_schema = 'praetore' AND table_name = $1 AND column_name = $2)",
+            &[&table, &column],
+        )
+        .unwrap()
+        .get(0)
+}
+
+/// 0007 is written as `BEGIN; ... COMMIT;`. Its effects and its
+/// schema_migrations row must commit together: if recording the version
+/// fails (here: an injected trigger, standing in for a crash after the body
+/// ran), nothing of 0007 may remain.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migration_effects_and_record_commit_atomically() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    client
+        .batch_execute(
+            "CREATE SCHEMA praetore; \
+             CREATE TABLE praetore.schema_migrations (\
+                 version TEXT PRIMARY KEY, \
+                 checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()); \
+             CREATE FUNCTION public.fail_0007_record() RETURNS trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+                 IF NEW.version = '0007_tenant_scoped_execution' THEN \
+                     RAISE EXCEPTION 'injected failure after the 0007 body'; \
+                 END IF; \
+                 RETURN NEW; \
+             END $$; \
+             CREATE TRIGGER fail_0007_record BEFORE INSERT ON praetore.schema_migrations \
+             FOR EACH ROW EXECUTE FUNCTION public.fail_0007_record();",
+        )
+        .unwrap();
+
+    let error = praetore_replay_postgres::apply_migrations(&mut client).unwrap_err();
+    assert!(
+        matches!(error, praetore_replay_postgres::MigrationError::Database(_)),
+        "{error}"
+    );
+    assert_eq!(recorded_versions(&mut client), all_versions()[..6].to_vec());
+    assert!(
+        !column_exists(&mut client, "replay_claims", "tenant_id"),
+        "0007 effects committed without its schema_migrations row"
+    );
+    assert!(matches!(
+        praetore_replay_postgres::verify_schema_current(&mut client),
+        Err(praetore_replay_postgres::MigrationError::Pending(
+            "0007_tenant_scoped_execution"
+        ))
+    ));
+
+    client
+        .batch_execute("DROP TRIGGER fail_0007_record ON praetore.schema_migrations")
+        .unwrap();
+    let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    assert_eq!(applied.first(), Some(&"0007_tenant_scoped_execution"));
+    assert_eq!(recorded_versions(&mut client), all_versions());
+    assert!(column_exists(&mut client, "replay_claims", "tenant_id"));
+    assert_0010_schema_present(&mut client);
+    praetore_replay_postgres::verify_schema_current(&mut client).unwrap();
+}
+
 fn fault_journal() -> Arc<CommitFaultJournal> {
     Arc::new(CommitFaultJournal {
         inner: connect_journal(),
