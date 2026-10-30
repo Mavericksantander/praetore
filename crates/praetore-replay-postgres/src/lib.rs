@@ -3,10 +3,14 @@ use praetore_core::replay::{ReplayGuard, ReplayGuardError};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+mod connection;
 mod execution;
 mod migrations;
 mod observability;
 
+pub use connection::{
+    DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RustlsConnect, verify_runtime_role,
+};
 pub use execution::PostgresExecutionJournal;
 pub use migrations::{MIGRATIONS, MigrationError, apply_migrations, verify_schema_current};
 pub use observability::{

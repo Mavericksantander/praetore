@@ -1237,9 +1237,12 @@ dependencies = [
  "postgres",
  "praetore-core",
  "praetore-gateway",
+ "rustls",
  "serde_json",
  "sha2 0.11.0",
  "time",
+ "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 
