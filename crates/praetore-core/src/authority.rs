@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    canonical::{canonical_json, parse_json_rejecting_duplicates},
+    canonical::{canonical_json, decode_lower_hex, parse_json_rejecting_duplicates},
     error::{PraetoreError, Result},
     identity::{AgentId, AgentIdentity, AgentKeyPair, VerifiedPublicKey},
 };
@@ -240,7 +240,7 @@ impl Authority {
             .as_deref()
             .ok_or(PraetoreError::AuthorityVerificationFailed)
             .and_then(|value| {
-                hex::decode(value).map_err(|_| PraetoreError::AuthorityVerificationFailed)
+                decode_lower_hex(value).ok_or(PraetoreError::AuthorityVerificationFailed)
             })?;
         let payload = self
             .canonical_signing_bytes()
@@ -330,7 +330,7 @@ impl Authority {
         if self
             .subject_key_hash
             .as_deref()
-            .is_some_and(|hash| hash.len() != 64 || hex::decode(hash).is_err())
+            .is_some_and(|hash| hash.len() != 64 || decode_lower_hex(hash).is_none())
         {
             return Err(PraetoreError::InvalidRequest(
                 "authority subject key hash is malformed".into(),
@@ -339,7 +339,7 @@ impl Authority {
         if self
             .issuer_key_id
             .as_deref()
-            .is_some_and(|key_id| key_id.len() != 64 || hex::decode(key_id).is_err())
+            .is_some_and(|key_id| key_id.len() != 64 || decode_lower_hex(key_id).is_none())
         {
             return Err(PraetoreError::InvalidRequest(
                 "authority issuer key id is malformed".into(),
