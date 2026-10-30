@@ -374,7 +374,10 @@ test evidence attester key that signed their evidence. Regenerate v2/v3 (and v1)
 `UPDATE_RECEIPT_FIXTURES=1 cargo test -p praetore-gateway --test enforcement receipt_fixtures`.
 The gateway no longer emits v1, so `receipt-v1-confirmed.json` is the committed
 v2 receipt re-signed as a legacy v1 attestation; regenerate only it with
-`UPDATE_RECEIPT_V1_FIXTURE=1` and the same command.
+`UPDATE_RECEIPT_V1_FIXTURE=1` and the same command. Regenerated receipts carry
+evidence schema v4 (`decision.decided_by`). `fixtures/legacy-evidence/` keeps
+receipts and evidence whose evidence predates v4 (schema v1/v2); they are
+never regenerated and must keep verifying unchanged.
 
 The Python package provides Rust-backed integrity and attester signature
 verification only (`verify_gateway_receipt` covers execution attestations,

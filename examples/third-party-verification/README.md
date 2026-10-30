@@ -59,7 +59,7 @@ verifica autoridad, intención ni política.
 
 ### Versiones de evidencia
 
-`praetore-verify` lee las tres versiones de `evidence_schema_version`:
+`praetore-verify` lee las cuatro versiones de `evidence_schema_version`:
 
 - **v1:** recibo base (modo desarrollo). Firma con dominio `PRAETORE_EVIDENCE_V1`.
 - **v2:** recibo HighAssurance, con `decided_at`, `freshness_valid_until`,
@@ -67,8 +67,14 @@ verifica autoridad, intención ni política.
   Usa el dominio de firma `PRAETORE_EVIDENCE_V2`.
 - **v3:** recibo que lleva una obligación de recuperación (`decision.recovery`,
   SAF-10).
+- **v4:** recibo que registra qué decidió (`decision.decided_by`: `rule`,
+  `unbound_rule`, `default_deny` o `engine_guard`), cubierto por el hash de
+  integridad y la firma del atestador. Es lo que emite el motor actual, con o
+  sin metadatos HighAssurance (mismo dominio de firma que v1 o v2) y con o
+  sin `decision.recovery`. v1-v3 no pueden llevar `decided_by` y siguen
+  verificando sin cambios.
 
-El bundle de este demo es **v1**. Este demo no ejercita v2 ni v3.
+El bundle de este demo es **v4** sin HighAssurance ni recuperación.
 
 ## Qué NO garantiza
 

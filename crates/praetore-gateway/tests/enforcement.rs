@@ -2471,7 +2471,10 @@ mod saf10_today {
             let fixture = fixture(effect, false);
             let receipt = fixture.gateway.execute(fixture.request).unwrap();
             let evidence = receipt.evidence;
-            prop_assert_eq!(evidence.evidence_schema_version, 2);
+            // HighAssurance evidence with decided_by is schema v4.
+            prop_assert_eq!(evidence.evidence_schema_version, 4);
+            prop_assert!(evidence.is_high_assurance_shape());
+            prop_assert!(evidence.decision.decided_by().is_some());
             prop_assert!(evidence.verify_integrity());
             let json = serde_json::to_string(&evidence).unwrap();
             let parsed: Evidence = serde_json::from_str(&json).unwrap();
@@ -2626,7 +2629,13 @@ mod saf10_full {
         let receipt = fixture.gateway.execute(fixture.request).unwrap();
         let recovery = receipt.evidence.decision.recovery.as_ref().unwrap();
         assert_eq!(recovery.recovery_id, "safe-hold");
-        assert_eq!(receipt.evidence.evidence_schema_version, 3);
+        // Recovery with decided_by is schema v4; the Recover rule decided it.
+        assert_eq!(receipt.evidence.evidence_schema_version, 4);
+        assert!(receipt.evidence.is_high_assurance_shape());
+        assert_eq!(
+            receipt.evidence.decision.decided_by(),
+            Some(&praetore_core::DecidedBy::rule(recovery.rule_id.clone()))
+        );
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
         assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
         receipt
@@ -2898,6 +2907,52 @@ mod apd {
             ),
             Err(ExecutionAttestationError::InvalidSignature)
         ));
+
+        // Current receipts carry evidence v4 with `decided_by`; receipts
+        // whose evidence predates it (v1-v3, committed before v4 existed and
+        // never regenerated) keep verifying byte-for-byte.
+        for name in [
+            "receipt-v1-confirmed.json",
+            "receipt-v2-confirmed.json",
+            "receipt-v3-crash-recovered.json",
+        ] {
+            let current = std::fs::read_to_string(dir.join(name)).unwrap();
+            let receipt = praetore_gateway::verify_gateway_receipt_json(
+                &current,
+                &public_key,
+                key_id,
+                &evidence_key,
+            )
+            .unwrap();
+            assert_eq!(receipt.evidence.evidence_schema_version, 4, "{name}");
+            assert!(receipt.evidence.decision.decided_by().is_some(), "{name}");
+
+            let legacy = std::fs::read_to_string(dir.join("legacy-evidence").join(name)).unwrap();
+            let receipt = praetore_gateway::verify_gateway_receipt_json(
+                &legacy,
+                &public_key,
+                key_id,
+                &evidence_key,
+            )
+            .unwrap();
+            assert!(receipt.evidence.evidence_schema_version < 4, "{name}");
+            assert_eq!(receipt.evidence.decision.decided_by(), None, "{name}");
+            // Adding decided_by to a legacy receipt breaks it.
+            let mut document: Value = serde_json::from_str(&legacy).unwrap();
+            let rule_id = document["evidence"]["decision"]["contributions"][0]["rule_id"].clone();
+            document["evidence"]["decision"]["decided_by"] =
+                json!({"kind": "rule", "rule_id": rule_id});
+            assert!(
+                praetore_gateway::verify_gateway_receipt_json(
+                    &document.to_string(),
+                    &public_key,
+                    key_id,
+                    &evidence_key,
+                )
+                .is_err(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

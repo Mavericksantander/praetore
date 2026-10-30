@@ -73,7 +73,12 @@ fn receipt(policy: &Policy) -> Evidence {
         .with_capability("data:read");
     let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
     request.sign_intent(&agent_key).unwrap();
-    let mut evidence = request.attest(Decision::allow("policy fixture")).unwrap();
+    let mut evidence = request
+        .attest(Decision::allow(
+            "policy fixture",
+            praetore_core::DecidedBy::rule("policy-fixture"),
+        ))
+        .unwrap();
     evidence
         .bind_policy_digest(policy.digest().unwrap())
         .unwrap();

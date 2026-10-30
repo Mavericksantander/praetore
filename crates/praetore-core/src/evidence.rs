@@ -16,7 +16,7 @@ use crate::{
         MAX_JSON_VALUE_BYTES, canonical_json, decode_lower_hex, parse_json_rejecting_duplicates,
         validate_json_value,
     },
-    decision::{Decision, DecisionOutcome},
+    decision::{Decision, DecisionOutcome, RecordedDecision},
     identity::{AgentIdentity, VerifiedPublicKey},
     key_rotation::KeyRotationProof,
     policy::Policy,
@@ -42,7 +42,7 @@ pub struct Evidence {
     pub agent: AgentIdentity,
     pub authority: Authority,
     pub action: Action,
-    pub decision: Decision,
+    pub decision: RecordedDecision,
     pub trace_id: Option<String>,
     pub context: BTreeMap<String, Value>,
     pub agent_signature: Option<String>,
@@ -143,7 +143,11 @@ impl Evidence {
         trace_id: Option<String>,
         context: BTreeMap<String, Value>,
     ) -> crate::Result<Self> {
-        let evidence_schema_version = if decision.recovery.is_some() { 3 } else { 1 };
+        decision
+            .validate()
+            .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+        // Every new decision records `decided_by`, which only v4 may carry.
+        let evidence_schema_version = 4;
         let mut evidence = Self {
             evidence_schema_version,
             canonical_version: crate::canonical::CANONICAL_VERSION,
@@ -152,7 +156,7 @@ impl Evidence {
             agent,
             authority,
             action,
-            decision,
+            decision: decision.into(),
             trace_id,
             context,
             agent_signature: None,
@@ -185,18 +189,28 @@ impl Evidence {
     /// cryptographically and does not provide non-repudiation.
     pub fn verify_integrity(&self) -> bool {
         let has_recovery = self.decision.recovery.is_some();
+        let has_decided_by = self.decision.decided_by.is_some();
         let shape_ok = match self.evidence_schema_version {
-            1 => !self.has_v2_fields() && !has_recovery,
-            2 => self.has_complete_v2_fields() && !has_recovery,
-            // SAF-10: v3 is the only version that may carry a recovery
+            // v1-v3 predate `decided_by` and must not carry it.
+            1 => !self.has_v2_fields() && !has_recovery && !has_decided_by,
+            2 => self.has_complete_v2_fields() && !has_recovery && !has_decided_by,
+            // SAF-10: v3 is the only legacy version that may carry a recovery
             // obligation; it is either a complete HighAssurance record or a
             // record without any v2 field.
-            3 => has_recovery && (self.has_complete_v2_fields() || !self.has_v2_fields()),
+            3 => {
+                has_recovery
+                    && !has_decided_by
+                    && (self.has_complete_v2_fields() || !self.has_v2_fields())
+            }
+            // v4 always records `decided_by` (covered by the context hash and
+            // the attester signature); recovery is optional and, like v3, it
+            // is either complete HighAssurance or has no v2 field.
+            4 => has_decided_by && (self.has_complete_v2_fields() || !self.has_v2_fields()),
             _ => false,
         };
         if !shape_ok
             || self.canonical_version != crate::canonical::CANONICAL_VERSION
-            || self.decision.validate_recovery().is_err()
+            || self.decision.validate().is_err()
         {
             return false;
         }
@@ -302,7 +316,9 @@ impl Evidence {
                 "HighAssurance evidence metadata is incomplete".into(),
             ));
         }
-        self.evidence_schema_version = if self.decision.recovery.is_some() {
+        self.evidence_schema_version = if self.decision.decided_by.is_some() {
+            4
+        } else if self.decision.recovery.is_some() {
             3
         } else {
             2
@@ -471,7 +487,7 @@ impl Evidence {
         Ok(())
     }
 
-    fn compute_context_hash(&self) -> Option<String> {
+    pub(crate) fn compute_context_hash(&self) -> Option<String> {
         self.validate_integrity_inputs().ok()?;
         let payload = EvidenceIntegrityPayload {
             evidence_schema_version: self.evidence_schema_version,
@@ -534,6 +550,7 @@ impl Evidence {
             || self.decision.contributions.iter().any(|contribution| {
                 contribution.rule_id.len() > 1024 || contribution.reason.len() > 4096
             })
+            || self.decision.validate().is_err()
         {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence decision exceeds configured limits".into(),
@@ -568,11 +585,11 @@ impl Evidence {
                 "evidence cryptographic metadata is malformed".into(),
             ));
         }
-        // v3 records without HighAssurance metadata (and the intermediate
+        // v3/v4 records without HighAssurance metadata (and the intermediate
         // state during attestation) are checked by `verify_integrity`'s shape
         // rule instead.
         if self.evidence_schema_version == 2
-            || (self.evidence_schema_version == 3 && self.has_complete_v2_fields())
+            || (matches!(self.evidence_schema_version, 3 | 4) && self.has_complete_v2_fields())
         {
             let intent = self.intent_v2.as_ref().ok_or_else(|| {
                 crate::PraetoreError::EvidenceError("v2 intent metadata is missing".into())
@@ -674,10 +691,10 @@ impl Evidence {
             && self.agent_signature.is_some()
     }
 
-    /// True for v2, or v3 with complete HighAssurance metadata. Use this
+    /// True for v2, or v3/v4 with complete HighAssurance metadata. Use this
     /// instead of comparing `evidence_schema_version` to 2.
     pub fn is_high_assurance_shape(&self) -> bool {
-        matches!(self.evidence_schema_version, 2 | 3) && self.has_complete_v2_fields()
+        matches!(self.evidence_schema_version, 2..=4) && self.has_complete_v2_fields()
     }
 
     fn attestation_domain(&self) -> &'static [u8] {
@@ -718,7 +735,7 @@ struct EvidenceIntegrityPayload<'a> {
     agent: &'a AgentIdentity,
     authority: &'a Authority,
     action: &'a Action,
-    decision: &'a Decision,
+    decision: &'a RecordedDecision,
     trace_id: &'a Option<String>,
     context: &'a BTreeMap<String, Value>,
     agent_signature: &'a Option<String>,
@@ -775,7 +792,10 @@ mod tests {
     }
 
     fn test_decision() -> Decision {
-        Decision::allow("policy permitted action")
+        Decision::allow(
+            "policy permitted action",
+            crate::DecidedBy::rule("test-rule"),
+        )
     }
 
     fn test_evidence() -> Evidence {
@@ -1128,7 +1148,13 @@ mod tests {
         let json = evidence.to_json().unwrap();
         let restored = Evidence::from_json(&json).unwrap();
 
-        assert_eq!(restored.evidence_schema_version, 1);
+        // New evidence records `decided_by`, which only schema v4 carries.
+        assert_eq!(restored.evidence_schema_version, 4);
+        assert!(!restored.is_high_assurance_shape());
+        assert_eq!(
+            restored.decision.decided_by(),
+            Some(&crate::DecidedBy::rule("test-rule"))
+        );
         assert_eq!(
             restored.canonical_version,
             crate::canonical::CANONICAL_VERSION
@@ -1164,7 +1190,12 @@ mod tests {
                 policy_digest.clone(),
             )
             .unwrap();
-        let mut evidence = request.attest(Decision::allow("v2 allow")).unwrap();
+        let mut evidence = request
+            .attest(Decision::allow(
+                "v2 allow",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
         evidence.bind_policy_digest(policy_digest).unwrap();
         evidence
             .bind_high_assurance_metadata(
@@ -1177,7 +1208,9 @@ mod tests {
         evidence.sign(&attester).unwrap();
         let pinned_attester = attester.public_key().unwrap();
 
-        assert_eq!(evidence.evidence_schema_version, 2);
+        // HighAssurance metadata on a decision with `decided_by`: v4.
+        assert_eq!(evidence.evidence_schema_version, 4);
+        assert!(evidence.is_high_assurance_shape());
         assert!(evidence.verify_integrity());
         assert!(evidence.verify_attester_signature(&pinned_attester).is_ok());
         assert!(Evidence::from_json(&evidence.to_json().unwrap()).is_ok());
@@ -1185,7 +1218,8 @@ mod tests {
         document["future_field"] = json!(true);
         assert!(Evidence::from_json(&document.to_string()).is_err());
 
-        evidence.decision = Decision::deny("tampered decision");
+        evidence.decision =
+            Decision::deny("tampered decision", crate::DecidedBy::rule("test-rule")).into();
         evidence.context_hash = evidence.compute_context_hash().unwrap();
 
         assert!(evidence.verify_integrity());
@@ -1220,7 +1254,23 @@ mod tests {
         let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
         request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
         request.sign_intent(&agent_key).unwrap();
-        let mut evidence = request.attest(Decision::allow("golden allow")).unwrap();
+        // The golden vector predates `decided_by`: it is a legacy receipt.
+        // New decisions cannot be built without `decided_by`, so the legacy
+        // decision is taken from the read path (deserialization) and every
+        // other field is regenerated deterministically.
+        let legacy = Evidence::from_json(golden["evidence_json"].as_str().unwrap()).unwrap();
+        assert_eq!(legacy.decision.decided_by(), None);
+        assert!(legacy.verify_integrity());
+        let mut evidence = request
+            .attest(Decision::allow(
+                "golden allow",
+                crate::DecidedBy::rule("golden-rule"),
+            ))
+            .unwrap();
+        assert!(evidence.decision.decided_by().is_some());
+        assert_eq!(evidence.evidence_schema_version, 4);
+        evidence.decision = legacy.decision.clone();
+        evidence.evidence_schema_version = 1;
         evidence.evidence_id = Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap();
         evidence.context_hash = evidence.compute_context_hash().unwrap();
 
@@ -1430,7 +1480,11 @@ mod tests {
     fn tampering_with_decision_invalidates_evidence() {
         let mut evidence = test_evidence();
 
-        evidence.decision = Decision::deny("policy rejected action");
+        evidence.decision = Decision::deny(
+            "policy rejected action",
+            crate::DecidedBy::rule("test-rule"),
+        )
+        .into();
 
         assert!(!evidence.verify_integrity());
     }
