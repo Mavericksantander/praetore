@@ -58,9 +58,14 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
         self.pin = (FIXTURES / "execution-attester-public-key.hex").read_text(
             encoding="ascii"
         ).strip()
+        self.evidence_pin = (
+            FIXTURES / "receipt-evidence-attester-public-key.hex"
+        ).read_text(encoding="ascii").strip()
 
     def verify(self, receipt: str) -> bool:
-        return praetore.verify_gateway_receipt(receipt, self.pin, self.KEY_ID)
+        return praetore.verify_gateway_receipt(
+            receipt, self.pin, self.KEY_ID, self.evidence_pin
+        )
 
     def test_accepts_v3_with_reason_and_v2(self) -> None:
         self.assertIn('"schema_version":3', self.v3)
@@ -89,9 +94,42 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
         self.assertFalse(self.verify(missing))
 
     def test_rejects_wrong_key_and_malformed_input(self) -> None:
-        self.assertFalse(praetore.verify_gateway_receipt(self.v3, "00" * 32, self.KEY_ID))
-        self.assertFalse(praetore.verify_gateway_receipt(self.v3, self.pin, "other-key"))
+        self.assertFalse(
+            praetore.verify_gateway_receipt(
+                self.v3, "00" * 32, self.KEY_ID, self.evidence_pin
+            )
+        )
+        self.assertFalse(
+            praetore.verify_gateway_receipt(
+                self.v3, self.pin, "other-key", self.evidence_pin
+            )
+        )
         self.assertFalse(self.verify("{"))
+
+    def test_rejects_forged_missing_or_foreign_evidence_attester_signature(
+        self,
+    ) -> None:
+        import json
+
+        for name in (
+            "receipt-v1-confirmed.json",
+            "receipt-v2-confirmed.json",
+            "receipt-v3-crash-recovered.json",
+        ):
+            original = (FIXTURES / name).read_text(encoding="utf-8")
+            self.assertTrue(self.verify(original), name)
+            receipt = json.loads(original)
+            receipt["evidence"]["attester_signature"] = "0" * 128
+            self.assertFalse(self.verify(json.dumps(receipt)), name)
+            receipt["evidence"]["attester_signature"] = None
+            self.assertFalse(self.verify(json.dumps(receipt)), name)
+            other = (FIXTURES / "attester-public-key.hex").read_text(
+                encoding="ascii"
+            ).strip()
+            self.assertFalse(
+                praetore.verify_gateway_receipt(original, self.pin, self.KEY_ID, other),
+                name,
+            )
 
 
 if __name__ == "__main__":

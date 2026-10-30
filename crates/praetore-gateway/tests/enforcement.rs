@@ -2635,6 +2635,21 @@ mod apd {
             .join("../../packages/praetore-python/tests/fixtures");
         let key_id = "test-execution-attester-v1";
         let public_key = execution_attester_public_key();
+        // The evidence attester used by `approval_fixture_with_approver_and_policy`.
+        let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap();
+        let evidence_key_path = dir.join("receipt-evidence-attester-public-key.hex");
+        if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some()
+            || std::env::var_os("UPDATE_RECEIPT_V1_FIXTURE").is_some()
+        {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&evidence_key_path, hex::encode(evidence_key.as_bytes())).unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&evidence_key_path).unwrap().trim(),
+            hex::encode(evidence_key.as_bytes())
+        );
         if std::env::var_os("UPDATE_RECEIPT_FIXTURES").is_some() {
             let (gateway, key, _, _, approver_key, _) = clocked_fixture();
             approve(&gateway, key, &approver_key);
@@ -2686,34 +2701,53 @@ mod apd {
         }
         let v1 = std::fs::read_to_string(dir.join("receipt-v1-confirmed.json")).unwrap();
         let receipt =
-            praetore_gateway::verify_gateway_receipt_json(&v1, &public_key, key_id).unwrap();
+            praetore_gateway::verify_gateway_receipt_json(&v1, &public_key, key_id, &evidence_key)
+                .unwrap();
         assert_eq!(receipt.execution_attestation.schema_version, 1);
         assert_eq!(receipt.execution_attestation.tenant_id, None);
         let tampered = v1.replacen("\"confirmed\"", "\"failed\"", 1);
         assert_ne!(tampered, v1);
         assert!(
-            praetore_gateway::verify_gateway_receipt_json(&tampered, &public_key, key_id).is_err()
+            praetore_gateway::verify_gateway_receipt_json(
+                &tampered,
+                &public_key,
+                key_id,
+                &evidence_key
+            )
+            .is_err()
         );
         let v3 = std::fs::read_to_string(dir.join("receipt-v3-crash-recovered.json")).unwrap();
         let receipt =
-            praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id).unwrap();
+            praetore_gateway::verify_gateway_receipt_json(&v3, &public_key, key_id, &evidence_key)
+                .unwrap();
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::CrashRecovered)
         );
         let v2 = std::fs::read_to_string(dir.join("receipt-v2-confirmed.json")).unwrap();
-        praetore_gateway::verify_gateway_receipt_json(&v2, &public_key, key_id).unwrap();
+        praetore_gateway::verify_gateway_receipt_json(&v2, &public_key, key_id, &evidence_key)
+            .unwrap();
         // Unknown reason: rejected at parse time.
         let unknown = v3.replace("\"crash_recovered\"", "\"operator_override\"");
         assert_ne!(unknown, v3);
         assert!(matches!(
-            praetore_gateway::verify_gateway_receipt_json(&unknown, &public_key, key_id),
+            praetore_gateway::verify_gateway_receipt_json(
+                &unknown,
+                &public_key,
+                key_id,
+                &evidence_key
+            ),
             Err(ExecutionAttestationError::InvalidPayload)
         ));
         // A different known reason breaks the signature.
         let swapped = v3.replace("\"crash_recovered\"", "\"approval_expired\"");
         assert!(matches!(
-            praetore_gateway::verify_gateway_receipt_json(&swapped, &public_key, key_id),
+            praetore_gateway::verify_gateway_receipt_json(
+                &swapped,
+                &public_key,
+                key_id,
+                &evidence_key
+            ),
             Err(ExecutionAttestationError::InvalidSignature)
         ));
     }
