@@ -37,6 +37,12 @@ echo "policy.json         -> $POLICY_DIGEST"
 echo "evidence.policy_digest -> $BOUND_DIGEST"
 [ "$POLICY_DIGEST" = "$BOUND_DIGEST" ] || fail "el digest de la política no coincide"
 echo "OK: coinciden"
+# Lo mismo, hecho por el verificador: la firma del atestador cubre el digest.
+"$VERIFY" evidence \
+  --evidence "$BUNDLE/evidence.json" \
+  --attester-pin "$BUNDLE/attester-public-key.hex" \
+  --policy "$BUNDLE/policy.json" \
+  --format json || fail "evidence --policy no verificó"
 
 step "4. Verificar la autoridad sola, ligada a la identidad del agente (fecha fija 2026-10-24T00:00:00Z)"
 "$VERIFY" authority \
