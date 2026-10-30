@@ -92,6 +92,17 @@ fn invalid_input_never_writes() {
         // blank id and blank server
         &["policy", "deny", "--id", " ", "--tool", "t"],
         &["policy", "deny", "--id", "g", "--server", " "],
+        // dotted (nested) argument key
+        &[
+            "policy",
+            "deny",
+            "--id",
+            "h",
+            "--tool",
+            "t",
+            "--arg-path-prefix",
+            "opts.path=/etc",
+        ],
         // remove a rule that does not exist
         &["policy", "remove", "--id", "nope"],
     ];
@@ -217,4 +228,26 @@ fn check_reports_hand_written_mistakes() {
     let text = String::from_utf8_lossy(&warned.stdout);
     assert!(warned.status.success(), "{text}");
     assert!(text.contains("without required_capability"), "{text}");
+}
+
+#[test]
+fn concurrent_policy_writes_are_locked_out() {
+    let (_temp, home) = init();
+    let dir = home.to_str().unwrap();
+    let before = fs::read(home.join("policy.json")).unwrap();
+    fs::write(home.join("policy.json.lock"), "123\n").unwrap();
+    let out = run(&with_dir(
+        &["policy", "deny", "--id", "x", "--tool", "t"],
+        dir,
+    ));
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("another `praetore-mcp policy`"));
+    assert_eq!(fs::read(home.join("policy.json")).unwrap(), before);
+    fs::remove_file(home.join("policy.json.lock")).unwrap();
+    let out = run(&with_dir(
+        &["policy", "deny", "--id", "x", "--tool", "t"],
+        dir,
+    ));
+    assert!(out.status.success(), "{out:?}");
+    assert!(!home.join("policy.json.lock").exists(), "lock released");
 }

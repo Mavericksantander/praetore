@@ -480,6 +480,40 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     Ok(if report.failures.is_empty() { 0 } else { 1 })
 }
 
+/// Exclusive lock for policy read-modify-write (O_EXCL lock file, removed on
+/// drop). Prevents lost updates between concurrent `policy` commands.
+struct PolicyLock(PathBuf);
+
+impl PolicyLock {
+    fn acquire(home: &Home) -> Result<Self, String> {
+        let path = home.root.join("policy.json.lock");
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                Ok(Self(path))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+                "another `praetore-mcp policy` command is running (lock {}); if none is, remove that file",
+                path.display()
+            )),
+            Err(error) => Err(format!("cannot create lock {}: {error}", path.display())),
+        }
+    }
+}
+
+impl Drop for PolicyLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 fn read_policy(home: &Home) -> Result<(String, praetore_core::Policy), String> {
     let path = home.policy();
     let text =
@@ -565,6 +599,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             let parsed = parse(rest, &["--dir", "--id"], &[], false)?;
             let id = parsed.value("--id").ok_or("policy remove needs --id")?;
             let home = parsed.home()?;
+            let _lock = PolicyLock::acquire(&home)?;
             let (original, current) = read_policy(&home)?;
             let updated = policy::remove_rule(&current, id)?;
             save_policy(&home, &original, &updated)?;
@@ -605,6 +640,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             };
             let rule = policy::build_rule(effect, &spec)?;
             let home = parsed.home()?;
+            let _lock = PolicyLock::acquire(&home)?;
             let (original, current) = read_policy(&home)?;
             let updated = policy::add_rule(&current, rule)?;
             save_policy(&home, &original, &updated)?;

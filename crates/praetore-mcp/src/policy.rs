@@ -48,6 +48,14 @@ pub fn parse_arg(spec: &str, operator: ArgOperator) -> Result<ArgCondition, Stri
     if key.is_empty() || key != key.trim() {
         return Err(format!("invalid argument key in {spec:?}"));
     }
+    if key.contains('.') {
+        // Only top-level argument fields are flattened. A rule on
+        // `arguments.opts.path` would match a literal top-level key
+        // "opts.path", which a caller controls, not the nested field.
+        return Err(format!(
+            "argument key {key:?} contains '.': nested argument fields are not supported, only top-level ones"
+        ));
+    }
     let value = match operator {
         ArgOperator::Exact => {
             serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
@@ -281,6 +289,16 @@ pub fn lint(policy: &Policy) -> Vec<String> {
             .parameter_conditions
             .iter()
             .any(|c| c.key.starts_with("arguments"));
+        for condition in &rule.parameter_conditions {
+            if let Some(field) = condition.key.strip_prefix("arguments.")
+                && field.contains('.')
+            {
+                warnings.push(format!(
+                    "rule {:?}: {:?} does not address a nested field; it matches a literal top-level argument key {field:?}, which the caller controls (nested fields are unsupported)",
+                    rule.id, condition.key
+                ));
+            }
+        }
         if rule.effect != PolicyEffect::Allow && has_arg && !has_selector {
             warnings.push(format!(
                 "rule {:?}: argument conditions without a tool/server selector also match calls that lack the argument (v2 unknown = match)",
@@ -317,6 +335,11 @@ mod tests {
         assert!(parse_arg("novalue", ArgOperator::Exact).is_err());
         assert!(parse_arg("=x", ArgOperator::Exact).is_err());
         assert!(parse_arg("p=", ArgOperator::PathPrefix).is_err());
+        assert!(
+            parse_arg("opts.path=/x", ArgOperator::PathPrefix)
+                .unwrap_err()
+                .contains("nested")
+        );
     }
 
     #[test]
@@ -439,7 +462,19 @@ mod tests {
             PolicyRule::new("args", ACTION_TYPE, PolicyEffect::Deny)
                 .with_parameter_condition(PolicyCondition::prefix("arguments.path", "/x")),
         );
+        policy.rules.push(
+            PolicyRule::new("dotted", ACTION_TYPE, PolicyEffect::Deny)
+                .with_target("fs")
+                .with_parameter_condition(PolicyCondition::exact(
+                    "arguments.opts.path",
+                    json!("/x"),
+                )),
+        );
         let warnings = lint(&policy).join("\n");
+        assert!(
+            warnings.contains("\"dotted\"") && warnings.contains("nested"),
+            "{warnings}"
+        );
         assert!(warnings.contains("\"ra\"") && warnings.contains("without required_capability"));
         assert!(warnings.contains("\"args\"") && warnings.contains("selector"));
     }
