@@ -226,12 +226,18 @@ impl Evidence {
         .verify_intent_signature()
     }
 
-    pub fn verify_key_rotation(&self) -> crate::Result<KeyRotationProof> {
-        if !self.verify_integrity() {
-            return Err(crate::PraetoreError::EvidenceError(
-                "evidence integrity verification failed".into(),
-            ));
-        }
+    /// Verifies a key rotation receipt: the attester signature against
+    /// `trusted_attester` (an externally pinned key), evidence integrity, the
+    /// old-key request intent, the action type, an ALLOW decision and the
+    /// new-key proof of possession.
+    ///
+    /// The attester signature is required because the `context_hash` alone
+    /// is unkeyed: anyone can rewrite a DENY into an ALLOW and recompute it.
+    pub fn verify_key_rotation(
+        &self,
+        trusted_attester: &VerifiedPublicKey,
+    ) -> crate::Result<KeyRotationProof> {
+        self.verify_attester_signature(trusted_attester)?;
         if self.action.action_type != "identity:rotate_key" {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence does not describe a key rotation action".into(),
