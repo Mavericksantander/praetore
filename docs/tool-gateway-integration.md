@@ -329,7 +329,7 @@ Route configuration is versioned JSON loaded at process startup. For example:
 ```json
 {
   "schema_version": 1,
-  "egress_proxy": "http://egress-proxy.praetore-egress.svc.cluster.local:3128",
+  "egress_proxy": "http://gateway-egress-proxy.praetore-egress.svc.cluster.local:3128",
   "routes": [
     {
       "tenant_id": "4c7a63c0-b326-4d61-9178-02824d79a571",
@@ -410,9 +410,20 @@ The `http` and `sandbox` adapters refuse to start without
 `PRAETORE_GATEWAY_FRESHNESS_FILE` (see
 [Freshness and revocation snapshot](#freshness-and-revocation-snapshot)); only
 `local-demo` may use the demo freshness provider, which never checks
-revocation. The binary remains a **local development demo** with
-loopback-only PostgreSQL. These settings do not make it suitable for SaaS
-production. HTTP mode now requires tenant-bound issuer configuration and
+revocation. The binary remains a **local development demo**. These settings
+do not make it suitable for SaaS production.
+
+PostgreSQL may run on a loopback host or socket without TLS; any other host
+(for example `postgres.praetore-data.svc.cluster.local` in the Kubernetes
+templates) requires `sslmode=verify-full&sslrootcert=<ca.pem>` in the URL, and
+the URL is checked before any connection is opened. Run migrations with a
+separate owner role (`PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`, or
+`praetore-gateway-demo migrate` as an init step) and give
+`PRAETORE_GATEWAY_DATABASE_URL` a login member of `praetore_runtime`. In `http`
+and `sandbox` modes the service refuses to start if the runtime role is
+superuser, `BYPASSRLS`, owns `praetore` objects, can create in the schema, or
+if the schema is not current; see
+[PostgreSQL adapter](operations.md#postgresql-adapter). HTTP mode now requires tenant-bound issuer configuration and
 rejects mismatched signed authority/tenant pairs. Production still needs
 tenant-isolated credentials, authenticated workload transport, secret-manager/
 KMS integration, rate limits, PostgreSQL row-level security, and tenant-aware
@@ -446,7 +457,13 @@ because pod-level network policy cannot isolate containers within one pod.
 Also prohibit `hostNetwork` for agent workloads and verify CNI behavior against
 node, service, and DNS paths. External APIs should be reached through the
 configured egress proxy and a cloud/CNI policy that blocks direct gateway
-egress. Without those controls an agent may bypass the gateway.
+egress. The templates use two proxies with separate identities:
+`gateway-egress-proxy` (label `app.kubernetes.io/name: gateway-egress-proxy`)
+accepts only the gateway and is the only source protected tools accept;
+`egress-proxy` serves sandbox tool runners, accepts only `tool-invocation`
+pods and may reach only explicitly allowed external destinations, never
+`praetore-tools`. Deploy them as separate pods; a single proxy shared by the
+gateway and tool runners would let a runner reach every protected tool. Without those controls an agent may bypass the gateway.
 For a Cilium cluster, apply the separate
 [Cilium policy template](../deploy/kubernetes/cilium-mandatory-enforcement.yaml)
 instead of combining it with the generic Kubernetes NetworkPolicy set. Replace
