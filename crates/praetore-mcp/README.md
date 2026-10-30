@@ -8,7 +8,9 @@ check offline with `praetore-verify`. It needs no PostgreSQL, no server and no
 Rust code.
 
 * **observe** (default): every call is forwarded. The decision is only
-  recorded.
+  recorded. If the home cannot be loaded at startup (not initialized, or
+  invalid keys, pins or policy), no receipt can be written, so every
+  `tools/call` is refused in observe as well (see Limitations).
 * **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
   forwarded; the client gets an MCP tool error instead.
 
@@ -273,10 +275,15 @@ Things to know:
     exact-key and the Go (case-folded, last-wins) readings are recorded.
 * Client lines over 32 MiB are refused in enforce. In observe they are
   forwarded unchecked, with a warning.
-* Errors (missing or invalid keys, policy, clock, replay guard): **enforce
-  refuses the call (fail closed); observe forwards it with a loud stderr
-  warning and no receipt.** If a receipt cannot be written, enforce refuses
-  the call; observe forwards it and warns.
+* If the home cannot be loaded when `wrap` starts (not initialized, or
+  missing or invalid keys, pins, authority or policy), **both modes refuse
+  every `tools/call` (fail closed)** and gate the remaining traffic as
+  enforce does; other MCP messages still reach the server. Fix the home
+  (`praetore-mcp init`, `praetore-mcp policy check`) and restart the client.
+* Errors while evaluating one call after a successful start (clock, replay
+  guard): **enforce refuses the call (fail closed); observe forwards it with
+  a loud stderr warning and no receipt.** If a receipt cannot be written,
+  enforce refuses the call; observe forwards it and warns.
 
 ## Trust model
 
