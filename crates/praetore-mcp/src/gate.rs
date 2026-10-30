@@ -303,8 +303,14 @@ impl Journal {
             .to_json()
             .map_err(|e| format!("cannot serialize evidence: {e}"))?;
         line.push('\n');
-        store::create_private_dir(&self.dir)?;
+        store::ensure_dir(&self.dir, false)?;
         let path = self.path_for(OffsetDateTime::now_utc());
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!(
+                "{} is a symlink; refusing to append",
+                path.display()
+            ));
+        }
         append_line(&path, line.as_bytes())
             .map_err(|e| format!("cannot append to {}: {e}", path.display()))?;
         Ok(path)
@@ -363,6 +369,21 @@ mod tests {
         assert!(built.get("arguments.data").is_none());
         assert_eq!(built["arguments_omitted"], true);
         assert_eq!(built["arguments_sha256"].as_str().unwrap().len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_refuses_symlinked_receipts_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let receipts = temp.path().join("receipts");
+        std::os::unix::fs::symlink(&elsewhere, &receipts).unwrap();
+        assert!(
+            store::ensure_dir(&receipts, false)
+                .unwrap_err()
+                .contains("symlink")
+        );
     }
 
     #[test]

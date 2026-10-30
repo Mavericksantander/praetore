@@ -47,6 +47,38 @@ impl Evaluator for GateOrError {
     }
 }
 
+/// Windows-style command lookup: a bare name (no separator, no extension)
+/// is searched in `path` with each `pathext` extension, so `npx` finds
+/// `npx.cmd`. `Command::new` alone only finds `.exe`. Used on Windows;
+/// platform-independent so it can be tested anywhere.
+pub fn resolve_command(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    if command.contains(['/', '\\']) || std::path::Path::new(command).extension().is_some() {
+        return None;
+    }
+    let pathext = pathext
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .to_owned();
+    for dir in std::env::split_paths(path?) {
+        for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
+            let candidate = dir.join(format!("{command}{}", ext.to_ascii_lowercase()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            let candidate = dir.join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 pub enum LineRead {
     Eof,
     Line,
@@ -133,7 +165,16 @@ pub fn run(options: WrapOptions) -> i32 {
     }
     let mut evaluator = GateOrError(gate);
 
-    let mut child = match Command::new(&options.command)
+    #[cfg(windows)]
+    let program = resolve_command(
+        &options.command,
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("PATHEXT").as_deref(),
+    )
+    .unwrap_or_else(|| std::path::PathBuf::from(&options.command));
+    #[cfg(not(windows))]
+    let program = std::path::PathBuf::from(&options.command);
+    let mut child = match Command::new(&program)
         .args(&options.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -245,6 +286,18 @@ pub fn run(options: WrapOptions) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_bare_commands_through_pathext() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("npx.cmd"), "").unwrap();
+        let path = std::env::join_paths([temp.path()]).unwrap();
+        let found = resolve_command("npx", Some(&path), Some(".EXE;.CMD".as_ref())).unwrap();
+        assert_eq!(found, temp.path().join("npx.cmd"));
+        assert!(resolve_command("npx.cmd", Some(&path), None).is_none());
+        assert!(resolve_command("dir/npx", Some(&path), None).is_none());
+        assert!(resolve_command("missing", Some(&path), None).is_none());
+    }
 
     #[test]
     fn limited_reader_splits_lines_and_flags_overflow() {

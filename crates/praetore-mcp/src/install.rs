@@ -208,7 +208,13 @@ pub fn wrap_config(doc: &mut JsonValue, client: Client, target: &WrapTarget) -> 
     };
     let mut changes = Vec::new();
     for (name, entry) in servers.iter_mut() {
-        if let Some(reason) = unsupported_reason(entry) {
+        let reason = unsupported_reason(entry).or_else(|| {
+            (!crate::cli::valid_server_name(name)).then(|| {
+                "server name is empty, too long, has control characters or starts with '-'"
+                    .to_owned()
+            })
+        });
+        if let Some(reason) = reason {
             changes.push(Change {
                 server: name.clone(),
                 kind: ChangeKind::Skipped(reason),
@@ -253,6 +259,26 @@ pub fn wrap_config(doc: &mut JsonValue, client: Client, target: &WrapTarget) -> 
         });
     }
     changes
+}
+
+/// Removes Windows verbatim prefixes that `canonicalize` adds
+/// (`\\?\C:\x` -> `C:\x`, `\\?\UNC\srv\share` -> `\\srv\share`), so
+/// client configs get ordinary paths. Other strings are returned unchanged.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+        {
+            return rest.to_owned();
+        }
+    }
+    path.to_owned()
 }
 
 /// Parsed `praetore-mcp wrap ... -- command args...` argument list.
@@ -460,6 +486,30 @@ mod tests {
             doc.to_compact(),
             r#"{"mcpServers":{"git":{"command":"uvx","args":["mcp-server-git"]}}}"#
         );
+    }
+
+    #[test]
+    fn strips_windows_verbatim_prefixes() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\bin\praetore-mcp.exe"),
+            r"C:\bin\praetore-mcp.exe"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\srv\share\x"),
+            r"\\srv\share\x"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\GLOBALROOT\x"),
+            r"\\?\GLOBALROOT\x"
+        );
+        assert_eq!(strip_verbatim_prefix("/usr/bin/x"), "/usr/bin/x");
+    }
+
+    #[test]
+    fn dash_server_names_are_skipped() {
+        let mut doc = JsonValue::parse(r#"{"mcpServers":{"--dir":{"command":"x"}}}"#).unwrap();
+        let changes = wrap_config(&mut doc, Client::ClaudeDesktop, &target());
+        assert!(matches!(changes[0].kind, ChangeKind::Skipped(_)));
     }
 
     #[test]

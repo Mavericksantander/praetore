@@ -251,3 +251,31 @@ fn concurrent_policy_writes_are_locked_out() {
     assert!(out.status.success(), "{out:?}");
     assert!(!home.join("policy.json.lock").exists(), "lock released");
 }
+
+#[cfg(unix)]
+#[test]
+fn init_never_chmods_an_existing_home_and_creates_new_dirs_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let existing = temp.path().join("existing");
+    fs::create_dir(&existing).unwrap();
+    fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        run(&["init", "--dir", existing.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&existing), 0o755);
+    assert_eq!(mode(&existing.join("keys")), 0o700);
+    assert_eq!(mode(&existing.join("receipts")), 0o700);
+
+    let fresh = temp.path().join("a").join("b");
+    assert!(
+        run(&["init", "--dir", fresh.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert_eq!(mode(&temp.path().join("a")), 0o700);
+    assert_eq!(mode(&fresh), 0o700);
+}
