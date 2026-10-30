@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `crates/praetore-mcp/GUIDE.md`: a guide for external developers with a
+  first-run walkthrough, the limits (only MCP `tools/call` through a wrapped
+  server is governed; LOCAL/DEV keys; no approval flow for REQUIRE_APPROVAL;
+  lexical path rules; TOCTOU) and a troubleshooting table.
 - `praetore-mcp install`/`uninstall` process a config file once when two
   default paths name it (Cursor's `~/.cursor/mcp.json` and
   `./.cursor/mcp.json` when run from `~`, or a symlink). Before, it was
