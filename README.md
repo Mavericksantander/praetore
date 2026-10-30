@@ -35,7 +35,8 @@ code or test that backs it. None of it is a security or production guarantee.
   `praetore approve` / `praetore reject` sign the gateway's approval challenge
   with a local Ed25519 approver key. The gateway verifies the signature
   against a pinned approver key, records the decision append-only in
-  `praetore.human_approvals`, and only then dispatches. A decision cannot be
+  `praetore.human_approvals` as `approved_pending_dispatch`; a separate
+  claim (`praetore dispatch`) performs the single dispatch. A decision cannot be
   reused, and a rejection is final. See the
   [CLI guide](crates/praetore-cli/README.md#human-approval) and the tests in
   [`crates/praetore-gateway/tests/enforcement.rs`](crates/praetore-gateway/tests/enforcement.rs)
@@ -48,10 +49,13 @@ code or test that backs it. None of it is a security or production guarantee.
   [`crates/praetore-core/src/evidence.rs`](crates/praetore-core/src/evidence.rs)
   (test `policy_digest_is_bound_to_integrity_hash`). The engine binds the
   digest in every mode, and `HighAssurance` additionally requires it to
-  equal the pinned policy digest. `Evidence::sign` itself does not yet
-  require the field;
-  [#17](https://github.com/Mavericksantander/praetore/pull/17) (draft)
-  extends that requirement to all signing.
+  equal the pinned policy digest.
+  [#17](https://github.com/Mavericksantander/praetore/pull/17):
+  `Evidence::sign` refuses to sign evidence without a lowercase SHA-256
+  `policy_digest` (test `signing_requires_a_bound_policy_digest`), and
+  `Evidence::verify_policy(&Policy)` checks a receipt against a given policy.
+  Receipts signed earlier without the field still verify, but
+  `verify_policy` rejects them.
 - **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
   A policy that exceeds any limit is rejected when it loads with the typed
   error `PolicyLimitExceeded`; nothing is skipped or treated as allow.
@@ -112,6 +116,7 @@ Run the tests listed above:
 ```sh
 cargo test -p praetore-core --test canopy_port --test path_prefix --test path_prefix_followups
 cargo test -p praetore-core --lib evidence::tests::policy_digest_is_bound_to_integrity_hash
+cargo test -p praetore-core --lib evidence::tests::signing_requires_a_bound_policy_digest
 cargo test -p praetore-gateway --test enforcement human_approval
 ```
 
@@ -124,13 +129,12 @@ cargo test -p praetore-gateway --test enforcement human_approval
 - **Path protection is local and lexical only.** `Prefix` and `PathPrefix`
   compare strings and never consult the filesystem. **Symlinks are out of
   scope.**
-- **The journal does not separate approval from dispatch, and does not
-  independently confirm execution.**
-  - In `praetore.execution_journal`, an approval moves an execution directly
-    from `not_dispatched` to `dispatched` in the same transaction that
-    records the decision in `praetore.human_approvals`
-    ([`crates/praetore-replay-postgres/src/execution.rs`](crates/praetore-replay-postgres/src/execution.rs)).
-    There is no separate "approved but not yet dispatched" state.
+- **The journal does not independently confirm execution.**
+  - Approval and dispatch are separate steps: an approval moves an execution
+    from `not_dispatched` to `approved_pending_dispatch`, and a separate
+    claim moves it to `dispatched`
+    ([`crates/praetore-replay-postgres/src/execution.rs`](crates/praetore-replay-postgres/src/execution.rs),
+    migration `0010_approved_pending_dispatch.sql`).
   - `executed` and `confirmed` record what the dispatcher adapter reported.
     The strength of `confirmed` depends on that adapter
     ([`DispatchReport`](crates/praetore-gateway/src/lib.rs)).
@@ -138,9 +142,9 @@ cargo test -p praetore-gateway --test enforcement human_approval
   does) can leave a journal state that does not reflect who actually
   executed it. [#16](https://github.com/Mavericksantander/praetore/pull/16)
   addresses this; it is in development and not merged.
-- **No fuzzing campaign has been run** on the new path operators. The
-  repository's bounded fuzz targets do not cover them specifically.
-- **Not yet tested on macOS.**
+- **No sustained fuzzing campaign has been run.** A `path_prefix` fuzz
+  target exists ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs)),
+  but CI runs each target only as a 10-second smoke test.
 
 ## Not verified
 
@@ -151,10 +155,14 @@ The following were **not** exercised when this README was last checked:
   `praetore init`, `run`, `demo`, `approve` / `reject`);
 - `cargo install` (the verifier was built with `cargo build` instead);
 - the Python package ([`packages/praetore-python/`](packages/praetore-python/));
-- the 21 PostgreSQL tests in
+- the three PostgreSQL server-restart tests in
   [`crates/praetore-replay-postgres/tests/postgres.rs`](crates/praetore-replay-postgres/tests/postgres.rs),
-  which are ignored without a database (`PRAETORE_TEST_DATABASE_URL`);
+  which need a manual restart between their `before` and `after` phases;
 - Windows.
+
+The workspace tests, Clippy and rustfmt were run on macOS (Apple silicon).
+The other PostgreSQL tests in `postgres.rs`, which are ignored without
+`PRAETORE_TEST_DATABASE_URL`, were run there against PostgreSQL 16.
 
 ## In development
 
@@ -163,7 +171,6 @@ The following are **open pull requests, not merged** and not available on
 
 - [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
 - [#16](https://github.com/Mavericksantander/praetore/pull/16): `SandboxDispatcher` executed by the gateway, and the `praetore-exec-mode` header.
-- [#17](https://github.com/Mavericksantander/praetore/pull/17): require the active policy digest before a receipt can be signed.
 - [#18](https://github.com/Mavericksantander/praetore/pull/18): `praetore-verify evidence --policy` (depends on #17).
 
 ## What it is — and is not
@@ -297,6 +304,7 @@ Identity, authority, policy, authorization, and evidence are treated as distinct
 praetore/
 ├── crates/
 │   ├── praetore-core/
+│   ├── praetore-receipt/
 │   ├── praetore-verify/
 │   ├── praetore-python/
 │   ├── praetore-replay-postgres/

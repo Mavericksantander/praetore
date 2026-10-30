@@ -539,6 +539,7 @@ fn parse_execution(value: &str) -> Result<ExecutionStatus, &'static str> {
     match value {
         "not_dispatched" => Ok(ExecutionStatus::NotDispatched),
         "authorized" => Ok(ExecutionStatus::Authorized),
+        "approved_pending_dispatch" => Ok(ExecutionStatus::ApprovedPendingDispatch),
         "dispatched" => Ok(ExecutionStatus::Dispatched),
         "executed" => Ok(ExecutionStatus::Executed),
         "confirmed" => Ok(ExecutionStatus::Confirmed),
@@ -624,6 +625,7 @@ fn execution_label(status: ExecutionStatus) -> &'static str {
     match status {
         ExecutionStatus::NotDispatched => "not_dispatched",
         ExecutionStatus::Authorized => "authorized",
+        ExecutionStatus::ApprovedPendingDispatch => "approved_pending_dispatch",
         ExecutionStatus::Dispatched => "dispatched",
         ExecutionStatus::Executed => "executed",
         ExecutionStatus::Confirmed => "confirmed",
@@ -637,6 +639,9 @@ fn execution_interpretation(status: ExecutionStatus) -> &'static str {
         ExecutionStatus::NotDispatched => "the journal records no dispatch attempt",
         ExecutionStatus::Authorized => {
             "authorization is recorded; restart recovery must not dispatch automatically"
+        }
+        ExecutionStatus::ApprovedPendingDispatch => {
+            "a human approved; no dispatch has been claimed and nothing has run"
         }
         ExecutionStatus::Dispatched => {
             "dispatch commitment is durable; whether the external effect occurred is unknown"
@@ -1059,6 +1064,7 @@ mod tests {
         let states = [
             ExecutionStatus::NotDispatched,
             ExecutionStatus::Authorized,
+            ExecutionStatus::ApprovedPendingDispatch,
             ExecutionStatus::Dispatched,
             ExecutionStatus::OutcomeUnknown,
             ExecutionStatus::Executed,
@@ -1066,13 +1072,13 @@ mod tests {
             ExecutionStatus::Failed,
         ];
         let labels: Vec<_> = states.into_iter().map(execution_label).collect();
-        assert_eq!(labels.len(), 7);
+        assert_eq!(labels.len(), 8);
         assert_eq!(
             labels
                 .iter()
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
-            7
+            8
         );
         assert_eq!(
             execution_label(ExecutionStatus::OutcomeUnknown),

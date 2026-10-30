@@ -564,3 +564,134 @@ fn authority_and_policy_digest_commands_verify_and_report_stable_results() {
     assert_eq!(output["details"]["policy_id"], "fixture-policy");
     assert_eq!(output["details"]["digest"].as_str().unwrap().len(), 64);
 }
+
+fn receipt_fixture(name: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../packages/praetore-python/tests/fixtures")
+        .join(name)
+}
+
+fn run_receipt(receipt: &Path) -> Output {
+    run(&[
+        "receipt".into(),
+        "--receipt".into(),
+        receipt.to_string_lossy().into_owned(),
+        "--execution-pin".into(),
+        receipt_fixture("execution-attester-public-key.hex")
+            .to_string_lossy()
+            .into_owned(),
+        "--key-id".into(),
+        "test-execution-attester-v1".into(),
+        "--evidence-attester-pin".into(),
+        receipt_fixture("receipt-evidence-attester-public-key.hex")
+            .to_string_lossy()
+            .into_owned(),
+        "--format".into(),
+        "json".into(),
+    ])
+}
+
+#[test]
+fn receipt_command_rejects_missing_or_forged_evidence_attester_signature() {
+    let v2 = fs::read_to_string(receipt_fixture("receipt-v2-confirmed.json")).unwrap();
+    let mut receipt: Value = serde_json::from_str(&v2).unwrap();
+    receipt["evidence"]["attester_signature"] = Value::String("0".repeat(128));
+    let path = std::env::temp_dir().join(format!("praetore-receipt-ev-{}.json", Uuid::new_v4()));
+    fs::write(&path, serde_json::to_string(&receipt).unwrap()).unwrap();
+    let output = run_receipt(&path);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success());
+    assert_eq!(
+        json_output(&output)["code"],
+        "RECEIPT_EVIDENCE_SIGNATURE_INVALID"
+    );
+
+    // Without --evidence-attester-pin the command refuses to run.
+    let output = run(&[
+        "receipt".into(),
+        "--receipt".into(),
+        receipt_fixture("receipt-v2-confirmed.json")
+            .to_string_lossy()
+            .into_owned(),
+        "--execution-pin".into(),
+        receipt_fixture("execution-attester-public-key.hex")
+            .to_string_lossy()
+            .into_owned(),
+        "--key-id".into(),
+        "test-execution-attester-v1".into(),
+        "--format".into(),
+        "json".into(),
+    ]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn receipt_command_verifies_v2_and_v3_attestations() {
+    let output = run_receipt(&receipt_fixture("receipt-v3-crash-recovered.json"));
+    assert!(output.status.success());
+    let summary = json_output(&output);
+    assert_eq!(summary["code"], "OK");
+    assert_eq!(summary["details"]["schema_version"], 3);
+    assert_eq!(summary["details"]["execution"], "not_dispatched");
+    assert_eq!(
+        summary["details"]["not_dispatched_reason"],
+        "crash_recovered"
+    );
+    assert_eq!(summary["details"]["current_authorization"], false);
+
+    let output = run_receipt(&receipt_fixture("receipt-v2-confirmed.json"));
+    assert!(output.status.success());
+    let summary = json_output(&output);
+    assert_eq!(summary["details"]["schema_version"], 2);
+    assert_eq!(summary["details"]["not_dispatched_reason"], Value::Null);
+}
+
+#[test]
+fn receipt_command_rejects_unknown_and_tampered_reasons() {
+    let v3 = fs::read_to_string(receipt_fixture("receipt-v3-crash-recovered.json")).unwrap();
+    let directory = std::env::temp_dir().join(format!("praetore-receipt-{}", Uuid::new_v4()));
+    fs::create_dir_all(&directory).unwrap();
+    for (name, replacement, code) in [
+        ("unknown.json", "\"operator_override\"", "RECEIPT_INVALID"),
+        (
+            "swapped.json",
+            "\"approval_expired\"",
+            "RECEIPT_SIGNATURE_INVALID",
+        ),
+    ] {
+        let path = directory.join(name);
+        let forged = v3.replace("\"crash_recovered\"", replacement);
+        assert_ne!(forged, v3);
+        fs::write(&path, forged).unwrap();
+        let output = run_receipt(&path);
+        assert!(!output.status.success());
+        assert_eq!(json_output(&output)["code"], code);
+    }
+    // A v3 attestation with its reason removed is not a valid v3.
+    let path = directory.join("missing.json");
+    let missing = v3.replace(",\"not_dispatched_reason\":\"crash_recovered\"", "");
+    assert_ne!(missing, v3);
+    fs::write(&path, missing).unwrap();
+    let output = run_receipt(&path);
+    assert!(!output.status.success());
+    let _ = fs::remove_dir_all(&directory);
+}
+
+#[test]
+fn receipt_command_verifies_v1_and_rejects_a_tampered_copy() {
+    let output = run_receipt(&receipt_fixture("receipt-v1-confirmed.json"));
+    assert!(output.status.success());
+    let summary = json_output(&output);
+    assert_eq!(summary["details"]["schema_version"], 1);
+    assert_eq!(summary["details"]["execution"], "confirmed");
+
+    let v1 = fs::read_to_string(receipt_fixture("receipt-v1-confirmed.json")).unwrap();
+    let tampered = v1.replacen("\"confirmed\"", "\"failed\"", 1);
+    assert_ne!(tampered, v1);
+    let path = std::env::temp_dir().join(format!("praetore-receipt-v1-{}.json", Uuid::new_v4()));
+    fs::write(&path, tampered).unwrap();
+    let output = run_receipt(&path);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success());
+    assert_eq!(json_output(&output)["ok"], false);
+}
