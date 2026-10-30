@@ -120,6 +120,31 @@ state, but it does not make downstream effects atomic. A client timeout is
 ambiguous, so the CLI does not retry and directs the operator to inspect the
 journal.
 
+### Gateway-executed filesystem sandbox (Unix)
+
+`praetore init <dir> --sandbox-root <absolute dir>` makes `praetore run` load
+`SandboxDispatcher`: the gateway itself performs `fs:write_file`
+(capability `fs:write`, target `sandbox`, `{"path", "content"}`) and
+`fs:delete_file` (`fs:delete`, `sandbox`, `{"path"}`) inside that directory.
+The root must exist, be canonical, not be `/`, be owned by the gateway user,
+not be group/other-writable, and neither contain nor sit inside the demo
+directory. The default policy still allows only `demo:set_value`; add rules
+for the two fs actions to `policy.json` before `run`. Then:
+
+```sh
+praetore demo ./praetore-local write notes/hello.txt "hola"
+praetore demo ./praetore-local delete notes/hello.txt   # e.g. RequireApproval
+praetore approve ./praetore-local <request_id> --approver local-approver
+praetore dispatch ./praetore-local <request_id>
+```
+
+In this mode every execution-path request must carry
+`praetore-exec-mode: gateway` (the CLI sends it), and `/status` answers 409
+`cooperative_exec_rejected` for approved actions instead of `approved`. The
+header is a declaration, not enforcement: give agents no write access to the
+sandbox root. See the `sandbox` module documentation for the confinement
+rules and residual risks.
+
 This command is a development/reference experience, not a production gateway,
 secure key custody system, external-agent integration, sandbox, or deployment
 readiness claim. Use the main [deployment gates](../../docs/pre-user-pilot-gates.md)

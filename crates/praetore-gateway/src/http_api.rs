@@ -205,6 +205,79 @@ impl ApiAuth {
 struct ApiState {
     gateway: Arc<Gateway>,
     auth: ApiAuth,
+    options: HttpOptions,
+}
+
+/// Transport options for [`router_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HttpOptions {
+    /// Set when the configured dispatcher performs the effects itself (for
+    /// example the filesystem [`crate::sandbox::SandboxDispatcher`]). The API
+    /// then requires [`EXEC_MODE_HEADER`] on every execution-path endpoint,
+    /// and `/status` of an approved action answers 409
+    /// `cooperative_exec_rejected` instead of `approved`, so a polling agent
+    /// never runs the effect itself. Receipts of effects performed by the
+    /// gateway carry the header `praetore-executed-by: gateway`.
+    ///
+    /// This option never changes who executes, what is authorized, or what
+    /// is journaled: it only refuses requests earlier.
+    pub gateway_executes_effects: bool,
+}
+
+const EXECUTED_BY_HEADER: &str = "praetore-executed-by";
+
+/// Request header a client must send, with the exact value `gateway`, on
+/// every execution-path request (`POST /v1/execute`, approval challenge,
+/// approval decision, dispatch and `/status`) when
+/// [`HttpOptions::gateway_executes_effects`] is set. It is an unverifiable
+/// declaration by the client that it will not perform the effect itself; it
+/// grants nothing. It is checked only after caller authentication.
+pub const EXEC_MODE_HEADER: &str = "praetore-exec-mode";
+pub const EXEC_MODE_GATEWAY: &str = "gateway";
+const MAX_EXEC_MODE_BYTES: usize = 16;
+
+/// Fail-closed check of [`EXEC_MODE_HEADER`]. Without gateway-executed
+/// effects the header is ignored (unchanged behaviour). Otherwise exactly
+/// one header with the exact value `gateway` (at most 16 bytes) is accepted;
+/// a missing, repeated, oversized, `cooperative` or any other value is
+/// refused with 409 `exec_mode_gateway_required` before the gateway is
+/// called, so nothing is evaluated, journaled, approved or executed.
+fn exec_mode_accepted(options: HttpOptions, headers: &HeaderMap) -> bool {
+    if !options.gateway_executes_effects {
+        return true;
+    }
+    let mut values = headers.get_all(EXEC_MODE_HEADER).iter();
+    match (values.next(), values.next()) {
+        (Some(value), None) => {
+            value.len() <= MAX_EXEC_MODE_BYTES && value.as_bytes() == EXEC_MODE_GATEWAY.as_bytes()
+        }
+        _ => false,
+    }
+}
+
+fn exec_mode_refused() -> Response {
+    error_response(StatusCode::CONFLICT, "exec_mode_gateway_required")
+}
+
+fn executed_by_gateway(options: HttpOptions, execution: crate::ExecutionStatus) -> bool {
+    options.gateway_executes_effects
+        && matches!(
+            execution,
+            crate::ExecutionStatus::Executed | crate::ExecutionStatus::Confirmed
+        )
+}
+
+fn with_executed_by(
+    options: HttpOptions,
+    execution: crate::ExecutionStatus,
+    mut response: Response,
+) -> Response {
+    if executed_by_gateway(options, execution) {
+        response
+            .headers_mut()
+            .insert(EXECUTED_BY_HEADER, HeaderValue::from_static("gateway"));
+    }
+    response
 }
 
 /// Why a request was refused before reaching the gateway.
@@ -307,6 +380,18 @@ struct ErrorResponse {
     /// `ApprovalExpiredReceipt` persisted for this key.
     #[serde(skip_serializing_if = "Option::is_none")]
     expiration_receipt_id: Option<uuid::Uuid>,
+    /// Only on 409 `cooperative_exec_rejected`: the execution state of the
+    /// approved action, which the gateway (never the client) performs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<crate::ExecutionStatus>,
+    /// Only on `action_not_dispatchable` / `dispatch_temporarily_refused`:
+    /// the adapter's stable refusal code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// Only on `action_not_dispatchable` when the refusal closed the
+    /// execution: its signed `not_dispatched` / `dispatch_refused` receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<Box<crate::GatewayReceipt>>,
 }
 
 /// State of the same key reported alongside approval errors.
@@ -352,6 +437,12 @@ struct ApprovalErrorContext {
 /// including denials and approval requirements. Request bodies are size
 /// limited and parsed through PRÆTORE's duplicate-key rejecting parser.
 pub fn router(gateway: Arc<Gateway>, auth: ApiAuth) -> Router {
+    router_with_options(gateway, auth, HttpOptions::default())
+}
+
+/// Like [`router`], with explicit transport options. Caller authentication
+/// is unchanged and always runs before the [`EXEC_MODE_HEADER`] check.
+pub fn router_with_options(gateway: Arc<Gateway>, auth: ApiAuth, options: HttpOptions) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/execute", post(execute))
@@ -369,15 +460,29 @@ pub fn router(gateway: Arc<Gateway>, auth: ApiAuth) -> Router {
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::map_request(mark_credentials_sensitive))
-        .with_state(ApiState { gateway, auth })
+        .with_state(ApiState {
+            gateway,
+            auth,
+            options,
+        })
 }
 
 /// Runs the service on IPv4 loopback only. It has no TLS and must not be
 /// exposed beyond local development.
 pub async fn serve_local(port: u16, gateway: Arc<Gateway>, auth: ApiAuth) -> io::Result<()> {
+    serve_local_with_options(port, gateway, auth, HttpOptions::default()).await
+}
+
+/// Like [`serve_local`], with explicit transport options.
+pub async fn serve_local_with_options(
+    port: u16,
+    gateway: Arc<Gateway>,
+    auth: ApiAuth,
+    options: HttpOptions,
+) -> io::Result<()> {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(address).await?;
-    axum::serve(listener, router(gateway, auth)).await
+    axum::serve(listener, router_with_options(gateway, auth, options)).await
 }
 
 async fn health() -> StatusCode {
@@ -406,6 +511,10 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     if let Err(denied) = state.authorize(&headers, &[ApiRole::Agent], Some(request_tenant)) {
         return denied.into_response();
     }
+    if !exec_mode_accepted(state.options, &headers) {
+        return exec_mode_refused();
+    }
+    let options = state.options;
     let gateway = state.gateway;
 
     let result = tokio::task::spawn_blocking(move || gateway.execute(request)).await;
@@ -426,7 +535,8 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
         AuthorizationStatus::RequiresApproval => StatusCode::ACCEPTED,
         AuthorizationStatus::Denied => StatusCode::FORBIDDEN,
     };
-    (status, Json(receipt)).into_response()
+    let execution = receipt.execution;
+    with_executed_by(options, execution, (status, Json(receipt)).into_response())
 }
 
 async fn approval_challenge(
@@ -436,6 +546,9 @@ async fn approval_challenge(
 ) -> Response {
     if let Err(denied) = state.authorize(&headers, &[ApiRole::Approver], Some(tenant_id)) {
         return denied.into_response();
+    }
+    if !exec_mode_accepted(state.options, &headers) {
+        return exec_mode_refused();
     }
     let gateway = state.gateway;
     let key = crate::ExecutionKey {
@@ -467,6 +580,9 @@ async fn resolve_approval(
 ) -> Response {
     if let Err(denied) = state.authorize(&headers, &[ApiRole::Approver], Some(tenant_id)) {
         return denied.into_response();
+    }
+    if !exec_mode_accepted(state.options, &headers) {
+        return exec_mode_refused();
     }
     let gateway = state.gateway;
     let decision = match std::str::from_utf8(&body)
@@ -514,6 +630,10 @@ async fn dispatch_approved(
     if let Err(denied) = state.authorize(&headers, &[ApiRole::Approver], Some(tenant_id)) {
         return denied.into_response();
     }
+    if !exec_mode_accepted(state.options, &headers) {
+        return exec_mode_refused();
+    }
+    let options = state.options;
     let gateway = state.gateway;
     let key = crate::ExecutionKey {
         tenant_id,
@@ -521,7 +641,14 @@ async fn dispatch_approved(
         request_id,
     };
     match tokio::task::spawn_blocking(move || gateway.dispatch_approved(key)).await {
-        Ok(Ok(receipt)) => (StatusCode::OK, Json(receipt)).into_response(),
+        Ok(Ok(receipt)) => {
+            let execution = receipt.execution;
+            with_executed_by(
+                options,
+                execution,
+                (StatusCode::OK, Json(receipt)).into_response(),
+            )
+        }
         Ok(Err(error)) => gateway_error_response(error),
         Err(error) => {
             tracing::error!(error = %error, "approved dispatch task failed");
@@ -544,6 +671,10 @@ async fn approval_status(
     ) {
         return denied.into_response();
     }
+    if !exec_mode_accepted(state.options, &headers) {
+        return exec_mode_refused();
+    }
+    let options = state.options;
     let gateway = state.gateway;
     let key = crate::ExecutionKey {
         tenant_id,
@@ -551,6 +682,29 @@ async fn approval_status(
         request_id,
     };
     match tokio::task::spawn_blocking(move || gateway.approval_state(key)).await {
+        // With gateway-executed effects an approved action is never handed
+        // to the client to run, whether or not it was dispatched yet.
+        Ok(Ok(state))
+            if options.gateway_executes_effects
+                && state.resolution == crate::ApprovalResolution::Approved =>
+        {
+            with_executed_by(
+                options,
+                state.execution,
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        code: "cooperative_exec_rejected",
+                        resolution: Some(state.resolution),
+                        expiration_receipt_id: None,
+                        execution: Some(state.execution),
+                        reason: None,
+                        receipt: None,
+                    }),
+                )
+                    .into_response(),
+            )
+        }
         Ok(Ok(state)) => (StatusCode::OK, Json(state)).into_response(),
         Ok(Err(error)) => gateway_error_response(error),
         Err(error) => {
@@ -613,6 +767,9 @@ fn approval_error_response(error: GatewayError, context: ApprovalErrorContext) -
             code,
             resolution: context.resolution,
             expiration_receipt_id: context.expiration_receipt_id,
+            execution: None,
+            reason: None,
+            receipt: None,
         }),
     )
         .into_response()
@@ -667,6 +824,33 @@ fn gateway_error_response(error: GatewayError) -> Response {
         GatewayError::TenantIdentityInvalid => {
             error_response(StatusCode::BAD_REQUEST, "tenant_identity_invalid")
         }
+        GatewayError::DispatchRefused {
+            reason,
+            transient,
+            receipt,
+            ..
+        } => {
+            let (status, code) = if transient {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "dispatch_temporarily_refused",
+                )
+            } else {
+                (StatusCode::FORBIDDEN, "action_not_dispatchable")
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    code,
+                    resolution: None,
+                    expiration_receipt_id: None,
+                    execution: None,
+                    reason: Some(reason),
+                    receipt,
+                }),
+            )
+                .into_response()
+        }
         GatewayError::ExecutionNotFound(_) => {
             error_response(StatusCode::NOT_FOUND, "execution_not_found")
         }
@@ -698,6 +882,9 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
             code,
             resolution: None,
             expiration_receipt_id: None,
+            execution: None,
+            reason: None,
+            receipt: None,
         }),
     )
         .into_response()
@@ -707,6 +894,61 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
 mod tests {
     use super::*;
     use praetore_core::PraetoreError;
+
+    fn exec_headers(values: &[&[u8]]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for value in values {
+            map.append(EXEC_MODE_HEADER, HeaderValue::from_bytes(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn exec_mode_header_is_validated_strictly_only_with_gateway_effects() {
+        let on = HttpOptions {
+            gateway_executes_effects: true,
+        };
+        assert!(exec_mode_accepted(on, &exec_headers(&[b"gateway"])));
+        for bad in [
+            &[][..],
+            &[&b"cooperative"[..]][..],
+            &[&b"Gateway"[..]][..],
+            &[&b"gateway "[..]][..],
+            &[&b""[..]][..],
+            &[&b"gatewaygatewaygateway"[..]][..],
+            &[&b"gateway"[..], &b"gateway"[..]][..],
+            &[&b"gateway"[..], &b"cooperative"[..]][..],
+        ] {
+            assert!(!exec_mode_accepted(on, &exec_headers(bad)), "{bad:?}");
+        }
+        let off = HttpOptions::default();
+        assert!(exec_mode_accepted(off, &exec_headers(&[])));
+        assert_eq!(exec_mode_refused().status(), StatusCode::CONFLICT);
+        assert!(exec_mode_accepted(off, &exec_headers(&[b"cooperative"])));
+    }
+
+    #[test]
+    fn dispatch_refusal_maps_to_forbidden_and_transient_to_unavailable() {
+        let key = crate::ExecutionKey {
+            tenant_id: Uuid::nil(),
+            agent_id: Uuid::nil(),
+            request_id: Uuid::nil(),
+        };
+        let response = gateway_error_response(GatewayError::DispatchRefused {
+            key,
+            reason: "path_traversal",
+            transient: false,
+            receipt: None,
+        });
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = gateway_error_response(GatewayError::DispatchRefused {
+            key,
+            reason: "parent_directory_unavailable",
+            transient: true,
+            receipt: None,
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn bearer_token_requires_exactly_one_bearer_header() {

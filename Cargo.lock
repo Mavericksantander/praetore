@@ -1139,6 +1139,7 @@ dependencies = [
  "axum",
  "ed25519-dalek",
  "hex",
+ "libc",
  "praetore-core",
  "praetore-receipt",
  "proptest",

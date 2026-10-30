@@ -275,7 +275,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT authorization_status, execution_status, evidence_json, action_digest \
+                "SELECT authorization_status, execution_status, evidence_json, action_digest, \
+                     not_dispatched_reason \
                      FROM praetore.execution_journal \
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -287,6 +288,11 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let evidence = Evidence::from_json(&row.get::<_, String>(2))
             .map_err(|_| JournalError::InvalidRecord)?;
         let stored_action_digest: String = row.get(3);
+        if row.get::<_, Option<String>>(4).is_some() {
+            // Closed without dispatch (for example dispatch_refused): no
+            // decision may ever be recorded for it.
+            return Err(JournalError::InvalidTransition);
+        }
         if transaction
             .query_opt(
                 "SELECT 1 FROM praetore.human_approval_expirations \
@@ -784,7 +790,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::Unavailable)?;
         let row = transaction
             .query_opt(
-                "SELECT execution_status, evidence_json, authorization_status \
+                "SELECT execution_status, evidence_json, authorization_status, \
+                 not_dispatched_reason \
                  FROM praetore.execution_journal \
                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -796,10 +803,20 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let authorization = parse_authorization(&row.get::<_, String>(2))?;
         let evidence =
             Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
-        // Allowed closes from Authorized without a reason; RequiresApproval
-        // closes from ApprovedPendingDispatch and must carry one.
+        // Allowed closes from Authorized without a reason or with
+        // dispatch_refused; RequiresApproval closes from
+        // ApprovedPendingDispatch with a reason, or, only with
+        // dispatch_refused, from a still undecided NotDispatched.
+        let refused =
+            attestation.not_dispatched_reason == Some(NotDispatchedReason::DispatchRefused);
         let from = match (authorization, reason) {
             (AuthorizationStatus::Allowed, None) => ExecutionStatus::Authorized,
+            (AuthorizationStatus::Allowed, Some(_)) if refused => ExecutionStatus::Authorized,
+            (AuthorizationStatus::RequiresApproval, Some(_))
+                if refused && current == ExecutionStatus::NotDispatched =>
+            {
+                ExecutionStatus::NotDispatched
+            }
             (AuthorizationStatus::RequiresApproval, Some(_)) => {
                 ExecutionStatus::ApprovedPendingDispatch
             }
@@ -814,7 +831,23 @@ impl ExecutionJournal for PostgresExecutionJournal {
             )
             .map_err(|_| JournalError::InvalidRecord)?;
 
-        if current == ExecutionStatus::NotDispatched {
+        let row_reason: Option<String> = row.get(3);
+        let undecided_close = from == ExecutionStatus::NotDispatched && row_reason.is_none();
+        if undecided_close
+            && transaction
+                .query_opt(
+                    "SELECT 1 FROM praetore.human_approvals \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                     UNION ALL SELECT 1 FROM praetore.human_approval_expirations \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
+                )
+                .map_err(|_| JournalError::Unavailable)?
+                .is_some()
+        {
+            return Err(JournalError::InvalidTransition);
+        }
+        if current == ExecutionStatus::NotDispatched && !undecided_close {
             let existing = transaction
                 .query_opt(
                     "SELECT attestation_json FROM praetore.execution_attestations \
@@ -1109,6 +1142,7 @@ fn not_dispatched_reason_as_db(reason: NotDispatchedReason) -> &'static str {
         NotDispatchedReason::ApprovalExpired => "approval_expired",
         NotDispatchedReason::DispatchFailed => "dispatch_failed",
         NotDispatchedReason::CrashRecovered => "crash_recovered",
+        NotDispatchedReason::DispatchRefused => "dispatch_refused",
     }
 }
 

@@ -140,8 +140,16 @@ cargo test -p praetore-gateway --test enforcement human_approval
     ([`DispatchReport`](crates/praetore-gateway/src/lib.rs)).
 - **A client that executes an action by itself** (as the current test agent
   does) can leave a journal state that does not reflect who actually
-  executed it. [#16](https://github.com/Mavericksantander/praetore/pull/16)
-  addresses this; it is in development and not merged.
+  executed it. With `sandbox_root` (`praetore init --sandbox-root`), the
+  gateway itself performs `fs:write_file` / `fs:delete_file` through
+  `praetore_gateway::sandbox::SandboxDispatcher` (Unix only), so for those
+  actions `executed` / `confirmed` record an effect the gateway performed.
+  The `praetore-exec-mode: gateway` header that this mode requires is an
+  unverifiable declaration by the client: it only lets the gateway refuse
+  clients that do not make it, and it cannot stop a client from also
+  performing the effect itself. That still requires OS-level isolation (the
+  agent must have no write access to the sandbox root). Other actions and
+  adapters are unchanged.
 - **A third party cannot prove that no receipt was deleted from the
   journal.** Each receipt is signed on its own; nothing signs or publishes
   the journal's sequence or head. A hash-linked export is only a proposal
@@ -176,7 +184,6 @@ The following are **open pull requests, not merged** and not available on
 `main`:
 
 - [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
-- [#16](https://github.com/Mavericksantander/praetore/pull/16): `SandboxDispatcher` executed by the gateway, and the `praetore-exec-mode` header.
 
 ## What it is — and is not
 
