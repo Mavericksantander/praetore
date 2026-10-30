@@ -4,6 +4,15 @@
 
 ## 0.3.0 - 2026-10-30
 
+- The gateway-service sandbox supervisor rejects a dispatch request when any
+  string value in `action.parameters`, at any depth, contains NUL, starts at
+  a root (`/` or `\`), has a drive or UNC prefix, or has a `..` segment
+  (T-013 fix A, lexical only; `/` and `\` are both checked on every OS).
+  Symlinks are not resolved yet (fix B, stage 2).
+- `crates/praetore-mcp/GUIDE.md`: a guide for external developers with a
+  first-run walkthrough, the limits (only MCP `tools/call` through a wrapped
+  server is governed; LOCAL/DEV keys; no approval flow for REQUIRE_APPROVAL;
+  lexical path rules; TOCTOU) and a troubleshooting table.
 - `praetore-mcp install`/`uninstall` process a config file once when two
   default paths name it (Cursor's `~/.cursor/mcp.json` and
   `./.cursor/mcp.json` when run from `~`, or a symlink). Before, it was
