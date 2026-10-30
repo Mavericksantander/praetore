@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `praetore-mcp install`/`uninstall` process a config file once when two
+  default paths name it (Cursor's `~/.cursor/mcp.json` and
+  `./.cursor/mcp.json` when run from `~`, or a symlink). Before, it was
+  listed twice; the second pass was skipped as already wrapped. The
+  praetore-mcp README records the real-app check on macOS (Claude Desktop
+  and Cursor).
 - The praetore-mcp README documents installing without a clone:
   `cargo install --git https://github.com/Mavericksantander/praetore
   praetore-mcp --locked` (checked on macOS arm64 against `9735974`).

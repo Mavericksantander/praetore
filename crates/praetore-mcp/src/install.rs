@@ -367,6 +367,20 @@ pub fn render_changes(path: &Path, changes: &[Change]) -> String {
 
 /// Serializes like the input: 2-space pretty JSON, keeping a trailing newline
 /// if the original had one.
+/// Drops targets that name the same file as an earlier one, e.g. Cursor's
+/// `~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
+/// symlink to a file already listed. Paths that cannot be resolved are
+/// compared as given.
+pub fn dedup_targets(targets: Vec<(Client, PathBuf)>) -> Vec<(Client, PathBuf)> {
+    let mut seen = std::collections::HashSet::new();
+    targets
+        .into_iter()
+        .filter(|(_, path)| {
+            seen.insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        })
+        .collect()
+}
+
 pub fn render_document(doc: &JsonValue, original: &str) -> String {
     let mut text = doc.to_pretty();
     if original.ends_with('\n') {
@@ -379,6 +393,34 @@ pub fn render_document(doc: &JsonValue, original: &str) -> String {
 mod tests {
     use super::*;
     use crate::gate::Mode;
+
+    #[test]
+    fn duplicate_and_symlinked_targets_are_processed_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("mcp.json");
+        std::fs::write(&file, "{}").unwrap();
+        let other = temp.path().join("other.json");
+        std::fs::write(&other, "{}").unwrap();
+        let link = temp.path().join("link.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&file, &link).unwrap();
+        let dotted = temp.path().join(".").join("mcp.json");
+        let targets = dedup_targets(vec![
+            (Client::Cursor, file.clone()),
+            (Client::Cursor, dotted),
+            (Client::Cursor, other.clone()),
+            (Client::Cursor, file.clone()),
+            (Client::Cursor, link.clone()),
+        ]);
+        let paths: Vec<_> = targets.into_iter().map(|(_, p)| p).collect();
+        if cfg!(unix) {
+            assert_eq!(paths, vec![file, other]);
+        } else {
+            assert_eq!(paths, vec![file, other, link]);
+        }
+    }
 
     fn target() -> WrapTarget {
         WrapTarget {
