@@ -2,7 +2,7 @@
 //! fixtures shared with the external verifiers.
 
 use praetore_core::VerifiedPublicKey;
-use praetore_receipt::{ExecutionAttestationError, verify_gateway_receipt_json};
+use praetore_receipt::{ExecutionAttestationError, GatewayReceipt, verify_gateway_receipt_json};
 use std::path::Path;
 
 const KEY_ID: &str = "test-execution-attester-v1";
@@ -277,8 +277,9 @@ fn rejects_a_missing_evidence_attester_signature() {
             .as_object_mut()
             .unwrap()
             .remove("attester_signature");
-        assert!(
-            verify(&serde_json::to_string(&value).unwrap()).is_err(),
+        assert_eq!(
+            verify(&serde_json::to_string(&value).unwrap()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
             "{name}: field removed"
         );
     }
@@ -302,6 +303,79 @@ fn rejects_evidence_signed_by_another_attester_key() {
         assert_eq!(
             verify_gateway_receipt_json(&fixture(name), &key(), KEY_ID, &key()).map(|_| ()),
             Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn rejects_non_canonical_evidence_attester_signature_encodings() {
+    for (version, name) in (1u8..).zip(FIXTURES) {
+        let original = fixture(name);
+        let sig = evidence_signature(&original);
+        assert!(
+            sig.bytes().any(|b| b.is_ascii_lowercase()),
+            "{name}: needs a-f"
+        );
+        let first_letter = sig.find(|c: char| c.is_ascii_lowercase()).unwrap();
+        let mut mixed = sig.clone();
+        mixed.replace_range(
+            first_letter..=first_letter,
+            &sig[first_letter..=first_letter].to_ascii_uppercase(),
+        );
+        // Same bytes, different encodings: only the canonical one verifies.
+        for altered in [
+            sig.to_ascii_uppercase(),
+            mixed,
+            sig[..126].to_owned(),
+            sig[..127].to_owned(),
+        ] {
+            let len = altered.len();
+            assert_eq!(
+                verify(&with_evidence_signature(&original, altered.into())),
+                Err(ExecutionAttestationError::InvalidEvidenceSignature),
+                "{name}: length {len}"
+            );
+        }
+        // Over 128 characters the evidence exceeds its integrity limits, so
+        // the execution attestation's binding check rejects it first.
+        for altered in [format!("{sig}0"), format!("{sig}00")] {
+            let len = altered.len();
+            assert_eq!(
+                verify(&with_evidence_signature(&original, altered.into())),
+                Err(ExecutionAttestationError::InvalidPayload),
+                "{name}: length {len}"
+            );
+        }
+        assert_eq!(
+            verify(&with_evidence_signature(&original, sig.into())),
+            Ok(version),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn verify_execution_attestation_also_requires_a_valid_evidence_signature() {
+    for name in FIXTURES {
+        let forged = with_evidence_signature(&fixture(name), "0".repeat(128).into());
+        let receipt: GatewayReceipt = serde_json::from_str(&forged).unwrap();
+        // The execution attestation alone is intact...
+        assert_eq!(
+            receipt.verify_evidence_attester_signature(&evidence_key()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+        // ...but the public method never returns Ok for it.
+        assert_eq!(
+            receipt.verify_execution_attestation(&key(), KEY_ID, &evidence_key()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+        let genuine: GatewayReceipt = serde_json::from_str(&fixture(name)).unwrap();
+        assert_eq!(
+            genuine.verify_execution_attestation(&key(), KEY_ID, &evidence_key()),
+            Ok(()),
             "{name}"
         );
     }

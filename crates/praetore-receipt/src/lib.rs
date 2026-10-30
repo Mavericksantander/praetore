@@ -5,7 +5,10 @@
 //! (`praetore-verify`, the Python bindings) can use it. `praetore-gateway`
 //! re-exports everything here.
 
-use praetore_core::{Action, Authority, Evidence, PraetoreError, canonical::canonicalize_json};
+use praetore_core::{
+    Action, Authority, Evidence, PraetoreError,
+    canonical::{canonicalize_json, is_canonical_signature_hex},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -357,16 +360,6 @@ impl ExecutionAttestation {
     }
 }
 
-/// Accepts only the canonical encoding produced by `hex::encode`: exactly
-/// 64 bytes as 128 lowercase hex digits. Uppercase or mixed case is rejected
-/// so each receipt has a single valid encoding.
-fn is_canonical_signature_hex(signature: &str) -> bool {
-    signature.len() == 128
-        && signature
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 fn authorization_for_outcome(outcome: praetore_core::DecisionOutcome) -> AuthorizationStatus {
     match outcome {
         praetore_core::DecisionOutcome::Allow => AuthorizationStatus::Allowed,
@@ -407,10 +400,17 @@ pub struct GatewayReceipt {
 }
 
 impl GatewayReceipt {
+    /// Verifies the execution attestation against the pinned execution key
+    /// and, because the attestation binds the evidence `context_hash` (which
+    /// excludes the evidence signature), also the evidence
+    /// `attester_signature` against the pinned evidence attester key. There is
+    /// no public way to check the attestation alone, so `Ok` always covers
+    /// both signatures.
     pub fn verify_execution_attestation(
         &self,
         public_key: &praetore_core::VerifiedPublicKey,
         expected_key_id: &str,
+        evidence_attester_key: &praetore_core::VerifiedPublicKey,
     ) -> Result<(), ExecutionAttestationError> {
         self.execution_attestation.verify(
             &self.evidence,
@@ -419,7 +419,8 @@ impl GatewayReceipt {
             self.output.as_ref(),
             public_key,
             expected_key_id,
-        )
+        )?;
+        self.verify_evidence_attester_signature(evidence_attester_key)
     }
 
     /// Verifies `evidence.attester_signature` against the pinned evidence
@@ -456,7 +457,6 @@ pub fn verify_gateway_receipt_json(
         .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
     let receipt: GatewayReceipt =
         serde_json::from_value(value).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
-    receipt.verify_execution_attestation(public_key, expected_key_id)?;
-    receipt.verify_evidence_attester_signature(evidence_attester_key)?;
+    receipt.verify_execution_attestation(public_key, expected_key_id, evidence_attester_key)?;
     Ok(receipt)
 }

@@ -32,6 +32,34 @@ use std::{
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+/// `verify_execution_attestation` also checks the evidence signature, so it
+/// needs the evidence attester key. These tests use several fixtures; pick
+/// the test attester whose key id the evidence names.
+trait VerifyWithTestEvidenceAttester {
+    fn verify_with_test_evidence_attester(
+        &self,
+        public_key: &VerifiedPublicKey,
+        expected_key_id: &str,
+    ) -> Result<(), ExecutionAttestationError>;
+}
+
+impl VerifyWithTestEvidenceAttester for praetore_gateway::GatewayReceipt {
+    fn verify_with_test_evidence_attester(
+        &self,
+        public_key: &VerifiedPublicKey,
+        expected_key_id: &str,
+    ) -> Result<(), ExecutionAttestationError> {
+        let evidence_key = [73, 83]
+            .into_iter()
+            .map(|secret| EvidenceAttesterKey::from_secret_bytes(&[secret; 32]))
+            .find(|key| self.evidence.attester_key_id.as_deref() == Some(key.key_id().as_str()))
+            .expect("evidence signed by a known test attester")
+            .public_key()
+            .unwrap();
+        self.verify_execution_attestation(public_key, expected_key_id, &evidence_key)
+    }
+}
+
 static TEST_DATABASE_SETUP: OnceLock<()> = OnceLock::new();
 const TEST_NOW: &str = "2026-06-01T12:00:00Z";
 const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
@@ -998,7 +1026,7 @@ fn postgres_gateway_authorizes_and_persists_one_effect() {
     };
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "postgres-test-execution-attester-v1",
         )
@@ -1020,7 +1048,7 @@ fn postgres_gateway_authorizes_and_persists_one_effect() {
         .reconcile(key)
         .unwrap();
     recovered
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "postgres-test-execution-attester-v1",
         )
@@ -1449,7 +1477,7 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
     let unresolved = gateway.reconcile(key).unwrap();
     assert_eq!(unresolved.execution, ExecutionStatus::OutcomeUnknown);
     unresolved
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "postgres-test-execution-attester-v1",
         )
@@ -1474,7 +1502,7 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
     let resolved = gateway.reconcile(key).unwrap();
     assert_eq!(resolved.execution, ExecutionStatus::Confirmed);
     resolved
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "postgres-test-execution-attester-v1",
         )
@@ -2417,7 +2445,7 @@ fn postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered() {
     );
     assert_eq!(receipt.execution_attestation.schema_version, 3);
     receipt
-        .verify_execution_attestation(
+        .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
             "postgres-test-execution-attester-v1",
         )
