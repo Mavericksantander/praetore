@@ -3648,6 +3648,17 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
     );
     ensure_test_role(&mut admin, "praetore_storage_bypass", "LOGIN BYPASSRLS");
     ensure_test_role(&mut admin, "praetore_storage_creator", "LOGIN NOBYPASSRLS");
+    ensure_test_role(
+        &mut admin,
+        "praetore_storage_createrole",
+        "LOGIN NOBYPASSRLS CREATEROLE",
+    );
+    ensure_test_role(
+        &mut admin,
+        "praetore_storage_grant_all",
+        "LOGIN NOBYPASSRLS",
+    );
+    ensure_test_role(&mut admin, "praetore_storage_writer", "LOGIN NOBYPASSRLS");
     admin
         .batch_execute(
             "GRANT praetore_runtime TO praetore_storage_runtime; \
@@ -3657,7 +3668,12 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
              GRANT USAGE ON SCHEMA praetore TO praetore_storage_owner; \
              CREATE TABLE praetore.owner_probe (id INT); \
              ALTER TABLE praetore.owner_probe OWNER TO praetore_storage_owner; \
-             GRANT CREATE ON SCHEMA praetore TO praetore_storage_creator",
+             GRANT CREATE ON SCHEMA praetore TO praetore_storage_creator; \
+             GRANT praetore_runtime TO praetore_storage_createrole; \
+             GRANT praetore_runtime TO praetore_storage_grant_all; \
+             GRANT ALL ON ALL TABLES IN SCHEMA praetore TO praetore_storage_grant_all; \
+             GRANT praetore_runtime TO praetore_storage_writer; \
+             GRANT pg_write_all_data TO praetore_storage_writer",
         )
         .unwrap();
 
@@ -3680,6 +3696,9 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
         ("praetore_storage_owner", "owner"),
         ("praetore_storage_owner_member", "owner"),
         ("praetore_storage_creator", "create"),
+        ("praetore_storage_createrole", "privileged"),
+        ("praetore_storage_grant_all", "excess"),
+        ("praetore_storage_writer", "excess"),
     ] {
         let result = verify_runtime_role(&mut connect_scratch_as(&scratch, user));
         let matched = matches!(
@@ -3687,6 +3706,7 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
             (Err(RuntimeRoleError::PrivilegedRole(_)), "privileged")
                 | (Err(RuntimeRoleError::OwnsSchemaObjects(_)), "owner")
                 | (Err(RuntimeRoleError::CanCreateInSchema(_)), "create")
+                | (Err(RuntimeRoleError::ExcessTablePrivilege(_)), "excess")
         );
         assert!(matched, "{user}: {result:?}");
     }
