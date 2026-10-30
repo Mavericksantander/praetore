@@ -1,6 +1,7 @@
 # Estado `approved_pending_dispatch` en el journal (propuesta)
 
-Estado: **propuesta, solo documento.** No contiene código. Base: `origin/main` `21f8141`.
+Estado: **implementada** en #33 (migración `0010_approved_pending_dispatch.sql`). Se conserva como registro de diseño; el código vigente manda sobre este texto. La re-verificación de la aprobación en `claim_dispatch` y la migración 0012 llegaron después (#41, #42).
+Propuesta original: solo documento. Base: `origin/main` `21f8141`.
 Las referencias `archivo:línea` son contra ese commit.
 
 ## 1. Problema
