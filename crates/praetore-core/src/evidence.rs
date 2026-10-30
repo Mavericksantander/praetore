@@ -354,6 +354,7 @@ impl Evidence {
         let signature = self
             .attester_signature
             .as_deref()
+            .filter(|signature| crate::canonical::is_canonical_signature_hex(signature))
             .ok_or(crate::PraetoreError::IdentityVerificationFailed)
             .and_then(|signature| {
                 decode_lower_hex(signature).ok_or(crate::PraetoreError::IdentityVerificationFailed)
@@ -870,6 +871,34 @@ mod tests {
                 .verify_attester_signature(&attester.public_key().unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn evidence_attester_signature_must_be_canonical_lowercase_hex() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[51; 32]);
+        let mut evidence = test_evidence();
+        evidence.sign(&attester).unwrap();
+        let key = attester.public_key().unwrap();
+        let canonical = evidence.attester_signature.clone().unwrap();
+        assert!(evidence.verify_attester_signature(&key).is_ok());
+        let first_letter = canonical.find(|c: char| c.is_ascii_lowercase()).unwrap();
+        let mut mixed = canonical.clone();
+        mixed.replace_range(
+            first_letter..=first_letter,
+            &canonical[first_letter..=first_letter].to_ascii_uppercase(),
+        );
+        for altered in [
+            canonical.to_ascii_uppercase(),
+            mixed,
+            canonical[..126].to_owned(),
+            canonical[..127].to_owned(),
+        ] {
+            evidence.attester_signature = Some(altered);
+            assert!(matches!(
+                evidence.verify_attester_signature(&key),
+                Err(crate::PraetoreError::IdentityVerificationFailed)
+            ));
+        }
     }
 
     #[test]

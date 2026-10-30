@@ -27,3 +27,7 @@ uuid = "1.18"
 
 [dev-dependencies]
 ed25519-dalek = "2"
+
+[[example]]
+name = "demo_receipt_verify"
+required-features = ["signing"]

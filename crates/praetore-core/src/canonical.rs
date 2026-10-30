@@ -138,6 +138,17 @@ pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_j
     Ok(output)
 }
 
+/// Accepts only the canonical encoding of an Ed25519 signature produced by
+/// `hex::encode`: exactly 64 bytes as 128 lowercase hex digits. Uppercase or
+/// mixed case is rejected so each signed document has a single valid
+/// encoding. Shared by evidence and execution-attestation signatures.
+pub fn is_canonical_signature_hex(signature: &str) -> bool {
+    signature.len() == 128
+        && signature
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 pub fn canonicalize_json(input: &str) -> crate::Result<Vec<u8>> {
     let value =
         parse_json_rejecting_duplicates(input).map_err(crate::PraetoreError::InvalidRequest)?;

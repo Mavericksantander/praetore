@@ -5,7 +5,10 @@
 //! (`praetore-verify`, the Python bindings) can use it. `praetore-gateway`
 //! re-exports everything here.
 
-use praetore_core::{Action, Authority, Evidence, PraetoreError, canonical::canonicalize_json};
+use praetore_core::{
+    Action, Authority, Evidence, PraetoreError,
+    canonical::{canonicalize_json, is_canonical_signature_hex},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -86,6 +89,10 @@ pub enum ExecutionAttestationError {
     InvalidSignature,
     #[error("execution attestation key does not match the pinned identifier")]
     KeyMismatch,
+    /// The receipt's evidence is missing a valid `attester_signature` from
+    /// the pinned evidence attester key.
+    #[error("receipt evidence attester signature is missing or invalid")]
+    InvalidEvidenceSignature,
 }
 
 /// Signs gateway execution observations using an externally managed key.
@@ -353,16 +360,6 @@ impl ExecutionAttestation {
     }
 }
 
-/// Accepts only the canonical encoding produced by `hex::encode`: exactly
-/// 64 bytes as 128 lowercase hex digits. Uppercase or mixed case is rejected
-/// so each receipt has a single valid encoding.
-fn is_canonical_signature_hex(signature: &str) -> bool {
-    signature.len() == 128
-        && signature
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 fn authorization_for_outcome(outcome: praetore_core::DecisionOutcome) -> AuthorizationStatus {
     match outcome {
         praetore_core::DecisionOutcome::Allow => AuthorizationStatus::Allowed,
@@ -407,10 +404,17 @@ pub struct GatewayReceipt {
 }
 
 impl GatewayReceipt {
+    /// Verifies the execution attestation against the pinned execution key
+    /// and, because the attestation binds the evidence `context_hash` (which
+    /// excludes the evidence signature), also the evidence
+    /// `attester_signature` against the pinned evidence attester key. There is
+    /// no public way to check the attestation alone, so `Ok` always covers
+    /// both signatures.
     pub fn verify_execution_attestation(
         &self,
         public_key: &praetore_core::VerifiedPublicKey,
         expected_key_id: &str,
+        evidence_attester_key: &praetore_core::VerifiedPublicKey,
     ) -> Result<(), ExecutionAttestationError> {
         // `"output": null` deserializes to `None`. An executed or confirmed
         // action always has an output, so there it is the JSON value `null`,
@@ -426,12 +430,29 @@ impl GatewayReceipt {
             output,
             public_key,
             expected_key_id,
-        )
+        )?;
+        self.verify_evidence_attester_signature(evidence_attester_key)
+    }
+
+    /// Verifies `evidence.attester_signature` against the pinned evidence
+    /// attester key. The execution attestation binds the evidence's
+    /// `context_hash`, which excludes this signature, so it must be checked
+    /// separately.
+    pub fn verify_evidence_attester_signature(
+        &self,
+        evidence_attester_key: &praetore_core::VerifiedPublicKey,
+    ) -> Result<(), ExecutionAttestationError> {
+        self.evidence
+            .verify_attester_signature(evidence_attester_key)
+            .map_err(|_| ExecutionAttestationError::InvalidEvidenceSignature)
     }
 }
 
-/// Parses a serialized [`GatewayReceipt`] and verifies its execution
-/// attestation (schema v1, v2 or v3) against a pinned key.
+/// Parses a serialized [`GatewayReceipt`], verifies its execution
+/// attestation (schema v1, v2 or v3) against a pinned execution key, and
+/// verifies the evidence `attester_signature` against a pinned evidence
+/// attester key. A missing, malformed or foreign evidence signature fails
+/// with [`ExecutionAttestationError::InvalidEvidenceSignature`].
 ///
 /// Duplicate JSON keys, unknown fields and unknown `not_dispatched_reason`
 /// values are rejected, as is a reason on anything but an approval closed
@@ -441,11 +462,12 @@ pub fn verify_gateway_receipt_json(
     json: &str,
     public_key: &praetore_core::VerifiedPublicKey,
     expected_key_id: &str,
+    evidence_attester_key: &praetore_core::VerifiedPublicKey,
 ) -> Result<GatewayReceipt, ExecutionAttestationError> {
     let value = praetore_core::canonical::parse_json_rejecting_duplicates(json)
         .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
     let receipt: GatewayReceipt =
         serde_json::from_value(value).map_err(|_| ExecutionAttestationError::InvalidPayload)?;
-    receipt.verify_execution_attestation(public_key, expected_key_id)?;
+    receipt.verify_execution_attestation(public_key, expected_key_id, evidence_attester_key)?;
     Ok(receipt)
 }
