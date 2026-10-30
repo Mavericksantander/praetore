@@ -109,8 +109,11 @@ fn rejects_any_single_hex_char_change_in_the_signature() {
             let mut chars: Vec<char> = sig.chars().collect();
             chars[index] = if chars[index] == '0' { '1' } else { '0' };
             let altered: String = chars.into_iter().collect();
-            assert!(
-                verify(&with_signature(&original, altered)).is_err(),
+            // Still 128 lowercase hex digits, so it passes the encoding
+            // check and must be rejected by the signature itself.
+            assert_eq!(
+                verify(&with_signature(&original, altered)),
+                Err(ExecutionAttestationError::InvalidSignature),
                 "{name}: char {index}"
             );
         }
@@ -150,13 +153,23 @@ fn rejects_uppercase_and_mixed_case_signatures() {
 
 #[test]
 fn rejects_truncated_extended_or_empty_signatures() {
-    let original = fixture("receipt-v2-confirmed.json");
-    let sig = signature(&original);
-    for altered in [String::new(), sig[..126].to_owned(), format!("{sig}00")] {
-        assert_eq!(
-            verify(&with_signature(&original, altered)),
-            Err(ExecutionAttestationError::InvalidPayload)
-        );
+    for name in FIXTURES {
+        let original = fixture(name);
+        let sig = signature(&original);
+        for altered in [
+            String::new(),
+            sig[..2].to_owned(),
+            sig[..126].to_owned(),
+            sig[..127].to_owned(),
+            format!("{sig}00"),
+        ] {
+            let len = altered.len();
+            assert_eq!(
+                verify(&with_signature(&original, altered)),
+                Err(ExecutionAttestationError::InvalidPayload),
+                "{name}: length {len}"
+            );
+        }
     }
 }
 
@@ -194,7 +207,13 @@ fn rejects_a_relabelled_schema_version() {
             let relabelled = with_attestation(&original, |attestation| {
                 attestation["schema_version"] = version.into();
             });
-            assert!(verify(&relabelled).is_err(), "{name} as v{version}");
+            // The (schema_version, tenant_id, not_dispatched_reason) shape
+            // no longer matches, so this fails before the signature check.
+            assert_eq!(
+                verify(&relabelled),
+                Err(ExecutionAttestationError::InvalidPayload),
+                "{name} as v{version}"
+            );
         }
     }
 }
