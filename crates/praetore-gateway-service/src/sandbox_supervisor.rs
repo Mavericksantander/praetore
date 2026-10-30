@@ -536,6 +536,31 @@ fn valid_dispatch_request(request: &DispatchRequest, idempotency: &str) -> bool 
             .is_some_and(|capability| request.authority.capabilities.contains(capability))
         && action_digest(&request.action).is_ok_and(|digest| digest == request.action_digest)
         && idempotency == idempotency_key(request.execution_key)
+        && lexically_confined(&request.action.parameters)
+}
+
+/// T-013 fix A (lexical only): the Job interprets `parameters` freely, so
+/// every string value at any depth is treated as a possible path relative to
+/// the sandbox. Rejected: NUL, a root (`/` or `\`), a drive or UNC prefix,
+/// and any `..` segment. Both separators are checked so the result does not
+/// depend on the host OS. Symlinks are not resolved here (fix B).
+fn lexically_confined(value: &Value) -> bool {
+    match value {
+        Value::String(text) => lexically_confined_text(text),
+        Value::Array(items) => items.iter().all(lexically_confined),
+        Value::Object(entries) => entries.values().all(lexically_confined),
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn lexically_confined_text(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let rooted = text.starts_with(['/', '\\']);
+    let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    !text.contains('\0')
+        && !rooted
+        && !drive
+        && !text.split(['/', '\\']).any(|segment| segment == "..")
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
@@ -1555,6 +1580,10 @@ mod tests {
     }
 
     fn request_with_path(path: &str) -> (DispatchRequest, String) {
+        request_with_parameters(json!({"path": path}))
+    }
+
+    fn request_with_parameters(parameters: Value) -> (DispatchRequest, String) {
         let tenant_id = Uuid::from_u128(10);
         let agent_id = AgentId::new();
         let key = ExecutionKey {
@@ -1564,13 +1593,9 @@ mod tests {
         };
         let mut authority = Authority::new(agent_id, "test-issuer", vec!["orders:write".into()]);
         authority.constraints = vec![AuthorityConstraint::new("tenant_id", tenant_id.to_string())];
-        let action = Action::new(
-            "orders:create",
-            Some("orders-api".into()),
-            json!({"path": path}),
-        )
-        .unwrap()
-        .with_capability("orders:write");
+        let action = Action::new("orders:create", Some("orders-api".into()), parameters)
+            .unwrap()
+            .with_capability("orders:write");
         let idempotency = idempotency_key(key);
         let request = DispatchRequest {
             schema_version: 1,
@@ -1583,27 +1608,72 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "T-013: SandboxSupervisor accepts `..` in action parameters (valid_dispatch_request). No confined dispatcher on main. Fails today."]
     fn sandbox_dispatch_rejects_parent_directory_escape() {
-        let (request, idempotency) = request_with_path("../etc/passwd");
-        assert!(
-            !valid_dispatch_request(&request, &idempotency),
-            "parent-directory path was accepted"
-        );
+        for path in ["../etc/passwd", "a/../../etc", "..", "a\\..\\b", "ok/..\\x"] {
+            let (request, idempotency) = request_with_path(path);
+            assert!(
+                !valid_dispatch_request(&request, &idempotency),
+                "parent-directory path {path:?} was accepted"
+            );
+        }
     }
 
     #[test]
-    #[ignore = "T-013: SandboxSupervisor accepts an absolute path in action parameters. No confined dispatcher on main. Fails today."]
     fn sandbox_dispatch_rejects_absolute_path_escape() {
-        let (request, idempotency) = request_with_path("/etc/passwd");
-        assert!(
-            !valid_dispatch_request(&request, &idempotency),
-            "absolute path was accepted"
-        );
+        for path in [
+            "/etc/passwd",
+            "/",
+            "\\etc\\passwd",
+            "\\\\server\\share",
+            "C:\\x",
+            "c:x",
+        ] {
+            let (request, idempotency) = request_with_path(path);
+            assert!(
+                !valid_dispatch_request(&request, &idempotency),
+                "absolute path {path:?} was accepted"
+            );
+        }
     }
 
     #[test]
-    #[ignore = "T-013: SandboxSupervisor does not reject a symlink path in action parameters. No confined dispatcher on main. Fails today."]
+    fn sandbox_dispatch_rejects_nul_and_nested_escapes() {
+        let (request, idempotency) = request_with_path("ok\0/etc");
+        assert!(
+            !valid_dispatch_request(&request, &idempotency),
+            "NUL accepted"
+        );
+
+        for parameters in [
+            json!({"files": ["ok.txt", "/etc/passwd"]}),
+            json!({"target": {"dir": "data", "file": "../secret"}}),
+        ] {
+            let (request, idempotency) = request_with_parameters(parameters.clone());
+            assert!(
+                !valid_dispatch_request(&request, &idempotency),
+                "nested escape accepted: {parameters}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_dispatch_accepts_relative_paths_and_plain_values() {
+        for parameters in [
+            json!({"path": "data/report.txt"}),
+            json!({"path": "./a/b..c/...", "id": 3, "flag": true, "none": null}),
+            json!({"note": "1..2", "url": "https://example.test/a/b"}),
+            json!({"files": ["a.txt", "dir/b.txt"], "nested": {"k": "v"}}),
+        ] {
+            let (request, idempotency) = request_with_parameters(parameters.clone());
+            assert!(
+                valid_dispatch_request(&request, &idempotency),
+                "rejected: {parameters}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "T-013 fix B (stage 2): a relative path that is a symlink leaving the sandbox root is only lexical-checked; no confined dispatcher resolves it yet. Fails today."]
     fn sandbox_dispatch_rejects_symlink_escape() {
         let root = std::env::temp_dir().join(format!("praetore-t013-{}", Uuid::new_v4()));
         let sandbox = root.join("sandbox");
@@ -1612,9 +1682,10 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         let target = outside.join("secret");
         std::fs::write(&target, b"secret").unwrap();
-        let link = sandbox.join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let (request, idempotency) = request_with_path(link.to_str().unwrap());
+        std::os::unix::fs::symlink(&target, sandbox.join("link")).unwrap();
+        // Relative to the sandbox root, so fix A (lexical) cannot reject it:
+        // only resolving it against the root (fix B) can.
+        let (request, idempotency) = request_with_path("link");
         let rejected = !valid_dispatch_request(&request, &idempotency);
         let _ = std::fs::remove_dir_all(&root);
         assert!(rejected, "symlink path was accepted");
