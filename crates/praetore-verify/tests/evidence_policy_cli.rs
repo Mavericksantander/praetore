@@ -186,3 +186,38 @@ fn legacy_receipt_without_policy_digest_verifies_but_fails_with_policy() {
         "POLICY_MISMATCH",
     );
 }
+
+#[test]
+fn swapping_the_recorded_digest_to_the_audited_policy_fails_signature() {
+    let dir = Dir::new();
+    let allow = policy(PolicyEffect::Allow);
+    let deny = policy(PolicyEffect::Deny);
+    // Signed under `allow`; a forger rewrites the digest to `deny` and
+    // recomputes the (unkeyed) integrity hash so the receipt still parses.
+    let mut forged = receipt(&allow);
+    forged.bind_policy_digest(deny.digest().unwrap()).unwrap();
+    assert!(forged.attester_signature.is_some());
+    let evidence = dir.write("forged.json", forged.to_json().unwrap());
+    let pin_file = dir.write("pin.hex", pin(&attester()));
+    let deny_file = dir.write("deny.json", serde_json::to_vec(&deny).unwrap());
+    assert_fails(&verify(&evidence, &pin_file, Some(&deny_file)), "AUTH_FAIL");
+    assert_fails(&verify(&evidence, &pin_file, None), "AUTH_FAIL");
+}
+
+#[test]
+fn oversized_or_missing_policy_file_fails_without_success() {
+    let dir = Dir::new();
+    let allow = policy(PolicyEffect::Allow);
+    let evidence = dir.write("e.json", receipt(&allow).to_json().unwrap());
+    let pin_file = dir.write("pin.hex", pin(&attester()));
+    let mut big = serde_json::to_value(&allow).unwrap();
+    big["id"] = Value::String("x".repeat(70 * 1024));
+    let big_file = dir.write("big.json", serde_json::to_vec(&big).unwrap());
+    let output = verify(&evidence, &pin_file, Some(&big_file));
+    assert!(!output.status.success());
+    assert_eq!(summary(&output)["ok"], false);
+    let missing = dir.0.join("missing.json").to_string_lossy().into_owned();
+    let output = verify(&evidence, &pin_file, Some(&missing));
+    assert!(!output.status.success());
+    assert_eq!(summary(&output)["ok"], false);
+}

@@ -8,7 +8,10 @@
 - The hash-linked journal export (`praetore-verify journal`) is a proposal
   only (`docs/proposals/journal-chain-jsonl.md`). It is not shipped: the
   verifier is kept on branch `feat/journal-chain-verifier` until a Postgres
-  exporter lands with it in one PR.
+  exporter lands with it in one PR. As specified (unkeyed links, no signed
+  or published head) it does not let a third party detect deletion,
+  truncation, reordering or a recomputed chain; the proposal lists what is
+  missing.
 - `scripts/regen-legacy-evidence-fixture.sh` regenerates the legacy receipt
   fixture (no `policy_digest`) from commit 3db7b5e.
 
