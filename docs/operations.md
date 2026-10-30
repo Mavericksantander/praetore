@@ -77,8 +77,9 @@ rotate, add the new key under a new `key_id` for the same tenant, restart,
 move the approver system to the new key, then remove the old one. Decisions
 already recorded but not yet dispatched are re-verified at dispatch against
 the configured keys; removing a key before those are dispatched leaves them
-`approved_pending_dispatch` (refused with `invalid_approval_signature`)
-until the window closes. The single-key environment variables are accepted
+`approved_pending_dispatch` (dispatch refused with
+`invalid_approval_signature`) until an operator closes them with
+`Gateway::reconcile` (`crash_recovered`). The single-key environment variables are accepted
 only for the local demo or a gateway with exactly one issuer-bound tenant.
 
 ## Freshness snapshot
