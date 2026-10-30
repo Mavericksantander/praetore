@@ -301,14 +301,14 @@ fn execute(command: Command) -> Result<Summary, CliError> {
             key_id,
         } => {
             let public_key = read_attester_pin(&execution_pin)?;
-            let receipt = praetore_gateway::verify_gateway_receipt_json(
+            let receipt = praetore_receipt::verify_gateway_receipt_json(
                 &read_limited(&receipt)?,
                 &public_key,
                 &key_id,
             )
             .map_err(|error| CliError {
                 code: match error {
-                    praetore_gateway::ExecutionAttestationError::InvalidPayload => {
+                    praetore_receipt::ExecutionAttestationError::InvalidPayload => {
                         "RECEIPT_INVALID"
                     }
                     _ => "RECEIPT_SIGNATURE_INVALID",
