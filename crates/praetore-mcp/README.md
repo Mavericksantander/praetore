@@ -218,15 +218,42 @@ Things to know:
   or inside a JSON-RPC batch (array). Requests with string, numeric or `null`
   ids get replies with the same id. Notifications (no `id`) that are blocked
   get no reply.
-* In a batch, blocked elements are removed. The remaining elements are
-  re-serialized and forwarded, and the blocked replies are returned to the
-  client as one batch. A batch with nothing blocked is forwarded unchanged.
+* Batches are all or nothing in enforce. If any `tools/call` in a batch is
+  blocked, **nothing in the batch is forwarded**. The client gets one reply
+  array: blocked tool calls get their `isError` reason, other tool calls get
+  `isError` "not executed", and other requests get JSON-RPC error `-32600`.
+  Allowed calls in a refused batch still have ALLOW receipts, because a
+  receipt records the decision, not execution. A batch with nothing blocked is
+  forwarded byte-for-byte; elements are never re-serialized. Nested arrays
+  inside a batch are treated as ambiguous (see below).
 * Blocked reply: `{"jsonrpc":"2.0","id":ID,"result":{"content":[{"type":"text","text":"Denied by PRÆTORE policy. Rule: ... Evidence id: ..."}],"isError":true}}`.
 * Client lines are parsed strictly. **Duplicate object keys** (for example two
   `method` members), invalid UTF-8 and invalid JSON are unparseable. Such a
   line could hide a `tools/call` from the proxy while the server still reads
   it as one. **Enforce does not forward unparseable lines** and answers with
   JSON-RPC error `-32700` (`id: null`). Observe forwards them unchanged.
+* **Ambiguous lines** are lines that this proxy and the server could split or
+  read differently. Enforce refuses them with `-32700` (`id: null`). Observe
+  forwards them unchanged, warns, and evaluates and records **every**
+  `tools/call` reading it can find. Two kinds are detected:
+  * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
+    `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
+    or `\r\n`: the MCP Python SDK (`TextIOWrapper`, `newline=None`) and
+    Node `readline`. Any `\r` except one trailing `\r\n` therefore makes a
+    line ambiguous. In observe, each `\r`-separated segment is classified on
+    its own. Other separators that `str.splitlines` knows (`\v`, `\f`,
+    `\x1c`-`\x1e`, U+0085, U+2028, U+2029) are not line breaks for those
+    readers. They are also not JSON whitespace, so a raw one outside a string
+    makes the line unparseable; inside a string it is harmless.
+  * **Case-insensitive keys.** Go `encoding/json` (used by mcp-go) matches
+    struct fields case-insensitively, and the last match wins. A line is
+    ambiguous if two keys fold to the same string under simple case folding.
+    This is checked at the message level, in `params`, and anywhere inside
+    `params.arguments`. It covers Go's orbits such as `s`/`S`/`ſ`,
+    `k`/`K`/`K` (Kelvin), `ß`/`ẞ` and `σ`/`ς`/`Σ`. A line is also ambiguous
+    if a message-level or `params` key is a case variant of `method`,
+    `params`, `id`, `jsonrpc`, `name` or `arguments`. In observe, both the
+    exact-key and the Go (case-folded, last-wins) readings are recorded.
 * Client lines over 32 MiB are refused in enforce. In observe they are
   forwarded unchecked, with a warning.
 * Errors (missing or invalid keys, policy, clock, replay guard): **enforce
@@ -269,11 +296,26 @@ Things to know:
   the wrapper (`uninstall`, or a manual edit) and bypass it. The proxy also
   cannot see tools the server runs on its own initiative.
 * Only top-level argument fields can be matched individually
-  (`arguments.<key>`). Nested fields can only be matched through an `Exact`
+  (`arguments.<key>`). `policy` commands refuse keys containing `.`,
+  because `arguments.opts.path` would match a literal top-level key
+  `"opts.path"` that the caller controls, not the nested field. `policy
+  check` warns about such hand-written rules. Nested fields can only be
+  matched through an `Exact`
   match on a whole value.
 * Several wrappers (one per server) append to the same daily journal file
   with single `O_APPEND` writes. This is safe on local filesystems; network
   filesystems are not supported.
+* `install` follows a symlinked config (for example one managed by a dotfile
+  manager): it rewrites the real target atomically and leaves the link in
+  place. Backups are created 0600 and are never overwritten. The temp file has
+  a random name, is created exclusively, and gets the original file's mode.
+* `init` creates missing directories as 0700 and never changes the
+  permissions of an existing `--dir` / `PRAETORE_MCP_HOME`. Symlinked `keys/`
+  and `receipts/` directories and symlinked journal files are refused.
+* On Windows, `wrap` resolves a bare command through `PATH` and `PATHEXT`
+  (so `npx` finds `npx.cmd`). `install` writes paths without the `\\?\`
+  verbatim prefix. This Windows-specific code is unit-tested but has not been
+  run on Windows.
 * File permissions are enforced on Unix only. On Windows, protect `DIR/keys`
   yourself.
 * JSONC client configs and the VS Code `settings.json` `"mcp"` key are not
