@@ -169,8 +169,8 @@ uses these exact byte prefixes:
 
 Authority signatures bind `issuer_key_id` as well as the subject key hash.
 Signatures, fingerprints, digests, and key IDs are lowercase hexadecimal;
-uppercase or mixed-case hex is rejected wherever one is parsed or verified
-(authority signature, subject key hash and issuer key ID, request intent
+`praetore-core` and `praetore-receipt` reject uppercase or mixed-case hex
+for (authority signature, subject key hash and issuer key ID, request intent
 signature, evidence attester signature and policy digest, issuer pin public
 key), so each signed document has a single valid encoding. Parsing
 helpers for policy, issuer pins, authority, and evidence reject duplicate JSON
@@ -254,6 +254,10 @@ conditions). Integer/float comparisons, unsafe path-like values, a missing
 action target and a restrictive rule's `required_capability` fail closed in
 both versions: an action without a target matches a targeted restrictive rule
 but no targeted ALLOW rule, and `required_capability` narrows only ALLOW rules.
+Such an unbound restrictive match always contributes DENY, so a
+REQUIRE_APPROVAL or RECOVER rule never yields an approval or a recovery
+obligation for an authority that lacks its capability or an action without
+its target.
 Targets are exact, case-sensitive identifiers; nothing is case-folded. In
 v2, an unknown condition value on a DENY or REQUIRE_APPROVAL rule is treated
 as a match, while it does not make an ALLOW rule match; a definitively false

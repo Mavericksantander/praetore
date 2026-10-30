@@ -45,6 +45,11 @@
   Targets stay exact, case-sensitive identifiers; this is now documented.
   Policies that used `required_capability` on a DENY rule to deny only the
   holders of that capability now deny everyone for that rule's scope.
+  Such an *unbound* match (authority lacks the capability, or the action
+  has no target) always contributes DENY, also for REQUIRE_APPROVAL and
+  RECOVER rules: it never turns a default deny into an approvable request,
+  and never emits a recovery obligation, for an authority the rule was not
+  scoped to.
 - Security (behavior change, more restrictive): an integer compared with a
   floating-point number no longer fails open in v1 policies. Previously a v1
   `Deny if amount > 10000` was bypassed with `"amount": 50000.0`, because
