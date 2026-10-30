@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `praetore-mcp wrap`: a call refused because evaluation failed now logs
+  `call REFUSED (fail closed)` instead of `(enforce, fail closed)`, which was
+  wrong when observe was requested and the home could not be loaded.
 - `crates/praetore-mcp/GUIDE.md`: a guide for external developers with a
   first-run walkthrough, the limits (only MCP `tools/call` through a wrapped
   server is governed; LOCAL/DEV keys; no approval flow for REQUIRE_APPROVAL;
