@@ -4,8 +4,10 @@ Estado: **propuesta, solo documento.** No contiene código de producción.
 Ninguna decisión está tomada: todas esperan al CTO.
 Base: `origin/main` en `97fa755`.
 Nombre: sigue la convención `SAF-NN`. El número es provisional.
-Relación: el PR #18 (cadena del journal en `praetore-verify`) cubre una parte
-de §5. Esta propuesta se ajusta a lo que ese PR termine garantizando.
+Relación: el PR #18 propone una cadena de hashes del journal. Al revisarlo
+(30-oct-2026) se vio que no trae verificador en el PR (hay uno de referencia
+en `feat/journal-chain-verifier`) y que, sin cabeza firmada, la cadena no
+detecta borrados ni truncamientos hechos por un adversario. Ver §5.
 
 ## 1. Problema
 
@@ -69,7 +71,7 @@ regenere completo de forma coherente.
 | 7 | **Checkpoints firmados** periódicos (cada N recibos o cada T segundos, lo que ocurra primero): `{log_id, tenant, tree_size, root_hash, timestamp}`, firmados por una llave de log **distinta** de la del attester. Formato compatible con *signed note* / *checkpoint* de transparency-dev, para poder reutilizar witnesses existentes. | PROPUESTA |
 | 8 | **Anclaje externo** de cada checkpoint en algo que el operador no controla. Configurable: sello de tiempo RFC 3161 de una TSA, y/o witnesses de terceros que cosignan checkpoints, y/o entrega directa al auditor. Sin anclaje, el log solo detecta borrados hechos por alguien **sin** la llave del log; esto se documenta así. | PROPUESTA |
 | 9 | **Pruebas para terceros:** `praetore-verify` agrega `inclusion` (este recibo está en el checkpoint C), `consistency` (el checkpoint C2 extiende C1 sin reescribirlo) y `audit` (con un export del journal y los checkpoints anclados: no hay huecos, ni duplicados, ni hojas que no correspondan a recibos válidos). Ninguna requiere red ni confiar en el operador. | PROPUESTA |
-| 10 | La cadena de #18 (si se mergea) se mantiene como verificación local barata, pero la garantía para terceros es la del árbol más el anclaje. Se documenta qué detecta cada una. | PROPUESTA |
+| 10 | La cadena de #18 (enlaces SHA-256 sin llave y sin cabeza firmada) **no** da garantía contra un adversario: quien controla el journal recalcula la cadena tras borrar o reordenar. Se mantiene como chequeo de errores accidentales; la garantía para terceros es la del árbol con checkpoints firmados y anclados, con `seq` y `prev` dentro del recibo firmado. | PROPUESTA |
 
 ## 4. Custodia: detalle (decisiones 1–5)
 
@@ -105,11 +107,12 @@ El índice de la hoja se guarda junto al recibo.
 
 **Qué detecta cada mecanismo:**
 
-| Ataque | Cadena local (#18) | Árbol + checkpoint firmado | + anclaje externo |
+| Ataque | Cadena sin cabeza firmada (diseño de #18) | Árbol + checkpoint firmado | + anclaje externo |
 |---|---|---|---|
-| Borrar un recibo del medio | sí | sí | sí |
-| Truncar el final | no (salvo que el auditor conozca la cola) | sí, respecto al último checkpoint visto | sí |
-| Reordenar | sí | sí | sí |
+| Edición ingenua (seq/prev incorrectos, duplicados) | sí | sí | sí |
+| Borrar un recibo del medio | **no**: se recalcula la cadena sin él | sí, respecto al último checkpoint visto | sí |
+| Truncar el final | no | sí, respecto al último checkpoint visto | sí |
+| Reordenar | **no**: se recalcula | sí | sí |
 | Mostrar logs distintos a auditores distintos (fork o equivocation) | no | no | sí, si los witnesses comparan |
 | Regenerar todo con la llave del log | no | no | sí, contra los checkpoints anclados previos |
 | Recibo omitido antes de entrar al log (nunca se agregó) | no | no | no: ver §6 |
