@@ -30,12 +30,75 @@ profile and an authenticated configuration channel.
    The core has no revocation list. HighAssurance guards reject reuse of
    previously consumed request IDs, but a stolen key can create new IDs; a
    still-valid authority remains usable until relying deployments stop
-   trusting it or it expires.
-3. Provision a new agent key using the approved key-protection mechanism,
+   trusting it or it expires. With the gateway service's file-based freshness
+   provider, add the agent's `AgentKeyFingerprint` (and/or the affected
+   authority IDs) to the revocation snapshot (`PRAETORE_GATEWAY_FRESHNESS_FILE`);
+   new checks refuse it within the reload interval (default 5 s) and existing
+   leases end within the lease length (default 30 s). Approved executions
+   still awaiting dispatch are revalidated at dispatch and closed as
+   `dispatch_failed`.
+3. Revoke the agent's gateway API credential by removing its entry from
+   `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` and restarting the gateway.
+4. Provision a new agent key using the approved key-protection mechanism,
    issue a new subject-bound authority, and verify a signed request end to end.
-4. Preserve existing evidence and separately identify the compromise window;
+5. Preserve existing evidence and separately identify the compromise window;
    do not rewrite evidence or claim the old signatures identify the legitimate
    agent operator.
+
+## Gateway HTTP API credentials
+
+The gateway service authenticates callers with tenant-scoped bearer tokens
+listed by SHA-256 digest in `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` (format in
+[Tool gateway integration](tool-gateway-integration.md#http-api-authentication)).
+It refuses to start without this file with the `http` or `sandbox` adapter or
+on a non-loopback listen address.
+
+1. Issue one credential per agent workload and one per approver/operator
+   system, each bound to a single tenant. Never give an agent workload an
+   `approver` token: approver tokens can read approval challenges (including
+   the action parameters) and dispatch approved actions.
+2. Generate tokens with a CSPRNG (at least 32 bytes, e.g.
+   `openssl rand -hex 32`) and store only the digest in the credentials file;
+   deliver the token through the secret manager of the calling workload.
+3. Rotate by adding the new digest under a new `name`, restarting the
+   gateway, moving callers to the new token, then removing the old entry and
+   restarting again. The file is read at startup only.
+4. Monitor `401 authentication_required` and `403 caller_not_authorized`
+   rates: repeated 403s with a valid token indicate a caller probing another
+   tenant or an endpoint outside its role.
+
+## Approver keys
+
+Human-approval public keys are bound to tenants with
+`PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE` (format in
+[Tool gateway integration](tool-gateway-integration.md#human-approvals)). An
+approver key for one tenant never verifies another tenant's decisions. To
+rotate, add the new key under a new `key_id` for the same tenant, restart,
+move the approver system to the new key, then remove the old one. Decisions
+already recorded but not yet dispatched are re-verified at dispatch against
+the configured keys; removing a key before those are dispatched leaves them
+`approved_pending_dispatch` (refused with `invalid_approval_signature`)
+until the window closes. The single-key environment variables are accepted
+only for the local demo or a gateway with exactly one issuer-bound tenant.
+
+## Freshness snapshot
+
+With the `http` and `sandbox` adapters the gateway requires
+`PRAETORE_GATEWAY_FRESHNESS_FILE`, a revocation snapshot with a short
+`valid_until` (format in
+[Tool gateway integration](tool-gateway-integration.md#freshness-and-revocation-snapshot)).
+
+1. Run a revocation publisher that rewrites the snapshot well before
+   `valid_until` (for example every minute with a five-minute validity),
+   writing a temporary file and renaming it into place.
+2. Alert on `freshness snapshot unavailable` warnings and on
+   `authorization_unavailable` (503) responses: once the snapshot is missing,
+   invalid or stale, every authorization and every approved dispatch fails
+   closed until it is refreshed. Approved executions stay
+   `approved_pending_dispatch` meanwhile and can be dispatched again while
+   their window is open.
+3. Treat write access to the snapshot as equivalent to the ability to
+   un-revoke an agent: the file is not signed.
 
 ## Policy rollback or substitution
 
