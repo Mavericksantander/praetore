@@ -14,9 +14,12 @@ postgres = { version = "0.19", features = ["with-time-0_3", "with-uuid-1", "with
 hex = "0.4.3"
 praetore-gateway = { path = "../praetore-gateway" }
 praetore-core = { path = "../praetore-core" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]

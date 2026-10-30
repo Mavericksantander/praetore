@@ -13,7 +13,7 @@ name, not a certification or a guarantee about the caller's deployment.
 | --- | --- | --- |
 | Development | Allows unsigned authorities for local compatibility. If a request signature is present, it must still verify. | Policy only; no issuer trust, policy pin, evidence attester, replay guard, or freshness provider. |
 | Strict | Verifies the authority signature against an exact issuer pin, authority validity and subject-key binding, plus the agent-signed request intent. | Non-empty issuer pins. Policy digest pinning, attestation, replay protection, and freshness are not provided by this mode. |
-| HighAssurance | Performs Strict checks and additionally binds a v2 policy digest, audience- and expiry-bound v2 request intent, v2 attested evidence, content-bound caller freshness, and one-time `(agent UUID, request UUID)` claims. | Time-bounded issuer pins, pinned v2 policy digest, audience, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
+| HighAssurance | Performs Strict checks and additionally binds a v2 policy digest, audience- and expiry-bound v2 request intent, v2 attested evidence, content-bound caller freshness, and one-time `(tenant, agent UUID, request UUID)` claims (tenant: the authority's `tenant_id` constraint, or the nil UUID). | Time-bounded issuer pins, pinned v2 policy digest, audience, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
 
 `AuthorizationEngine::development` and
 `AuthorizationEngine::development_with_clock` are explicit development
@@ -110,8 +110,13 @@ bound into the authority. Development mode permits unsigned requests, but
 rejects any invalid signature that is present. The signature is retained in
 evidence and can be checked offline with `Evidence::verify_agent_intent`.
 
-HighAssurance evaluation atomically claims the signed `(agent_id, request_id)`
-through the configured `ReplayGuard` before returning evidence. This applies
+HighAssurance evaluation atomically claims the signed
+`(tenant_id, agent_id, request_id)` through the configured `ReplayGuard`
+before returning evidence. `tenant_id` is taken from the signed authority's
+single `tenant_id` constraint; an authority without one (or with a nil,
+malformed or duplicated one) uses the nil UUID, a single shared unscoped
+namespace. The same agent and request ID can therefore be claimed once per
+tenant namespace. This applies
 to ALLOW, REQUIRE_APPROVAL, and DENY results. Duplicate claims or storage
 failure return an error; no evidence is returned. The caller's implementation
 must be durable and shared across all engine instances in the authorization
@@ -127,8 +132,14 @@ authorization. See [ADR-006](adr/006-high-assurance-replay-guard.md).
 Signatures and digests use compact UTF-8 JSON produced by the crate's canonical
 encoder:
 
-* Object keys are sorted lexicographically at every nesting level; there is no
-  insignificant whitespace.
+* Object keys are sorted by their UTF-8 bytes at every nesting level; there is
+  no insignificant whitespace. This is a deliberate deviation from RFC 8785
+  (JCS), which sorts by UTF-16 code units: the two orders differ only for keys
+  that contain characters above U+FFFF compared with characters in
+  U+E000..U+FFFF. Number formatting also follows `serde_json` (`5000.0` stays
+  `5000.0`), not JCS's ECMAScript formatting; an independent verifier must reproduce
+  these rules, not a generic JCS library. Changing the order would change
+  signed bytes and digests and requires a new canonical version.
 * JSON strings use `serde_json` escaping, numbers use the `serde_json::Number`
   representation, and array order is preserved.
 * Authority capabilities are sorted lexicographically and constraints by key
@@ -157,7 +168,11 @@ uses these exact byte prefixes:
 * Issuer key ID: `PRAETORE_ISSUER_KEY_V1\0ed25519\0`
 
 Authority signatures bind `issuer_key_id` as well as the subject key hash.
-Signatures, fingerprints, and key IDs are lowercase hexadecimal. Parsing
+Signatures, fingerprints, digests, and key IDs are lowercase hexadecimal;
+`praetore-core` and `praetore-receipt` reject uppercase or mixed-case hex
+for (authority signature, subject key hash and issuer key ID, request intent
+signature, evidence attester signature and policy digest, issuer pin public
+key), so each signed document has a single valid encoding. Parsing
 helpers for policy, issuer pins, authority, and evidence reject duplicate JSON
 object keys, trailing data, unknown fields, unsupported schema/canonical
 versions, unsafe integral numbers, and values over the documented
@@ -197,10 +212,13 @@ Key rotation is represented as an ordinary `identity:rotate_key` action.
 `KeyRotationProof` contains the old and new fingerprints, new public key,
 subject, authority ID, and request ID; its proof-of-possession signature uses
 `PRAETORE_KEY_ROTATION_V1\0`. The old key signs the request intent, which binds
-the proof into evidence. `Evidence::verify_key_rotation` checks evidence
-integrity, old-key intent, action type, an ALLOW decision, and the new-key
-proof. It does not establish issuer/attester trust by itself; consumers must
-also verify those signatures against their external pins. This receipt does
+the proof into evidence. `Evidence::verify_key_rotation(trusted_attester)`
+checks the evidence attester signature against the caller's pinned attester
+key, evidence integrity, old-key intent, action type, an ALLOW decision, and
+the new-key proof. The attester signature is mandatory: the unkeyed
+`context_hash` alone cannot stop a DENY from being rewritten into an ALLOW.
+It does not establish issuer trust; consumers must also verify the authority
+signature against their issuer pins. This receipt does
 not update an agent registry or revoke the old key; those operations remain
 caller-owned.
 
@@ -221,10 +239,26 @@ Rules can match action parameters and request context with `PolicyCondition`:
 * `In` compares against a non-empty JSON array of permitted values.
 * Numeric operators require JSON numbers on both sides. Integer comparisons
   retain integer precision; floating-point numbers compare as represented by
-  `serde_json`. Comparisons between integer and floating-point representations
-  fail closed.
+  `serde_json`. An integer compared with a floating-point number (for
+  example `50000` against `50000.0`) uses the exact mathematical order; the
+  integer is never cast to `f64`. Such a mixed comparison, and an `Exact` or
+  `In` comparison between an integer and a numerically equal float, fails
+  closed in every semantics version: it applies its exact result to DENY and
+  REQUIRE_APPROVAL rules and never makes an ALLOW rule match. So
+  `Deny if amount > 10000` denies `50000.0` under v1 and v2, while an ALLOW
+  rule for `amount <= 100` does not match `50.0`.
 
-For v1 policies, missing fields and operator/type mismatches do not match. In
+For v1 policies, missing fields and operator/type mismatches do not match,
+even on DENY and REQUIRE_APPROVAL rules (legacy; use v2 for restrictive
+conditions). Integer/float comparisons, unsafe path-like values, a missing
+action target and a restrictive rule's `required_capability` fail closed in
+both versions: an action without a target matches a targeted restrictive rule
+but no targeted ALLOW rule, and `required_capability` narrows only ALLOW rules.
+Such an unbound restrictive match always contributes DENY, so a
+REQUIRE_APPROVAL or RECOVER rule never yields an approval or a recovery
+obligation for an authority that lacks its capability or an action without
+its target.
+Targets are exact, case-sensitive identifiers; nothing is case-folded. In
 v2, an unknown condition value on a DENY or REQUIRE_APPROVAL rule is treated
 as a match, while it does not make an ALLOW rule match; a definitively false
 condition still makes the rule fail. Conditions compose with AND within a
@@ -234,9 +268,11 @@ Validation rejects duplicate rule IDs, invalid matcher shapes, and detectable
 contradictions such as incompatible exact values or disjoint membership sets.
 
 Authority capabilities use explicit names such as `data:read`, `data:write`,
-`shell:execute`, `api:call`, and `deployment:create`. An action can select its
-required authority capability with `Action::with_capability`; if omitted,
-`action_type` is used for compatibility. A policy rule's optional
+`shell:execute`, `api:call`, and `deployment:create`. An action selects its
+required authority capability with `Action::with_capability`. There is no
+fallback to `action_type`: Strict and HighAssurance reject an action without
+a capability with an `INVALID_REQUEST` error, and Development returns a DENY
+decision. A policy rule's optional
 `with_capability` is an additional authority requirement. In Strict and
 HighAssurance modes it is mandatory for `Allow` and `RequireApproval` rules: a
 matching rule without it is denied, because the action's capability is chosen
