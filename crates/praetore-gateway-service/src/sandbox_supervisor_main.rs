@@ -1,6 +1,6 @@
 use praetore_gateway_service::sandbox_supervisor::{
-    KubernetesApi, SandboxSupervisor, load_server_tls, load_worker_tls, parse_listen_address,
-    serve_tls,
+    ConnectionLimits, KubernetesApi, SandboxSupervisor, load_server_tls, load_worker_tls,
+    parse_listen_address, serve_tls,
 };
 use std::{env, fs, path::Path};
 use tracing_subscriber::EnvFilter;
@@ -50,11 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             parse_listen_address(&gateway_address)?,
             server_tls,
             supervisor.clone().gateway_router(),
+            ConnectionLimits::gateway_ingress(),
         ),
         serve_tls(
             parse_listen_address(&worker_address)?,
             worker_tls,
             supervisor.worker_router(),
+            ConnectionLimits::worker_callback(),
         ),
     )?;
     Ok(())

@@ -383,19 +383,21 @@ not assigned to a tenant. HighAssurance rejects requests without a signed
 tenant claim or whose authority issuer key is not bound to that tenant. The
 agent intent must be signed for the configured gateway audience.
 
-This binds agent identities to tenant-scoped issuer trust; it does not
-authenticate an HTTP network peer or provide user/admin RBAC. Keep authenticated
-TLS termination and private network controls in place. Human approval remains
-protected by its configured Ed25519 approver key, but challenge reads and
-administrative identity/role management still need a separately enforced
-administrative access layer.
+This binds agent identities to tenant-scoped issuer trust. HTTP callers are
+authenticated separately with tenant-scoped bearer credentials (see
+[HTTP API authentication](#http-api-authentication)); that is a minimal
+caller check, not user/admin RBAC or identity management. Keep authenticated
+TLS termination and private network controls in place.
 
 HTTP adapter configuration requires an explicit egress proxy in the route
 configuration; the production parser rejects a missing proxy. Make it enforce
 the destination hostname allowlist. In a separately networked pod, the example
-listener can bind with `PRAETORE_GATEWAY_LISTEN_ADDR=0.0.0.0:8080`; this is
-plain HTTP and is only safe behind private network policy and authenticated
-TLS termination.
+listener can bind with `PRAETORE_GATEWAY_LISTEN_ADDR=0.0.0.0:8080`; the service
+refuses to start on a non-loopback address unless
+`PRAETORE_GATEWAY_API_CREDENTIALS_FILE` is configured, and never binds the
+`local-demo` adapter beyond loopback. The listener is plain
+HTTP: bearer tokens are only protected behind private network policy and
+authenticated TLS termination.
 Without that variable the listener remains loopback-only.
 
 HTTP adapter mode also uses the Chrony-backed trusted clock and fails startup
@@ -405,8 +407,12 @@ configured error bound. See the
 health thresholds and required host controls. Local demo mode remains on the
 system clock and is not a production configuration.
 
-The binary remains a **local development demo**, with local freshness. These
-settings do not make it suitable for SaaS production.
+The `http` and `sandbox` adapters refuse to start without
+`PRAETORE_GATEWAY_FRESHNESS_FILE` (see
+[Freshness and revocation snapshot](#freshness-and-revocation-snapshot)); only
+`local-demo` may use the demo freshness provider, which never checks
+revocation. The binary remains a **local development demo**. These settings
+do not make it suitable for SaaS production.
 
 PostgreSQL may run on a loopback host or socket without TLS; any other host
 (for example `postgres.praetore-data.svc.cluster.local` in the Kubernetes
@@ -479,6 +485,100 @@ boundary; the production runner image, CRI handler, admission controls,
 Cilium policy, and KVM nodes must also be configured and tested by the
 operator.
 
+## HTTP API authentication
+
+`http_api::router(gateway, auth)` takes an `ApiAuth`. With
+`ApiAuth::Required`, every endpoint except `GET /healthz` needs exactly one
+`Authorization: Bearer <token>` header. The gateway service loads credentials
+from `PRAETORE_GATEWAY_API_CREDENTIALS_FILE`:
+
+```json
+{
+  "schema_version": 1,
+  "credentials": [
+    {"name": "tenant-a-agent", "tenant_id": "<tenant uuid>", "role": "agent",
+     "token_sha256": "<lowercase hex SHA-256 of the token>"},
+    {"name": "tenant-a-approver", "tenant_id": "<tenant uuid>", "role": "approver",
+     "token_sha256": "<lowercase hex SHA-256 of the token>"}
+  ]
+}
+```
+
+Only token digests are stored. Tokens must be 32 to 256 bytes (generate at
+least 128 random bits, e.g. `openssl rand -hex 32`; the digest is
+`printf %s "$TOKEN" | sha256sum`). Presented tokens are hashed and compared in
+constant time with every configured digest, and `Authorization` headers are
+marked sensitive. The file is parsed strictly: duplicate JSON keys, unknown
+fields, duplicate names or digests, nil tenants and non-canonical digests are
+rejected at startup.
+
+Every credential is bound to one tenant and one role:
+
+| Endpoint | `agent` | `approver` |
+| --- | --- | --- |
+| `POST /v1/execute` | yes, only if the request's issuer-signed authority names the credential's tenant | no |
+| `GET /v1/approvals/{tenant}/{agent}/{request}/status` | yes | yes |
+| `GET /v1/approvals/{tenant}/{agent}/{request}` (challenge) | no | yes |
+| `POST /v1/approvals/{tenant}/{agent}/{request}` (decision) | no | yes |
+| `POST /v1/approvals/{tenant}/{agent}/{request}/dispatch` | no | yes |
+
+The `{tenant}` path segment must equal the credential's tenant. Role and
+tenant are checked before any journal lookup, so a caller cannot probe or
+read another tenant's executions. Missing or unknown tokens get `401
+authentication_required` (with `WWW-Authenticate: Bearer`); a wrong role or
+tenant gets `403 caller_not_authorized`. Agents can never trigger the
+dispatch of an approved action. Approver tokens authorize transport access
+only; a decision still needs the approver's Ed25519 signature.
+
+The service requires credentials with the `http` and `sandbox` adapters and
+for any non-loopback listen address. Only the `local-demo` adapter on a
+loopback listener may run with `ApiAuth::UnauthenticatedLoopbackDemo`, and it
+logs a warning; `local-demo` refuses a non-loopback address even with
+credentials, because its approver key may be unscoped and its freshness
+provider never checks revocation. `praetore run` (the CLI demo) always authenticates, with
+tokens generated by `praetore init`.
+
+The challenge and status `GET` endpoints are not purely read-only: the first
+request that observes a closed approval window persists the single signed
+`ApprovalExpiredReceipt` for that key (idempotent, never dispatches). This is
+why they are authenticated like the other approval endpoints.
+
+## Freshness and revocation snapshot
+
+`PRAETORE_GATEWAY_FRESHNESS_FILE` points to a revocation snapshot produced by
+an external revocation process, for example a job that renders the current
+revocation list into a mounted file and replaces it atomically (write then
+rename):
+
+```json
+{
+  "schema_version": 1,
+  "issued_at": "2026-06-01T12:00:00Z",
+  "valid_until": "2026-06-01T12:05:00Z",
+  "revoked_authority_ids": ["<authority uuid>"],
+  "revoked_agent_key_fingerprints": ["<AgentKeyFingerprint::to_hex() of the agent key>"],
+  "revoked_authority_digests": ["<evidence.authority_digest>"]
+}
+```
+
+The provider checks the configured policy digest and the three revocation
+lists, and grants a lease of at most `PRAETORE_GATEWAY_FRESHNESS_LEASE_MS`
+(default 30 000, at most 60 000), never beyond `valid_until`. It re-reads the
+file at most every `PRAETORE_GATEWAY_FRESHNESS_RELOAD_INTERVAL_MS` (default
+5 000), so a revocation applies to new checks within that interval and to
+already-granted leases within the lease length. It fails closed with
+`FRESHNESS_UNAVAILABLE` when the file is missing, unreadable, unparseable
+(strict JSON, unknown fields rejected), issued after the engine's trusted
+time, or past `valid_until`; it never falls back to an older copy. A snapshot
+may cover at most `PRAETORE_GATEWAY_FRESHNESS_MAX_SNAPSHOT_VALIDITY_MS`
+(default one hour) between `issued_at` and `valid_until`, so the revocation
+process must keep refreshing it. Startup fails if the file cannot be parsed.
+
+The snapshot is not signed: its integrity rests on the file system and the
+process that writes it (for example a read-only Secret or ConfigMap volume
+with restricted write access). A signed or online revocation service is a
+separate design.
+
 ## Human approvals
 
 The gateway reference implements a minimal signed approval protocol for
@@ -490,18 +590,22 @@ The HTTP flow is:
 
 1. `POST /v1/execute` returns `202 Accepted` and a receipt with
    `authorization = requires_approval`; the action remains `NotDispatched`.
-2. `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}` returns the persisted
-   `ApprovalChallenge` derived from the pending execution's stored evidence.
-   Its fields bind the tenant, agent and request IDs, evidence ID/context hash,
-   exact action digest, policy digest, and expiry.
+2. `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}` returns
+   `{"challenge": ApprovalChallenge, "action": Action}`. The challenge is
+   derived from the pending execution's stored evidence and binds the tenant,
+   agent and request IDs, evidence ID/context hash, exact action digest,
+   policy digest, and expiry. `action` is the persisted action itself, so the
+   approver can show the human what is being approved and must check that
+   `action_digest(action) == challenge.action_digest`
+   (`ApprovalChallengeView::action_matches_challenge`) before signing.
 3. An external approver system constructs a `HumanApprovalDecision` containing
    the challenge, a unique approval ID, the configured approver key ID, an
    `approve` or `reject` outcome, and an Ed25519 signature. The signature
    covers the canonical decision payload under the
    `PRAETORE_HUMAN_APPROVAL_V1\0` domain separator.
 4. `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}` submits that signed decision.
-   The gateway checks the fixed approver key, signature, exact pending
-   challenge, path IDs, and expiration. PostgreSQL rechecks the pending
+   The gateway checks that the approver key ID is pinned for the execution's
+   tenant, the signature, exact pending challenge, path IDs, and expiration. PostgreSQL rechecks the pending
    execution and expiry while holding the journal row lock.
 5. PostgreSQL stores the decision append-only. For `approve`, it records the
    approval and moves the journal to `approved_pending_dispatch` in the same
@@ -512,16 +616,30 @@ The HTTP flow is:
    authorization remains `RequiresApproval`; the human decision does not
    rewrite it as `ALLOW`.
 6. `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}/dispatch` claims the
-   single dispatch: under the row lock it revalidates the stored approval
+   single dispatch. The gateway first re-verifies the stored approval
+   independently of the engine (approve outcome, challenge equal to the one
+   derived from the persisted evidence and action digest, signature by an
+   approver pinned for the tenant, no self-approval); a record that fails this
+   check is not dispatched and is left unchanged for an operator. It then
+   revalidates the evidence and, under the row lock, checks the approval
    against the engine clock and moves `approved_pending_dispatch` to
    `dispatched` only if exactly one row changes. Only then is the adapter
    invoked; the response is the signed receipt. A concurrent or repeated claim
-   gets 409. If the window closed first, or revalidation fails, the execution
-   is closed as `not_dispatched` with a signed attestation (schema version 3)
-   whose `not_dispatched_reason` is `approval_expired` or `dispatch_failed`.
+   gets 409. If the window closed first, or revalidation fails terminally
+   (for example the authority was revoked), the execution is closed as
+   `not_dispatched` with a signed attestation (schema version 3) whose
+   `not_dispatched_reason` is `approval_expired` or `dispatch_failed`.
+   Transient failures (trusted clock, freshness source or replay storage
+   unavailable, HTTP 503) leave it `approved_pending_dispatch`, so the
+   dispatch can be requested again while the window is open.
    `Gateway::reconcile` closes an unclaimed approval left by a crash the same
    way with `crash_recovered`. There is no re-dispatch: a closed approval
    cannot be claimed again; submit a new request.
+
+`GET .../status` returns `{"resolution", "execution", "not_dispatched_reason"?}`.
+`resolution` is `pending`, `approved` (awaiting dispatch or dispatched),
+`rejected`, `expired` (window closed without a decision) or `not_dispatched`
+(approved, but closed without dispatch; `not_dispatched_reason` says why).
 
 An approval is valid only until the earlier of the signed intent expiration
 and the freshness lease expiration. Once expired, the request cannot be
@@ -529,12 +647,31 @@ approved; submit a newly signed authorization request and obtain a fresh
 decision instead. The decision is single-use per
 `(tenant_id, agent_id, request_id)`.
 
-The demo service loads the approver key ID and public key from
-`PRAETORE_GATEWAY_APPROVER_KEY_ID` and
-`PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX`. The matching private key must
-remain in the external approver system. The demo HTTP listener is loopback-only
-and has no network authentication or TLS; these endpoints must not be exposed
-to an untrusted network.
+Approver keys are bound to tenants. The service loads
+`PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE`, which mirrors the tenant issuer
+binding file:
+
+```json
+{
+  "schema_version": 1,
+  "tenants": [
+    {"tenant_id": "<tenant uuid>",
+     "approvers": [{"key_id": "tenant-a-alice", "public_key_hex": "<64 hex Ed25519 key>"}]}
+  ]
+}
+```
+
+Each tenant appears once with 1 to 16 approvers; every key ID and public key
+is assigned to exactly one tenant, and with the `http`/`sandbox` adapters every
+approver tenant must also be issuer-bound. An approver key for tenant A never
+verifies a decision for tenant B. The single
+`PRAETORE_GATEWAY_APPROVER_KEY_ID`/`PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX`
+pair remains for single-tenant setups: it is unscoped with `local-demo`, and
+with a production adapter it is accepted only when exactly one tenant is
+issuer-bound, and is then bound to that tenant. Setting both forms is an
+error. The matching private keys must remain in the external approver system.
+The listener has no TLS; these endpoints must not be exposed to an untrusted
+network.
 
 There is a deliberate crash-safety tradeoff: after approval is durably
 consumed and the journal reaches `Dispatched`, a process crash before or during

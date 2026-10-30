@@ -1,14 +1,18 @@
 use ed25519_dalek::{Signer, SigningKey};
 use praetore_core::{
-    EvidenceAttesterKey, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
-    Policy, TrustedAuthorityIssuer, VerifiedPublicKey, canonical::parse_json_rejecting_duplicates,
-    engine::AuthorizationEngine, identity::AgentKeyFingerprint,
+    EvidenceAttesterKey, FreshnessProvider, HighAssuranceConfig, Policy, TrustedAuthorityIssuer,
+    canonical::parse_json_rejecting_duplicates, engine::AuthorizationEngine,
 };
 use praetore_gateway::{
     ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway,
     HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
 };
-use praetore_gateway_service::chrony_clock::ChronyClock;
+use praetore_gateway_service::{
+    api_auth::select_api_auth,
+    approver_bindings::{parse_approver_bindings, single_approver},
+    chrony_clock::ChronyClock,
+    file_freshness::{DemoFreshnessProvider, FileFreshnessLimits, FileFreshnessProvider},
+};
 use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use serde::Deserialize;
 use serde_json::Value;
@@ -19,49 +23,8 @@ use std::{
     sync::Arc,
     time::Duration as StdDuration,
 };
-use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-struct LocalFreshnessProvider {
-    policy_digest: String,
-}
-
-impl FreshnessProvider for LocalFreshnessProvider {
-    fn check(
-        &self,
-        _agent: &AgentKeyFingerprint,
-        _authority_id: &praetore_core::AuthorityId,
-        policy_digest: &str,
-        now: OffsetDateTime,
-    ) -> Result<FreshnessLease, FreshnessError> {
-        if policy_digest != self.policy_digest {
-            return Err(FreshnessError::Revoked);
-        }
-        Ok(FreshnessLease {
-            valid_until: now + Duration::seconds(30),
-        })
-    }
-
-    fn check_authority(
-        &self,
-        _agent: &AgentKeyFingerprint,
-        _authority_id: &praetore_core::AuthorityId,
-        authority_digest: &str,
-        policy_digest: &str,
-        now: OffsetDateTime,
-    ) -> Result<FreshnessLease, FreshnessError> {
-        if authority_digest.len() != 64
-            || !authority_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || policy_digest != self.policy_digest
-        {
-            return Err(FreshnessError::InvalidResponse);
-        }
-        self.check(_agent, _authority_id, policy_digest, now)
-    }
-}
 
 struct LocalExecutionSigner {
     key_id: String,
@@ -87,6 +50,9 @@ struct GatewayAdapterSetup {
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: String,
     require_trusted_clock: bool,
+    /// `http` and `sandbox`: refuse demo freshness, unauthenticated API
+    /// access and unscoped multi-tenant approver keys.
+    production_adapter: bool,
 }
 
 impl LocalExecutionSigner {
@@ -248,6 +214,8 @@ fn build_gateway(
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: &str,
     require_trusted_clock: bool,
+    production_adapter: bool,
+    approval_verifiers: Vec<HumanApprovalVerifier>,
 ) -> Result<Gateway, Box<dyn std::error::Error>> {
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
@@ -269,7 +237,7 @@ fn build_gateway(
             .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(
                 database.connect()?,
             )))
-            .with_freshness_provider(Arc::new(LocalFreshnessProvider { policy_digest }));
+            .with_freshness_provider(freshness_provider(production_adapter, policy_digest)?);
     if let Some(bindings) = tenant_issuer_bindings {
         config = config.with_tenant_issuer_bindings(bindings);
     }
@@ -293,14 +261,89 @@ fn build_gateway(
     let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
         "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
     )?)?);
-    let approval_key_id = required_env("PRAETORE_GATEWAY_APPROVER_KEY_ID")?;
-    let approval_public_key = VerifiedPublicKey::from_bytes(&hex::decode(required_env(
-        "PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX",
-    )?)?)?;
-    let approval_verifier = HumanApprovalVerifier::new(approval_key_id, approval_public_key)?;
+    let mut gateway = Gateway::new(engine, journal, dispatcher, execution_signer)?;
+    for verifier in approval_verifiers {
+        gateway = gateway.with_human_approval_verifier(verifier);
+    }
+    Ok(gateway)
+}
 
-    Ok(Gateway::new(engine, journal, dispatcher, execution_signer)?
-        .with_human_approval_verifier(approval_verifier))
+/// `http`/`sandbox` require the file-based revocation snapshot; only the
+/// local demo may fall back to the demo provider that never checks
+/// revocation.
+fn freshness_provider(
+    production_adapter: bool,
+    policy_digest: String,
+) -> Result<Arc<dyn FreshnessProvider>, Box<dyn std::error::Error>> {
+    match env::var("PRAETORE_GATEWAY_FRESHNESS_FILE") {
+        Ok(path) => {
+            let defaults = FileFreshnessLimits::default();
+            let limits = FileFreshnessLimits {
+                reload_interval: env_duration_ms(
+                    "PRAETORE_GATEWAY_FRESHNESS_RELOAD_INTERVAL_MS",
+                    defaults.reload_interval.as_millis() as u64,
+                )?,
+                lease: time::Duration::try_from(env_duration_ms(
+                    "PRAETORE_GATEWAY_FRESHNESS_LEASE_MS",
+                    defaults.lease.whole_milliseconds() as u64,
+                )?)?,
+                max_snapshot_validity: time::Duration::try_from(env_duration_ms(
+                    "PRAETORE_GATEWAY_FRESHNESS_MAX_SNAPSHOT_VALIDITY_MS",
+                    defaults.max_snapshot_validity.whole_milliseconds() as u64,
+                )?)?,
+            };
+            if limits.lease > time::Duration::minutes(1) {
+                return Err("PRAETORE_GATEWAY_FRESHNESS_LEASE_MS must be at most 60000".into());
+            }
+            Ok(Arc::new(FileFreshnessProvider::new(
+                path,
+                policy_digest,
+                limits,
+            )?))
+        }
+        Err(_) if production_adapter => Err(
+            "PRAETORE_GATEWAY_FRESHNESS_FILE is required with the http and sandbox adapters; the demo freshness provider never checks revocation"
+                .into(),
+        ),
+        Err(_) => {
+            tracing::warn!(
+                "local-demo adapter: demo freshness provider grants leases without checking revocation"
+            );
+            Ok(Arc::new(DemoFreshnessProvider::new(policy_digest)))
+        }
+    }
+}
+
+/// Per-tenant approver bindings, or a single approver key that is unscoped
+/// only for the local demo and bound to the sole tenant otherwise.
+fn approval_verifiers(
+    tenant_issuer_bindings: Option<&HashMap<Uuid, Vec<String>>>,
+) -> Result<Vec<HumanApprovalVerifier>, Box<dyn std::error::Error>> {
+    let issuer_tenants: Option<HashSet<Uuid>> =
+        tenant_issuer_bindings.map(|bindings| bindings.keys().copied().collect());
+    let single_key = (
+        env::var("PRAETORE_GATEWAY_APPROVER_KEY_ID"),
+        env::var("PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX"),
+    );
+    match (env::var("PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE"), single_key) {
+        (Ok(_), (Ok(_), _) | (_, Ok(_))) => Err(
+            "set either PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE or the single approver key variables, not both"
+                .into(),
+        ),
+        (Ok(path), _) => parse_approver_bindings(
+            &read_limited(&path, 1_048_576)?,
+            issuer_tenants.as_ref(),
+        ),
+        (Err(_), (Ok(key_id), Ok(public_key_hex))) => Ok(vec![single_approver(
+            &key_id,
+            &public_key_hex,
+            issuer_tenants.as_ref(),
+        )?]),
+        (Err(_), _) => Err(
+            "PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE or PRAETORE_GATEWAY_APPROVER_KEY_ID and PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX are required"
+                .into(),
+        ),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -331,6 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_issuer_bindings: Some(bindings),
                 audience,
                 require_trusted_clock: true,
+                production_adapter: true,
             }
         }
         Ok("sandbox") => {
@@ -351,6 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_issuer_bindings: Some(bindings),
                 audience,
                 require_trusted_clock: true,
+                production_adapter: true,
             }
         }
         Ok("local-demo") | Err(_) => GatewayAdapterSetup {
@@ -358,23 +403,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tenant_issuer_bindings: None,
             audience: "praetore-local-demo".to_owned(),
             require_trusted_clock: false,
+            production_adapter: false,
         },
         Ok(_) => {
             return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
         }
     };
-    let production = matches!(
-        env::var("PRAETORE_GATEWAY_ADAPTER").as_deref(),
-        Ok("http" | "sandbox")
-    );
+    let approval_verifiers = approval_verifiers(adapter_setup.tenant_issuer_bindings.as_ref())?;
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL").ok();
-    let database = prepare_database(&database_url, migration_url.as_deref(), production)?;
+    let database = prepare_database(
+        &database_url,
+        migration_url.as_deref(),
+        adapter_setup.production_adapter,
+    )?;
     let gateway = Arc::new(build_gateway(
         &database,
         adapter_setup.dispatcher,
         adapter_setup.tenant_issuer_bindings,
         &adapter_setup.audience,
         adapter_setup.require_trusted_clock,
+        adapter_setup.production_adapter,
+        approval_verifiers,
     )?);
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
         Ok(address) => address.parse::<std::net::SocketAddr>()?,
@@ -391,11 +440,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if address.port() == 0 {
         return Err("gateway listener port must be between 1 and 65535".into());
     }
+    let credentials = env::var("PRAETORE_GATEWAY_API_CREDENTIALS_FILE")
+        .ok()
+        .map(|path| read_limited(&path, 1_048_576))
+        .transpose()?;
+    let api_auth = select_api_auth(
+        adapter_setup.production_adapter,
+        address,
+        credentials.as_deref(),
+    )?;
+    if !api_auth.is_required() {
+        tracing::warn!(
+            %address,
+            "local demo: HTTP API has no caller authentication; loopback only"
+        );
+    }
 
     tracing::warn!(
         %address,
         loopback_only = address.ip().is_loopback(),
-        "development service: plain HTTP and local freshness; do not expose without private-network policy and authenticated TLS termination"
+        api_authentication = api_auth.is_required(),
+        "plain HTTP service: do not expose without private-network policy and authenticated TLS termination"
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -403,7 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&address).await?;
         tracing::info!(%address, "PRÆTORE local demo gateway listening");
-        axum::serve(listener, http_api::router(gateway)).await?;
+        axum::serve(listener, http_api::router(gateway, api_auth)).await?;
         Ok::<_, std::io::Error>(())
     })?;
     Ok(())
