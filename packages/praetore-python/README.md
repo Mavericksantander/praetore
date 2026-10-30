@@ -9,9 +9,21 @@ intact = praetore.verify_evidence_integrity(evidence_json)
 authentic = praetore.verify_evidence_attester_signature(
     evidence_json, trusted_attester_public_key_hex
 )
+
+receipt_ok = praetore.verify_gateway_receipt(
+    receipt_json,
+    trusted_execution_public_key_hex,
+    "execution-key-id",
+    trusted_evidence_attester_public_key_hex,
+)
 ```
 
-Both functions return `False` for malformed, tampered, or unverifiable input.
+`verify_gateway_receipt` checks a gateway receipt's signed execution
+attestation (schema v1, v2 or v3) and the evidence `attester_signature`
+against the pinned evidence attester key. It rejects an unknown or tampered
+`not_dispatched_reason` and a missing, forged or foreign evidence signature.
+
+All functions return `False` for malformed, tampered, or unverifiable input.
 The public key must be a trusted Ed25519 key provisioned independently from the
 evidence. These functions verify historical evidence integrity or attester
 authenticity only: they do not check current freshness, replay state, policy,

@@ -57,4 +57,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "path_prefix"
+path = "fuzz_targets/path_prefix.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
