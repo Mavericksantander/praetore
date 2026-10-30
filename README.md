@@ -125,13 +125,12 @@ cargo test -p praetore-gateway --test enforcement human_approval
 - **Path protection is local and lexical only.** `Prefix` and `PathPrefix`
   compare strings and never consult the filesystem. **Symlinks are out of
   scope.**
-- **The journal does not separate approval from dispatch, and does not
-  independently confirm execution.**
-  - In `praetore.execution_journal`, an approval moves an execution directly
-    from `not_dispatched` to `dispatched` in the same transaction that
-    records the decision in `praetore.human_approvals`
-    ([`crates/praetore-replay-postgres/src/execution.rs`](crates/praetore-replay-postgres/src/execution.rs)).
-    There is no separate "approved but not yet dispatched" state.
+- **The journal does not independently confirm execution.**
+  - Approval and dispatch are separate steps: an approval moves an execution
+    from `not_dispatched` to `approved_pending_dispatch`, and a separate
+    claim moves it to `dispatched`
+    ([`crates/praetore-replay-postgres/src/execution.rs`](crates/praetore-replay-postgres/src/execution.rs),
+    migration `0010_approved_pending_dispatch.sql`).
   - `executed` and `confirmed` record what the dispatcher adapter reported.
     The strength of `confirmed` depends on that adapter
     ([`DispatchReport`](crates/praetore-gateway/src/lib.rs)).
@@ -139,9 +138,9 @@ cargo test -p praetore-gateway --test enforcement human_approval
   does) can leave a journal state that does not reflect who actually
   executed it. [#16](https://github.com/Mavericksantander/praetore/pull/16)
   addresses this; it is in development and not merged.
-- **No fuzzing campaign has been run** on the new path operators. The
-  repository's bounded fuzz targets do not cover them specifically.
-- **Not yet tested on macOS.**
+- **No sustained fuzzing campaign has been run.** A `path_prefix` fuzz
+  target exists ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs)),
+  but CI runs each target only as a 10-second smoke test.
 
 ## Not verified
 
@@ -152,10 +151,14 @@ The following were **not** exercised when this README was last checked:
   `praetore init`, `run`, `demo`, `approve` / `reject`);
 - `cargo install` (the verifier was built with `cargo build` instead);
 - the Python package ([`packages/praetore-python/`](packages/praetore-python/));
-- the 21 PostgreSQL tests in
+- the three PostgreSQL server-restart tests in
   [`crates/praetore-replay-postgres/tests/postgres.rs`](crates/praetore-replay-postgres/tests/postgres.rs),
-  which are ignored without a database (`PRAETORE_TEST_DATABASE_URL`);
+  which need a manual restart between their `before` and `after` phases;
 - Windows.
+
+The workspace tests, Clippy and rustfmt were run on macOS (Apple silicon).
+The other PostgreSQL tests in `postgres.rs`, which are ignored without
+`PRAETORE_TEST_DATABASE_URL`, were run there against PostgreSQL 16.
 
 ## In development
 
@@ -298,6 +301,7 @@ Identity, authority, policy, authorization, and evidence are treated as distinct
 praetore/
 ├── crates/
 │   ├── praetore-core/
+│   ├── praetore-receipt/
 │   ├── praetore-verify/
 │   ├── praetore-python/
 │   ├── praetore-replay-postgres/
