@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `praetore-mcp wrap --mode observe` no longer forwards `tools/call` without
+  receipts when the home cannot be loaded at startup (not initialized, or
+  invalid keys, pins, authority or policy). Both modes now refuse every
+  `tools/call` in that case and print `every tools/call will be REFUSED`;
+  other MCP traffic is still relayed. Per-call evaluation errors after a
+  successful start keep the documented observe behavior.
 - New receipts always record what decided them in `decision.decided_by`, as
   part of the hashed and Ed25519-signed evidence payload, in the new
   **evidence schema v4**:
