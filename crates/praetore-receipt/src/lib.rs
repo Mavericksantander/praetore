@@ -395,6 +395,10 @@ pub struct GatewayReceipt {
     pub evidence: Evidence,
     pub authorization: AuthorizationStatus,
     pub execution: ExecutionStatus,
+    /// Adapter output of an executed or confirmed action. JSON `null` is
+    /// read as `None`, so the serialized form cannot tell "no output" from
+    /// an adapter that returned `null`; verification resolves this from the
+    /// signed execution status (see [`Self::verify_execution_attestation`]).
     pub output: Option<Value>,
     pub execution_attestation: ExecutionAttestation,
 }
@@ -412,11 +416,18 @@ impl GatewayReceipt {
         expected_key_id: &str,
         evidence_attester_key: &praetore_core::VerifiedPublicKey,
     ) -> Result<(), ExecutionAttestationError> {
+        // `"output": null` deserializes to `None`. An executed or confirmed
+        // action always has an output, so there it is the JSON value `null`,
+        // whose digest the attestation signs; elsewhere it means no output.
+        let output = match (&self.output, self.execution) {
+            (None, ExecutionStatus::Executed | ExecutionStatus::Confirmed) => Some(&Value::Null),
+            (output, _) => output.as_ref(),
+        };
         self.execution_attestation.verify(
             &self.evidence,
             self.authorization,
             self.execution,
-            self.output.as_ref(),
+            output,
             public_key,
             expected_key_id,
         )?;

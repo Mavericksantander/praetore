@@ -37,8 +37,10 @@ and include restrictive content-security and MIME-sniffing headers.
 Do not expose this listener to a network. Remote operator access requires a
 separately reviewed authenticated TLS proxy and network boundary; forwarding
 the loopback listener or changing its bind check is not an approved
-deployment pattern. The current PostgreSQL client uses `NoTls`; use a local
-socket or a trusted protected database network/tunnel. The API never connects
+deployment pattern. `PRAETORE_OBSERVE_DATABASE_URL` follows the same TLS
+rule as the gateway: loopback hosts and local sockets may use plaintext, any
+other host requires `sslmode=verify-full` and `sslrootcert` (see
+[PostgreSQL adapter](operations.md#postgresql-adapter)). The API never connects
 to PostgreSQL from the browser.
 
 Apply migrations in numeric order through
