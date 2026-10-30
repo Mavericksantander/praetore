@@ -130,6 +130,17 @@ pub mod http_api;
 pub mod local_demo;
 
 const HUMAN_APPROVAL_DOMAIN: &[u8] = b"PRAETORE_HUMAN_APPROVAL_V1\0";
+
+/// Revalidation failures that say nothing about the approval itself and may
+/// clear on their own: they must not permanently close an approved execution.
+fn is_transient_authorization_error(error: &PraetoreError) -> bool {
+    matches!(
+        error,
+        PraetoreError::TrustedClockUnavailable
+            | PraetoreError::ReplayGuardUnavailable
+            | PraetoreError::FreshnessCheckFailed(FreshnessError::Unavailable)
+    )
+}
 const APPROVAL_EXPIRED_DOMAIN: &[u8] = b"PRAETORE_APPROVAL_EXPIRED_V1\0";
 
 /// Returns the tenant UUID only when the authority contains exactly one
@@ -200,6 +211,34 @@ impl ApprovalChallenge {
     }
 }
 
+/// What an approver is shown: the challenge to sign and the exact persisted
+/// action whose digest it binds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalChallengeView {
+    pub challenge: ApprovalChallenge,
+    pub action: Action,
+}
+
+impl ApprovalChallengeView {
+    pub fn from_json(json: &str) -> Result<Self, ApprovalError> {
+        if json.len() > 131_072 {
+            return Err(ApprovalError::InvalidChallenge);
+        }
+        let value = praetore_core::canonical::parse_json_rejecting_duplicates(json)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        serde_json::from_value(value).map_err(|_| ApprovalError::InvalidChallenge)
+    }
+
+    /// True only when the displayed action hashes to the digest that the
+    /// challenge (and therefore the approver's signature) commits to.
+    pub fn action_matches_challenge(&self) -> bool {
+        self.action.validate().is_ok()
+            && action_digest(&self.action)
+                .is_ok_and(|digest| digest == self.challenge.action_digest)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanApprovalOutcome {
@@ -213,9 +252,15 @@ pub enum HumanApprovalOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalResolution {
     Pending,
+    /// Approved and either awaiting its single dispatch or dispatched.
     Approved,
     Rejected,
+    /// The window closed without a signed decision.
     Expired,
+    /// Approved, but the execution was closed without dispatch (expired
+    /// before the claim, crash-recovered, or failed revalidation). The
+    /// signed receipt carries the `not_dispatched_reason`.
+    NotDispatched,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -447,6 +492,10 @@ impl ApprovalExpiredReceipt {
             return Err(ExecutionAttestationError::KeyMismatch);
         }
         self.validate_binding(evidence)?;
+        // Lowercase hex only, so a signature has a single valid encoding.
+        if !is_lower_hex(&self.signature) {
+            return Err(ExecutionAttestationError::InvalidSignature);
+        }
         let signature = hex::decode(&self.signature)
             .map_err(|_| ExecutionAttestationError::InvalidSignature)?;
         if signature.len() != 64 {
@@ -458,13 +507,22 @@ impl ApprovalExpiredReceipt {
     }
 }
 
+/// A pinned human-approver key.
+///
+/// A verifier built with [`HumanApprovalVerifier::for_tenant`] only verifies
+/// decisions whose challenge belongs to that tenant. One built with
+/// [`HumanApprovalVerifier::new`] is unscoped and approves for every tenant
+/// the gateway serves; use it only for single-tenant deployments such as the
+/// local demo.
 #[derive(Debug, Clone)]
 pub struct HumanApprovalVerifier {
     key_id: String,
     public_key: praetore_core::VerifiedPublicKey,
+    tenant_id: Option<Uuid>,
 }
 
 impl HumanApprovalVerifier {
+    /// Unscoped verifier: valid for every tenant. Single-tenant use only.
     pub fn new(
         key_id: impl Into<String>,
         public_key: praetore_core::VerifiedPublicKey,
@@ -473,7 +531,39 @@ impl HumanApprovalVerifier {
         if key_id.trim().is_empty() || key_id != key_id.trim() || key_id.len() > 256 {
             return Err(ApprovalError::InvalidVerifier);
         }
-        Ok(Self { key_id, public_key })
+        Ok(Self {
+            key_id,
+            public_key,
+            tenant_id: None,
+        })
+    }
+
+    /// Verifier bound to exactly one tenant: it never verifies a decision
+    /// for another tenant's execution.
+    pub fn for_tenant(
+        tenant_id: Uuid,
+        key_id: impl Into<String>,
+        public_key: praetore_core::VerifiedPublicKey,
+    ) -> Result<Self, ApprovalError> {
+        if tenant_id.is_nil() {
+            return Err(ApprovalError::InvalidVerifier);
+        }
+        let mut verifier = Self::new(key_id, public_key)?;
+        verifier.tenant_id = Some(tenant_id);
+        Ok(verifier)
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// `None` for an unscoped (single-tenant) verifier.
+    pub fn tenant_id(&self) -> Option<Uuid> {
+        self.tenant_id
+    }
+
+    fn applies_to(&self, key_id: &str, tenant_id: Uuid) -> bool {
+        self.key_id == key_id && self.tenant_id.is_none_or(|bound| bound == tenant_id)
     }
 
     fn verify(&self, decision: &HumanApprovalDecision) -> Result<(), ApprovalError> {
@@ -481,6 +571,9 @@ impl HumanApprovalVerifier {
             || decision.approver_key_id != self.key_id
             || decision.approval_id.is_nil()
         {
+            return Err(ApprovalError::InvalidSignature);
+        }
+        if !is_lower_hex(&decision.signature) {
             return Err(ApprovalError::InvalidSignature);
         }
         let signature =
@@ -511,6 +604,16 @@ pub enum ApprovalError {
     NotPending,
     #[error("the requesting agent cannot approve its own action")]
     SelfApproval,
+}
+
+/// Human-approval state of one execution key, with the execution state that
+/// actually resulted from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalState {
+    pub resolution: ApprovalResolution,
+    pub execution: ExecutionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_dispatched_reason: Option<NotDispatchedReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -742,7 +845,7 @@ pub struct Gateway {
     journal: Arc<dyn ExecutionJournal>,
     dispatcher: Arc<dyn ActionDispatcher>,
     execution_attester: Arc<dyn ExecutionAttestationSigner>,
-    approval_verifier: Option<HumanApprovalVerifier>,
+    approval_verifiers: Vec<HumanApprovalVerifier>,
 }
 
 impl Gateway {
@@ -760,13 +863,69 @@ impl Gateway {
             journal,
             dispatcher,
             execution_attester,
-            approval_verifier: None,
+            approval_verifiers: Vec::new(),
         })
     }
 
+    /// Adds a pinned approver key. May be called once per approver; a
+    /// decision is verified only by the single verifier whose key id matches
+    /// and whose tenant scope covers the execution's tenant.
     pub fn with_human_approval_verifier(mut self, verifier: HumanApprovalVerifier) -> Self {
-        self.approval_verifier = Some(verifier);
+        self.approval_verifiers.push(verifier);
         self
+    }
+
+    /// Verifies a decision against the stored execution: the challenge must
+    /// be the one derived from the persisted evidence, the approver key must
+    /// be pinned for the execution's tenant, the signature must verify, and
+    /// the requesting agent must not be the approver.
+    fn verify_decision_for_record(
+        &self,
+        record: &ExecutionRecord,
+        decision: &HumanApprovalDecision,
+    ) -> Result<(), GatewayError> {
+        if self.approval_verifiers.is_empty() {
+            return Err(ApprovalError::NotConfigured.into());
+        }
+        let expected = ApprovalChallenge::from_evidence(&record.evidence, &record.action_digest)?;
+        if decision.challenge != expected {
+            return Err(ApprovalError::InvalidChallenge.into());
+        }
+        let mut candidates = self.approval_verifiers.iter().filter(|verifier| {
+            verifier.applies_to(&decision.approver_key_id, record.key.tenant_id)
+        });
+        let verifier = match (candidates.next(), candidates.next()) {
+            (Some(verifier), None) => verifier,
+            _ => return Err(ApprovalError::InvalidSignature.into()),
+        };
+        verifier.verify(decision)?;
+        if verifier.public_key.as_bytes().as_slice() == record.evidence.agent.public_key.as_slice()
+            || decision.approver_key_id == record.evidence.agent.id.as_uuid().to_string()
+        {
+            return Err(ApprovalError::SelfApproval.into());
+        }
+        Ok(())
+    }
+
+    /// Independently re-checks, at claim time, that a `RequireApproval`
+    /// execution carries a recorded, valid approval for exactly this action.
+    /// `validate_evidence_for_dispatch` accepts `RequireApproval` evidence,
+    /// so it must never be the only gate before dispatch.
+    fn verify_recorded_approval(&self, record: &ExecutionRecord) -> Result<(), GatewayError> {
+        if record.authorization != AuthorizationStatus::RequiresApproval
+            || record.evidence.decision.outcome != DecisionOutcome::RequireApproval
+        {
+            return Err(GatewayError::InvalidEvidence);
+        }
+        let decision = record
+            .human_approval
+            .as_ref()
+            .filter(|decision| decision.outcome == HumanApprovalOutcome::Approve)
+            .ok_or(ApprovalError::NotPending)?;
+        if action_digest(&record.evidence.action)? != record.action_digest {
+            return Err(GatewayError::Journal(JournalError::InvalidRecord));
+        }
+        self.verify_decision_for_record(record, decision)
     }
 
     fn create_execution_attestation(
@@ -858,6 +1017,27 @@ impl Gateway {
         )?)
     }
 
+    /// The pending challenge together with the persisted action it binds,
+    /// so an approver can be shown exactly what it is about to sign.
+    pub fn approval_challenge_view(
+        &self,
+        key: ExecutionKey,
+    ) -> Result<ApprovalChallengeView, GatewayError> {
+        let challenge = self.approval_challenge(key)?;
+        let record = self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?;
+        let view = ApprovalChallengeView {
+            challenge,
+            action: record.evidence.action,
+        };
+        if !view.action_matches_challenge() {
+            return Err(GatewayError::Journal(JournalError::InvalidRecord));
+        }
+        Ok(view)
+    }
+
     /// Reports the human-approval state of exactly one execution key. It never
     /// dispatches. On the first detection of an expired window it persists the
     /// single signed [`ApprovalExpiredReceipt`] (SAF-10); otherwise it does not
@@ -868,10 +1048,34 @@ impl Gateway {
         &self,
         key: ExecutionKey,
     ) -> Result<ApprovalResolution, GatewayError> {
+        Ok(self.approval_state(key)?.resolution)
+    }
+
+    /// [`Gateway::approval_resolution`] together with the execution state
+    /// that resulted from it. An approved execution that was later closed
+    /// without dispatch reports [`ApprovalResolution::NotDispatched`] and the
+    /// signed `not_dispatched_reason`, never `approved`.
+    pub fn approval_state(&self, key: ExecutionKey) -> Result<ApprovalState, GatewayError> {
         let record = self
             .journal
             .get(key)?
             .ok_or(GatewayError::ExecutionNotFound(key))?;
+        let resolution = self.resolution_of(&record)?;
+        let not_dispatched_reason = match record.execution {
+            ExecutionStatus::NotDispatched => record
+                .execution_attestation
+                .as_ref()
+                .and_then(|attestation| attestation.not_dispatched_reason),
+            _ => None,
+        };
+        Ok(ApprovalState {
+            resolution,
+            execution: record.execution,
+            not_dispatched_reason,
+        })
+    }
+
+    fn resolution_of(&self, record: &ExecutionRecord) -> Result<ApprovalResolution, GatewayError> {
         if record.authorization != AuthorizationStatus::RequiresApproval {
             return Err(ApprovalError::NotPending.into());
         }
@@ -883,6 +1087,11 @@ impl Gateway {
         }
         match &record.human_approval {
             Some(decision) => Ok(match decision.outcome {
+                HumanApprovalOutcome::Approve
+                    if record.execution == ExecutionStatus::NotDispatched =>
+                {
+                    ApprovalResolution::NotDispatched
+                }
                 HumanApprovalOutcome::Approve => ApprovalResolution::Approved,
                 HumanApprovalOutcome::Reject => ApprovalResolution::Rejected,
             }),
@@ -891,7 +1100,7 @@ impl Gateway {
                 // decision is inconsistent; never report it as pending.
                 Err(GatewayError::Journal(JournalError::InvalidRecord))
             }
-            None => match self.check_pending_approval_window(&record) {
+            None => match self.check_pending_approval_window(record) {
                 Ok(()) => Ok(ApprovalResolution::Pending),
                 Err(GatewayError::Approval(ApprovalError::Expired)) => {
                     Ok(ApprovalResolution::Expired)
@@ -909,10 +1118,9 @@ impl Gateway {
         &self,
         decision: HumanApprovalDecision,
     ) -> Result<HumanApprovalResult, GatewayError> {
-        let verifier = self
-            .approval_verifier
-            .as_ref()
-            .ok_or(ApprovalError::NotConfigured)?;
+        if self.approval_verifiers.is_empty() {
+            return Err(ApprovalError::NotConfigured.into());
+        }
         let key = ExecutionKey {
             tenant_id: decision.challenge.tenant_id,
             agent_id: decision.challenge.agent_id,
@@ -934,12 +1142,7 @@ impl Gateway {
             return Err(ApprovalError::InvalidChallenge.into());
         }
         self.check_pending_approval_window(&record)?;
-        verifier.verify(&decision)?;
-        if verifier.public_key.as_bytes().as_slice() == record.evidence.agent.public_key.as_slice()
-            || decision.approver_key_id == record.evidence.agent.id.as_uuid().to_string()
-        {
-            return Err(ApprovalError::SelfApproval.into());
-        }
+        self.verify_decision_for_record(&record, &decision)?;
         if decision.outcome == HumanApprovalOutcome::Approve {
             self.engine
                 .validate_evidence_for_dispatch(&record.evidence)
@@ -991,16 +1194,25 @@ impl Gateway {
         Ok(ApprovedPendingDispatch { record })
     }
 
-    /// Revalidates the evidence with the engine clock and claims the single
-    /// dispatch in the journal. On an expired window or a failed
-    /// revalidation the execution is closed as `NotDispatched` with a signed
-    /// reason, and the error is returned. Never retries.
+    /// Re-verifies the recorded approval, revalidates the evidence with the
+    /// engine clock and claims the single dispatch in the journal. On an
+    /// expired window or a terminal revalidation failure the execution is
+    /// closed as `NotDispatched` with a signed reason, and the error is
+    /// returned. Transient failures (trusted clock, freshness source or
+    /// replay storage unavailable) leave it `ApprovedPendingDispatch` so the
+    /// claim can be attempted again. Never retries by itself.
     pub fn claim_dispatch(
         &self,
         pending: ApprovedPendingDispatch,
     ) -> Result<DispatchPermit, GatewayError> {
         let record = pending.record;
+        // Fail closed without changing state: a record whose stored approval
+        // no longer verifies is not dispatched, and is left for an operator.
+        self.verify_recorded_approval(&record)?;
         if let Err(error) = self.engine.validate_evidence_for_dispatch(&record.evidence) {
+            if is_transient_authorization_error(&error) {
+                return Err(GatewayError::Authorization(error));
+            }
             let reason = match error {
                 PraetoreError::IntentInvalid
                 | PraetoreError::FreshnessCheckFailed(FreshnessError::Expired) => {
@@ -1257,7 +1469,7 @@ impl Gateway {
         }
 
         self.journal.mark_dispatched(key)?;
-        if let Err(error) = self.engine.validate_evidence_for_dispatch(&evidence) {
+        if let Err(error) = self.engine.validate_allow_evidence_for_dispatch(&evidence) {
             let execution = ExecutionStatus::Failed;
             let attestation =
                 self.create_execution_attestation(&evidence, authorization, execution, None)?;
@@ -1354,4 +1566,10 @@ impl Gateway {
 
         self.attest_record(&mut record)
     }
+}
+
+fn is_lower_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }

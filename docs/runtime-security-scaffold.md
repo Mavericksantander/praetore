@@ -92,9 +92,16 @@ and must not receive permission to create Jobs or Secrets.
 
 The supervisor revalidates the authority and action structures on gateway
 dispatch, then binds the worker callback to the result-token hash, exact
-action digest, and execution-key hash stored on the Job. Digest comparisons
-use a constant-time primitive and the one-shot pending result is removed only
-after all bindings match. This authenticates possession of the per-invocation
+action digest, and execution-key hash stored on the Job. The token and action
+digests are first compared against the in-memory pending execution, so a
+callback for an unknown key or with a wrong token is refused before any
+Kubernetes API request; the Job annotations are then checked as well. Digest
+comparisons use a constant-time primitive and the one-shot pending result is
+removed only after all bindings match. The callback listener closes excess
+connections at accept instead of queueing them, allows at most four
+concurrent connections per peer IP, enforces a 5 s header read timeout and
+closes each connection after 20 s, so one pod cannot hold the listener's 128
+connection slots. This authenticates possession of the per-invocation
 bearer token, not the truthfulness of the runner's output; compromised runner
 code can still submit a false result for its own invocation. The callback and
 restart path still need integration tests against a representative cluster.
