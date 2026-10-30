@@ -12,6 +12,10 @@ use serde_json::{Value, json};
 
 pub const TOOLS_CALL: &str = "tools/call";
 
+/// Keys other parsers may match case-insensitively at the message and
+/// `params` levels (Go `encoding/json`, used by mcp-go, folds field names).
+const RESERVED_KEYS: [&str; 6] = ["method", "params", "id", "jsonrpc", "name", "arguments"];
+
 /// One `tools/call` request or notification found in a client line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -20,18 +24,84 @@ pub struct ToolCall {
     pub params: Value,
 }
 
+/// One element of a JSON-RPC batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchItem {
+    pub id: Option<Value>,
+    pub call: Option<ToolCall>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Classified {
     /// Forward unchanged (not a `tools/call`, or blank).
     Passthrough,
     ToolCall(ToolCall),
-    /// A JSON-RPC batch containing at least one `tools/call`. Elements keep
-    /// their original order; `Some` marks the gated ones.
-    Batch(Vec<(JsonValue, Option<ToolCall>)>),
+    /// A JSON-RPC batch containing at least one `tools/call`.
+    Batch(Vec<BatchItem>),
     /// Not UTF-8, not JSON, or JSON with duplicate keys.
     Unparseable(String),
+    /// Valid here, but another MCP server parser could read it differently
+    /// (bare `\r` line splitting, case-insensitive keys, nested batches).
+    /// `candidates` are every `tools/call` reading found, for observe.
+    Ambiguous {
+        reason: String,
+        candidates: Vec<ToolCall>,
+    },
 }
 
+/// Simple case folding, at least as broad as Go's `unicode.SimpleFold` /
+/// `strings.EqualFold`: lower∘upper∘lower maps every member of a simple-fold
+/// orbit (e.g. `s`/`S`/`ſ`, `k`/`K`/`K`, `ß`/`ẞ`, `σ`/`ς`/`Σ`) to one string.
+/// It may fold some extra pairs (e.g. `ß`/`ss`), which only makes enforce
+/// stricter.
+pub fn fold(key: &str) -> String {
+    key.chars()
+        .flat_map(char::to_lowercase)
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn entries(value: &JsonValue) -> &[(String, JsonValue)] {
+    match value {
+        JsonValue::Object(entries) => entries,
+        _ => &[],
+    }
+}
+
+/// Keys that collide under case folding, or that fold to a reserved name
+/// without being it.
+fn fold_problem(value: &JsonValue, check_reserved: bool) -> Option<String> {
+    let mut seen = std::collections::HashMap::new();
+    for (key, _) in entries(value) {
+        let folded = fold(key);
+        if let Some(previous) = seen.insert(folded.clone(), key) {
+            return Some(format!(
+                "keys {previous:?} and {key:?} are equal under case folding"
+            ));
+        }
+        if check_reserved
+            && RESERVED_KEYS.contains(&folded.as_str())
+            && !RESERVED_KEYS.contains(&key.as_str())
+        {
+            return Some(format!("key {key:?} is a case variant of {folded:?}"));
+        }
+    }
+    None
+}
+
+/// Case-fold collisions anywhere inside tool arguments (tools may decode
+/// nested structs case-insensitively too).
+fn nested_fold_problem(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Object(entries) => fold_problem(value, false)
+            .or_else(|| entries.iter().find_map(|(_, v)| nested_fold_problem(v))),
+        JsonValue::Array(items) => items.iter().find_map(nested_fold_problem),
+        _ => None,
+    }
+}
+
+/// Exact-key reading (what this proxy and most JSON parsers see).
 fn tool_call_of(value: &JsonValue) -> Option<ToolCall> {
     if value.get("method").and_then(JsonValue::as_str) != Some(TOOLS_CALL) {
         return None;
@@ -42,12 +112,133 @@ fn tool_call_of(value: &JsonValue) -> Option<ToolCall> {
     })
 }
 
+/// Last member whose key folds to `key` (Go assigns every case-insensitive
+/// match in document order, so the last one wins).
+fn get_folded<'a>(value: &'a JsonValue, key: &str) -> Option<&'a JsonValue> {
+    entries(value)
+        .iter()
+        .rev()
+        .find(|(k, _)| fold(k) == key)
+        .map(|(_, v)| v)
+}
+
+/// Case-insensitive reading (Go `encoding/json` into structs).
+fn folded_tool_call_of(value: &JsonValue) -> Option<ToolCall> {
+    if get_folded(value, "method").and_then(JsonValue::as_str) != Some(TOOLS_CALL) {
+        return None;
+    }
+    let params = get_folded(value, "params").map(|params| {
+        let mut out = serde_json::Map::new();
+        if let JsonValue::Object(_) = params {
+            for key in ["name", "arguments"] {
+                if let Some(v) = get_folded(params, key) {
+                    out.insert(key.into(), v.to_value());
+                }
+            }
+            Value::Object(out)
+        } else {
+            params.to_value()
+        }
+    });
+    Some(ToolCall {
+        id: get_folded(value, "id").map(JsonValue::to_value),
+        params: params.unwrap_or(Value::Null),
+    })
+}
+
+struct Ambiguity {
+    reason: String,
+    candidates: Vec<ToolCall>,
+}
+
+fn push_unique(candidates: &mut Vec<ToolCall>, call: Option<ToolCall>) {
+    if let Some(call) = call
+        && !candidates.contains(&call)
+    {
+        candidates.push(call);
+    }
+}
+
+/// Every exact or case-folded `tools/call` reading anywhere in `value`.
+fn collect_calls(value: &JsonValue, out: &mut Vec<ToolCall>) {
+    match value {
+        JsonValue::Array(items) => items.iter().for_each(|item| collect_calls(item, out)),
+        JsonValue::Object(_) => {
+            push_unique(out, tool_call_of(value));
+            push_unique(out, folded_tool_call_of(value));
+        }
+        _ => {}
+    }
+}
+
+/// Checks one message object for case-folding ambiguity.
+fn check_message(value: &JsonValue) -> Result<Option<ToolCall>, Ambiguity> {
+    let exact = tool_call_of(value);
+    let mut problem = fold_problem(value, true);
+    if problem.is_none()
+        && exact.is_some()
+        && let Some(params) = value.get("params")
+    {
+        problem = fold_problem(params, true)
+            .or_else(|| params.get("arguments").and_then(nested_fold_problem));
+    }
+    match problem {
+        None => Ok(exact),
+        Some(reason) => {
+            let mut candidates = Vec::new();
+            push_unique(&mut candidates, exact);
+            push_unique(&mut candidates, folded_tool_call_of(value));
+            Err(Ambiguity { reason, candidates })
+        }
+    }
+}
+
 /// Classifies one line (without or with its trailing newline).
 pub fn classify(line: &[u8]) -> Classified {
     let Ok(text) = std::str::from_utf8(line) else {
         return Classified::Unparseable("line is not valid UTF-8".into());
     };
-    let text = text.trim_end_matches(['\n', '\r']);
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    if body.contains('\r') {
+        // Python's TextIOWrapper (universal newlines, used by the MCP Python
+        // SDK) and Node's readline end a line at `\r`, `\n` or `\r\n`, while
+        // JSON treats `\r` as whitespace. Collect what such a reader sees.
+        let mut candidates = Vec::new();
+        let segments: Vec<&str> = body.split('\r').collect();
+        for segment in &segments {
+            match classify_text(segment) {
+                Classified::ToolCall(call) => push_unique(&mut candidates, Some(call)),
+                Classified::Batch(items) => {
+                    for item in items {
+                        push_unique(&mut candidates, item.call);
+                    }
+                }
+                Classified::Ambiguous {
+                    candidates: inner, ..
+                } => {
+                    for call in inner {
+                        push_unique(&mut candidates, Some(call));
+                    }
+                }
+                Classified::Passthrough | Classified::Unparseable(_) => {}
+            }
+        }
+        if let Classified::ToolCall(call) = classify_text(body) {
+            push_unique(&mut candidates, Some(call));
+        }
+        return Classified::Ambiguous {
+            reason: format!(
+                "bare carriage return: universal-newline readers would split this line into {} messages",
+                segments.len()
+            ),
+            candidates,
+        };
+    }
+    classify_text(body)
+}
+
+fn classify_text(text: &str) -> Classified {
     if text.trim().is_empty() {
         return Classified::Passthrough;
     }
@@ -56,17 +247,49 @@ pub fn classify(line: &[u8]) -> Classified {
         Err(error) => return Classified::Unparseable(error),
     };
     match &value {
-        JsonValue::Object(_) => match tool_call_of(&value) {
-            Some(call) => Classified::ToolCall(call),
-            None => Classified::Passthrough,
+        JsonValue::Object(_) => match check_message(&value) {
+            Ok(Some(call)) => Classified::ToolCall(call),
+            Ok(None) => Classified::Passthrough,
+            Err(Ambiguity { reason, candidates }) => Classified::Ambiguous { reason, candidates },
         },
-        JsonValue::Array(items) => {
-            let gated: Vec<_> = items
-                .iter()
-                .map(|item| (item.clone(), tool_call_of(item)))
-                .collect();
-            if gated.iter().any(|(_, call)| call.is_some()) {
-                Classified::Batch(gated)
+        JsonValue::Array(elements) => {
+            let mut items = Vec::new();
+            let mut ambiguous: Option<String> = None;
+            let mut candidates = Vec::new();
+            for element in elements {
+                match element {
+                    JsonValue::Array(_) => {
+                        ambiguous.get_or_insert_with(|| "nested array inside a batch".into());
+                        collect_calls(element, &mut candidates);
+                    }
+                    JsonValue::Object(_) => match check_message(element) {
+                        Ok(call) => {
+                            push_unique(&mut candidates, call.clone());
+                            items.push(BatchItem {
+                                id: element.get("id").map(JsonValue::to_value),
+                                call,
+                            });
+                        }
+                        Err(Ambiguity {
+                            reason,
+                            candidates: inner,
+                        }) => {
+                            ambiguous.get_or_insert(reason);
+                            for call in inner {
+                                push_unique(&mut candidates, Some(call));
+                            }
+                        }
+                    },
+                    _ => items.push(BatchItem {
+                        id: None,
+                        call: None,
+                    }),
+                }
+            }
+            if let Some(reason) = ambiguous {
+                Classified::Ambiguous { reason, candidates }
+            } else if items.iter().any(|item| item.call.is_some()) {
+                Classified::Batch(items)
             } else {
                 Classified::Passthrough
             }
@@ -232,6 +455,26 @@ fn forward_unchanged(raw: &[u8]) -> Vec<u8> {
     bytes
 }
 
+fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str) {
+    out.warnings.push(format!(
+        "praetore-mcp: REFUSED {what} client line in enforce mode ({reason}); it could hide a tools/call"
+    ));
+    out.to_client = Some(line(&parse_error_response(&format!(
+        "praetore-mcp (enforce): {what} message was not forwarded"
+    ))));
+}
+
+fn batch_refused_error(id: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32600,
+            "message": "praetore-mcp (enforce): batch not forwarded because another element was blocked"
+        }
+    })
+}
+
 /// Handles one raw client line (including its newline, if any).
 pub fn handle_client_line(
     raw: &[u8],
@@ -244,13 +487,20 @@ pub fn handle_client_line(
         Classified::Passthrough => out.to_server = Some(forward_unchanged(raw)),
         Classified::Unparseable(reason) => match mode {
             Mode::Observe => out.to_server = Some(forward_unchanged(raw)),
-            Mode::Enforce => {
+            Mode::Enforce => refuse_unparseable(&mut out, "an unparseable", &reason),
+        },
+        Classified::Ambiguous { reason, candidates } => match mode {
+            Mode::Enforce => refuse_unparseable(&mut out, "an ambiguous", &reason),
+            Mode::Observe => {
                 out.warnings.push(format!(
-                    "praetore-mcp: REFUSED an unparseable client line in enforce mode ({reason}); it could hide a tools/call"
+                    "praetore-mcp: WARNING ambiguous client line ({reason}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
+                    candidates.len()
                 ));
-                out.to_client = Some(line(&parse_error_response(
-                    "praetore-mcp (enforce): unparseable message was not forwarded",
-                )));
+                for call in &candidates {
+                    // Observe always forwards; this only records receipts.
+                    let _ = decide(mode, server, call, evaluator, &mut out.warnings);
+                }
+                out.to_server = Some(forward_unchanged(raw));
             }
         },
         Classified::ToolCall(call) => {
@@ -264,30 +514,40 @@ pub fn handle_client_line(
             }
         }
         Classified::Batch(items) => {
-            let mut kept = Vec::new();
-            let mut replies = Vec::new();
-            let mut blocked_any = false;
-            for (item, call) in items {
-                match call {
-                    None => kept.push(item),
-                    Some(call) => match decide(mode, server, &call, evaluator, &mut out.warnings) {
-                        CallDecision::Forward => kept.push(item),
-                        CallDecision::Block(text) => {
-                            blocked_any = true;
-                            if let Some(id) = &call.id {
-                                replies.push(blocked_response(id, &text));
-                            }
-                        }
+            // All or nothing: if any tools/call is blocked, nothing in the
+            // batch is forwarded and every request in it gets a reply. The
+            // forwarded bytes are therefore always the original bytes.
+            let mut blocked: Vec<Option<String>> = Vec::with_capacity(items.len());
+            for item in &items {
+                blocked.push(match &item.call {
+                    Some(call) => match decide(mode, server, call, evaluator, &mut out.warnings) {
+                        CallDecision::Forward => None,
+                        CallDecision::Block(text) => Some(text),
                     },
-                }
+                    None => None,
+                });
             }
-            if !blocked_any {
+            if blocked.iter().all(Option::is_none) {
                 out.to_server = Some(forward_unchanged(raw));
-            } else if !kept.is_empty() {
-                out.to_server = Some(line(&JsonValue::Array(kept)));
-            }
-            if !replies.is_empty() {
-                out.to_client = Some(line(&replies));
+            } else {
+                let replies: Vec<Value> = items
+                    .iter()
+                    .zip(&blocked)
+                    .filter_map(|(item, text)| {
+                        let id = item.id.as_ref()?;
+                        Some(match (text, &item.call) {
+                            (Some(text), _) => blocked_response(id, text),
+                            (None, Some(_)) => blocked_response(
+                                id,
+                                "Not executed: praetore-mcp refused the whole batch because another tool call in it was blocked.",
+                            ),
+                            (None, None) => batch_refused_error(id),
+                        })
+                    })
+                    .collect();
+                if !replies.is_empty() {
+                    out.to_client = Some(line(&replies));
+                }
             }
         }
     }
@@ -497,23 +757,160 @@ mod tests {
     }
 
     #[test]
-    fn batch_removes_blocked_calls_and_replies_in_a_batch() {
-        let raw = br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":"b","method":"tools/call","params":{"name":"rm"}}]"#;
+    fn enforce_batch_is_all_or_nothing() {
+        let raw = br#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":"b","method":"tools/call","params":{"name":"rm"}},{"jsonrpc":"2.0","method":"notifications/x"}]"#;
         let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
-        assert_eq!(
-            out.to_server.as_deref(),
-            Some(&b"[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}]\n"[..])
-        );
+        assert!(out.to_server.is_none());
         let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
-        assert_eq!(reply[0]["id"], "b");
-        assert_eq!(reply[0]["result"]["isError"], true);
+        assert_eq!(reply.as_array().unwrap().len(), 2);
+        assert_eq!(reply[0]["id"], 1);
+        assert_eq!(reply[0]["error"]["code"], -32600);
+        assert_eq!(reply[1]["id"], "b");
+        assert_eq!(reply[1]["result"]["isError"], true);
 
+        // Nothing blocked: original bytes (including number formatting).
+        let raw = br#"[{"jsonrpc":"2.0","id":1.50,"method":"tools/call","params":{"name":"x","arguments":{"n":1e2}}}]"#;
         let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
         assert_eq!(
             out.to_server.as_deref().map(|b| &b[..b.len() - 1]),
             Some(&raw[..])
         );
+    }
+
+    #[test]
+    fn nested_batch_is_refused_in_enforce() {
+        let raw = br#"[[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rm"}}]]"#;
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+        assert!(out.to_server.is_none());
+        assert!(eval.calls.is_empty());
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert!(out.to_server.is_some());
+        assert_eq!(eval.calls.len(), 1, "observe still records the nested call");
+    }
+
+    /// Reviewer's repro: Python's universal-newline reader splits on bare CR.
+    #[test]
+    fn bare_carriage_return_is_refused_in_enforce_and_recorded_in_observe() {
+        let raw = b"{\"a\":1,\"x\":\r{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{\"name\":\"rm\"}}\r}\n";
+        assert!(matches!(classify(raw), Classified::Ambiguous { .. }));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+        assert!(out.to_server.is_none());
+        assert!(eval.calls.is_empty());
+        let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+        assert_eq!(reply["error"]["code"], -32700);
+
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
+        let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
+        assert_eq!(eval.calls.len(), 1);
+        assert_eq!(eval.calls[0].1["name"], "rm");
+        assert!(out.warnings[0].contains("carriage return"));
+    }
+
+    #[test]
+    fn crlf_terminator_is_still_fine() {
+        let raw = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\r\n";
+        assert_eq!(classify(raw), Classified::Passthrough);
+        let raw = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\r\r\n";
+        assert!(matches!(classify(raw), Classified::Ambiguous { .. }));
+    }
+
+    #[test]
+    fn unicode_line_separators_outside_strings_are_rejected_by_json() {
+        // U+2028 / U+2029 / NEL are not JSON whitespace: serde_json rejects
+        // them outside strings, and they are harmless inside strings.
+        for sep in ["\u{2028}", "\u{2029}", "\u{85}", "\u{0b}", "\u{0c}"] {
+            let line = format!("{{\"a\":1,{sep}\"b\":2}}");
+            assert!(
+                matches!(classify(line.as_bytes()), Classified::Unparseable(_)),
+                "{sep:?}"
+            );
+            let inside =
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"x\",\"p\":\"a{sep}b\"}}");
+            // Raw C0 controls are invalid even inside strings (fail closed).
+            let c0 = sep.chars().all(|c| (c as u32) < 0x20);
+            assert_eq!(
+                classify(inside.as_bytes()) == Classified::Passthrough,
+                !c0,
+                "{sep:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folding_matches_go_simple_fold_orbits() {
+        for (a, b) in [
+            ("method", "METHOD"),
+            ("s", "ſ"),
+            ("k", "\u{212a}"),
+            ("ß", "ẞ"),
+            ("σ", "ς"),
+            ("Σ", "ς"),
+            ("ǅ", "ǆ"),
+        ] {
+            assert_eq!(fold(a), fold(b), "{a} {b}");
+        }
+        assert_ne!(fold("method"), fold("methods"));
+    }
+
+    #[test]
+    fn case_variant_keys_are_ambiguous() {
+        let cases: &[&[u8]] = &[
+            // Go: last case-insensitive match wins -> tools/call
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","Method":"tools/call","params":{"name":"rm"}}"#,
+            // Kelvin sign / long s variants of reserved keys
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"argument\u{17f}\":{\"p\":1}}}".as_bytes(),
+            // Kelvin sign collision inside arguments
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"x\",\"arguments\":{\"k\":1,\"\u{212a}\":2}}}".as_bytes(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/li\u{17f}t\"}".as_bytes(),
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"METHOD\":\"tools/call\"}".as_bytes(),
+            // params level
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","Name":"rm"}}"#,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","Arguments":{"p":"/"}}}"#,
+            // nested inside arguments
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"o":[{"path":"/ok","PATH":"/etc"}]}}}"#,
+        ];
+        for raw in &cases[..3] {
+            assert!(
+                matches!(classify(raw), Classified::Ambiguous { .. }),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        // "tools/liſt" is a value, not a key: values are compared exactly.
+        assert_eq!(classify(cases[3]), Classified::Passthrough);
+        for raw in &cases[4..] {
+            assert!(
+                matches!(classify(raw), Classified::Ambiguous { .. }),
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+
+        let raw = cases[0];
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+        assert!(out.to_server.is_none() && eval.calls.is_empty());
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert_eq!(
+            out.to_server.as_deref().map(|b| &b[..b.len() - 1]),
+            Some(raw)
+        );
+        assert_eq!(
+            eval.calls.len(),
+            1,
+            "the Go reading (tools/call rm) is recorded"
+        );
+        assert_eq!(eval.calls[0].1["name"], "rm");
+
+        // Ordinary non-reserved keys with distinct folds stay fine.
+        let ok = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"Path":"/a","mode":"r"}}}"#;
+        assert!(matches!(classify(ok), Classified::ToolCall(_)));
     }
 }

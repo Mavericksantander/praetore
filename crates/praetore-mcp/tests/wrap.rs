@@ -455,3 +455,47 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
     );
     assert!(verify_cli(&home).status.success());
 }
+
+/// Security review regressions: bare-CR line splitting (Python/Node
+/// universal newlines) and case-insensitive keys (Go encoding/json).
+#[test]
+fn enforce_refuses_line_split_and_case_fold_differentials() {
+    let (_temp, home) = init_home();
+    let input = concat!(
+        "{\"a\":1,\"x\":\r{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"delete_file\"}}\r}\n",
+        r#"{"jsonrpc":"2.0","id":8,"method":"tools/list","Method":"tools/call","params":{"name":"delete_file"}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#,
+        "\r\n",
+    );
+    let (responses, stderr, out) = wrap_raw(&home, "enforce", input);
+    assert!(out.status.success(), "{stderr}");
+    let refused: Vec<_> = responses
+        .iter()
+        .filter(|r| r["error"]["code"] == -32700)
+        .collect();
+    assert_eq!(refused.len(), 2, "{responses:?}");
+    assert!(responses.iter().all(|r| r["id"] != 8), "{responses:?}");
+    // The CRLF-terminated line is still relayed normally.
+    assert_eq!(
+        by_id(&responses, &json!(9))["result"]["tools"][0]["name"],
+        "echo"
+    );
+    assert!(
+        stderr.contains("carriage return") && stderr.contains("case"),
+        "{stderr}"
+    );
+    assert!(receipts::read_journal(&home).unwrap().is_empty());
+
+    // Observe forwards both lines unchanged but records each tools/call reading.
+    let (_, stderr, out) = wrap_raw(&home, "observe", input);
+    assert!(out.status.success(), "{stderr}");
+    let evidence = journal(&home);
+    assert_eq!(evidence.len(), 2, "{stderr}");
+    assert!(
+        evidence
+            .iter()
+            .all(|e| e.action.parameters["tool"] == "delete_file")
+    );
+    assert!(verify_cli(&home).status.success());
+}
