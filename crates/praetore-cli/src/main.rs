@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signer, SigningKey};
-use postgres::{Client, NoTls};
+use postgres::Client;
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, AuthorizationRequest, EvidenceAttesterKey,
     FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig, Policy, PolicyEffect,
@@ -7,20 +7,18 @@ use praetore_core::{
     identity::AgentKeyFingerprint,
 };
 use praetore_gateway::{
-    ActionDispatcher, ApprovalChallenge, ExecutionAttestationError, ExecutionAttestationSigner,
-    Gateway, HumanApprovalDecision, HumanApprovalOutcome, HumanApprovalVerifier, http_api,
-    local_demo::LocalDemoDispatcher, sandbox::SandboxDispatcher,
+    ActionDispatcher, ApprovalChallenge, ApprovalChallengeView, ExecutionAttestationError,
+    ExecutionAttestationSigner, Gateway, HumanApprovalDecision, HumanApprovalOutcome,
+    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher, sandbox::SandboxDispatcher,
 };
-use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
+use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env, fs,
     io::{self, Write},
-    net::IpAddr,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -37,25 +35,19 @@ const CONFIG_FILE: &str = "config.json";
 const APPROVER_KEY_FILE: &str = "approver.key";
 const APPROVER_PIN_FILE: &str = "approver-pin.json";
 const LOCAL_APPROVER_ID: &str = "local-approver";
+/// Bearer token the demo agent (`praetore demo`) presents to the gateway.
+const AGENT_TOKEN_FILE: &str = "agent-api.token";
+/// Bearer token the human approver (`approve`/`reject`/`dispatch`) presents.
+const APPROVER_TOKEN_FILE: &str = "approver-api.token";
 const MAX_POLICY_BYTES: u64 = 1_048_576;
 const AUDIENCE: &str = "praetore-local-demo";
-const REQUIRED_DATABASE_TABLES: [&str; 5] = [
+const REQUIRED_DATABASE_TABLES: [&str; 6] = [
     "praetore.replay_claims",
     "praetore.execution_journal",
     "praetore.execution_journal_events",
     "praetore.execution_attestations",
     "praetore.human_approvals",
-];
-
-const MIGRATIONS: [&str; 8] = [
-    include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0004_execution_journal_events.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0005_execution_attestations.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0008_tenant_row_level_security.sql"),
+    "praetore.human_approval_expirations",
 ];
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -199,13 +191,40 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         "demo" => {
             let directory = required_argument(&mut args, "directory")?;
             let action = required_argument(&mut args, "action")?;
-            if action != "set" {
-                return Err("the only supported demo action is 'set'".into());
+            match action.as_str() {
+                "set" => {
+                    let key = required_argument(&mut args, "key")?;
+                    let value = required_argument(&mut args, "value")?;
+                    ensure_no_arguments(args)?;
+                    execute_demo(Path::new(&directory), &key, &value)
+                }
+                "write" => {
+                    let path = required_argument(&mut args, "path")?;
+                    let content = required_argument(&mut args, "content")?;
+                    ensure_no_arguments(args)?;
+                    execute_sandbox_demo(
+                        Path::new(&directory),
+                        sandbox_action(
+                            praetore_gateway::sandbox::WRITE_ACTION,
+                            praetore_gateway::sandbox::WRITE_CAPABILITY,
+                            serde_json::json!({"path": path, "content": content}),
+                        )?,
+                    )
+                }
+                "delete" => {
+                    let path = required_argument(&mut args, "path")?;
+                    ensure_no_arguments(args)?;
+                    execute_sandbox_demo(
+                        Path::new(&directory),
+                        sandbox_action(
+                            praetore_gateway::sandbox::DELETE_ACTION,
+                            praetore_gateway::sandbox::DELETE_CAPABILITY,
+                            serde_json::json!({"path": path}),
+                        )?,
+                    )
+                }
+                _ => Err("supported demo actions: set, write, delete".into()),
             }
-            let key = required_argument(&mut args, "key")?;
-            let value = required_argument(&mut args, "value")?;
-            ensure_no_arguments(args)?;
-            execute_demo(Path::new(&directory), &key, &value)
         }
         "approve" | "reject" => {
             let outcome = if command == "approve" {
@@ -217,7 +236,12 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             let execution_id = required_argument(&mut args, "execution_id")?;
             let mut approver = None;
             let mut agent = None;
+            let mut confirmation = Confirmation::Prompt;
             while let Some(flag) = args.next() {
+                if flag == "--yes" {
+                    confirmation = Confirmation::AssumeYes;
+                    continue;
+                }
                 let slot = match flag.as_str() {
                     "--approver" => &mut approver,
                     "--agent" => &mut agent,
@@ -235,7 +259,19 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                 agent.as_deref(),
                 &approver,
                 outcome,
+                confirmation,
             )
+        }
+        "dispatch" => {
+            let directory = required_argument(&mut args, "directory")?;
+            let execution_id = required_argument(&mut args, "execution_id")?;
+            let agent = match args.next().as_deref() {
+                None => None,
+                Some("--agent") => Some(required_argument(&mut args, "--agent")?),
+                Some(flag) => return Err(format!("unexpected argument: {flag}").into()),
+            };
+            ensure_no_arguments(args)?;
+            dispatch_approved(Path::new(&directory), &execution_id, agent.as_deref())
         }
         "help" | "--help" | "-h" => {
             print_usage();
@@ -274,8 +310,11 @@ fn print_usage() {
            praetore doctor <directory>\n\
            praetore run <directory>\n\
            praetore demo <directory> set <key> <value>\n\
-           praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>]\n\
-           praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>]\n\
+           praetore demo <directory> write <path> <content>   (needs sandbox_root)\n\
+           praetore demo <directory> delete <path>            (needs sandbox_root)\n\
+           praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
+           praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
+           praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
@@ -350,6 +389,16 @@ fn initialize_with_sandbox(
         &directory.join(APPROVER_KEY_FILE),
         hex::encode(approver_key_bytes).as_bytes(),
     )?;
+    // Distinct API credentials for the agent and the approver: the gateway
+    // only lets the approver token read challenges, decide and dispatch.
+    write_private_file(
+        &directory.join(AGENT_TOKEN_FILE),
+        hex::encode(random_secret()?).as_bytes(),
+    )?;
+    write_private_file(
+        &directory.join(APPROVER_TOKEN_FILE),
+        hex::encode(random_secret()?).as_bytes(),
+    )?;
     let approver_pin = ApproverPin {
         schema_version: 1,
         key_id: LOCAL_APPROVER_ID.into(),
@@ -370,7 +419,7 @@ fn initialize_with_sandbox(
     println!("Next, set PRAETORE_GATEWAY_DATABASE_URL to a local PostgreSQL database URL.");
     println!("Then run: praetore doctor {}", directory.display());
     println!(
-        "This demo has no authentication on its loopback HTTP API and is not production key custody."
+        "The loopback HTTP API requires the generated {AGENT_TOKEN_FILE} / {APPROVER_TOKEN_FILE} bearer tokens; this demo is not production key custody."
     );
     Ok(())
 }
@@ -538,7 +587,13 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    for secret_file in [ISSUER_KEY_FILE, EVIDENCE_KEY_FILE, EXECUTION_KEY_FILE] {
+    for secret_file in [
+        ISSUER_KEY_FILE,
+        EVIDENCE_KEY_FILE,
+        EXECUTION_KEY_FILE,
+        AGENT_TOKEN_FILE,
+        APPROVER_TOKEN_FILE,
+    ] {
         match read_secret(directory, secret_file) {
             Ok(_) => println!("[ok] {secret_file} exists with owner-only permissions"),
             Err(error) => {
@@ -616,6 +671,10 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         healthy = false;
                     }
                 }
+                match praetore_replay_postgres::verify_runtime_role(&mut client) {
+                    Ok(()) => println!("[ok] least-privilege runtime database role"),
+                    Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
+                }
                 for table in REQUIRED_DATABASE_TABLES {
                     let exists: bool = client
                         .query_one("SELECT to_regclass($1)::text IS NOT NULL", &[&table])?
@@ -670,33 +729,28 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
-    let mut config = postgres::Config::from_str(database_url)?;
-    if config.get_hosts().is_empty()
-        || config.get_hosts().iter().any(|host| match host {
-            postgres::config::Host::Tcp(host) => {
-                host != "localhost"
-                    && !host
-                        .parse::<IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
-            }
-            #[cfg(unix)]
-            postgres::config::Host::Unix(_) => false,
-        })
-    {
+/// The demo only talks to loopback PostgreSQL (or a Unix socket). The URL is
+/// validated, including its TLS policy, before any connection is made.
+fn local_database(database_url: &str) -> Result<DatabaseConnector, Box<dyn std::error::Error>> {
+    let connector =
+        DatabaseConnector::from_url(database_url)?.connect_timeout(StdDuration::from_secs(3));
+    if !connector.is_loopback() {
         return Err(
             "local demo requires PostgreSQL on localhost, a loopback IP, or a Unix socket".into(),
         );
     }
-    config.connect_timeout(StdDuration::from_secs(3));
-    Ok(config.connect(NoTls)?)
+    Ok(connector)
 }
 
+fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
+    Ok(local_database(database_url)?.connect()?)
+}
+
+/// Development only: without PRAETORE_GATEWAY_MIGRATION_DATABASE_URL the demo
+/// migrates with its runtime URL, so the runtime role owns the tables.
 fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect_local_database(database_url)?;
-    for migration in MIGRATIONS {
-        client.batch_execute(migration)?;
-    }
+    praetore_replay_postgres::apply_migrations(&mut client)?;
     Ok(())
 }
 
@@ -731,8 +785,8 @@ fn build_gateway(
             .with_freshness_provider(Arc::new(LocalFreshnessProvider { policy_digest }));
     let engine = AuthorizationEngine::production(policy, high_assurance)?;
     let journal = Arc::new(PostgresExecutionJournal::from_connection_factory({
-        let database_url = database_url.to_owned();
-        move || Client::connect(&database_url, NoTls)
+        let database = local_database(database_url)?;
+        move || database.connect()
     })?);
     let execution_secret = read_secret(directory, EXECUTION_KEY_FILE)?;
     let signer = Arc::new(LocalExecutionSigner::from_secret(&execution_secret));
@@ -740,7 +794,7 @@ fn build_gateway(
     let gateway = Gateway::new(engine, journal, dispatcher, signer)?;
     // Fail closed: without an approver pin the gateway has no verifier and
     // every approval attempt is refused with `approval_not_configured`.
-    Ok(match load_approver_verifier(directory)? {
+    Ok(match load_approver_verifier(directory, config.tenant_id)? {
         Some(verifier) => gateway.with_human_approval_verifier(verifier),
         None => gateway,
     })
@@ -797,16 +851,66 @@ fn http_options(config: &LocalConfig) -> http_api::HttpOptions {
     }
 }
 
+fn read_api_token(directory: &Path, filename: &str) -> Result<String, Box<dyn std::error::Error>> {
+    read_secret(directory, filename).map(hex::encode).map_err(|error| {
+        format!(
+            "{filename}: {error}; demo directories created before API authentication need a fresh `praetore init`"
+        )
+        .into()
+    })
+}
+
+/// The demo tenant's agent and approver credentials, derived from the
+/// owner-only token files created by `praetore init`.
+fn local_api_auth(
+    directory: &Path,
+    config: &LocalConfig,
+) -> Result<http_api::ApiAuth, Box<dyn std::error::Error>> {
+    let agent = read_api_token(directory, AGENT_TOKEN_FILE)?;
+    let approver = read_api_token(directory, APPROVER_TOKEN_FILE)?;
+    if agent == approver {
+        return Err("agent and approver API tokens must differ".into());
+    }
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "credentials": [
+            {
+                "name": "local-demo-agent",
+                "tenant_id": config.tenant_id,
+                "role": "agent",
+                "token_sha256": http_api::ApiCredentials::token_sha256_hex(&agent),
+            },
+            {
+                "name": "local-demo-approver",
+                "tenant_id": config.tenant_id,
+                "role": "approver",
+                "token_sha256": http_api::ApiCredentials::token_sha256_hex(&approver),
+            }
+        ]
+    });
+    Ok(http_api::ApiAuth::required(
+        http_api::ApiCredentials::from_json(&document.to_string())?,
+    ))
+}
+
 fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(directory)?;
     let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL")
         .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
-    apply_migrations(&database_url)?;
+    let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")
+        .unwrap_or_else(|_| database_url.clone());
+    apply_migrations(&migration_url)?;
+    let runtime_role =
+        praetore_replay_postgres::verify_runtime_role(&mut connect_local_database(&database_url)?);
+    let api_auth = local_api_auth(directory, &config)?;
     let gateway = Arc::new(build_gateway(directory, &config, &database_url)?);
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    if let Err(error) = runtime_role {
+        tracing::warn!(%error, "local demo database role is not least-privilege; development only");
+    }
     if let Some(root) = &config.sandbox_root {
         tracing::warn!(
             sandbox_root = %root.display(),
@@ -815,16 +919,55 @@ fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::warn!(
         port = config.port,
-        "local demo uses unauthenticated HTTP on loopback, local freshness, and in-memory tool effects; do not expose or use for production"
+        "local demo uses plain HTTP on loopback with locally generated bearer tokens, local freshness, and in-memory tool effects; do not expose or use for production"
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let options = http_options(&config);
     runtime.block_on(async move {
-        http_api::serve_local_with_options(config.port, gateway, http_options(&config)).await?;
+        http_api::serve_local_with_options(config.port, gateway, api_auth, options).await?;
         Ok::<_, io::Error>(())
     })?;
     Ok(())
+}
+
+fn sandbox_action(
+    action_type: &str,
+    capability: &str,
+    parameters: serde_json::Value,
+) -> Result<Action, Box<dyn std::error::Error>> {
+    Ok(Action::new(
+        action_type,
+        Some(praetore_gateway::sandbox::DEFAULT_TARGET.into()),
+        parameters,
+    )?
+    .with_capability(capability))
+}
+
+/// Submits a signed `fs:write_file` / `fs:delete_file` request. The gateway,
+/// not the CLI, performs the effect inside its `sandbox_root`.
+fn execute_sandbox_demo(
+    directory: &Path,
+    action: Action,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = load_config(directory)?;
+    if config.sandbox_root.is_none() {
+        return Err(
+            "this demo directory has no sandbox_root (praetore init --sandbox-root)".into(),
+        );
+    }
+    let policy = load_policy(directory)?;
+    let capability = action.capability.clone().unwrap_or_default();
+    let request = build_signed_request(
+        directory,
+        &config,
+        &policy,
+        action,
+        vec![capability],
+        &AgentKeyPair::generate(),
+    )?;
+    submit_demo_request(directory, &config, &request)
 }
 
 fn execute_demo(
@@ -838,10 +981,20 @@ fn execute_demo(
     let config = load_config(directory)?;
     let policy = load_policy(directory)?;
     let request = build_demo_request(directory, &config, &policy, key, value)?;
+    submit_demo_request(directory, &config, &request)
+}
+
+fn submit_demo_request(
+    directory: &Path,
+    config: &LocalConfig,
+    request: &AuthorizationRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_token = read_api_token(directory, AGENT_TOKEN_FILE)?;
 
     let response = http_client()?
         .post(format!("http://127.0.0.1:{}/v1/execute", config.port))
-        .json(&request)
+        .bearer_auth(agent_token)
+        .json(request)
         .send()
         .map_err(|error| {
             format!(
@@ -980,15 +1133,130 @@ fn load_approver_pin(directory: &Path) -> Result<Option<ApproverPin>, Box<dyn st
     Ok(Some(pin))
 }
 
+/// The demo approver is bound to the demo tenant only.
 fn load_approver_verifier(
     directory: &Path,
+    tenant_id: Uuid,
 ) -> Result<Option<HumanApprovalVerifier>, Box<dyn std::error::Error>> {
     let Some(pin) = load_approver_pin(directory)? else {
         return Ok(None);
     };
     let public_key =
         praetore_core::VerifiedPublicKey::from_bytes(&hex::decode(&pin.public_key_hex)?)?;
-    Ok(Some(HumanApprovalVerifier::new(pin.key_id, public_key)?))
+    Ok(Some(HumanApprovalVerifier::for_tenant(
+        tenant_id, pin.key_id, public_key,
+    )?))
+}
+
+/// Whether `approve`/`reject` asks before signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    Prompt,
+    /// `--yes`: for scripts that have reviewed the action by other means.
+    AssumeYes,
+}
+
+/// Escapes control and bidirectional-formatting characters so gateway- or
+/// agent-supplied text cannot rewrite the terminal or disguise itself.
+fn terminal_safe(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        let bidi = matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        );
+        if (character.is_control() && character != '\n') || bidi {
+            safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
+/// Checks that the challenge belongs to this execution, that the shown
+/// action is exactly the one the challenge's digest commits to, and that it
+/// was evaluated under this demo's policy; then renders it for the human.
+fn describe_challenge(
+    view: &ApprovalChallengeView,
+    config: &LocalConfig,
+    agent_id: Uuid,
+    request_id: Uuid,
+    policy_digest: &str,
+    outcome: HumanApprovalOutcome,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let challenge = &view.challenge;
+    if challenge.tenant_id != config.tenant_id
+        || challenge.agent_id != agent_id
+        || challenge.request_id != request_id
+    {
+        return Err("gateway returned a challenge for a different execution".into());
+    }
+    if !view.action_matches_challenge() {
+        return Err(
+            "the action returned by the gateway does not match the challenge's action digest; refusing to sign"
+                .into(),
+        );
+    }
+    if challenge.policy_digest != policy_digest {
+        return Err(
+            "the challenge was evaluated under a different policy than this demo's policy.json; refusing to sign"
+                .into(),
+        );
+    }
+    let action = &view.action;
+    let quoted = |value: Option<&str>| {
+        value
+            .map(|value| serde_json::to_string(value).unwrap_or_default())
+            .unwrap_or_else(|| "(none)".into())
+    };
+    let parameters = serde_json::to_string_pretty(&action.parameters)?
+        .lines()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let decision = match outcome {
+        HumanApprovalOutcome::Approve => "APPROVE",
+        HumanApprovalOutcome::Reject => "REJECT",
+    };
+    Ok(terminal_safe(&format!(
+        "Approval request\n  \
+         tenant:         {}\n  \
+         agent:          {}\n  \
+         request:        {}\n  \
+         action type:    {}\n  \
+         target:         {}\n  \
+         capability:     {}\n  \
+         parameters:\n{parameters}\n  \
+         action digest:  {} (recomputed from the action above: match)\n  \
+         policy digest:  {} (this demo's policy.json)\n  \
+         expires at:     {} (UTC)\n\
+         Decision to sign: {decision}",
+        challenge.tenant_id,
+        challenge.agent_id,
+        challenge.request_id,
+        quoted(Some(&action.action_type)),
+        quoted(action.target.as_deref()),
+        quoted(action.capability.as_deref()),
+        challenge.action_digest,
+        challenge.policy_digest,
+        challenge.expires_at,
+    )))
+}
+
+fn confirm_decision(confirmation: Confirmation) -> Result<(), Box<dyn std::error::Error>> {
+    if confirmation == Confirmation::AssumeYes {
+        return Ok(());
+    }
+    print!("Type 'yes' to sign and submit this decision: ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if matches!(answer.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
+        Ok(())
+    } else {
+        Err("decision not confirmed; nothing was signed or sent".into())
+    }
 }
 
 /// Looks up the pending execution for `request_id` in this demo's tenant.
@@ -1041,6 +1309,7 @@ fn resolve_approval(
     agent_id: Option<&str>,
     approver_id: &str,
     outcome: HumanApprovalOutcome,
+    confirmation: Confirmation,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request_id = Uuid::parse_str(execution_id)
         .ok()
@@ -1059,43 +1328,40 @@ fn resolve_approval(
         return Err("approver.key does not match the approver pin".into());
     }
     let config = load_config(directory)?;
-    // The endpoint is addressed by tenant/agent/request. The tenant comes from
-    // config.json; the agent is either given explicitly or looked up.
-    let agent_id = match agent_id {
-        Some(agent) => Uuid::parse_str(agent)
-            .ok()
-            .filter(|id| !id.is_nil())
-            .ok_or("--agent must be the evidence.agent.id UUID from the demo receipt")?,
-        None => {
-            let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL").map_err(|_| {
-                "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL (or pass --agent)"
-            })?;
-            find_pending_agent(&database_url, config.tenant_id, request_id)?
-        }
-    };
+    let policy_digest = load_policy(directory)?.digest()?;
+    let approver_token = read_api_token(directory, APPROVER_TOKEN_FILE)?;
+    let agent_id = resolve_agent_id(&config, request_id, agent_id)?;
 
     let url = format!(
         "http://127.0.0.1:{}/v1/approvals/{}/{}/{}",
         config.port, config.tenant_id, agent_id, request_id
     );
     let client = http_client()?;
-    let response = client.get(&url).send()?;
+    let response = client.get(&url).bearer_auth(&approver_token).send()?;
     let status = response.status();
     let body = response.text()?;
     if !status.is_success() {
-        println!("{body}");
+        println!("{}", terminal_safe(&body));
         return Err(format!("gateway refused the approval challenge (HTTP {status})").into());
     }
-    let challenge: ApprovalChallenge = serde_json::from_str(&body)?;
-    if challenge.tenant_id != config.tenant_id
-        || challenge.agent_id != agent_id
-        || challenge.request_id != request_id
-    {
-        return Err("gateway returned a challenge for a different execution".into());
-    }
-    let decision = sign_decision(challenge, approver_id, outcome, &signing_key)?;
+    let view = ApprovalChallengeView::from_json(&body)
+        .map_err(|_| "gateway returned an invalid approval challenge")?;
+    println!(
+        "{}",
+        describe_challenge(
+            &view,
+            &config,
+            agent_id,
+            request_id,
+            &policy_digest,
+            outcome
+        )?
+    );
+    confirm_decision(confirmation)?;
+    let decision = sign_decision(view.challenge, approver_id, outcome, &signing_key)?;
     let response = client
         .post(&url)
+        .bearer_auth(&approver_token)
         .json(&decision)
         .send()
         .map_err(|error| {
@@ -1103,6 +1369,75 @@ fn resolve_approval(
                 "could not confirm the gateway response ({error}); the decision may have been recorded and the CLI did not retry. Inspect praetore.human_approvals before taking further action"
             )
         })?;
+    let status = response.status();
+    let body = response.text()?;
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    match &value {
+        Some(value) => println!("{}", serde_json::to_string_pretty(value)?),
+        None => println!("{body}"),
+    }
+    if !status.is_success() {
+        return Err(format!("gateway returned HTTP {status}; review the response above").into());
+    }
+    if value.as_ref().and_then(|value| value["status"].as_str())
+        == Some("approved_pending_dispatch")
+    {
+        println!(
+            "approved_pending_dispatch: the approval is recorded and the action has NOT run. Dispatch it once with:\n  praetore dispatch {} {request_id} --agent {agent_id}",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
+/// The endpoint is addressed by tenant/agent/request. The tenant comes from
+/// config.json; the agent is either given explicitly or looked up.
+fn resolve_agent_id(
+    config: &LocalConfig,
+    request_id: Uuid,
+    agent_id: Option<&str>,
+) -> Result<Uuid, Box<dyn std::error::Error>> {
+    match agent_id {
+        Some(agent) => Ok(Uuid::parse_str(agent)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or("--agent must be the evidence.agent.id UUID from the demo receipt")?),
+        None => {
+            let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL").map_err(|_| {
+                "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL (or pass --agent)"
+            })?;
+            find_pending_agent(&database_url, config.tenant_id, request_id)
+        }
+    }
+}
+
+/// Claims and performs the single dispatch of an approved execution. Never
+/// retried by the CLI: on a lost response, inspect the journal first.
+fn dispatch_approved(
+    directory: &Path,
+    execution_id: &str,
+    agent_id: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let request_id = Uuid::parse_str(execution_id)
+        .ok()
+        .filter(|id| !id.is_nil())
+        .ok_or("execution_id must be the request_id UUID from the demo receipt")?;
+    let config = load_config(directory)?;
+    let approver_token = read_api_token(directory, APPROVER_TOKEN_FILE)?;
+    let agent_id = resolve_agent_id(&config, request_id, agent_id)?;
+    let url = format!(
+        "http://127.0.0.1:{}/v1/approvals/{}/{}/{}/dispatch",
+        config.port, config.tenant_id, agent_id, request_id
+    );
+    let response = http_client()?
+        .post(&url)
+        .bearer_auth(approver_token)
+        .send()
+        .map_err(|error| {
+        format!(
+            "could not confirm the gateway response ({error}); the action may have been dispatched and the CLI did not retry. Inspect praetore.execution_journal before taking further action"
+        )
+    })?;
     let status = response.status();
     let body = response.text()?;
     match serde_json::from_str::<serde_json::Value>(&body) {
@@ -1157,6 +1492,129 @@ mod tests {
         assert_eq!(parsed.semantics_version, 2);
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn initialization_creates_distinct_owner_only_api_tokens() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        for filename in [AGENT_TOKEN_FILE, APPROVER_TOKEN_FILE] {
+            let metadata = fs::metadata(directory.join(filename)).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        }
+        let agent = read_api_token(&directory, AGENT_TOKEN_FILE).unwrap();
+        let approver = read_api_token(&directory, APPROVER_TOKEN_FILE).unwrap();
+        assert_eq!(agent.len(), 64);
+        assert_ne!(agent, approver);
+        let config = load_config(&directory).unwrap();
+        assert!(local_api_auth(&directory, &config).unwrap().is_required());
+
+        // Directories from before API authentication fail with guidance.
+        fs::remove_file(directory.join(APPROVER_TOKEN_FILE)).unwrap();
+        let error = local_api_auth(&directory, &config).unwrap_err();
+        assert!(error.to_string().contains("praetore init"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn challenge_view(directory: &Path, config: &LocalConfig) -> (ApprovalChallengeView, String) {
+        let policy = load_policy(directory).unwrap();
+        let request = build_demo_request(directory, config, &policy, "mode", "safe").unwrap();
+        let action_digest = praetore_gateway::action_digest(&request.action).unwrap();
+        let policy_digest = policy.digest().unwrap();
+        let view = ApprovalChallengeView {
+            challenge: ApprovalChallenge {
+                schema_version: 1,
+                tenant_id: config.tenant_id,
+                agent_id: *request.agent.id.as_uuid(),
+                request_id: request.request_id,
+                evidence_id: Uuid::new_v4(),
+                evidence_hash: "a".repeat(64),
+                action_digest,
+                policy_digest: policy_digest.clone(),
+                expires_at: "2026-06-01T12:00:00Z".into(),
+            },
+            action: request.action,
+        };
+        (view, policy_digest)
+    }
+
+    #[test]
+    fn approver_sees_the_exact_action_and_tampering_is_refused() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let config = load_config(&directory).unwrap();
+        let (view, policy_digest) = challenge_view(&directory, &config);
+        let (agent, request) = (view.challenge.agent_id, view.challenge.request_id);
+
+        let shown = describe_challenge(
+            &view,
+            &config,
+            agent,
+            request,
+            &policy_digest,
+            HumanApprovalOutcome::Approve,
+        )
+        .unwrap();
+        for expected in [
+            "\"demo:set_value\"",
+            "\"demo-state\"",
+            "\"demo:write\"",
+            "\"value\": \"safe\"",
+            view.challenge.action_digest.as_str(),
+            policy_digest.as_str(),
+            "2026-06-01T12:00:00Z",
+            "APPROVE",
+        ] {
+            assert!(shown.contains(expected), "missing {expected} in {shown}");
+        }
+
+        // The gateway shows a different action than the one the digest binds.
+        let mut swapped = view.clone();
+        swapped.action.parameters = serde_json::json!({"key": "mode", "value": "unsafe"});
+        assert!(
+            describe_challenge(
+                &swapped,
+                &config,
+                agent,
+                request,
+                &policy_digest,
+                HumanApprovalOutcome::Approve
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match")
+        );
+        assert!(
+            describe_challenge(
+                &view,
+                &config,
+                agent,
+                request,
+                &"0".repeat(64),
+                HumanApprovalOutcome::Approve
+            )
+            .is_err()
+        );
+        assert!(
+            describe_challenge(
+                &view,
+                &config,
+                Uuid::new_v4(),
+                request,
+                &policy_digest,
+                HumanApprovalOutcome::Approve
+            )
+            .is_err()
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn terminal_output_escapes_control_and_bidi_characters() {
+        assert_eq!(
+            terminal_safe("ok\n\u{1b}[2Jx\u{202e}y"),
+            "ok\n\\u{001b}[2Jx\\u{202e}y"
+        );
     }
 
     #[test]
@@ -1221,6 +1679,20 @@ mod tests {
     }
 
     #[test]
+    fn local_demo_database_must_be_loopback_and_is_checked_before_connecting() {
+        assert!(local_database("postgres://postgres@127.0.0.1:1/praetore").is_ok());
+        assert!(local_database("host=/tmp user=postgres").is_ok());
+        assert!(local_database("postgres://postgres@db.internal/praetore").is_err());
+        // Even with TLS the demo stays local; a missing root fails before I/O.
+        assert!(
+            local_database(
+                "postgres://postgres@db.internal/praetore?sslmode=verify-full&sslrootcert=%2Fmissing"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn approver_ids_are_strictly_validated() {
         assert!(valid_approver_id("local-approver"));
         for bad in ["", "Local", "a b", "x;drop", "../key", &"a".repeat(65)] {
@@ -1241,7 +1713,11 @@ mod tests {
             hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes()),
             pin.public_key_hex
         );
-        assert!(load_approver_verifier(&directory).unwrap().is_some());
+        assert!(
+            load_approver_verifier(&directory, load_config(&directory).unwrap().tenant_id)
+                .unwrap()
+                .is_some()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1250,13 +1726,18 @@ mod tests {
         let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
         initialize(&directory, 8080).unwrap();
         fs::remove_file(directory.join(APPROVER_PIN_FILE)).unwrap();
-        assert!(load_approver_verifier(&directory).unwrap().is_none());
+        assert!(
+            load_approver_verifier(&directory, load_config(&directory).unwrap().tenant_id)
+                .unwrap()
+                .is_none()
+        );
         let error = resolve_approval(
             &directory,
             &Uuid::new_v4().to_string(),
             None,
             LOCAL_APPROVER_ID,
             HumanApprovalOutcome::Approve,
+            Confirmation::AssumeYes,
         )
         .unwrap_err();
         assert!(error.to_string().contains("human approval is disabled"));
@@ -1278,7 +1759,8 @@ mod tests {
                     id,
                     None,
                     LOCAL_APPROVER_ID,
-                    HumanApprovalOutcome::Approve
+                    HumanApprovalOutcome::Approve,
+                    Confirmation::AssumeYes,
                 )
                 .is_err()
             );
@@ -1289,6 +1771,7 @@ mod tests {
             Some("not-a-uuid"),
             LOCAL_APPROVER_ID,
             HumanApprovalOutcome::Approve,
+            Confirmation::AssumeYes,
         )
         .unwrap_err();
         assert!(error.to_string().contains("--agent must be"));
@@ -1298,6 +1781,7 @@ mod tests {
             None,
             "someone-else",
             HumanApprovalOutcome::Approve,
+            Confirmation::AssumeYes,
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown approver"));
@@ -1325,6 +1809,7 @@ mod tests {
     fn postgres_approval_dispatches_once_and_rejection_is_final() {
         use praetore_gateway::{
             ApprovalError, ApprovalResolution, ExecutionKey, ExecutionStatus, GatewayError,
+            HumanApprovalResult,
         };
         let database_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
         apply_migrations(&database_url).unwrap();
@@ -1370,12 +1855,22 @@ mod tests {
             ApprovalResolution::Pending
         );
         let resolution = gateway.resolve_human_approval(decision.clone()).unwrap();
-        assert_eq!(resolution.receipt.execution, ExecutionStatus::Confirmed);
+        assert!(matches!(
+            resolution,
+            HumanApprovalResult::ApprovedPendingDispatch { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(&resolution).unwrap()["status"],
+            "approved_pending_dispatch"
+        );
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),
             ApprovalResolution::Approved
         );
         assert!(gateway.resolve_human_approval(decision).is_err());
+        let receipt = gateway.dispatch_approved(key).unwrap();
+        assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+        assert!(gateway.dispatch_approved(key).is_err());
         assert!(matches!(
             gateway.approval_challenge(key),
             Err(GatewayError::Approval(ApprovalError::NotPending))
@@ -1391,8 +1886,12 @@ mod tests {
             &approver,
         )
         .unwrap();
-        let resolution = gateway.resolve_human_approval(reject).unwrap();
-        assert_eq!(resolution.receipt.execution, ExecutionStatus::NotDispatched);
+        let HumanApprovalResult::Rejected { receipt, .. } =
+            gateway.resolve_human_approval(reject).unwrap()
+        else {
+            panic!("a rejection must return its receipt");
+        };
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),
             ApprovalResolution::Rejected
@@ -1551,6 +2050,7 @@ mod tests {
         // The root may not contain the gateway directory with the keys.
         let root = temp_path("root");
         fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(initialize_with_sandbox(&root.join("gw"), 8080, Some(root.clone())).is_err());
         assert!(!root.join("gw").exists());
 
@@ -1628,6 +2128,7 @@ mod tests {
             let root = temp_path("sandbox");
             let outside = temp_path("outside");
             fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             fs::create_dir(&outside).unwrap();
             let port = {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1689,12 +2190,17 @@ mod tests {
             let signer = LocalExecutionSigner::from_secret(
                 &read_secret(&self.directory, EXECUTION_KEY_FILE).unwrap(),
             );
+            let evidence_key = EvidenceAttesterKey::from_secret_bytes(
+                &read_secret(&self.directory, EVIDENCE_KEY_FILE).unwrap(),
+            )
+            .public_key()
+            .unwrap();
             let public_key = praetore_core::VerifiedPublicKey::from_bytes(
                 signer.signing_key.verifying_key().as_bytes(),
             )
             .unwrap();
             receipt
-                .verify_execution_attestation(&public_key, &signer.key_id)
+                .verify_execution_attestation(&public_key, &signer.key_id, &evidence_key)
                 .unwrap();
             // A different key must not verify.
             let other = LocalExecutionSigner::from_secret(&[5; 32]);
@@ -1704,7 +2210,7 @@ mod tests {
             .unwrap();
             assert!(
                 receipt
-                    .verify_execution_attestation(&other_key, &signer.key_id)
+                    .verify_execution_attestation(&other_key, &signer.key_id, &evidence_key)
                     .is_err()
             );
         }
@@ -1888,7 +2394,10 @@ mod tests {
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_sandbox_approval_executes_once_in_the_gateway() {
-        use praetore_gateway::{ApprovalResolution, ExecutionKey, ExecutionStatus};
+        use praetore_gateway::{
+            ApprovalResolution, ExecutionKey, ExecutionStatus, HumanApprovalResult,
+            NotDispatchedReason,
+        };
         let fx = SandboxFixture::new();
         let gateway = fx.gateway();
         let approver =
@@ -1914,7 +2423,8 @@ mod tests {
             }
         };
 
-        // Approve: the gateway deletes the file; executed/confirmed + signed.
+        // Approve, then dispatch: only the dispatch claim makes the gateway
+        // delete the file; executed/confirmed + signed.
         let key = held("borrar.txt");
         assert!(fx.root.join("borrar.txt").exists(), "held, not executed");
         assert_eq!(
@@ -1929,9 +2439,26 @@ mod tests {
         )
         .unwrap();
         let resolved = gateway.resolve_human_approval(decision.clone()).unwrap();
-        assert_eq!(resolved.receipt.execution, ExecutionStatus::Confirmed);
-        fx.verify(&resolved.receipt);
+        assert!(matches!(
+            resolved,
+            HumanApprovalResult::ApprovedPendingDispatch { .. }
+        ));
+        assert!(
+            fx.root.join("borrar.txt").exists(),
+            "approval alone runs nothing"
+        );
+        assert_eq!(
+            fx.journal(key.request_id),
+            (
+                "requires_approval".into(),
+                "approved_pending_dispatch".into()
+            )
+        );
+        let receipt = gateway.dispatch_approved(key).unwrap();
+        assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+        fx.verify(&receipt);
         assert!(!fx.root.join("borrar.txt").exists());
+        assert!(gateway.dispatch_approved(key).is_err(), "single dispatch");
         assert_eq!(
             fx.journal(key.request_id),
             ("requires_approval".into(), "confirmed".into())
@@ -1954,9 +2481,13 @@ mod tests {
             &approver,
         )
         .unwrap();
-        let rejected = gateway.resolve_human_approval(reject).unwrap();
-        assert_eq!(rejected.receipt.execution, ExecutionStatus::NotDispatched);
-        fx.verify(&rejected.receipt);
+        let HumanApprovalResult::Rejected { receipt, .. } =
+            gateway.resolve_human_approval(reject).unwrap()
+        else {
+            panic!("a rejection must return its receipt");
+        };
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        fx.verify(&receipt);
         assert!(fx.root.join("rechazar.txt").exists());
 
         // shell:exec is outside the allowlist: refused at submission with a
@@ -2028,6 +2559,39 @@ mod tests {
             ("requires_approval".into(), "not_dispatched".into())
         );
 
+        // A file swapped for a symlink AFTER approval is refused at the
+        // dispatch claim (after the approval is re-verified) and closed as
+        // not_dispatched with a signed reason; the outside file is intact.
+        fs::write(fx.root.join("late.txt"), "x").unwrap();
+        let key = held("late.txt");
+        let decision = sign_decision(
+            gateway.approval_challenge(key).unwrap(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+        gateway.resolve_human_approval(decision).unwrap();
+        fs::remove_file(fx.root.join("late.txt")).unwrap();
+        symlink(fx.outside.join("victim.txt"), fx.root.join("late.txt")).unwrap();
+        let (_, reason) = refused_key(gateway.dispatch_approved(key).unwrap_err());
+        assert_eq!(reason, "symlink_not_allowed");
+        assert_eq!(
+            fx.journal(key.request_id),
+            ("requires_approval".into(), "not_dispatched".into())
+        );
+        assert_eq!(
+            gateway.approval_state(key).unwrap().not_dispatched_reason,
+            Some(NotDispatchedReason::DispatchFailed)
+        );
+        assert!(fx.outside_untouched());
+        assert!(
+            fs::symlink_metadata(fx.root.join("late.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
         println!("journal counts: {counts:?}");
         assert!(
             fx.journal_counts()
@@ -2049,10 +2613,13 @@ mod tests {
             .unwrap();
         let port = fx.config.port;
         let options = http_options(&fx.config);
+        let auth = local_api_auth(&fx.directory, &fx.config).unwrap();
+        let agent_token = read_api_token(&fx.directory, AGENT_TOKEN_FILE).unwrap();
+        let approver_token = read_api_token(&fx.directory, APPROVER_TOKEN_FILE).unwrap();
         // Keep a handle so the Postgres clients are dropped outside tokio.
         let keep_alive = Arc::clone(&gateway);
         runtime.spawn(async move {
-            let _ = http_api::serve_local_with_options(port, gateway, options).await;
+            let _ = http_api::serve_local_with_options(port, gateway, auth, options).await;
         });
         let client = http_client().unwrap();
         let base = format!("http://127.0.0.1:{port}");
@@ -2066,9 +2633,17 @@ mod tests {
         }
         assert!(up, "gateway did not start");
 
-        // EXEC MODE: without the header, or with `cooperative`/other values,
-        // the gateway answers 409 before evaluating: no effect on disk and
-        // no journal row.
+        // The exec-mode header is never a credential: 401 without a token.
+        let response = client
+            .post(format!("{base}/v1/execute"))
+            .json(&fx.write("coop.txt", "x"))
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
+
+        // EXEC MODE: an authenticated agent without the header, or with
+        // `cooperative`/other values, gets 409 before evaluation: no effect
+        // on disk and no journal row.
         let bare = reqwest::blocking::Client::builder()
             .no_proxy()
             .timeout(StdDuration::from_secs(5))
@@ -2082,6 +2657,7 @@ mod tests {
         ] {
             let mut request = bare
                 .post(format!("{base}/v1/execute"))
+                .bearer_auth(&agent_token)
                 .json(&fx.write("coop.txt", "x"));
             if let Some(mode) = mode {
                 request = request.header(http_api::EXEC_MODE_HEADER, mode);
@@ -2097,6 +2673,7 @@ mod tests {
         // ALLOW over HTTP: 200, confirmed, header marks gateway execution.
         let response = client
             .post(format!("{base}/v1/execute"))
+            .bearer_auth(&agent_token)
             .json(&fx.write("http.txt", "via http"))
             .send()
             .unwrap();
@@ -2116,6 +2693,7 @@ mod tests {
         // ESCAPE over HTTP: 403 action_not_dispatchable.
         let response = client
             .post(format!("{base}/v1/execute"))
+            .bearer_auth(&agent_token)
             .json(&fx.write("../escape.txt", "pwned"))
             .send()
             .unwrap();
@@ -2123,11 +2701,13 @@ mod tests {
         let body: serde_json::Value = response.json().unwrap();
         assert_eq!(body["code"], "action_not_dispatchable");
 
-        // APPROVAL over HTTP: approve executes in the gateway; afterwards
-        // /status refuses cooperative execution with 409.
+        // APPROVAL over HTTP: approve records intent only, the approver's
+        // dispatch makes the gateway execute; /status never tells the agent
+        // to run an approved action itself.
         fs::write(fx.root.join("aprobar.txt"), "x").unwrap();
         let response = client
             .post(format!("{base}/v1/execute"))
+            .bearer_auth(&agent_token)
             .json(&fx.request(
                 "fs:delete_file",
                 "fs:delete",
@@ -2146,27 +2726,50 @@ mod tests {
         );
         let status: serde_json::Value = client
             .get(format!("{path}/status"))
+            .bearer_auth(&agent_token)
             .send()
             .unwrap()
             .json()
             .unwrap();
         assert_eq!(status["resolution"], "pending");
-        let challenge: ApprovalChallenge = client.get(&path).send().unwrap().json().unwrap();
+        // The agent cannot read the challenge, decide or dispatch.
+        for request in [
+            client.get(&path),
+            client.post(&path),
+            client.post(format!("{path}/dispatch")),
+        ] {
+            let response = request.bearer_auth(&agent_token).send().unwrap();
+            assert_eq!(response.status().as_u16(), 403);
+        }
+        let view = ApprovalChallengeView::from_json(
+            &client
+                .get(&path)
+                .bearer_auth(&approver_token)
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+        )
+        .unwrap();
         let approver =
             SigningKey::from_bytes(&read_secret(&fx.directory, APPROVER_KEY_FILE).unwrap());
         let decision = sign_decision(
-            challenge,
+            view.challenge,
             LOCAL_APPROVER_ID,
             HumanApprovalOutcome::Approve,
             &approver,
         )
         .unwrap();
         for request in [
-            bare.get(format!("{path}/status")),
+            bare.get(format!("{path}/status")).bearer_auth(&agent_token),
             bare.get(&path)
+                .bearer_auth(&approver_token)
                 .header(http_api::EXEC_MODE_HEADER, "cooperative"),
-            bare.post(&path).json(&decision),
             bare.post(&path)
+                .bearer_auth(&approver_token)
+                .json(&decision),
+            bare.post(&path)
+                .bearer_auth(&approver_token)
                 .header(http_api::EXEC_MODE_HEADER, "cooperative")
                 .json(&decision),
         ] {
@@ -2181,23 +2784,57 @@ mod tests {
             ("requires_approval".into(), "not_dispatched".into()),
             "refused approve leaves the action pending"
         );
-        let response = client.post(&path).json(&decision).send().unwrap();
+        let response = client
+            .post(&path)
+            .bearer_auth(&approver_token)
+            .json(&decision)
+            .send()
+            .unwrap();
         assert_eq!(response.status().as_u16(), 200);
-        assert_eq!(response.headers()["praetore-executed-by"], "gateway");
-        let resolved: praetore_gateway::HumanApprovalReceipt = response.json().unwrap();
-        fx.verify(&resolved.receipt);
-        assert!(!fx.root.join("aprobar.txt").exists());
-        let response = client.get(format!("{path}/status")).send().unwrap();
+        let resolved: serde_json::Value = response.json().unwrap();
+        assert_eq!(resolved["status"], "approved_pending_dispatch");
+        assert!(
+            fx.root.join("aprobar.txt").exists(),
+            "approval runs nothing"
+        );
+        let response = client
+            .get(format!("{path}/status"))
+            .bearer_auth(&agent_token)
+            .send()
+            .unwrap();
         assert_eq!(response.status().as_u16(), 409);
         let body: serde_json::Value = response.json().unwrap();
         assert_eq!(body["code"], "cooperative_exec_rejected");
+        assert_eq!(body["execution"], "approved_pending_dispatch");
+
+        let response = client
+            .post(format!("{path}/dispatch"))
+            .bearer_auth(&approver_token)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.headers()["praetore-executed-by"], "gateway");
+        let receipt: praetore_gateway::GatewayReceipt = response.json().unwrap();
+        fx.verify(&receipt);
+        assert!(!fx.root.join("aprobar.txt").exists());
+        let response = client
+            .get(format!("{path}/status"))
+            .bearer_auth(&agent_token)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 409);
+        assert_eq!(response.headers()["praetore-executed-by"], "gateway");
+        let body: serde_json::Value = response.json().unwrap();
+        assert_eq!(body["code"], "cooperative_exec_rejected");
         assert_eq!(body["resolution"], "approved");
+        assert_eq!(body["execution"], "confirmed");
 
         // GATEWAY DOWN: connection refused and no effect.
         runtime.shutdown_timeout(StdDuration::from_secs(2));
         std::thread::sleep(StdDuration::from_millis(200));
         let result = client
             .post(format!("{base}/v1/execute"))
+            .bearer_auth(&agent_token)
             .json(&fx.write("down.txt", "x"))
             .send();
         assert!(result.is_err(), "gateway must be unreachable");

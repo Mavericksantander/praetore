@@ -1,80 +1,30 @@
 use ed25519_dalek::{Signer, SigningKey};
-use postgres::{Client, NoTls};
 use praetore_core::{
-    EvidenceAttesterKey, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
-    Policy, TrustedAuthorityIssuer, VerifiedPublicKey, canonical::parse_json_rejecting_duplicates,
-    engine::AuthorizationEngine, identity::AgentKeyFingerprint,
+    EvidenceAttesterKey, FreshnessProvider, HighAssuranceConfig, Policy, TrustedAuthorityIssuer,
+    canonical::parse_json_rejecting_duplicates, engine::AuthorizationEngine,
 };
 use praetore_gateway::{
     ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway,
     HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
 };
-use praetore_gateway_service::chrony_clock::ChronyClock;
-use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
+use praetore_gateway_service::{
+    api_auth::select_api_auth,
+    approver_bindings::{parse_approver_bindings, single_approver},
+    chrony_clock::ChronyClock,
+    file_freshness::{DemoFreshnessProvider, FileFreshnessLimits, FileFreshnessProvider},
+};
+use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
     path::Path,
-    str::FromStr,
     sync::Arc,
     time::Duration as StdDuration,
 };
-use time::{Duration, OffsetDateTime};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-const MIGRATIONS: [&str; 8] = [
-    include_str!("../../praetore-replay-postgres/migrations/0001_replay_claims.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0002_execution_journal.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0003_execution_replay_link.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0004_execution_journal_events.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0005_execution_attestations.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0006_human_approvals.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0007_tenant_scoped_execution.sql"),
-    include_str!("../../praetore-replay-postgres/migrations/0008_tenant_row_level_security.sql"),
-];
-
-struct LocalFreshnessProvider {
-    policy_digest: String,
-}
-
-impl FreshnessProvider for LocalFreshnessProvider {
-    fn check(
-        &self,
-        _agent: &AgentKeyFingerprint,
-        _authority_id: &praetore_core::AuthorityId,
-        policy_digest: &str,
-        now: OffsetDateTime,
-    ) -> Result<FreshnessLease, FreshnessError> {
-        if policy_digest != self.policy_digest {
-            return Err(FreshnessError::Revoked);
-        }
-        Ok(FreshnessLease {
-            valid_until: now + Duration::seconds(30),
-        })
-    }
-
-    fn check_authority(
-        &self,
-        _agent: &AgentKeyFingerprint,
-        _authority_id: &praetore_core::AuthorityId,
-        authority_digest: &str,
-        policy_digest: &str,
-        now: OffsetDateTime,
-    ) -> Result<FreshnessLease, FreshnessError> {
-        if authority_digest.len() != 64
-            || !authority_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || policy_digest != self.policy_digest
-        {
-            return Err(FreshnessError::InvalidResponse);
-        }
-        self.check(_agent, _authority_id, policy_digest, now)
-    }
-}
 
 struct LocalExecutionSigner {
     key_id: String,
@@ -100,6 +50,9 @@ struct GatewayAdapterSetup {
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: String,
     require_trusted_clock: bool,
+    /// `http` and `sandbox`: refuse demo freshness, unauthenticated API
+    /// access and unscoped multi-tenant approver keys.
+    production_adapter: bool,
 }
 
 impl LocalExecutionSigner {
@@ -210,40 +163,59 @@ fn parse_tenant_issuer_bindings(
     Ok(tenants)
 }
 
-fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    validate_local_database_url(database_url)?;
-    let mut client = Client::connect(database_url, NoTls)?;
-    for migration in MIGRATIONS {
-        client.batch_execute(migration)?;
-    }
+fn apply_migrations(database: &DatabaseConnector) -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = database.connect()?;
+    let applied = praetore_replay_postgres::apply_migrations(&mut client)?;
+    tracing::info!(?applied, "database migrations applied");
     Ok(())
 }
 
-fn validate_local_database_url(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let config = postgres::Config::from_str(database_url)?;
-    if config.get_hosts().is_empty()
-        || config.get_hosts().iter().any(|host| match host {
-            postgres::config::Host::Tcp(host) => {
-                host != "localhost"
-                    && !host
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
-            }
-            #[cfg(unix)]
-            postgres::config::Host::Unix(_) => false,
-        })
-    {
-        return Err("local demo gateway requires a loopback or Unix-socket PostgreSQL host".into());
+/// Validates both database URLs (including TLS: non-loopback hosts need
+/// sslmode=verify-full) before any connection is opened, migrates with the
+/// owner URL, then checks the runtime connection.
+///
+/// Production adapters (`http`, `sandbox`) never migrate with the runtime
+/// URL and refuse a runtime role that could bypass row-level security or
+/// the append-only triggers. The local demo falls back to migrating with the
+/// runtime URL and only warns (development only).
+fn prepare_database(
+    runtime_url: &str,
+    migration_url: Option<&str>,
+    production: bool,
+) -> Result<DatabaseConnector, Box<dyn std::error::Error>> {
+    let runtime = DatabaseConnector::from_url(runtime_url)?;
+    let migration = migration_url.map(DatabaseConnector::from_url).transpose()?;
+    match (&migration, production) {
+        (Some(migration), _) => apply_migrations(migration)?,
+        (None, false) => apply_migrations(&runtime)?,
+        (None, true) => {}
     }
-    Ok(())
+    let mut client = runtime.connect()?;
+    if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
+        if production {
+            return Err(error.into());
+        }
+        tracing::warn!(%error, "local demo database role is not least-privilege; development only");
+    }
+    praetore_replay_postgres::verify_schema_current(&mut client)?;
+    Ok(runtime)
+}
+
+/// `praetore-gateway-demo migrate`: applies migrations with
+/// PRAETORE_GATEWAY_MIGRATION_DATABASE_URL (the schema owner) and exits.
+fn migrate_command() -> Result<(), Box<dyn std::error::Error>> {
+    let url = required_env("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")?;
+    apply_migrations(&DatabaseConnector::from_url(&url)?)
 }
 
 fn build_gateway(
-    database_url: &str,
+    database: &DatabaseConnector,
     dispatcher: Arc<dyn ActionDispatcher>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
     audience: &str,
     require_trusted_clock: bool,
+    production_adapter: bool,
+    approval_verifiers: Vec<HumanApprovalVerifier>,
 ) -> Result<Gateway, Box<dyn std::error::Error>> {
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
@@ -262,11 +234,10 @@ fn build_gateway(
     let mut config =
         HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_attester)?
             .with_audience(audience)
-            .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(Client::connect(
-                database_url,
-                NoTls,
-            )?)))
-            .with_freshness_provider(Arc::new(LocalFreshnessProvider { policy_digest }));
+            .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(
+                database.connect()?,
+            )))
+            .with_freshness_provider(freshness_provider(production_adapter, policy_digest)?);
     if let Some(bindings) = tenant_issuer_bindings {
         config = config.with_tenant_issuer_bindings(bindings);
     }
@@ -284,26 +255,104 @@ fn build_gateway(
     };
 
     let journal = Arc::new(PostgresExecutionJournal::from_connection_factory({
-        let database_url = database_url.to_owned();
-        move || Client::connect(&database_url, NoTls)
+        let database = database.clone();
+        move || database.connect()
     })?);
     let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
         "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
     )?)?);
-    let approval_key_id = required_env("PRAETORE_GATEWAY_APPROVER_KEY_ID")?;
-    let approval_public_key = VerifiedPublicKey::from_bytes(&hex::decode(required_env(
-        "PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX",
-    )?)?)?;
-    let approval_verifier = HumanApprovalVerifier::new(approval_key_id, approval_public_key)?;
+    let mut gateway = Gateway::new(engine, journal, dispatcher, execution_signer)?;
+    for verifier in approval_verifiers {
+        gateway = gateway.with_human_approval_verifier(verifier);
+    }
+    Ok(gateway)
+}
 
-    Ok(Gateway::new(engine, journal, dispatcher, execution_signer)?
-        .with_human_approval_verifier(approval_verifier))
+/// `http`/`sandbox` require the file-based revocation snapshot; only the
+/// local demo may fall back to the demo provider that never checks
+/// revocation.
+fn freshness_provider(
+    production_adapter: bool,
+    policy_digest: String,
+) -> Result<Arc<dyn FreshnessProvider>, Box<dyn std::error::Error>> {
+    match env::var("PRAETORE_GATEWAY_FRESHNESS_FILE") {
+        Ok(path) => {
+            let defaults = FileFreshnessLimits::default();
+            let limits = FileFreshnessLimits {
+                reload_interval: env_duration_ms(
+                    "PRAETORE_GATEWAY_FRESHNESS_RELOAD_INTERVAL_MS",
+                    defaults.reload_interval.as_millis() as u64,
+                )?,
+                lease: time::Duration::try_from(env_duration_ms(
+                    "PRAETORE_GATEWAY_FRESHNESS_LEASE_MS",
+                    defaults.lease.whole_milliseconds() as u64,
+                )?)?,
+                max_snapshot_validity: time::Duration::try_from(env_duration_ms(
+                    "PRAETORE_GATEWAY_FRESHNESS_MAX_SNAPSHOT_VALIDITY_MS",
+                    defaults.max_snapshot_validity.whole_milliseconds() as u64,
+                )?)?,
+            };
+            if limits.lease > time::Duration::minutes(1) {
+                return Err("PRAETORE_GATEWAY_FRESHNESS_LEASE_MS must be at most 60000".into());
+            }
+            Ok(Arc::new(FileFreshnessProvider::new(
+                path,
+                policy_digest,
+                limits,
+            )?))
+        }
+        Err(_) if production_adapter => Err(
+            "PRAETORE_GATEWAY_FRESHNESS_FILE is required with the http and sandbox adapters; the demo freshness provider never checks revocation"
+                .into(),
+        ),
+        Err(_) => {
+            tracing::warn!(
+                "local-demo adapter: demo freshness provider grants leases without checking revocation"
+            );
+            Ok(Arc::new(DemoFreshnessProvider::new(policy_digest)))
+        }
+    }
+}
+
+/// Per-tenant approver bindings, or a single approver key that is unscoped
+/// only for the local demo and bound to the sole tenant otherwise.
+fn approval_verifiers(
+    tenant_issuer_bindings: Option<&HashMap<Uuid, Vec<String>>>,
+) -> Result<Vec<HumanApprovalVerifier>, Box<dyn std::error::Error>> {
+    let issuer_tenants: Option<HashSet<Uuid>> =
+        tenant_issuer_bindings.map(|bindings| bindings.keys().copied().collect());
+    let single_key = (
+        env::var("PRAETORE_GATEWAY_APPROVER_KEY_ID"),
+        env::var("PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX"),
+    );
+    match (env::var("PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE"), single_key) {
+        (Ok(_), (Ok(_), _) | (_, Ok(_))) => Err(
+            "set either PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE or the single approver key variables, not both"
+                .into(),
+        ),
+        (Ok(path), _) => parse_approver_bindings(
+            &read_limited(&path, 1_048_576)?,
+            issuer_tenants.as_ref(),
+        ),
+        (Err(_), (Ok(key_id), Ok(public_key_hex))) => Ok(vec![single_approver(
+            &key_id,
+            &public_key_hex,
+            issuer_tenants.as_ref(),
+        )?]),
+        (Err(_), _) => Err(
+            "PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE or PRAETORE_GATEWAY_APPROVER_KEY_ID and PRAETORE_GATEWAY_APPROVER_PUBLIC_KEY_HEX are required"
+                .into(),
+        ),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    if env::args().nth(1).as_deref() == Some("migrate") {
+        return migrate_command();
+    }
 
     let database_url = required_env("PRAETORE_GATEWAY_DATABASE_URL")?;
     let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
@@ -325,6 +374,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_issuer_bindings: Some(bindings),
                 audience,
                 require_trusted_clock: true,
+                production_adapter: true,
             }
         }
         Ok("sandbox") => {
@@ -345,6 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tenant_issuer_bindings: Some(bindings),
                 audience,
                 require_trusted_clock: true,
+                production_adapter: true,
             }
         }
         Ok("local-demo") | Err(_) => GatewayAdapterSetup {
@@ -352,19 +403,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tenant_issuer_bindings: None,
             audience: "praetore-local-demo".to_owned(),
             require_trusted_clock: false,
+            production_adapter: false,
         },
         Ok(_) => {
             return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
         }
     };
-    let gateway = Arc::new(build_gateway(
+    let approval_verifiers = approval_verifiers(adapter_setup.tenant_issuer_bindings.as_ref())?;
+    let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL").ok();
+    let database = prepare_database(
         &database_url,
+        migration_url.as_deref(),
+        adapter_setup.production_adapter,
+    )?;
+    let gateway = Arc::new(build_gateway(
+        &database,
         adapter_setup.dispatcher,
         adapter_setup.tenant_issuer_bindings,
         &adapter_setup.audience,
         adapter_setup.require_trusted_clock,
+        adapter_setup.production_adapter,
+        approval_verifiers,
     )?);
-    apply_migrations(&database_url)?;
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
         Ok(address) => address.parse::<std::net::SocketAddr>()?,
         Err(_) => {
@@ -380,11 +440,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if address.port() == 0 {
         return Err("gateway listener port must be between 1 and 65535".into());
     }
+    let credentials = env::var("PRAETORE_GATEWAY_API_CREDENTIALS_FILE")
+        .ok()
+        .map(|path| read_limited(&path, 1_048_576))
+        .transpose()?;
+    let api_auth = select_api_auth(
+        adapter_setup.production_adapter,
+        address,
+        credentials.as_deref(),
+    )?;
+    if !api_auth.is_required() {
+        tracing::warn!(
+            %address,
+            "local demo: HTTP API has no caller authentication; loopback only"
+        );
+    }
 
     tracing::warn!(
         %address,
         loopback_only = address.ip().is_loopback(),
-        "development service: plain HTTP and local freshness; do not expose without private-network policy and authenticated TLS termination"
+        api_authentication = api_auth.is_required(),
+        "plain HTTP service: do not expose without private-network policy and authenticated TLS termination"
     );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -392,7 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&address).await?;
         tracing::info!(%address, "PRÆTORE local demo gateway listening");
-        axum::serve(listener, http_api::router(gateway)).await?;
+        axum::serve(listener, http_api::router(gateway, api_auth)).await?;
         Ok::<_, std::io::Error>(())
     })?;
     Ok(())
@@ -493,9 +569,63 @@ mod tests {
     }
 
     #[test]
-    fn remote_database_hosts_are_rejected_by_local_demo() {
-        assert!(validate_local_database_url("postgres://localhost/praetore").is_ok());
-        assert!(validate_local_database_url("postgres://127.0.0.1/praetore").is_ok());
-        assert!(validate_local_database_url("postgres://db.internal/praetore").is_err());
+    fn database_urls_are_validated_before_any_connection() {
+        use praetore_replay_postgres::DatabaseUrlError;
+        // Unresolvable hosts: an error other than DatabaseUrlError would mean
+        // a connection was attempted.
+        for (runtime, migration) in [
+            ("postgres://gateway@db.invalid/praetore", None),
+            (
+                "postgres://gateway@127.0.0.1:1/praetore",
+                Some("postgres://owner@db.invalid/praetore"),
+            ),
+            (
+                "postgres://gateway@db.invalid/praetore?sslmode=require",
+                Some("postgres://owner@127.0.0.1:1/praetore"),
+            ),
+        ] {
+            for production in [false, true] {
+                let error = prepare_database(runtime, migration, production).unwrap_err();
+                assert!(
+                    error.downcast_ref::<DatabaseUrlError>().is_some(),
+                    "{runtime}: {error}"
+                );
+            }
+        }
+    }
+
+    fn test_database_url() -> String {
+        env::var("PRAETORE_TEST_DATABASE_URL").expect("PRAETORE_TEST_DATABASE_URL")
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL (superuser)"]
+    fn production_refuses_a_privileged_runtime_role_and_local_demo_warns() {
+        let url = test_database_url();
+        let error = prepare_database(&url, Some(&url), true).unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<praetore_replay_postgres::RuntimeRoleError>()
+                .is_some(),
+            "{error}"
+        );
+        assert!(prepare_database(&url, None, false).is_ok());
+
+        // A login member of praetore_runtime is accepted in production.
+        let mut admin = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(
+                "DO $$ BEGIN CREATE ROLE praetore_storage_runtime; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; \
+                 ALTER ROLE praetore_storage_runtime LOGIN PASSWORD 'praetore-storage-test'; \
+                 GRANT praetore_runtime TO praetore_storage_runtime",
+            )
+            .unwrap();
+        let host_and_database = url.rsplit_once('@').unwrap().1;
+        let runtime = format!(
+            "postgres://praetore_storage_runtime:praetore-storage-test@{host_and_database}"
+        );
+        prepare_database(&runtime, Some(&url), true).unwrap();
+        prepare_database(&runtime, None, true).unwrap();
     }
 }
