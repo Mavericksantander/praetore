@@ -194,7 +194,9 @@ fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
 fn verify(json: &str, keys: &DemoPublicKeys) -> Result<(), ExecutionAttestationError> {
     let key = VerifiedPublicKey::from_bytes(&keys.execution)
         .map_err(|_| ExecutionAttestationError::InvalidSignature)?;
-    verify_gateway_receipt_json(json, &key, DEMO_ONLY_KEY_ID).map(|_| ())
+    let evidence_attester = VerifiedPublicKey::from_bytes(&keys.evidence_attester)
+        .map_err(|_| ExecutionAttestationError::InvalidEvidenceSignature)?;
+    verify_gateway_receipt_json(json, &key, DEMO_ONLY_KEY_ID, &evidence_attester).map(|_| ())
 }
 
 /// Changes exactly one byte inside the first occurrence of `marker`, at
@@ -306,6 +308,19 @@ fn run() -> DemoResult<bool> {
         &tampered_output,
         &public_key,
         ExecutionAttestationError::InvalidPayload,
+    );
+    // 4c: one hex digit of the evidence attester signature (needs PR #35).
+    let att_marker = "\"attester_signature\": \"";
+    let att_offset = att_marker.len() + 10;
+    let att_original =
+        receipt_json.as_bytes()[marker_position(&receipt_json, att_marker)? + att_offset];
+    let att_replacement = if att_original == b'0' { b'1' } else { b'0' };
+    let tampered_att = flip_one_byte(&receipt_json, att_marker, att_offset, att_replacement)?;
+    ok &= check_rejected(
+        "4c evidence attester signature byte changed",
+        &tampered_att,
+        &public_key,
+        ExecutionAttestationError::InvalidEvidenceSignature,
     );
     println!();
 
