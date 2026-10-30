@@ -24,7 +24,7 @@ use postgres::Client;
 use sha2::{Digest, Sha256};
 
 /// Ordered `(version, sql)` pairs. Append only; never edit or reorder.
-pub const MIGRATIONS: [(&str, &str); 11] = [
+pub const MIGRATIONS: [(&str, &str); 12] = [
     (
         "0001_replay_claims",
         include_str!("../migrations/0001_replay_claims.sql"),
@@ -68,6 +68,10 @@ pub const MIGRATIONS: [(&str, &str); 11] = [
     (
         "0011_runtime_role",
         include_str!("../migrations/0011_runtime_role.sql"),
+    ),
+    (
+        "0012_dispatch_requires_live_approval",
+        include_str!("../migrations/0012_dispatch_requires_live_approval.sql"),
     ),
 ];
 

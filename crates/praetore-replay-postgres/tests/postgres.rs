@@ -2924,7 +2924,11 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
     let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
     assert_eq!(
         applied,
-        vec!["0010_approved_pending_dispatch", "0011_runtime_role"]
+        vec![
+            "0010_approved_pending_dispatch",
+            "0011_runtime_role",
+            "0012_dispatch_requires_live_approval"
+        ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
     assert_eq!(recorded_versions(&mut client), all_versions());
@@ -3453,6 +3457,125 @@ fn postgres_apd_sigkill_between_approve_and_claim() {
         !database_transitions(key)
             .iter()
             .any(|(_, to)| to == "dispatched")
+    );
+}
+
+/// APD -> dispatched through raw SQL with an optional
+/// `praetore.dispatch_observed_at`.
+fn sql_claim(
+    client: &mut Client,
+    key: ExecutionKey,
+    observed_at: Option<OffsetDateTime>,
+) -> Result<u64, postgres::Error> {
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&key.tenant_id.to_string()],
+        )
+        .unwrap();
+    if let Some(observed_at) = observed_at {
+        let observed_at = observed_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        transaction
+            .query_one(
+                "SELECT set_config('praetore.dispatch_observed_at', $1, true)",
+                &[&observed_at],
+            )
+            .unwrap();
+    }
+    let changed = transaction.execute(
+        "UPDATE praetore.execution_journal \
+         SET execution_status = 'dispatched', updated_at = clock_timestamp() \
+         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+        &[&key.tenant_id, &key.agent_id, &key.request_id],
+    )?;
+    transaction.commit()?;
+    Ok(changed)
+}
+
+fn approval_expires_at(key: ExecutionKey) -> OffsetDateTime {
+    connect_client()
+        .query_one(
+            "SELECT expires_at FROM praetore.human_approvals \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap()
+        .get(0)
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_sql_refuses_dispatch_of_an_expired_or_expiration_receipted_approval() {
+    let mut admin = connect_client();
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let key = approved_pending(&fixture);
+    let expires_at = approval_expires_at(key);
+
+    // Bypassing claim_dispatch: no observation time, or one at/after expiry.
+    for observed_at in [None, Some(expires_at), Some(expires_at + Duration::days(1))] {
+        assert!(
+            sql_claim(&mut admin, key, observed_at).is_err(),
+            "dispatch accepted with observed_at {observed_at:?}"
+        );
+    }
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+
+    // An expiration receipt blocks dispatch even with a valid observation
+    // time. APD and a receipt are exclusive under the 0009 triggers, so the
+    // receipt is planted with triggers disabled (replica role).
+    admin
+        .batch_execute("SET session_replication_role = replica")
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO praetore.human_approval_expirations \
+                 (tenant_id, agent_id, request_id, evidence_id, evidence_hash, action_digest, \
+                  policy_digest, expires_at, observed_at, gateway_key_id, signature, \
+                  receipt_json, receipt_id) \
+             VALUES ($1, $2, $3, $4, $5, $5, $5, $6, $6, 'planted', $7, '{}'::jsonb, $4)",
+            &[
+                &key.tenant_id,
+                &key.agent_id,
+                &key.request_id,
+                &Uuid::new_v4(),
+                &"0".repeat(64),
+                &expires_at,
+                &"0".repeat(128),
+            ],
+        )
+        .unwrap();
+    admin
+        .batch_execute("SET session_replication_role = origin")
+        .unwrap();
+    assert!(sql_claim(&mut admin, key, Some(expires_at - Duration::seconds(1))).is_err());
+    admin
+        .batch_execute("SET session_replication_role = replica")
+        .unwrap();
+    admin
+        .execute(
+            "DELETE FROM praetore.human_approval_expirations \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap();
+    admin
+        .batch_execute("SET session_replication_role = origin")
+        .unwrap();
+
+    // Live approval, no receipt, observation before expiry: allowed.
+    assert_eq!(
+        sql_claim(&mut admin, key, Some(expires_at - Duration::seconds(1))).unwrap(),
+        1
+    );
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::Dispatched
     );
 }
 
