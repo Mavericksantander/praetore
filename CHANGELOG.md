@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- New crate `praetore-mcp` (binary `praetore-mcp`): a local stdio MCP proxy
+  for Claude Desktop, Cursor and VS Code that needs no PostgreSQL and no Rust.
+  `init` creates LOCAL/DEV issuer, agent and attester keys (0600), a signed
+  authority, `praetore-verify`-compatible trust pins and a default v2 policy.
+  `wrap` evaluates every client→server `tools/call` in HighAssurance mode and
+  appends attested evidence to an fsynced JSONL journal. In `observe` mode
+  (the default) calls are always forwarded and only recorded. In `enforce`
+  mode DENY and REQUIRE_APPROVAL are blocked with an MCP `isError` result,
+  and errors fail closed. The mode is bound into the signed evidence as
+  `context["praetore.mode"]`. `install` / `uninstall` rewrite and restore
+  client configs, writing a backup and asking for confirmation first.
+  `receipts` and `verify` read and check the journal. Limitations: stdio
+  only, REQUIRE_APPROVAL is not supported, LOCAL/DEV keys only, and receipts
+  attest the proxy's view of a call, not the upstream agent's intent. See
+  `crates/praetore-mcp/README.md`. `praetore-core` is unchanged.
 - Policy size and complexity limits are now public, documented constants in
   `praetore_core::policy`, and exceeding any of them rejects the whole policy
   with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`
