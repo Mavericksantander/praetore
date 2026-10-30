@@ -18,7 +18,13 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, fs, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use uuid::Uuid;
@@ -37,7 +43,7 @@ const ACTION_DIGEST_ANNOTATION: &str = "praetore.io/action-sha256";
 pub struct SandboxSupervisor {
     kubernetes: KubernetesApi,
     runner_image: String,
-    routes: Arc<HashMap<(Uuid, String, String, String), String>>,
+    routes: Arc<HashMap<(Uuid, String, String, String), Route>>,
     pending: Arc<Mutex<HashMap<ExecutionKey, PendingResult>>>,
     concurrency: Arc<Semaphore>,
 }
@@ -73,6 +79,25 @@ struct ProfileRoute {
     target: String,
     capability: String,
     tool_profile: String,
+    /// Closed schema of the action's top-level parameters. A key that is not
+    /// declared, or a value of another kind, refuses the dispatch.
+    parameters: BTreeMap<String, ParameterKind>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ParameterKind {
+    /// A string naming a file relative to the sandbox; checked lexically.
+    Path,
+    String,
+    Integer,
+    Boolean,
+}
+
+#[derive(Clone)]
+struct Route {
+    tool_profile: String,
+    parameters: BTreeMap<String, ParameterKind>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -308,7 +333,7 @@ impl SandboxSupervisor {
         let config_value = parse_json_rejecting_duplicates(config_json)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let config: SupervisorConfig = serde_json::from_value(config_value)?;
-        if config.schema_version != 1
+        if config.schema_version != 2
             || config.routes.is_empty()
             || config.routes.len() > 128
             || !valid_runner_image(&config.runner_image)
@@ -322,6 +347,8 @@ impl SandboxSupervisor {
                 || !valid_route_text(&route.action_type)
                 || !valid_route_text(&route.target)
                 || !valid_route_text(&route.capability)
+                || route.parameters.len() > 64
+                || route.parameters.keys().any(|key| !valid_route_text(key))
             {
                 return Err("sandbox supervisor route contains invalid fields".into());
             }
@@ -331,7 +358,11 @@ impl SandboxSupervisor {
                 route.target,
                 route.capability,
             );
-            if routes.insert(key, route.tool_profile).is_some() {
+            let value = Route {
+                tool_profile: route.tool_profile,
+                parameters: route.parameters,
+            };
+            if routes.insert(key, value).is_some() {
                 return Err("sandbox supervisor configuration contains duplicate routes".into());
             }
         }
@@ -392,7 +423,7 @@ async fn dispatch(
         .capability
         .as_deref()
         .ok_or_else(ApiError::bad_request)?;
-    let profile = supervisor
+    let route = supervisor
         .routes
         .get(&(
             tenant_id,
@@ -400,8 +431,11 @@ async fn dispatch(
             target.to_owned(),
             capability.to_owned(),
         ))
-        .ok_or_else(ApiError::forbidden)?
-        .clone();
+        .ok_or_else(ApiError::forbidden)?;
+    if !parameters_match_schema(&route.parameters, &request.action.parameters) {
+        return Err(ApiError::bad_request());
+    }
+    let profile = route.tool_profile.clone();
     let execution_id = execution_id(request.execution_key);
     let action_prefix = request
         .action_digest
@@ -536,23 +570,32 @@ fn valid_dispatch_request(request: &DispatchRequest, idempotency: &str) -> bool 
             .is_some_and(|capability| request.authority.capabilities.contains(capability))
         && action_digest(&request.action).is_ok_and(|digest| digest == request.action_digest)
         && idempotency == idempotency_key(request.execution_key)
-        && lexically_confined(&request.action.parameters)
 }
 
-/// T-013 fix A (lexical only): the Job interprets `parameters` freely, so
-/// every string value at any depth is treated as a possible path relative to
-/// the sandbox. Rejected: NUL, a root (`/` or `\`), a drive or UNC prefix,
-/// and any `..` segment. Both separators are checked so the result does not
+/// T-013 fix A: `parameters` must be an object whose keys are all declared by
+/// the route, each value of the declared kind. Only `path` values get the
+/// lexical check, so free text that merely looks like a path is not refused.
+/// Declared keys may be absent.
+fn parameters_match_schema(schema: &BTreeMap<String, ParameterKind>, parameters: &Value) -> bool {
+    let Value::Object(entries) = parameters else {
+        return false;
+    };
+    entries
+        .iter()
+        .all(|(key, value)| match (schema.get(key), value) {
+            (Some(ParameterKind::Path), Value::String(text)) => lexically_confined_text(text),
+            (Some(ParameterKind::String), Value::String(_))
+            | (Some(ParameterKind::Boolean), Value::Bool(_)) => true,
+            (Some(ParameterKind::Integer), Value::Number(number)) => {
+                number.is_i64() || number.is_u64()
+            }
+            _ => false,
+        })
+}
+
+/// Lexical only: rejects NUL, a root (`/` or `\`), a drive or UNC prefix and
+/// any `..` segment. Both separators are checked so the result does not
 /// depend on the host OS. Symlinks are not resolved here (fix B).
-fn lexically_confined(value: &Value) -> bool {
-    match value {
-        Value::String(text) => lexically_confined_text(text),
-        Value::Array(items) => items.iter().all(lexically_confined),
-        Value::Object(entries) => entries.values().all(lexically_confined),
-        Value::Null | Value::Bool(_) | Value::Number(_) => true,
-    }
-}
-
 fn lexically_confined_text(text: &str) -> bool {
     let bytes = text.as_bytes();
     let rooted = text.starts_with(['/', '\\']);
@@ -1359,7 +1402,7 @@ mod tests {
             base_url: Url::parse("https://127.0.0.1:1/").unwrap(),
         };
         let config = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "runner_image": format!(
                 "registry.example.com/praetore/tool-runner@sha256:{}",
                 "a".repeat(64)
@@ -1369,7 +1412,8 @@ mod tests {
                 "action_type": "orders:create",
                 "target": "orders-api",
                 "capability": "orders:write",
-                "tool_profile": "orders-create"
+                "tool_profile": "orders-create",
+                "parameters": {"path": "path", "content": "string"}
             }]
         });
         SandboxSupervisor::new(kubernetes, &config.to_string()).unwrap()
@@ -1476,10 +1520,11 @@ mod tests {
             "action_type": "orders:create",
             "target": "orders-api",
             "capability": "orders:write",
-            "tool_profile": "orders-create"
+            "tool_profile": "orders-create",
+            "parameters": {"id": "integer"}
         });
         let valid = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "runner_image": format!(
                 "registry.example.com/praetore/tool-runner@sha256:{}",
                 "a".repeat(64)
@@ -1489,8 +1534,8 @@ mod tests {
         assert!(SandboxSupervisor::new(kubernetes(), &valid.to_string()).is_ok());
 
         let duplicate_root_key = valid.to_string().replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"schema_version\":1",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"schema_version\":2",
             1,
         );
         assert!(SandboxSupervisor::new(kubernetes(), &duplicate_root_key).is_err());
@@ -1503,14 +1548,14 @@ mod tests {
         assert!(SandboxSupervisor::new(kubernetes(), &duplicate_route_key).is_err());
 
         let invalid_image = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "runner_image": "registry.example.com/praetore/tool-runner:latest",
             "routes": [route.clone()]
         });
         assert!(SandboxSupervisor::new(kubernetes(), &invalid_image.to_string()).is_err());
 
         let duplicate_route = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "runner_image": format!(
                 "registry.example.com/praetore/tool-runner@sha256:{}",
                 "a".repeat(64)
@@ -1518,6 +1563,27 @@ mod tests {
             "routes": [route.clone(), route]
         });
         assert!(SandboxSupervisor::new(kubernetes(), &duplicate_route.to_string()).is_err());
+
+        // Version 1 had no parameter schema; it is refused, not upgraded.
+        let mut version_one = valid.clone();
+        version_one["schema_version"] = json!(1);
+        assert!(SandboxSupervisor::new(kubernetes(), &version_one.to_string()).is_err());
+
+        // Every route must declare its parameters, each with a known kind.
+        let mut missing = valid.clone();
+        missing["routes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("parameters");
+        assert!(SandboxSupervisor::new(kubernetes(), &missing.to_string()).is_err());
+        for schema in [json!({"id": "number"}), json!({"id": "path", "": "string"})] {
+            let mut config = valid.clone();
+            config["routes"][0]["parameters"] = schema;
+            assert!(
+                SandboxSupervisor::new(kubernetes(), &config.to_string()).is_err(),
+                "{config}"
+            );
+        }
     }
 
     #[test]
@@ -1579,10 +1645,6 @@ mod tests {
         ));
     }
 
-    fn request_with_path(path: &str) -> (DispatchRequest, String) {
-        request_with_parameters(json!({"path": path}))
-    }
-
     fn request_with_parameters(parameters: Value) -> (DispatchRequest, String) {
         let tenant_id = Uuid::from_u128(10);
         let agent_id = AgentId::new();
@@ -1607,12 +1669,20 @@ mod tests {
         (request, idempotency)
     }
 
+    fn path_schema() -> BTreeMap<String, ParameterKind> {
+        BTreeMap::from([
+            ("path".to_owned(), ParameterKind::Path),
+            ("note".to_owned(), ParameterKind::String),
+            ("count".to_owned(), ParameterKind::Integer),
+            ("force".to_owned(), ParameterKind::Boolean),
+        ])
+    }
+
     #[test]
     fn sandbox_dispatch_rejects_parent_directory_escape() {
         for path in ["../etc/passwd", "a/../../etc", "..", "a\\..\\b", "ok/..\\x"] {
-            let (request, idempotency) = request_with_path(path);
             assert!(
-                !valid_dispatch_request(&request, &idempotency),
+                !parameters_match_schema(&path_schema(), &json!({"path": path})),
                 "parent-directory path {path:?} was accepted"
             );
         }
@@ -1627,49 +1697,117 @@ mod tests {
             "\\\\server\\share",
             "C:\\x",
             "c:x",
+            "ok\0/etc",
         ] {
-            let (request, idempotency) = request_with_path(path);
             assert!(
-                !valid_dispatch_request(&request, &idempotency),
-                "absolute path {path:?} was accepted"
+                !parameters_match_schema(&path_schema(), &json!({"path": path})),
+                "path {path:?} was accepted"
             );
         }
     }
 
     #[test]
-    fn sandbox_dispatch_rejects_nul_and_nested_escapes() {
-        let (request, idempotency) = request_with_path("ok\0/etc");
-        assert!(
-            !valid_dispatch_request(&request, &idempotency),
-            "NUL accepted"
-        );
-
+    fn sandbox_dispatch_rejects_undeclared_keys_and_unexpected_kinds() {
         for parameters in [
-            json!({"files": ["ok.txt", "/etc/passwd"]}),
-            json!({"target": {"dir": "data", "file": "../secret"}}),
+            json!({"path": "ok.txt", "destination": "ok2.txt"}),
+            json!({"Path": "ok.txt"}),
+            json!({"path": 3}),
+            json!({"path": ["ok.txt"]}),
+            json!({"path": {"dir": "ok"}}),
+            json!({"path": null}),
+            json!({"count": "3"}),
+            json!({"count": 1.5}),
+            json!({"force": "true"}),
+            json!({"note": false}),
+            json!(["ok.txt"]),
+            json!("ok.txt"),
         ] {
-            let (request, idempotency) = request_with_parameters(parameters.clone());
             assert!(
-                !valid_dispatch_request(&request, &idempotency),
-                "nested escape accepted: {parameters}"
+                !parameters_match_schema(&path_schema(), &parameters),
+                "accepted: {parameters}"
             );
         }
+        assert!(!parameters_match_schema(
+            &BTreeMap::new(),
+            &json!({"id": 3})
+        ));
     }
 
     #[test]
-    fn sandbox_dispatch_accepts_relative_paths_and_plain_values() {
+    fn sandbox_dispatch_accepts_declared_values_and_free_text() {
         for parameters in [
+            json!({}),
             json!({"path": "data/report.txt"}),
-            json!({"path": "./a/b..c/...", "id": 3, "flag": true, "none": null}),
-            json!({"note": "1..2", "url": "https://example.test/a/b"}),
-            json!({"files": ["a.txt", "dir/b.txt"], "nested": {"k": "v"}}),
+            json!({"path": "./a/b..c/..."}),
+            // Only `path` values are checked: free text that looks like a
+            // path, a URL or `..` is not refused.
+            json!({
+                "path": "a.txt",
+                "note": "/v1/orders ../x https://example.test/a",
+                "count": -2,
+                "force": true
+            }),
         ] {
-            let (request, idempotency) = request_with_parameters(parameters.clone());
             assert!(
-                valid_dispatch_request(&request, &idempotency),
+                parameters_match_schema(&path_schema(), &parameters),
                 "rejected: {parameters}"
             );
         }
+    }
+
+    async fn post_execution(supervisor: &SandboxSupervisor, parameters: Value) -> StatusCode {
+        use tower::ServiceExt;
+        let (mut request, _) = request_with_parameters(parameters);
+        let tenant_id = Uuid::from_u128(1);
+        request.execution_key.tenant_id = tenant_id;
+        request.authority.constraints =
+            vec![AuthorityConstraint::new("tenant_id", tenant_id.to_string())];
+        let idempotency = idempotency_key(request.execution_key);
+        assert!(valid_dispatch_request(&request, &idempotency));
+        let body = json!({
+            "schema_version": request.schema_version,
+            "execution_key": request.execution_key,
+            "authority": request.authority,
+            "action_digest": request.action_digest,
+            "action": request.action,
+        });
+        supervisor
+            .clone()
+            .gateway_router()
+            .oneshot(
+                axum::http::Request::post("/v1/executions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", idempotency)
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_schema_violations_before_any_kubernetes_request() {
+        let supervisor = unreachable_supervisor();
+        // The route declares {"path": "path", "content": "string"}.
+        for parameters in [
+            json!({"path": "../etc/passwd"}),
+            json!({"path": "/etc/passwd"}),
+            json!({"path": "ok.txt", "destination": "/etc/passwd"}),
+            json!({"path": 7}),
+        ] {
+            assert_eq!(
+                post_execution(&supervisor, parameters.clone()).await,
+                StatusCode::BAD_REQUEST,
+                "{parameters}"
+            );
+        }
+        // A valid request passes the schema and only then fails on the
+        // unreachable Kubernetes API, so the 400s above came from the schema.
+        let status =
+            post_execution(&supervisor, json!({"path": "ok.txt", "content": "../x"})).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(status, StatusCode::FORBIDDEN);
     }
 
     #[test]
@@ -1685,8 +1823,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, sandbox.join("link")).unwrap();
         // Relative to the sandbox root, so fix A (lexical) cannot reject it:
         // only resolving it against the root (fix B) can.
-        let (request, idempotency) = request_with_path("link");
-        let rejected = !valid_dispatch_request(&request, &idempotency);
+        let rejected = !parameters_match_schema(&path_schema(), &json!({"path": "link"}));
         let _ = std::fs::remove_dir_all(&root);
         assert!(rejected, "symlink path was accepted");
     }
