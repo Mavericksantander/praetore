@@ -468,7 +468,10 @@ mod tests {
         let request = test_request();
 
         let evidence = request
-            .attest(Decision::allow("policy permitted action"))
+            .attest(Decision::allow(
+                "policy permitted action",
+                crate::DecidedBy::rule("test-rule"),
+            ))
             .unwrap();
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
@@ -481,7 +484,10 @@ mod tests {
         let request_id = request.request_id;
 
         let evidence = request
-            .attest(Decision::deny("policy rejected action"))
+            .attest(Decision::deny(
+                "policy rejected action",
+                crate::DecidedBy::rule("test-rule"),
+            ))
             .unwrap();
 
         assert_eq!(evidence.request_id, request_id);
@@ -492,7 +498,10 @@ mod tests {
         let request = test_request().with_trace_id("trace-001");
 
         let evidence = request
-            .attest(Decision::allow("policy permitted action"))
+            .attest(Decision::allow(
+                "policy permitted action",
+                crate::DecidedBy::rule("test-rule"),
+            ))
             .unwrap();
 
         assert_eq!(evidence.trace_id.as_deref(), Some("trace-001"));
@@ -505,7 +514,10 @@ mod tests {
         request.agent.id = AgentId::new();
 
         assert!(matches!(
-            request.attest(Decision::allow("policy permitted action")),
+            request.attest(Decision::allow(
+                "policy permitted action",
+                crate::DecidedBy::rule("test-rule")
+            )),
             Err(crate::PraetoreError::InvalidRequest(_))
         ));
     }
@@ -516,7 +528,10 @@ mod tests {
         request.trace_id = Some("   ".into());
 
         assert!(matches!(
-            request.attest(Decision::allow("policy permitted action")),
+            request.attest(Decision::allow(
+                "policy permitted action",
+                crate::DecidedBy::rule("test-rule")
+            )),
             Err(crate::PraetoreError::InvalidRequest(_))
         ));
     }

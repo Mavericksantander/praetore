@@ -185,7 +185,10 @@ mod tests {
 
     fn make_rotation_evidence() -> crate::evidence::Evidence {
         let mut evidence = make_rotation_request()
-            .attest(Decision::allow("rotation permitted"))
+            .attest(Decision::allow(
+                "rotation permitted",
+                crate::DecidedBy::rule("test-rule"),
+            ))
             .unwrap();
         evidence.bind_policy_digest("ab".repeat(32)).unwrap();
         evidence.sign(&attester()).unwrap();
@@ -272,13 +275,22 @@ mod tests {
     fn rotation_evidence_requires_a_trusted_attester_signature() {
         let request = make_rotation_request();
 
-        let unsigned = request.clone().attest(Decision::allow("forged")).unwrap();
+        let unsigned = request
+            .clone()
+            .attest(Decision::allow(
+                "forged",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
         assert!(unsigned.verify_integrity());
         assert!(unsigned.verify_key_rotation(&attester_key()).is_err());
 
         let mut other_attester = request
             .clone()
-            .attest(Decision::allow("other attester"))
+            .attest(Decision::allow(
+                "other attester",
+                crate::DecidedBy::rule("test-rule"),
+            ))
             .unwrap();
         other_attester.bind_policy_digest("ab".repeat(32)).unwrap();
         other_attester
@@ -286,13 +298,18 @@ mod tests {
             .unwrap();
         assert!(other_attester.verify_key_rotation(&attester_key()).is_err());
 
-        let mut denied = request.attest(Decision::deny("denied")).unwrap();
+        let mut denied = request
+            .attest(Decision::deny(
+                "denied",
+                crate::DecidedBy::rule("test-rule"),
+            ))
+            .unwrap();
         denied.bind_policy_digest("ab".repeat(32)).unwrap();
         denied.sign(&attester()).unwrap();
         assert!(denied.verify_key_rotation(&attester_key()).is_err());
         // Flip the signed DENY into an ALLOW, keeping the attester signature.
         let mut flipped = make_rotation_evidence();
-        flipped.decision = Decision::deny("flipped");
+        flipped.decision = Decision::deny("flipped", crate::DecidedBy::rule("test-rule")).into();
         assert!(flipped.verify_key_rotation(&attester_key()).is_err());
     }
 }
