@@ -33,7 +33,9 @@ Usage:
 
 DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys. Observe mode records decisions but
-never blocks; enforce mode blocks DENY and REQUIRE_APPROVAL decisions.";
+never blocks; enforce mode blocks DENY and REQUIRE_APPROVAL decisions. If the
+home cannot be loaded (e.g. no `init`), `wrap` refuses every tools/call in
+both modes.";
 
 #[derive(Debug, Default)]
 struct Parsed {
