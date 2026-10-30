@@ -1,7 +1,7 @@
 # SAF-11 · Custodia de llaves y log de transparencia de recibos (propuesta)
 
 Estado: **propuesta, solo documento.** No contiene código de producción.
-Ninguna decisión está tomada: todas esperan al CTO.
+Decisiones 1–3 **decididas** por el fundador (30-oct-2026); el resto espera al CTO.
 Base: `origin/main` en `97fa755`.
 Nombre: sigue la convención `SAF-NN`. El número es provisional.
 Relación: el PR #18 propone una cadena de hashes del journal. Al revisarlo
@@ -62,9 +62,9 @@ regenere completo de forma coherente.
 
 | # | Decisión | Estado |
 |---|---|---|
-| 1 | La firma pasa por un trait `Signer` (llave pública, `key_id`, `sign(dominio, mensaje)`). `EvidenceAttesterKey` y la llave de ejecución pasan a ser una implementación más (`LocalSigner`). Los formatos de recibo no cambian: solo cambia quién firma. | PROPUESTA |
-| 2 | Implementaciones: AWS KMS y GCP KMS (Ed25519 o, si el KMS no lo ofrece, ECDSA P-256 con su propio `attester_algorithm`), y PKCS#11 para HSM. Cada una va en un crate opcional; `praetore-core` no depende de ningún SDK de nube. | PROPUESTA |
-| 3 | En los modos `http`/`sandbox`, el servicio **no arranca** con una llave de firma entregada como variable de entorno, salvo con un opt-in explícito y con nombre alarmante. El demo local sigue igual. | PROPUESTA |
+| 1 | La firma pasa por un trait `Signer` (llave pública, `key_id`, `sign(dominio, mensaje)`). `EvidenceAttesterKey` y la llave de ejecución pasan a ser una implementación más (`LocalSigner`). Los formatos de recibo no cambian: solo cambia quién firma. | **DECIDIDA** (fundador, 30-oct-2026) |
+| 2 | Implementaciones: AWS KMS y GCP KMS (Ed25519 o, si el KMS no lo ofrece, ECDSA P-256 con su propio `attester_algorithm`), y PKCS#11 para HSM. Cada una va en un crate opcional; `praetore-core` no depende de ningún SDK de nube. | **DECIDIDA** (fundador, 30-oct-2026) |
+| 3 | En los modos `http`/`sandbox`, el servicio **no arranca** con una llave de firma entregada como variable de entorno, salvo con un opt-in explícito y con nombre alarmante. El demo local sigue igual. | **DECIDIDA** (fundador, 30-oct-2026) |
 | 4 | **Pines con vigencia para attester y ejecución:** archivo `attester-pins.jsonl` con el mismo formato que los pines de issuer (`key_id`, `public_key`, `validity`). Un recibo verifica solo si `decided_at` cae dentro de la vigencia de la llave que lo firmó. `--attester-pin HEX_FILE` se mantiene como caso de un solo pin sin vigencia. | PROPUESTA |
 | 5 | **Revocación con fecha de corte:** una llave comprometida se marca `revoked_at`. Desde ese momento no se cree nada que haya firmado. Lo anterior sigue valiendo **solo** si un checkpoint anclado (decisión 8) lo cubre, porque `decided_at` por sí solo lo controla quien tiene la llave. | PROPUESTA |
 | 6 | **Log de transparencia:** cada recibo cerrado (evidencia más attestation de ejecución) se agrega como hoja de un árbol de Merkle append-only por tenant, con el esquema de hashes de RFC 6962/9162 y prefijos de dominio propios. | PROPUESTA |
@@ -95,6 +95,19 @@ trait Signer: Send + Sync {
   `attester_algorithm` y la versión de esquema de evidencia sube. Los
   verificadores existentes rechazan ese algoritmo hasta soportarlo, que es
   lo esperado.
+- **Primer KMS (decidido 30-oct-2026): AWS KMS**, con llaves
+  `ECC_NIST_EDWARDS25519` y el algoritmo `ED25519_SHA_512` en modo `RAW`. La
+  llave pública se exporta con `GetPublicKey`, así que la verificación offline
+  no cambia. Costo de referencia: 1 USD/mes por llave; las firmas asimétricas
+  no entran en la capa gratuita (0,15 USD por 10.000). Para desarrollo y CI se
+  usa PKCS#11 con SoftHSM2, que es gratuito y local.
+- **Límite de 4 KiB en `RAW`:** AWS KMS firma mensajes `RAW` de hasta 4096
+  bytes, y un recibo completo puede superarlo. Las firmas hechas por un
+  `Signer` remoto cubren `dominio_v2 ‖ SHA-256(payload canónico)`, con un
+  dominio nuevo y un `attester_algorithm` explícito (por ejemplo
+  `ed25519-sha256-envelope`). Ed25519ph (`ED25519_PH_SHA_512`) se descarta:
+  KMS aplica un segundo hash y los verificadores tendrían que implementar
+  otra variante. Los recibos existentes no cambian.
 - **Rotación:** se agrega un pin nuevo con `not_before = T`, se cambia el
   `Signer` y se cierra la vigencia del pin anterior con `not_after = T + margen`.
   Los recibos antiguos siguen verificando con su propio pin.
