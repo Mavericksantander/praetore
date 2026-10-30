@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signer, SigningKey};
-use postgres::{Client, NoTls};
+use postgres::Client;
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, AuthorizationRequest, EvidenceAttesterKey,
     FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig, Policy, PolicyEffect,
@@ -11,16 +11,14 @@ use praetore_gateway::{
     Gateway, HumanApprovalDecision, HumanApprovalOutcome, HumanApprovalVerifier, http_api,
     local_demo::LocalDemoDispatcher,
 };
-use praetore_replay_postgres::{PostgresExecutionJournal, PostgresReplayGuard};
+use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env, fs,
     io::{self, Write},
-    net::IpAddr,
     path::Path,
-    str::FromStr,
     sync::Arc,
     time::Duration as StdDuration,
 };
@@ -574,6 +572,10 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         healthy = false;
                     }
                 }
+                match praetore_replay_postgres::verify_runtime_role(&mut client) {
+                    Ok(()) => println!("[ok] least-privilege runtime database role"),
+                    Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
+                }
                 for table in REQUIRED_DATABASE_TABLES {
                     let exists: bool = client
                         .query_one("SELECT to_regclass($1)::text IS NOT NULL", &[&table])?
@@ -628,28 +630,25 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
-    let mut config = postgres::Config::from_str(database_url)?;
-    if config.get_hosts().is_empty()
-        || config.get_hosts().iter().any(|host| match host {
-            postgres::config::Host::Tcp(host) => {
-                host != "localhost"
-                    && !host
-                        .parse::<IpAddr>()
-                        .is_ok_and(|address| address.is_loopback())
-            }
-            #[cfg(unix)]
-            postgres::config::Host::Unix(_) => false,
-        })
-    {
+/// The demo only talks to loopback PostgreSQL (or a Unix socket). The URL is
+/// validated, including its TLS policy, before any connection is made.
+fn local_database(database_url: &str) -> Result<DatabaseConnector, Box<dyn std::error::Error>> {
+    let connector =
+        DatabaseConnector::from_url(database_url)?.connect_timeout(StdDuration::from_secs(3));
+    if !connector.is_loopback() {
         return Err(
             "local demo requires PostgreSQL on localhost, a loopback IP, or a Unix socket".into(),
         );
     }
-    config.connect_timeout(StdDuration::from_secs(3));
-    Ok(config.connect(NoTls)?)
+    Ok(connector)
 }
 
+fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
+    Ok(local_database(database_url)?.connect()?)
+}
+
+/// Development only: without PRAETORE_GATEWAY_MIGRATION_DATABASE_URL the demo
+/// migrates with its runtime URL, so the runtime role owns the tables.
 fn apply_migrations(database_url: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = connect_local_database(database_url)?;
     praetore_replay_postgres::apply_migrations(&mut client)?;
@@ -687,8 +686,8 @@ fn build_gateway(
             .with_freshness_provider(Arc::new(LocalFreshnessProvider { policy_digest }));
     let engine = AuthorizationEngine::production(policy, high_assurance)?;
     let journal = Arc::new(PostgresExecutionJournal::from_connection_factory({
-        let database_url = database_url.to_owned();
-        move || Client::connect(&database_url, NoTls)
+        let database = local_database(database_url)?;
+        move || database.connect()
     })?);
     let execution_secret = read_secret(directory, EXECUTION_KEY_FILE)?;
     let signer = Arc::new(LocalExecutionSigner::from_secret(&execution_secret));
@@ -706,12 +705,19 @@ fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(directory)?;
     let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL")
         .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
-    apply_migrations(&database_url)?;
+    let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")
+        .unwrap_or_else(|_| database_url.clone());
+    apply_migrations(&migration_url)?;
+    let runtime_role =
+        praetore_replay_postgres::verify_runtime_role(&mut connect_local_database(&database_url)?);
     let gateway = Arc::new(build_gateway(directory, &config, &database_url)?);
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    if let Err(error) = runtime_role {
+        tracing::warn!(%error, "local demo database role is not least-privilege; development only");
+    }
     tracing::warn!(
         port = config.port,
         "local demo uses unauthenticated HTTP on loopback, local freshness, and in-memory tool effects; do not expose or use for production"
@@ -1144,6 +1150,20 @@ mod tests {
                 .unwrap()
                 .outcome,
             praetore_core::DecisionOutcome::Deny
+        );
+    }
+
+    #[test]
+    fn local_demo_database_must_be_loopback_and_is_checked_before_connecting() {
+        assert!(local_database("postgres://postgres@127.0.0.1:1/praetore").is_ok());
+        assert!(local_database("host=/tmp user=postgres").is_ok());
+        assert!(local_database("postgres://postgres@db.internal/praetore").is_err());
+        // Even with TLS the demo stays local; a missing root fails before I/O.
+        assert!(
+            local_database(
+                "postgres://postgres@db.internal/praetore?sslmode=verify-full&sslrootcert=%2Fmissing"
+            )
+            .is_err()
         );
     }
 
