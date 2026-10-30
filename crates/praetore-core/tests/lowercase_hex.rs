@@ -97,6 +97,7 @@ fn request_intent_signature_must_be_lowercase() {
 fn evidence_attester_signature_must_be_lowercase() {
     let attester = EvidenceAttesterKey::from_secret_bytes(&[6; 32]);
     let mut evidence: Evidence = fixture().request.attest(Decision::allow("ok")).unwrap();
+    evidence.bind_policy_digest("ab".repeat(32)).unwrap();
     evidence.sign(&attester).unwrap();
     let key = attester.public_key().unwrap();
     evidence.verify_attester_signature(&key).unwrap();
