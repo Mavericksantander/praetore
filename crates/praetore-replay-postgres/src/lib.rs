@@ -8,7 +8,7 @@ mod migrations;
 mod observability;
 
 pub use execution::PostgresExecutionJournal;
-pub use migrations::{MIGRATIONS, MigrationError, apply_migrations};
+pub use migrations::{MIGRATIONS, MigrationError, apply_migrations, verify_schema_current};
 pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,
