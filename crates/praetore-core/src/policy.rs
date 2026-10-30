@@ -197,11 +197,25 @@ impl Policy {
         let mut decision: Option<Decision> = None;
 
         for rule in &self.rules {
-            if !rule.matches(agent, authority, action, context, self.semantics_version) {
-                continue;
-            }
-
-            let rule_decision = rule.decision()?;
+            let rule_decision = match rule.matches(
+                agent,
+                authority,
+                action,
+                context,
+                self.semantics_version,
+            ) {
+                RuleMatch::No => continue,
+                RuleMatch::Bound => rule.decision()?,
+                // A restrictive rule that applies only because the authority
+                // lacks its capability or the action has no target must not
+                // offer a path to dispatch (RequireApproval) or trigger a
+                // recovery obligation (Recover): it denies (fail closed).
+                RuleMatch::Unbound if rule.effect == PolicyEffect::Deny => rule.decision()?,
+                RuleMatch::Unbound => Decision::deny(format!(
+                    "Policy rule '{}' matched without its required capability or target; denied",
+                    rule.id
+                )),
+            };
 
             let contribution = DecisionContribution::new(
                 rule.id.clone(),
@@ -432,9 +446,9 @@ impl PolicyRule {
         action: &Action,
         context: &BTreeMap<String, Value>,
         semantics_version: u8,
-    ) -> bool {
+    ) -> RuleMatch {
         if self.action_type != action.action_type {
-            return false;
+            return RuleMatch::No;
         }
 
         // Deny and RequireApproval rules are "restrictive".
@@ -443,12 +457,16 @@ impl PolicyRule {
         // A rule capability narrows Allow rules only. A restrictive rule keeps
         // applying when the authority lacks it, in every semantics version;
         // otherwise an authority without e.g. `payments:large` would skip the
-        // approval rule and fall through to a broader Allow.
+        // approval rule and fall through to a broader Allow. Such a match is
+        // `Unbound` and only ever denies (see `evaluate_with_context`).
+        let mut bound = true;
         if let Some(required_capability) = &self.required_capability
-            && !deny_like
             && !authority.permits(required_capability)
         {
-            return false;
+            if !deny_like {
+                return RuleMatch::No;
+            }
+            bound = false;
         }
 
         // Targets are exact, case-sensitive identifiers. A missing action
@@ -457,8 +475,8 @@ impl PolicyRule {
         if let Some(required_target) = &self.target {
             match action.target.as_deref() {
                 Some(target) if target == required_target => {}
-                None if deny_like => {}
-                _ => return false,
+                None if deny_like => bound = false,
+                _ => return RuleMatch::No,
             }
         }
         let restrictive = semantics_version >= 2 && deny_like;
@@ -475,13 +493,19 @@ impl PolicyRule {
             // never matches a mixed representation (fail closed).
             ConditionMatch::MixedNumber(result) => deny_like && result,
         };
-        self.parameter_conditions
+        let conditions_hold = self
+            .parameter_conditions
             .iter()
             .all(|condition| holds(condition.matches(&action.parameters, restrictive)))
             && self
                 .context_conditions
                 .iter()
-                .all(|condition| holds(condition.matches_map(context, restrictive)))
+                .all(|condition| holds(condition.matches_map(context, restrictive)));
+        match (conditions_hold, bound) {
+            (false, _) => RuleMatch::No,
+            (true, true) => RuleMatch::Bound,
+            (true, false) => RuleMatch::Unbound,
+        }
     }
 
     fn decision(&self) -> Result<Decision> {
@@ -826,6 +850,18 @@ impl PolicyCondition {
 
         Ok(())
     }
+}
+
+/// How a rule matched an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleMatch {
+    No,
+    /// The authority holds the rule's capability and the action names its
+    /// target (when the rule declares them).
+    Bound,
+    /// A restrictive rule matched although the authority lacks its capability
+    /// or the action has no target.
+    Unbound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

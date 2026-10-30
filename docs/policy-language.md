@@ -15,7 +15,11 @@ an exact `action_type`, an effect, and optional match criteria:
   capability for the rule to match. On a DENY, REQUIRE_APPROVAL or RECOVER
   (restrictive) rule it does not narrow matching: the rule applies whether or
   not the authority holds the capability, so an authority cannot escape an
-  approval or deny rule by lacking the capability it names. (Strict and
+  approval or deny rule by lacking the capability it names. Such an
+  *unbound* match (the authority lacks the capability, or the action has no
+  target) always contributes DENY: a REQUIRE_APPROVAL rule does not offer an
+  approval, and a RECOVER rule does not emit a recovery obligation, to an
+  authority the rule was never scoped to. (Strict and
   HighAssurance still require it on matching ALLOW and REQUIRE_APPROVAL rules;
   see below.)
 * `target`: the action target must be exactly equal. Targets are exact,
@@ -100,7 +104,8 @@ When constructing conditions directly, `PolicyCondition::new` accepts a
 | `In` | Actual JSON value equals one element of the expected array | Non-empty array |
 | `GreaterThan`, `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual` | Numeric comparison | JSON number |
 
-Prefix matching is string-only. Membership compares JSON values exactly.
+Prefix matching is string-only. Membership compares JSON values exactly,
+except that a numerically equal integer and float are equal (see below).
 Numeric comparisons require JSON numbers; a non-number is unknown in v2.
 An integer against a floating-point number (`50000` vs `50000.0`) is compared
 exactly, without casting the integer to `f64`, and fails closed in every
