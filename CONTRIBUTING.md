@@ -1,5 +1,13 @@
 # Contributing
 
+## Acuerdo de licencia de contribuidor (CLA) — obligatorio
+
+PRÆTORE se distribuye bajo AGPL-3.0-only y además bajo licencia comercial a
+solicitud. Para poder ofrecer ambas, **no se fusiona ninguna contribución externa
+sin el CLA firmado y registrado** (ver `CLA.md`). Los pull requests externos sin CLA
+firmado quedan retenidos o se cierran. El DCO no basta, porque no otorga derecho a
+relicenciar.
+
 ## Local validation
 
 Use Rust 1.88 or newer for workspace builds. Run these checks before opening a

@@ -1,6 +1,20 @@
 PRÆTORE
 
-Copyright © 2026 PRÆTOR TECHNOLOGIES.
-All rights reserved except where otherwise stated.
+Copyright © 2026 José Tomás Enrique Santander Muñoz.
 
-PRÆTORE is a product of PRÆTOR TECHNOLOGIES.
+PRÆTORE se distribuye bajo GNU Affero General Public License v3.0 (AGPL-3.0-only); ver LICENSE.
+
+Está disponible, a solicitud, una licencia comercial alternativa para quienes no deseen cumplir las obligaciones de la AGPL. Sus términos se acuerdan caso a caso por escrito; este aviso no constituye oferta ni compromiso de términos, precio o disponibilidad.
+
+"PRÆTOR", "PRÆTORE" y sus logos no se licencian bajo la AGPL (ver TRADEMARKS.md). PRÆTOR TECHNOLOGIES es un nombre comercial aún no constituido como persona jurídica.
+
+## Autoría
+
+Autor humano único: José Tomás Enrique Santander Muñoz. El código se escribió con
+herramientas de IA (Claude, GitHub Copilot, Cursor Agent) usadas bajo su dirección.
+No hay contribuidores humanos terceros con derechos sobre el código a la fecha de
+este aviso. Las contribuciones externas futuras requieren el CLA (ver CLA.md).
+
+## Componentes de terceros
+
+Las dependencias conservan sus propias licencias y avisos; ver THIRD-PARTY-NOTICES.

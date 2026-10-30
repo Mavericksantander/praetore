@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Cambio de licencia:** desde este cambio PRÆTORE se distribuye bajo
+  `AGPL-3.0-only`, con licencia comercial alternativa disponible a solicitud
+  (ver `NOTICE`). Titular: José Tomás Enrique Santander Muñoz, persona natural.
+  Último commit bajo la PRÆTORE Open Core License v1.0: `9735974` (origin/main).
+  El primer commit bajo AGPL es el que fusione este cambio. La v1.0 no se revoca:
+  las copias ya recibidas bajo v1.0 conservan esos permisos, y no se reescribe el
+  historial. Se agregan `CLA.md` y `THIRD-PARTY-NOTICES`.
+
 - New receipts always record what decided them in `decision.decided_by`, as
   part of the hashed and Ed25519-signed evidence payload, in the new
   **evidence schema v4**:
