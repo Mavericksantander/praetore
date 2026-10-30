@@ -3579,6 +3579,9 @@ fn postgres_sql_refuses_dispatch_of_an_expired_or_expiration_receipted_approval(
     );
 }
 
+/// Password for the role-separation test roles (CI uses password auth).
+const TEST_ROLE_PASSWORD: &str = "praetore-storage-test";
+
 /// Creates (once) a cluster role for role-separation tests. All names are
 /// prefixed `praetore_storage_`.
 fn ensure_test_role(admin: &mut Client, name: &str, options: &str) {
@@ -3586,7 +3589,7 @@ fn ensure_test_role(admin: &mut Client, name: &str, options: &str) {
         .batch_execute(&format!(
             "DO $$ BEGIN CREATE ROLE {name} {options}; \
              EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; \
-             ALTER ROLE {name} {options}"
+             ALTER ROLE {name} {options} PASSWORD '{TEST_ROLE_PASSWORD}'"
         ))
         .unwrap();
 }
@@ -3594,7 +3597,10 @@ fn ensure_test_role(admin: &mut Client, name: &str, options: &str) {
 fn connect_scratch_as(scratch: &ScratchDatabase, user: &str) -> Client {
     let url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
     let mut config: postgres::Config = url.parse().unwrap();
-    config.dbname(&scratch.name).user(user);
+    config
+        .dbname(&scratch.name)
+        .user(user)
+        .password(TEST_ROLE_PASSWORD);
     config.connect(NoTls).expect("connect as test role")
 }
 
