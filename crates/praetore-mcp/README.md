@@ -8,17 +8,40 @@ check offline with `praetore-verify`. It needs no PostgreSQL, no server and no
 Rust code.
 
 * **observe** (default): every call is forwarded. The decision is only
-  recorded.
+  recorded. If the home cannot be loaded at startup (not initialized, or
+  invalid keys, pins or policy), no receipt can be written, so every
+  `tools/call` is refused in observe as well (see Limitations).
 * **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
   forwarded; the client gets an MCP tool error instead.
 
 New to praetore-mcp? [GUIDE.md](GUIDE.md) walks through a first run, lists
 what it does not cover, and has a troubleshooting table.
 
+## Install
+
+`praetore-mcp` is not published on crates.io and there are no prebuilt
+binaries yet. Install it with Cargo, without cloning the repository. The
+workspace declares `rust-version = "1.88"` (checked with Rust 1.94); building
+praetore-mcp needs no PostgreSQL, Node or Python.
+
+```sh
+cargo install --git https://github.com/Mavericksantander/praetore praetore-mcp --locked
+praetore-mcp --version
+```
+
+`--locked` builds with the repository's `Cargo.lock`. To pin an exact
+revision, add `--rev <commit>` (or `--tag <tag>` once releases are tagged).
+The binary goes to `~/.cargo/bin` (or `--root DIR`); `cargo uninstall
+praetore-mcp` removes it. `praetore-mcp install` writes the absolute path of
+the running binary into client configs, so run `install` again after moving
+or reinstalling it to a different location.
+
+From a clone of the repository: `cargo install --locked --path
+crates/praetore-mcp`, or `cargo build --release -p praetore-mcp`.
+
 ## 5-minute quickstart
 
 ```sh
-cargo install --locked --path crates/praetore-mcp   # or: cargo build --release -p praetore-mcp
 
 # 1. Create LOCAL/DEV keys, a signed authority, trust pins and a default policy
 praetore-mcp init                     # ~/.praetore/mcp, or $PRAETORE_MCP_HOME, or --dir DIR
@@ -77,6 +100,23 @@ You can also wrap a server by hand:
 praetore-mcp wrap --name my-server --mode observe -- node server.js --flag
 ```
 
+## Command-line help and exit codes
+
+`praetore-mcp --help` lists every command; `praetore-mcp <command> --help`
+(or `-h`) prints that command's options, for example `praetore-mcp wrap
+--help` or `praetore-mcp policy deny --help`. For `wrap`, anything after
+`--` belongs to the MCP server, so `wrap -- server --help` starts the server
+with `--help`. `praetore-mcp --version` prints the version.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success, including `--help` and `--version`. |
+| 1 | The command ran and found a problem: `verify` found a failed receipt, `policy check` found an invalid policy or engine, or `install`/`uninstall` could not read, parse or write a config, or the change was not confirmed. |
+| 2 | Usage error, or the command could not run (the reason is on stderr). |
+| `wrap` | The MCP server's own exit code; 127 if the server cannot be started; 1 if it was killed by a signal. |
+
+These codes are checked by `crates/praetore-mcp/tests/cli.rs`.
+
 ## Supported clients
 
 | Client | File | Format |
@@ -96,6 +136,18 @@ against their current documentation. The Claude Desktop format and its macOS
 and Windows paths are the documented ones. The Linux Claude Desktop path and
 the VS Code user-profile paths follow each app's standard config directory;
 they are assumptions.
+
+Checked with the real apps on macOS (arm64): Claude Desktop
+(`~/Library/Application Support/Claude/claude_desktop_config.json`) and
+Cursor (`~/.cursor/mcp.json`), each with `install --mode enforce` in front of
+`@modelcontextprotocol/server-filesystem@2.1.0` launched with `npx`, and a
+`deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused
+with the rule and evidence id shown in the chat, the file was not created,
+and `verify` checked every receipt. Not checked: Windows, Linux, VS Code.
+
+A config file that two default paths resolve to (for example Cursor's
+`~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
+symlink) is processed once.
 
 ## What a receipt is
 
@@ -259,10 +311,15 @@ Things to know:
     exact-key and the Go (case-folded, last-wins) readings are recorded.
 * Client lines over 32 MiB are refused in enforce. In observe they are
   forwarded unchecked, with a warning.
-* Errors (missing or invalid keys, policy, clock, replay guard): **enforce
-  refuses the call (fail closed); observe forwards it with a loud stderr
-  warning and no receipt.** If a receipt cannot be written, enforce refuses
-  the call; observe forwards it and warns.
+* If the home cannot be loaded when `wrap` starts (not initialized, or
+  missing or invalid keys, pins, authority or policy), **both modes refuse
+  every `tools/call` (fail closed)** and gate the remaining traffic as
+  enforce does; other MCP messages still reach the server. Fix the home
+  (`praetore-mcp init`, `praetore-mcp policy check`) and restart the client.
+* Errors while evaluating one call after a successful start (clock, replay
+  guard): **enforce refuses the call (fail closed); observe forwards it with
+  a loud stderr warning and no receipt.** If a receipt cannot be written,
+  enforce refuses the call; observe forwards it and warns.
 
 ## Trust model
 

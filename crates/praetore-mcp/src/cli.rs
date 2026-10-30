@@ -31,9 +31,131 @@ Usage:
                          [--arg-prefix KEY=VALUE]... [--any-tool] [--dir DIR]
   praetore-mcp policy remove --id ID [--dir DIR]
 
+  praetore-mcp <command> --help
+  praetore-mcp --version
+
 DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys. Observe mode records decisions but
-never blocks; enforce mode blocks DENY and REQUIRE_APPROVAL decisions.";
+never blocks; enforce mode blocks DENY and REQUIRE_APPROVAL decisions. If the
+home cannot be loaded (e.g. no `init`), `wrap` refuses every tools/call in
+both modes.
+
+Exit codes:
+  0    success (also --help and --version)
+  1    the command ran and found a problem: `verify` found a failed receipt,
+       `policy check` found an invalid policy or engine, or `install` /
+       `uninstall` could not read, parse or write a config (or was not
+       confirmed)
+  2    usage error, or the command could not run (message on stderr)
+  wrap exits with the MCP server's exit code; 127 if the server cannot be
+       started, 1 if it was killed by a signal";
+
+const INIT_HELP: &str = "Usage: praetore-mcp init [--dir DIR]
+
+Creates LOCAL/DEV Ed25519 keys (0600), a signed authority, trust pins for
+praetore-verify, a v2 policy that allows every tools/call, and the receipts
+journal under DIR. Running it again on an initialized DIR changes nothing.
+
+  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
+
+const WRAP_HELP: &str = "Usage: praetore-mcp wrap [--dir DIR] [--name SERVER] [--mode observe|enforce] -- <command> [args...]
+
+Starts the stdio MCP server <command> and relays its stdio. Every tools/call
+is evaluated and recorded as a signed receipt. Everything after `--` is
+passed to the server unchanged (including any --help).
+
+  --dir DIR     home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+  --name SERVER server name used in policy rules and receipts
+                (default: the command's file name)
+  --mode MODE   observe (default): forward every call, record the decision
+                enforce: block DENY and REQUIRE_APPROVAL with an MCP tool error
+
+Exit code: the server's; 127 if it cannot be started, 1 if it was killed by
+a signal, 2 on a usage error.";
+
+const INSTALL_HELP: &str = "Usage: praetore-mcp install [--client claude-desktop|cursor|vscode] [--config FILE] [--dir DIR]
+                            [--mode observe|enforce] [--dry-run] [--yes]
+
+Rewrites the stdio servers of an MCP client config so they run through
+`praetore-mcp wrap`. A timestamped backup is written next to each file first.
+Without --client, every detected client is processed.
+
+  --client NAME  claude-desktop, cursor or vscode
+  --config FILE  config file to edit (needs --client)
+  --dir DIR      home passed to `wrap` (must be initialized)
+  --mode MODE    mode passed to `wrap` (default observe)
+  --dry-run      show the changes, write nothing
+  --yes          do not ask for confirmation
+
+Exit code: 0 on success or nothing to do, 1 if a config could not be read,
+parsed or written, or was not confirmed, 2 on a usage error.";
+
+const UNINSTALL_HELP: &str = "Usage: praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
+
+Restores the original commands of servers wrapped by `install`. A timestamped
+backup is written next to each file first.
+
+  --client NAME  claude-desktop, cursor or vscode
+  --config FILE  config file to edit (needs --client)
+  --dry-run      show the changes, write nothing
+  --yes          do not ask for confirmation
+
+Exit code: 0 on success or nothing to do, 1 if a config could not be read,
+parsed or written, or was not confirmed, 2 on a usage error.";
+
+const RECEIPTS_HELP: &str = "Usage: praetore-mcp receipts [--dir DIR] [--tail N]
+
+Prints the last N receipts of the journal as a table (default 20).
+
+  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+  --tail N    number of receipts to show";
+
+const VERIFY_HELP: &str = "Usage: praetore-mcp verify [--dir DIR]
+
+Checks every receipt in the journal: integrity hash, attester signature,
+agent intent signature, authority signature against the issuer pins at
+decision time, and the praetore.mode binding.
+
+  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+
+Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
+cannot be read.";
+
+const POLICY_HELP: &str = "Usage:
+  praetore-mcp policy list   [--dir DIR]
+  praetore-mcp policy check  [--dir DIR]
+  praetore-mcp policy deny|require-approval|allow --id ID [--server NAME] [--tool NAME]
+                         [--arg-exact KEY=VALUE]... [--arg-path-prefix KEY=/abs/path]...
+                         [--arg-prefix KEY=VALUE]... [--any-tool] [--dir DIR]
+  praetore-mcp policy remove --id ID [--dir DIR]
+
+Reads and edits DIR/policy.json. Every change is re-validated and a backup is
+written first. Running MCP clients must be restarted to load a change.
+--arg-path-prefix is a lexical match: symlinks are not resolved.
+
+Exit code: 0 on success, 1 if `check` finds an invalid policy or engine,
+2 on a usage error or a rejected change.";
+
+fn help_for(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "init" => INIT_HELP,
+        "wrap" => WRAP_HELP,
+        "install" => INSTALL_HELP,
+        "uninstall" => UNINSTALL_HELP,
+        "receipts" => RECEIPTS_HELP,
+        "verify" => VERIFY_HELP,
+        "policy" => POLICY_HELP,
+        _ => return None,
+    })
+}
+
+/// `-h`/`--help` among a command's own options; anything after `--` belongs
+/// to the wrapped server and is ignored.
+fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "-h" || arg == "--help")
+}
 
 #[derive(Debug, Default)]
 struct Parsed {
@@ -116,6 +238,12 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("{USAGE}");
         return 2;
     };
+    if let Some(help) = help_for(command)
+        && wants_help(rest)
+    {
+        println!("{help}");
+        return 0;
+    }
     let result = match command.as_str() {
         "init" => cmd_init(rest),
         "wrap" => cmd_wrap(rest),
@@ -128,7 +256,7 @@ pub fn run(args: &[String]) -> i32 {
             println!("{USAGE}");
             Ok(0)
         }
-        "-V" | "--version" => {
+        "-V" | "--version" | "version" => {
             println!("praetore-mcp {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
@@ -267,7 +395,7 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                     }
                 }
             }
-            found
+            install::dedup_targets(found)
         }
     };
     if targets.is_empty() {

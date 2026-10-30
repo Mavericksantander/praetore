@@ -326,24 +326,47 @@ fn enforce_refuses_unparseable_lines_but_relays_other_traffic() {
     assert!(!stderr.contains("EXECUTED"), "{stderr}");
 }
 
-#[test]
-fn broken_home_fails_closed_in_enforce_and_open_in_observe() {
-    let (_temp, home) = init_home();
-    fs::write(home.policy(), "{not a policy").unwrap();
+fn assert_refused_without_receipts(home: &Home, mode: &str) {
     let call = json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"echo","arguments":{}}});
-
-    let (responses, stderr, _) = wrap(&home, "enforce", &session(vec![call.clone()]));
+    let (responses, stderr, _) = wrap(home, mode, &session(vec![call]));
+    // Non-tools traffic still reaches the server and comes back.
     assert_eq!(
         by_id(&responses, &json!(2))["result"]["tools"][0]["name"],
         "echo"
     );
-    assert_eq!(by_id(&responses, &json!(9))["result"]["isError"], true);
-    assert!(!stderr.contains("EXECUTED"), "{stderr}");
+    let refused = by_id(&responses, &json!(9));
+    assert_eq!(refused["result"]["isError"], true, "{mode}: {refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not ready"),
+        "{mode}: {refused}"
+    );
+    assert!(!stderr.contains("EXECUTED"), "{mode}: {stderr}");
+    assert!(stderr.contains("REFUSED"), "{mode}: {stderr}");
+    assert!(!stderr.contains("WITHOUT"), "{mode}: {stderr}");
+}
 
-    let (responses, stderr, _) = wrap(&home, "observe", &session(vec![call]));
-    assert_eq!(by_id(&responses, &json!(9))["result"]["isError"], false);
-    assert!(stderr.contains("WITHOUT"), "{stderr}");
+#[test]
+fn broken_home_fails_closed_in_enforce_and_observe() {
+    let (_temp, home) = init_home();
+    fs::write(home.policy(), "{not a policy").unwrap();
+    for mode in ["enforce", "observe"] {
+        assert_refused_without_receipts(&home, mode);
+    }
     assert!(receipts::read_journal(&home).unwrap().is_empty());
+}
+
+#[test]
+fn uninitialized_home_fails_closed_in_enforce_and_observe() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = Home::new(temp.path().join("never-initialized"));
+    for mode in ["enforce", "observe"] {
+        assert_refused_without_receipts(&home, mode);
+    }
+    // wrap must not create a home (or keys) on its own.
+    assert!(!home.root.exists());
 }
 
 #[test]
