@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `praetore-verify evidence` accepts `--policy PATH`: the receipt must record
+  that policy's digest (`Evidence::verify_policy`); receipts without a digest
+  fail with `POLICY_MISMATCH`.
+- The hash-linked journal export (`praetore-verify journal`) is a proposal
+  only (`docs/proposals/journal-chain-jsonl.md`). It is not shipped: the
+  verifier is kept on branch `feat/journal-chain-verifier` until a Postgres
+  exporter lands with it in one PR. As specified (unkeyed links, no signed
+  or published head) it does not let a third party detect deletion,
+  truncation, reordering or a recomputed chain; the proposal lists what is
+  missing.
+- `scripts/regen-legacy-evidence-fixture.sh` regenerates the legacy receipt
+  fixture (no `policy_digest`) from commit 3db7b5e.
+
 - Breaking (core): `Evidence::sign` now refuses to sign a receipt that does
   not record the full lowercase SHA-256 digest of the active policy
   (`policy_digest`, from `Policy::digest()` over the canonical JSON). The
