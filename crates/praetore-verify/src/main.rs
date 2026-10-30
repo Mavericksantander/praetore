@@ -63,6 +63,7 @@ enum Command {
         receipt: PathBuf,
         execution_pin: PathBuf,
         key_id: String,
+        evidence_attester_pin: PathBuf,
     },
     Authority {
         authority: PathBuf,
@@ -76,7 +77,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -203,10 +204,12 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             }
         }
         "receipt" => {
-            if values
-                .keys()
-                .any(|key| !matches!(key.as_str(), "--receipt" | "--execution-pin" | "--key-id"))
-            {
+            if values.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "--receipt" | "--execution-pin" | "--key-id" | "--evidence-attester-pin"
+                )
+            }) {
                 return Err(CliError::usage());
             }
             Command::Receipt {
@@ -217,6 +220,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                     .and_then(Option::as_ref)
                     .cloned()
                     .ok_or_else(CliError::usage)?,
+                evidence_attester_pin: path("--evidence-attester-pin")?,
             }
         }
         "policy-digest" => {
@@ -299,17 +303,23 @@ fn execute(command: Command) -> Result<Summary, CliError> {
             receipt,
             execution_pin,
             key_id,
+            evidence_attester_pin,
         } => {
             let public_key = read_attester_pin(&execution_pin)?;
+            let evidence_attester = read_attester_pin(&evidence_attester_pin)?;
             let receipt = praetore_receipt::verify_gateway_receipt_json(
                 &read_limited(&receipt)?,
                 &public_key,
                 &key_id,
+                &evidence_attester,
             )
             .map_err(|error| CliError {
                 code: match error {
                     praetore_receipt::ExecutionAttestationError::InvalidPayload => {
                         "RECEIPT_INVALID"
+                    }
+                    praetore_receipt::ExecutionAttestationError::InvalidEvidenceSignature => {
+                        "RECEIPT_EVIDENCE_SIGNATURE_INVALID"
                     }
                     _ => "RECEIPT_SIGNATURE_INVALID",
                 },

@@ -28,18 +28,30 @@ fn verify_evidence_attester_signature(evidence_json: &str, attester_public_key_h
 }
 
 /// Verifies a serialized gateway receipt's execution attestation (schema v1,
-/// v2 or v3) against a pinned key. Unknown `not_dispatched_reason` values,
-/// unknown fields and bad signatures return `false`. Historical only.
+/// v2 or v3) against a pinned execution key, and its evidence attester
+/// signature against a pinned evidence attester key. Unknown
+/// `not_dispatched_reason` values, unknown fields and bad or missing
+/// signatures return `false`. Historical only.
 #[pyfunction]
 fn verify_gateway_receipt(
     receipt_json: &str,
     execution_public_key_hex: &str,
     key_id: &str,
+    evidence_attester_public_key_hex: &str,
 ) -> bool {
-    let Some(public_key) = parse_public_key(execution_public_key_hex) else {
+    let (Some(public_key), Some(evidence_attester)) = (
+        parse_public_key(execution_public_key_hex),
+        parse_public_key(evidence_attester_public_key_hex),
+    ) else {
         return false;
     };
-    praetore_receipt::verify_gateway_receipt_json(receipt_json, &public_key, key_id).is_ok()
+    praetore_receipt::verify_gateway_receipt_json(
+        receipt_json,
+        &public_key,
+        key_id,
+        &evidence_attester,
+    )
+    .is_ok()
 }
 
 fn parse_public_key(hex_value: &str) -> Option<VerifiedPublicKey> {
