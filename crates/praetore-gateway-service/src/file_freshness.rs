@@ -30,6 +30,7 @@ use serde::Deserialize;
 use std::{
     collections::HashSet,
     fs,
+    io::Read,
     path::PathBuf,
     sync::Mutex,
     time::{Duration as StdDuration, Instant},
@@ -91,7 +92,14 @@ pub struct FileFreshnessProvider {
     path: PathBuf,
     policy_digest: String,
     limits: FileFreshnessLimits,
-    state: Mutex<Option<Loaded>>,
+    state: Mutex<State>,
+}
+
+struct State {
+    loaded: Option<Loaded>,
+    /// Newest `issued_at` ever loaded. An older snapshot (rollback by a stale
+    /// sync or a restored backup) would undo revocations, so it is refused.
+    newest_issued_at: Option<OffsetDateTime>,
 }
 
 impl FileFreshnessProvider {
@@ -113,16 +121,22 @@ impl FileFreshnessProvider {
             path: path.into(),
             policy_digest: policy_digest.into(),
             limits,
-            state: Mutex::new(None),
+            state: Mutex::new(State {
+                loaded: None,
+                newest_issued_at: None,
+            }),
         };
         let snapshot = provider.read_snapshot()?;
         *provider
             .state
             .lock()
-            .map_err(|_| "freshness state lock poisoned")? = Some(Loaded {
-            read_at: Instant::now(),
-            snapshot,
-        });
+            .map_err(|_| "freshness state lock poisoned")? = State {
+            newest_issued_at: Some(snapshot.issued_at),
+            loaded: Some(Loaded {
+                read_at: Instant::now(),
+                snapshot,
+            }),
+        };
         Ok(provider)
     }
 
@@ -134,10 +148,19 @@ impl FileFreshnessProvider {
             )
             .into());
         }
-        parse_snapshot(
-            &fs::read_to_string(&self.path)?,
-            self.limits.max_snapshot_validity,
-        )
+        // The file may be replaced after the metadata check: bound the read
+        // itself, not only the size reported by `metadata`.
+        let mut contents = String::new();
+        fs::File::open(&self.path)?
+            .take(MAX_SNAPSHOT_BYTES + 1)
+            .read_to_string(&mut contents)?;
+        if contents.len() as u64 > MAX_SNAPSHOT_BYTES {
+            return Err(format!(
+                "freshness snapshot must be no larger than {MAX_SNAPSHOT_BYTES} bytes"
+            )
+            .into());
+        }
+        parse_snapshot(&contents, self.limits.max_snapshot_validity)
     }
 
     fn with_current_snapshot<T>(
@@ -146,12 +169,24 @@ impl FileFreshnessProvider {
     ) -> Result<T, FreshnessError> {
         let mut state = self.state.lock().map_err(|_| FreshnessError::Unavailable)?;
         let stale = state
+            .loaded
             .as_ref()
             .is_none_or(|loaded| loaded.read_at.elapsed() >= self.limits.reload_interval);
         if stale {
-            match self.read_snapshot() {
+            let read = self.read_snapshot().and_then(|snapshot| {
+                if state
+                    .newest_issued_at
+                    .is_some_and(|newest| snapshot.issued_at < newest)
+                {
+                    Err("freshness snapshot is older than one already loaded (rollback)".into())
+                } else {
+                    Ok(snapshot)
+                }
+            });
+            match read {
                 Ok(snapshot) => {
-                    *state = Some(Loaded {
+                    state.newest_issued_at = Some(snapshot.issued_at);
+                    state.loaded = Some(Loaded {
                         read_at: Instant::now(),
                         snapshot,
                     });
@@ -159,13 +194,13 @@ impl FileFreshnessProvider {
                 Err(error) => {
                     // Fail closed: never keep serving a snapshot that can no
                     // longer be read back.
-                    *state = None;
+                    state.loaded = None;
                     tracing::warn!(%error, path = %self.path.display(), "freshness snapshot unavailable");
                     return Err(FreshnessError::Unavailable);
                 }
             }
         }
-        let loaded = state.as_ref().ok_or(FreshnessError::Unavailable)?;
+        let loaded = state.loaded.as_ref().ok_or(FreshnessError::Unavailable)?;
         check(&loaded.snapshot)
     }
 
@@ -384,9 +419,25 @@ mod tests {
         agents: &[String],
         digests: &[String],
     ) -> serde_json::Value {
+        snapshot_issued_at(
+            "2026-06-01T11:59:00Z",
+            valid_until,
+            authorities,
+            agents,
+            digests,
+        )
+    }
+
+    fn snapshot_issued_at(
+        issued_at: &str,
+        valid_until: &str,
+        authorities: &[Uuid],
+        agents: &[String],
+        digests: &[String],
+    ) -> serde_json::Value {
         serde_json::json!({
             "schema_version": 1,
-            "issued_at": "2026-06-01T11:59:00Z",
+            "issued_at": issued_at,
             "valid_until": valid_until,
             "revoked_authority_ids": authorities,
             "revoked_agent_key_fingerprints": agents,
@@ -571,5 +622,46 @@ mod tests {
             provider.check(&agent, &authority, POLICY, now()),
             Err(FreshnessError::Revoked)
         );
+    }
+
+    #[test]
+    fn an_older_snapshot_never_replaces_a_newer_one() {
+        let fixture = Fixture::new("rollback");
+        let (authority, authority_uuid) = authority_id();
+        let agent = fingerprint();
+        fixture.write(snapshot_issued_at(
+            "2026-06-01T11:59:30Z",
+            "2026-06-01T12:05:00Z",
+            &[authority_uuid],
+            &[],
+            &[],
+        ));
+        let provider =
+            FileFreshnessProvider::new(&fixture.path, POLICY, immediate_reload()).unwrap();
+        assert_eq!(
+            provider.check(&agent, &authority, POLICY, now()),
+            Err(FreshnessError::Revoked)
+        );
+        // A stale copy without the revocation must not undo it.
+        fixture.write(snapshot_issued_at(
+            "2026-06-01T11:59:00Z",
+            "2026-06-01T12:05:00Z",
+            &[],
+            &[],
+            &[],
+        ));
+        assert_eq!(
+            provider.check(&agent, &authority, POLICY, now()),
+            Err(FreshnessError::Unavailable)
+        );
+        // An equally new or newer snapshot is accepted again.
+        fixture.write(snapshot_issued_at(
+            "2026-06-01T11:59:45Z",
+            "2026-06-01T12:05:00Z",
+            &[],
+            &[],
+            &[],
+        ));
+        assert!(provider.check(&agent, &authority, POLICY, now()).is_ok());
     }
 }

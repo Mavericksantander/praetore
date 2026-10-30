@@ -14,7 +14,11 @@
   - Breaking (gateway service): `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` is
     required with the `http` and `sandbox` adapters and for any non-loopback
     `PRAETORE_GATEWAY_LISTEN_ADDR`. Only `local-demo` on loopback may run
-    unauthenticated.
+    unauthenticated, and `local-demo` never listens beyond loopback.
+  - The freshness snapshot is read with a bounded read (not only a
+    `metadata` size check), and a snapshot whose `issued_at` is older than
+    one already loaded is refused (fail closed), so a stale sync or restored
+    backup cannot undo a revocation.
   - Breaking (CLI): `praetore init` creates `agent-api.token` and
     `approver-api.token`; `run`, `demo`, `approve`, `reject` and `dispatch`
     use them. Older demo directories need a fresh `init`.

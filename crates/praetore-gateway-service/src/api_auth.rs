@@ -14,18 +14,17 @@ pub fn select_api_auth(
     address: SocketAddr,
     credentials_document: Option<&str>,
 ) -> Result<ApiAuth, Box<dyn std::error::Error>> {
+    // The local demo may use an unscoped approver key and the demo freshness
+    // provider, so it never listens beyond loopback, with or without tokens.
+    if !production_adapter && !address.ip().is_loopback() {
+        return Err("the local-demo adapter listens on a loopback address only".into());
+    }
     if let Some(document) = credentials_document {
         return Ok(ApiAuth::required(ApiCredentials::from_json(document)?));
     }
     if production_adapter {
         return Err(
             "PRAETORE_GATEWAY_API_CREDENTIALS_FILE is required with the http and sandbox adapters"
-                .into(),
-        );
-    }
-    if !address.ip().is_loopback() {
-        return Err(
-            "PRAETORE_GATEWAY_API_CREDENTIALS_FILE is required for a non-loopback listen address"
                 .into(),
         );
     }
@@ -80,7 +79,6 @@ mod tests {
         for (production, address) in [
             (true, "0.0.0.0:8080"),
             (true, "127.0.0.1:8080"),
-            (false, "0.0.0.0:8080"),
             (false, "127.0.0.1:8080"),
         ] {
             assert!(
@@ -90,5 +88,7 @@ mod tests {
             );
         }
         assert!(select_api_auth(true, "0.0.0.0:8080".parse().unwrap(), Some("{}")).is_err());
+        // The local demo stays on loopback even with credentials.
+        assert!(select_api_auth(false, "0.0.0.0:8080".parse().unwrap(), Some(&document)).is_err());
     }
 }
