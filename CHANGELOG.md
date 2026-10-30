@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Docs: HighAssurance replay claims are documented as keyed by
+  `(tenant_id, agent_id, request_id)` (tenant from the signed authority, nil
+  UUID when absent), matching the code; an action without a capability is
+  documented as rejected (Strict/HighAssurance) or denied (Development), with
+  no `action_type` fallback; canonical JSON key order is documented as UTF-8
+  byte order, a deliberate deviation from RFC 8785's UTF-16 order (codec v1
+  bytes unchanged).
 - `AuthorizationEngine::validate_evidence_for_dispatch` is now documented as
   accepting ALLOW **and** REQUIRE_APPROVAL evidence (behavior unchanged; the
   gateway's post-approval path relies on it), and its error message says so.
