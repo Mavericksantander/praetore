@@ -2,6 +2,122 @@
 
 ## Unreleased
 
+- Security (gateway HTTP API): caller authentication. `http_api::router` and
+  `serve_local` now take an `ApiAuth`. `ApiAuth::Required(ApiCredentials)`
+  requires `Authorization: Bearer` on every endpoint except `/healthz`, with
+  tenant-scoped credentials (SHA-256 digests, constant-time comparison) whose
+  tenant must match the `{tenant_id}` path segment or, for `/v1/execute`, the
+  submitted authority's tenant. Roles are disjoint: `agent` may execute and
+  read status; only `approver` may read challenges, decide and dispatch.
+  Unauthenticated: 401 `authentication_required`; wrong role or tenant: 403
+  `caller_not_authorized`.
+  - Breaking (gateway service): `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` is
+    required with the `http` and `sandbox` adapters and for any non-loopback
+    `PRAETORE_GATEWAY_LISTEN_ADDR`. Only `local-demo` on loopback may run
+    unauthenticated, and `local-demo` never listens beyond loopback.
+  - The freshness snapshot is read with a bounded read (not only a
+    `metadata` size check), and a snapshot whose `issued_at` is older than
+    one already loaded is refused (fail closed), so a stale sync or restored
+    backup cannot undo a revocation.
+  - Breaking (CLI): `praetore init` creates `agent-api.token` and
+    `approver-api.token`; `run`, `demo`, `approve`, `reject` and `dispatch`
+    use them. Older demo directories need a fresh `init`.
+- Security (gateway): approver keys can be bound to a tenant
+  (`HumanApprovalVerifier::for_tenant`); the gateway accepts several
+  verifiers and a key never verifies another tenant's decision. Service:
+  new `PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE`; breaking: the single
+  `PRAETORE_GATEWAY_APPROVER_KEY_ID`/`_PUBLIC_KEY_HEX` pair is rejected with
+  `http`/`sandbox` unless exactly one tenant is issuer-bound (it is then bound
+  to that tenant). The CLI demo approver is bound to the demo tenant.
+- Security (gateway service): breaking: `http` and `sandbox` adapters require
+  `PRAETORE_GATEWAY_FRESHNESS_FILE`, a file-based revocation snapshot
+  (revoked authority IDs, agent key fingerprints, authority digests) with
+  bounded staleness that fails closed when missing, invalid or stale
+  (`PRAETORE_GATEWAY_FRESHNESS_RELOAD_INTERVAL_MS`, `_LEASE_MS`,
+  `_MAX_SNAPSHOT_VALIDITY_MS`). The demo provider, which never checks
+  revocation, is limited to `local-demo`.
+- Security (gateway): `claim_dispatch` independently re-verifies the
+  recorded approval (approve outcome, challenge bound to the persisted
+  evidence and action digest, tenant-pinned approver signature, no
+  self-approval) before dispatch, since `validate_evidence_for_dispatch`
+  accepts `RequireApproval` evidence.
+- Gateway: transient revalidation failures at dispatch claim (trusted clock,
+  freshness source or replay storage unavailable) leave the execution
+  `approved_pending_dispatch` instead of closing it as `dispatch_failed`.
+- Gateway: new `ApprovalResolution::NotDispatched` (breaking for exhaustive
+  matches) and `Gateway::approval_state`. The status endpoint reports
+  `not_dispatched` plus `execution` and `not_dispatched_reason` for approved
+  executions closed without dispatch, instead of `approved`.
+- Breaking (gateway HTTP API): `GET /v1/approvals/{tenant}/{agent}/{request}`
+  returns `{"challenge": ..., "action": ...}` (`ApprovalChallengeView`)
+  instead of the bare challenge. `praetore approve`/`reject` show the action,
+  verify its digest and policy digest, and require confirmation (`--yes` for
+  scripts).
+- Security (sandbox supervisor): worker callbacks are authenticated against
+  the in-memory pending execution (constant time) before any Kubernetes API
+  call; `serve_tls` takes `ConnectionLimits` (non-blocking accept, per-peer
+  connection cap, header read timeout, 20 s worker connection lifetime).
+- Dependencies: `praetore-gateway` now depends on `sha2` 0.11 and `subtle`
+  2.6 (both already in the lockfile).
+
+- Docs: HighAssurance replay claims are documented as keyed by
+  `(tenant_id, agent_id, request_id)` (tenant from the signed authority, nil
+  UUID when absent), matching the code; an action without a capability is
+  documented as rejected (Strict/HighAssurance) or denied (Development), with
+  no `action_type` fallback; canonical JSON key order is documented as UTF-8
+  byte order, a deliberate deviation from RFC 8785's UTF-16 order (codec v1
+  bytes unchanged).
+- `AuthorizationEngine::validate_evidence_for_dispatch` is now documented as
+  accepting ALLOW **and** REQUIRE_APPROVAL evidence (behavior unchanged; the
+  gateway's post-approval path relies on it), and its error message says so.
+  New `validate_allow_evidence_for_dispatch` additionally requires an ALLOW
+  decision, for dispatch paths without a verified human approval.
+- Security (breaking API): `Evidence::verify_key_rotation` now takes the
+  trusted attester key (`&VerifiedPublicKey`) and requires a valid attester
+  signature. It previously accepted an ALLOW decision protected only by the
+  unkeyed `context_hash`, so anyone could forge an authorized rotation by
+  rewriting the decision and recomputing the hash. Unsigned evidence (e.g.
+  Development/Strict without an attester) no longer verifies as a rotation.
+- Security (breaking for non-canonical input): uppercase or mixed-case hex is
+  now rejected for authority signatures, `subject_key_hash` and
+  `issuer_key_id` (`Authority::validate`), request intent signatures,
+  evidence attester signatures, `Evidence::bind_policy_digest` and issuer pin
+  public keys. `hex::decode` accepted both cases, so one signed document had
+  several valid encodings. Everything this crate emits is lowercase.
+- Fix: a gateway receipt for an executed or confirmed action whose adapter
+  output was JSON `null` now verifies. `"output": null` deserializes to
+  `None`, which verification rejected for those statuses although the
+  attestation signs the digest of `null`. For `executed`/`confirmed`, an
+  absent or `null` output is now verified as the JSON value `null`; other
+  statuses still require no output. Serialization is unchanged, so existing
+  receipts and fixtures are byte-identical.
+- Security (behavior change, more restrictive, all semantics versions):
+  DENY/REQUIRE_APPROVAL/RECOVER rules no longer stop applying because of
+  their `required_capability` or `target`. An authority that lacks the rule's
+  `required_capability` is still subject to the rule (previously
+  `RequireApproval{transfer, payments:large, amount > 1000}` plus
+  `Allow{transfer, payments:write}` let an authority without
+  `payments:large` make large transfers without approval), and an action
+  without a target matches a targeted restrictive rule (previously omitting
+  the target bypassed `Deny target=prod-db`). ALLOW rules are unchanged.
+  Targets stay exact, case-sensitive identifiers; this is now documented.
+  Policies that used `required_capability` on a DENY rule to deny only the
+  holders of that capability now deny everyone for that rule's scope.
+  Such an *unbound* match (authority lacks the capability, or the action
+  has no target) always contributes DENY, also for REQUIRE_APPROVAL and
+  RECOVER rules: it never turns a default deny into an approvable request,
+  and never emits a recovery obligation, for an authority the rule was not
+  scoped to.
+- Security (behavior change, more restrictive): an integer compared with a
+  floating-point number no longer fails open in v1 policies. Previously a v1
+  `Deny if amount > 10000` was bypassed with `"amount": 50000.0`, because
+  every mixed integer/float comparison was "no match". Numeric operators now
+  compare integer and float exactly (no lossy `f64` cast); `Exact`/`In`
+  treat a numerically equal float as equal. In every semantics version the
+  exact result applies to DENY/REQUIRE_APPROVAL/RECOVER rules, and an ALLOW
+  rule never matches a mixed representation (unchanged). In v2 a mixed value
+  that is definitively on the safe side of a restrictive rule (`5.0` against
+  `> 10000`) no longer counts as unknown.
 - Policy size and complexity limits are now public, documented constants in
   `praetore_core::policy`, and exceeding any of them rejects the whole policy
   with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`
@@ -55,6 +171,48 @@
   (for example percent-encoded URLs) no longer match.
 - Breaking: `MatchOperator` is now `#[non_exhaustive]`; exhaustive `match`es
   outside `praetore-core` need a wildcard arm.
+
+- Storage security (PostgreSQL journal and deployment templates):
+  - Migrations: each migration and its `schema_migrations` row now commit in
+    one transaction. 0007-0009 contain their own `BEGIN;`/`COMMIT;`, which
+    used to end the runner's transaction early (a crash in between left the
+    migration applied but unrecorded); the runner strips one enclosing
+    top-level pair and refuses any other transaction control. Migration files
+    and checksums are unchanged.
+  - New migration 0011 creates the NOLOGIN group role `praetore_runtime`
+    (needs `CREATEROLE`, or pre-create it) with least-privilege grants. New
+    migration 0012 makes SQL refuse `approved_pending_dispatch -> dispatched`
+    without an approve decision, with an expiration receipt, or with
+    `expires_at` at or before the gateway observation time
+    (`praetore.dispatch_observed_at`, set by `claim_dispatch`).
+  - TLS: all PostgreSQL connections go through `DatabaseConnector`
+    (rustls). Non-loopback hosts require `sslmode=verify-full` and
+    `sslrootcert`; `prefer`/`require`/`verify-ca` are refused. The URL is
+    checked before any socket is opened.
+  - Breaking (gateway service): new `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`
+    and `praetore-gateway-demo migrate`. With `PRAETORE_GATEWAY_ADAPTER=http`
+    or `sandbox` the runtime URL no longer runs migrations, and startup
+    refuses a runtime role that is superuser, `BYPASSRLS`, owns `praetore`
+    objects or can create in the schema, or a schema that is not current.
+    The loopback-only database check is replaced by the TLS rule above, so
+    remote databases (for example in `praetore-data`) work with
+    `verify-full`. The local demo and the CLI still migrate with the runtime
+    URL when no migration URL is set and only warn (development only).
+  - Breaking (public API): `MigrationError` has new variants
+    `ExplicitTransactionControl` and `Pending`; new `DatabaseConnector`,
+    `verify_runtime_role`, `verify_schema_current`.
+  - Kubernetes templates (not cluster-tested): the execution-claim
+    admission policy is scoped to claim ConfigMaps and the supervisor CA,
+    handles DELETE via `oldObject`, no longer blocks `kube-root-ca.crt` or
+    operator ConfigMaps, and lets a dedicated `claim-retention` identity (new
+    Role) and namespace deletion remove claims. The Job policy exempts
+    finalizer-only updates by the garbage collector / TTL / Job controllers
+    on Jobs being deleted, so Foreground deletion can finish. Tool runners
+    no longer share the gateway's proxy: the gateway uses
+    `gateway-egress-proxy` (the only source protected tools accept) and
+    runners keep `egress-proxy`, which may reach only allowed external
+    destinations. Breaking: deploy the second proxy and update the gateway's
+    `egress_proxy` route setting.
 
 ## 0.2.0 (not yet tagged or published)
 
