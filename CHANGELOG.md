@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `praetore-mcp install`/`uninstall` process a config file once when two
+  default paths name it (Cursor's `~/.cursor/mcp.json` and
+  `./.cursor/mcp.json` when run from `~`, or a symlink). Before, it was
+  listed twice; the second pass was skipped as already wrapped. The
+  praetore-mcp README records the real-app check on macOS (Claude Desktop
+  and Cursor).
 - New receipts always record what decided them in `decision.decided_by`, as
   part of the hashed and Ed25519-signed evidence payload, in the new
   **evidence schema v4**:

@@ -267,7 +267,7 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                     }
                 }
             }
-            found
+            install::dedup_targets(found)
         }
     };
     if targets.is_empty() {
