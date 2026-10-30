@@ -142,6 +142,12 @@ cargo test -p praetore-gateway --test enforcement human_approval
   does) can leave a journal state that does not reflect who actually
   executed it. [#16](https://github.com/Mavericksantander/praetore/pull/16)
   addresses this; it is in development and not merged.
+- **A third party cannot prove that no receipt was deleted from the
+  journal.** Each receipt is signed on its own; nothing signs or publishes
+  the journal's sequence or head. A hash-linked export is only a proposal
+  ([`docs/proposals/journal-chain-jsonl.md`](docs/proposals/journal-chain-jsonl.md)),
+  and as specified it would not detect deletion, truncation or a recomputed
+  chain either; the proposal lists what is missing.
 - **No sustained fuzzing campaign has been run.** A `path_prefix` fuzz
   target exists ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs)),
   but CI runs each target only as a 10-second smoke test.
@@ -171,7 +177,6 @@ The following are **open pull requests, not merged** and not available on
 
 - [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
 - [#16](https://github.com/Mavericksantander/praetore/pull/16): `SandboxDispatcher` executed by the gateway, and the `praetore-exec-mode` header.
-- [#18](https://github.com/Mavericksantander/praetore/pull/18): `praetore-verify evidence --policy` (depends on #17).
 
 ## What it is — and is not
 
@@ -463,6 +468,15 @@ target/release/praetore-verify evidence \
   --format json
 
 target/release/praetore-verify policy-digest --policy examples/verify/policy.json --format json
+
+# Same receipt, also required to record that policy's digest (signed by the
+# attester). A different policy, or a receipt without a digest, prints
+# {"ok":false,"command":"evidence","code":"POLICY_MISMATCH"} and exits 1.
+target/release/praetore-verify evidence \
+  --evidence examples/verify/evidence.json \
+  --attester-pin examples/verify/attester-public-key.hex \
+  --policy examples/verify/policy.json \
+  --format json
 
 target/release/praetore-verify authority \
   --authority examples/verify/authority.json \
