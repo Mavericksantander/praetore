@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- Docs: HighAssurance replay claims are documented as keyed by
+  `(tenant_id, agent_id, request_id)` (tenant from the signed authority, nil
+  UUID when absent), matching the code; an action without a capability is
+  documented as rejected (Strict/HighAssurance) or denied (Development), with
+  no `action_type` fallback; canonical JSON key order is documented as UTF-8
+  byte order, a deliberate deviation from RFC 8785's UTF-16 order (codec v1
+  bytes unchanged).
+- `AuthorizationEngine::validate_evidence_for_dispatch` is now documented as
+  accepting ALLOW **and** REQUIRE_APPROVAL evidence (behavior unchanged; the
+  gateway's post-approval path relies on it), and its error message says so.
+  New `validate_allow_evidence_for_dispatch` additionally requires an ALLOW
+  decision, for dispatch paths without a verified human approval.
+- Security (breaking API): `Evidence::verify_key_rotation` now takes the
+  trusted attester key (`&VerifiedPublicKey`) and requires a valid attester
+  signature. It previously accepted an ALLOW decision protected only by the
+  unkeyed `context_hash`, so anyone could forge an authorized rotation by
+  rewriting the decision and recomputing the hash. Unsigned evidence (e.g.
+  Development/Strict without an attester) no longer verifies as a rotation.
+- Security (breaking for non-canonical input): uppercase or mixed-case hex is
+  now rejected for authority signatures, `subject_key_hash` and
+  `issuer_key_id` (`Authority::validate`), request intent signatures,
+  evidence attester signatures, `Evidence::bind_policy_digest` and issuer pin
+  public keys. `hex::decode` accepted both cases, so one signed document had
+  several valid encodings. Everything this crate emits is lowercase.
+- Fix: a gateway receipt for an executed or confirmed action whose adapter
+  output was JSON `null` now verifies. `"output": null` deserializes to
+  `None`, which verification rejected for those statuses although the
+  attestation signs the digest of `null`. For `executed`/`confirmed`, an
+  absent or `null` output is now verified as the JSON value `null`; other
+  statuses still require no output. Serialization is unchanged, so existing
+  receipts and fixtures are byte-identical.
+- Security (behavior change, more restrictive, all semantics versions):
+  DENY/REQUIRE_APPROVAL/RECOVER rules no longer stop applying because of
+  their `required_capability` or `target`. An authority that lacks the rule's
+  `required_capability` is still subject to the rule (previously
+  `RequireApproval{transfer, payments:large, amount > 1000}` plus
+  `Allow{transfer, payments:write}` let an authority without
+  `payments:large` make large transfers without approval), and an action
+  without a target matches a targeted restrictive rule (previously omitting
+  the target bypassed `Deny target=prod-db`). ALLOW rules are unchanged.
+  Targets stay exact, case-sensitive identifiers; this is now documented.
+  Policies that used `required_capability` on a DENY rule to deny only the
+  holders of that capability now deny everyone for that rule's scope.
+  Such an *unbound* match (authority lacks the capability, or the action
+  has no target) always contributes DENY, also for REQUIRE_APPROVAL and
+  RECOVER rules: it never turns a default deny into an approvable request,
+  and never emits a recovery obligation, for an authority the rule was not
+  scoped to.
+- Security (behavior change, more restrictive): an integer compared with a
+  floating-point number no longer fails open in v1 policies. Previously a v1
+  `Deny if amount > 10000` was bypassed with `"amount": 50000.0`, because
+  every mixed integer/float comparison was "no match". Numeric operators now
+  compare integer and float exactly (no lossy `f64` cast); `Exact`/`In`
+  treat a numerically equal float as equal. In every semantics version the
+  exact result applies to DENY/REQUIRE_APPROVAL/RECOVER rules, and an ALLOW
+  rule never matches a mixed representation (unchanged). In v2 a mixed value
+  that is definitively on the safe side of a restrictive rule (`5.0` against
+  `> 10000`) no longer counts as unknown.
 - Policy size and complexity limits are now public, documented constants in
   `praetore_core::policy`, and exceeding any of them rejects the whole policy
   with the typed `PraetoreError::PolicyLimitExceeded { limit: PolicyLimit, max }`

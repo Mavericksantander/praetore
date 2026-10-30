@@ -14,9 +14,11 @@ replay protection for engines shared across processes or restarts.
 ## Decision
 
 HighAssurance configuration must include a caller-owned `ReplayGuard`.
-HighAssurance evaluation claims the `(agent_id, request_id)` pair after request
-validation, decision, evidence construction, and attestation, but before
-returning evidence. A previously claimed request returns `REPLAY_DETECTED`;
+HighAssurance evaluation claims the `(tenant_id, agent_id, request_id)` triple
+after request validation, decision, evidence construction, and attestation,
+but before returning evidence. `tenant_id` comes from the signed authority's
+`tenant_id` constraint; an authority without a valid one uses the nil UUID,
+one shared unscoped namespace. A previously claimed request returns `REPLAY_DETECTED`;
 unavailable or full storage returns `REPLAY_GUARD_FAIL`. Neither condition
 returns evidence or authorization.
 
@@ -41,7 +43,8 @@ the request remains consumed.
 - The caller must provide durable, atomic, appropriately capacity-managed
   storage. The core cannot guarantee replay protection if deployments bypass
   the configured engine or delete claims.
-- Request IDs are treated as one-time identifiers for an agent. Storage must
+- Request IDs are treated as one-time identifiers for an agent within a
+  tenant namespace. Storage must
   not expire claims automatically; a bounded store must fail closed when it
   cannot safely accept a new claim.
 
