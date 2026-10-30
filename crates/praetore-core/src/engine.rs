@@ -747,8 +747,27 @@ impl AuthorizationEngine {
         Ok(())
     }
 
+    /// Like [`Self::validate_evidence_for_dispatch`], but also requires an
+    /// ALLOW decision. Use it on any dispatch path that has no verified human
+    /// approval.
+    pub fn validate_allow_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
+        if evidence.decision.outcome != crate::decision::DecisionOutcome::Allow {
+            return Err(PraetoreError::EvidenceError(
+                "evidence is not a valid HighAssurance allow decision".into(),
+            ));
+        }
+        self.validate_evidence_for_dispatch(evidence)
+    }
+
     /// Revalidates an attested HighAssurance authorization immediately before
     /// a gateway dispatches its bound action.
+    ///
+    /// Accepts both ALLOW and REQUIRE_APPROVAL evidence (DENY is rejected):
+    /// the gateway also calls it on the post-approval path, after a human
+    /// approved a REQUIRE_APPROVAL decision. This function does **not** check
+    /// that approval. A caller that dispatches without a verified human
+    /// approval must use [`Self::validate_allow_evidence_for_dispatch`],
+    /// which also requires an ALLOW decision.
     pub fn validate_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
         if self.mode != EvaluationMode::HighAssurance
             || !evidence.is_high_assurance_shape()
@@ -761,7 +780,7 @@ impl AuthorizationEngine {
             || !evidence.verify_integrity()
         {
             return Err(PraetoreError::EvidenceError(
-                "evidence is not a valid HighAssurance allow decision".into(),
+                "evidence is not a valid HighAssurance allow or require-approval decision".into(),
             ));
         }
 
@@ -1436,7 +1455,14 @@ mod tests {
         provider: Arc<dyn FreshnessProvider>,
         tenant_binding: Option<(Uuid, Uuid)>,
     ) -> (AuthorizationEngine, AuthorizationRequest) {
-        let policy = allow_policy();
+        production_engine_with_policy(allow_policy(), provider, tenant_binding)
+    }
+
+    fn production_engine_with_policy(
+        policy: Policy,
+        provider: Arc<dyn FreshnessProvider>,
+        tenant_binding: Option<(Uuid, Uuid)>,
+    ) -> (AuthorizationEngine, AuthorizationRequest) {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let issuer_key = AgentKeyPair::generate();
@@ -2907,6 +2933,40 @@ mod tests {
         assert!(matches!(
             engine.validate_evidence_for_dispatch(&evidence),
             Err(PraetoreError::FreshnessCheckFailed(FreshnessError::Expired))
+        ));
+    }
+
+    #[test]
+    fn dispatch_validation_distinguishes_allow_from_require_approval() {
+        let (engine, request) = production_engine_with_provider(test_freshness_provider());
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
+        engine.validate_evidence_for_dispatch(&evidence).unwrap();
+        engine
+            .validate_allow_evidence_for_dispatch(&evidence)
+            .unwrap();
+
+        let approval_policy = Policy::new_v2(
+            "test-policy",
+            1,
+            vec![
+                PolicyRule::new(
+                    "approve-read-data",
+                    "read_data",
+                    crate::policy::PolicyEffect::RequireApproval,
+                )
+                .with_capability("read_data"),
+            ],
+        );
+        let (engine, request) =
+            production_engine_with_policy(approval_policy, test_freshness_provider(), None);
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::RequireApproval);
+        // The post-approval path relies on this accepting RequireApproval.
+        engine.validate_evidence_for_dispatch(&evidence).unwrap();
+        assert!(matches!(
+            engine.validate_allow_evidence_for_dispatch(&evidence),
+            Err(PraetoreError::EvidenceError(message)) if message.contains("allow decision")
         ));
     }
 
