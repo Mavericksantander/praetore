@@ -49,10 +49,13 @@ code or test that backs it. None of it is a security or production guarantee.
   [`crates/praetore-core/src/evidence.rs`](crates/praetore-core/src/evidence.rs)
   (test `policy_digest_is_bound_to_integrity_hash`). The engine binds the
   digest in every mode, and `HighAssurance` additionally requires it to
-  equal the pinned policy digest. `Evidence::sign` itself does not yet
-  require the field;
-  [#17](https://github.com/Mavericksantander/praetore/pull/17) (draft)
-  extends that requirement to all signing.
+  equal the pinned policy digest.
+  [#17](https://github.com/Mavericksantander/praetore/pull/17):
+  `Evidence::sign` refuses to sign evidence without a lowercase SHA-256
+  `policy_digest` (test `signing_requires_a_bound_policy_digest`), and
+  `Evidence::verify_policy(&Policy)` checks a receipt against a given policy.
+  Receipts signed earlier without the field still verify, but
+  `verify_policy` rejects them.
 - **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
   A policy that exceeds any limit is rejected when it loads with the typed
   error `PolicyLimitExceeded`; nothing is skipped or treated as allow.
@@ -113,6 +116,7 @@ Run the tests listed above:
 ```sh
 cargo test -p praetore-core --test canopy_port --test path_prefix --test path_prefix_followups
 cargo test -p praetore-core --lib evidence::tests::policy_digest_is_bound_to_integrity_hash
+cargo test -p praetore-core --lib evidence::tests::signing_requires_a_bound_policy_digest
 cargo test -p praetore-gateway --test enforcement human_approval
 ```
 
@@ -174,7 +178,6 @@ The following are **open pull requests, not merged** and not available on
 `main`:
 
 - [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
-- [#17](https://github.com/Mavericksantander/praetore/pull/17): require the active policy digest before a receipt can be signed.
 - [#18](https://github.com/Mavericksantander/praetore/pull/18): `praetore-verify evidence --policy` (depends on #17).
 
 ## What it is — and is not

@@ -187,6 +187,7 @@ mod tests {
         let mut evidence = make_rotation_request()
             .attest(Decision::allow("rotation permitted"))
             .unwrap();
+        evidence.bind_policy_digest("ab".repeat(32)).unwrap();
         evidence.sign(&attester()).unwrap();
         evidence
     }
@@ -279,12 +280,14 @@ mod tests {
             .clone()
             .attest(Decision::allow("other attester"))
             .unwrap();
+        other_attester.bind_policy_digest("ab".repeat(32)).unwrap();
         other_attester
             .sign(&EvidenceAttesterKey::from_secret_bytes(&[14; 32]))
             .unwrap();
         assert!(other_attester.verify_key_rotation(&attester_key()).is_err());
 
         let mut denied = request.attest(Decision::deny("denied")).unwrap();
+        denied.bind_policy_digest("ab".repeat(32)).unwrap();
         denied.sign(&attester()).unwrap();
         assert!(denied.verify_key_rotation(&attester_key()).is_err());
         // Flip the signed DENY into an ALLOW, keeping the attester signature.
