@@ -2,7 +2,7 @@ use crate::{
     PraetoreError, Result,
     authority::Validity,
     authorization::AuthorizationRequest,
-    canonical::parse_json_rejecting_duplicates,
+    canonical::{decode_lower_hex, parse_json_rejecting_duplicates},
     decision::Decision,
     evidence::{Evidence, EvidenceAttesterKey},
     freshness::{FreshnessError, FreshnessProvider},
@@ -197,7 +197,7 @@ impl TrustedAuthorityIssuer {
             return Err(PraetoreError::TrustStoreFailure);
         }
         let key_bytes =
-            hex::decode(&document.public_key).map_err(|_| PraetoreError::TrustStoreFailure)?;
+            decode_lower_hex(&document.public_key).ok_or(PraetoreError::TrustStoreFailure)?;
         let public_key = VerifiedPublicKey::from_bytes(&key_bytes)
             .map_err(|_| PraetoreError::TrustStoreFailure)?;
         let pin = Self::new(document.issuer, public_key)
@@ -689,12 +689,18 @@ impl AuthorizationEngine {
         self.mode
     }
 
+    /// Current time from the engine's configured (trusted) clock. Gateways
+    /// use it to timestamp approval expirations instead of the host clock.
+    pub fn trusted_now(&self) -> Result<OffsetDateTime> {
+        self.clock.now()
+    }
+
     /// Checks the signed authorization's time bounds using the configured
     /// clock. This is useful for decisions that do not dispatch an action but
     /// still must not be consumed after their challenge has expired.
     pub fn validate_evidence_time_bounds(&self, evidence: &Evidence) -> Result<()> {
         if self.mode != EvaluationMode::HighAssurance
-            || evidence.evidence_schema_version != 2
+            || !evidence.is_high_assurance_shape()
             || evidence.evaluation_mode.as_deref() != Some("high_assurance")
             || !evidence.verify_integrity()
         {
@@ -741,11 +747,30 @@ impl AuthorizationEngine {
         Ok(())
     }
 
+    /// Like [`Self::validate_evidence_for_dispatch`], but also requires an
+    /// ALLOW decision. Use it on any dispatch path that has no verified human
+    /// approval.
+    pub fn validate_allow_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
+        if evidence.decision.outcome != crate::decision::DecisionOutcome::Allow {
+            return Err(PraetoreError::EvidenceError(
+                "evidence is not a valid HighAssurance allow decision".into(),
+            ));
+        }
+        self.validate_evidence_for_dispatch(evidence)
+    }
+
     /// Revalidates an attested HighAssurance authorization immediately before
     /// a gateway dispatches its bound action.
+    ///
+    /// Accepts both ALLOW and REQUIRE_APPROVAL evidence (DENY is rejected):
+    /// the gateway also calls it on the post-approval path, after a human
+    /// approved a REQUIRE_APPROVAL decision. This function does **not** check
+    /// that approval. A caller that dispatches without a verified human
+    /// approval must use [`Self::validate_allow_evidence_for_dispatch`],
+    /// which also requires an ALLOW decision.
     pub fn validate_evidence_for_dispatch(&self, evidence: &Evidence) -> Result<()> {
         if self.mode != EvaluationMode::HighAssurance
-            || evidence.evidence_schema_version != 2
+            || !evidence.is_high_assurance_shape()
             || evidence.evaluation_mode.as_deref() != Some("high_assurance")
             || !matches!(
                 evidence.decision.outcome,
@@ -755,7 +780,7 @@ impl AuthorizationEngine {
             || !evidence.verify_integrity()
         {
             return Err(PraetoreError::EvidenceError(
-                "evidence is not a valid HighAssurance allow decision".into(),
+                "evidence is not a valid HighAssurance allow or require-approval decision".into(),
             ));
         }
 
@@ -933,6 +958,9 @@ impl AuthorizationEngine {
             self.validate_production_configuration(now, atomic_commit.is_none())?;
         }
         let decision = self.evaluate_request(&request, now)?;
+        if decision.outcome == crate::decision::DecisionOutcome::RequireApproval {
+            self.validate_approval_window(intent_v2.as_ref(), now)?;
+        }
         let freshness = if self.mode == EvaluationMode::HighAssurance {
             let freshness = self
                 .freshness_provider
@@ -1042,6 +1070,28 @@ impl AuthorizationEngine {
             }
         }
         Ok(evidence)
+    }
+
+    /// SAF-10 (CTO, 29-oct-2026): a RequireApproval request whose signed
+    /// intent asks for an approval window longer than the policy's
+    /// `max_approval_ms` is rejected before any replay claim or record.
+    fn validate_approval_window(
+        &self,
+        intent: Option<&crate::authorization::AuthorizationIntentV2>,
+        now: OffsetDateTime,
+    ) -> Result<()> {
+        let (Some(max_ms), Some(intent)) = (self.policy.max_approval_ms, intent) else {
+            return Ok(());
+        };
+        let expires_at = OffsetDateTime::parse(&intent.expires_at, &Rfc3339)
+            .map_err(|_| PraetoreError::IntentInvalid)?;
+        let max = Duration::milliseconds(
+            i64::try_from(max_ms).map_err(|_| PraetoreError::PolicyIntegrityFailed)?,
+        );
+        if expires_at - now > max {
+            return Err(PraetoreError::IntentInvalid);
+        }
+        Ok(())
     }
 
     fn validate_high_assurance_request(
@@ -1405,7 +1455,14 @@ mod tests {
         provider: Arc<dyn FreshnessProvider>,
         tenant_binding: Option<(Uuid, Uuid)>,
     ) -> (AuthorizationEngine, AuthorizationRequest) {
-        let policy = allow_policy();
+        production_engine_with_policy(allow_policy(), provider, tenant_binding)
+    }
+
+    fn production_engine_with_policy(
+        policy: Policy,
+        provider: Arc<dyn FreshnessProvider>,
+        tenant_binding: Option<(Uuid, Uuid)>,
+    ) -> (AuthorizationEngine, AuthorizationRequest) {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let issuer_key = AgentKeyPair::generate();
@@ -2880,6 +2937,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_validation_distinguishes_allow_from_require_approval() {
+        let (engine, request) = production_engine_with_provider(test_freshness_provider());
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Allow);
+        engine.validate_evidence_for_dispatch(&evidence).unwrap();
+        engine
+            .validate_allow_evidence_for_dispatch(&evidence)
+            .unwrap();
+
+        let approval_policy = Policy::new_v2(
+            "test-policy",
+            1,
+            vec![
+                PolicyRule::new(
+                    "approve-read-data",
+                    "read_data",
+                    crate::policy::PolicyEffect::RequireApproval,
+                )
+                .with_capability("read_data"),
+            ],
+        );
+        let (engine, request) =
+            production_engine_with_policy(approval_policy, test_freshness_provider(), None);
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::RequireApproval);
+        // The post-approval path relies on this accepting RequireApproval.
+        engine.validate_evidence_for_dispatch(&evidence).unwrap();
+        assert!(matches!(
+            engine.validate_allow_evidence_for_dispatch(&evidence),
+            Err(PraetoreError::EvidenceError(message)) if message.contains("allow decision")
+        ));
+    }
+
+    #[test]
     fn production_profile_rejects_invalid_intent_metadata_and_unbounded_authority() {
         let (engine, mut request) = production_engine_with_provider(test_freshness_provider());
         request.intent_v2.as_mut().unwrap().audience = "other-gateway".into();
@@ -3246,7 +3337,7 @@ mod tests {
             ] {
                 let outcome = unbound_delete_outcome(
                     mode,
-                    effect,
+                    effect.clone(),
                     vec!["read_data".into(), "delete_data".into()],
                 )
                 .unwrap();

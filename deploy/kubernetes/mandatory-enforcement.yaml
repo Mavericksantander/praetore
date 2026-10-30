@@ -75,7 +75,7 @@ spec:
               kubernetes.io/metadata.name: praetore-egress
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: egress-proxy
+              app.kubernetes.io/name: gateway-egress-proxy
       ports:
         - protocol: TCP
           port: 3128
@@ -120,7 +120,88 @@ spec:
               kubernetes.io/metadata.name: praetore-egress
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: egress-proxy
+              app.kubernetes.io/name: gateway-egress-proxy
       ports:
         - protocol: TCP
           port: 443
+---
+# Two proxies with separate identities. gateway-egress-proxy is the only path
+# to protected tools (see the praetore-tools policy above) and accepts only
+# the gateway. egress-proxy serves sandbox tool runners (its Service name is
+# fixed in the supervisor's Job spec and in admission); protected tools do not
+# accept it, and it may reach only public addresses.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress-proxy-ingress-only-from-gateway
+  namespace: praetore-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: gateway-egress-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: praetore-gateway
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: praetore-gateway
+      ports:
+        - protocol: TCP
+          port: 3128
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-egress-proxy-runners-only-public-egress
+  namespace: praetore-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: egress-proxy
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: praetore-sandbox
+          podSelector:
+            matchLabels:
+              praetore.io/component: tool-invocation
+      ports:
+        - protocol: TCP
+          port: 3128
+  # NetworkPolicy has no FQDN rules: restrict runner destinations further in
+  # the proxy allowlist. Add the cluster's pod and service CIDRs to `except`
+  # if they are not inside these private ranges.
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

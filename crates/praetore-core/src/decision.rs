@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 /// The outcome of an authorization decision.
 ///
 /// Ordering is intentional:
-/// DENY > REQUIRE_APPROVAL > ALLOW
+/// DENY > REQUIRE_APPROVAL > ALLOW. A `Deny` carrying a
+/// [`RecoveryObligation`] ranks above a plain `Deny` (see [`Severity`]).
 ///
 /// ```
 /// use praetore_core::DecisionOutcome;
@@ -68,12 +69,90 @@ impl DecisionContribution {
     }
 }
 
+/// Effective severity of a decision (SAF-10):
+/// `Recover > Deny > RequireApproval > Allow`.
+///
+/// `Recover` is not a fourth [`DecisionOutcome`]: it is a `Deny` that also
+/// carries a [`RecoveryObligation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Severity {
+    Allow,
+    RequireApproval,
+    Deny,
+    Recover,
+}
+
+/// Obligation to enter a predeclared safe mode, produced by a policy rule
+/// with effect `Recover`. It never authorizes the proposed action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RecoveryObligation {
+    /// Safe mode predeclared in the policy.
+    pub recovery_id: String,
+    /// Rule that produced the obligation.
+    pub rule_id: String,
+    pub reason: String,
+    /// Maximum time to reach the safe mode (`T_recover_max`), in ms; > 0.
+    pub deadline_ms: u64,
+}
+
+impl RecoveryObligation {
+    /// Checks the structural bounds shared by policy loading and evidence.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let canonical = |value: &str| !value.trim().is_empty() && value == value.trim();
+        if !canonical(&self.recovery_id) || self.recovery_id.len() > 1024 {
+            return Err("recovery_id must be a non-empty canonical identifier");
+        }
+        if !canonical(&self.rule_id) || self.rule_id.len() > 1024 {
+            return Err("recovery rule_id must be a non-empty canonical identifier");
+        }
+        if self.reason.len() > 4096 {
+            return Err("recovery reason is too long");
+        }
+        if self.deadline_ms == 0 || self.deadline_ms > crate::canonical::MAX_SAFE_INTEGER {
+            return Err("recovery deadline_ms must be positive and canonically representable");
+        }
+        Ok(())
+    }
+}
+
+/// An authorization decision.
+///
+/// Invariant: `recovery.is_some()` implies `outcome == Deny`. Deserialization
+/// rejects any document that violates it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "DecisionWire")]
 pub struct Decision {
     pub outcome: DecisionOutcome,
     pub reason: String,
     pub contributions: Vec<DecisionContribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<RecoveryObligation>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionWire {
+    outcome: DecisionOutcome,
+    reason: String,
+    contributions: Vec<DecisionContribution>,
+    #[serde(default)]
+    recovery: Option<RecoveryObligation>,
+}
+
+impl TryFrom<DecisionWire> for Decision {
+    type Error = &'static str;
+
+    fn try_from(wire: DecisionWire) -> Result<Self, Self::Error> {
+        let decision = Self {
+            outcome: wire.outcome,
+            reason: wire.reason,
+            contributions: wire.contributions,
+            recovery: wire.recovery,
+        };
+        decision.validate_recovery()?;
+        Ok(decision)
+    }
 }
 
 impl Decision {
@@ -82,6 +161,8 @@ impl Decision {
             outcome: DecisionOutcome::Allow,
             reason: reason.into(),
             contributions: Vec::new(),
+
+            recovery: None,
         }
     }
 
@@ -90,6 +171,8 @@ impl Decision {
             outcome: DecisionOutcome::RequireApproval,
             reason: reason.into(),
             contributions: Vec::new(),
+
+            recovery: None,
         }
     }
 
@@ -98,6 +181,8 @@ impl Decision {
             outcome: DecisionOutcome::Deny,
             reason: reason.into(),
             contributions: Vec::new(),
+
+            recovery: None,
         }
     }
 
@@ -106,13 +191,53 @@ impl Decision {
         self
     }
 
+    /// A `Deny` that carries a recovery obligation.
+    pub fn recover(reason: impl Into<String>, recovery: RecoveryObligation) -> Self {
+        Self {
+            outcome: DecisionOutcome::Deny,
+            reason: reason.into(),
+            contributions: Vec::new(),
+            recovery: Some(recovery),
+        }
+    }
+
+    /// Effective severity: `Recover` when an obligation is present.
+    pub fn severity(&self) -> Severity {
+        match (&self.recovery, self.outcome) {
+            (Some(_), _) => Severity::Recover,
+            (None, DecisionOutcome::Allow) => Severity::Allow,
+            (None, DecisionOutcome::RequireApproval) => Severity::RequireApproval,
+            (None, DecisionOutcome::Deny) => Severity::Deny,
+        }
+    }
+
+    /// Checks the recovery invariant and bounds.
+    pub fn validate_recovery(&self) -> Result<(), &'static str> {
+        match &self.recovery {
+            None => Ok(()),
+            Some(_) if self.outcome != DecisionOutcome::Deny => {
+                Err("a decision with a recovery obligation must deny")
+            }
+            Some(recovery) => recovery.validate(),
+        }
+    }
+
+    /// Combines two matching decisions. Admission follows
+    /// `DecisionOutcome::strongest` (deny wins). A recovery obligation is never
+    /// discarded: the left one is kept if both carry one, and any obligation
+    /// forces `Deny`.
     pub fn strongest(self, other: Self) -> Self {
-        let outcome = self.outcome.strongest(other.outcome);
+        let recovery = self.recovery.or(other.recovery);
+        let outcome = if recovery.is_some() {
+            DecisionOutcome::Deny
+        } else {
+            self.outcome.strongest(other.outcome)
+        };
 
         let reason = if self.outcome == outcome {
-            self.reason.clone()
+            self.reason
         } else {
-            other.reason.clone()
+            other.reason
         };
 
         let mut contributions = self.contributions;
@@ -122,6 +247,7 @@ impl Decision {
             outcome,
             reason,
             contributions,
+            recovery,
         }
     }
 }
@@ -129,6 +255,56 @@ impl Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obligation(rule_id: &str) -> RecoveryObligation {
+        RecoveryObligation {
+            recovery_id: "safe-hold".into(),
+            rule_id: rule_id.into(),
+            reason: "enter safe hold".into(),
+            deadline_ms: 500,
+        }
+    }
+
+    #[test]
+    fn recovery_survives_a_deny_and_forces_deny_over_allow() {
+        let recover = Decision::recover("recover", obligation("r1"));
+        let combined = Decision::allow("ok").strongest(recover.clone());
+        assert_eq!(combined.outcome, DecisionOutcome::Deny);
+        assert_eq!(combined.recovery, Some(obligation("r1")));
+        let combined = recover.clone().strongest(Decision::deny("no"));
+        assert_eq!(combined.recovery, Some(obligation("r1")));
+        assert_eq!(combined.severity(), Severity::Recover);
+        let both = recover.strongest(Decision::recover("x", obligation("r2")));
+        assert_eq!(both.recovery, Some(obligation("r1")));
+    }
+
+    #[test]
+    fn severity_order_is_recover_deny_approval_allow() {
+        assert!(Severity::Recover > Severity::Deny);
+        assert!(Severity::Deny > Severity::RequireApproval);
+        assert!(Severity::RequireApproval > Severity::Allow);
+    }
+
+    #[test]
+    fn decision_without_recovery_serializes_as_before() {
+        let json = serde_json::to_string(&Decision::deny("x")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"outcome":"Deny","reason":"x","contributions":[]}"#
+        );
+        let parsed: Decision = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.recovery, None);
+    }
+
+    #[test]
+    fn decision_rejects_illegal_recovery_states() {
+        let allow = r#"{"outcome":"Allow","reason":"x","contributions":[],"recovery":{"recovery_id":"s","rule_id":"r","reason":"x","deadline_ms":1}}"#;
+        assert!(serde_json::from_str::<Decision>(allow).is_err());
+        let zero = r#"{"outcome":"Deny","reason":"x","contributions":[],"recovery":{"recovery_id":"s","rule_id":"r","reason":"x","deadline_ms":0}}"#;
+        assert!(serde_json::from_str::<Decision>(zero).is_err());
+        let unknown = r#"{"outcome":"Deny","reason":"x","contributions":[],"extra":1}"#;
+        assert!(serde_json::from_str::<Decision>(unknown).is_err());
+    }
 
     #[test]
     fn deny_beats_everything() {
