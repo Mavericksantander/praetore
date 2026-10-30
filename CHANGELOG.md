@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Security (behavior change, more restrictive, all semantics versions):
+  DENY/REQUIRE_APPROVAL/RECOVER rules no longer stop applying because of
+  their `required_capability` or `target`. An authority that lacks the rule's
+  `required_capability` is still subject to the rule (previously
+  `RequireApproval{transfer, payments:large, amount > 1000}` plus
+  `Allow{transfer, payments:write}` let an authority without
+  `payments:large` make large transfers without approval), and an action
+  without a target matches a targeted restrictive rule (previously omitting
+  the target bypassed `Deny target=prod-db`). ALLOW rules are unchanged.
+  Targets stay exact, case-sensitive identifiers; this is now documented.
+  Policies that used `required_capability` on a DENY rule to deny only the
+  holders of that capability now deny everyone for that rule's scope.
 - Security (behavior change, more restrictive): an integer compared with a
   floating-point number no longer fails open in v1 policies. Previously a v1
   `Deny if amount > 10000` was bypassed with `"amount": 50000.0`, because
