@@ -153,16 +153,20 @@ fn write_locked(out: &Mutex<io::Stdout>, bytes: &[u8]) -> io::Result<()> {
 
 pub fn run(options: WrapOptions) -> i32 {
     let gate = Gate::load(&options.home, options.mode);
-    if let Err(error) = &gate {
-        match options.mode {
-            Mode::Enforce => eprintln!(
-                "praetore-mcp: ERROR {error}\npraetore-mcp: enforce mode: every tools/call will be REFUSED until this is fixed"
-            ),
-            Mode::Observe => eprintln!(
-                "praetore-mcp: WARNING {error}\npraetore-mcp: observe mode: tools/call will be forwarded WITHOUT receipts"
-            ),
+    // Without a gate no receipt can be written, so there is nothing to
+    // observe: both modes refuse every tools/call (fail closed) and gate the
+    // rest of the traffic as enforce does. Other MCP traffic still flows, so
+    // the client shows the refusal instead of a dead server.
+    let mode = match &gate {
+        Ok(_) => options.mode,
+        Err(error) => {
+            eprintln!(
+                "praetore-mcp: ERROR {error}\npraetore-mcp: {} mode: every tools/call will be REFUSED until this is fixed",
+                options.mode.as_str()
+            );
+            Mode::Enforce
         }
-    }
+    };
     let mut evaluator = GateOrError(gate);
 
     #[cfg(windows)]
@@ -218,7 +222,6 @@ pub fn run(options: WrapOptions) -> i32 {
         })
     };
 
-    let mode = options.mode;
     let name = options.name.clone();
     let client_stdout = Arc::clone(&stdout);
     thread::spawn(move || {
