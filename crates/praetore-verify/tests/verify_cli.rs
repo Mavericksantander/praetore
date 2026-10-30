@@ -582,9 +582,47 @@ fn run_receipt(receipt: &Path) -> Output {
             .into_owned(),
         "--key-id".into(),
         "test-execution-attester-v1".into(),
+        "--evidence-attester-pin".into(),
+        receipt_fixture("receipt-evidence-attester-public-key.hex")
+            .to_string_lossy()
+            .into_owned(),
         "--format".into(),
         "json".into(),
     ])
+}
+
+#[test]
+fn receipt_command_rejects_missing_or_forged_evidence_attester_signature() {
+    let v2 = fs::read_to_string(receipt_fixture("receipt-v2-confirmed.json")).unwrap();
+    let mut receipt: Value = serde_json::from_str(&v2).unwrap();
+    receipt["evidence"]["attester_signature"] = Value::String("0".repeat(128));
+    let path = std::env::temp_dir().join(format!("praetore-receipt-ev-{}.json", Uuid::new_v4()));
+    fs::write(&path, serde_json::to_string(&receipt).unwrap()).unwrap();
+    let output = run_receipt(&path);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success());
+    assert_eq!(
+        json_output(&output)["code"],
+        "RECEIPT_EVIDENCE_SIGNATURE_INVALID"
+    );
+
+    // Without --evidence-attester-pin the command refuses to run.
+    let output = run(&[
+        "receipt".into(),
+        "--receipt".into(),
+        receipt_fixture("receipt-v2-confirmed.json")
+            .to_string_lossy()
+            .into_owned(),
+        "--execution-pin".into(),
+        receipt_fixture("execution-attester-public-key.hex")
+            .to_string_lossy()
+            .into_owned(),
+        "--key-id".into(),
+        "test-execution-attester-v1".into(),
+        "--format".into(),
+        "json".into(),
+    ]);
+    assert!(!output.status.success());
 }
 
 #[test]
