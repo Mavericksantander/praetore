@@ -1469,7 +1469,7 @@ impl Gateway {
         }
 
         self.journal.mark_dispatched(key)?;
-        if let Err(error) = self.engine.validate_evidence_for_dispatch(&evidence) {
+        if let Err(error) = self.engine.validate_allow_evidence_for_dispatch(&evidence) {
             let execution = ExecutionStatus::Failed;
             let attestation =
                 self.create_execution_attestation(&evidence, authorization, execution, None)?;
