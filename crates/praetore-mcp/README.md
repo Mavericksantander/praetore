@@ -12,6 +12,9 @@ Rust code.
 * **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
   forwarded; the client gets an MCP tool error instead.
 
+New to praetore-mcp? [GUIDE.md](GUIDE.md) walks through a first run, lists
+what it does not cover, and has a troubleshooting table.
+
 ## 5-minute quickstart
 
 ```sh

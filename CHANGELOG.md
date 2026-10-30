@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `crates/praetore-mcp/GUIDE.md`: a guide for external developers with a
+  first-run walkthrough, the limits (only MCP `tools/call` through a wrapped
+  server is governed; LOCAL/DEV keys; no approval flow for REQUIRE_APPROVAL;
+  lexical path rules; TOCTOU) and a troubleshooting table.
 - New receipts always record what decided them in `decision.decided_by`, as
   part of the hashed and Ed25519-signed evidence payload, in the new
   **evidence schema v4**:
