@@ -38,8 +38,17 @@ pub struct SandboxSupervisor {
     kubernetes: KubernetesApi,
     runner_image: String,
     routes: Arc<HashMap<(Uuid, String, String, String), String>>,
-    pending: Arc<Mutex<HashMap<ExecutionKey, oneshot::Sender<Value>>>>,
+    pending: Arc<Mutex<HashMap<ExecutionKey, PendingResult>>>,
     concurrency: Arc<Semaphore>,
+}
+
+/// A started execution awaiting its single worker callback. The expected
+/// token and action digests are kept in memory so that an unauthenticated
+/// callback is refused before any Kubernetes API request is made.
+struct PendingResult {
+    sender: oneshot::Sender<Value>,
+    result_token_hash: String,
+    action_digest: String,
 }
 
 #[derive(Clone)]
@@ -476,11 +485,14 @@ async fn dispatch(
     }
 
     let (sender, receiver) = oneshot::channel();
-    supervisor
-        .pending
-        .lock()
-        .await
-        .insert(request.execution_key, sender);
+    supervisor.pending.lock().await.insert(
+        request.execution_key,
+        PendingResult {
+            sender,
+            result_token_hash: result_token_hash.clone(),
+            action_digest: action_digest_full.clone(),
+        },
+    );
     if supervisor
         .kubernetes
         .unsuspend_job(&job_name)
@@ -557,6 +569,20 @@ async fn submit_result(
     {
         return Err(ApiError::bad_request());
     }
+    let supplied_token_hash = sha256_hex(result.result_token.as_bytes());
+    // Authenticate the callback against the in-memory pending execution
+    // first: unknown keys and wrong tokens never cause a Kubernetes request.
+    {
+        let pending = supervisor.pending.lock().await;
+        let expected = pending
+            .get(&result.execution_key)
+            .ok_or_else(ApiError::conflict)?;
+        let token_ok = constant_time_digest_eq(&supplied_token_hash, &expected.result_token_hash);
+        let digest_ok = constant_time_digest_eq(&result.action_digest, &expected.action_digest);
+        if !(token_ok & digest_ok) {
+            return Err(ApiError::forbidden());
+        }
+    }
     let execution_id = execution_id(result.execution_key);
     let job = supervisor
         .kubernetes
@@ -578,7 +604,6 @@ async fn submit_result(
         .get(EXECUTION_KEY_ANNOTATION)
         .and_then(Value::as_str)
         .ok_or_else(ApiError::forbidden)?;
-    let supplied_token_hash = sha256_hex(result.result_token.as_bytes());
     let expected_execution_key_hash = sha256_hex(idempotency_key(result.execution_key).as_bytes());
     if !constant_time_digest_eq(&supplied_token_hash, expected_token_hash)
         || !constant_time_digest_eq(&result.action_digest, expected_action_digest)
@@ -586,13 +611,14 @@ async fn submit_result(
     {
         return Err(ApiError::forbidden());
     }
-    let sender = supervisor
+    let pending = supervisor
         .pending
         .lock()
         .await
         .remove(&result.execution_key)
         .ok_or_else(ApiError::conflict)?;
-    sender
+    pending
+        .sender
         .send(result.output)
         .map_err(|_| ApiError::conflict())?;
     Ok(StatusCode::NO_CONTENT)
@@ -966,28 +992,114 @@ pub fn load_worker_tls(
     Ok(Arc::new(config))
 }
 
+/// Connection limits of one TLS listener.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionLimits {
+    /// Concurrent connections; further connections are closed at accept.
+    pub max_connections: usize,
+    /// Concurrent connections from one peer IP address.
+    pub max_connections_per_peer: usize,
+    /// Time allowed for the request line and headers after the handshake.
+    pub header_read_timeout: Duration,
+    /// Total lifetime of one connection (one request; no keep-alive).
+    pub connection_timeout: Duration,
+}
+
+impl ConnectionLimits {
+    /// mTLS gateway ingress: a dispatch may wait up to 120 s for its worker.
+    pub fn gateway_ingress() -> Self {
+        Self {
+            max_connections: 128,
+            max_connections_per_peer: 128,
+            header_read_timeout: Duration::from_secs(10),
+            connection_timeout: Duration::from_secs(145),
+        }
+    }
+
+    /// Worker callback port: reachable by sandbox pods without client
+    /// certificates, so one pod must not be able to hold many slots or keep
+    /// connections open.
+    pub fn worker_callback() -> Self {
+        Self {
+            max_connections: 128,
+            max_connections_per_peer: 4,
+            header_read_timeout: Duration::from_secs(5),
+            connection_timeout: Duration::from_secs(20),
+        }
+    }
+}
+
+/// Counts concurrent connections per peer address.
+#[derive(Clone, Default)]
+struct PeerConnections {
+    counts: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, usize>>>,
+}
+
+struct PeerConnectionGuard {
+    peers: PeerConnections,
+    peer: std::net::IpAddr,
+}
+
+impl PeerConnections {
+    fn try_acquire(&self, peer: std::net::IpAddr, limit: usize) -> Option<PeerConnectionGuard> {
+        let mut counts = self.counts.lock().ok()?;
+        let count = counts.entry(peer).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(PeerConnectionGuard {
+            peers: self.clone(),
+            peer,
+        })
+    }
+}
+
+impl Drop for PeerConnectionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.peers.counts.lock()
+            && let Some(count) = counts.get_mut(&self.peer)
+        {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
 pub async fn serve_tls(
     address: SocketAddr,
     tls: Arc<rustls::ServerConfig>,
     router: Router,
+    limits: ConnectionLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use hyper::{server::conn::http1, service::service_fn};
-    use hyper_util::rt::TokioIo;
+    use hyper_util::rt::{TokioIo, TokioTimer};
     use tokio_rustls::TlsAcceptor;
     use tower::Service;
 
+    if limits.max_connections == 0 || limits.max_connections_per_peer == 0 {
+        return Err("connection limits must be greater than zero".into());
+    }
     let listener = tokio::net::TcpListener::bind(address).await?;
     let acceptor = TlsAcceptor::from(tls);
-    let connections = Arc::new(Semaphore::new(128));
+    let connections = Arc::new(Semaphore::new(limits.max_connections));
+    let peers = PeerConnections::default();
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
+        // Never block the accept loop: when the listener or this peer is
+        // at its limit, the new connection is closed immediately.
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            tracing::debug!(%peer, "TLS listener at connection limit");
+            continue;
+        };
+        let Some(peer_guard) = peers.try_acquire(peer.ip(), limits.max_connections_per_peer) else {
+            tracing::debug!(%peer, "TLS peer at connection limit");
+            continue;
+        };
         let acceptor = acceptor.clone();
         let app = router.clone();
-        let permit = connections
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| "TLS connection limiter is closed")?;
         tokio::spawn(async move {
             let stream =
                 match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(stream)).await {
@@ -1012,10 +1124,12 @@ pub async fn serve_tls(
                 }
             });
             let connection = http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
                 .keep_alive(false)
                 .serve_connection(io, service)
                 .with_upgrades();
-            match tokio::time::timeout(Duration::from_secs(145), connection).await {
+            match tokio::time::timeout(limits.connection_timeout, connection).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     tracing::debug!(%error, "sandbox HTTP connection closed with an error");
@@ -1024,6 +1138,7 @@ pub async fn serve_tls(
                     tracing::debug!("sandbox HTTP connection timed out");
                 }
             }
+            drop(peer_guard);
             drop(permit);
         });
     }
@@ -1205,6 +1320,124 @@ mod tests {
         assert!(is_json_content_type(&headers));
         headers.insert(CONTENT_TYPE, "text/plain".parse().unwrap());
         assert!(!is_json_content_type(&headers));
+    }
+
+    fn unreachable_supervisor() -> SandboxSupervisor {
+        // Any Kubernetes request fails fast with 503, so a 403/409 answer
+        // proves that the callback was refused before reaching the API.
+        let kubernetes = KubernetesApi {
+            client: Client::builder()
+                .timeout(Duration::from_secs(2))
+                .no_proxy()
+                .build()
+                .unwrap(),
+            base_url: Url::parse("https://127.0.0.1:1/").unwrap(),
+        };
+        let config = json!({
+            "schema_version": 1,
+            "runner_image": format!(
+                "registry.example.com/praetore/tool-runner@sha256:{}",
+                "a".repeat(64)
+            ),
+            "routes": [{
+                "tenant_id": Uuid::from_u128(1),
+                "action_type": "orders:create",
+                "target": "orders-api",
+                "capability": "orders:write",
+                "tool_profile": "orders-create"
+            }]
+        });
+        SandboxSupervisor::new(kubernetes, &config.to_string()).unwrap()
+    }
+
+    async fn post_result(supervisor: &SandboxSupervisor, body: Value) -> StatusCode {
+        use tower::ServiceExt;
+        supervisor
+            .clone()
+            .worker_router()
+            .oneshot(
+                axum::http::Request::post("/v1/results")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn worker_callback_is_authenticated_before_any_kubernetes_request() {
+        let supervisor = unreachable_supervisor();
+        let key = ExecutionKey {
+            tenant_id: Uuid::from_u128(1),
+            agent_id: Uuid::from_u128(2),
+            request_id: Uuid::from_u128(3),
+        };
+        let token = "correct-result-token";
+        let action_digest = "e".repeat(64);
+        let result = |token: &str, digest: &str| {
+            json!({
+                "schema_version": 1,
+                "execution_key": key,
+                "action_digest": digest,
+                "result_token": token,
+                "output": {"ok": true}
+            })
+        };
+
+        // No pending execution for the key: refused without a lookup.
+        assert_eq!(
+            post_result(&supervisor, result(token, &action_digest)).await,
+            StatusCode::CONFLICT
+        );
+
+        let (sender, _receiver) = oneshot::channel();
+        supervisor.pending.lock().await.insert(
+            key,
+            PendingResult {
+                sender,
+                result_token_hash: sha256_hex(token.as_bytes()),
+                action_digest: action_digest.clone(),
+            },
+        );
+        assert_eq!(
+            post_result(&supervisor, result("wrong-token", &action_digest)).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_result(&supervisor, result(token, &"f".repeat(64))).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(supervisor.pending.lock().await.contains_key(&key));
+        // Only an authenticated callback reaches the Kubernetes API (which is
+        // unreachable here).
+        assert_eq!(
+            post_result(&supervisor, result(token, &action_digest)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn per_peer_connection_limit_is_enforced_and_released() {
+        let peers = PeerConnections::default();
+        let pod: std::net::IpAddr = "10.1.2.3".parse().unwrap();
+        let other: std::net::IpAddr = "10.1.2.4".parse().unwrap();
+        let first = peers.try_acquire(pod, 2).unwrap();
+        let _second = peers.try_acquire(pod, 2).unwrap();
+        assert!(peers.try_acquire(pod, 2).is_none());
+        assert!(peers.try_acquire(other, 2).is_some());
+        drop(first);
+        assert!(peers.try_acquire(pod, 2).is_some());
+    }
+
+    #[test]
+    fn worker_callback_limits_are_tighter_than_gateway_ingress() {
+        let worker = ConnectionLimits::worker_callback();
+        let gateway = ConnectionLimits::gateway_ingress();
+        assert!(worker.max_connections_per_peer < worker.max_connections);
+        assert!(worker.connection_timeout < gateway.connection_timeout);
+        assert!(worker.header_read_timeout <= Duration::from_secs(5));
     }
 
     #[test]

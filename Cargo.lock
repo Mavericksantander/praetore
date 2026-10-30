@@ -1144,6 +1144,8 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "subtle",
  "thiserror",
  "time",
  "tokio",
@@ -1254,9 +1256,12 @@ dependencies = [
  "postgres",
  "praetore-core",
  "praetore-gateway",
+ "rustls",
  "serde_json",
  "sha2 0.11.0",
  "time",
+ "tokio",
+ "tokio-rustls",
  "uuid",
 ]
 

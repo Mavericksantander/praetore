@@ -981,6 +981,41 @@ fn approval_fixture_with_approver_and_policy(
     Arc<MemoryJournal>,
     SigningKey,
 ) {
+    let (gateway, request, tool, journal, approver_key, _) =
+        approval_fixture_full(build_provider, approver_secret, edit, |approver_key| {
+            vec![
+                HumanApprovalVerifier::new(
+                    "test-human-approver-v1",
+                    VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes())
+                        .unwrap(),
+                )
+                .unwrap(),
+            ]
+        });
+    (gateway, request, tool, journal, approver_key)
+}
+
+type ApprovalFixtureWithClock = (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+    Arc<Mutex<OffsetDateTime>>,
+);
+
+fn approval_fixture_with_verifiers(
+    verifiers: impl FnOnce(&SigningKey) -> Vec<HumanApprovalVerifier>,
+) -> ApprovalFixtureWithClock {
+    approval_fixture_full(|_| Arc::new(CurrentFreshness), [34; 32], |_| {}, verifiers)
+}
+
+fn approval_fixture_full(
+    build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
+    approver_secret: [u8; 32],
+    edit: impl FnOnce(&mut Policy),
+    verifiers: impl FnOnce(&SigningKey) -> Vec<HumanApprovalVerifier>,
+) -> ApprovalFixtureWithClock {
     let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[32; 32]);
     let attester = EvidenceAttesterKey::from_secret_bytes(&[33; 32]);
@@ -1037,26 +1072,27 @@ fn approval_fixture_with_approver_and_policy(
         .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
         .with_freshness_provider(build_provider(clock.clone()));
     let engine =
-        AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock)).unwrap();
+        AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock.clone()))
+            .unwrap();
     let tool = Arc::new(LocalSetTool::default());
     let journal = Arc::new(MemoryJournal::default());
     let approver_key = SigningKey::from_bytes(&approver_secret);
-    let verifier = HumanApprovalVerifier::new(
-        "test-human-approver-v1",
-        VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap(),
-    )
-    .unwrap();
-    let gateway = Gateway::new(engine, journal.clone(), tool.clone(), execution_attester())
-        .unwrap()
-        .with_human_approval_verifier(verifier);
-    (gateway, request, tool, journal, approver_key)
+    let mut gateway =
+        Gateway::new(engine, journal.clone(), tool.clone(), execution_attester()).unwrap();
+    for verifier in verifiers(&approver_key) {
+        gateway = gateway.with_human_approval_verifier(verifier);
+    }
+    (gateway, request, tool, journal, approver_key, clock)
 }
 
 #[tokio::test]
 async fn http_gateway_returns_receipt_and_dispatches_allowed_action_once() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     let request_body = serde_json::to_string(&fixture.request).unwrap();
-    let app = http_api::router(Arc::new(fixture.gateway));
+    let app = http_api::router(
+        Arc::new(fixture.gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
 
     let response = app.oneshot(http_request(request_body)).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -1092,7 +1128,10 @@ async fn http_gateway_returns_receipt_and_dispatches_allowed_action_once() {
 async fn http_gateway_returns_denials_without_dispatch() {
     let fixture = fixture(None, false);
     let request_body = serde_json::to_string(&fixture.request).unwrap();
-    let app = http_api::router(Arc::new(fixture.gateway));
+    let app = http_api::router(
+        Arc::new(fixture.gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
 
     let response = app.oneshot(http_request(request_body)).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -1107,7 +1146,10 @@ async fn http_gateway_returns_denials_without_dispatch() {
 async fn http_gateway_returns_approval_receipt_without_dispatch() {
     let fixture = fixture(Some(PolicyEffect::RequireApproval), false);
     let request_body = serde_json::to_string(&fixture.request).unwrap();
-    let app = http_api::router(Arc::new(fixture.gateway));
+    let app = http_api::router(
+        Arc::new(fixture.gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
 
     let response = app.oneshot(http_request(request_body)).await.unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -1348,7 +1390,10 @@ fn expired_human_rejection_uses_the_engine_clock() {
 #[tokio::test]
 async fn http_human_approval_resumes_the_pending_execution() {
     let (gateway, request, tool, _, approver_key) = approval_fixture();
-    let app = http_api::router(Arc::new(gateway));
+    let app = http_api::router(
+        Arc::new(gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
     let response = app
         .clone()
         .oneshot(http_request(serde_json::to_string(&request).unwrap()))
@@ -1393,7 +1438,15 @@ async fn http_human_approval_resumes_the_pending_execution() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 65_536).await.unwrap();
-    let challenge: praetore_gateway::ApprovalChallenge = serde_json::from_slice(&body).unwrap();
+    let view =
+        praetore_gateway::ApprovalChallengeView::from_json(std::str::from_utf8(&body).unwrap())
+            .unwrap();
+    assert!(view.action_matches_challenge());
+    assert_eq!(
+        serde_json::to_value(&view.action).unwrap(),
+        serde_json::to_value(&request.action).unwrap()
+    );
+    let challenge = view.challenge;
     let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
 
     let mismatched_path = app
@@ -1515,7 +1568,10 @@ async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
         signer.clone(),
     )
     .unwrap();
-    let app = http_api::router(Arc::new(gateway));
+    let app = http_api::router(
+        Arc::new(gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
     let response = app
         .oneshot(http_request(serde_json::to_string(&request).unwrap()))
         .await
@@ -1544,7 +1600,10 @@ async fn http_gateway_rejects_duplicate_json_keys_before_gateway_execution() {
         &format!(r#"{{"request_id":"{}", "#, fixture.request.request_id),
         1,
     );
-    let app = http_api::router(Arc::new(fixture.gateway));
+    let app = http_api::router(
+        Arc::new(fixture.gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
 
     let response = app.oneshot(http_request(request_body)).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -2207,14 +2266,21 @@ async fn json_response(
 
 #[tokio::test]
 async fn http_conflicts_and_status_report_the_resolution() {
-    for (outcome, expected) in [
-        (HumanApprovalOutcome::Approve, "approved"),
-        (HumanApprovalOutcome::Reject, "rejected"),
+    for (outcome, expected, execution) in [
+        (
+            HumanApprovalOutcome::Approve,
+            "approved",
+            "approved_pending_dispatch",
+        ),
+        (HumanApprovalOutcome::Reject, "rejected", "not_dispatched"),
     ] {
         let (gateway, request, _, _, approver_key) = approval_fixture();
         let gateway = Arc::new(gateway);
         let key = pending_key(&gateway, request);
-        let app = http_api::router(gateway.clone());
+        let app = http_api::router(
+            gateway.clone(),
+            http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+        );
         let path = format!(
             "/v1/approvals/{}/{}/{}",
             key.tenant_id, key.agent_id, key.request_id
@@ -2223,7 +2289,10 @@ async fn http_conflicts_and_status_report_the_resolution() {
             json_response(&app, "GET", &format!("{path}/status"), String::new()).await;
         assert_eq!(
             (status, body),
-            (StatusCode::OK, json!({"resolution": "pending"}))
+            (
+                StatusCode::OK,
+                json!({"resolution": "pending", "execution": "not_dispatched"})
+            )
         );
 
         let decision = human_approval_decision(
@@ -2244,7 +2313,10 @@ async fn http_conflicts_and_status_report_the_resolution() {
             json_response(&app, "GET", &format!("{path}/status"), String::new()).await;
         assert_eq!(
             (status, body),
-            (StatusCode::OK, json!({"resolution": expected}))
+            (
+                StatusCode::OK,
+                json!({"resolution": expected, "execution": execution})
+            )
         );
 
         let other_tenant = format!(
@@ -2276,7 +2348,7 @@ async fn http_expired_approval_reports_expired_resolution() {
     let key = pending_key(&gateway, request);
     let clock = captured_clock.lock().unwrap().clone().unwrap();
     *clock.lock().unwrap() += Duration::seconds(21);
-    let app = http_api::router(gateway);
+    let app = http_api::router(gateway, http_api::ApiAuth::UnauthenticatedLoopbackDemo);
     let path = format!(
         "/v1/approvals/{}/{}/{}",
         key.tenant_id, key.agent_id, key.request_id
@@ -2538,7 +2610,10 @@ mod saf10_full {
             &approver_key,
         );
         *clock.lock().unwrap() += Duration::seconds(21);
-        let app = http_api::router(Arc::new(gateway));
+        let app = http_api::router(
+            Arc::new(gateway),
+            http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+        );
         let path = format!(
             "/v1/approvals/{}/{}/{}",
             key.tenant_id, key.agent_id, key.request_id
@@ -2574,7 +2649,10 @@ mod saf10_full {
         let (gateway, key, tool, journal, _, clock) = expired_fixture();
         journal.unreadable_expiration.store(true, Ordering::SeqCst);
         *clock.lock().unwrap() += Duration::seconds(21);
-        let app = http_api::router(Arc::new(gateway));
+        let app = http_api::router(
+            Arc::new(gateway),
+            http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+        );
         let path = format!(
             "/v1/approvals/{}/{}/{}",
             key.tenant_id, key.agent_id, key.request_id
@@ -2972,4 +3050,642 @@ mod apd {
             }
         }
     }
+}
+
+fn approver_public_key(approver_key: &SigningKey) -> VerifiedPublicKey {
+    VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap()
+}
+
+#[test]
+fn tenant_scoped_approver_key_does_not_verify_for_another_tenant() {
+    let other_tenant = Uuid::from_u128(2);
+    let (gateway, request, tool, journal, approver_key, _) =
+        approval_fixture_with_verifiers(|approver_key| {
+            vec![
+                HumanApprovalVerifier::for_tenant(
+                    other_tenant,
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        });
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert!(record.human_approval.is_none());
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn tenant_scoped_approver_key_verifies_only_its_own_tenant() {
+    let other_tenant = Uuid::from_u128(2);
+    let other_key = SigningKey::from_bytes(&[35; 32]);
+    let other_public = approver_public_key(&other_key);
+    let (gateway, request, tool, _, approver_key, _) =
+        approval_fixture_with_verifiers(|approver_key| {
+            vec![
+                HumanApprovalVerifier::for_tenant(
+                    other_tenant,
+                    "tenant-two-approver",
+                    other_public,
+                )
+                .unwrap(),
+                HumanApprovalVerifier::for_tenant(
+                    TEST_TENANT_ID,
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        });
+    let key = pending_key(&gateway, request);
+    let challenge = gateway.approval_challenge(key).unwrap();
+
+    // Tenant B's approver signing under its own key id is refused for A.
+    let mut foreign =
+        human_approval_decision(challenge.clone(), HumanApprovalOutcome::Approve, &other_key);
+    foreign.approver_key_id = "tenant-two-approver".into();
+    foreign.signature = hex::encode(
+        other_key
+            .sign(&foreign.signing_message().unwrap())
+            .to_bytes(),
+    );
+    assert!(matches!(
+        gateway.resolve_human_approval(foreign),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    gateway.resolve_human_approval(decision).unwrap();
+    gateway.dispatch_approved(key).unwrap();
+    assert_eq!(tool.invocations(), 1);
+}
+
+#[test]
+fn nil_tenant_approver_binding_is_rejected() {
+    let key = SigningKey::from_bytes(&[36; 32]);
+    assert!(matches!(
+        HumanApprovalVerifier::for_tenant(Uuid::nil(), "approver", approver_public_key(&key)),
+        Err(ApprovalError::InvalidVerifier)
+    ));
+}
+
+#[test]
+fn transient_clock_failure_at_claim_leaves_the_approval_retryable() {
+    let (gateway, request, tool, journal, approver_key, clock) =
+        approval_fixture_with_verifiers(|approver_key| {
+            vec![
+                HumanApprovalVerifier::new(
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        });
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+
+    // The engine clock steps back before the decision time: the trusted
+    // clock is unhealthy, which says nothing about the approval itself.
+    let now = *clock.lock().unwrap();
+    *clock.lock().unwrap() = now - Duration::seconds(30);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Authorization(
+            PraetoreError::TrustedClockUnavailable
+        ))
+    ));
+    assert_eq!(tool.invocations(), 0);
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::ApprovedPendingDispatch);
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Approved
+    );
+
+    *clock.lock().unwrap() = now;
+    let receipt = gateway.dispatch_approved(key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(tool.invocations(), 1);
+}
+
+struct SwitchableFreshness {
+    state: Arc<Mutex<Option<FreshnessError>>>,
+}
+
+impl FreshnessProvider for SwitchableFreshness {
+    fn check(
+        &self,
+        _agent: &AgentKeyFingerprint,
+        _authority_id: &praetore_core::AuthorityId,
+        _policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> Result<FreshnessLease, FreshnessError> {
+        match *self.state.lock().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(FreshnessLease {
+                valid_until: now + Duration::seconds(30),
+            }),
+        }
+    }
+
+    fn check_authority(
+        &self,
+        agent: &AgentKeyFingerprint,
+        authority_id: &praetore_core::AuthorityId,
+        _authority_digest: &str,
+        policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> Result<FreshnessLease, FreshnessError> {
+        self.check(agent, authority_id, policy_digest, now)
+    }
+}
+
+#[test]
+fn unavailable_freshness_at_claim_is_retryable_but_revocation_is_terminal() {
+    let state = Arc::new(Mutex::new(None));
+    let provider_state = state.clone();
+    let (gateway, request, tool, journal, approver_key, _) = approval_fixture_full(
+        move |_| {
+            Arc::new(SwitchableFreshness {
+                state: provider_state,
+            })
+        },
+        [34; 32],
+        |_| {},
+        |approver_key| {
+            vec![
+                HumanApprovalVerifier::new(
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        },
+    );
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+
+    *state.lock().unwrap() = Some(FreshnessError::Unavailable);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Authorization(
+            PraetoreError::FreshnessCheckFailed(FreshnessError::Unavailable)
+        ))
+    ));
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+
+    *state.lock().unwrap() = Some(FreshnessError::Revoked);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Authorization(
+            PraetoreError::FreshnessCheckFailed(FreshnessError::Revoked)
+        ))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        record.execution_attestation.unwrap().not_dispatched_reason,
+        Some(NotDispatchedReason::DispatchFailed)
+    );
+    let state = gateway.approval_state(key).unwrap();
+    assert_eq!(
+        state.resolution,
+        praetore_gateway::ApprovalResolution::NotDispatched
+    );
+    assert_eq!(
+        state.not_dispatched_reason,
+        Some(NotDispatchedReason::DispatchFailed)
+    );
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn approval_resolution_reports_not_dispatched_after_crash_recovery_or_expiry() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    gateway.reconcile(key).unwrap();
+    let state = gateway.approval_state(key).unwrap();
+    assert_eq!(
+        state.resolution,
+        praetore_gateway::ApprovalResolution::NotDispatched
+    );
+    assert_eq!(state.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        state.not_dispatched_reason,
+        Some(NotDispatchedReason::CrashRecovered)
+    );
+    assert_eq!(
+        serde_json::to_value(state).unwrap(),
+        json!({
+            "resolution": "not_dispatched",
+            "execution": "not_dispatched",
+            "not_dispatched_reason": "crash_recovered"
+        })
+    );
+    assert_eq!(tool.invocations(), 0);
+
+    let (gateway, request, _, _, approver_key) = approval_fixture_with_provider(|clock| {
+        Arc::new(ExpiringOnDispatchFreshness {
+            clock,
+            calls: AtomicUsize::new(0),
+            expire_on_call: 2,
+            advance_by: Duration::seconds(6),
+            lease_duration: Duration::seconds(5),
+        })
+    });
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    assert!(gateway.dispatch_approved(key).is_err());
+    let state = gateway.approval_state(key).unwrap();
+    assert_eq!(
+        state.resolution,
+        praetore_gateway::ApprovalResolution::NotDispatched
+    );
+    assert_eq!(
+        state.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalExpired)
+    );
+}
+
+#[test]
+fn claim_reverifies_the_recorded_approval_before_dispatch() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision.clone()).unwrap();
+
+    // A journal row whose stored approval no longer verifies (corrupted or
+    // forged storage) is never dispatched, and its state is left untouched.
+    let forged_key = SigningKey::from_bytes(&[99; 32]);
+    let forged = human_approval_decision(
+        decision.challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &forged_key,
+    );
+    journal
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&key)
+        .unwrap()
+        .human_approval = Some(forged);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+    assert_eq!(tool.invocations(), 0);
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+
+    // A validly signed approval for a different challenge is refused too.
+    let mut other_challenge = decision.challenge.clone();
+    other_challenge.action_digest = "0".repeat(64);
+    let mismatched = human_approval_decision(
+        other_challenge,
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    journal
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&key)
+        .unwrap()
+        .human_approval = Some(mismatched);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::InvalidChallenge))
+    ));
+    assert_eq!(tool.invocations(), 0);
+
+    journal
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&key)
+        .unwrap()
+        .human_approval = Some(decision);
+    gateway.dispatch_approved(key).unwrap();
+    assert_eq!(tool.invocations(), 1);
+}
+
+const AGENT_A_TOKEN: &str = "agent-a-token-0123456789abcdef0123456789";
+const APPROVER_A_TOKEN: &str = "approver-a-token-0123456789abcdef01234567";
+const AGENT_B_TOKEN: &str = "agent-b-token-0123456789abcdef0123456789";
+const APPROVER_B_TOKEN: &str = "approver-b-token-0123456789abcdef01234567";
+
+fn api_credentials() -> http_api::ApiCredentials {
+    let tenant_b = Uuid::from_u128(2);
+    let entry = |name: &str, tenant: Uuid, role: &str, token: &str| {
+        json!({
+            "name": name,
+            "tenant_id": tenant,
+            "role": role,
+            "token_sha256": http_api::ApiCredentials::token_sha256_hex(token),
+        })
+    };
+    let document = json!({
+        "schema_version": 1,
+        "credentials": [
+            entry("tenant-a-agent", TEST_TENANT_ID, "agent", AGENT_A_TOKEN),
+            entry("tenant-a-approver", TEST_TENANT_ID, "approver", APPROVER_A_TOKEN),
+            entry("tenant-b-agent", tenant_b, "agent", AGENT_B_TOKEN),
+            entry("tenant-b-approver", tenant_b, "approver", APPROVER_B_TOKEN),
+        ]
+    });
+    http_api::ApiCredentials::from_json(&document.to_string()).unwrap()
+}
+
+async fn authed(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: String,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 262_144).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn http_api_requires_tenant_scoped_role_bound_credentials() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let app = http_api::router(
+        Arc::new(gateway),
+        http_api::ApiAuth::required(api_credentials()),
+    );
+    let request_json = serde_json::to_string(&request).unwrap();
+
+    let health = app
+        .clone()
+        .oneshot(http_body_request("GET", "/healthz", String::new()))
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::NO_CONTENT);
+
+    // No, malformed, too-short or unknown credentials: 401.
+    for token in [
+        None,
+        Some("short"),
+        Some("unknown-token-0123456789abcdef0123456789"),
+    ] {
+        let (status, body) = authed(&app, "POST", "/v1/execute", token, request_json.clone()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, json!({"code": "authentication_required"}));
+    }
+    // Approver credentials cannot submit agent requests; tenant B's agent
+    // cannot submit (and so cannot consume) tenant A's signed request.
+    for token in [APPROVER_A_TOKEN, AGENT_B_TOKEN] {
+        let (status, body) = authed(
+            &app,
+            "POST",
+            "/v1/execute",
+            Some(token),
+            request_json.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({"code": "caller_not_authorized"}));
+    }
+    assert!(journal.entries.lock().unwrap().is_empty());
+
+    let (status, pending) = authed(
+        &app,
+        "POST",
+        "/v1/execute",
+        Some(AGENT_A_TOKEN),
+        request_json,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: pending["evidence"]["agent"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+        request_id: pending["evidence"]["request_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    };
+    let path = format!(
+        "/v1/approvals/{}/{}/{}",
+        key.tenant_id, key.agent_id, key.request_id
+    );
+
+    // Unauthenticated, agent and other-tenant callers never reach the
+    // challenge, decision or dispatch endpoints.
+    for (method, uri) in [
+        ("GET", path.clone()),
+        ("POST", path.clone()),
+        ("POST", format!("{path}/dispatch")),
+        ("GET", format!("{path}/status")),
+    ] {
+        let (status, _) = authed(&app, method, &uri, None, String::new()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+        let (status, _) = authed(&app, method, &uri, Some(APPROVER_B_TOKEN), String::new()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        let (status, _) = authed(&app, method, &uri, Some(AGENT_B_TOKEN), String::new()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    for (method, uri) in [
+        ("GET", path.clone()),
+        ("POST", path.clone()),
+        ("POST", format!("{path}/dispatch")),
+    ] {
+        let (status, _) = authed(&app, method, &uri, Some(AGENT_A_TOKEN), String::new()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+    // The tenant's own agent may observe the status.
+    let (status, body) = authed(
+        &app,
+        "GET",
+        &format!("{path}/status"),
+        Some(AGENT_A_TOKEN),
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["resolution"], "pending");
+
+    let (status, view) = authed(&app, "GET", &path, Some(APPROVER_A_TOKEN), String::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    let view: praetore_gateway::ApprovalChallengeView = serde_json::from_value(view).unwrap();
+    assert!(view.action_matches_challenge());
+    let decision =
+        human_approval_decision(view.challenge, HumanApprovalOutcome::Approve, &approver_key);
+    let (status, body) = authed(
+        &app,
+        "POST",
+        &path,
+        Some(APPROVER_A_TOKEN),
+        serde_json::to_string(&decision).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "approved_pending_dispatch");
+
+    // Even after approval, the requesting agent cannot trigger dispatch.
+    let (status, _) = authed(
+        &app,
+        "POST",
+        &format!("{path}/dispatch"),
+        Some(AGENT_A_TOKEN),
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(tool.invocations(), 0);
+
+    let (status, receipt) = authed(
+        &app,
+        "POST",
+        &format!("{path}/dispatch"),
+        Some(APPROVER_A_TOKEN),
+        String::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["execution"], "confirmed");
+    assert_eq!(tool.invocations(), 1);
+}
+
+#[test]
+fn api_credentials_file_is_strictly_validated() {
+    let hash = http_api::ApiCredentials::token_sha256_hex(AGENT_A_TOKEN);
+    let entry = |name: &str, tenant: Uuid, hash: &str| json!({"name": name, "tenant_id": tenant, "role": "agent", "token_sha256": hash});
+    let parse = |credentials: Value| {
+        http_api::ApiCredentials::from_json(
+            &json!({"schema_version": 1, "credentials": credentials}).to_string(),
+        )
+    };
+    assert_eq!(
+        parse(json!([entry("a", TEST_TENANT_ID, &hash)]))
+            .unwrap()
+            .len(),
+        1
+    );
+    // Duplicate token digests or names, nil tenants, non-canonical digests.
+    assert!(
+        parse(json!([
+            entry("a", TEST_TENANT_ID, &hash),
+            entry("b", Uuid::from_u128(2), &hash)
+        ]))
+        .is_err()
+    );
+    let other = http_api::ApiCredentials::token_sha256_hex(AGENT_B_TOKEN);
+    assert!(
+        parse(json!([
+            entry("a", TEST_TENANT_ID, &hash),
+            entry("a", TEST_TENANT_ID, &other)
+        ]))
+        .is_err()
+    );
+    assert!(parse(json!([entry("a", Uuid::nil(), &hash)])).is_err());
+    assert!(parse(json!([entry("a", TEST_TENANT_ID, &hash.to_uppercase())])).is_err());
+    assert!(parse(json!([entry("a", TEST_TENANT_ID, &hash[..62])])).is_err());
+    assert!(parse(json!([entry("Bad Name", TEST_TENANT_ID, &hash)])).is_err());
+    assert!(parse(json!([])).is_err());
+    let mut unknown_role = entry("a", TEST_TENANT_ID, &hash);
+    unknown_role["role"] = json!("operator");
+    assert!(parse(json!([unknown_role])).is_err());
+    let mut unknown_field = entry("a", TEST_TENANT_ID, &hash);
+    unknown_field["extra"] = json!(true);
+    assert!(parse(json!([unknown_field])).is_err());
+    let duplicate_key =
+        json!({"schema_version": 1, "credentials": [entry("a", TEST_TENANT_ID, &hash)]})
+            .to_string()
+            .replacen(
+                "\"schema_version\":1",
+                "\"schema_version\":1,\"schema_version\":1",
+                1,
+            );
+    assert!(http_api::ApiCredentials::from_json(&duplicate_key).is_err());
+    assert!(
+        http_api::ApiCredentials::from_json(
+            &json!({"schema_version": 2, "credentials": [entry("a", TEST_TENANT_ID, &hash)]})
+                .to_string()
+        )
+        .is_err()
+    );
+}
+
+// Signatures are lowercase hex only: an uppercase copy of a valid approval
+// signature is another encoding of the same bytes and is refused.
+#[test]
+fn uppercase_human_approval_signature_is_refused() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let mut decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    assert!(decision.signature.bytes().any(|b| b.is_ascii_lowercase()));
+    let lowercase = decision.signature.clone();
+    decision.signature = lowercase.to_ascii_uppercase();
+    assert!(matches!(
+        gateway.resolve_human_approval(decision.clone()),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+    decision.signature = lowercase;
+    gateway.resolve_human_approval(decision).unwrap();
+    assert_eq!(tool.invocations(), 0);
 }
