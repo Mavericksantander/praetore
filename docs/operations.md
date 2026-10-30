@@ -188,8 +188,19 @@ Use two database roles:
   It must not be `SUPERUSER` or `BYPASSRLS` (both ignore row-level security),
   must not own or be a member of the owner of anything in `praetore` (an owner
   can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY` or `DISABLE TRIGGER`, which
-  defeats tenant isolation and the append-only triggers), and must not have
-  `CREATE` on the schema.
+  defeats tenant isolation and the append-only triggers), must not have
+  `CREATE` on the schema, must not be `CREATEROLE` (on PostgreSQL 15 and
+  older it can grant itself the owner role), and must not hold `DELETE`,
+  `TRUNCATE`, table-wide `UPDATE`, `TRIGGER` or `REFERENCES` on any
+  `praetore` table, including through `pg_write_all_data` or a leftover
+  `GRANT ALL` from an install where the gateway owned the tables.
+  `verify_runtime_role` refuses each of these at startup in `http` and
+  `sandbox` modes.
+- `praetore_runtime` is a cluster-wide role, so a login member of it can
+  connect to every database on the cluster that ran migration 0011. Use one
+  PostgreSQL cluster per environment (staging and production never share a
+  cluster), or `REVOKE CONNECT ON DATABASE ... FROM PUBLIC` and grant
+  `CONNECT` per runtime role.
 
 Migration 0011 grants `praetore_runtime` exactly what the code uses:
 
@@ -342,8 +353,14 @@ that the policy is approved. Compare the result with the independently
 provisioned production pin.
 
 `praetore-verify receipt --receipt receipt.json --execution-pin key.hex
---key-id ID --format json` verifies a gateway receipt's signed execution
-attestation (schema v1, v2 or v3). A v3 attestation carries
+--key-id ID --evidence-attester-pin attester.hex --format json` verifies a
+gateway receipt's signed execution attestation (schema v1, v2 or v3) and the
+embedded evidence's `attester_signature` against the pinned evidence attester
+key; a missing or invalid evidence signature fails with
+`RECEIPT_EVIDENCE_SIGNATURE_INVALID`. Both signatures must be exactly 128
+lowercase hex characters; uppercase or mixed case is rejected. The execution attestation binds the
+evidence `context_hash`, which excludes that signature, so both checks are
+required. A v3 attestation carries
 `not_dispatched_reason` (`approval_expired`, `dispatch_failed` or
 `crash_recovered`); unknown reasons fail with `RECEIPT_INVALID`, a reason that
 does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
@@ -352,7 +369,8 @@ does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
 Receipt verification lives in the `praetore-receipt` crate, which has no
 server dependencies (no axum or tokio); `praetore-gateway` re-exports it.
 The receipt fixtures in `packages/praetore-python/tests/fixtures` are signed
-with the test execution key. Regenerate v2/v3 (and v1) with
+with the test execution key; `receipt-evidence-attester-public-key.hex` is the
+test evidence attester key that signed their evidence. Regenerate v2/v3 (and v1) with
 `UPDATE_RECEIPT_FIXTURES=1 cargo test -p praetore-gateway --test enforcement receipt_fixtures`.
 The gateway no longer emits v1, so `receipt-v1-confirmed.json` is the committed
 v2 receipt re-signed as a legacy v1 attestation; regenerate only it with
