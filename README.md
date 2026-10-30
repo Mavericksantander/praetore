@@ -765,17 +765,15 @@ See `SECURITY.md` for the project's security policy.
 
 ## License
 
-PRÆTORE source code in this repository is released under the PRÆTORE Open Core License.
+Copyright © 2026 José Tomás Enrique Santander Muñoz.
 
-The license permits personal, educational, research, testing, and other non-commercial use only.
+PRÆTORE se distribuye bajo GNU Affero General Public License v3.0 (AGPL-3.0-only); ver LICENSE.
 
-**Commercial use is not permitted.**
+Está disponible, a solicitud, una licencia comercial alternativa para quienes no deseen cumplir las obligaciones de la AGPL. Sus términos se acuerdan caso a caso por escrito; este aviso no constituye oferta ni compromiso de términos, precio o disponibilidad.
 
-Commercial use includes using the software as part of a commercial product, service, infrastructure, internal business operation, or revenue-generating activity.
+"PRÆTOR", "PRÆTORE" y sus logos no se licencian bajo la AGPL (ver TRADEMARKS.md). PRÆTOR TECHNOLOGIES es un nombre comercial aún no constituido como persona jurídica.
 
-Any commercial use requires a separate written license from PRÆTOR TECHNOLOGIES.
-
-See `LICENSE` for the complete terms.
+Ver `NOTICE`, `CLA.md` y `THIRD-PARTY-NOTICES`.
 
 ---
 
@@ -791,6 +789,4 @@ See `TRADEMARKS.md` for additional information.
 
 ## Copyright
 
-Copyright © 2026 PRÆTOR TECHNOLOGIES.
-
-All rights reserved except where otherwise stated.
+Copyright © 2026 José Tomás Enrique Santander Muñoz. Licensed under AGPL-3.0-only; see `LICENSE` and `NOTICE`.
