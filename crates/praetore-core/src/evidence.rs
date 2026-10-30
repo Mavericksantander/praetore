@@ -13,7 +13,8 @@ use crate::{
     authority::Authority,
     authorization::{AuthorizationIntentV2, AuthorizationRequest},
     canonical::{
-        MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
+        MAX_JSON_VALUE_BYTES, canonical_json, decode_lower_hex, parse_json_rejecting_duplicates,
+        validate_json_value,
     },
     decision::{Decision, DecisionOutcome},
     identity::{AgentIdentity, VerifiedPublicKey},
@@ -349,7 +350,7 @@ impl Evidence {
             .as_deref()
             .ok_or(crate::PraetoreError::IdentityVerificationFailed)
             .and_then(|signature| {
-                hex::decode(signature).map_err(|_| crate::PraetoreError::IdentityVerificationFailed)
+                decode_lower_hex(signature).ok_or(crate::PraetoreError::IdentityVerificationFailed)
             })?;
         let signature = Signature::from_slice(&signature)
             .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)?;
@@ -406,7 +407,7 @@ impl Evidence {
     }
 
     pub fn bind_policy_digest(&mut self, digest: String) -> crate::Result<()> {
-        if digest.len() != 64 || hex::decode(&digest).is_err() {
+        if digest.len() != 64 || decode_lower_hex(&digest).is_none() {
             return Err(crate::PraetoreError::EvidenceError(
                 "policy digest must be a 32-byte SHA-256 hex value".into(),
             ));
