@@ -1553,4 +1553,70 @@ mod tests {
             &idempotency_key(mismatched_key)
         ));
     }
+
+    fn request_with_path(path: &str) -> (DispatchRequest, String) {
+        let tenant_id = Uuid::from_u128(10);
+        let agent_id = AgentId::new();
+        let key = ExecutionKey {
+            tenant_id,
+            agent_id: *agent_id.as_uuid(),
+            request_id: Uuid::from_u128(12),
+        };
+        let mut authority = Authority::new(agent_id, "test-issuer", vec!["orders:write".into()]);
+        authority.constraints = vec![AuthorityConstraint::new("tenant_id", tenant_id.to_string())];
+        let action = Action::new(
+            "orders:create",
+            Some("orders-api".into()),
+            json!({"path": path}),
+        )
+        .unwrap()
+        .with_capability("orders:write");
+        let idempotency = idempotency_key(key);
+        let request = DispatchRequest {
+            schema_version: 1,
+            execution_key: key,
+            authority,
+            action_digest: action_digest(&action).unwrap(),
+            action,
+        };
+        (request, idempotency)
+    }
+
+    #[test]
+    #[ignore = "T-013: SandboxSupervisor accepts `..` in action parameters (valid_dispatch_request). No confined dispatcher on main. Fails today."]
+    fn sandbox_dispatch_rejects_parent_directory_escape() {
+        let (request, idempotency) = request_with_path("../etc/passwd");
+        assert!(
+            !valid_dispatch_request(&request, &idempotency),
+            "parent-directory path was accepted"
+        );
+    }
+
+    #[test]
+    #[ignore = "T-013: SandboxSupervisor accepts an absolute path in action parameters. No confined dispatcher on main. Fails today."]
+    fn sandbox_dispatch_rejects_absolute_path_escape() {
+        let (request, idempotency) = request_with_path("/etc/passwd");
+        assert!(
+            !valid_dispatch_request(&request, &idempotency),
+            "absolute path was accepted"
+        );
+    }
+
+    #[test]
+    #[ignore = "T-013: SandboxSupervisor does not reject a symlink path in action parameters. No confined dispatcher on main. Fails today."]
+    fn sandbox_dispatch_rejects_symlink_escape() {
+        let root = std::env::temp_dir().join(format!("praetore-t013-{}", Uuid::new_v4()));
+        let sandbox = root.join("sandbox");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("secret");
+        std::fs::write(&target, b"secret").unwrap();
+        let link = sandbox.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let (request, idempotency) = request_with_path(link.to_str().unwrap());
+        let rejected = !valid_dispatch_request(&request, &idempotency);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(rejected, "symlink path was accepted");
+    }
 }

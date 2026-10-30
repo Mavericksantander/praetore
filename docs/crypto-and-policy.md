@@ -225,6 +225,13 @@ with the final outcome, which is the strongest contributed one; a
 higher effective severity (`Recover > Deny > RequireApproval > Allow`) is
 kept; on a tie the earlier-matching rule's.
 
+These checks catch internally inconsistent receipts only. A `rule` decider on
+a decision with no contributions, or any fully consistent rewrite of outcome,
+contributions and decider, passes integrity verification; only the attester
+signature authenticates `decided_by`, and confirming that the named rule
+really produced the decision requires the policy whose digest the receipt
+records (`praetore-verify evidence --policy`).
+
 `AgentId` remains a UUID alias and is not an authenticator. The key-derived
 `AgentKeyFingerprint` is SHA-256 over
 `PRAETORE_AGENT_KEY_V1\0ed25519\0 || verified_public_key_bytes`; its v1 test
