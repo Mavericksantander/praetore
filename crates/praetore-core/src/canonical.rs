@@ -11,6 +11,20 @@ pub const MAX_JSON_VALUE_BYTES: usize = 65_536;
 const MAX_JSON_NODES: usize = 16_384;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// Decodes lowercase hexadecimal only, the single encoding `hex::encode`
+/// emits. Signatures, digests and key ids have one valid textual form, so
+/// uppercase or mixed case is rejected rather than silently accepted.
+pub(crate) fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
+    if value
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        hex::decode(value).ok()
+    } else {
+        None
+    }
+}
+
 pub fn parse_json_rejecting_duplicates(input: &str) -> Result<Value, String> {
     if input.len() > MAX_JSON_VALUE_BYTES {
         return Err("JSON input exceeds maximum size".into());

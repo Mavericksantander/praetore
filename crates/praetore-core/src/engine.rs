@@ -2,7 +2,7 @@ use crate::{
     PraetoreError, Result,
     authority::Validity,
     authorization::AuthorizationRequest,
-    canonical::parse_json_rejecting_duplicates,
+    canonical::{decode_lower_hex, parse_json_rejecting_duplicates},
     decision::Decision,
     evidence::{Evidence, EvidenceAttesterKey},
     freshness::{FreshnessError, FreshnessProvider},
@@ -197,7 +197,7 @@ impl TrustedAuthorityIssuer {
             return Err(PraetoreError::TrustStoreFailure);
         }
         let key_bytes =
-            hex::decode(&document.public_key).map_err(|_| PraetoreError::TrustStoreFailure)?;
+            decode_lower_hex(&document.public_key).ok_or(PraetoreError::TrustStoreFailure)?;
         let public_key = VerifiedPublicKey::from_bytes(&key_bytes)
             .map_err(|_| PraetoreError::TrustStoreFailure)?;
         let pin = Self::new(document.issuer, public_key)

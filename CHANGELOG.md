@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Security (breaking for non-canonical input): uppercase or mixed-case hex is
+  now rejected for authority signatures, `subject_key_hash` and
+  `issuer_key_id` (`Authority::validate`), request intent signatures,
+  evidence attester signatures, `Evidence::bind_policy_digest` and issuer pin
+  public keys. `hex::decode` accepted both cases, so one signed document had
+  several valid encodings. Everything this crate emits is lowercase.
 - Fix: a gateway receipt for an executed or confirmed action whose adapter
   output was JSON `null` now verifies. `"output": null` deserializes to
   `None`, which verification rejected for those statuses although the

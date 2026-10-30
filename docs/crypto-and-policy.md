@@ -157,7 +157,11 @@ uses these exact byte prefixes:
 * Issuer key ID: `PRAETORE_ISSUER_KEY_V1\0ed25519\0`
 
 Authority signatures bind `issuer_key_id` as well as the subject key hash.
-Signatures, fingerprints, and key IDs are lowercase hexadecimal. Parsing
+Signatures, fingerprints, digests, and key IDs are lowercase hexadecimal;
+uppercase or mixed-case hex is rejected wherever one is parsed or verified
+(authority signature, subject key hash and issuer key ID, request intent
+signature, evidence attester signature and policy digest, issuer pin public
+key), so each signed document has a single valid encoding. Parsing
 helpers for policy, issuer pins, authority, and evidence reject duplicate JSON
 object keys, trailing data, unknown fields, unsupported schema/canonical
 versions, unsafe integral numbers, and values over the documented
