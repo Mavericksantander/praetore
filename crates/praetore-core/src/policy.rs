@@ -437,20 +437,30 @@ impl PolicyRule {
             return false;
         }
 
+        // Deny and RequireApproval rules are "restrictive".
+        let deny_like = self.effect != PolicyEffect::Allow;
+
+        // A rule capability narrows Allow rules only. A restrictive rule keeps
+        // applying when the authority lacks it, in every semantics version;
+        // otherwise an authority without e.g. `payments:large` would skip the
+        // approval rule and fall through to a broader Allow.
         if let Some(required_capability) = &self.required_capability
+            && !deny_like
             && !authority.permits(required_capability)
         {
             return false;
         }
 
-        if let Some(required_target) = &self.target
-            && action.target.as_deref() != Some(required_target.as_str())
-        {
-            return false;
+        // Targets are exact, case-sensitive identifiers. A missing action
+        // target is unknown: it matches restrictive rules in every semantics
+        // version and never matches Allow rules.
+        if let Some(required_target) = &self.target {
+            match action.target.as_deref() {
+                Some(target) if target == required_target => {}
+                None if deny_like => {}
+                _ => return false,
+            }
         }
-
-        // Deny and RequireApproval rules are "restrictive".
-        let deny_like = self.effect != PolicyEffect::Allow;
         let restrictive = semantics_version >= 2 && deny_like;
         let holds = |result: ConditionMatch| match result {
             ConditionMatch::True => true,

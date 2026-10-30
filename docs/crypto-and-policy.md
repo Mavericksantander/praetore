@@ -230,7 +230,13 @@ Rules can match action parameters and request context with `PolicyCondition`:
   `Deny if amount > 10000` denies `50000.0` under v1 and v2, while an ALLOW
   rule for `amount <= 100` does not match `50.0`.
 
-For v1 policies, missing fields and operator/type mismatches do not match. In
+For v1 policies, missing fields and operator/type mismatches do not match,
+even on DENY and REQUIRE_APPROVAL rules (legacy; use v2 for restrictive
+conditions). Integer/float comparisons, unsafe path-like values, a missing
+action target and a restrictive rule's `required_capability` fail closed in
+both versions: an action without a target matches a targeted restrictive rule
+but no targeted ALLOW rule, and `required_capability` narrows only ALLOW rules.
+Targets are exact, case-sensitive identifiers; nothing is case-folded. In
 v2, an unknown condition value on a DENY or REQUIRE_APPROVAL rule is treated
 as a match, while it does not make an ALLOW rule match; a definitively false
 condition still makes the rule fail. Conditions compose with AND within a
