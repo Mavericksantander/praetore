@@ -2,7 +2,7 @@
 //! fixtures shared with the external verifiers.
 
 use praetore_core::VerifiedPublicKey;
-use praetore_receipt::{ExecutionAttestationError, verify_gateway_receipt_json};
+use praetore_receipt::{ExecutionAttestationError, GatewayReceipt, verify_gateway_receipt_json};
 use std::path::Path;
 
 const KEY_ID: &str = "test-execution-attester-v1";
@@ -23,8 +23,15 @@ fn key() -> VerifiedPublicKey {
     .unwrap()
 }
 
+fn evidence_key() -> VerifiedPublicKey {
+    VerifiedPublicKey::from_bytes(
+        &hex::decode(fixture("receipt-evidence-attester-public-key.hex").trim()).unwrap(),
+    )
+    .unwrap()
+}
+
 fn verify(json: &str) -> Result<u8, ExecutionAttestationError> {
-    verify_gateway_receipt_json(json, &key(), KEY_ID)
+    verify_gateway_receipt_json(json, &key(), KEY_ID, &evidence_key())
         .map(|receipt| receipt.execution_attestation.schema_version)
 }
 
@@ -187,12 +194,14 @@ fn rejects_a_different_public_key() {
     assert_ne!(other.as_bytes(), key().as_bytes());
     for name in FIXTURES {
         assert_eq!(
-            verify_gateway_receipt_json(&fixture(name), &other, KEY_ID).map(|_| ()),
+            verify_gateway_receipt_json(&fixture(name), &other, KEY_ID, &evidence_key())
+                .map(|_| ()),
             Err(ExecutionAttestationError::InvalidSignature),
             "{name}"
         );
         assert_eq!(
-            verify_gateway_receipt_json(&fixture(name), &key(), "other-key-id").map(|_| ()),
+            verify_gateway_receipt_json(&fixture(name), &key(), "other-key-id", &evidence_key())
+                .map(|_| ()),
             Err(ExecutionAttestationError::KeyMismatch),
             "{name}"
         );
@@ -234,4 +243,163 @@ fn rejects_v2_relabelled_as_v1_even_without_tenant() {
         verify(&downgraded),
         Err(ExecutionAttestationError::InvalidSignature)
     );
+}
+
+fn with_evidence_signature(json: &str, signature: serde_json::Value) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+    value["evidence"]["attester_signature"] = signature;
+    serde_json::to_string(&value).unwrap()
+}
+
+fn evidence_signature(json: &str) -> String {
+    let value: serde_json::Value = serde_json::from_str(json).unwrap();
+    value["evidence"]["attester_signature"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn rejects_an_altered_evidence_attester_signature() {
+    for name in FIXTURES {
+        let original = fixture(name);
+        let bytes = hex::decode(evidence_signature(&original)).unwrap();
+        for bit in [0, 7, 255, 511] {
+            let mut flipped = bytes.clone();
+            flipped[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                verify(&with_evidence_signature(
+                    &original,
+                    hex::encode(flipped).into()
+                )),
+                Err(ExecutionAttestationError::InvalidEvidenceSignature),
+                "{name}: bit {bit}"
+            );
+        }
+        for forged in ["0".repeat(128), "not-hex".into(), String::new()] {
+            assert_eq!(
+                verify(&with_evidence_signature(&original, forged.clone().into())),
+                Err(ExecutionAttestationError::InvalidEvidenceSignature),
+                "{name}: {forged:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_a_missing_evidence_attester_signature() {
+    for name in FIXTURES {
+        let original = fixture(name);
+        assert_eq!(
+            verify(&with_evidence_signature(&original, serde_json::Value::Null)),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}: null"
+        );
+        let mut value: serde_json::Value = serde_json::from_str(&original).unwrap();
+        value["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("attester_signature");
+        assert_eq!(
+            verify(&serde_json::to_string(&value).unwrap()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}: field removed"
+        );
+    }
+}
+
+#[test]
+fn rejects_evidence_signed_by_another_attester_key() {
+    // A valid Ed25519 key that did not sign this evidence.
+    let other = VerifiedPublicKey::from_bytes(
+        &hex::decode(fixture("attester-public-key.hex").trim()).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(other.as_bytes(), evidence_key().as_bytes());
+    for name in FIXTURES {
+        assert_eq!(
+            verify_gateway_receipt_json(&fixture(name), &key(), KEY_ID, &other).map(|_| ()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+        // Nor does the execution key double as the evidence attester key.
+        assert_eq!(
+            verify_gateway_receipt_json(&fixture(name), &key(), KEY_ID, &key()).map(|_| ()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn rejects_non_canonical_evidence_attester_signature_encodings() {
+    for (version, name) in (1u8..).zip(FIXTURES) {
+        let original = fixture(name);
+        let sig = evidence_signature(&original);
+        assert!(
+            sig.bytes().any(|b| b.is_ascii_lowercase()),
+            "{name}: needs a-f"
+        );
+        let first_letter = sig.find(|c: char| c.is_ascii_lowercase()).unwrap();
+        let mut mixed = sig.clone();
+        mixed.replace_range(
+            first_letter..=first_letter,
+            &sig[first_letter..=first_letter].to_ascii_uppercase(),
+        );
+        // Same bytes, different encodings: only the canonical one verifies.
+        for altered in [
+            sig.to_ascii_uppercase(),
+            mixed,
+            sig[..126].to_owned(),
+            sig[..127].to_owned(),
+        ] {
+            let len = altered.len();
+            assert_eq!(
+                verify(&with_evidence_signature(&original, altered.into())),
+                Err(ExecutionAttestationError::InvalidEvidenceSignature),
+                "{name}: length {len}"
+            );
+        }
+        // Over 128 characters the evidence exceeds its integrity limits, so
+        // the execution attestation's binding check rejects it first.
+        for altered in [format!("{sig}0"), format!("{sig}00")] {
+            let len = altered.len();
+            assert_eq!(
+                verify(&with_evidence_signature(&original, altered.into())),
+                Err(ExecutionAttestationError::InvalidPayload),
+                "{name}: length {len}"
+            );
+        }
+        assert_eq!(
+            verify(&with_evidence_signature(&original, sig.into())),
+            Ok(version),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn verify_execution_attestation_also_requires_a_valid_evidence_signature() {
+    for name in FIXTURES {
+        let forged = with_evidence_signature(&fixture(name), "0".repeat(128).into());
+        let receipt: GatewayReceipt = serde_json::from_str(&forged).unwrap();
+        // The execution attestation alone is intact...
+        assert_eq!(
+            receipt.verify_evidence_attester_signature(&evidence_key()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+        // ...but the public method never returns Ok for it.
+        assert_eq!(
+            receipt.verify_execution_attestation(&key(), KEY_ID, &evidence_key()),
+            Err(ExecutionAttestationError::InvalidEvidenceSignature),
+            "{name}"
+        );
+        let genuine: GatewayReceipt = serde_json::from_str(&fixture(name)).unwrap();
+        assert_eq!(
+            genuine.verify_execution_attestation(&key(), KEY_ID, &evidence_key()),
+            Ok(()),
+            "{name}"
+        );
+    }
 }
