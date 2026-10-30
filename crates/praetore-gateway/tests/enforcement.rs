@@ -953,6 +953,41 @@ fn approval_fixture_with_approver_and_policy(
     Arc<MemoryJournal>,
     SigningKey,
 ) {
+    let (gateway, request, tool, journal, approver_key, _) =
+        approval_fixture_full(build_provider, approver_secret, edit, |approver_key| {
+            vec![
+                HumanApprovalVerifier::new(
+                    "test-human-approver-v1",
+                    VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes())
+                        .unwrap(),
+                )
+                .unwrap(),
+            ]
+        });
+    (gateway, request, tool, journal, approver_key)
+}
+
+type ApprovalFixtureWithClock = (
+    Gateway,
+    AuthorizationRequest,
+    Arc<LocalSetTool>,
+    Arc<MemoryJournal>,
+    SigningKey,
+    Arc<Mutex<OffsetDateTime>>,
+);
+
+fn approval_fixture_with_verifiers(
+    verifiers: impl FnOnce(&SigningKey) -> Vec<HumanApprovalVerifier>,
+) -> ApprovalFixtureWithClock {
+    approval_fixture_full(|_| Arc::new(CurrentFreshness), [34; 32], |_| {}, verifiers)
+}
+
+fn approval_fixture_full(
+    build_provider: impl FnOnce(Arc<Mutex<OffsetDateTime>>) -> Arc<dyn FreshnessProvider>,
+    approver_secret: [u8; 32],
+    edit: impl FnOnce(&mut Policy),
+    verifiers: impl FnOnce(&SigningKey) -> Vec<HumanApprovalVerifier>,
+) -> ApprovalFixtureWithClock {
     let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[32; 32]);
     let attester = EvidenceAttesterKey::from_secret_bytes(&[33; 32]);
@@ -1009,19 +1044,17 @@ fn approval_fixture_with_approver_and_policy(
         .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
         .with_freshness_provider(build_provider(clock.clone()));
     let engine =
-        AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock)).unwrap();
+        AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock.clone()))
+            .unwrap();
     let tool = Arc::new(LocalSetTool::default());
     let journal = Arc::new(MemoryJournal::default());
     let approver_key = SigningKey::from_bytes(&approver_secret);
-    let verifier = HumanApprovalVerifier::new(
-        "test-human-approver-v1",
-        VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap(),
-    )
-    .unwrap();
-    let gateway = Gateway::new(engine, journal.clone(), tool.clone(), execution_attester())
-        .unwrap()
-        .with_human_approval_verifier(verifier);
-    (gateway, request, tool, journal, approver_key)
+    let mut gateway =
+        Gateway::new(engine, journal.clone(), tool.clone(), execution_attester()).unwrap();
+    for verifier in verifiers(&approver_key) {
+        gateway = gateway.with_human_approval_verifier(verifier);
+    }
+    (gateway, request, tool, journal, approver_key, clock)
 }
 
 #[tokio::test]
@@ -2909,4 +2942,362 @@ mod apd {
             }
         }
     }
+}
+
+fn approver_public_key(approver_key: &SigningKey) -> VerifiedPublicKey {
+    VerifiedPublicKey::from_bytes(&approver_key.verifying_key().to_bytes()).unwrap()
+}
+
+#[test]
+fn tenant_scoped_approver_key_does_not_verify_for_another_tenant() {
+    let other_tenant = Uuid::from_u128(2);
+    let (gateway, request, tool, journal, approver_key, _) =
+        approval_fixture_with_verifiers(|approver_key| {
+            vec![
+                HumanApprovalVerifier::for_tenant(
+                    other_tenant,
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        });
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert!(record.human_approval.is_none());
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn tenant_scoped_approver_key_verifies_only_its_own_tenant() {
+    let other_tenant = Uuid::from_u128(2);
+    let other_key = SigningKey::from_bytes(&[35; 32]);
+    let other_public = approver_public_key(&other_key);
+    let (gateway, request, tool, _, approver_key, _) =
+        approval_fixture_with_verifiers(|approver_key| {
+            vec![
+                HumanApprovalVerifier::for_tenant(
+                    other_tenant,
+                    "tenant-two-approver",
+                    other_public,
+                )
+                .unwrap(),
+                HumanApprovalVerifier::for_tenant(
+                    TEST_TENANT_ID,
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        });
+    let key = pending_key(&gateway, request);
+    let challenge = gateway.approval_challenge(key).unwrap();
+
+    // Tenant B's approver signing under its own key id is refused for A.
+    let mut foreign =
+        human_approval_decision(challenge.clone(), HumanApprovalOutcome::Approve, &other_key);
+    foreign.approver_key_id = "tenant-two-approver".into();
+    foreign.signature = hex::encode(
+        other_key
+            .sign(&foreign.signing_message().unwrap())
+            .to_bytes(),
+    );
+    assert!(matches!(
+        gateway.resolve_human_approval(foreign),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    gateway.resolve_human_approval(decision).unwrap();
+    gateway.dispatch_approved(key).unwrap();
+    assert_eq!(tool.invocations(), 1);
+}
+
+#[test]
+fn nil_tenant_approver_binding_is_rejected() {
+    let key = SigningKey::from_bytes(&[36; 32]);
+    assert!(matches!(
+        HumanApprovalVerifier::for_tenant(Uuid::nil(), "approver", approver_public_key(&key)),
+        Err(ApprovalError::InvalidVerifier)
+    ));
+}
+
+#[test]
+fn transient_clock_failure_at_claim_leaves_the_approval_retryable() {
+    let (gateway, request, tool, journal, approver_key, clock) =
+        approval_fixture_with_verifiers(|approver_key| {
+            vec![
+                HumanApprovalVerifier::new(
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        });
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+
+    // The engine clock steps back before the decision time: the trusted
+    // clock is unhealthy, which says nothing about the approval itself.
+    let now = *clock.lock().unwrap();
+    *clock.lock().unwrap() = now - Duration::seconds(30);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Authorization(
+            PraetoreError::TrustedClockUnavailable
+        ))
+    ));
+    assert_eq!(tool.invocations(), 0);
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::ApprovedPendingDispatch);
+    assert_eq!(
+        gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Approved
+    );
+
+    *clock.lock().unwrap() = now;
+    let receipt = gateway.dispatch_approved(key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(tool.invocations(), 1);
+}
+
+struct SwitchableFreshness {
+    state: Arc<Mutex<Option<FreshnessError>>>,
+}
+
+impl FreshnessProvider for SwitchableFreshness {
+    fn check(
+        &self,
+        _agent: &AgentKeyFingerprint,
+        _authority_id: &praetore_core::AuthorityId,
+        _policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> Result<FreshnessLease, FreshnessError> {
+        match *self.state.lock().unwrap() {
+            Some(error) => Err(error),
+            None => Ok(FreshnessLease {
+                valid_until: now + Duration::seconds(30),
+            }),
+        }
+    }
+
+    fn check_authority(
+        &self,
+        agent: &AgentKeyFingerprint,
+        authority_id: &praetore_core::AuthorityId,
+        _authority_digest: &str,
+        policy_digest: &str,
+        now: OffsetDateTime,
+    ) -> Result<FreshnessLease, FreshnessError> {
+        self.check(agent, authority_id, policy_digest, now)
+    }
+}
+
+#[test]
+fn unavailable_freshness_at_claim_is_retryable_but_revocation_is_terminal() {
+    let state = Arc::new(Mutex::new(None));
+    let provider_state = state.clone();
+    let (gateway, request, tool, journal, approver_key, _) = approval_fixture_full(
+        move |_| {
+            Arc::new(SwitchableFreshness {
+                state: provider_state,
+            })
+        },
+        [34; 32],
+        |_| {},
+        |approver_key| {
+            vec![
+                HumanApprovalVerifier::new(
+                    "test-human-approver-v1",
+                    approver_public_key(approver_key),
+                )
+                .unwrap(),
+            ]
+        },
+    );
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+
+    *state.lock().unwrap() = Some(FreshnessError::Unavailable);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Authorization(
+            PraetoreError::FreshnessCheckFailed(FreshnessError::Unavailable)
+        ))
+    ));
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+
+    *state.lock().unwrap() = Some(FreshnessError::Revoked);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Authorization(
+            PraetoreError::FreshnessCheckFailed(FreshnessError::Revoked)
+        ))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        record.execution_attestation.unwrap().not_dispatched_reason,
+        Some(NotDispatchedReason::DispatchFailed)
+    );
+    let state = gateway.approval_state(key).unwrap();
+    assert_eq!(
+        state.resolution,
+        praetore_gateway::ApprovalResolution::NotDispatched
+    );
+    assert_eq!(
+        state.not_dispatched_reason,
+        Some(NotDispatchedReason::DispatchFailed)
+    );
+    assert_eq!(tool.invocations(), 0);
+}
+
+#[test]
+fn approval_resolution_reports_not_dispatched_after_crash_recovery_or_expiry() {
+    let (gateway, request, tool, _, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    gateway.reconcile(key).unwrap();
+    let state = gateway.approval_state(key).unwrap();
+    assert_eq!(
+        state.resolution,
+        praetore_gateway::ApprovalResolution::NotDispatched
+    );
+    assert_eq!(state.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        state.not_dispatched_reason,
+        Some(NotDispatchedReason::CrashRecovered)
+    );
+    assert_eq!(
+        serde_json::to_value(state).unwrap(),
+        json!({
+            "resolution": "not_dispatched",
+            "execution": "not_dispatched",
+            "not_dispatched_reason": "crash_recovered"
+        })
+    );
+    assert_eq!(tool.invocations(), 0);
+
+    let (gateway, request, _, _, approver_key) = approval_fixture_with_provider(|clock| {
+        Arc::new(ExpiringOnDispatchFreshness {
+            clock,
+            calls: AtomicUsize::new(0),
+            expire_on_call: 2,
+            advance_by: Duration::seconds(6),
+            lease_duration: Duration::seconds(5),
+        })
+    });
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    assert!(gateway.dispatch_approved(key).is_err());
+    let state = gateway.approval_state(key).unwrap();
+    assert_eq!(
+        state.resolution,
+        praetore_gateway::ApprovalResolution::NotDispatched
+    );
+    assert_eq!(
+        state.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalExpired)
+    );
+}
+
+#[test]
+fn claim_reverifies_the_recorded_approval_before_dispatch() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision.clone()).unwrap();
+
+    // A journal row whose stored approval no longer verifies (corrupted or
+    // forged storage) is never dispatched, and its state is left untouched.
+    let forged_key = SigningKey::from_bytes(&[99; 32]);
+    let forged = human_approval_decision(
+        decision.challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &forged_key,
+    );
+    journal
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&key)
+        .unwrap()
+        .human_approval = Some(forged);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+    assert_eq!(tool.invocations(), 0);
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+
+    // A validly signed approval for a different challenge is refused too.
+    let mut other_challenge = decision.challenge.clone();
+    other_challenge.action_digest = "0".repeat(64);
+    let mismatched = human_approval_decision(
+        other_challenge,
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    journal
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&key)
+        .unwrap()
+        .human_approval = Some(mismatched);
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::InvalidChallenge))
+    ));
+    assert_eq!(tool.invocations(), 0);
+
+    journal
+        .entries
+        .lock()
+        .unwrap()
+        .get_mut(&key)
+        .unwrap()
+        .human_approval = Some(decision);
+    gateway.dispatch_approved(key).unwrap();
+    assert_eq!(tool.invocations(), 1);
 }
