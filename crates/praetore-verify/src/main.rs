@@ -55,6 +55,7 @@ enum Command {
         attester_pin: PathBuf,
         issuer_pins: Option<PathBuf>,
         require_intent: bool,
+        policy: Option<PathBuf>,
     },
     PolicyDigest {
         policy: PathBuf,
@@ -77,7 +78,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--policy PATH] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -191,7 +192,11 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             if values.keys().any(|key| {
                 !matches!(
                     key.as_str(),
-                    "--evidence" | "--attester-pin" | "--issuer-pins" | "--require-intent"
+                    "--evidence"
+                        | "--attester-pin"
+                        | "--issuer-pins"
+                        | "--require-intent"
+                        | "--policy"
                 )
             }) {
                 return Err(CliError::usage());
@@ -201,6 +206,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 attester_pin: path("--attester-pin")?,
                 issuer_pins: optional_path("--issuer-pins"),
                 require_intent: values.contains_key("--require-intent"),
+                policy: optional_path("--policy"),
             }
         }
         "receipt" => {
@@ -260,13 +266,19 @@ fn execute(command: Command) -> Result<Summary, CliError> {
             attester_pin,
             issuer_pins,
             require_intent,
+            policy,
         } => {
+            let policy = policy.as_deref().map(read_policy).transpose()?;
             let evidence =
                 Evidence::from_json(&read_limited(&evidence)?).map_err(CliError::from_core)?;
             let attester = read_attester_pin(&attester_pin)?;
             evidence
                 .verify_attester_signature(&attester)
                 .map_err(CliError::from_core)?;
+            if let Some(policy) = &policy {
+                verify_receipt_policy(&evidence, policy)?;
+                details.insert("policy_verified".into(), serde_json::Value::Bool(true));
+            }
             if let Some(pin_path) = issuer_pins {
                 let now = OffsetDateTime::now_utc();
                 verify_evidence_authority(&evidence, &read_issuer_pins(&pin_path)?, now)?;
@@ -397,6 +409,16 @@ fn execute(command: Command) -> Result<Summary, CliError> {
         command: command_name,
         code: "OK",
         details,
+    })
+}
+
+fn read_policy(path: &Path) -> Result<Policy, CliError> {
+    Policy::from_json(&read_limited(path)?).map_err(CliError::from_core)
+}
+
+fn verify_receipt_policy(evidence: &Evidence, policy: &Policy) -> Result<(), CliError> {
+    evidence.verify_policy(policy).map_err(|_| CliError {
+        code: "POLICY_MISMATCH",
     })
 }
 
