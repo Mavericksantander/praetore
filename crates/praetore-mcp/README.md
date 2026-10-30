@@ -76,6 +76,23 @@ You can also wrap a server by hand:
 praetore-mcp wrap --name my-server --mode observe -- node server.js --flag
 ```
 
+## Command-line help and exit codes
+
+`praetore-mcp --help` lists every command; `praetore-mcp <command> --help`
+(or `-h`) prints that command's options, for example `praetore-mcp wrap
+--help` or `praetore-mcp policy deny --help`. For `wrap`, anything after
+`--` belongs to the MCP server, so `wrap -- server --help` starts the server
+with `--help`. `praetore-mcp --version` prints the version.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success, including `--help` and `--version`. |
+| 1 | The command ran and found a problem: `verify` found a failed receipt, `policy check` found an invalid policy or engine, or `install`/`uninstall` could not read, parse or write a config, or the change was not confirmed. |
+| 2 | Usage error, or the command could not run (the reason is on stderr). |
+| `wrap` | The MCP server's own exit code; 127 if the server cannot be started; 1 if it was killed by a signal. |
+
+These codes are checked by `crates/praetore-mcp/tests/cli.rs`.
+
 ## Supported clients
 
 | Client | File | Format |

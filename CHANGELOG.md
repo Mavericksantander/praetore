@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `praetore-mcp <command> --help` / `-h` prints that command's usage and
+  exits 0 (it used to fail with `unexpected argument "--help"`). `--help`
+  after `wrap ... --` is still passed to the MCP server. `praetore-mcp
+  version` is an alias of `--version`. Exit codes (0, 1, 2, and `wrap`'s
+  server code / 127) are documented in `--help` and the praetore-mcp README.
 - `praetore-mcp wrap --mode observe` no longer forwards `tools/call` without
   receipts when the home cannot be loaded at startup (not initialized, or
   invalid keys, pins, authority or policy). Both modes now refuse every
