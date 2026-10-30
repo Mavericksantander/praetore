@@ -30,12 +30,77 @@ profile and an authenticated configuration channel.
    The core has no revocation list. HighAssurance guards reject reuse of
    previously consumed request IDs, but a stolen key can create new IDs; a
    still-valid authority remains usable until relying deployments stop
-   trusting it or it expires.
-3. Provision a new agent key using the approved key-protection mechanism,
+   trusting it or it expires. With the gateway service's file-based freshness
+   provider, add the agent's `AgentKeyFingerprint` (and/or the affected
+   authority IDs) to the revocation snapshot (`PRAETORE_GATEWAY_FRESHNESS_FILE`);
+   new checks refuse it within the reload interval (default 5 s) and existing
+   leases end within the lease length (default 30 s). Approved executions
+   still awaiting dispatch are revalidated at dispatch and closed as
+   `dispatch_failed`.
+3. Revoke the agent's gateway API credential by removing its entry from
+   `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` and restarting the gateway.
+4. Provision a new agent key using the approved key-protection mechanism,
    issue a new subject-bound authority, and verify a signed request end to end.
-4. Preserve existing evidence and separately identify the compromise window;
+5. Preserve existing evidence and separately identify the compromise window;
    do not rewrite evidence or claim the old signatures identify the legitimate
    agent operator.
+
+## Gateway HTTP API credentials
+
+The gateway service authenticates callers with tenant-scoped bearer tokens
+listed by SHA-256 digest in `PRAETORE_GATEWAY_API_CREDENTIALS_FILE` (format in
+[Tool gateway integration](tool-gateway-integration.md#http-api-authentication)).
+It refuses to start without this file with the `http` or `sandbox` adapter.
+The `local-demo` adapter listens on loopback only, with or without
+credentials.
+
+1. Issue one credential per agent workload and one per approver/operator
+   system, each bound to a single tenant. Never give an agent workload an
+   `approver` token: approver tokens can read approval challenges (including
+   the action parameters) and dispatch approved actions.
+2. Generate tokens with a CSPRNG (at least 32 bytes, e.g.
+   `openssl rand -hex 32`) and store only the digest in the credentials file;
+   deliver the token through the secret manager of the calling workload.
+3. Rotate by adding the new digest under a new `name`, restarting the
+   gateway, moving callers to the new token, then removing the old entry and
+   restarting again. The file is read at startup only.
+4. Monitor `401 authentication_required` and `403 caller_not_authorized`
+   rates: repeated 403s with a valid token indicate a caller probing another
+   tenant or an endpoint outside its role.
+
+## Approver keys
+
+Human-approval public keys are bound to tenants with
+`PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE` (format in
+[Tool gateway integration](tool-gateway-integration.md#human-approvals)). An
+approver key for one tenant never verifies another tenant's decisions. To
+rotate, add the new key under a new `key_id` for the same tenant, restart,
+move the approver system to the new key, then remove the old one. Decisions
+already recorded but not yet dispatched are re-verified at dispatch against
+the configured keys; removing a key before those are dispatched leaves them
+`approved_pending_dispatch` (dispatch refused with
+`invalid_approval_signature`) until an operator closes them with
+`Gateway::reconcile` (`crash_recovered`). The single-key environment variables are accepted
+only for the local demo or a gateway with exactly one issuer-bound tenant.
+
+## Freshness snapshot
+
+With the `http` and `sandbox` adapters the gateway requires
+`PRAETORE_GATEWAY_FRESHNESS_FILE`, a revocation snapshot with a short
+`valid_until` (format in
+[Tool gateway integration](tool-gateway-integration.md#freshness-and-revocation-snapshot)).
+
+1. Run a revocation publisher that rewrites the snapshot well before
+   `valid_until` (for example every minute with a five-minute validity),
+   writing a temporary file and renaming it into place.
+2. Alert on `freshness snapshot unavailable` warnings and on
+   `authorization_unavailable` (503) responses: once the snapshot is missing,
+   invalid or stale, every authorization and every approved dispatch fails
+   closed until it is refreshed. Approved executions stay
+   `approved_pending_dispatch` meanwhile and can be dispatched again while
+   their window is open.
+3. Treat write access to the snapshot as equivalent to the ability to
+   un-revoke an agent: the file is not signed.
 
 ## Policy rollback or substitution
 
@@ -106,17 +171,130 @@ deployment/rollback mechanism.
 
 ### PostgreSQL adapter
 
-The optional `praetore-replay-postgres` crate implements the replay guard using
-a fixed `praetore.replay_claims` table and an atomic primary-key insert. Apply
-`crates/praetore-replay-postgres/migrations/0001_replay_claims.sql` with a
-privileged migration role before starting the application. The runtime role
-should have `USAGE` on the `praetore` schema, `INSERT` on the `agent_id` and
-`request_id` columns, and `SELECT` on those same columns only (required by
-PostgreSQL for the `ON CONFLICT` key). Do not grant table-wide `SELECT`,
-`UPDATE`, `DELETE`, or `TRUNCATE`.
+The optional `praetore-replay-postgres` crate implements the replay guard and
+the gateway execution journal in the `praetore` schema.
 
-The adapter accepts an already-created PostgreSQL client so the deployment
-controls TLS, credentials, connection lifecycle, and pool topology. It sets
+#### Roles
+
+Use two database roles:
+
+- a **migration (owner) role** that owns the `praetore` schema and its tables,
+  functions and triggers. It runs migrations and nothing else. Creating the
+  `praetore_runtime` group role (migration 0011) needs `CREATEROLE`; a DBA may
+  instead pre-create `praetore_runtime NOLOGIN`, and 0011 then only grants.
+- a **runtime role** used by the gateway: a `LOGIN` member of
+  `praetore_runtime`, for example
+  `CREATE ROLE praetore_gateway LOGIN PASSWORD '...' IN ROLE praetore_runtime;`.
+  It must not be `SUPERUSER` or `BYPASSRLS` (both ignore row-level security),
+  must not own or be a member of the owner of anything in `praetore` (an owner
+  can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY` or `DISABLE TRIGGER`, which
+  defeats tenant isolation and the append-only triggers), must not have
+  `CREATE` on the schema, must not be `CREATEROLE` (on PostgreSQL 15 and
+  older it can grant itself the owner role), and must not hold `DELETE`,
+  `TRUNCATE`, table-wide `UPDATE`, `TRIGGER` or `REFERENCES` on any
+  `praetore` table, including through `pg_write_all_data` or a leftover
+  `GRANT ALL` from an install where the gateway owned the tables.
+  `verify_runtime_role` refuses each of these at startup in `http` and
+  `sandbox` modes.
+- `praetore_runtime` is a cluster-wide role, so a login member of it can
+  connect to every database on the cluster that ran migration 0011. Use one
+  PostgreSQL cluster per environment (staging and production never share a
+  cluster), or `REVOKE CONNECT ON DATABASE ... FROM PUBLIC` and grant
+  `CONNECT` per runtime role.
+
+Migration 0011 grants `praetore_runtime` exactly what the code uses:
+
+| Table | Privileges |
+| --- | --- |
+| `replay_claims` | `SELECT`, `INSERT` |
+| `execution_journal` | `SELECT`, `INSERT`, `UPDATE (execution_status, output_json, not_dispatched_reason, updated_at)` |
+| `execution_journal_events` | `SELECT` (rows are written by a `SECURITY DEFINER` trigger owned by the migration role) |
+| `execution_attestations`, `human_approvals`, `human_approval_expirations` | `SELECT`, `INSERT` |
+| `schema_migrations` | `SELECT` (startup schema check) |
+
+No `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER` or `CREATE` is granted. All
+tables carry `tenant_id` and use forced row-level security keyed on the
+transaction-local `praetore.tenant_id` setting.
+
+With `PRAETORE_GATEWAY_ADAPTER=http` or `sandbox`, `praetore-gateway-demo`
+verifies at startup (before serving) that the runtime connection's session and
+current role meet these rules and that the schema is current, and refuses to
+start otherwise. The local demo adapter and the `praetore` CLI only warn: they
+are development tools, and without a migration URL they migrate with the
+runtime URL, so the runtime role owns the tables. Do not use that setup for
+anything but local development.
+
+#### Migrations
+
+Migrations are applied by `praetore_replay_postgres::apply_migrations`. Run
+them with the owner role, either as a separate step
+(`PRAETORE_GATEWAY_MIGRATION_DATABASE_URL=... praetore-gateway-demo migrate`,
+for example a Kubernetes init Job) or by setting
+`PRAETORE_GATEWAY_MIGRATION_DATABASE_URL` for the service, which then migrates
+with that URL before connecting with `PRAETORE_GATEWAY_DATABASE_URL`. Production
+adapters never migrate with the runtime URL; without a migration URL they only
+check that the schema is current.
+
+Each migration runs once and is recorded with its SHA-256 in
+`praetore.schema_migrations`; a recorded migration whose text changed is
+refused. A migration and its record commit in one transaction owned by the
+runner. Migrations 0007-0009 were written with their own `BEGIN;`/`COMMIT;`;
+their text cannot change (checksums), so the runner strips one enclosing
+top-level `BEGIN;`/`COMMIT;` pair and refuses any other transaction control.
+Earlier releases executed those files as-is, so their `COMMIT` ended the
+runner's transaction early; a crash between the body and the record could
+leave such a migration applied but unrecorded, which the next start then
+fails on (the migration is not idempotent everywhere). If that happens,
+compare the schema with the migration and record it manually with the
+owner role.
+
+The comment in 0009 that says "migration 0007 is re-applied on every start"
+describes the behavior before the runner existed; since the runner, every
+migration runs exactly once. The file is kept byte-identical because its
+checksum is recorded in existing databases.
+
+A database migrated before the control table existed is adopted only if its
+schema matches 0009 exactly: 0001-0009 are then recorded without executing
+and only 0010+ run. A partial or unrecognized `praetore` schema is refused,
+and a binary refuses to start if `schema_migrations` records a version it does
+not know (for example after a rollback to an older binary).
+
+Migration 0012 adds a defense-in-depth trigger on
+`approved_pending_dispatch -> dispatched`: it requires an `approve` decision,
+no approval-expiration receipt, and `expires_at` later than the gateway's
+observation time, which `claim_dispatch` passes in the transaction-local
+setting `praetore.dispatch_observed_at`. The database clock is deliberately
+not used: the gateway's injected, trusted clock decides expiry (and is signed
+into expiration receipts), and the database clock may be skewed relative to
+it. A dispatch without the setting is refused.
+
+#### TLS
+
+Every connection (gateway, CLI, `praetore-observe`) validates its URL before
+opening a socket:
+
+- `sslmode=verify-full&sslrootcert=/path/ca.pem` (URL form) connects with
+  rustls, verifies the server certificate chain against the given PEM roots
+  and checks that the certificate names the host. There is no plaintext
+  fallback.
+- `sslmode=disable` or no `sslmode` is accepted only when every host is a Unix
+  socket, `localhost` or a loopback IP (and every `hostaddr` is loopback).
+- `prefer`, `require` and `verify-ca` are refused because they do not bind the
+  certificate to the host.
+
+Example for the Kubernetes layout (Postgres in namespace `praetore-data`):
+
+```text
+PRAETORE_GATEWAY_DATABASE_URL=postgres://praetore_gateway:...@postgres.praetore-data.svc.cluster.local:5432/praetore?sslmode=verify-full&sslrootcert=/etc/praetore/postgres-ca.pem
+```
+
+SCRAM channel binding is not offered, so do not set `channel_binding=require`;
+the server is authenticated by `verify-full`. Client certificates are not
+supported yet.
+
+The library types also accept an already-created PostgreSQL client, so an
+embedding deployment controls credentials, connection lifecycle and pool
+topology; `DatabaseConnector` applies the TLS policy above. It sets
 `synchronous_commit = on` for each claim. This flushes the primary's WAL, but
 does not by itself guarantee that an asynchronous replica has the claim after
 failover. HighAssurance deployments must configure and test synchronous
@@ -174,8 +352,36 @@ canonical policy digest. This command computes a digest; it does not establish
 that the policy is approved. Compare the result with the independently
 provisioned production pin.
 
+`praetore-verify receipt --receipt receipt.json --execution-pin key.hex
+--key-id ID --evidence-attester-pin attester.hex --format json` verifies a
+gateway receipt's signed execution attestation (schema v1, v2 or v3) and the
+embedded evidence's `attester_signature` against the pinned evidence attester
+key; a missing or invalid evidence signature fails with
+`RECEIPT_EVIDENCE_SIGNATURE_INVALID`. Both signatures must be exactly 128
+lowercase hex characters; uppercase or mixed case is rejected. The execution attestation binds the
+evidence `context_hash`, which excludes that signature, so both checks are
+required. A v3 attestation carries
+`not_dispatched_reason` (`approval_expired`, `dispatch_failed` or
+`crash_recovered`); unknown reasons fail with `RECEIPT_INVALID`, a reason that
+does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
+`evidence`, this is historical verification only (`current_authorization=false`).
+
+Receipt verification lives in the `praetore-receipt` crate, which has no
+server dependencies (no axum or tokio); `praetore-gateway` re-exports it.
+The receipt fixtures in `packages/praetore-python/tests/fixtures` are signed
+with the test execution key; `receipt-evidence-attester-public-key.hex` is the
+test evidence attester key that signed their evidence. Regenerate v2/v3 (and v1) with
+`UPDATE_RECEIPT_FIXTURES=1 cargo test -p praetore-gateway --test enforcement receipt_fixtures`.
+The gateway no longer emits v1, so `receipt-v1-confirmed.json` is the committed
+v2 receipt re-signed as a legacy v1 attestation; regenerate only it with
+`UPDATE_RECEIPT_V1_FIXTURE=1` and the same command. Regenerated receipts carry
+evidence schema v4 (`decision.decided_by`). `fixtures/legacy-evidence/` keeps
+receipts and evidence whose evidence predates v4 (schema v1/v2); they are
+never regenerated and must keep verifying unchanged.
+
 The Python package provides Rust-backed integrity and attester signature
-verification only. It does not evaluate policies or establish trust in a
+verification only (`verify_gateway_receipt` covers execution attestations,
+including v3). It does not evaluate policies or establish trust in a
 public key supplied by an untrusted caller.
 
 ## Release artifact integrity
