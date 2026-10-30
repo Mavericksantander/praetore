@@ -137,5 +137,91 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
             )
 
 
+class LegacyEvidenceVerificationTests(unittest.TestCase):
+    """Receipts whose evidence predates ``decided_by`` (schema v1-v3) keep
+    verifying unchanged; current fixtures carry evidence schema v4."""
+
+    KEY_ID = "test-execution-attester-v1"
+    LEGACY = FIXTURES / "legacy-evidence"
+    RECEIPTS = (
+        "receipt-v1-confirmed.json",
+        "receipt-v2-confirmed.json",
+        "receipt-v3-crash-recovered.json",
+    )
+
+    def setUp(self) -> None:
+        read_hex = lambda name: (FIXTURES / name).read_text(encoding="ascii").strip()
+        self.attester_pin = read_hex("attester-public-key.hex")
+        self.pin = read_hex("execution-attester-public-key.hex")
+        self.evidence_pin = read_hex("receipt-evidence-attester-public-key.hex")
+
+    def verify(self, receipt: str) -> bool:
+        return praetore.verify_gateway_receipt(
+            receipt, self.pin, self.KEY_ID, self.evidence_pin
+        )
+
+    def test_legacy_evidence_still_verifies(self) -> None:
+        import json
+
+        legacy = (self.LEGACY / "evidence-valid.json").read_text(encoding="utf-8")
+        self.assertEqual(json.loads(legacy)["evidence_schema_version"], 1)
+        self.assertNotIn("decided_by", legacy)
+        self.assertTrue(praetore.verify_evidence_integrity(legacy))
+        self.assertTrue(
+            praetore.verify_evidence_attester_signature(legacy, self.attester_pin)
+        )
+        tampered = (self.LEGACY / "evidence-tampered.json").read_text(encoding="utf-8")
+        self.assertFalse(praetore.verify_evidence_integrity(tampered))
+
+    def test_current_evidence_is_v4_with_decided_by(self) -> None:
+        import json
+
+        current = json.loads(
+            (FIXTURES / "evidence-valid.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(current["evidence_schema_version"], 4)
+        self.assertIn("decided_by", current["decision"])
+        for name in self.RECEIPTS:
+            receipt = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+            self.assertEqual(receipt["evidence"]["evidence_schema_version"], 4, name)
+            self.assertIn("decided_by", receipt["evidence"]["decision"], name)
+
+    def test_legacy_receipts_still_verify_and_reject_tampering(self) -> None:
+        import json
+
+        for name in self.RECEIPTS:
+            original = (self.LEGACY / name).read_text(encoding="utf-8")
+            receipt = json.loads(original)
+            self.assertLess(receipt["evidence"]["evidence_schema_version"], 4, name)
+            self.assertNotIn("decided_by", receipt["evidence"]["decision"], name)
+            self.assertTrue(self.verify(original), name)
+            tampered = original.replace('"confirmed"', '"failed"', 1)
+            if tampered != original:
+                self.assertFalse(self.verify(tampered), name)
+            receipt["evidence"]["decision"]["decided_by"] = {
+                "kind": "default_deny"
+            }
+            self.assertFalse(self.verify(json.dumps(receipt)), name)
+
+    def test_decided_by_tampering_fails_closed(self) -> None:
+        import json
+
+        for name in self.RECEIPTS:
+            original = (FIXTURES / name).read_text(encoding="utf-8")
+            for forged in (
+                None,
+                {"kind": "default_deny"},
+                {"kind": "rule", "rule_id": "some-other-rule"},
+                {"kind": "operator_override"},
+                {"kind": "rule", "rule_id": "require-human-approval", "x": 1},
+            ):
+                receipt = json.loads(original)
+                if forged is None:
+                    del receipt["evidence"]["decision"]["decided_by"]
+                else:
+                    receipt["evidence"]["decision"]["decided_by"] = forged
+                self.assertFalse(self.verify(json.dumps(receipt)), (name, forged))
+
+
 if __name__ == "__main__":
     unittest.main()

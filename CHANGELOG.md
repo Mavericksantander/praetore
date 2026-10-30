@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- New receipts always record what decided them in `decision.decided_by`, as
+  part of the hashed and Ed25519-signed evidence payload, in the new
+  **evidence schema v4**:
+  - `DecidedBy::Rule { rule_id }` (a rule's declared effect applied; a
+    RECOVER rule's `rule_id` equals its recovery obligation's),
+    `UnboundRule { rule_id }` (a REQUIRE_APPROVAL/RECOVER rule matched
+    without its required capability or target and denied instead),
+    `DefaultDeny` and `EngineGuard { guard }`. Combining decisions keeps the
+    decider of the higher severity (`Recover > Deny > RequireApproval >
+    Allow`), the earlier one on a tie.
+  - Versioning: every new evidence is v4 (with or without HighAssurance
+    metadata and recovery). v1-v3 must not carry `decided_by`, so existing
+    receipts, golden vectors and fixtures keep verifying byte-for-byte; v4
+    must carry it. `decided_by` must be consistent with the outcome,
+    recovery obligation and contributions; unknown kinds, unknown fields and
+    an explicit `null` are rejected.
+  - Upgrade order: binaries without v4 support reject v4 evidence (fail
+    closed). Upgrade every verifier, Python binding and gateway node before
+    any node starts producing v4; during a mixed-version rollout or after a
+    rollback, journal rows and pending approvals written by new nodes are
+    unreadable (`InvalidRecord`) on old ones.
+  - Breaking: `Decision` has a required `decided_by: DecidedBy` (JSON without
+    it does not deserialize); `Decision::allow/deny/require_approval` take it
+    as a second argument (`Decision::recover` derives it from the
+    obligation). `Evidence.decision` is now a `RecordedDecision` (the read
+    path) whose `decided_by` is optional, crate-private and read via
+    `decided_by()`; `Decision` converts with `.into()`. `Evidence::new` and
+    `attest` reject a decision that violates these invariants. Consumers that
+    compared `evidence_schema_version` to 2/3 should use
+    `is_high_assurance_shape()` and `decision.recovery`.
+  - Dispatch revalidation compares a legacy (pre-v4) record on every field
+    except `decided_by`, so approvals pending across the upgrade can still be
+    dispatched; v4 records must match `decided_by` too.
+  - Test fixtures in `packages/praetore-python/tests/fixtures` were
+    regenerated as v4; the previous v1/v2 bytes are kept in
+    `fixtures/legacy-evidence/` and still verify.
 - New crate `praetore-mcp` (binary `praetore-mcp`): a local stdio MCP proxy
   for Claude Desktop, Cursor and VS Code that needs no PostgreSQL and no Rust.
   `init` creates LOCAL/DEV issuer, agent and attester keys (0600), a signed

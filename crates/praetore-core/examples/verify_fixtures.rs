@@ -7,7 +7,7 @@ use praetore_core::{
     action::Action,
     authority::{Authority, Validity},
     authorization::AuthorizationRequest,
-    decision::Decision,
+    decision::{DecidedBy, Decision},
     engine::TrustedAuthorityIssuer,
     evidence::EvidenceAttesterKey,
     identity::{AgentId, AgentKeyPair},
@@ -59,7 +59,12 @@ fn main() {
     let mut request = AuthorizationRequest::new(agent.clone(), authority.clone(), action).unwrap();
     request.request_id = "00000000-0000-0000-0000-0000000000b3".parse().unwrap();
     request.sign_intent(&agent_key).unwrap();
-    let mut evidence = request.attest(Decision::allow("example allow")).unwrap();
+    let mut evidence = request
+        .attest(Decision::allow(
+            "example allow",
+            DecidedBy::rule("allow-read"),
+        ))
+        .unwrap();
     evidence
         .bind_policy_digest(policy.digest().unwrap())
         .unwrap();

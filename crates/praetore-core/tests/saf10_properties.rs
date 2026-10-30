@@ -322,6 +322,8 @@ mod full {
         assert_eq!(recovery.recovery_id, "first");
         assert_eq!(recovery.rule_id, "r2");
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        // The Recover rule that produced the kept obligation decided it.
+        assert_eq!(decision.decided_by, praetore_core::DecidedBy::rule("r2"));
     }
 
     fn evidence(decision: praetore_core::Decision) -> praetore_core::Evidence {
@@ -348,19 +350,61 @@ mod full {
         }
     }
 
-    /// Evidence v3: a recovery obligation is carried only by v3; v1 evidence
-    /// keeps verifying, and recovery cannot be smuggled into v1 or removed
-    /// from v3 without breaking integrity.
+    /// Rebuilds `evidence` as a legacy receipt of `version` (v1-v3 predate
+    /// `decided_by`): drops `decided_by` and recomputes the unkeyed context
+    /// hash the way a pre-v4 engine did.
+    fn legacy(evidence: &praetore_core::Evidence, version: u16) -> serde_json::Value {
+        let mut value = serde_json::to_value(evidence).unwrap();
+        value["decision"]
+            .as_object_mut()
+            .unwrap()
+            .remove("decided_by");
+        value["evidence_schema_version"] = json!(version);
+        rehash(&mut value);
+        value
+    }
+
+    fn rehash(value: &mut serde_json::Value) {
+        use sha2::{Digest, Sha256};
+        let mut payload = value.clone();
+        let object = payload.as_object_mut().unwrap();
+        object.remove("context_hash");
+        object.remove("attester_signature");
+        let canonical = praetore_core::canonical::canonicalize_json(&payload.to_string()).unwrap();
+        value["context_hash"] = json!(hex::encode(Sha256::digest(canonical)));
+    }
+
+    fn parse(value: &serde_json::Value) -> praetore_core::Evidence {
+        praetore_core::Evidence::from_json(&value.to_string()).unwrap()
+    }
+
+    /// Evidence v3: a recovery obligation is carried only by v3 among the
+    /// legacy versions; v1 evidence keeps verifying, and recovery cannot be
+    /// smuggled into v1 or removed from v3 without breaking integrity.
+    /// New evidence is v4 (it records `decided_by`) with or without recovery.
     #[test]
     fn p8_evidence_v3_and_v1_coexist() {
-        let v1 = evidence(praetore_core::Decision::deny("x"));
+        let deny = praetore_core::Decision::deny("x", praetore_core::DecidedBy::DefaultDeny);
+        let v4_deny = evidence(deny);
+        assert_eq!(v4_deny.evidence_schema_version, 4);
+        assert!(v4_deny.verify_integrity());
+        let v4_recover = evidence(praetore_core::Decision::recover("x", obligation()));
+        assert_eq!(v4_recover.evidence_schema_version, 4);
+        assert!(v4_recover.verify_integrity());
+        assert_eq!(
+            v4_recover.decision.decided_by(),
+            Some(&praetore_core::DecidedBy::rule("r"))
+        );
+
+        let v1 = parse(&legacy(&v4_deny, 1));
         assert_eq!(v1.evidence_schema_version, 1);
         assert!(v1.verify_integrity());
+        assert_eq!(v1.decision.decided_by(), None);
         let v1_json = serde_json::to_string(&v1).unwrap();
         assert!(!v1_json.contains("recovery"));
         assert!(praetore_core::Evidence::from_json(&v1_json).is_ok());
 
-        let v3 = evidence(praetore_core::Decision::recover("x", obligation()));
+        let v3 = parse(&legacy(&v4_recover, 3));
         assert_eq!(v3.evidence_schema_version, 3);
         assert!(v3.verify_integrity());
         let v3_json = serde_json::to_string(&v3).unwrap();
@@ -370,15 +414,35 @@ mod full {
                 .verify_integrity()
         );
 
-        let mut smuggled = v1.clone();
-        smuggled.decision.recovery = Some(obligation());
-        assert!(!smuggled.verify_integrity());
-        let mut relabeled = v3.clone();
-        relabeled.evidence_schema_version = 1;
-        assert!(!relabeled.verify_integrity());
-        let mut stripped = v3;
-        stripped.decision.recovery = None;
-        assert!(!stripped.verify_integrity());
+        for (base, label) in [(&v1, "v1"), (&v4_deny, "v4")] {
+            let mut smuggled = base.clone();
+            smuggled.decision.recovery = Some(obligation());
+            assert!(!smuggled.verify_integrity(), "{label}");
+        }
+        for (base, label) in [(&v3, "v3"), (&v4_recover, "v4")] {
+            let mut relabeled = base.clone();
+            relabeled.evidence_schema_version = 1;
+            assert!(!relabeled.verify_integrity(), "{label}");
+            let mut stripped = base.clone();
+            stripped.decision.recovery = None;
+            assert!(!stripped.verify_integrity(), "{label}");
+        }
+
+        // Even with a recomputed (unkeyed) hash, the version shape holds:
+        // legacy versions cannot carry decided_by, v4 cannot omit it, and an
+        // unknown version is rejected.
+        let mut value = serde_json::to_value(&v4_recover).unwrap();
+        for version in [1, 2, 3, 5] {
+            value["evidence_schema_version"] = json!(version);
+            rehash(&mut value);
+            assert!(
+                praetore_core::Evidence::from_json(&value.to_string()).is_err(),
+                "v{version} with decided_by"
+            );
+        }
+        let mut value = legacy(&v4_recover, 4);
+        rehash(&mut value);
+        assert!(praetore_core::Evidence::from_json(&value.to_string()).is_err());
     }
 
     /// Validation of the Recover effect itself at load time.

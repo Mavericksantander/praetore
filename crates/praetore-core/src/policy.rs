@@ -9,7 +9,7 @@ use crate::{
     canonical::{
         MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
     },
-    decision::{Decision, DecisionContribution, RecoveryObligation},
+    decision::{DecidedBy, Decision, DecisionContribution, RecoveryObligation},
     error::{PraetoreError, Result},
     identity::AgentIdentity,
 };
@@ -211,10 +211,15 @@ impl Policy {
                 // offer a path to dispatch (RequireApproval) or trigger a
                 // recovery obligation (Recover): it denies (fail closed).
                 RuleMatch::Unbound if rule.effect == PolicyEffect::Deny => rule.decision()?,
-                RuleMatch::Unbound => Decision::deny(format!(
-                    "Policy rule '{}' matched without its required capability or target; denied",
-                    rule.id
-                )),
+                // Recorded as `UnboundRule`, not `Rule`: the rule's declared
+                // effect was not applied.
+                RuleMatch::Unbound => Decision::deny(
+                    format!(
+                        "Policy rule '{}' matched without its required capability or target; denied",
+                        rule.id
+                    ),
+                    DecidedBy::unbound_rule(rule.id.clone()),
+                ),
             };
 
             let contribution = DecisionContribution::new(
@@ -232,10 +237,13 @@ impl Policy {
         }
 
         Ok(decision.unwrap_or_else(|| {
-            Decision::deny(format!(
-                "Policy '{}' v{}: no matching rule; default deny",
-                self.id, self.version
-            ))
+            Decision::deny(
+                format!(
+                    "Policy '{}' v{}: no matching rule; default deny",
+                    self.id, self.version
+                ),
+                DecidedBy::DefaultDeny,
+            )
         }))
     }
 
@@ -510,11 +518,12 @@ impl PolicyRule {
 
     fn decision(&self) -> Result<Decision> {
         let reason = format!("Policy rule '{}' matched", self.id);
+        let decided_by = DecidedBy::rule(self.id.clone());
 
         match &self.effect {
-            PolicyEffect::Allow => Ok(Decision::allow(reason)),
-            PolicyEffect::Deny => Ok(Decision::deny(reason)),
-            PolicyEffect::RequireApproval => Ok(Decision::require_approval(reason)),
+            PolicyEffect::Allow => Ok(Decision::allow(reason, decided_by)),
+            PolicyEffect::Deny => Ok(Decision::deny(reason, decided_by)),
+            PolicyEffect::RequireApproval => Ok(Decision::require_approval(reason, decided_by)),
             PolicyEffect::Recover {
                 recovery_id,
                 deadline_ms,
@@ -528,6 +537,7 @@ impl PolicyRule {
                 recovery
                     .validate()
                     .map_err(|message| PraetoreError::PolicyEvaluationFailed(message.into()))?;
+                // Decided by this rule (`DecidedBy::Rule`, from the obligation).
                 Ok(Decision::recover(reason, recovery))
             }
         }

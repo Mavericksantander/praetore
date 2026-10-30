@@ -19,7 +19,9 @@ an exact `action_type`, an effect, and optional match criteria:
   *unbound* match (the authority lacks the capability, or the action has no
   target) always contributes DENY: a REQUIRE_APPROVAL rule does not offer an
   approval, and a RECOVER rule does not emit a recovery obligation, to an
-  authority the rule was never scoped to. (Strict and
+  authority the rule was never scoped to. The decision records it as
+  `decided_by: {"kind": "unbound_rule", "rule_id": ...}` (an unbound DENY rule
+  applied its declared effect and is an ordinary `rule`). (Strict and
   HighAssurance still require it on matching ALLOW and REQUIRE_APPROVAL rules;
   see below.)
 * `target`: the action target must be exactly equal. Targets are exact,
