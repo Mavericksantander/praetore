@@ -375,3 +375,83 @@ fn init_is_idempotent_and_keys_are_private() {
     assert!(!out.status.success());
     assert_eq!(fs::read(home.agent_key()).unwrap(), before);
 }
+
+#[test]
+fn rules_generated_by_policy_commands_enforce_end_to_end() {
+    let (_temp, home) = init_home();
+    let dir = home.root.to_str().unwrap();
+    for args in [
+        vec![
+            "policy",
+            "deny",
+            "--id",
+            "deny-delete",
+            "--server",
+            "fake",
+            "--tool",
+            "delete_file",
+        ],
+        vec![
+            "policy",
+            "require-approval",
+            "--id",
+            "approve-secret",
+            "--tool",
+            "echo",
+            "--arg-path-prefix",
+            "path=/secret",
+        ],
+    ] {
+        let mut args = args;
+        args.extend(["--dir", dir]);
+        let out = run(&args, "");
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("restart your MCP client"));
+    }
+    let check = run(&["policy", "check", "--dir", dir], "");
+    let report = String::from_utf8_lossy(&check.stdout);
+    assert!(check.status.success(), "{report}");
+    assert!(report.contains("0 warning(s)"), "{report}");
+
+    let (responses, stderr, out) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/tmp/x"}}}),
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/tmp/ok"}}}),
+            json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/secret/key"}}}),
+        ]),
+    );
+    assert!(out.status.success(), "{stderr}");
+    let denied = by_id(&responses, &json!(10))["result"].clone();
+    assert_eq!(denied["isError"], true);
+    assert!(
+        denied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("deny-delete")
+    );
+    assert_eq!(by_id(&responses, &json!(11))["result"]["isError"], false);
+    let held = by_id(&responses, &json!(12))["result"].clone();
+    assert_eq!(held["isError"], true);
+    assert!(
+        held["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("requires human approval")
+    );
+    assert_eq!(stderr.matches("EXECUTED").count(), 1, "{stderr}");
+
+    // The approval rule is bound (capability granted, target present), so the
+    // receipt says REQUIRE_APPROVAL rather than an unbound DENY.
+    let outcomes: Vec<_> = journal(&home).iter().map(|e| e.decision.outcome).collect();
+    assert_eq!(
+        outcomes,
+        [
+            DecisionOutcome::Deny,
+            DecisionOutcome::Allow,
+            DecisionOutcome::RequireApproval
+        ]
+    );
+    assert!(verify_cli(&home).status.success());
+}
