@@ -39,7 +39,7 @@ fn verify_gateway_receipt(
     let Some(public_key) = parse_public_key(execution_public_key_hex) else {
         return false;
     };
-    praetore_gateway::verify_gateway_receipt_json(receipt_json, &public_key, key_id).is_ok()
+    praetore_receipt::verify_gateway_receipt_json(receipt_json, &public_key, key_id).is_ok()
 }
 
 fn parse_public_key(hex_value: &str) -> Option<VerifiedPublicKey> {

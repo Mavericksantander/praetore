@@ -192,6 +192,15 @@ attestation (schema v1, v2 or v3). A v3 attestation carries
 does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
 
+Receipt verification lives in the `praetore-receipt` crate, which has no
+server dependencies (no axum or tokio); `praetore-gateway` re-exports it.
+The receipt fixtures in `packages/praetore-python/tests/fixtures` are signed
+with the test execution key. Regenerate v2/v3 (and v1) with
+`UPDATE_RECEIPT_FIXTURES=1 cargo test -p praetore-gateway --test enforcement receipt_fixtures`.
+The gateway no longer emits v1, so `receipt-v1-confirmed.json` is the committed
+v2 receipt re-signed as a legacy v1 attestation; regenerate only it with
+`UPDATE_RECEIPT_V1_FIXTURE=1` and the same command.
+
 The Python package provides Rust-backed integrity and attester signature
 verification only (`verify_gateway_receipt` covers execution attestations,
 including v3). It does not evaluate policies or establish trust in a

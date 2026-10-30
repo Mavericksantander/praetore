@@ -1140,10 +1140,10 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "praetore-core",
+ "praetore-receipt",
  "proptest",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror",
  "time",
  "tokio",
@@ -1210,8 +1210,22 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "praetore-core",
- "praetore-gateway",
+ "praetore-receipt",
  "pyo3",
+]
+
+[[package]]
+name = "praetore-receipt"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "praetore-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "time",
+ "uuid",
 ]
 
 [[package]]
@@ -1235,7 +1249,7 @@ version = "0.2.0"
 dependencies = [
  "hex",
  "praetore-core",
- "praetore-gateway",
+ "praetore-receipt",
  "serde",
  "serde_json",
  "time",
