@@ -34,6 +34,35 @@ jobs:
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
 
+  verifier-features:
+    name: Offline verifiers build without receipt signing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # `ExecutionAttestation::create` exists only with praetore-receipt's
+      # `signing` feature. Workspace-wide commands unify features (the gateway
+      # enables `signing`), so they cannot catch a verifier that starts
+      # enabling it. Resolve each verifier on its own, over its shipped
+      # (normal + build) dependency graph, and fail if `signing` appears.
+      - name: praetore-verify and praetore-python do not enable signing
+        run: |
+          set -euo pipefail
+          for package in praetore-verify praetore-python; do
+            tree="$(cargo tree --locked -p "$package" --edges normal,build,features -i praetore-receipt)"
+            printf '%s\n' "$tree"
+            if grep -F 'praetore-receipt feature "signing"' <<<"$tree"; then
+              echo "::error::$package enables praetore-receipt/signing"
+              exit 1
+            fi
+          done
+      # Sanity check that the guard can fail: the gateway must enable it.
+      - name: praetore-gateway does enable signing
+        run: cargo tree --locked -p praetore-gateway --edges normal,build,features -i praetore-receipt | grep -F 'praetore-receipt feature "signing"'
+      - run: cargo check --locked -p praetore-verify
+      - run: cargo check --locked -p praetore-python
+      - run: cargo check --locked -p praetore-receipt --no-default-features
+
   audit:
     name: Dependency advisory audit
     runs-on: ubuntu-latest
