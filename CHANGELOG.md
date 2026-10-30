@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `AuthorizationEngine::validate_evidence_for_dispatch` is now documented as
+  accepting ALLOW **and** REQUIRE_APPROVAL evidence (behavior unchanged; the
+  gateway's post-approval path relies on it), and its error message says so.
+  New `validate_allow_evidence_for_dispatch` additionally requires an ALLOW
+  decision, for dispatch paths without a verified human approval.
 - Security (breaking API): `Evidence::verify_key_rotation` now takes the
   trusted attester key (`&VerifiedPublicKey`) and requires a valid attester
   signature. It previously accepted an ALLOW decision protected only by the
