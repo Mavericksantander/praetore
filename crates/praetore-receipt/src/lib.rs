@@ -144,6 +144,11 @@ struct ExecutionAttestationPayload<'a> {
 impl ExecutionAttestation {
     /// Signs an execution observation. Used by the gateway; verifiers only
     /// need [`GatewayReceipt::verify_execution_attestation`].
+    ///
+    /// Only available with the `signing` feature (off by default), so offline
+    /// verifiers cannot mint attestations that bypass the gateway's state
+    /// machine.
+    #[cfg(feature = "signing")]
     pub fn create(
         evidence: &Evidence,
         authorization: AuthorizationStatus,
@@ -330,7 +335,7 @@ impl ExecutionAttestation {
             || self.key_id.is_empty()
             || self.key_id.len() > 256
             || self.key_id.trim() != self.key_id
-            || hex::decode(&self.signature).map_or(true, |signature| signature.len() != 64)
+            || !is_canonical_signature_hex(&self.signature)
             || OffsetDateTime::parse(&self.observed_at, &Rfc3339).is_err()
         {
             return Err(ExecutionAttestationError::InvalidPayload);
@@ -346,6 +351,16 @@ impl ExecutionAttestation {
         }
         Ok(())
     }
+}
+
+/// Accepts only the canonical encoding produced by `hex::encode`: exactly
+/// 64 bytes as 128 lowercase hex digits. Uppercase or mixed case is rejected
+/// so each receipt has a single valid encoding.
+fn is_canonical_signature_hex(signature: &str) -> bool {
+    signature.len() == 128
+        && signature
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn authorization_for_outcome(outcome: praetore_core::DecisionOutcome) -> AuthorizationStatus {
