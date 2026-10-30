@@ -18,11 +18,18 @@
 //! Confinement does not rely on string checks alone:
 //!
 //! - The root must be an absolute, canonical, existing directory (not `/`),
-//!   owned by the gateway's effective user and not writable by group or
-//!   others. It is opened once as a directory file descriptor and its
-//!   device/inode is checked against the path. Before every preflight and
-//!   dispatch the path is checked again to still name that same directory;
-//!   if the root was renamed or replaced, the action is refused (fail closed).
+//!   owned by the gateway's effective user, not writable by group or others
+//!   and, on macOS, without extended ACL entries (on Linux, POSIX ACLs are
+//!   bounded by the mask shown in the group bits). It is opened once as a
+//!   directory file descriptor and its device/inode is checked against the
+//!   path. Before every preflight and dispatch the path is checked again to
+//!   still name that same directory and the owner/mode/ACL requirements are
+//!   re-validated; otherwise the action is refused (fail closed). At open,
+//!   leftover temporary files (see [`TEMP_PREFIX`], matched ASCII
+//!   case-insensitively) are removed without following links.
+//! - Refusal codes are terminal except `sandbox_root_unavailable`,
+//!   `parent_directory_unavailable` and `file_unavailable` (descriptor or
+//!   I/O errors while inspecting), which are transient.
 //! - Paths are validated lexically first: relative only, no `.`/`..`, no
 //!   empty components, no NUL/control characters, no `\`, no Unicode
 //!   bidirectional or zero-width format characters, bounded length and depth.
@@ -109,6 +116,8 @@ pub enum SandboxConfigError {
     NotOwned,
     #[error("sandbox root must not be writable by group or others")]
     InsecurePermissions,
+    #[error("sandbox root must not carry extended ACL entries")]
+    ExtendedAcl,
     #[error("sandbox root changed while it was being opened")]
     Replaced,
     #[error("sandbox root is not accessible: {0}")]
@@ -203,13 +212,15 @@ impl SandboxDispatcher {
         {
             return Err(SandboxConfigError::Replaced);
         }
-        // SAFETY: geteuid has no preconditions.
-        if stat.st_uid != unsafe { libc::geteuid() } {
-            return Err(SandboxConfigError::NotOwned);
+        match root_security(root_fd.as_raw_fd(), &stat) {
+            Ok(()) => {}
+            Err(RootProblem::NotOwned) => return Err(SandboxConfigError::NotOwned),
+            Err(RootProblem::Writable) => return Err(SandboxConfigError::InsecurePermissions),
+            Err(RootProblem::Acl) => return Err(SandboxConfigError::ExtendedAcl),
         }
-        if stat.st_mode & 0o022 != 0 {
-            return Err(SandboxConfigError::InsecurePermissions);
-        }
+        // Temporary files left by an interrupted write are never the target
+        // of an action; remove them (best effort, never following links).
+        sweep_temp_files(root_fd.as_raw_fd(), root_dev, 0);
         Ok(Self {
             root: canonical,
             c_root,
@@ -246,35 +257,35 @@ impl SandboxDispatcher {
         let (capability, keys): (&str, &[&str]) = match action.action_type.as_str() {
             WRITE_ACTION => (WRITE_CAPABILITY, &["content", "path"]),
             DELETE_ACTION => (DELETE_CAPABILITY, &["path"]),
-            _ => return Err(DispatchRefused("action_not_in_sandbox_allowlist")),
+            _ => return Err(DispatchRefused::terminal("action_not_in_sandbox_allowlist")),
         };
         if action.capability.as_deref() != Some(capability) {
-            return Err(DispatchRefused("capability_mismatch"));
+            return Err(DispatchRefused::terminal("capability_mismatch"));
         }
         if action.target.as_deref() != Some(self.target.as_str()) {
-            return Err(DispatchRefused("target_mismatch"));
+            return Err(DispatchRefused::terminal("target_mismatch"));
         }
         let parameters = action
             .parameters
             .as_object()
-            .ok_or(DispatchRefused("invalid_parameters"))?;
+            .ok_or(DispatchRefused::terminal("invalid_parameters"))?;
         let mut present: Vec<&str> = parameters.keys().map(String::as_str).collect();
         present.sort_unstable();
         if present != keys {
-            return Err(DispatchRefused("invalid_parameters"));
+            return Err(DispatchRefused::terminal("invalid_parameters"));
         }
         let path = parameters
             .get("path")
             .and_then(Value::as_str)
-            .ok_or(DispatchRefused("invalid_path"))?;
+            .ok_or(DispatchRefused::terminal("invalid_path"))?;
         validate_relative_path(path)?;
         if action.action_type == WRITE_ACTION {
             let content = parameters
                 .get("content")
                 .and_then(Value::as_str)
-                .ok_or(DispatchRefused("invalid_content"))?;
+                .ok_or(DispatchRefused::terminal("invalid_content"))?;
             if content.len() > self.max_content_bytes {
-                return Err(DispatchRefused("content_too_large"));
+                return Err(DispatchRefused::terminal("content_too_large"));
             }
             Ok(FsOp::Write { path, content })
         } else {
@@ -284,18 +295,26 @@ impl SandboxDispatcher {
 
     /// Fails closed when the configured path no longer names the directory
     /// opened at startup (renamed, removed or replaced, including by a
-    /// symlink).
+    /// symlink), or when that directory stopped satisfying the ownership,
+    /// mode and ACL requirements checked at open.
     fn check_root_unchanged(&self) -> Result<(), DispatchRefused> {
-        match fstatat_nofollow(libc::AT_FDCWD, &self.c_root) {
+        let path_stat = match fstatat_nofollow(libc::AT_FDCWD, &self.c_root) {
             Ok(stat)
                 if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
                     && stat.st_dev == self.root_dev
                     && stat.st_ino == self.root_ino =>
             {
-                Ok(())
+                stat
             }
-            _ => Err(DispatchRefused("sandbox_root_replaced")),
+            _ => return Err(DispatchRefused::terminal("sandbox_root_replaced")),
+        };
+        let fd_stat = fstat(self.root_fd.as_raw_fd())
+            .map_err(|_| DispatchRefused::transient("sandbox_root_unavailable"))?;
+        for stat in [&path_stat, &fd_stat] {
+            root_security(self.root_fd.as_raw_fd(), stat)
+                .map_err(|_| DispatchRefused::terminal("sandbox_root_insecure"))?;
         }
+        Ok(())
     }
 
     /// Walks every intermediate component without following symlinks or
@@ -306,7 +325,7 @@ impl SandboxDispatcher {
         let components: Vec<&str> = path.split('/').collect();
         let (name, directories) = components
             .split_last()
-            .ok_or(DispatchRefused("invalid_path"))?;
+            .ok_or(DispatchRefused::terminal("invalid_path"))?;
         let mut current = dup(self.root_fd.as_raw_fd())?;
         for directory in directories {
             let c = c_component(directory)?;
@@ -321,18 +340,18 @@ impl SandboxDispatcher {
             if fd < 0 {
                 return Err(match io::Error::last_os_error().raw_os_error() {
                     Some(libc::ELOOP) | Some(libc::ENOTDIR) => {
-                        DispatchRefused("symlink_or_non_directory_in_path")
+                        DispatchRefused::terminal("symlink_or_non_directory_in_path")
                     }
-                    Some(libc::ENOENT) => DispatchRefused("parent_directory_missing"),
-                    _ => DispatchRefused("parent_directory_unavailable"),
+                    Some(libc::ENOENT) => DispatchRefused::terminal("parent_directory_missing"),
+                    _ => DispatchRefused::transient("parent_directory_unavailable"),
                 });
             }
             // SAFETY: freshly opened, exclusively owned.
             current = unsafe { OwnedFd::from_raw_fd(fd) };
             let stat = fstat(current.as_raw_fd())
-                .map_err(|_| DispatchRefused("parent_directory_unavailable"))?;
+                .map_err(|_| DispatchRefused::transient("parent_directory_unavailable"))?;
             if stat.st_dev != self.root_dev {
-                return Err(DispatchRefused("mount_point_in_path"));
+                return Err(DispatchRefused::terminal("mount_point_in_path"));
             }
         }
         Ok((current, c_component(name)?))
@@ -549,39 +568,159 @@ impl ActionDispatcher for SandboxDispatcher {
 /// distinct, ordinary file names and are not detected.
 pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
     if path.is_empty() {
-        return Err(DispatchRefused("empty_path"));
+        return Err(DispatchRefused::terminal("empty_path"));
     }
     if path.len() > MAX_PATH_BYTES {
-        return Err(DispatchRefused("path_too_long"));
+        return Err(DispatchRefused::terminal("path_too_long"));
     }
     if path.starts_with('/') {
-        return Err(DispatchRefused("absolute_path"));
+        return Err(DispatchRefused::terminal("absolute_path"));
     }
     if path
         .chars()
         .any(|c| c.is_control() || c == '\\' || is_format_char(c))
     {
-        return Err(DispatchRefused("invalid_path_character"));
+        return Err(DispatchRefused::terminal("invalid_path_character"));
     }
     let mut depth = 0;
     for component in path.split('/') {
         depth += 1;
         match component {
-            "" => return Err(DispatchRefused("empty_path_component")),
-            "." | ".." => return Err(DispatchRefused("path_traversal")),
+            "" => return Err(DispatchRefused::terminal("empty_path_component")),
+            "." | ".." => return Err(DispatchRefused::terminal("path_traversal")),
             c if c.len() > MAX_COMPONENT_BYTES => {
-                return Err(DispatchRefused("path_component_too_long"));
+                return Err(DispatchRefused::terminal("path_component_too_long"));
             }
-            c if c.starts_with(TEMP_PREFIX) => {
-                return Err(DispatchRefused("reserved_file_name"));
+            c if is_temp_name(c.as_bytes()) => {
+                return Err(DispatchRefused::terminal("reserved_file_name"));
             }
             _ => {}
         }
     }
     if depth > MAX_PATH_DEPTH {
-        return Err(DispatchRefused("path_too_deep"));
+        return Err(DispatchRefused::terminal("path_too_deep"));
     }
     Ok(())
+}
+
+/// [`TEMP_PREFIX`], compared ASCII case-insensitively: on a case-insensitive
+/// filesystem (default APFS) `.PRAETORE-TMP-x` names the same entry.
+fn is_temp_name(name: &[u8]) -> bool {
+    name.len() >= TEMP_PREFIX.len()
+        && name[..TEMP_PREFIX.len()].eq_ignore_ascii_case(TEMP_PREFIX.as_bytes())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootProblem {
+    NotOwned,
+    Writable,
+    Acl,
+}
+
+/// Owned by the effective user, not group/other-writable, and (on macOS) no
+/// extended ACL entries, which could grant write access the mode bits do not
+/// show. On Linux, POSIX ACL entries are bounded by the ACL mask, which is
+/// reported as the group mode bits, so the mode check covers them.
+fn root_security(fd: RawFd, stat: &libc::stat) -> Result<(), RootProblem> {
+    // SAFETY: geteuid has no preconditions.
+    if stat.st_uid != unsafe { libc::geteuid() } {
+        return Err(RootProblem::NotOwned);
+    }
+    if stat.st_mode & 0o022 != 0 {
+        return Err(RootProblem::Writable);
+    }
+    if has_extended_acl(fd) {
+        return Err(RootProblem::Acl);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn has_extended_acl(fd: RawFd) -> bool {
+    // <sys/acl.h>: ACL_TYPE_EXTENDED, ACL_FIRST_ENTRY. Part of libSystem.
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: libc::c_int = 0;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *mut libc::c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut libc::c_void,
+        ) -> libc::c_int;
+        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
+    }
+    // SAFETY: valid fd; the returned ACL (if any) is freed below.
+    let acl = unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        // ENOENT: no ACL. Any other error: fail closed.
+        return io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT);
+    }
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: `acl` is a valid ACL; `entry` is a valid out-pointer.
+    let has_entry = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
+    // SAFETY: `acl` was returned by acl_get_fd_np and is freed once.
+    unsafe { acl_free(acl) };
+    has_entry
+}
+
+#[cfg(not(target_os = "macos"))]
+fn has_extended_acl(_fd: RawFd) -> bool {
+    false
+}
+
+/// Best-effort removal of leftover temporary files below `dirfd`, never
+/// following symlinks or crossing devices, bounded by [`MAX_PATH_DEPTH`].
+fn sweep_temp_files(dirfd: RawFd, root_dev: libc::dev_t, depth: usize) {
+    let Ok(dir) = dup(dirfd) else {
+        return;
+    };
+    // SAFETY: `dir` is an owned directory fd; fdopendir takes ownership.
+    let stream = unsafe { libc::fdopendir(dir.as_raw_fd()) };
+    if stream.is_null() {
+        return;
+    }
+    std::mem::forget(dir);
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` is a valid DIR*.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: d_name is NUL-terminated within the dirent.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            names.push(name.to_owned());
+        }
+    }
+    // SAFETY: closes the stream and its descriptor exactly once.
+    unsafe { libc::closedir(stream) };
+    for name in names {
+        let Ok(stat) = fstatat_nofollow(dirfd, &name) else {
+            continue;
+        };
+        match stat.st_mode & libc::S_IFMT {
+            libc::S_IFREG if is_temp_name(name.to_bytes()) => unlink_quietly(dirfd, &name),
+            libc::S_IFDIR if depth < MAX_PATH_DEPTH && stat.st_dev == root_dev => {
+                // SAFETY: valid dirfd and NUL-terminated name.
+                let fd = unsafe {
+                    libc::openat(
+                        dirfd,
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd >= 0 {
+                    // SAFETY: freshly opened, exclusively owned.
+                    let child = unsafe { OwnedFd::from_raw_fd(fd) };
+                    if fstat(child.as_raw_fd()).is_ok_and(|stat| stat.st_dev == root_dev) {
+                        sweep_temp_files(child.as_raw_fd(), root_dev, depth + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Invisible or direction-changing format characters.
@@ -609,10 +748,10 @@ fn check_entry(dirfd: RawFd, name: &CString, may_be_absent: bool) -> Result<(), 
             if may_be_absent {
                 Ok(())
             } else {
-                Err(DispatchRefused("file_not_found"))
+                Err(DispatchRefused::terminal("file_not_found"))
             }
         }
-        Err(_) => Err(DispatchRefused("file_unavailable")),
+        Err(_) => Err(DispatchRefused::transient("file_unavailable")),
     }
 }
 
@@ -622,14 +761,14 @@ fn unlink_quietly(dirfd: RawFd, name: &CString) {
 }
 
 fn c_component(component: &str) -> Result<CString, DispatchRefused> {
-    CString::new(component).map_err(|_| DispatchRefused("invalid_path_character"))
+    CString::new(component).map_err(|_| DispatchRefused::terminal("invalid_path_character"))
 }
 
 fn dup(fd: RawFd) -> Result<OwnedFd, DispatchRefused> {
     // SAFETY: `fd` is a valid open descriptor owned by the dispatcher.
     let new = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if new < 0 {
-        return Err(DispatchRefused("sandbox_root_unavailable"));
+        return Err(DispatchRefused::transient("sandbox_root_unavailable"));
     }
     // SAFETY: freshly duplicated, exclusively owned.
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
@@ -666,12 +805,12 @@ fn fstatat_nofollow(dirfd: RawFd, name: &CString) -> io::Result<libc::stat> {
 fn check_regular_single_link(stat: &libc::stat) -> Result<(), DispatchRefused> {
     match stat.st_mode & libc::S_IFMT {
         libc::S_IFREG => {}
-        libc::S_IFLNK => return Err(DispatchRefused("symlink_not_allowed")),
-        _ => return Err(DispatchRefused("not_a_regular_file")),
+        libc::S_IFLNK => return Err(DispatchRefused::terminal("symlink_not_allowed")),
+        _ => return Err(DispatchRefused::terminal("not_a_regular_file")),
     }
     // A hard link could alias an inode outside the sandbox.
     if stat.st_nlink != 1 {
-        return Err(DispatchRefused("hard_link_not_allowed"));
+        return Err(DispatchRefused::terminal("hard_link_not_allowed"));
     }
     Ok(())
 }
@@ -794,7 +933,10 @@ mod tests {
         let del = delete("sub/hola.txt");
         assert!(matches!(run(&d, 2, &del), Ok(DispatchReport::Confirmed(_))));
         assert!(!dirs.root.join("sub/hola.txt").exists());
-        assert_eq!(d.preflight(&del), Err(DispatchRefused("file_not_found")));
+        assert_eq!(
+            d.preflight(&del),
+            Err(DispatchRefused::terminal("file_not_found"))
+        );
     }
 
     #[test]
@@ -820,11 +962,11 @@ mod tests {
         ] {
             assert_eq!(
                 d.preflight(&write(&path, "x")),
-                Err(DispatchRefused("absolute_path"))
+                Err(DispatchRefused::terminal("absolute_path"))
             );
             assert_eq!(
                 d.preflight(&delete(&path)),
-                Err(DispatchRefused("absolute_path"))
+                Err(DispatchRefused::terminal("absolute_path"))
             );
             assert_eq!(run(&d, 11, &write(&path, "x")), Err(DispatchError));
         }
@@ -844,15 +986,15 @@ mod tests {
 
         assert_eq!(
             d.preflight(&write("link.txt", "pwned")),
-            Err(DispatchRefused("symlink_not_allowed"))
+            Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         assert_eq!(
             d.preflight(&write("dangling.txt", "pwned")),
-            Err(DispatchRefused("symlink_not_allowed"))
+            Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         assert_eq!(
             d.preflight(&delete("link.txt")),
-            Err(DispatchRefused("symlink_not_allowed"))
+            Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         // Even bypassing preflight, dispatch refuses (O_NOFOLLOW / lstat).
         assert_eq!(run(&d, 20, &write("link.txt", "pwned")), Err(DispatchError));
@@ -882,7 +1024,9 @@ mod tests {
         for path in ["escape/x.txt", "escape/victim.txt", "real/deeper/x.txt"] {
             assert_eq!(
                 d.preflight(&write(path, "pwned")),
-                Err(DispatchRefused("symlink_or_non_directory_in_path")),
+                Err(DispatchRefused::terminal(
+                    "symlink_or_non_directory_in_path"
+                )),
                 "{path}"
             );
             assert_eq!(
@@ -893,7 +1037,9 @@ mod tests {
         }
         assert_eq!(
             d.preflight(&delete("escape/victim.txt")),
-            Err(DispatchRefused("symlink_or_non_directory_in_path"))
+            Err(DispatchRefused::terminal(
+                "symlink_or_non_directory_in_path"
+            ))
         );
         assert_eq!(
             run(&d, 31, &delete("escape/victim.txt")),
@@ -912,15 +1058,18 @@ mod tests {
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
         assert_eq!(
             d.preflight(&write("", "x")),
-            Err(DispatchRefused("empty_path"))
+            Err(DispatchRefused::terminal("empty_path"))
         );
-        assert_eq!(d.preflight(&delete("")), Err(DispatchRefused("empty_path")));
+        assert_eq!(
+            d.preflight(&delete("")),
+            Err(DispatchRefused::terminal("empty_path"))
+        );
         for path in ["a//b", "dir/", "/"] {
             assert!(d.preflight(&write(path, "x")).is_err(), "{path}");
         }
         assert_eq!(
             d.preflight(&write("a\0b", "x")),
-            Err(DispatchRefused("invalid_path_character"))
+            Err(DispatchRefused::terminal("invalid_path_character"))
         );
         assert_eq!(run(&d, 40, &write("", "x")), Err(DispatchError));
         assert_eq!(std::fs::read_dir(&dirs.root).unwrap().count(), 0);
@@ -935,26 +1084,29 @@ mod tests {
             .unwrap();
         assert!(d.preflight(&write("ok.txt", "12345678")).is_ok());
         let big = write("big.txt", "123456789");
-        assert_eq!(d.preflight(&big), Err(DispatchRefused("content_too_large")));
+        assert_eq!(
+            d.preflight(&big),
+            Err(DispatchRefused::terminal("content_too_large"))
+        );
         assert_eq!(run(&d, 50, &big), Err(DispatchError));
         assert!(!dirs.root.join("big.txt").exists());
         let default = SandboxDispatcher::open(&dirs.root).unwrap();
         let huge = write("huge.txt", &"x".repeat(DEFAULT_MAX_CONTENT_BYTES + 1));
         assert_eq!(
             default.preflight(&huge),
-            Err(DispatchRefused("content_too_large"))
+            Err(DispatchRefused::terminal("content_too_large"))
         );
         assert_eq!(
             default.preflight(&write(&"a".repeat(256), "x")),
-            Err(DispatchRefused("path_component_too_long"))
+            Err(DispatchRefused::terminal("path_component_too_long"))
         );
         assert_eq!(
             default.preflight(&write(&"a/".repeat(600), "x")),
-            Err(DispatchRefused("path_too_long"))
+            Err(DispatchRefused::terminal("path_too_long"))
         );
         assert_eq!(
             default.preflight(&write(&format!("{}leaf", "a/".repeat(16)), "x")),
-            Err(DispatchRefused("path_too_deep"))
+            Err(DispatchRefused::terminal("path_too_deep"))
         );
         assert!(
             SandboxDispatcher::open(&dirs.root)
@@ -973,7 +1125,7 @@ mod tests {
         if std::fs::hard_link(&outside, dirs.root.join("hard.txt")).is_ok() {
             assert_eq!(
                 d.preflight(&write("hard.txt", "pwned")),
-                Err(DispatchRefused("hard_link_not_allowed"))
+                Err(DispatchRefused::terminal("hard_link_not_allowed"))
             );
             assert_eq!(run(&d, 60, &write("hard.txt", "pwned")), Err(DispatchError));
             assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
@@ -981,24 +1133,24 @@ mod tests {
         std::fs::create_dir(dirs.root.join("dir")).unwrap();
         assert_eq!(
             d.preflight(&write("dir", "x")),
-            Err(DispatchRefused("not_a_regular_file"))
+            Err(DispatchRefused::terminal("not_a_regular_file"))
         );
         assert_eq!(
             d.preflight(&delete("dir")),
-            Err(DispatchRefused("not_a_regular_file"))
+            Err(DispatchRefused::terminal("not_a_regular_file"))
         );
         let fifo = CString::new(dirs.root.join("fifo").as_os_str().as_bytes()).unwrap();
         // SAFETY: valid path.
         if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0 {
             assert_eq!(
                 d.preflight(&write("fifo", "x")),
-                Err(DispatchRefused("not_a_regular_file"))
+                Err(DispatchRefused::terminal("not_a_regular_file"))
             );
             assert_eq!(run(&d, 61, &write("fifo", "x")), Err(DispatchError));
         }
         assert_eq!(
             d.preflight(&write("missing/x.txt", "x")),
-            Err(DispatchRefused("parent_directory_missing"))
+            Err(DispatchRefused::terminal("parent_directory_missing"))
         );
     }
 
@@ -1015,7 +1167,7 @@ mod tests {
         .with_capability("shell:exec");
         assert_eq!(
             d.preflight(&exec),
-            Err(DispatchRefused("action_not_in_sandbox_allowlist"))
+            Err(DispatchRefused::terminal("action_not_in_sandbox_allowlist"))
         );
         assert_eq!(run(&d, 70, &exec), Err(DispatchError));
         let demo = Action::new(
@@ -1032,7 +1184,7 @@ mod tests {
         let wrong_cap = write("x", "y").with_capability("fs:delete");
         assert_eq!(
             d.preflight(&wrong_cap),
-            Err(DispatchRefused("capability_mismatch"))
+            Err(DispatchRefused::terminal("capability_mismatch"))
         );
         let wrong_target = Action::new(
             WRITE_ACTION,
@@ -1043,7 +1195,7 @@ mod tests {
         .with_capability(WRITE_CAPABILITY);
         assert_eq!(
             d.preflight(&wrong_target),
-            Err(DispatchRefused("target_mismatch"))
+            Err(DispatchRefused::terminal("target_mismatch"))
         );
         let extra = Action::new(
             WRITE_ACTION,
@@ -1054,7 +1206,7 @@ mod tests {
         .with_capability(WRITE_CAPABILITY);
         assert_eq!(
             d.preflight(&extra),
-            Err(DispatchRefused("invalid_parameters"))
+            Err(DispatchRefused::terminal("invalid_parameters"))
         );
         let with_demo = SandboxDispatcher::open(&dirs.root)
             .unwrap()
@@ -1139,7 +1291,7 @@ mod tests {
         assert!(no_temp_files(&dirs.root));
         assert_eq!(
             d.preflight(&write(&format!("{TEMP_PREFIX}x"), "x")),
-            Err(DispatchRefused("reserved_file_name"))
+            Err(DispatchRefused::terminal("reserved_file_name"))
         );
     }
 
@@ -1153,13 +1305,13 @@ mod tests {
         // Path missing.
         assert_eq!(
             d.preflight(&write("a.txt", "x")),
-            Err(DispatchRefused("sandbox_root_replaced"))
+            Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
         // Path replaced by another directory.
         std::fs::create_dir(&dirs.root).unwrap();
         assert_eq!(
             d.preflight(&write("a.txt", "x")),
-            Err(DispatchRefused("sandbox_root_replaced"))
+            Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
         assert_eq!(run(&d, 110, &write("a.txt", "x")), Err(DispatchError));
         assert_eq!(run(&d, 111, &delete("keep.txt")), Err(DispatchError));
@@ -1168,7 +1320,7 @@ mod tests {
         symlink(&moved, &dirs.root).unwrap();
         assert_eq!(
             d.preflight(&write("a.txt", "x")),
-            Err(DispatchRefused("sandbox_root_replaced"))
+            Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
         assert_eq!(run(&d, 112, &write("a.txt", "x")), Err(DispatchError));
         assert!(!moved.join("a.txt").exists());
@@ -1246,16 +1398,18 @@ mod tests {
         std::fs::write(dirs.root.join("file.txt"), "x").unwrap();
         assert_eq!(
             d.preflight(&write("file.txt/x", "x")),
-            Err(DispatchRefused("symlink_or_non_directory_in_path"))
+            Err(DispatchRefused::terminal(
+                "symlink_or_non_directory_in_path"
+            ))
         );
         if let Ok(_listener) = std::os::unix::net::UnixListener::bind(dirs.root.join("sock")) {
             assert_eq!(
                 d.preflight(&write("sock", "x")),
-                Err(DispatchRefused("not_a_regular_file"))
+                Err(DispatchRefused::terminal("not_a_regular_file"))
             );
             assert_eq!(
                 d.preflight(&delete("sock")),
-                Err(DispatchRefused("not_a_regular_file"))
+                Err(DispatchRefused::terminal("not_a_regular_file"))
             );
             assert_eq!(run(&d, 130, &write("sock", "x")), Err(DispatchError));
             assert!(std::fs::symlink_metadata(dirs.root.join("sock")).is_ok());
@@ -1276,7 +1430,7 @@ mod tests {
         ] {
             assert_eq!(
                 d.preflight(&write(path, "x")),
-                Err(DispatchRefused("invalid_path_character")),
+                Err(DispatchRefused::terminal("invalid_path_character")),
                 "{path:?}"
             );
         }
@@ -1328,5 +1482,106 @@ mod tests {
             );
         }
         assert!(no_temp_files(&dirs.root));
+    }
+
+    /// Review finding 5: mode and owner are re-validated on every
+    /// operation, not only at open.
+    #[test]
+    fn root_mode_changed_after_open_fails_closed() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        assert!(d.preflight(&write("a.txt", "x")).is_ok());
+        std::fs::set_permissions(&dirs.root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            d.preflight(&write("a.txt", "x")),
+            Err(DispatchRefused::terminal("sandbox_root_insecure"))
+        );
+        assert_eq!(run(&d, 400, &write("a.txt", "x")), Err(DispatchError));
+        assert!(!dirs.root.join("a.txt").exists());
+        std::fs::set_permissions(&dirs.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            run(&d, 401, &write("a.txt", "x")),
+            Ok(DispatchReport::Confirmed(_))
+        ));
+    }
+
+    /// Review finding 5 (macOS): an extended ACL can grant write access the
+    /// mode bits do not show; it is refused at open and on every operation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_extended_acl_on_root_is_refused() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let chmod = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("/bin/chmod")
+                    .args(args)
+                    .arg(&dirs.root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        chmod(&[
+            "+a",
+            "everyone allow add_file,add_subdirectory,delete_child",
+        ]);
+        assert!(matches!(
+            SandboxDispatcher::open(&dirs.root),
+            Err(SandboxConfigError::ExtendedAcl)
+        ));
+        assert_eq!(
+            d.preflight(&write("a.txt", "x")),
+            Err(DispatchRefused::terminal("sandbox_root_insecure"))
+        );
+        assert_eq!(run(&d, 410, &write("a.txt", "x")), Err(DispatchError));
+        assert!(!dirs.root.join("a.txt").exists());
+        chmod(&["-N"]);
+        assert!(SandboxDispatcher::open(&dirs.root).is_ok());
+        assert!(d.preflight(&write("a.txt", "x")).is_ok());
+    }
+
+    /// Review finding 6: the reserved prefix is matched case-insensitively
+    /// (case-insensitive APFS), and leftovers are swept at open without
+    /// following symlinks.
+    #[test]
+    fn temp_prefix_is_case_insensitive_and_leftovers_are_swept_at_open() {
+        let dirs = dirs();
+        for name in [".PRAETORE-TMP-x", ".Praetore-Tmp-y", "sub/.praetore-tmp-z"] {
+            assert_eq!(
+                validate_relative_path(name),
+                Err(DispatchRefused::terminal("reserved_file_name")),
+                "{name}"
+            );
+        }
+        std::fs::create_dir(dirs.root.join("sub")).unwrap();
+        std::fs::write(dirs.root.join(".praetore-tmp-abc"), "partial").unwrap();
+        std::fs::write(dirs.root.join("sub/.PRAETORE-TMP-def"), "partial").unwrap();
+        std::fs::write(dirs.root.join("keep.txt"), "keep").unwrap();
+        std::fs::create_dir(dirs.root.join(".praetore-tmp-dir")).unwrap();
+        std::fs::write(dirs.outside.join(".praetore-tmp-victim"), "outside").unwrap();
+        symlink(&dirs.outside, dirs.root.join("link")).unwrap();
+        symlink(
+            dirs.outside.join(".praetore-tmp-victim"),
+            dirs.root.join(".praetore-tmp-link"),
+        )
+        .unwrap();
+        SandboxDispatcher::open(&dirs.root).unwrap();
+        assert!(!dirs.root.join(".praetore-tmp-abc").exists());
+        assert!(!dirs.root.join("sub/.PRAETORE-TMP-def").exists());
+        assert!(dirs.root.join("keep.txt").exists());
+        // Only regular files are removed; links and directories stay, and
+        // nothing outside the root is touched.
+        assert!(dirs.root.join(".praetore-tmp-dir").is_dir());
+        assert!(
+            std::fs::symlink_metadata(dirs.root.join(".praetore-tmp-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dirs.outside.join(".praetore-tmp-victim")).unwrap(),
+            "outside"
+        );
     }
 }

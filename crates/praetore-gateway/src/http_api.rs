@@ -384,6 +384,14 @@ struct ErrorResponse {
     /// approved action, which the gateway (never the client) performs.
     #[serde(skip_serializing_if = "Option::is_none")]
     execution: Option<crate::ExecutionStatus>,
+    /// Only on `action_not_dispatchable` / `dispatch_temporarily_refused`:
+    /// the adapter's stable refusal code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    /// Only on `action_not_dispatchable` when the refusal closed the
+    /// execution: its signed `not_dispatched` / `dispatch_refused` receipt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt: Option<Box<crate::GatewayReceipt>>,
 }
 
 /// State of the same key reported alongside approval errors.
@@ -690,6 +698,8 @@ async fn approval_status(
                         resolution: Some(state.resolution),
                         expiration_receipt_id: None,
                         execution: Some(state.execution),
+                        reason: None,
+                        receipt: None,
                     }),
                 )
                     .into_response(),
@@ -758,6 +768,8 @@ fn approval_error_response(error: GatewayError, context: ApprovalErrorContext) -
             resolution: context.resolution,
             expiration_receipt_id: context.expiration_receipt_id,
             execution: None,
+            reason: None,
+            receipt: None,
         }),
     )
         .into_response()
@@ -812,8 +824,32 @@ fn gateway_error_response(error: GatewayError) -> Response {
         GatewayError::TenantIdentityInvalid => {
             error_response(StatusCode::BAD_REQUEST, "tenant_identity_invalid")
         }
-        GatewayError::DispatchRefused { .. } => {
-            error_response(StatusCode::FORBIDDEN, "action_not_dispatchable")
+        GatewayError::DispatchRefused {
+            reason,
+            transient,
+            receipt,
+            ..
+        } => {
+            let (status, code) = if transient {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "dispatch_temporarily_refused",
+                )
+            } else {
+                (StatusCode::FORBIDDEN, "action_not_dispatchable")
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    code,
+                    resolution: None,
+                    expiration_receipt_id: None,
+                    execution: None,
+                    reason: Some(reason),
+                    receipt,
+                }),
+            )
+                .into_response()
         }
         GatewayError::ExecutionNotFound(_) => {
             error_response(StatusCode::NOT_FOUND, "execution_not_found")
@@ -847,6 +883,8 @@ fn error_response(status: StatusCode, code: &'static str) -> Response {
             resolution: None,
             expiration_receipt_id: None,
             execution: None,
+            reason: None,
+            receipt: None,
         }),
     )
         .into_response()
@@ -890,16 +928,26 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_refusal_maps_to_forbidden() {
+    fn dispatch_refusal_maps_to_forbidden_and_transient_to_unavailable() {
+        let key = crate::ExecutionKey {
+            tenant_id: Uuid::nil(),
+            agent_id: Uuid::nil(),
+            request_id: Uuid::nil(),
+        };
         let response = gateway_error_response(GatewayError::DispatchRefused {
-            key: crate::ExecutionKey {
-                tenant_id: Uuid::nil(),
-                agent_id: Uuid::nil(),
-                request_id: Uuid::nil(),
-            },
+            key,
             reason: "path_traversal",
+            transient: false,
+            receipt: None,
         });
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = gateway_error_response(GatewayError::DispatchRefused {
+            key,
+            reason: "parent_directory_unavailable",
+            transient: true,
+            receipt: None,
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

@@ -136,12 +136,14 @@
 - **T-013:** `praetore_gateway::sandbox::SandboxDispatcher` (Unix), an
   `ActionDispatcher` executed by the gateway with a closed allowlist
   (`fs:write_file`, `fs:delete_file`) confined to a root directory.
-  - Root: absolute, canonical, not `/`, owned by the gateway user and not
-    group/other-writable; held open as a descriptor and refused
-    (`sandbox_root_replaced`) if the path stops naming that directory.
+  - Root: absolute, canonical, not `/`, owned by the gateway user, not
+    group/other-writable and (macOS) without extended ACL entries; held open
+    as a descriptor, refused (`sandbox_root_replaced`) if the path stops
+    naming that directory and (`sandbox_root_insecure`) if owner, mode or
+    ACL change later. Leftover temporary files are swept at open.
   - Paths: relative only; no `.`/`..`, empty components, NUL/control
     characters, `\`, Unicode bidi/zero-width format characters or the
-    reserved `.praetore-tmp-` prefix; bounded length and depth. Every
+    reserved `.praetore-tmp-` prefix (ASCII case-insensitive); bounded length and depth. Every
     component is opened with `openat(O_NOFOLLOW|O_DIRECTORY)`; symlinks at
     any level and mount points are refused. Targets must be absent or
     regular single-link files (no hard links, directories, FIFOs, sockets,
@@ -156,14 +158,31 @@
     contains/is inside the gateway directory); `praetore demo <dir> write
     <path> <content>` / `delete <path>` submit the two actions.
     `demo:set_value` is kept unchanged. No `exec`.
-- New `ActionDispatcher::preflight` (default: admit). The gateway runs it at
-  submission, on the approval challenge, status and decision, and in
+- New `ActionDispatcher::preflight` (default: admit) returning
+  `DispatchRefused::terminal` / `::transient`. The gateway runs it at
+  submission, on the approval challenge and decision, and in
   `claim_dispatch` after the approval is re-verified and the evidence
-  revalidated, before the journal claim. Refused actions are recorded
-  `not_dispatched` with a signed attestation (`dispatch_failed` reason at the
-  claim) and answered 403 `action_not_dispatchable`, never `outcome_unknown`;
-  a refused decision is not consumed.
-- **Breaking:** new `GatewayError::DispatchRefused` variant.
+  revalidated, before the journal claim. Status never runs it (it reports
+  journal state only).
+  - A refusal at submission closes the execution (allowed or held for
+    approval) as `not_dispatched` with the new signed reason
+    `dispatch_refused`; a held approval closed this way is final and can
+    never be approved, rejected or dispatched. HTTP 403
+    `action_not_dispatchable` carries `reason` and the signed `receipt`.
+  - At the claim, a terminal refusal closes `approved_pending_dispatch` as
+    `not_dispatched` / `dispatch_refused`; a transient one leaves it
+    `approved_pending_dispatch` (HTTP 503 `dispatch_temporarily_refused`).
+  - A refused challenge or decision changes nothing and consumes nothing.
+- New `NotDispatchedReason::DispatchRefused` (`dispatch_refused`, receipt
+  schema v3), the only reason also valid for `allowed` executions
+  (breaking for exhaustive matches; older verifiers reject it as unknown).
+  Migration `0013_dispatch_refused` accepts it in the journal and
+  attestation CHECKs, replaces the transition trigger with
+  `validate_execution_journal_transition_v3` (the reason is write-once; an
+  undecided requires_approval row may be closed with it), and refuses any
+  human decision for an execution closed with a reason.
+- **Breaking:** new `GatewayError::DispatchRefused { key, reason, transient,
+  receipt }` variant.
 - HTTP: `router_with_options` / `serve_local_with_options` (taking the same
   `ApiAuth`) with `HttpOptions::gateway_executes_effects`. Then
   `POST /v1/execute`, the approval challenge, decision, dispatch and
