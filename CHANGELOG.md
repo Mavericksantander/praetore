@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The praetore-mcp README documents installing without a clone:
+  `cargo install --git https://github.com/Mavericksantander/praetore
+  praetore-mcp --locked` (checked on macOS arm64 against `9735974`).
 - `praetore-mcp <command> --help` / `-h` prints that command's usage and
   exits 0 (it used to fail with `unexpected argument "--help"`). `--help`
   after `wrap ... --` is still passed to the MCP server. `praetore-mcp
