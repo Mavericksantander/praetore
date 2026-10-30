@@ -211,6 +211,34 @@ impl ApprovalChallenge {
     }
 }
 
+/// What an approver is shown: the challenge to sign and the exact persisted
+/// action whose digest it binds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalChallengeView {
+    pub challenge: ApprovalChallenge,
+    pub action: Action,
+}
+
+impl ApprovalChallengeView {
+    pub fn from_json(json: &str) -> Result<Self, ApprovalError> {
+        if json.len() > 131_072 {
+            return Err(ApprovalError::InvalidChallenge);
+        }
+        let value = praetore_core::canonical::parse_json_rejecting_duplicates(json)
+            .map_err(|_| ApprovalError::InvalidChallenge)?;
+        serde_json::from_value(value).map_err(|_| ApprovalError::InvalidChallenge)
+    }
+
+    /// True only when the displayed action hashes to the digest that the
+    /// challenge (and therefore the approver's signature) commits to.
+    pub fn action_matches_challenge(&self) -> bool {
+        self.action.validate().is_ok()
+            && action_digest(&self.action)
+                .is_ok_and(|digest| digest == self.challenge.action_digest)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanApprovalOutcome {
@@ -980,6 +1008,27 @@ impl Gateway {
             &record.evidence,
             &record.action_digest,
         )?)
+    }
+
+    /// The pending challenge together with the persisted action it binds,
+    /// so an approver can be shown exactly what it is about to sign.
+    pub fn approval_challenge_view(
+        &self,
+        key: ExecutionKey,
+    ) -> Result<ApprovalChallengeView, GatewayError> {
+        let challenge = self.approval_challenge(key)?;
+        let record = self
+            .journal
+            .get(key)?
+            .ok_or(GatewayError::ExecutionNotFound(key))?;
+        let view = ApprovalChallengeView {
+            challenge,
+            action: record.evidence.action,
+        };
+        if !view.action_matches_challenge() {
+            return Err(GatewayError::Journal(JournalError::InvalidRecord));
+        }
+        Ok(view)
     }
 
     /// Reports the human-approval state of exactly one execution key. It never

@@ -379,7 +379,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&address).await?;
         tracing::info!(%address, "PRÆTORE local demo gateway listening");
-        axum::serve(listener, http_api::router(gateway)).await?;
+        axum::serve(
+            listener,
+            http_api::router(gateway, http_api::ApiAuth::UnauthenticatedLoopbackDemo),
+        )
+        .await?;
         Ok::<_, std::io::Error>(())
     })?;
     Ok(())

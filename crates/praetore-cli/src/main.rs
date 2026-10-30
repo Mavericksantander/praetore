@@ -720,7 +720,12 @@ fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        http_api::serve_local(config.port, gateway).await?;
+        http_api::serve_local(
+            config.port,
+            gateway,
+            http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+        )
+        .await?;
         Ok::<_, io::Error>(())
     })?;
     Ok(())
