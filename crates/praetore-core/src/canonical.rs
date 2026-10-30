@@ -9,7 +9,21 @@ pub const CANONICAL_VERSION: u8 = 1;
 pub const MAX_JSON_DEPTH: usize = 32;
 pub const MAX_JSON_VALUE_BYTES: usize = 65_536;
 const MAX_JSON_NODES: usize = 16_384;
-const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Decodes lowercase hexadecimal only, the single encoding `hex::encode`
+/// emits. Signatures, digests and key ids have one valid textual form, so
+/// uppercase or mixed case is rejected rather than silently accepted.
+pub(crate) fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
+    if value
+        .bytes()
+        .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        hex::decode(value).ok()
+    } else {
+        None
+    }
+}
 
 pub fn parse_json_rejecting_duplicates(input: &str) -> Result<Value, String> {
     if input.len() > MAX_JSON_VALUE_BYTES {
@@ -122,6 +136,17 @@ pub(crate) fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_j
         ));
     }
     Ok(output)
+}
+
+/// Accepts only the canonical encoding of an Ed25519 signature produced by
+/// `hex::encode`: exactly 64 bytes as 128 lowercase hex digits. Uppercase or
+/// mixed case is rejected so each signed document has a single valid
+/// encoding. Shared by evidence and execution-attestation signatures.
+pub fn is_canonical_signature_hex(signature: &str) -> bool {
+    signature.len() == 128
+        && signature
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 pub fn canonicalize_json(input: &str) -> crate::Result<Vec<u8>> {
