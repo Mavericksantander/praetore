@@ -24,6 +24,12 @@ Usage:
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
   praetore-mcp verify    [--dir DIR]
+  praetore-mcp policy list   [--dir DIR]
+  praetore-mcp policy check  [--dir DIR]
+  praetore-mcp policy deny|require-approval|allow --id ID [--server NAME] [--tool NAME]
+                         [--arg-exact KEY=VALUE]... [--arg-path-prefix KEY=/abs/path]...
+                         [--arg-prefix KEY=VALUE]... [--any-tool] [--dir DIR]
+  praetore-mcp policy remove --id ID [--dir DIR]
 
 DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys. Observe mode records decisions but
@@ -32,6 +38,8 @@ never blocks; enforce mode blocks DENY and REQUIRE_APPROVAL decisions.";
 #[derive(Debug, Default)]
 struct Parsed {
     values: BTreeMap<String, String>,
+    /// Repeatable options, in command-line order.
+    multi: Vec<(String, String)>,
     flags: Vec<String>,
     rest: Vec<String>,
 }
@@ -39,6 +47,16 @@ struct Parsed {
 fn parse(
     args: &[String],
     with_value: &[&str],
+    flags: &[&str],
+    allow_rest: bool,
+) -> Result<Parsed, String> {
+    parse_multi(args, with_value, &[], flags, allow_rest)
+}
+
+fn parse_multi(
+    args: &[String],
+    with_value: &[&str],
+    repeatable: &[&str],
     flags: &[&str],
     allow_rest: bool,
 ) -> Result<Parsed, String> {
@@ -57,6 +75,12 @@ fn parse(
             if parsed.values.insert(arg.clone(), value.clone()).is_some() {
                 return Err(format!("{arg} given twice"));
             }
+            index += 2;
+        } else if repeatable.contains(&arg.as_str()) {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{arg} needs a value"))?;
+            parsed.multi.push((arg.clone(), value.clone()));
             index += 2;
         } else if flags.contains(&arg.as_str()) {
             parsed.flags.push(arg.clone());
@@ -99,6 +123,7 @@ pub fn run(args: &[String]) -> i32 {
         "uninstall" => cmd_install(rest, true),
         "receipts" => cmd_receipts(rest),
         "verify" => cmd_verify(rest),
+        "policy" => cmd_policy(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
             Ok(0)
@@ -235,7 +260,11 @@ fn backup_path(path: &Path) -> PathBuf {
 }
 
 /// Backs up, then atomically replaces `path`, keeping its permissions.
-fn write_with_backup(path: &Path, original: &str, updated: &str) -> Result<PathBuf, String> {
+pub(crate) fn write_with_backup(
+    path: &Path,
+    original: &str,
+    updated: &str,
+) -> Result<PathBuf, String> {
     let backup = backup_path(path);
     fs::copy(path, &backup)
         .map_err(|e| format!("cannot write backup {}: {e}", backup.display()))?;
@@ -449,4 +478,140 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     println!("observe receipts record a decision that was NOT enforced.");
     Ok(if report.failures.is_empty() { 0 } else { 1 })
+}
+
+fn read_policy(home: &Home) -> Result<(String, praetore_core::Policy), String> {
+    let path = home.policy();
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let policy = praetore_core::Policy::from_json(&text).map_err(|e| {
+        format!(
+            "{} is invalid ({e}); fix it (see `praetore-mcp policy check`) or restore a backup",
+            path.display()
+        )
+    })?;
+    Ok((text, policy))
+}
+
+fn save_policy(home: &Home, original: &str, updated: &str) -> Result<(), String> {
+    let backup = write_with_backup(&home.policy(), original, updated)?;
+    let digest = praetore_core::Policy::from_json(updated)
+        .and_then(|p| p.digest())
+        .map_err(|e| format!("written policy failed to re-validate: {e}"))?;
+    println!(
+        "updated {} (digest {digest}); backup at {}",
+        home.policy().display(),
+        backup.display()
+    );
+    Ok(())
+}
+
+fn cmd_policy(args: &[String]) -> Result<i32, String> {
+    use crate::policy::{self, ArgOperator, RuleSpec};
+    let Some((sub, rest)) = args.split_first() else {
+        return Err(format!("policy needs a subcommand\n\n{USAGE}"));
+    };
+    let code = match sub.as_str() {
+        "list" => {
+            let parsed = parse(rest, &["--dir"], &[], false)?;
+            let (_, policy) = read_policy(&parsed.home()?)?;
+            print!("{}", policy::render_list(&policy));
+            0
+        }
+        "check" => {
+            let parsed = parse(rest, &["--dir"], &[], false)?;
+            let home = parsed.home()?;
+            let path = home.policy();
+            let text = fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            match praetore_core::Policy::from_json(&text).and_then(|p| p.digest().map(|d| (p, d))) {
+                Err(error) => {
+                    println!("INVALID {}: {error}", path.display());
+                    1
+                }
+                Ok((parsed_policy, digest)) => {
+                    let warnings = policy::lint(&parsed_policy);
+                    for warning in &warnings {
+                        println!("warning: {warning}");
+                    }
+                    // Build the same engine `wrap` builds, so key/pin/policy
+                    // problems surface here instead of as refused calls.
+                    let engine = if home.is_initialized() {
+                        crate::gate::Gate::load(&home, Mode::Observe).map(|_| ())
+                    } else {
+                        Err(format!("{} is not initialized", home.root.display()))
+                    };
+                    match engine {
+                        Ok(()) => {
+                            println!(
+                                "OK {} policy {} v{}: {} rule(s), digest {digest}, {} warning(s); HighAssurance engine starts",
+                                path.display(),
+                                parsed_policy.id,
+                                parsed_policy.version,
+                                parsed_policy.rules.len(),
+                                warnings.len()
+                            );
+                            0
+                        }
+                        Err(error) => {
+                            println!("INVALID engine: {error}");
+                            1
+                        }
+                    }
+                }
+            }
+        }
+        "remove" => {
+            let parsed = parse(rest, &["--dir", "--id"], &[], false)?;
+            let id = parsed.value("--id").ok_or("policy remove needs --id")?;
+            let home = parsed.home()?;
+            let (original, current) = read_policy(&home)?;
+            let updated = policy::remove_rule(&current, id)?;
+            save_policy(&home, &original, &updated)?;
+            println!("removed rule {id:?}");
+            0
+        }
+        effect_name => {
+            let Some(effect) = policy::parse_effect(effect_name) else {
+                return Err(format!(
+                    "unknown policy subcommand {effect_name:?} (list, check, deny, require-approval, allow, remove)"
+                ));
+            };
+            let parsed = parse_multi(
+                rest,
+                &["--dir", "--id", "--server", "--tool"],
+                &["--arg-exact", "--arg-path-prefix", "--arg-prefix"],
+                &["--any-tool"],
+                false,
+            )?;
+            let mut conditions = Vec::new();
+            for (flag, value) in &parsed.multi {
+                let operator = match flag.as_str() {
+                    "--arg-exact" => ArgOperator::Exact,
+                    "--arg-path-prefix" => ArgOperator::PathPrefix,
+                    _ => ArgOperator::Prefix,
+                };
+                conditions.push(policy::parse_arg(value, operator)?);
+            }
+            let spec = RuleSpec {
+                id: parsed
+                    .value("--id")
+                    .ok_or("policy rules need --id")?
+                    .to_owned(),
+                server: parsed.value("--server").map(str::to_owned),
+                tool: parsed.value("--tool").map(str::to_owned),
+                args: conditions,
+                any_tool: parsed.flag("--any-tool"),
+            };
+            let rule = policy::build_rule(effect, &spec)?;
+            let home = parsed.home()?;
+            let (original, current) = read_policy(&home)?;
+            let updated = policy::add_rule(&current, rule)?;
+            save_policy(&home, &original, &updated)?;
+            println!("added {effect_name} rule {:?}", spec.id);
+            0
+        }
+    };
+    println!("{}", policy::RESTART_REMINDER);
+    Ok(code)
 }

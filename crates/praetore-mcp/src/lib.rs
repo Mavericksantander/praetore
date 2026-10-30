@@ -6,6 +6,7 @@ pub mod cli;
 pub mod gate;
 pub mod install;
 pub mod json;
+pub mod policy;
 pub mod proxy;
 pub mod receipts;
 pub mod relay;
