@@ -13,18 +13,47 @@
 //! else is refused in [`ActionDispatcher::preflight`], so the gateway records
 //! it as `not_dispatched` instead of `outcome_unknown`. There is no `exec`.
 //!
-//! Confinement does not rely on string checks alone: the root is opened once
-//! as a directory file descriptor, and every path component is resolved with
-//! `openat(2)` relative to its parent using `O_NOFOLLOW | O_DIRECTORY`, so a
-//! symlink anywhere on the path (intermediate or final) fails with
-//! `ELOOP`/`ENOTDIR` instead of being followed. Files are opened with
-//! `O_NOFOLLOW | O_NONBLOCK`, checked to be regular single-link files, and
-//! only then truncated. Deletion uses `fstatat(AT_SYMLINK_NOFOLLOW)` and
-//! `unlinkat` on the parent descriptor. Intermediate directories are never
-//! created.
+//! # Confinement
 //!
-//! Idempotency and reconciliation records are kept in memory and are lost on
-//! restart, like the local demo adapter.
+//! Confinement does not rely on string checks alone:
+//!
+//! - The root must be an absolute, canonical, existing directory (not `/`),
+//!   owned by the gateway's effective user and not writable by group or
+//!   others. It is opened once as a directory file descriptor and its
+//!   device/inode is checked against the path. Before every preflight and
+//!   dispatch the path is checked again to still name that same directory;
+//!   if the root was renamed or replaced, the action is refused (fail closed).
+//! - Paths are validated lexically first: relative only, no `.`/`..`, no
+//!   empty components, no NUL/control characters, no `\`, no Unicode
+//!   bidirectional or zero-width format characters, bounded length and depth.
+//! - Every component is then resolved with `openat(2)` relative to the
+//!   previous directory descriptor using `O_NOFOLLOW | O_DIRECTORY`, so a
+//!   symlink at any level fails instead of being followed, and the kernel
+//!   never resolves `..`. A component on another device (a mount point) is
+//!   refused. Intermediate directories are never created.
+//! - The final component must be absent (write) or a regular file with a
+//!   single link (write and delete); symlinks, hard links, directories,
+//!   FIFOs, sockets and devices are refused.
+//!
+//! # Effects
+//!
+//! - `fs:write_file` is atomic: the content is written to a fresh
+//!   `O_CREAT | O_EXCL | O_NOFOLLOW` temporary file (mode `0600`) in the
+//!   target's directory, `fsync`ed, and `renameat`ed over the target, then
+//!   the directory is `fsync`ed. `renameat` replaces the directory entry and
+//!   never opens or follows what was there, so even a target swapped for a
+//!   symlink, hard link or special file after the checks cannot redirect the
+//!   write outside the root. Replaced files get mode `0600` and the gateway
+//!   user as owner. Content is limited (16 KiB by default).
+//! - `fs:delete_file` uses `unlinkat(…, 0)` on the parent descriptor, which
+//!   never removes a directory and removes a symlink itself, never its target.
+//!
+//! Residual risks (documented, not solved here): a process that can rename
+//! directories inside the root *and* write outside it can move an already
+//! opened directory out of the root while a single operation is in flight;
+//! there is no quota on the number of files; and idempotency/reconciliation
+//! records are kept in memory and are lost on restart, like the local demo
+//! adapter.
 
 use crate::{
     ActionDispatcher, DispatchError, DispatchRefused, DispatchReport, ExecutionKey,
@@ -58,6 +87,11 @@ pub const MAX_CONTENT_BYTES_LIMIT: usize = 32_768;
 pub const MAX_PATH_BYTES: usize = 1024;
 pub const MAX_COMPONENT_BYTES: usize = 255;
 pub const MAX_PATH_DEPTH: usize = 16;
+/// Prefix of the temporary files used for atomic writes. Paths whose final
+/// component starts with it are refused, so an action can never target one.
+pub const TEMP_PREFIX: &str = ".praetore-tmp-";
+/// Mode of every file created or replaced by `fs:write_file`.
+pub const FILE_MODE: u32 = 0o600;
 
 #[derive(Debug, Error)]
 pub enum SandboxConfigError {
@@ -69,20 +103,36 @@ pub enum SandboxConfigError {
     NotDirectory,
     #[error("sandbox root must be canonical (no symlinks, `.` or `..`): {0}")]
     NotCanonical(PathBuf),
+    #[error("sandbox root must not be the filesystem root")]
+    FilesystemRoot,
+    #[error("sandbox root must be owned by the gateway user")]
+    NotOwned,
+    #[error("sandbox root must not be writable by group or others")]
+    InsecurePermissions,
+    #[error("sandbox root changed while it was being opened")]
+    Replaced,
     #[error("sandbox root is not accessible: {0}")]
     Io(#[from] io::Error),
     #[error("sandbox content limit must be between 1 byte and 32 KiB")]
     InvalidLimit,
 }
 
+/// What the adapter knows about one execution key, for idempotency and
+/// read-only reconciliation.
 #[derive(Default)]
 struct Records {
+    /// Effects performed: action digest and output.
     executions: HashMap<ExecutionKey, (String, Value)>,
+    /// Dispatches that failed before any change to the target: digest.
+    not_applied: HashMap<ExecutionKey, String>,
 }
 
 pub struct SandboxDispatcher {
     root: PathBuf,
+    c_root: CString,
     root_fd: OwnedFd,
+    root_dev: libc::dev_t,
+    root_ino: libc::ino_t,
     target: String,
     max_content_bytes: usize,
     demo: Option<LocalDemoDispatcher>,
@@ -94,15 +144,25 @@ enum FsOp<'a> {
     Delete { path: &'a str },
 }
 
+/// A dispatch attempt that failed before anything changed at the target, so
+/// reconciliation may truthfully report `NotApplied`. Every failure after
+/// the effect point (`renameat`/`unlinkat`) is reported as success with
+/// `Executed` instead, because the effect did happen.
+struct BeforeEffect;
+
 impl SandboxDispatcher {
-    /// Opens `root` fail-closed: it must exist, be an absolute, canonical,
-    /// non-symlink directory. The directory is held open for the lifetime of
-    /// the dispatcher, so renaming or replacing the path later has no effect.
+    /// Opens `root` fail-closed: it must exist and be an absolute, canonical,
+    /// non-symlink directory other than `/`, owned by the effective user and
+    /// not writable by group or others. The directory is held open for the
+    /// lifetime of the dispatcher; if the path later stops naming that same
+    /// directory, every action is refused.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SandboxConfigError> {
         let root = root.as_ref();
         if !root.is_absolute() {
             return Err(SandboxConfigError::NotAbsolute);
         }
+        let c_root = CString::new(root.as_os_str().as_bytes())
+            .map_err(|_| SandboxConfigError::NotCanonical(root.to_path_buf()))?;
         let metadata = std::fs::symlink_metadata(root)?;
         if metadata.file_type().is_symlink() {
             return Err(SandboxConfigError::Symlink);
@@ -114,8 +174,10 @@ impl SandboxDispatcher {
         if canonical != root {
             return Err(SandboxConfigError::NotCanonical(canonical));
         }
-        let c_root = CString::new(canonical.as_os_str().as_bytes())
-            .map_err(|_| SandboxConfigError::NotCanonical(canonical.clone()))?;
+        if canonical.parent().is_none() {
+            return Err(SandboxConfigError::FilesystemRoot);
+        }
+        let before = fstatat_nofollow(libc::AT_FDCWD, &c_root)?;
         // SAFETY: valid NUL-terminated path; the returned fd is owned below.
         let fd = unsafe {
             libc::open(
@@ -128,9 +190,32 @@ impl SandboxDispatcher {
         }
         // SAFETY: `fd` is a freshly opened descriptor owned by nobody else.
         let root_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The descriptor, not the path, is authoritative: it must be the
+        // directory that was inspected above (no swap during the checks).
+        let stat = fstat(root_fd.as_raw_fd())?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(SandboxConfigError::NotDirectory);
+        }
+        let (root_dev, root_ino) = (stat.st_dev, stat.st_ino);
+        if before.st_mode & libc::S_IFMT != libc::S_IFDIR
+            || root_dev != before.st_dev
+            || root_ino != before.st_ino
+        {
+            return Err(SandboxConfigError::Replaced);
+        }
+        // SAFETY: geteuid has no preconditions.
+        if stat.st_uid != unsafe { libc::geteuid() } {
+            return Err(SandboxConfigError::NotOwned);
+        }
+        if stat.st_mode & 0o022 != 0 {
+            return Err(SandboxConfigError::InsecurePermissions);
+        }
         Ok(Self {
             root: canonical,
+            c_root,
             root_fd,
+            root_dev,
+            root_ino,
             target: DEFAULT_TARGET.into(),
             max_content_bytes: DEFAULT_MAX_CONTENT_BYTES,
             demo: None,
@@ -197,9 +282,27 @@ impl SandboxDispatcher {
         }
     }
 
-    /// Walks every intermediate component without following symlinks and
-    /// returns the parent directory fd plus the final component name.
+    /// Fails closed when the configured path no longer names the directory
+    /// opened at startup (renamed, removed or replaced, including by a
+    /// symlink).
+    fn check_root_unchanged(&self) -> Result<(), DispatchRefused> {
+        match fstatat_nofollow(libc::AT_FDCWD, &self.c_root) {
+            Ok(stat)
+                if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                    && stat.st_dev == self.root_dev
+                    && stat.st_ino == self.root_ino =>
+            {
+                Ok(())
+            }
+            _ => Err(DispatchRefused("sandbox_root_replaced")),
+        }
+    }
+
+    /// Walks every intermediate component without following symlinks or
+    /// crossing mount points and returns the parent directory fd plus the
+    /// final component name.
     fn open_parent(&self, path: &str) -> Result<(OwnedFd, CString), DispatchRefused> {
+        self.check_root_unchanged()?;
         let components: Vec<&str> = path.split('/').collect();
         let (name, directories) = components
             .split_last()
@@ -226,6 +329,11 @@ impl SandboxDispatcher {
             }
             // SAFETY: freshly opened, exclusively owned.
             current = unsafe { OwnedFd::from_raw_fd(fd) };
+            let stat = fstat(current.as_raw_fd())
+                .map_err(|_| DispatchRefused("parent_directory_unavailable"))?;
+            if stat.st_dev != self.root_dev {
+                return Err(DispatchRefused("mount_point_in_path"));
+            }
         }
         Ok((current, c_component(name)?))
     }
@@ -236,14 +344,7 @@ impl SandboxDispatcher {
             FsOp::Write { path, .. } | FsOp::Delete { path } => path,
         };
         let (parent, name) = self.open_parent(path)?;
-        match fstatat_nofollow(parent.as_raw_fd(), &name) {
-            Ok(stat) => check_regular_single_link(&stat),
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => match op {
-                FsOp::Write { .. } => Ok(()),
-                FsOp::Delete { .. } => Err(DispatchRefused("file_not_found")),
-            },
-            Err(_) => Err(DispatchRefused("file_unavailable")),
-        }
+        check_entry(parent.as_raw_fd(), &name, matches!(op, FsOp::Write { .. }))
     }
 
     fn admit(&self, action: &Action) -> Result<(), DispatchRefused> {
@@ -254,62 +355,95 @@ impl SandboxDispatcher {
         self.check_final(&op)
     }
 
-    fn perform(&self, op: &FsOp<'_>) -> Result<DispatchReport, DispatchError> {
+    fn perform(&self, op: &FsOp<'_>) -> Result<DispatchReport, BeforeEffect> {
         match op {
             FsOp::Write { path, content } => {
-                let (parent, name) = self.open_parent(path).map_err(|_| DispatchError)?;
-                // SAFETY: valid dirfd and NUL-terminated name. O_NOFOLLOW makes
-                // a final symlink fail; O_NONBLOCK keeps a FIFO from blocking.
+                let (parent, name) = self.open_parent(path).map_err(|_| BeforeEffect)?;
+                let dirfd = parent.as_raw_fd();
+                check_entry(dirfd, &name, true).map_err(|_| BeforeEffect)?;
+                let temp = CString::new(format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple()))
+                    .map_err(|_| BeforeEffect)?;
+                // SAFETY: valid dirfd and NUL-terminated name. O_EXCL and
+                // O_NOFOLLOW guarantee a brand-new regular file.
                 let fd = unsafe {
                     libc::openat(
-                        parent.as_raw_fd(),
-                        name.as_ptr(),
+                        dirfd,
+                        temp.as_ptr(),
                         libc::O_WRONLY
                             | libc::O_CREAT
+                            | libc::O_EXCL
                             | libc::O_NOFOLLOW
-                            | libc::O_NONBLOCK
                             | libc::O_CLOEXEC,
-                        0o600 as libc::c_uint,
+                        FILE_MODE as libc::c_uint,
                     )
                 };
                 if fd < 0 {
-                    return Err(DispatchError);
+                    return Err(BeforeEffect);
                 }
                 // SAFETY: freshly opened, exclusively owned.
                 let mut file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-                let stat = fstat(file.as_raw_fd()).map_err(|_| DispatchError)?;
-                check_regular_single_link(&stat).map_err(|_| DispatchError)?;
-                file.set_len(0).map_err(|_| DispatchError)?;
-                file.write_all(content.as_bytes())
-                    .map_err(|_| DispatchError)?;
-                file.sync_all().map_err(|_| DispatchError)?;
-                let written = fstat(file.as_raw_fd()).map_err(|_| DispatchError)?;
+                let prepared = (|| {
+                    // SAFETY: valid fd. Makes the mode independent of umask.
+                    if unsafe { libc::fchmod(file.as_raw_fd(), FILE_MODE as libc::mode_t) } != 0 {
+                        return Err(());
+                    }
+                    file.write_all(content.as_bytes()).map_err(|_| ())?;
+                    file.sync_all().map_err(|_| ())?;
+                    let stat = fstat(file.as_raw_fd()).map_err(|_| ())?;
+                    if stat.st_size as u64 != content.len() as u64 {
+                        return Err(());
+                    }
+                    // Re-check right before the rename (narrows, does not
+                    // need to close, the window: rename never follows).
+                    check_entry(dirfd, &name, true).map_err(|_| ())?;
+                    Ok(stat)
+                })();
+                let temp_stat = match prepared {
+                    Ok(stat) => stat,
+                    Err(()) => {
+                        unlink_quietly(dirfd, &temp);
+                        return Err(BeforeEffect);
+                    }
+                };
+                // SAFETY: valid dirfds and NUL-terminated names.
+                if unsafe { libc::renameat(dirfd, temp.as_ptr(), dirfd, name.as_ptr()) } != 0 {
+                    unlink_quietly(dirfd, &temp);
+                    return Err(BeforeEffect);
+                }
+                // SAFETY: valid directory fd.
+                let synced = unsafe { libc::fsync(dirfd) } == 0;
                 let output = json!({
                     "action": WRITE_ACTION,
                     "path": path,
                     "bytes": content.len(),
                     "sha256": hex::encode(Sha256::digest(content.as_bytes())),
                 });
-                if written.st_size as u64 == content.len() as u64 {
-                    Ok(DispatchReport::Confirmed(output))
+                let confirmed = synced
+                    && fstatat_nofollow(dirfd, &name).is_ok_and(|stat| {
+                        stat.st_dev == temp_stat.st_dev
+                            && stat.st_ino == temp_stat.st_ino
+                            && stat.st_size == temp_stat.st_size
+                    });
+                Ok(if confirmed {
+                    DispatchReport::Confirmed(output)
                 } else {
-                    Ok(DispatchReport::Executed(output))
-                }
+                    DispatchReport::Executed(output)
+                })
             }
             FsOp::Delete { path } => {
-                let (parent, name) = self.open_parent(path).map_err(|_| DispatchError)?;
-                let stat =
-                    fstatat_nofollow(parent.as_raw_fd(), &name).map_err(|_| DispatchError)?;
-                check_regular_single_link(&stat).map_err(|_| DispatchError)?;
-                // SAFETY: valid dirfd and NUL-terminated name; flag 0 = file.
-                if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-                    return Err(DispatchError);
+                let (parent, name) = self.open_parent(path).map_err(|_| BeforeEffect)?;
+                let dirfd = parent.as_raw_fd();
+                check_entry(dirfd, &name, false).map_err(|_| BeforeEffect)?;
+                // SAFETY: valid dirfd and NUL-terminated name. Flag 0 never
+                // removes a directory and removes a symlink, not its target.
+                if unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) } != 0 {
+                    return Err(BeforeEffect);
                 }
                 // SAFETY: valid directory fd.
-                unsafe { libc::fsync(parent.as_raw_fd()) };
+                let synced = unsafe { libc::fsync(dirfd) } == 0;
                 let output = json!({"action": DELETE_ACTION, "path": path});
-                match fstatat_nofollow(parent.as_raw_fd(), &name) {
-                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                match fstatat_nofollow(dirfd, &name) {
+                    Err(error) if synced && error.raw_os_error() == Some(libc::ENOENT) => {
                         Ok(DispatchReport::Confirmed(output))
                     }
                     _ => Ok(DispatchReport::Executed(output)),
@@ -345,15 +479,31 @@ impl ActionDispatcher for SandboxDispatcher {
                 Err(DispatchError)
             };
         }
-        let op = self.parse(action).map_err(|_| DispatchError)?;
-        let report = self.perform(&op)?;
-        let output = match &report {
-            DispatchReport::Executed(output) | DispatchReport::Confirmed(output) => output.clone(),
+        if records.not_applied.contains_key(&key) {
+            // A key is dispatched at most once by the gateway; never retry.
+            return Err(DispatchError);
+        }
+        let result = match self.parse(action) {
+            Ok(op) => self.perform(&op),
+            Err(_) => Err(BeforeEffect),
         };
-        records
-            .executions
-            .insert(key, (action_digest.to_owned(), output));
-        Ok(report)
+        match result {
+            Ok(report) => {
+                let output = match &report {
+                    DispatchReport::Executed(output) | DispatchReport::Confirmed(output) => {
+                        output.clone()
+                    }
+                };
+                records
+                    .executions
+                    .insert(key, (action_digest.to_owned(), output));
+                Ok(report)
+            }
+            Err(BeforeEffect) => {
+                records.not_applied.insert(key, action_digest.to_owned());
+                Err(DispatchError)
+            }
+        }
     }
 
     fn reconcile(
@@ -376,7 +526,11 @@ impl ActionDispatcher for SandboxDispatcher {
             Some((digest, output)) if digest == action_digest => {
                 ReconciliationReport::Applied(output.clone())
             }
-            _ => ReconciliationReport::Unknown,
+            Some(_) => ReconciliationReport::Unknown,
+            None => match records.not_applied.get(&key) {
+                Some(digest) if digest == action_digest => ReconciliationReport::NotApplied,
+                _ => ReconciliationReport::Unknown,
+            },
         }
     }
 
@@ -387,7 +541,12 @@ impl ActionDispatcher for SandboxDispatcher {
 
 /// Accepts only `name(/name)*` with each name a normal, non-empty component.
 /// Rejects absolute paths, `.`/`..`, empty components (`a//b`, trailing `/`),
-/// NUL and control characters, backslashes, and excessive length or depth.
+/// NUL and control characters (C0, DEL, C1), backslashes, Unicode
+/// bidirectional and zero-width format characters (which could make the path
+/// shown to an approver differ from the one written), names starting with
+/// [`TEMP_PREFIX`], and excessive length or depth. This is lexical only:
+/// visually confusable names (for example Cyrillic `а` for Latin `a`) are
+/// distinct, ordinary file names and are not detected.
 pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
     if path.is_empty() {
         return Err(DispatchRefused("empty_path"));
@@ -399,8 +558,8 @@ pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
         return Err(DispatchRefused("absolute_path"));
     }
     if path
-        .bytes()
-        .any(|byte| byte.is_ascii_control() || byte == b'\\')
+        .chars()
+        .any(|c| c.is_control() || c == '\\' || is_format_char(c))
     {
         return Err(DispatchRefused("invalid_path_character"));
     }
@@ -413,6 +572,9 @@ pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
             c if c.len() > MAX_COMPONENT_BYTES => {
                 return Err(DispatchRefused("path_component_too_long"));
             }
+            c if c.starts_with(TEMP_PREFIX) => {
+                return Err(DispatchRefused("reserved_file_name"));
+            }
             _ => {}
         }
     }
@@ -420,6 +582,43 @@ pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
         return Err(DispatchRefused("path_too_deep"));
     }
     Ok(())
+}
+
+/// Invisible or direction-changing format characters.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+    )
+}
+
+/// The final entry must be absent (only when `may_be_absent`) or a regular
+/// file with exactly one link. Never follows a symlink.
+fn check_entry(dirfd: RawFd, name: &CString, may_be_absent: bool) -> Result<(), DispatchRefused> {
+    match fstatat_nofollow(dirfd, name) {
+        Ok(stat) => check_regular_single_link(&stat),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            if may_be_absent {
+                Ok(())
+            } else {
+                Err(DispatchRefused("file_not_found"))
+            }
+        }
+        Err(_) => Err(DispatchRefused("file_unavailable")),
+    }
+}
+
+fn unlink_quietly(dirfd: RawFd, name: &CString) {
+    // SAFETY: valid dirfd and NUL-terminated name.
+    unsafe { libc::unlinkat(dirfd, name.as_ptr(), 0) };
 }
 
 fn c_component(component: &str) -> Result<CString, DispatchRefused> {
@@ -481,7 +680,8 @@ fn check_regular_single_link(stat: &libc::stat) -> Result<(), DispatchRefused> {
 mod tests {
     use super::*;
     use praetore_core::AgentId;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     struct Dirs {
@@ -504,6 +704,9 @@ mod tests {
         let outside = base.join("outside");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
+        // Independent of the process umask: the root must not be group- or
+        // other-writable.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         Dirs {
             base,
             root,
@@ -889,5 +1092,241 @@ mod tests {
             SandboxDispatcher::open(dirs.root.join("../root")),
             Err(SandboxConfigError::NotCanonical(_))
         ));
+    }
+
+    fn no_temp_files(dir: &Path) -> bool {
+        std::fs::read_dir(dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TEMP_PREFIX)
+        })
+    }
+
+    #[test]
+    fn writes_are_atomic_owner_only_and_leave_no_temporary_files() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let existing = dirs.root.join("existing.txt");
+        std::fs::write(&existing, "old content that is longer").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let before = std::fs::metadata(&existing).unwrap();
+        assert!(matches!(
+            run(&d, 100, &write("existing.txt", "new")),
+            Ok(DispatchReport::Confirmed(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&existing).unwrap(), "new");
+        let after = std::fs::metadata(&existing).unwrap();
+        // Replaced by rename (a new inode), never truncated in place.
+        assert_ne!(
+            std::os::unix::fs::MetadataExt::ino(&before),
+            std::os::unix::fs::MetadataExt::ino(&after)
+        );
+        assert_eq!(after.permissions().mode() & 0o7777, FILE_MODE);
+        assert!(matches!(
+            run(&d, 101, &write("created.txt", "")),
+            Ok(DispatchReport::Confirmed(ref o)) if o["bytes"] == 0
+        ));
+        assert_eq!(
+            std::fs::metadata(dirs.root.join("created.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            FILE_MODE
+        );
+        assert!(no_temp_files(&dirs.root));
+        assert_eq!(
+            d.preflight(&write(&format!("{TEMP_PREFIX}x"), "x")),
+            Err(DispatchRefused("reserved_file_name"))
+        );
+    }
+
+    #[test]
+    fn root_renamed_or_replaced_after_open_fails_closed() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        std::fs::write(dirs.root.join("keep.txt"), "x").unwrap();
+        let moved = dirs.base.join("moved");
+        std::fs::rename(&dirs.root, &moved).unwrap();
+        // Path missing.
+        assert_eq!(
+            d.preflight(&write("a.txt", "x")),
+            Err(DispatchRefused("sandbox_root_replaced"))
+        );
+        // Path replaced by another directory.
+        std::fs::create_dir(&dirs.root).unwrap();
+        assert_eq!(
+            d.preflight(&write("a.txt", "x")),
+            Err(DispatchRefused("sandbox_root_replaced"))
+        );
+        assert_eq!(run(&d, 110, &write("a.txt", "x")), Err(DispatchError));
+        assert_eq!(run(&d, 111, &delete("keep.txt")), Err(DispatchError));
+        std::fs::remove_dir(&dirs.root).unwrap();
+        // Path replaced by a symlink to the original directory.
+        symlink(&moved, &dirs.root).unwrap();
+        assert_eq!(
+            d.preflight(&write("a.txt", "x")),
+            Err(DispatchRefused("sandbox_root_replaced"))
+        );
+        assert_eq!(run(&d, 112, &write("a.txt", "x")), Err(DispatchError));
+        assert!(!moved.join("a.txt").exists());
+        assert!(moved.join("keep.txt").exists());
+        // The failed dispatches are known not to have changed anything.
+        let action = write("a.txt", "x");
+        let digest = crate::action_digest(&action).unwrap();
+        assert_eq!(
+            d.reconcile(key(112), &authority(), &action, &digest),
+            ReconciliationReport::NotApplied
+        );
+        // Never retried for the same key.
+        std::fs::remove_file(&dirs.root).unwrap();
+        std::fs::rename(&moved, &dirs.root).unwrap();
+        assert_eq!(run(&d, 112, &action), Err(DispatchError));
+        assert!(!dirs.root.join("a.txt").exists());
+        // Back in place: works again for a new key.
+        assert!(matches!(
+            run(&d, 113, &action),
+            Ok(DispatchReport::Confirmed(_))
+        ));
+    }
+
+    #[test]
+    fn insecure_or_filesystem_roots_are_refused() {
+        let dirs = dirs();
+        assert!(matches!(
+            SandboxDispatcher::open("/"),
+            Err(SandboxConfigError::FilesystemRoot)
+        ));
+        for mode in [0o770, 0o707, 0o777] {
+            std::fs::set_permissions(&dirs.root, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(
+                    SandboxDispatcher::open(&dirs.root),
+                    Err(SandboxConfigError::InsecurePermissions)
+                ),
+                "{mode:o}"
+            );
+        }
+        std::fs::set_permissions(&dirs.root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(SandboxDispatcher::open(&dirs.root).is_ok());
+    }
+
+    #[test]
+    fn deletes_never_remove_directories_symlinks_targets_or_special_files() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let victim = dirs.outside.join("victim.txt");
+        std::fs::write(&victim, "original").unwrap();
+        std::fs::create_dir(dirs.root.join("dir")).unwrap();
+        std::fs::write(dirs.root.join("dir/inner.txt"), "x").unwrap();
+        symlink(&victim, dirs.root.join("link")).unwrap();
+        symlink(&dirs.outside, dirs.root.join("dirlink")).unwrap();
+        for (n, path) in ["dir", "link", "dirlink", "dirlink/victim.txt", "missing"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(d.preflight(&delete(path)).is_err(), "{path}");
+            assert_eq!(
+                run(&d, 120 + n as u128, &delete(path)),
+                Err(DispatchError),
+                "{path}"
+            );
+        }
+        assert!(dirs.root.join("dir/inner.txt").exists());
+        assert!(std::fs::symlink_metadata(dirs.root.join("link")).is_ok());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "original");
+    }
+
+    #[test]
+    fn sockets_and_files_used_as_directories_are_refused() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        std::fs::write(dirs.root.join("file.txt"), "x").unwrap();
+        assert_eq!(
+            d.preflight(&write("file.txt/x", "x")),
+            Err(DispatchRefused("symlink_or_non_directory_in_path"))
+        );
+        if let Ok(_listener) = std::os::unix::net::UnixListener::bind(dirs.root.join("sock")) {
+            assert_eq!(
+                d.preflight(&write("sock", "x")),
+                Err(DispatchRefused("not_a_regular_file"))
+            );
+            assert_eq!(
+                d.preflight(&delete("sock")),
+                Err(DispatchRefused("not_a_regular_file"))
+            );
+            assert_eq!(run(&d, 130, &write("sock", "x")), Err(DispatchError));
+            assert!(std::fs::symlink_metadata(dirs.root.join("sock")).is_ok());
+        }
+    }
+
+    #[test]
+    fn unicode_is_lexical_format_characters_are_refused() {
+        let dirs = dirs();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        for path in [
+            "evil\u{202E}txt.exe",
+            "a\u{200B}b",
+            "x\u{2066}y",
+            "bom\u{FEFF}",
+            "c1\u{0085}",
+            "del\u{7F}",
+        ] {
+            assert_eq!(
+                d.preflight(&write(path, "x")),
+                Err(DispatchRefused("invalid_path_character")),
+                "{path:?}"
+            );
+        }
+        // Lookalikes are ordinary names inside the root, never traversal:
+        // U+2024 ONE DOT LEADER, U+FF0F FULLWIDTH SOLIDUS, Cyrillic а.
+        for (n, path) in ["\u{2024}\u{2024}", "a\u{FF0F}b", "p\u{0430}sswd"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                matches!(
+                    run(&d, 140 + n as u128, &write(path, "x")),
+                    Ok(DispatchReport::Confirmed(_))
+                ),
+                "{path}"
+            );
+            assert!(dirs.root.join(path).is_file(), "{path}");
+        }
+        assert!(outside_is_empty(&dirs));
+        assert_eq!(std::fs::read_dir(dirs.base.as_path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_writes_are_serialized_and_never_torn() {
+        let dirs = dirs();
+        let d = Arc::new(SandboxDispatcher::open(&dirs.root).unwrap());
+        let threads: Vec<_> = (0..16u128)
+            .map(|n| {
+                let d = Arc::clone(&d);
+                std::thread::spawn(move || {
+                    let content = n.to_string().repeat(1000);
+                    run(&d, 200 + n, &write("shared.txt", &content)).unwrap();
+                    run(&d, 300 + n, &write(&format!("own-{n}.txt"), &content)).unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let shared = std::fs::read_to_string(dirs.root.join("shared.txt")).unwrap();
+        assert!(
+            (0..16u128).any(|n| shared == n.to_string().repeat(1000)),
+            "torn write"
+        );
+        for n in 0..16u128 {
+            assert_eq!(
+                std::fs::read_to_string(dirs.root.join(format!("own-{n}.txt"))).unwrap(),
+                n.to_string().repeat(1000)
+            );
+        }
+        assert!(no_temp_files(&dirs.root));
     }
 }

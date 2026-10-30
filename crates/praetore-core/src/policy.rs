@@ -9,7 +9,7 @@ use crate::{
     canonical::{
         MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
     },
-    decision::{Decision, DecisionContribution},
+    decision::{Decision, DecisionContribution, RecoveryObligation},
     error::{PraetoreError, Result},
     identity::AgentIdentity,
 };
@@ -137,6 +137,11 @@ pub struct Policy {
     )]
     pub semantics_version: u8,
     pub rules: Vec<PolicyRule>,
+    /// SAF-10: upper bound for a human-approval window, in milliseconds.
+    /// A RequireApproval request whose signed intent window is longer is
+    /// rejected. Omitted when `None`, so existing digests do not change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_approval_ms: Option<u64>,
 }
 
 fn legacy_policy_semantics_version() -> u8 {
@@ -155,6 +160,7 @@ impl Policy {
             canonical_version: crate::canonical::CANONICAL_VERSION,
             semantics_version: 1,
             rules,
+            max_approval_ms: None,
         }
     }
 
@@ -191,11 +197,25 @@ impl Policy {
         let mut decision: Option<Decision> = None;
 
         for rule in &self.rules {
-            if !rule.matches(agent, authority, action, context, self.semantics_version) {
-                continue;
-            }
-
-            let rule_decision = rule.decision()?;
+            let rule_decision = match rule.matches(
+                agent,
+                authority,
+                action,
+                context,
+                self.semantics_version,
+            ) {
+                RuleMatch::No => continue,
+                RuleMatch::Bound => rule.decision()?,
+                // A restrictive rule that applies only because the authority
+                // lacks its capability or the action has no target must not
+                // offer a path to dispatch (RequireApproval) or trigger a
+                // recovery obligation (Recover): it denies (fail closed).
+                RuleMatch::Unbound if rule.effect == PolicyEffect::Deny => rule.decision()?,
+                RuleMatch::Unbound => Decision::deny(format!(
+                    "Policy rule '{}' matched without its required capability or target; denied",
+                    rule.id
+                )),
+            };
 
             let contribution = DecisionContribution::new(
                 rule.id.clone(),
@@ -217,6 +237,40 @@ impl Policy {
                 self.id, self.version
             ))
         }))
+    }
+
+    /// SAF-10 decision 4 (CTO, 29-oct-2026): load-time coherence of human
+    /// approval against the declared control loop. Checks declarations only;
+    /// it does not measure real timings.
+    fn validate_approval_loops(&self) -> Result<()> {
+        if self.max_approval_ms == Some(0) {
+            return Err(PraetoreError::PolicyEvaluationFailed(
+                "max_approval_ms must be greater than zero".into(),
+            ));
+        }
+        for rule in &self.rules {
+            if rule.effect != PolicyEffect::RequireApproval {
+                continue;
+            }
+            match (self.max_approval_ms, rule.control_loop, rule.delta_ms) {
+                // Fail closed (CTO, 29-oct-2026): on the fast loop both bounds
+                // must be declared, and delta_ms must cover max_approval_ms.
+                (None, Some(ControlLoop::Fast), _) | (_, Some(ControlLoop::Fast), None) => {
+                    return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                        "policy rule '{}' requires approval on the fast control loop without both max_approval_ms and delta_ms",
+                        rule.id
+                    )));
+                }
+                (Some(max), _, Some(delta)) if delta < max => {
+                    return Err(PraetoreError::PolicyEvaluationFailed(format!(
+                        "policy rule '{}' requires approval with delta_ms {delta} below max_approval_ms {max}",
+                        rule.id
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub fn digest(&self) -> Result<String> {
@@ -272,6 +326,7 @@ impl Policy {
         for rule in &self.rules {
             rule.validate()?;
         }
+        self.validate_approval_loops()?;
 
         for (index, rule) in self.rules.iter().enumerate() {
             if self.rules[..index]
@@ -318,6 +373,21 @@ pub struct PolicyRule {
     pub target: Option<String>,
     pub parameter_conditions: Vec<PolicyCondition>,
     pub context_conditions: Vec<PolicyCondition>,
+    /// SAF-10: control loop the rule governs. Omitted when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_loop: Option<ControlLoop>,
+    /// SAF-10: declared reaction budget δ of the governed loop, in ms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta_ms: Option<u64>,
+}
+
+/// SAF-10: the control loop a rule governs. Human approval is never
+/// coherent on the fast loop without a declared approval bound.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlLoop {
+    Fast,
+    Slow,
 }
 
 impl PolicyRule {
@@ -334,7 +404,19 @@ impl PolicyRule {
             target: None,
             parameter_conditions: Vec::new(),
             context_conditions: Vec::new(),
+            control_loop: None,
+            delta_ms: None,
         }
+    }
+
+    pub fn with_control_loop(mut self, control_loop: ControlLoop) -> Self {
+        self.control_loop = Some(control_loop);
+        self
+    }
+
+    pub fn with_delta_ms(mut self, delta_ms: u64) -> Self {
+        self.delta_ms = Some(delta_ms);
+        self
     }
 
     pub fn with_capability(mut self, capability: impl Into<String>) -> Self {
@@ -364,25 +446,39 @@ impl PolicyRule {
         action: &Action,
         context: &BTreeMap<String, Value>,
         semantics_version: u8,
-    ) -> bool {
+    ) -> RuleMatch {
         if self.action_type != action.action_type {
-            return false;
-        }
-
-        if let Some(required_capability) = &self.required_capability
-            && !authority.permits(required_capability)
-        {
-            return false;
-        }
-
-        if let Some(required_target) = &self.target
-            && action.target.as_deref() != Some(required_target.as_str())
-        {
-            return false;
+            return RuleMatch::No;
         }
 
         // Deny and RequireApproval rules are "restrictive".
         let deny_like = self.effect != PolicyEffect::Allow;
+
+        // A rule capability narrows Allow rules only. A restrictive rule keeps
+        // applying when the authority lacks it, in every semantics version;
+        // otherwise an authority without e.g. `payments:large` would skip the
+        // approval rule and fall through to a broader Allow. Such a match is
+        // `Unbound` and only ever denies (see `evaluate_with_context`).
+        let mut bound = true;
+        if let Some(required_capability) = &self.required_capability
+            && !authority.permits(required_capability)
+        {
+            if !deny_like {
+                return RuleMatch::No;
+            }
+            bound = false;
+        }
+
+        // Targets are exact, case-sensitive identifiers. A missing action
+        // target is unknown: it matches restrictive rules in every semantics
+        // version and never matches Allow rules.
+        if let Some(required_target) = &self.target {
+            match action.target.as_deref() {
+                Some(target) if target == required_target => {}
+                None if deny_like => bound = false,
+                _ => return RuleMatch::No,
+            }
+        }
         let restrictive = semantics_version >= 2 && deny_like;
         let holds = |result: ConditionMatch| match result {
             ConditionMatch::True => true,
@@ -392,23 +488,48 @@ impl PolicyRule {
             // Unsafe path-like value: always matches Deny/RequireApproval and
             // never matches Allow, in every semantics version (fail closed).
             ConditionMatch::UnsafeValue => deny_like,
+            // Integer against floating-point representation: restrictive rules
+            // use the exact numeric result in every semantics version; Allow
+            // never matches a mixed representation (fail closed).
+            ConditionMatch::MixedNumber(result) => deny_like && result,
         };
-        self.parameter_conditions
+        let conditions_hold = self
+            .parameter_conditions
             .iter()
             .all(|condition| holds(condition.matches(&action.parameters, restrictive)))
             && self
                 .context_conditions
                 .iter()
-                .all(|condition| holds(condition.matches_map(context, restrictive)))
+                .all(|condition| holds(condition.matches_map(context, restrictive)));
+        match (conditions_hold, bound) {
+            (false, _) => RuleMatch::No,
+            (true, true) => RuleMatch::Bound,
+            (true, false) => RuleMatch::Unbound,
+        }
     }
 
     fn decision(&self) -> Result<Decision> {
         let reason = format!("Policy rule '{}' matched", self.id);
 
-        match self.effect {
+        match &self.effect {
             PolicyEffect::Allow => Ok(Decision::allow(reason)),
             PolicyEffect::Deny => Ok(Decision::deny(reason)),
             PolicyEffect::RequireApproval => Ok(Decision::require_approval(reason)),
+            PolicyEffect::Recover {
+                recovery_id,
+                deadline_ms,
+            } => {
+                let recovery = RecoveryObligation {
+                    recovery_id: recovery_id.clone(),
+                    rule_id: self.id.clone(),
+                    reason: reason.clone(),
+                    deadline_ms: *deadline_ms,
+                };
+                recovery
+                    .validate()
+                    .map_err(|message| PraetoreError::PolicyEvaluationFailed(message.into()))?;
+                Ok(Decision::recover(reason, recovery))
+            }
         }
     }
 
@@ -477,6 +598,31 @@ impl PolicyRule {
         validate_conditions(&self.id, "parameter", &self.parameter_conditions)?;
         validate_conditions(&self.id, "context", &self.context_conditions)?;
 
+        if let PolicyEffect::Recover {
+            recovery_id,
+            deadline_ms,
+        } = &self.effect
+        {
+            check_limit(
+                PolicyLimit::RuleIdBytes,
+                recovery_id.len(),
+                MAX_POLICY_TEXT_BYTES,
+            )?;
+            RecoveryObligation {
+                recovery_id: recovery_id.clone(),
+                rule_id: self.id.clone(),
+                reason: String::new(),
+                deadline_ms: *deadline_ms,
+            }
+            .validate()
+            .map_err(|message| {
+                PraetoreError::PolicyEvaluationFailed(format!(
+                    "policy rule '{}': {message}",
+                    self.id
+                ))
+            })?;
+        }
+
         Ok(())
     }
 }
@@ -544,6 +690,8 @@ impl PolicyCondition {
             MatchOperator::Exact => {
                 if actual == &self.expected {
                     ConditionMatch::True
+                } else if let Some((order, true)) = compare_numeric(actual, &self.expected) {
+                    ConditionMatch::MixedNumber(order == Ordering::Equal)
                 } else if same_json_type(actual, &self.expected) {
                     ConditionMatch::False
                 } else {
@@ -579,10 +727,21 @@ impl PolicyCondition {
                 let Some(values) = self.expected.as_array() else {
                     return ConditionMatch::Unknown;
                 };
+                let mixed = |equal: bool| {
+                    values.iter().any(|value| {
+                        compare_numeric(actual, value).is_some_and(|(order, mixed)| {
+                            mixed && (order == Ordering::Equal) == equal
+                        })
+                    })
+                };
                 if values.contains(actual) {
                     ConditionMatch::True
+                } else if mixed(true) {
+                    ConditionMatch::MixedNumber(true)
                 } else if values.iter().any(|value| same_json_type(actual, value)) {
                     ConditionMatch::False
+                } else if mixed(false) {
+                    ConditionMatch::MixedNumber(false)
                 } else {
                     ConditionMatch::Unknown
                 }
@@ -591,7 +750,7 @@ impl PolicyCondition {
             | MatchOperator::GreaterThanOrEqual
             | MatchOperator::LessThan
             | MatchOperator::LessThanOrEqual => {
-                let Some(order) = compare_numeric(actual, &self.expected) else {
+                let Some((order, mixed)) = compare_numeric(actual, &self.expected) else {
                     return if restrictive {
                         ConditionMatch::Unknown
                     } else {
@@ -605,7 +764,9 @@ impl PolicyCondition {
                     MatchOperator::LessThanOrEqual => order != Ordering::Greater,
                     _ => unreachable!(),
                 };
-                if matches {
+                if mixed {
+                    ConditionMatch::MixedNumber(matches)
+                } else if matches {
                     ConditionMatch::True
                 } else {
                     ConditionMatch::False
@@ -691,6 +852,18 @@ impl PolicyCondition {
     }
 }
 
+/// How a rule matched an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleMatch {
+    No,
+    /// The authority holds the rule's capability and the action names its
+    /// target (when the rule declares them).
+    Bound,
+    /// A restrictive rule matched although the authority lacks its capability
+    /// or the action has no target.
+    Unbound,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConditionMatch {
     True,
@@ -698,6 +871,9 @@ enum ConditionMatch {
     Unknown,
     /// A string value that is unsafe for a path-like operator.
     UnsafeValue,
+    /// Exact numeric result of comparing an integer with a floating-point
+    /// number; see `holds` in `PolicyRule::matches`.
+    MixedNumber(bool),
 }
 
 fn same_json_type(left: &Value, right: &Value) -> bool {
@@ -812,41 +988,66 @@ fn path_segments(path: &str) -> Option<Vec<&str>> {
     Some(segments)
 }
 
-fn compare_numeric(actual: &Value, expected: &Value) -> Option<Ordering> {
-    let actual = actual.as_number()?;
-    let expected = expected.as_number()?;
-
-    if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_i64()) {
-        return Some(actual.cmp(&expected));
+/// Exact numeric ordering of two JSON numbers, and whether one side is an
+/// integer and the other a floating-point number. No lossy cast is used: an
+/// integer is never converted to `f64`.
+fn compare_numeric(actual: &Value, expected: &Value) -> Option<(Ordering, bool)> {
+    match (json_number(actual)?, json_number(expected)?) {
+        (JsonNumber::Integer(actual), JsonNumber::Integer(expected)) => {
+            Some((actual.cmp(&expected), false))
+        }
+        (JsonNumber::Float(actual), JsonNumber::Float(expected)) => {
+            Some((actual.partial_cmp(&expected)?, false))
+        }
+        (JsonNumber::Integer(actual), JsonNumber::Float(expected)) => {
+            Some((compare_integer_float(actual, expected)?, true))
+        }
+        (JsonNumber::Float(actual), JsonNumber::Integer(expected)) => {
+            Some((compare_integer_float(expected, actual)?.reverse(), true))
+        }
     }
+}
 
-    if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_u64()) {
-        return Some(actual.cmp(&expected));
+enum JsonNumber {
+    Integer(i128),
+    Float(f64),
+}
+
+fn json_number(value: &Value) -> Option<JsonNumber> {
+    let number = value.as_number()?;
+    if let Some(integer) = number.as_i64() {
+        Some(JsonNumber::Integer(integer.into()))
+    } else if let Some(integer) = number.as_u64() {
+        Some(JsonNumber::Integer(integer.into()))
+    } else {
+        number.as_f64().map(JsonNumber::Float)
     }
+}
 
-    if let (Some(actual), Some(expected)) = (actual.as_i64(), expected.as_u64()) {
-        return Some(if actual < 0 {
-            Ordering::Less
-        } else {
-            (actual as u64).cmp(&expected)
-        });
-    }
-
-    if let (Some(actual), Some(expected)) = (actual.as_u64(), expected.as_i64()) {
-        return Some(if expected < 0 {
-            Ordering::Greater
-        } else {
-            actual.cmp(&(expected as u64))
-        });
-    }
-
-    let actual_is_float = actual.as_i64().is_none() && actual.as_u64().is_none();
-    let expected_is_float = expected.as_i64().is_none() && expected.as_u64().is_none();
-    if !actual_is_float || !expected_is_float {
+/// Exact ordering of `integer` relative to `float`.
+fn compare_integer_float(integer: i128, float: f64) -> Option<Ordering> {
+    // 2^127; every finite f64 in [-2^127, 2^127) has an integral part that
+    // fits in i128 exactly, so the cast below is lossless.
+    const LIMIT: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    if float.is_nan() {
         return None;
     }
-
-    actual.as_f64()?.partial_cmp(&expected.as_f64()?)
+    if float >= LIMIT {
+        return Some(Ordering::Less);
+    }
+    if float < -LIMIT {
+        return Some(Ordering::Greater);
+    }
+    let whole = float.trunc();
+    // `float - whole` is exact for f64; only its sign matters.
+    let fraction = float - whole;
+    Some(integer.cmp(&(whole as i128)).then(if fraction > 0.0 {
+        Ordering::Less
+    } else if fraction < 0.0 {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    }))
 }
 
 fn validate_conditions(rule_id: &str, scope: &str, conditions: &[PolicyCondition]) -> Result<()> {
@@ -921,11 +1122,17 @@ fn conditions_conflict(left: &PolicyCondition, right: &PolicyCondition) -> bool 
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PolicyEffect {
     Allow,
     Deny,
     RequireApproval,
+    /// SAF-10: deny the proposed action and oblige entry into the
+    /// predeclared safe mode `recovery_id` within `deadline_ms`.
+    Recover {
+        recovery_id: String,
+        deadline_ms: u64,
+    },
 }
 
 #[cfg(test)]
@@ -1374,8 +1581,8 @@ mod tests {
                     "precedence-test",
                     1,
                     vec![
-                        PolicyRule::new("rule-left", "read_data", *left_effect),
-                        PolicyRule::new("rule-right", "read_data", *right_effect),
+                        PolicyRule::new("rule-left", "read_data", left_effect.clone()),
+                        PolicyRule::new("rule-right", "read_data", right_effect.clone()),
                     ],
                 );
 
@@ -1655,12 +1862,56 @@ mod tests {
         );
         assert_eq!(
             mixed_type.matches(&json!({"count": 1}), false),
-            ConditionMatch::False
+            ConditionMatch::MixedNumber(false)
+        );
+        assert_eq!(
+            mixed_type.matches(&json!({"count": 2}), false),
+            ConditionMatch::MixedNumber(true)
         );
         assert_eq!(
             mixed_type.matches(&json!({"count": "2"}), true),
             ConditionMatch::Unknown
         );
+    }
+
+    #[test]
+    fn integer_float_comparison_is_exact_without_lossy_casts() {
+        let cases: &[(i128, f64, Ordering)] = &[
+            (10_000, 10_000.0, Ordering::Equal),
+            (10_000, 10_000.5, Ordering::Less),
+            (10_001, 10_000.5, Ordering::Greater),
+            (-3, -2.5, Ordering::Less),
+            (-2, -2.5, Ordering::Greater),
+            (0, -0.0, Ordering::Equal),
+            // 2^53 + 1 is not representable as f64; a lossy cast would say Equal.
+            (
+                9_007_199_254_740_993,
+                9_007_199_254_740_992.0,
+                Ordering::Greater,
+            ),
+            (i64::MAX.into(), 9_223_372_036_854_775_808.0, Ordering::Less),
+            (
+                u64::MAX.into(),
+                18_446_744_073_709_551_616.0,
+                Ordering::Less,
+            ),
+            (
+                i64::MIN.into(),
+                -9_223_372_036_854_775_808.0,
+                Ordering::Equal,
+            ),
+            (u64::MAX.into(), 1e300, Ordering::Less),
+            (i64::MIN.into(), -1e300, Ordering::Greater),
+            (0, f64::MIN_POSITIVE, Ordering::Less),
+        ];
+        for &(integer, float, expected) in cases {
+            assert_eq!(
+                compare_integer_float(integer, float),
+                Some(expected),
+                "{integer} vs {float}"
+            );
+        }
+        assert_eq!(compare_integer_float(0, f64::NAN), None);
     }
 
     #[test]
