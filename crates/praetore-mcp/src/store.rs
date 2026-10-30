@@ -146,9 +146,9 @@ pub fn init(home: &Home) -> Result<InitOutcome, String> {
         ));
     }
 
-    create_private_dir(&home.root)?;
-    create_private_dir(&home.keys_dir())?;
-    create_private_dir(&home.receipts_dir())?;
+    ensure_dir(&home.root, true)?;
+    ensure_dir(&home.keys_dir(), false)?;
+    ensure_dir(&home.receipts_dir(), false)?;
 
     let issuer_secret = random_secret();
     let agent_secret = random_secret();
@@ -263,15 +263,32 @@ fn write_new(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-pub fn create_private_dir(path: &Path) -> Result<(), String> {
-    fs::create_dir_all(path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("cannot restrict {}: {e}", path.display()))?;
+/// Ensures `path` is a directory. Directories this tool creates get 0700
+/// at creation (including missing parents); an existing directory is used
+/// as is and never chmod-ed. With `allow_symlink == false`, a symlink at
+/// `path` is refused instead of followed.
+pub fn ensure_dir(path: &Path, allow_symlink: bool) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() && !allow_symlink => Err(format!(
+            "{} is a symlink; refusing to follow it",
+            path.display()
+        )),
+        Ok(_) if path.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} exists and is not a directory", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder
+                .create(path)
+                .map_err(|e| format!("cannot create {}: {e}", path.display()))
+        }
+        Err(error) => Err(format!("cannot stat {}: {error}", path.display())),
     }
-    Ok(())
 }
 
 /// Everything `wrap` and `verify` need, loaded from the home.

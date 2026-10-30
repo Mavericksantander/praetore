@@ -177,8 +177,9 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
-fn valid_server_name(name: &str) -> bool {
+pub(crate) fn valid_server_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.starts_with('-')
         && name.len() <= 128
         && name == name.trim()
         && !name.chars().any(char::is_control)
@@ -203,7 +204,7 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
     };
     if !valid_server_name(&name) {
         return Err(format!(
-            "invalid server name {name:?} (1-128 printable characters)"
+            "invalid server name {name:?} (1-128 printable characters, not starting with '-')"
         ));
     }
     Ok(relay::run(relay::WrapOptions {
@@ -233,63 +234,6 @@ fn confirm(path: &Path, yes: bool) -> bool {
         return false;
     }
     matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
-fn backup_path(path: &Path) -> PathBuf {
-    let now = time::OffsetDateTime::now_utc();
-    let stamp = format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        now.year(),
-        u8::from(now.month()),
-        now.day(),
-        now.hour(),
-        now.minute(),
-        now.second()
-    );
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".praetore-backup-{stamp}"));
-    let mut candidate = path.with_file_name(&name);
-    let mut counter = 1;
-    while candidate.exists() {
-        let mut numbered = name.clone();
-        numbered.push(format!("-{counter}"));
-        candidate = path.with_file_name(numbered);
-        counter += 1;
-    }
-    candidate
-}
-
-/// Backs up, then atomically replaces `path`, keeping its permissions.
-pub(crate) fn write_with_backup(
-    path: &Path,
-    original: &str,
-    updated: &str,
-) -> Result<PathBuf, String> {
-    let backup = backup_path(path);
-    fs::copy(path, &backup)
-        .map_err(|e| format!("cannot write backup {}: {e}", backup.display()))?;
-    // Verify the backup is byte-identical before touching the original.
-    if fs::read_to_string(&backup).ok().as_deref() != Some(original) {
-        return Err(format!(
-            "backup {} does not match the original; aborting",
-            backup.display()
-        ));
-    }
-    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
-    tmp_name.push(format!(".praetore-tmp-{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    let result = (|| -> std::io::Result<()> {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(updated.as_bytes())?;
-        file.sync_all()?;
-        fs::set_permissions(&tmp, fs::metadata(path)?.permissions())?;
-        fs::rename(&tmp, path)
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("cannot update {}: {error}", path.display()));
-    }
-    Ok(backup)
 }
 
 fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
@@ -352,15 +296,15 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             .and_then(|exe| exe.canonicalize())
             .map_err(|e| format!("cannot locate the praetore-mcp executable: {e}"))?;
         Some(WrapTarget {
-            exe: exe
-                .to_str()
-                .ok_or("praetore-mcp executable path is not UTF-8")?
-                .to_owned(),
-            dir: home
-                .root
-                .to_str()
-                .ok_or("home directory path is not UTF-8")?
-                .to_owned(),
+            exe: install::strip_verbatim_prefix(
+                exe.to_str()
+                    .ok_or("praetore-mcp executable path is not UTF-8")?,
+            ),
+            dir: install::strip_verbatim_prefix(
+                home.root
+                    .to_str()
+                    .ok_or("home directory path is not UTF-8")?,
+            ),
             mode: parsed.mode()?,
         })
     };
@@ -408,9 +352,14 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             continue;
         }
         let updated = install::render_document(&doc, &original);
-        match write_with_backup(&path, &original, &updated) {
-            Ok(backup) => println!(
-                "  updated; backup at {}\n  restart {} to apply",
+        match crate::fsutil::write_with_backup(&path, &original, &updated) {
+            Ok((real, backup)) => println!(
+                "  updated{}; backup at {}\n  restart {} to apply",
+                if real == path {
+                    String::new()
+                } else {
+                    format!(" {} (symlink target)", real.display())
+                },
                 backup.display(),
                 client.name()
             ),
@@ -528,7 +477,7 @@ fn read_policy(home: &Home) -> Result<(String, praetore_core::Policy), String> {
 }
 
 fn save_policy(home: &Home, original: &str, updated: &str) -> Result<(), String> {
-    let backup = write_with_backup(&home.policy(), original, updated)?;
+    let (_, backup) = crate::fsutil::write_with_backup(&home.policy(), original, updated)?;
     let digest = praetore_core::Policy::from_json(updated)
         .and_then(|p| p.digest())
         .map_err(|e| format!("written policy failed to re-validate: {e}"))?;
