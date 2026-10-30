@@ -33,6 +33,7 @@ use std::{
     },
     thread,
 };
+use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -3695,6 +3696,236 @@ fn uppercase_human_approval_signature_is_refused() {
     ));
     decision.signature = lowercase;
     gateway.resolve_human_approval(decision).unwrap();
+    assert_eq!(tool.invocations(), 0);
+}
+
+fn execution_key_of(receipt_agent: &Uuid, request_id: Uuid) -> ExecutionKey {
+    ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *receipt_agent,
+        request_id,
+    }
+}
+
+/// Second held action on the same agent, authority, and approval window.
+fn second_pending_request(template: &AuthorizationRequest, value: &str) -> AuthorizationRequest {
+    let mut request = template.clone();
+    request.request_id = Uuid::new_v4();
+    request.action.parameters = json!({"key": "mode", "value": value});
+    let intent = request
+        .intent_v2
+        .clone()
+        .expect("approval fixture signs v2");
+    let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
+    request
+        .sign_intent_v2(
+            &agent_key,
+            intent.audience,
+            OffsetDateTime::parse(&intent.issued_at, &Rfc3339).unwrap(),
+            OffsetDateTime::parse(&intent.expires_at, &Rfc3339).unwrap(),
+            intent.policy_digest,
+        )
+        .unwrap();
+    request
+}
+
+#[test]
+fn human_approval_rejects_bad_signatures_without_writing_the_journal() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = execution_key_of(
+        pending.evidence.agent.id.as_uuid(),
+        pending.evidence.request_id,
+    );
+    let challenge = gateway.approval_challenge(key).unwrap();
+
+    let forged = human_approval_decision(
+        challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &SigningKey::from_bytes(&[7; 32]),
+    );
+    assert!(matches!(
+        gateway.resolve_human_approval(forged),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let mut flipped = human_approval_decision(
+        challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    let mut signature = hex::decode(&flipped.signature).unwrap();
+    signature[0] ^= 0xff;
+    flipped.signature = hex::encode(signature);
+    assert!(matches!(
+        gateway.resolve_human_approval(flipped),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let mut swapped_outcome = human_approval_decision(
+        challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    swapped_outcome.outcome = HumanApprovalOutcome::Reject;
+    assert!(matches!(
+        gateway.resolve_human_approval(swapped_outcome),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let mut nil_approval = human_approval_decision(
+        challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    nil_approval.approval_id = Uuid::nil();
+    assert!(matches!(
+        gateway.resolve_human_approval(nil_approval),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let mut wrong_approver =
+        human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    wrong_approver.approver_key_id = "other-approver".into();
+    assert!(matches!(
+        gateway.resolve_human_approval(wrong_approver),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let record = journal.get(key).unwrap().unwrap();
+    assert!(record.human_approval.is_none());
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(tool.invocations(), 0);
+    assert!(gateway.approval_challenge(key).is_ok());
+}
+
+#[test]
+fn approval_signed_for_action_a_does_not_authorize_action_b() {
+    let (gateway, request_a, tool, journal, approver_key) = approval_fixture();
+    let request_b = second_pending_request(&request_a, "other-action");
+    let pending_a = gateway.execute(request_a).unwrap();
+    let pending_b = gateway.execute(request_b).unwrap();
+    let key_a = execution_key_of(
+        pending_a.evidence.agent.id.as_uuid(),
+        pending_a.evidence.request_id,
+    );
+    let key_b = execution_key_of(
+        pending_b.evidence.agent.id.as_uuid(),
+        pending_b.evidence.request_id,
+    );
+    let challenge_a = gateway.approval_challenge(key_a).unwrap();
+    let challenge_b = gateway.approval_challenge(key_b).unwrap();
+    assert_ne!(challenge_a.action_digest, challenge_b.action_digest);
+    let signed_a =
+        human_approval_decision(challenge_a, HumanApprovalOutcome::Approve, &approver_key);
+
+    let mut transplanted = signed_a.clone();
+    transplanted.challenge = challenge_b.clone();
+    assert!(matches!(
+        gateway.resolve_human_approval(transplanted),
+        Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+    ));
+
+    let mut digest_swap = signed_a;
+    digest_swap.challenge.action_digest = challenge_b.action_digest;
+    assert!(matches!(
+        gateway.resolve_human_approval(digest_swap),
+        Err(GatewayError::Approval(ApprovalError::InvalidChallenge))
+    ));
+
+    for key in [key_a, key_b] {
+        let record = journal.get(key).unwrap().unwrap();
+        assert!(record.human_approval.is_none());
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    }
+    assert_eq!(tool.invocations(), 0);
+    assert_eq!(tool.value("mode"), None);
+}
+
+#[test]
+fn a_second_signed_approval_cannot_replay_the_same_action() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let challenge = gateway.approval_challenge(key).unwrap();
+    let first = human_approval_decision(
+        challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    // Since the two-step flow on main, approving only records the decision
+    // (`approved_pending_dispatch`); the dispatch is a separate claim.
+    assert!(matches!(
+        gateway.resolve_human_approval(first.clone()).unwrap(),
+        HumanApprovalResult::ApprovedPendingDispatch { .. }
+    ));
+    let second = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    assert_ne!(first.approval_id, second.approval_id);
+
+    // A second, independently valid approval is refused both while the first
+    // is pending dispatch and after it was dispatched.
+    assert!(matches!(
+        gateway.resolve_human_approval(second.clone()),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+    assert_eq!(tool.invocations(), 0);
+    gateway.dispatch_approved(key).unwrap();
+    assert_eq!(tool.invocations(), 1);
+    assert!(matches!(
+        gateway.resolve_human_approval(second),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
+    assert_eq!(tool.invocations(), 1);
+    assert_eq!(
+        journal
+            .get(key)
+            .unwrap()
+            .unwrap()
+            .human_approval
+            .unwrap()
+            .approval_id,
+        first.approval_id
+    );
+}
+
+#[test]
+fn expired_human_approval_is_not_written_to_the_journal() {
+    let captured_clock = Arc::new(Mutex::new(None));
+    let capture = captured_clock.clone();
+    let (gateway, request, tool, journal, approver_key) =
+        approval_fixture_with_provider(move |clock| {
+            *capture.lock().unwrap() = Some(clock);
+            Arc::new(CurrentFreshness)
+        });
+    let pending = gateway.execute(request).unwrap();
+    let key = execution_key_of(
+        pending.evidence.agent.id.as_uuid(),
+        pending.evidence.request_id,
+    );
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    let clock = captured_clock.lock().unwrap().clone().unwrap();
+    *clock.lock().unwrap() += Duration::seconds(21);
+
+    assert!(matches!(
+        gateway.resolve_human_approval(decision),
+        Err(GatewayError::Approval(ApprovalError::Expired))
+    ));
+    let record = journal.get(key).unwrap().unwrap();
+    assert!(record.human_approval.is_none());
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    // Two-step flow: nothing reached approved_pending_dispatch, so the
+    // separate dispatch claim has nothing to claim.
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::Approval(ApprovalError::NotPending))
+    ));
     assert_eq!(tool.invocations(), 0);
 }
 

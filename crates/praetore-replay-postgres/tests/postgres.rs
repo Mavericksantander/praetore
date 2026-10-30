@@ -990,7 +990,8 @@ fn database_rows_for_request(table: &str, request_id: Uuid) -> i64 {
     let query = match table {
         "praetore.replay_claims"
         | "praetore.execution_journal"
-        | "praetore.human_approval_expirations" => {
+        | "praetore.human_approval_expirations"
+        | "praetore.human_approvals" => {
             format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = $1 AND request_id = $2")
         }
         _ => panic!("unsupported test table"),
@@ -3744,4 +3745,140 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
              REVOKE CREATE ON SCHEMA praetore FROM praetore_storage_creator",
         )
         .unwrap();
+}
+
+/// Regression for the human-approval race across gateway instances, in the
+/// two-step flow: two gateways (own journal connections, own adapters, same
+/// database) resolve the same pending request concurrently, then both race
+/// the dispatch claim. Even iterations submit the same signed decision twice
+/// (caught by the `approval_id` key); odd iterations submit two distinct
+/// valid decisions for the same challenge, which only the row lock and the
+/// status re-check in `record_human_approval` can serialize.
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_concurrent_human_approval_dispatches_exactly_once() {
+    for race in 0..20 {
+        let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+        let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
+        assert_eq!(
+            pending.evidence.decision.outcome,
+            DecisionOutcome::RequireApproval
+        );
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        let first_decision = sign_approval(&fixture, key);
+        let second_decision = if race % 2 == 0 {
+            first_decision.clone()
+        } else {
+            sign_approval(&fixture, key)
+        };
+        let (other, other_adapter) = second_gateway(&fixture);
+        let gateways = [&fixture.gateway, &other];
+        let decisions = [first_decision, second_decision];
+
+        // Phase 1: concurrent approval of the same pending request.
+        let barrier = std::sync::Barrier::new(2);
+        let approvals: Vec<Result<HumanApprovalResult, GatewayError>> = thread::scope(|scope| {
+            let handles: Vec<_> = gateways
+                .iter()
+                .zip(decisions.iter().cloned())
+                .map(|(gateway, decision)| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        gateway.resolve_human_approval(decision)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let approved: Vec<_> = approvals
+            .iter()
+            .filter_map(|result| match result {
+                Ok(HumanApprovalResult::ApprovedPendingDispatch { decision }) => Some(decision),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(approved.len(), 1, "race {race}: {approvals:?}");
+        for result in &approvals {
+            if let Err(error) = result {
+                assert!(
+                    matches!(
+                        error,
+                        GatewayError::Journal(
+                            JournalError::ApprovalAlreadyRecorded | JournalError::InvalidRecord
+                        ) | GatewayError::Approval(praetore_gateway::ApprovalError::NotPending)
+                    ),
+                    "race {race}: losing approval must be refused as already resolved, \
+                     got {error:?}"
+                );
+            }
+        }
+        let winning_decision = approved[0].clone();
+        assert_eq!(
+            database_rows_for_request("praetore.human_approvals", key.request_id),
+            1,
+            "race {race}"
+        );
+        let record = connect_journal().get(key).unwrap().unwrap();
+        assert_eq!(record.execution, ExecutionStatus::ApprovedPendingDispatch);
+        assert_eq!(record.human_approval.as_ref(), Some(&winning_decision));
+        assert_eq!(
+            fixture.adapter.invocation_count() + other_adapter.invocation_count(),
+            0,
+            "race {race}: approval alone must never dispatch"
+        );
+
+        // Phase 2: both gateways load the pending dispatch, then race the claim.
+        let barrier = std::sync::Barrier::new(2);
+        let dispatches: Vec<Result<praetore_gateway::GatewayReceipt, GatewayError>> =
+            thread::scope(|scope| {
+                let handles: Vec<_> = gateways
+                    .iter()
+                    .map(|gateway| {
+                        let barrier = &barrier;
+                        scope.spawn(move || {
+                            let pending = gateway.pending_dispatch(key);
+                            barrier.wait();
+                            let permit = gateway.claim_dispatch(pending?)?;
+                            gateway.dispatch(permit)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        let winners: Vec<_> = dispatches.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(winners.len(), 1, "race {race}: {dispatches:?}");
+        assert_eq!(winners[0].execution, ExecutionStatus::Confirmed);
+        for result in &dispatches {
+            if let Err(error) = result {
+                assert!(
+                    matches!(
+                        error,
+                        GatewayError::Journal(JournalError::InvalidTransition)
+                    ),
+                    "race {race}: losing claim must fail the CAS, got {error:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            database_rows_for_request("praetore.human_approvals", key.request_id),
+            1,
+            "race {race}"
+        );
+        let record = connect_journal().get(key).unwrap().unwrap();
+        assert_eq!(record.execution, ExecutionStatus::Confirmed);
+        assert_eq!(record.human_approval, Some(winning_decision));
+        assert_eq!(
+            fixture.adapter.invocation_count() + other_adapter.invocation_count(),
+            1,
+            "race {race}"
+        );
+        assert_eq!(database_invocation_count(key), 1, "race {race}");
+        assert_eq!(database_effect_count(key), 1, "race {race}");
+    }
 }

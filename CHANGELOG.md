@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Breaking (core): `Evidence::sign` now refuses to sign a receipt that does
+  not record the full lowercase SHA-256 digest of the active policy
+  (`policy_digest`, from `Policy::digest()` over the canonical JSON). The
+  engine already bound it in every mode; this makes it a hard requirement of the write path, so the
+  Ed25519 attester signature always covers which policy decided. Receipts
+  signed before this change (no `policy_digest`) still deserialize and verify.
+  Callers that sign evidence directly (not through `PolicyEngine`) must call
+  `Evidence::bind_policy_digest` first.
+- New `Evidence::verify_policy(&Policy)` checks that a receipt was decided
+  under a given policy (digest present and equal). Legacy receipts without a
+  digest return an error.
+- Known limitation (accepted): legacy receipts whose `policy_digest` was
+  recorded in uppercase hex still deserialize and verify, but cannot be
+  re-signed, because `Evidence::sign` only accepts the lowercase SHA-256 hex
+  produced by `Policy::digest()`; `verify_policy` also rejects them.
 - Security (gateway HTTP API): caller authentication. `http_api::router` and
   `serve_local` now take an `ApiAuth`. `ApiAuth::Required(ApiCredentials)`
   requires `Authorization: Bearer` on every endpoint except `/healthz`, with
