@@ -13,7 +13,7 @@ name, not a certification or a guarantee about the caller's deployment.
 | --- | --- | --- |
 | Development | Allows unsigned authorities for local compatibility. If a request signature is present, it must still verify. | Policy only; no issuer trust, policy pin, evidence attester, replay guard, or freshness provider. |
 | Strict | Verifies the authority signature against an exact issuer pin, authority validity and subject-key binding, plus the agent-signed request intent. | Non-empty issuer pins. Policy digest pinning, attestation, replay protection, and freshness are not provided by this mode. |
-| HighAssurance | Performs Strict checks and additionally binds a v2 policy digest, audience- and expiry-bound v2 request intent, v2 attested evidence, content-bound caller freshness, and one-time `(agent UUID, request UUID)` claims. | Time-bounded issuer pins, pinned v2 policy digest, audience, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
+| HighAssurance | Performs Strict checks and additionally binds a v2 policy digest, audience- and expiry-bound v2 request intent, v2 attested evidence, content-bound caller freshness, and one-time `(tenant, agent UUID, request UUID)` claims (tenant: the authority's `tenant_id` constraint, or the nil UUID). | Time-bounded issuer pins, pinned v2 policy digest, audience, evidence attester, caller-supplied `FreshnessProvider`, and caller-owned `ReplayGuard`. |
 
 `AuthorizationEngine::development` and
 `AuthorizationEngine::development_with_clock` are explicit development
@@ -110,8 +110,13 @@ bound into the authority. Development mode permits unsigned requests, but
 rejects any invalid signature that is present. The signature is retained in
 evidence and can be checked offline with `Evidence::verify_agent_intent`.
 
-HighAssurance evaluation atomically claims the signed `(agent_id, request_id)`
-through the configured `ReplayGuard` before returning evidence. This applies
+HighAssurance evaluation atomically claims the signed
+`(tenant_id, agent_id, request_id)` through the configured `ReplayGuard`
+before returning evidence. `tenant_id` is taken from the signed authority's
+single `tenant_id` constraint; an authority without one (or with a nil,
+malformed or duplicated one) uses the nil UUID, a single shared unscoped
+namespace. The same agent and request ID can therefore be claimed once per
+tenant namespace. This applies
 to ALLOW, REQUIRE_APPROVAL, and DENY results. Duplicate claims or storage
 failure return an error; no evidence is returned. The caller's implementation
 must be durable and shared across all engine instances in the authorization
@@ -127,8 +132,14 @@ authorization. See [ADR-006](adr/006-high-assurance-replay-guard.md).
 Signatures and digests use compact UTF-8 JSON produced by the crate's canonical
 encoder:
 
-* Object keys are sorted lexicographically at every nesting level; there is no
-  insignificant whitespace.
+* Object keys are sorted by their UTF-8 bytes at every nesting level; there is
+  no insignificant whitespace. This is a deliberate deviation from RFC 8785
+  (JCS), which sorts by UTF-16 code units: the two orders differ only for keys
+  that contain characters above U+FFFF compared with characters in
+  U+E000..U+FFFF. Number formatting also follows `serde_json` (`5000.0` stays
+  `5000.0`), not JCS's ECMAScript formatting; an independent verifier must reproduce
+  these rules, not a generic JCS library. Changing the order would change
+  signed bytes and digests and requires a new canonical version.
 * JSON strings use `serde_json` escaping, numbers use the `serde_json::Number`
   representation, and array order is preserved.
 * Authority capabilities are sorted lexicographically and constraints by key
@@ -253,9 +264,11 @@ Validation rejects duplicate rule IDs, invalid matcher shapes, and detectable
 contradictions such as incompatible exact values or disjoint membership sets.
 
 Authority capabilities use explicit names such as `data:read`, `data:write`,
-`shell:execute`, `api:call`, and `deployment:create`. An action can select its
-required authority capability with `Action::with_capability`; if omitted,
-`action_type` is used for compatibility. A policy rule's optional
+`shell:execute`, `api:call`, and `deployment:create`. An action selects its
+required authority capability with `Action::with_capability`. There is no
+fallback to `action_type`: Strict and HighAssurance reject an action without
+a capability with an `INVALID_REQUEST` error, and Development returns a DENY
+decision. A policy rule's optional
 `with_capability` is an additional authority requirement. In Strict and
 HighAssurance modes it is mandatory for `Allow` and `RequireApproval` rules: a
 matching rule without it is denied, because the action's capability is chosen
