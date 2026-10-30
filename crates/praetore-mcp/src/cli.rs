@@ -722,6 +722,14 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             let updated = policy::add_rule(&current, rule)?;
             save_policy(&home, &original, &updated)?;
             println!("added {effect_name} rule {:?}", spec.id);
+            if let Ok(saved) = praetore_core::Policy::from_json(&updated) {
+                let rule_tag = format!("rule {:?}:", spec.id);
+                for warning in policy::lint(&saved) {
+                    if warning.starts_with(&rule_tag) {
+                        println!("warning: {warning}");
+                    }
+                }
+            }
             0
         }
     };

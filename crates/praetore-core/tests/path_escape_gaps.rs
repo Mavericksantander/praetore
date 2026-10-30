@@ -1,7 +1,9 @@
 //! T-014 path-restriction escapes against `PathPrefix`.
 //!
-//! A symlink whose path string stays inside the prefix is still allowed; that
-//! test is ignored because running it fails. The lexical `..` and
+//! A symlink whose path string stays inside the prefix is still allowed by
+//! core; that test is ignored because running it fails. It is an accepted
+//! limitation of core: praetore-mcp resolves the arguments before evaluation
+//! and has the end-to-end version of this case in its `tests/wrap.rs`. The lexical `..` and
 //! absolute-path-outside-the-prefix cases are covered on main by
 //! `tests/path_prefix.rs` (`path_prefix_allows_only_normalized_paths_inside_prefix`,
 //! `safe_path_prefix_rejects_dot_dot_traversal`), so they are not repeated here.
@@ -64,7 +66,7 @@ fn outcome(prefix: &str, path: &str) -> DecisionOutcome {
 }
 
 #[test]
-#[ignore = "T-014 KNOWN LIMITATION, not a regression: PathPrefix is lexical and allows a symlink inside the prefix whose target is outside. Documented as out of scope on main (README 'Symlinks are out of scope', MatchOperator::PathPrefix docs); confinement must happen in the dispatcher. Running this fails with Allow."]
+#[ignore = "T-014 ACCEPTED LIMITATION of core, not a regression: PathPrefix is lexical by design (deterministic evaluation). praetore-mcp resolves covered arguments before evaluation; the same case is checked there by crates/praetore-mcp/tests/wrap.rs::allow_path_prefix_does_not_allow_a_symlink_that_leaves_it. Running this fails with Allow."]
 fn path_prefix_allow_rejects_symlink_that_leaves_the_prefix() {
     let tree = TempTree::new();
     let sandbox = tree.root().join("sandbox");

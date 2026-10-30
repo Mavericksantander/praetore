@@ -4,14 +4,14 @@
 use crate::store::{self, ACTION_TYPE, AUDIENCE, CAPABILITY, Home, LoadedHome};
 use praetore_core::{
     Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, DecisionOutcome,
-    Evidence, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig, ReplayGuard,
-    ReplayGuardError, authority::AuthorityId, engine::AuthorizationEngine,
-    identity::AgentKeyFingerprint,
+    Evidence, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
+    MatchOperator, Policy, ReplayGuard, ReplayGuardError, authority::AuthorityId,
+    engine::AuthorizationEngine, identity::AgentKeyFingerprint,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -24,6 +24,13 @@ use uuid::Uuid;
 pub const MODE_CONTEXT_KEY: &str = "praetore.mode";
 /// Context key naming the component that produced the request.
 pub const PROXY_CONTEXT_KEY: &str = "praetore.proxy";
+/// Context key recording, for each argument a `PathPrefix` rule covers, the
+/// value the client sent, the value it resolves to and the check result.
+pub const PATH_CHECK_CONTEXT_KEY: &str = "praetore.path_check";
+/// Value the engine sees instead of a path that does not resolve to itself.
+/// It is not absolute, so core's `PathPrefix` treats it as unsafe: it
+/// matches every DENY / REQUIRE_APPROVAL `PathPrefix` rule and no ALLOW one.
+pub const UNRESOLVED_PATH: &str = "praetore-mcp:path-check-failed";
 /// Maximum canonical size of `arguments` (and the flattened copies) kept
 /// inline in the action. Larger arguments are replaced by their SHA-256 so
 /// a receipt always stays below the 64 KiB evidence limit.
@@ -185,6 +192,105 @@ pub struct Gate {
     policy_digest: String,
     mode: Mode,
     journal: Journal,
+    /// Parameter keys used by `PathPrefix` conditions (T-014).
+    path_keys: BTreeSet<String>,
+}
+
+/// Parameter keys that some rule matches with `PathPrefix`.
+pub fn path_prefix_keys(policy: &Policy) -> BTreeSet<String> {
+    policy
+        .rules
+        .iter()
+        .flat_map(|rule| &rule.parameter_conditions)
+        .filter(|condition| condition.operator == MatchOperator::PathPrefix)
+        .map(|condition| condition.key.clone())
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathCheck {
+    /// The path resolves to itself (no symlink, `.` or `..` on the way).
+    Same,
+    /// The path resolves to another path (a symlink, `..`, a trailing `/.`).
+    Differs,
+    /// The path or its parent does not exist, is a dangling symlink, or is
+    /// not UTF-8: it cannot be resolved now.
+    Unresolved,
+}
+
+impl PathCheck {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Differs => "differs",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// Resolves an absolute path through the filesystem. A missing final
+/// component is allowed (a file about to be created) if its parent resolves
+/// and nothing, not even a dangling symlink, exists at that name.
+pub fn resolve_path(lexical: &str) -> (PathCheck, Option<String>) {
+    let path = Path::new(lexical);
+    let resolved = match fs::canonicalize(path) {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return (PathCheck::Unresolved, None);
+            };
+            if fs::symlink_metadata(path).is_ok() {
+                return (PathCheck::Unresolved, None);
+            }
+            match fs::canonicalize(parent) {
+                Ok(parent) => parent.join(name),
+                Err(_) => return (PathCheck::Unresolved, None),
+            }
+        }
+        Err(_) => return (PathCheck::Unresolved, None),
+    };
+    let Ok(resolved) = resolved.into_os_string().into_string() else {
+        return (PathCheck::Unresolved, None);
+    };
+    let normalized = match lexical.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => lexical,
+    };
+    let check = if normalized == resolved {
+        PathCheck::Same
+    } else {
+        PathCheck::Differs
+    };
+    (check, Some(resolved))
+}
+
+/// T-014: `PathPrefix` in core is lexical by design. Before evaluation, each
+/// absolute string argument under `keys` is resolved; unless it resolves to
+/// itself, the engine sees [`UNRESOLVED_PATH`] instead (fail closed). The
+/// bytes forwarded to the server are never changed. Returns the record for
+/// [`PATH_CHECK_CONTEXT_KEY`], or `None` when no covered argument is present.
+pub fn check_paths(parameters: &mut Value, keys: &BTreeSet<String>) -> Option<Value> {
+    let mut record = Map::new();
+    for key in keys {
+        let Some(Value::String(lexical)) = parameters.get(key) else {
+            continue;
+        };
+        // Relative and other non-absolute values are already unsafe for
+        // core's `PathPrefix`; there is nothing to resolve.
+        if !lexical.starts_with('/') {
+            continue;
+        }
+        let lexical = lexical.clone();
+        let (check, resolved) = resolve_path(&lexical);
+        if check != PathCheck::Same {
+            parameters[key.as_str()] = Value::String(UNRESOLVED_PATH.into());
+        }
+        record.insert(
+            key.clone(),
+            json!({"lexical": lexical, "resolved": resolved, "status": check.as_str()}),
+        );
+    }
+    (!record.is_empty()).then_some(Value::Object(record))
 }
 
 impl Gate {
@@ -199,6 +305,7 @@ impl Gate {
             ..
         } = store::load(home)?;
         let policy_digest = policy.digest().map_err(|e| format!("policy digest: {e}"))?;
+        let path_keys = path_prefix_keys(&policy);
         let config = HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, attester_key)
             .map_err(|e| format!("HighAssurance config: {e}"))?
             .with_audience(AUDIENCE)
@@ -214,20 +321,27 @@ impl Gate {
             policy_digest,
             mode,
             journal: Journal::new(home.receipts_dir()),
+            path_keys,
         })
     }
 
     /// Evaluates and returns the attested evidence without journaling it.
     pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, String> {
         let target = Some(server.to_owned());
-        let action = Action::new(
-            ACTION_TYPE,
-            target.clone(),
-            build_parameters(server, params, false),
-        )
-        .or_else(|_| Action::new(ACTION_TYPE, target, build_parameters(server, params, true)))
-        .map_err(|e| format!("{}: {e}", e.code()))?
-        .with_capability(CAPABILITY);
+        let mut path_check = None;
+        let mut inline = build_parameters(server, params, false);
+        if !self.path_keys.is_empty() {
+            path_check = check_paths(&mut inline, &self.path_keys);
+        }
+        let action = Action::new(ACTION_TYPE, target.clone(), inline)
+            .or_else(|_| {
+                // The digest form has no `arguments.<key>` copies, so no path
+                // is checked; conditions on them are unknown (fail closed).
+                path_check = None;
+                Action::new(ACTION_TYPE, target, build_parameters(server, params, true))
+            })
+            .map_err(|e| format!("{}: {e}", e.code()))?
+            .with_capability(CAPABILITY);
         let mut request =
             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
                 .map_err(|e| format!("{}: {e}", e.code()))?
@@ -236,6 +350,9 @@ impl Gate {
                     PROXY_CONTEXT_KEY,
                     Value::String(concat!("praetore-mcp/", env!("CARGO_PKG_VERSION")).into()),
                 );
+        if let Some(record) = path_check {
+            request = request.with_context(PATH_CHECK_CONTEXT_KEY, record);
+        }
         let now = OffsetDateTime::now_utc();
         request
             .sign_intent_v2(
@@ -335,6 +452,126 @@ fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A canonical temporary root (macOS `/var` is a symlink to `/private/var`).
+    fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        (temp, root)
+    }
+
+    fn text(path: &Path) -> String {
+        path.to_str().unwrap().to_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_detects_symlinks_and_missing_parents() {
+        use std::os::unix::fs::symlink;
+        let (_temp, root) = canonical_tempdir();
+        let sandbox = root.join("sandbox");
+        let outside = root.join("outside");
+        fs::create_dir_all(&sandbox).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(sandbox.join("file"), b"x").unwrap();
+        fs::write(outside.join("secret"), b"s").unwrap();
+        symlink(outside.join("secret"), sandbox.join("link")).unwrap();
+        symlink(&outside, sandbox.join("dirlink")).unwrap();
+        symlink(outside.join("missing"), sandbox.join("dangling")).unwrap();
+
+        let same = |path: PathBuf| {
+            let (check, resolved) = resolve_path(&text(&path));
+            assert_eq!(check, PathCheck::Same, "{}", path.display());
+            assert_eq!(resolved.as_deref(), Some(text(&path).as_str()));
+        };
+        same(sandbox.join("file"));
+        same(sandbox.join("new-file"));
+        same(sandbox.clone());
+        assert_eq!(
+            resolve_path(&format!("{}/", text(&sandbox))).0,
+            PathCheck::Same
+        );
+
+        let (check, resolved) = resolve_path(&text(&sandbox.join("link")));
+        assert_eq!(check, PathCheck::Differs);
+        assert_eq!(resolved, Some(text(&outside.join("secret"))));
+        // A new file under a symlinked directory resolves outside too.
+        let (check, resolved) = resolve_path(&text(&sandbox.join("dirlink").join("new")));
+        assert_eq!(check, PathCheck::Differs);
+        assert_eq!(resolved, Some(text(&outside.join("new"))));
+        assert_eq!(
+            resolve_path(&format!("{}/../outside/secret", text(&sandbox))).0,
+            PathCheck::Differs
+        );
+
+        for path in [
+            sandbox.join("dangling"),
+            sandbox.join("no-dir").join("file"),
+            sandbox.join("file").join("under-a-file"),
+        ] {
+            assert_eq!(
+                resolve_path(&text(&path)),
+                (PathCheck::Unresolved, None),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_paths_hides_unresolved_paths_from_the_engine_only() {
+        use std::os::unix::fs::symlink;
+        let (_temp, root) = canonical_tempdir();
+        fs::create_dir_all(root.join("outside")).unwrap();
+        symlink(root.join("outside"), root.join("link")).unwrap();
+        let keys = BTreeSet::from(["arguments.path".to_owned(), "arguments.to".to_owned()]);
+        let ok = text(&root.join("a.txt"));
+        let escape = text(&root.join("link").join("x"));
+        let call = json!({"name": "move", "arguments": {
+            "path": ok, "to": escape, "other": escape, "rel": "x/y"}});
+        let mut built = build_parameters("fs", &call, false);
+        let record = check_paths(&mut built, &keys).unwrap();
+
+        assert_eq!(built["arguments.path"], ok);
+        assert_eq!(built["arguments.to"], UNRESOLVED_PATH);
+        // Keys no PathPrefix rule covers, and the full `arguments`, keep the
+        // client's value.
+        assert_eq!(built["arguments.other"], escape);
+        assert_eq!(built["arguments"]["to"], escape);
+        assert_eq!(record["arguments.path"]["status"], "same");
+        assert_eq!(record["arguments.to"]["status"], "differs");
+        assert_eq!(record["arguments.to"]["lexical"], escape);
+        assert_eq!(
+            record["arguments.to"]["resolved"],
+            text(&root.join("outside").join("x"))
+        );
+
+        // Relative values and absent keys are left alone and not recorded.
+        let mut built = build_parameters("fs", &json!({"arguments": {"path": "x/y"}}), false);
+        assert_eq!(check_paths(&mut built, &keys), None);
+        assert_eq!(built["arguments.path"], "x/y");
+    }
+
+    #[test]
+    fn path_prefix_keys_come_from_every_rule() {
+        use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+        let policy = Policy::new_v2(
+            "p",
+            1,
+            vec![
+                PolicyRule::new("a", ACTION_TYPE, PolicyEffect::Allow)
+                    .with_parameter_condition(PolicyCondition::path_prefix("arguments.path", "/a")),
+                PolicyRule::new("d", ACTION_TYPE, PolicyEffect::Deny)
+                    .with_parameter_condition(PolicyCondition::path_prefix("arguments.to", "/b"))
+                    .with_parameter_condition(PolicyCondition::prefix("arguments.name", "x")),
+            ],
+        );
+        assert_eq!(
+            path_prefix_keys(&policy),
+            BTreeSet::from(["arguments.path".to_owned(), "arguments.to".to_owned()])
+        );
+    }
 
     #[test]
     fn parameters_flatten_top_level_arguments() {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **T-014, `praetore-mcp`:** arguments covered by a `PathPrefix` rule are
+  resolved through the filesystem before evaluation. Unless an absolute value
+  resolves to itself (no symlink, `.`/`..`, dangling link or missing parent),
+  the engine sees `praetore-mcp:path-check-failed`, which core treats as an
+  unsafe path (every DENY / REQUIRE_APPROVAL `PathPrefix` rule matches, no
+  ALLOW one). Receipts record `context["praetore.path_check"]`; forwarded
+  bytes are unchanged. Core's `PathPrefix` stays lexical. Behavior change: on
+  macOS, `/tmp/...` arguments under such a rule are now refused or not
+  allowed; use resolved paths. `policy` commands and `policy check` warn
+  about prefixes that resolve elsewhere. The check is point-in-time (TOCTOU).
 ## 0.3.0 - 2026-10-30
 
 - The gateway-service sandbox supervisor rejects a dispatch request when any

@@ -192,7 +192,11 @@ fn observe_forwards_and_records_verifiable_observe_receipt() {
 
 #[test]
 fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
-    let (_temp, home) = init_home();
+    let (temp, home) = init_home();
+    // A path that resolves to itself: `/tmp` is a symlink on macOS, and
+    // paths covered by a PathPrefix rule are resolved first (T-014).
+    let ok_path = fs::canonicalize(temp.path()).unwrap().join("ok");
+    let ok_path = ok_path.to_str().unwrap();
     write_policy(
         &home,
         vec![
@@ -211,7 +215,7 @@ fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
         "enforce",
         &session(vec![
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/tmp/x"}}}),
-            json!({"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"echo","arguments":{"path":"/tmp/ok"}}}),
+            json!({"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"echo","arguments":{"path":ok_path}}}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/secret/keys"}}}),
         ]),
     );
@@ -401,8 +405,11 @@ fn init_is_idempotent_and_keys_are_private() {
 
 #[test]
 fn rules_generated_by_policy_commands_enforce_end_to_end() {
-    let (_temp, home) = init_home();
+    let (temp, home) = init_home();
     let dir = home.root.to_str().unwrap();
+    // Resolves to itself (not `/tmp`, a symlink on macOS): see T-014.
+    let ok_path = fs::canonicalize(temp.path()).unwrap().join("ok");
+    let ok_path = ok_path.to_str().unwrap();
     for args in [
         vec![
             "policy",
@@ -441,7 +448,7 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
         "enforce",
         &session(vec![
             json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/tmp/x"}}}),
-            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/tmp/ok"}}}),
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"path":ok_path}}}),
             json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/secret/key"}}}),
         ]),
     );
@@ -521,4 +528,175 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
             .all(|e| e.action.parameters["tool"] == "delete_file")
     );
     assert!(verify_cli(&home).status.success());
+}
+
+fn write_rules(home: &Home, rules: Vec<PolicyRule>) {
+    let policy = Policy::new_v2("test-policy", 1, rules);
+    fs::write(
+        home.policy(),
+        serde_json::to_string_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+}
+
+fn echo_path(id: u32, path: &Path) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"echo","arguments":{"path":path.to_str().unwrap()}}})
+}
+
+/// `<canonical tmp>/sandbox/{file, link -> outside/secret, dirlink -> outside}`.
+#[cfg(unix)]
+fn symlink_tree(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::symlink;
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let sandbox = root.join("sandbox");
+    let outside = root.join("outside");
+    fs::create_dir_all(&sandbox).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(sandbox.join("file"), b"x").unwrap();
+    fs::write(outside.join("secret"), b"s").unwrap();
+    symlink(outside.join("secret"), sandbox.join("link")).unwrap();
+    symlink(&outside, sandbox.join("dirlink")).unwrap();
+    (sandbox, outside)
+}
+
+/// T-014, the case `praetore-core/tests/path_escape_gaps.rs` documents as a
+/// core limitation: a symlink inside an ALLOW PathPrefix whose target is
+/// outside. praetore-mcp resolves it before evaluation, so it is not allowed.
+#[cfg(unix)]
+#[test]
+fn allow_path_prefix_does_not_allow_a_symlink_that_leaves_it() {
+    let (temp, home) = init_home();
+    let (sandbox, outside) = symlink_tree(&temp);
+    write_rules(
+        &home,
+        vec![
+            PolicyRule::new("sandbox-only", ACTION_TYPE, PolicyEffect::Allow)
+                .with_capability(CAPABILITY)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    sandbox.to_str().unwrap(),
+                )),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(10, &sandbox.join("file")),
+            echo_path(11, &sandbox.join("link")),
+            echo_path(12, &sandbox.join("dirlink").join("new")),
+            echo_path(13, &sandbox.join("missing-dir").join("new")),
+            echo_path(14, &sandbox.join("new-file")),
+        ]),
+    );
+    for (id, refused) in [(10, false), (11, true), (12, true), (13, true), (14, false)] {
+        assert_eq!(
+            by_id(&responses, &json!(id))["result"]["isError"],
+            refused,
+            "id {id}: {stderr}"
+        );
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 2, "{stderr}");
+
+    let evidence = journal(&home);
+    let outcomes: Vec<_> = evidence.iter().map(|e| e.decision.outcome).collect();
+    use DecisionOutcome::{Allow, Deny};
+    assert_eq!(outcomes, [Allow, Deny, Deny, Deny, Allow]);
+    let check = |i: usize| &evidence[i].context["praetore.path_check"]["arguments.path"];
+    assert_eq!(check(0)["status"], "same");
+    assert_eq!(check(1)["status"], "differs");
+    assert_eq!(check(1)["lexical"], sandbox.join("link").to_str().unwrap());
+    assert_eq!(
+        check(1)["resolved"],
+        outside.join("secret").to_str().unwrap()
+    );
+    assert_eq!(check(2)["resolved"], outside.join("new").to_str().unwrap());
+    assert_eq!(check(3)["status"], "unresolved");
+    assert_eq!(check(3)["resolved"], Value::Null);
+    // The engine saw the placeholder; the server got the client's bytes.
+    assert_eq!(
+        evidence[1].action.parameters["arguments.path"],
+        "praetore-mcp:path-check-failed"
+    );
+    assert_eq!(
+        evidence[1].action.parameters["arguments"]["path"],
+        sandbox.join("link").to_str().unwrap()
+    );
+
+    let verify = verify_cli(&home);
+    let report = String::from_utf8_lossy(&verify.stdout);
+    assert!(verify.status.success(), "{report}");
+    assert!(report.contains("5 verified, 0 failed"), "{report}");
+}
+
+/// The default policy shape (allow everything, deny one directory): a path
+/// that only reaches the denied directory through a symlink is denied, and
+/// so is one whose parent does not exist yet.
+#[cfg(unix)]
+#[test]
+fn deny_path_prefix_catches_symlinks_into_it_and_unresolvable_paths() {
+    let (temp, home) = init_home();
+    let (sandbox, outside) = symlink_tree(&temp);
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-outside", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    outside.to_str().unwrap(),
+                )),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(20, &sandbox.join("file")),
+            echo_path(21, &sandbox.join("link")),
+            echo_path(22, &sandbox.join("dirlink").join("secret")),
+            echo_path(23, &sandbox.join("missing-dir").join("x")),
+            echo_path(24, &outside.join("secret")),
+        ]),
+    );
+    for (id, refused) in [(20, false), (21, true), (22, true), (23, true), (24, true)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+        if refused {
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("deny-outside"), "id {id}: {text}");
+        }
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Observe still forwards everything, and its receipts record the check.
+#[cfg(unix)]
+#[test]
+fn observe_records_the_path_check_and_forwards() {
+    let (temp, home) = init_home();
+    let (sandbox, outside) = symlink_tree(&temp);
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-outside", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    outside.to_str().unwrap(),
+                )),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "observe",
+        &session(vec![echo_path(30, &sandbox.join("link"))]),
+    );
+    assert_eq!(by_id(&responses, &json!(30))["result"]["isError"], false);
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    let evidence = journal(&home);
+    assert_eq!(evidence[0].decision.outcome, DecisionOutcome::Deny);
+    assert_eq!(
+        evidence[0].context["praetore.path_check"]["arguments.path"]["status"],
+        "differs"
+    );
 }
