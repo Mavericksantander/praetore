@@ -56,6 +56,48 @@
 - Breaking: `MatchOperator` is now `#[non_exhaustive]`; exhaustive `match`es
   outside `praetore-core` need a wildcard arm.
 
+- Storage security (PostgreSQL journal and deployment templates):
+  - Migrations: each migration and its `schema_migrations` row now commit in
+    one transaction. 0007-0009 contain their own `BEGIN;`/`COMMIT;`, which
+    used to end the runner's transaction early (a crash in between left the
+    migration applied but unrecorded); the runner strips one enclosing
+    top-level pair and refuses any other transaction control. Migration files
+    and checksums are unchanged.
+  - New migration 0011 creates the NOLOGIN group role `praetore_runtime`
+    (needs `CREATEROLE`, or pre-create it) with least-privilege grants. New
+    migration 0012 makes SQL refuse `approved_pending_dispatch -> dispatched`
+    without an approve decision, with an expiration receipt, or with
+    `expires_at` at or before the gateway observation time
+    (`praetore.dispatch_observed_at`, set by `claim_dispatch`).
+  - TLS: all PostgreSQL connections go through `DatabaseConnector`
+    (rustls). Non-loopback hosts require `sslmode=verify-full` and
+    `sslrootcert`; `prefer`/`require`/`verify-ca` are refused. The URL is
+    checked before any socket is opened.
+  - Breaking (gateway service): new `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`
+    and `praetore-gateway-demo migrate`. With `PRAETORE_GATEWAY_ADAPTER=http`
+    or `sandbox` the runtime URL no longer runs migrations, and startup
+    refuses a runtime role that is superuser, `BYPASSRLS`, owns `praetore`
+    objects or can create in the schema, or a schema that is not current.
+    The loopback-only database check is replaced by the TLS rule above, so
+    remote databases (for example in `praetore-data`) work with
+    `verify-full`. The local demo and the CLI still migrate with the runtime
+    URL when no migration URL is set and only warn (development only).
+  - Breaking (public API): `MigrationError` has new variants
+    `ExplicitTransactionControl` and `Pending`; new `DatabaseConnector`,
+    `verify_runtime_role`, `verify_schema_current`.
+  - Kubernetes templates (not cluster-tested): the execution-claim
+    admission policy is scoped to claim ConfigMaps and the supervisor CA,
+    handles DELETE via `oldObject`, no longer blocks `kube-root-ca.crt` or
+    operator ConfigMaps, and lets a dedicated `claim-retention` identity (new
+    Role) and namespace deletion remove claims. The Job policy exempts
+    finalizer-only updates by the garbage collector / TTL / Job controllers
+    on Jobs being deleted, so Foreground deletion can finish. Tool runners
+    no longer share the gateway's proxy: the gateway uses
+    `gateway-egress-proxy` (the only source protected tools accept) and
+    runners keep `egress-proxy`, which may reach only allowed external
+    destinations. Breaking: deploy the second proxy and update the gateway's
+    `egress_proxy` route setting.
+
 ## 0.2.0 (not yet tagged or published)
 
 Version bump from 0.1.0 to 0.2.0 (#10). Under Cargo's SemVer rules for `0.x`
