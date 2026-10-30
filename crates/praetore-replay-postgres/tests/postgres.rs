@@ -3654,12 +3654,12 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
         ("praetore_storage_creator", "create"),
     ] {
         let result = verify_runtime_role(&mut connect_scratch_as(&scratch, user));
-        let matched = match (&result, expected) {
-            (Err(RuntimeRoleError::PrivilegedRole(_)), "privileged") => true,
-            (Err(RuntimeRoleError::OwnsSchemaObjects(_)), "owner") => true,
-            (Err(RuntimeRoleError::CanCreateInSchema(_)), "create") => true,
-            _ => false,
-        };
+        let matched = matches!(
+            (&result, expected),
+            (Err(RuntimeRoleError::PrivilegedRole(_)), "privileged")
+                | (Err(RuntimeRoleError::OwnsSchemaObjects(_)), "owner")
+                | (Err(RuntimeRoleError::CanCreateInSchema(_)), "create")
+        );
         assert!(matched, "{user}: {result:?}");
     }
 
