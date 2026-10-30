@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Security (breaking API): `Evidence::verify_key_rotation` now takes the
+  trusted attester key (`&VerifiedPublicKey`) and requires a valid attester
+  signature. It previously accepted an ALLOW decision protected only by the
+  unkeyed `context_hash`, so anyone could forge an authorized rotation by
+  rewriting the decision and recomputing the hash. Unsigned evidence (e.g.
+  Development/Strict without an attester) no longer verifies as a rotation.
 - Security (breaking for non-canonical input): uppercase or mixed-case hex is
   now rejected for authority signatures, `subject_key_hash` and
   `issuer_key_id` (`Authority::validate`), request intent signatures,

@@ -201,10 +201,13 @@ Key rotation is represented as an ordinary `identity:rotate_key` action.
 `KeyRotationProof` contains the old and new fingerprints, new public key,
 subject, authority ID, and request ID; its proof-of-possession signature uses
 `PRAETORE_KEY_ROTATION_V1\0`. The old key signs the request intent, which binds
-the proof into evidence. `Evidence::verify_key_rotation` checks evidence
-integrity, old-key intent, action type, an ALLOW decision, and the new-key
-proof. It does not establish issuer/attester trust by itself; consumers must
-also verify those signatures against their external pins. This receipt does
+the proof into evidence. `Evidence::verify_key_rotation(trusted_attester)`
+checks the evidence attester signature against the caller's pinned attester
+key, evidence integrity, old-key intent, action type, an ALLOW decision, and
+the new-key proof. The attester signature is mandatory: the unkeyed
+`context_hash` alone cannot stop a DENY from being rewritten into an ALLOW.
+It does not establish issuer trust; consumers must also verify the authority
+signature against their issuer pins. This receipt does
 not update an agent registry or revoke the old key; those operations remain
 caller-owned.
 
