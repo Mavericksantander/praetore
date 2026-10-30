@@ -330,7 +330,7 @@ fn decide(
         Err(error) => match mode {
             Mode::Enforce => {
                 warnings.push(format!(
-                    "praetore-mcp: ERROR evaluating {server}/{tool}: {error}; call REFUSED (enforce, fail closed)"
+                    "praetore-mcp: ERROR evaluating {server}/{tool}: {error}; call REFUSED (fail closed)"
                 ));
                 CallDecision::Block(format!(
                     "PRÆTORE could not evaluate this tool call, so it was refused (fail closed): {error}"

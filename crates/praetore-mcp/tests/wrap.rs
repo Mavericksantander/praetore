@@ -346,6 +346,17 @@ fn assert_refused_without_receipts(home: &Home, mode: &str) {
     assert!(!stderr.contains("EXECUTED"), "{mode}: {stderr}");
     assert!(stderr.contains("REFUSED"), "{mode}: {stderr}");
     assert!(!stderr.contains("WITHOUT"), "{mode}: {stderr}");
+    // The startup line names the requested mode; no line claims another one.
+    assert!(
+        stderr.contains(&format!("{mode} mode: every tools/call will be REFUSED")),
+        "{mode}: {stderr}"
+    );
+    let other = if mode == "observe" {
+        "enforce"
+    } else {
+        "observe"
+    };
+    assert!(!stderr.contains(other), "{mode}: {stderr}");
 }
 
 #[test]
