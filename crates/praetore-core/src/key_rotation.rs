@@ -190,6 +190,7 @@ mod tests {
                 crate::DecidedBy::rule("test-rule"),
             ))
             .unwrap();
+        evidence.bind_policy_digest("ab".repeat(32)).unwrap();
         evidence.sign(&attester()).unwrap();
         evidence
     }
@@ -291,6 +292,7 @@ mod tests {
                 crate::DecidedBy::rule("test-rule"),
             ))
             .unwrap();
+        other_attester.bind_policy_digest("ab".repeat(32)).unwrap();
         other_attester
             .sign(&EvidenceAttesterKey::from_secret_bytes(&[14; 32]))
             .unwrap();
@@ -302,6 +304,7 @@ mod tests {
                 crate::DecidedBy::rule("test-rule"),
             ))
             .unwrap();
+        denied.bind_policy_digest("ab".repeat(32)).unwrap();
         denied.sign(&attester()).unwrap();
         assert!(denied.verify_key_rotation(&attester_key()).is_err());
         // Flip the signed DENY into an ALLOW, keeping the attester signature.

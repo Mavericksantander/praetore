@@ -3780,4 +3780,184 @@ mod tests {
             Err(PraetoreError::InvalidRequest(_))
         ));
     }
+
+    /// Unbound Allow/RequireApproval on `delete_data`, with the action declaring
+    /// `read_data`. `grants` is the authority capability list.
+    fn unbound_delete_outcome(
+        mode: EvaluationMode,
+        effect: crate::policy::PolicyEffect,
+        grants: Vec<String>,
+    ) -> std::result::Result<DecisionOutcome, PraetoreError> {
+        let policy = Policy::new_v2(
+            "unbound-capability",
+            1,
+            vec![PolicyRule::new("unbound-delete", "delete_data", effect)],
+        );
+        let action = Action::new(
+            "delete_data",
+            Some("database".into()),
+            json!({"table":"users"}),
+        )
+        .unwrap()
+        .with_capability("read_data");
+
+        if mode == EvaluationMode::Development {
+            let agent = test_agent();
+            let authority = Authority::new(agent.id.clone(), "praetore-root", grants);
+            let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+            return Ok(AuthorizationEngine::development(policy)
+                .evaluate(request)?
+                .decision
+                .outcome);
+        }
+
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority = Authority::new(agent.id.clone(), "praetore-root", grants);
+        if mode == EvaluationMode::HighAssurance {
+            authority = authority.with_validity(high_assurance_validity());
+        }
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+
+        let engine = if mode == EvaluationMode::Strict {
+            request.sign_intent(&agent_key).unwrap();
+            let pin =
+                TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
+            AuthorizationEngine::strict(policy, vec![pin]).unwrap()
+        } else {
+            let policy_digest = policy.digest().unwrap();
+            let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+            request
+                .sign_intent_v2(
+                    &agent_key,
+                    "test-gateway",
+                    now,
+                    now + time::Duration::minutes(1),
+                    policy_digest.clone(),
+                )
+                .unwrap();
+            let config = HighAssuranceConfig::new(
+                policy_digest,
+                vec![production_test_pin(&issuer_key, high_assurance_validity())],
+                EvidenceAttesterKey::generate(),
+            )
+            .unwrap()
+            .with_audience("test-gateway")
+            .with_replay_guard(test_replay_guard())
+            .with_freshness_provider(test_freshness_provider());
+            AuthorizationEngine::production_with_clock(
+                policy,
+                config,
+                FixedClock::new("2026-06-01T12:00:00Z"),
+            )
+            .unwrap()
+        };
+        Ok(engine.evaluate(request)?.decision.outcome)
+    }
+
+    #[test]
+    fn development_unbound_require_approval_still_needs_the_action_type_grant() {
+        assert_eq!(
+            unbound_delete_outcome(
+                EvaluationMode::Development,
+                crate::policy::PolicyEffect::RequireApproval,
+                vec!["read_data".into()],
+            )
+            .unwrap(),
+            DecisionOutcome::Deny
+        );
+        assert_eq!(
+            unbound_delete_outcome(
+                EvaluationMode::Development,
+                crate::policy::PolicyEffect::RequireApproval,
+                vec!["read_data".into(), "delete_data".into()],
+            )
+            .unwrap(),
+            DecisionOutcome::RequireApproval
+        );
+    }
+
+    #[test]
+    fn strict_and_high_assurance_deny_unbound_rules_even_when_action_type_is_granted() {
+        for mode in [EvaluationMode::Strict, EvaluationMode::HighAssurance] {
+            for effect in [
+                crate::policy::PolicyEffect::Allow,
+                crate::policy::PolicyEffect::RequireApproval,
+            ] {
+                let outcome = unbound_delete_outcome(
+                    mode,
+                    effect.clone(),
+                    vec!["read_data".into(), "delete_data".into()],
+                )
+                .unwrap();
+                assert_eq!(
+                    outcome,
+                    DecisionOutcome::Deny,
+                    "{mode:?} {effect:?} must not fall back to the action_type grant"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn high_assurance_rejects_missing_capability_even_when_action_type_is_granted() {
+        let agent_key = AgentKeyPair::generate();
+        let agent = agent_key.identity(AgentId::new());
+        let issuer_key = AgentKeyPair::generate();
+        let mut authority =
+            Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
+                .with_validity(high_assurance_validity());
+        authority.sign_for_agent(&issuer_key, &agent).unwrap();
+        let mut action = test_action();
+        action.capability = None;
+        let policy = allow_policy();
+        let policy_digest = policy.digest().unwrap();
+        let now = FixedClock::new("2026-06-01T12:00:00Z").now();
+        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        request
+            .sign_intent_v2(
+                &agent_key,
+                "test-gateway",
+                now,
+                now + time::Duration::minutes(1),
+                policy_digest.clone(),
+            )
+            .unwrap();
+        let config = HighAssuranceConfig::new(
+            policy_digest,
+            vec![production_test_pin(&issuer_key, high_assurance_validity())],
+            EvidenceAttesterKey::generate(),
+        )
+        .unwrap()
+        .with_audience("test-gateway")
+        .with_replay_guard(test_replay_guard())
+        .with_freshness_provider(test_freshness_provider());
+        let engine = AuthorizationEngine::production_with_clock(
+            policy,
+            config,
+            FixedClock::new("2026-06-01T12:00:00Z"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn blank_capability_does_not_fall_back_to_action_type() {
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        request.action.capability = Some(String::new());
+        let engine = AuthorizationEngine::development(allow_policy());
+
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
 }

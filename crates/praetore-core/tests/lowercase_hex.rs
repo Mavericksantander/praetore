@@ -103,6 +103,7 @@ fn evidence_attester_signature_must_be_lowercase() {
             praetore_core::DecidedBy::rule("test-rule"),
         ))
         .unwrap();
+    evidence.bind_policy_digest("ab".repeat(32)).unwrap();
     evidence.sign(&attester).unwrap();
     let key = attester.public_key().unwrap();
     evidence.verify_attester_signature(&key).unwrap();
