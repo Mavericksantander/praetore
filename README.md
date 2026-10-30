@@ -5,18 +5,194 @@
 [![Python](https://img.shields.io/badge/Python-bindings-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-replay%20adapter-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-Deterministic authorization and governance primitives for autonomous and
-AI-enabled systems.
+**Deterministic authorization and governance primitives for autonomous and
+AI-enabled systems.**
 
 PRÆTORE Core is a Rust library for evaluating signed authorization requests
 against declarative policy and delegated authority. It keeps identity,
 authority, policy, decisions, and evidence as separate concepts and defaults
 to deny when a policy has no applicable rule.
 
+```mermaid
+flowchart LR
+    A[Agent] --> B[Authority]
+    B --> C[Action]
+    C --> D[Policy]
+    D --> E[Decision]
+    E --> F[Evidence]
+```
+
+> **Status:** under active development. Not independently audited or
+> accredited. Passing the repository's tests is not a substitute for your own
+> threat model, deployment validation and security assessment.
+
+---
+
+## Contents
+
+- [Quickstart](#quickstart)
+- [Third-party verification demo](#third-party-verification-demo)
+- [Human approval with `praetore approve`](#human-approval-with-praetore-approve)
+- [Verify evidence offline](#verify-evidence-offline)
+- [Workspace crates](#workspace-crates)
+- **Reference**
+  - [Status](#status)
+  - [Current state on `main`](#current-state-on-main)
+  - [Limitations](#limitations)
+  - [Not verified](#not-verified)
+  - [In development](#in-development)
+  - [What it is — and is not](#what-it-is--and-is-not)
+  - [Local PostgreSQL gateway demo](#local-postgresql-gateway-demo)
+  - [Documentation](#documentation)
+  - [Core Concepts](#core-concepts)
+  - [Design Principles](#design-principles)
+  - [Repository Structure](#repository-structure)
+  - [Security and production use](#security-and-production-use)
+  - [Development](#development)
+  - [Architecture](#architecture)
+  - [Authorization Model](#authorization-model)
+  - [Evidence and Integrity](#evidence-and-integrity)
+  - [Verify evidence offline (reference)](#verify-evidence-offline-reference)
+  - [End-to-end examples](#end-to-end-examples)
+  - [Security](#security)
+  - [License](#license)
+  - [Trademarks](#trademarks)
+  - [Copyright](#copyright)
+
+---
+
+## Quickstart
+
+Requirements: Rust 1.88 or newer and Cargo.
+
+Run the self-contained example from the repository root:
+
+```sh
+git clone https://github.com/Mavericksantander/praetore.git
+cd praetore
+cargo run -p praetore-core --example quickstart
+```
+
+Expected output:
+
+```text
+Strict: ALLOW; request intent, issuer authority, and evidence integrity verified.
+HighAssurance: ALLOW; intent, issuer authority, attester signature, and evidence integrity verified.
+```
+
+The example creates an agent keypair, issues an authority bound to that key,
+signs requests, evaluates them in **Strict** and **HighAssurance** modes and
+verifies the resulting evidence. It uses ephemeral keys, an in-memory replay
+guard and a demonstration freshness provider.
+
+It creates an agent keypair, issues an authority bound to that key, signs
+requests, evaluates them in both **Strict** and **HighAssurance** modes, and
+verifies the resulting evidence. The example uses ephemeral keys, an
+in-memory replay guard, and a demonstration freshness provider; none is
+suitable for production. See the [policy language guide](docs/policy-language.md)
+for declarative rules and the [crypto and policy guide](docs/crypto-and-policy.md)
+for signing and verification details.
+
+For the HighAssurance-only variant:
+
+```sh
+cargo run -p praetore-core --example high_assurance
+```
+
+---
+
+## Third-party verification demo
+
+One command signs a fictitious receipt, verifies it with public keys only,
+then flips single bytes and shows each rejection:
+
+```sh
+./demo/verify-receipt.sh
+```
+
+![Real output of demo/verify-receipt.sh](docs/img/verify-receipt.svg)
+
+- The keys come from a fixed, public seed: they are **DEMO/TEST-ONLY** and
+  anyone can recompute them. Never sign anything real with them.
+- The verifier receives only the public keys and key id, never a private key.
+- Exit code is 0 only if the valid receipt verifies and every tampered copy is
+  rejected with the expected error. CI runs it in `assurance.yml`.
+- It proves the integrity of a historical record; it does not authorize
+  anything.
+
+Details: [`demo/README.md`](demo/README.md).
+
+---
+
+## Human approval with `praetore approve`
+
+When a policy rule returns `RequireApproval`, the local reference gateway holds
+the action. A human signs the approval challenge with a local Ed25519 approver
+key; the action runs only after a separate `praetore dispatch`.
+
+```sh
+cargo build --locked -p praetore-cli        # binary: target/debug/praetore
+praetore init ./praetore-local
+cp crates/praetore-cli/examples/policies/require-approval.json ./praetore-local/policy.json
+export PRAETORE_GATEWAY_DATABASE_URL='postgresql://<user>@127.0.0.1:<port>/<db>'   # local PostgreSQL
+praetore doctor ./praetore-local
+praetore run ./praetore-local                # terminal 1
+
+praetore demo ./praetore-local set greeting hello                             # terminal 2
+praetore approve ./praetore-local <request_id> --approver local-approver
+praetore dispatch ./praetore-local <request_id>
+```
+
+![Real output of praetore approve](docs/img/praetore-approve.svg)
+
+- `approve` recomputes the action digest and checks the policy digest before
+  asking you to type `yes`. It refuses to sign on a mismatch.
+- The gateway records the decision append-only and answers
+  `approved_pending_dispatch`: the action has **not** run yet.
+  `praetore dispatch` performs the single dispatch (here, `execution: confirmed`).
+- The approval window is short (about 30 s in the local demo); after it the
+  gateway answers `approval_expired`.
+- All keys and tokens are generated by `init` for this demo only (**DEMO-ONLY**);
+  this is not key custody or separation of duties.
+
+Full guide: [`crates/praetore-cli/README.md`](crates/praetore-cli/README.md).
+
+---
+
+## Verify evidence offline
+
+See the full [offline verifier reference](#verify-evidence-offline-reference) below (all commands and expected outputs).
+
+---
+
+## Workspace crates
+
+From the workspace `Cargo.toml` and each crate's `Cargo.toml`:
+
+| Crate | Purpose |
+| --- | --- |
+| [`praetore-core`](crates/praetore-core) | Authorization and governance core for autonomous agents. |
+| [`praetore-receipt`](crates/praetore-receipt) | Signed gateway receipts and execution attestations, without server dependencies. |
+| [`praetore-verify`](crates/praetore-verify) | Offline evidence verifier CLI (`praetore-verify`). |
+| [`praetore-python`](crates/praetore-python) | Verify-only Python bindings (PyO3 extension `_core`). |
+| [`praetore-replay-postgres`](crates/praetore-replay-postgres) | PostgreSQL-backed durable replay guard for HighAssurance deployments. |
+| [`praetore-gateway`](crates/praetore-gateway) | Reference local tool-execution boundary. |
+| [`praetore-gateway-service`](crates/praetore-gateway-service) | Loopback-only development HTTP service for the gateway. |
+| [`praetore-cli`](crates/praetore-cli) | Local PostgreSQL-backed gateway demo CLI (`praetore`). |
+| [`praetore-observe`](crates/praetore-observe) | Authenticated read-only observability API and UI for gateway journals. |
+| [`praetore-mcp`](crates/praetore-mcp) | Local stdio MCP proxy that records signed evidence for every `tools/call` (observe) or enforces policy (enforce). |
+
+Other top-level directories: `fuzz/`, `packages/praetore-python/`, `docs/`,
+`examples/`, `scripts/`, `demo/`.
+
+---
+
+# Reference
+
 ## Status
 
-**Production readiness: not yet established.** PRÆTORE is under active
-development and has not been independently certified or accredited. Passing
+**Readiness for real deployments: not yet established.** PRÆTORE is under active
+development and has not been independently audited or accredited. Passing
 the repository's tests and assurance gates is not a substitute for deployment
 validation, threat modeling, operational controls, or a security assessment
 appropriate to your environment.
@@ -26,7 +202,12 @@ verifier, verify-only Python bindings, a reference tool-gateway crate, a
 PostgreSQL-backed local CLI demo, bounded fuzz targets, and an optional
 PostgreSQL replay-guard adapter.
 
+---
+
 ## Current state on `main`
+
+<details open>
+<summary>Show / hide</summary>
 
 This section lists only what is merged on `main`. Each item points to the
 code or test that backs it. None of it is a security or production guarantee.
@@ -82,11 +263,11 @@ code or test that backs it. None of it is a security or production guarantee.
   (`/srv/agent` matches `/srv/agent/x`, not `/srv/agentx`).
   - Rule prefixes must be absolute and normalized. An invalid prefix rejects
     the policy when it loads.
-  - A value that is not absolute and normalized is *unsafe*. That covers
-    `.`, `..`, `//`, `\`, NUL, any `%`, and relative paths. An unsafe value
+  - A value that is not absolute and normalized is *non-canonical*. That covers
+    `.`, `..`, `//`, `\`, NUL, any `%`, and relative paths. A non-canonical value
     never matches an `Allow` rule, and always matches `Deny` and
     `RequireApproval` rules, under both policy semantics versions.
-  - `Prefix` applies the same unsafe rule to values containing a `..`
+  - `Prefix` applies the same non-canonical rule to values containing a `..`
     segment, `%`, or NUL.
   - Pairs of `PathPrefix` / `PathPrefix`, `PathPrefix` / `Exact` and
     `PathPrefix` / `Prefix` conditions on the same key that have no lexical
@@ -96,7 +277,7 @@ code or test that backs it. None of it is a security or production guarantee.
     division slash `∕` (U+2215), spaces (`" .."`), and `...` are ordinary
     characters. No layer downstream may NFKC-normalize or percent-decode a
     value after it was authorized.
-  - **Over-restriction (accepted, fail closed):** an unsafe value triggers a
+  - **Over-restriction (accepted, fail closed):** a non-canonical value triggers a
     `Deny` or `RequireApproval` rule even when it lies outside the rule's
     prefix. For example, a deny on `/srv/secret` also denies `/home/50%.txt`.
   - See [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs),
@@ -120,7 +301,14 @@ cargo test -p praetore-core --lib evidence::tests::signing_requires_a_bound_poli
 cargo test -p praetore-gateway --test enforcement human_approval
 ```
 
+</details>
+
+---
+
 ## Limitations
+
+<details open>
+<summary>Show / hide</summary>
 
 - **Cooperative enforcement.** PRÆTORE governs only the actions an agent
   submits to it. It cannot stop an agent, or any other process, from
@@ -160,7 +348,13 @@ cargo test -p praetore-gateway --test enforcement human_approval
   target exists ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs)),
   but CI runs each target only as a 10-second smoke test.
 
+</details>
+
+---
+
 ## Not verified
+
+> For this README revision the quickstart, `./demo/verify-receipt.sh`, the `praetore-verify` commands and the CLI flow `init` → `doctor` → `run` → `demo` → `approve` → `dispatch` (local PostgreSQL 16, Linux) were run. The list below is the original one and is kept unchanged.
 
 The following were **not** exercised when this README was last checked:
 
@@ -178,12 +372,16 @@ The workspace tests, Clippy and rustfmt were run on macOS (Apple silicon).
 The other PostgreSQL tests in `postgres.rs`, which are ignored without
 `PRAETORE_TEST_DATABASE_URL`, were run there against PostgreSQL 16.
 
+---
+
 ## In development
 
 The following are **open pull requests, not merged** and not available on
 `main`:
 
-- [#15](https://github.com/Mavericksantander/praetore/pull/15): record the deciding rule (`decided_by`) inside signed decisions and receipts.
+- [#15](https://github.com/Mavericksantander/praetore/pull/15) (merged on 2026-10-30, kept here for history): record the deciding rule (`decided_by`) inside signed decisions and receipts.
+
+---
 
 ## What it is — and is not
 
@@ -207,7 +405,7 @@ The following are **open pull requests, not merged** and not available on
   deployment contracts, but not the production tool-runner implementation or
   validated target-cluster integration needed to establish an end-to-end
   sandbox.
-* A certification, accreditation, or guarantee that a deployment is safe.
+* An accreditation, or a guarantee that a deployment is protected.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
@@ -223,21 +421,7 @@ integration](docs/tool-gateway-integration.md), [threat model](docs/threat-model
 and [pre-user deployment gates](docs/pre-user-pilot-gates.md) before any
 high-consequence pilot.
 
-## Quick start
-
-Run the self-contained example from the repository root:
-
-```sh
-cargo run -p praetore-core --example quickstart
-```
-
-It creates an agent keypair, issues an authority bound to that key, signs
-requests, evaluates them in both **Strict** and **HighAssurance** modes, and
-verifies the resulting evidence. The example uses ephemeral keys, an
-in-memory replay guard, and a demonstration freshness provider; none is
-suitable for production. See the [policy language guide](docs/policy-language.md)
-for declarative rules and the [crypto and policy guide](docs/crypto-and-policy.md)
-for signing and verification details.
+---
 
 ## Local PostgreSQL gateway demo
 
@@ -246,6 +430,8 @@ a demo directory, checking local PostgreSQL and gateway health, running the
 loopback-only gateway, and submitting its single signed key/value demo action.
 The generated keys and in-memory adapter are for local development only; this
 is not a production deployment or an external-agent integration.
+
+---
 
 ## Documentation
 
@@ -263,6 +449,8 @@ is not a production deployment or an external-agent integration.
 * [Architecture decision records](docs/adr/README.md)
 * [Offline verifier CLI](#verify-evidence-offline)
 * [Contributing and validation](CONTRIBUTING.md)
+
+---
 
 ## Core Concepts
 
@@ -283,6 +471,8 @@ The architecture is designed around an explicit trust chain:
 **Agent → Authority → Action → Policy → Decision → Evidence**
 
 The goal is to make authorization decisions not only executable, but explainable and independently verifiable.
+
+---
 
 ## Design Principles
 
@@ -310,6 +500,8 @@ When authorization requirements are not satisfied, the system should deny the ac
 
 Identity, authority, policy, authorization, and evidence are treated as distinct security concepts.
 
+---
+
 ## Repository Structure
 
 ```text
@@ -323,7 +515,9 @@ praetore/
 │   ├── praetore-gateway/
 │   ├── praetore-gateway-service/
 │   ├── praetore-cli/
-│   └── praetore-observe/
+│   ├── praetore-observe/
+│   └── praetore-mcp/
+├── demo/
 ├── fuzz/
 ├── packages/praetore-python/
 ├── docs/
@@ -338,7 +532,12 @@ praetore/
 └── README.md
 ```
 
+---
+
 ## Security and production use
+
+<details open>
+<summary>Show / hide</summary>
 
 There are three evaluation modes; choose deliberately:
 
@@ -359,7 +558,11 @@ execution.
 
 See the linked documentation above before production integration. High-
 consequence pilots must close the [pre-user deployment gates](docs/pre-user-pilot-gates.md);
-these documents do not represent certification or accreditation.
+these documents do not represent formal accreditation.
+
+</details>
+
+---
 
 ## Development
 
@@ -394,6 +597,8 @@ Check for whitespace and patch errors:
 git diff --check
 ```
 
+---
+
 ## Architecture
 
 PRÆTORE Core separates the authorization pipeline into explicit components.
@@ -412,6 +617,8 @@ PRÆTORE Core separates the authorization pipeline into explicit components.
 
 The `engine` coordinates these components and enforces the authorization flow.
 
+---
+
 ## Authorization Model
 
 PRÆTORE follows a fail-closed authorization model.
@@ -426,6 +633,8 @@ When multiple applicable policy rules contribute to a decision, the strongest ap
 
 This allows restrictive rules to override permissive rules without depending on policy rule ordering.
 
+---
+
 ## Evidence and Integrity
 
 Authorization evidence contains the request context and resulting decision.
@@ -438,7 +647,12 @@ The hash is not a signature: anyone able to modify an evidence document can
 recompute it. Signed authorities and optional signed request intents use
 Ed25519 and are described in [Crypto and policy semantics](docs/crypto-and-policy.md).
 
-## Verify evidence offline
+---
+
+## Verify evidence offline (reference)
+
+<details open>
+<summary>Show / hide</summary>
 
 Install the verifier with `cargo install --path crates/praetore-verify --locked`
 (or build it with `cargo build --release --locked --package
@@ -517,6 +731,10 @@ See [the assurance traceability matrix](docs/assurance-matrix.md) for
 requirements, tests, and CI job mapping, and [CONTRIBUTING.md](CONTRIBUTING.md)
 for exact local validation and release commands.
 
+</details>
+
+---
+
 ## End-to-end examples
 
 Run the combined Strict and HighAssurance example:
@@ -533,6 +751,8 @@ in the authorization domain, and a real freshness source. Duplicate requests,
 storage outages, or freshness failures fail closed; neither example is a
 revocation service.
 
+---
+
 ## Security
 
 PRÆTORE is security-sensitive infrastructure.
@@ -540,6 +760,8 @@ PRÆTORE is security-sensitive infrastructure.
 Please do not disclose suspected vulnerabilities through public issues.
 
 See `SECURITY.md` for the project's security policy.
+
+---
 
 ## License
 
@@ -555,6 +777,8 @@ Any commercial use requires a separate written license from PRÆTOR TECHNOLOGIES
 
 See `LICENSE` for the complete terms.
 
+---
+
 ## Trademarks
 
 PRÆTOR, PRÆTORE, and associated names, logos, and product names are trademarks or intended trademarks of PRÆTOR TECHNOLOGIES.
@@ -562,6 +786,8 @@ PRÆTOR, PRÆTORE, and associated names, logos, and product names are trademarks
 The software license does not grant trademark rights.
 
 See `TRADEMARKS.md` for additional information.
+
+---
 
 ## Copyright
 
