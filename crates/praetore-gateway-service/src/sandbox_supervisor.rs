@@ -80,8 +80,9 @@ struct ProfileRoute {
     capability: String,
     tool_profile: String,
     /// Closed schema of the action's top-level parameters. A key that is not
-    /// declared, or a value of another kind, refuses the dispatch.
-    parameters: BTreeMap<String, ParameterKind>,
+    /// declared, a value of another kind, or a missing required key refuses
+    /// the dispatch.
+    parameters: BTreeMap<String, ParameterSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -89,15 +90,54 @@ struct ProfileRoute {
 enum ParameterKind {
     /// A string naming a file relative to the sandbox; checked lexically.
     Path,
+    /// An array of at most `MAX_PATH_LIST_ITEMS` `path` values.
+    PathList,
     String,
     Integer,
     Boolean,
 }
 
+/// `"path"` declares a required parameter; `{"kind": "path", "optional": true}`
+/// is the only way to make one optional.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ParameterSpec {
+    Required(ParameterKind),
+    Detailed(DetailedParameterSpec),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DetailedParameterSpec {
+    kind: ParameterKind,
+    #[serde(default)]
+    optional: bool,
+}
+
+impl ParameterSpec {
+    fn kind(self) -> ParameterKind {
+        match self {
+            Self::Required(kind) | Self::Detailed(DetailedParameterSpec { kind, .. }) => kind,
+        }
+    }
+
+    fn required(self) -> bool {
+        !matches!(
+            self,
+            Self::Detailed(DetailedParameterSpec { optional: true, .. })
+        )
+    }
+}
+
+const MAX_PATH_LIST_ITEMS: usize = 64;
+
+/// Exact startup error for a configuration that is not `schema_version` 2.
+const UNSUPPORTED_SCHEMA_VERSION: &str = "sandbox supervisor configuration must have schema_version 2 (version 1 has no per-route `parameters` schema; see the CHANGELOG for the migration)";
+
 #[derive(Clone)]
 struct Route {
     tool_profile: String,
-    parameters: BTreeMap<String, ParameterKind>,
+    parameters: BTreeMap<String, ParameterSpec>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -332,6 +372,11 @@ impl SandboxSupervisor {
         }
         let config_value = parse_json_rejecting_duplicates(config_json)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        // Checked before the routes are parsed, so a version 1 file reports
+        // its version instead of a missing `parameters` field.
+        if config_value.get("schema_version") != Some(&json!(2)) {
+            return Err(UNSUPPORTED_SCHEMA_VERSION.into());
+        }
         let config: SupervisorConfig = serde_json::from_value(config_value)?;
         if config.schema_version != 2
             || config.routes.is_empty()
@@ -576,21 +621,36 @@ fn valid_dispatch_request(request: &DispatchRequest, idempotency: &str) -> bool 
 /// the route, each value of the declared kind. Only `path` values get the
 /// lexical check, so free text that merely looks like a path is not refused.
 /// Declared keys may be absent.
-fn parameters_match_schema(schema: &BTreeMap<String, ParameterKind>, parameters: &Value) -> bool {
+fn parameters_match_schema(schema: &BTreeMap<String, ParameterSpec>, parameters: &Value) -> bool {
     let Value::Object(entries) = parameters else {
         return false;
     };
-    entries
+    let declared_and_well_typed = entries.iter().all(|(key, value)| {
+        schema
+            .get(key)
+            .is_some_and(|spec| value_matches_kind(spec.kind(), value))
+    });
+    let required_present = schema
         .iter()
-        .all(|(key, value)| match (schema.get(key), value) {
-            (Some(ParameterKind::Path), Value::String(text)) => lexically_confined_text(text),
-            (Some(ParameterKind::String), Value::String(_))
-            | (Some(ParameterKind::Boolean), Value::Bool(_)) => true,
-            (Some(ParameterKind::Integer), Value::Number(number)) => {
-                number.is_i64() || number.is_u64()
-            }
-            _ => false,
-        })
+        .all(|(key, spec)| !spec.required() || entries.contains_key(key));
+    declared_and_well_typed && required_present
+}
+
+fn value_matches_kind(kind: ParameterKind, value: &Value) -> bool {
+    match (kind, value) {
+        (ParameterKind::Path, Value::String(text)) => lexically_confined_text(text),
+        (ParameterKind::PathList, Value::Array(items)) => {
+            items.len() <= MAX_PATH_LIST_ITEMS
+                && items
+                    .iter()
+                    .all(|item| item.as_str().is_some_and(lexically_confined_text))
+        }
+        (ParameterKind::String, Value::String(_)) | (ParameterKind::Boolean, Value::Bool(_)) => {
+            true
+        }
+        (ParameterKind::Integer, Value::Number(number)) => number.is_i64() || number.is_u64(),
+        _ => false,
+    }
 }
 
 /// Lexical only: rejects NUL, a root (`/` or `\`), a drive or UNC prefix and
@@ -1564,10 +1624,41 @@ mod tests {
         });
         assert!(SandboxSupervisor::new(kubernetes(), &duplicate_route.to_string()).is_err());
 
-        // Version 1 had no parameter schema; it is refused, not upgraded.
-        let mut version_one = valid.clone();
-        version_one["schema_version"] = json!(1);
-        assert!(SandboxSupervisor::new(kubernetes(), &version_one.to_string()).is_err());
+        // Version 1 had no parameter schema; it is refused, not upgraded,
+        // with the message quoted in the CHANGELOG.
+        let version_one = json!({
+            "schema_version": 1,
+            "runner_image": valid["runner_image"],
+            "routes": [{
+                "tenant_id": Uuid::from_u128(1),
+                "action_type": "orders:create",
+                "target": "orders-api",
+                "capability": "orders:write",
+                "tool_profile": "orders-create"
+            }]
+        });
+        let error = SandboxSupervisor::new(kubernetes(), &version_one.to_string())
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(error, UNSUPPORTED_SCHEMA_VERSION);
+        assert_eq!(
+            error,
+            "sandbox supervisor configuration must have schema_version 2 (version 1 has no per-route `parameters` schema; see the CHANGELOG for the migration)"
+        );
+
+        // Shorthand is required; the object form may mark a key optional.
+        let mut mixed = valid.clone();
+        mixed["routes"][0]["parameters"] = json!({
+            "files": "path_list",
+            "note": {"kind": "string", "optional": true},
+            "mode": {"kind": "string"}
+        });
+        let supervisor = SandboxSupervisor::new(kubernetes(), &mixed.to_string()).unwrap();
+        let route = supervisor.routes.values().next().unwrap();
+        assert!(route.parameters["files"].required());
+        assert!(!route.parameters["note"].required());
+        assert!(route.parameters["mode"].required());
 
         // Every route must declare its parameters, each with a known kind.
         let mut missing = valid.clone();
@@ -1576,7 +1667,14 @@ mod tests {
             .unwrap()
             .remove("parameters");
         assert!(SandboxSupervisor::new(kubernetes(), &missing.to_string()).is_err());
-        for schema in [json!({"id": "number"}), json!({"id": "path", "": "string"})] {
+        for schema in [
+            json!({"id": "number"}),
+            json!({"id": "path", "": "string"}),
+            json!({"id": {"kind": "path", "optional": "yes"}}),
+            json!({"id": {"kind": "path", "required": false}}),
+            json!({"id": {"optional": true}}),
+            json!({"id": "object"}),
+        ] {
             let mut config = valid.clone();
             config["routes"][0]["parameters"] = schema;
             assert!(
@@ -1669,12 +1767,24 @@ mod tests {
         (request, idempotency)
     }
 
-    fn path_schema() -> BTreeMap<String, ParameterKind> {
+    fn optional(kind: ParameterKind) -> ParameterSpec {
+        ParameterSpec::Detailed(DetailedParameterSpec {
+            kind,
+            optional: true,
+        })
+    }
+
+    /// `path` is required; every other key is optional.
+    fn path_schema() -> BTreeMap<String, ParameterSpec> {
         BTreeMap::from([
-            ("path".to_owned(), ParameterKind::Path),
-            ("note".to_owned(), ParameterKind::String),
-            ("count".to_owned(), ParameterKind::Integer),
-            ("force".to_owned(), ParameterKind::Boolean),
+            (
+                "path".to_owned(),
+                ParameterSpec::Required(ParameterKind::Path),
+            ),
+            ("files".to_owned(), optional(ParameterKind::PathList)),
+            ("note".to_owned(), optional(ParameterKind::String)),
+            ("count".to_owned(), optional(ParameterKind::Integer)),
+            ("force".to_owned(), optional(ParameterKind::Boolean)),
         ])
     }
 
@@ -1715,10 +1825,10 @@ mod tests {
             json!({"path": ["ok.txt"]}),
             json!({"path": {"dir": "ok"}}),
             json!({"path": null}),
-            json!({"count": "3"}),
-            json!({"count": 1.5}),
-            json!({"force": "true"}),
-            json!({"note": false}),
+            json!({"path": "a", "count": "3"}),
+            json!({"path": "a", "count": 1.5}),
+            json!({"path": "a", "force": "true"}),
+            json!({"path": "a", "note": false}),
             json!(["ok.txt"]),
             json!("ok.txt"),
         ] {
@@ -1731,12 +1841,45 @@ mod tests {
             &BTreeMap::new(),
             &json!({"id": 3})
         ));
+        assert!(parameters_match_schema(&BTreeMap::new(), &json!({})));
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_missing_required_keys() {
+        for parameters in [json!({}), json!({"note": "x"}), json!({"files": ["a"]})] {
+            assert!(
+                !parameters_match_schema(&path_schema(), &parameters),
+                "accepted without the required path: {parameters}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_dispatch_checks_every_path_list_item_and_its_length() {
+        let ok = |files: Value| {
+            parameters_match_schema(&path_schema(), &json!({"path": "a", "files": files}))
+        };
+        assert!(ok(json!([])));
+        assert!(ok(json!(["a.txt", "dir/b.txt"])));
+        assert!(ok(json!(vec!["f"; MAX_PATH_LIST_ITEMS])));
+        assert!(!ok(json!(vec!["f"; MAX_PATH_LIST_ITEMS + 1])));
+        for files in [
+            json!(["a.txt", "../etc/passwd"]),
+            json!(["/etc/passwd"]),
+            json!(["ok", "a\\..\\b"]),
+            json!(["ok\0"]),
+            json!(["ok", 3]),
+            json!([["nested"]]),
+            json!([{"path": "a"}]),
+            json!("a.txt"),
+        ] {
+            assert!(!ok(files.clone()), "accepted files: {files}");
+        }
     }
 
     #[test]
     fn sandbox_dispatch_accepts_declared_values_and_free_text() {
         for parameters in [
-            json!({}),
             json!({"path": "data/report.txt"}),
             json!({"path": "./a/b..c/..."}),
             // Only `path` values are checked: free text that looks like a
@@ -1789,12 +1932,15 @@ mod tests {
     #[tokio::test]
     async fn dispatch_refuses_schema_violations_before_any_kubernetes_request() {
         let supervisor = unreachable_supervisor();
-        // The route declares {"path": "path", "content": "string"}.
+        // The route declares {"path": "path", "content": "string"}, both
+        // required.
         for parameters in [
             json!({"path": "../etc/passwd"}),
             json!({"path": "/etc/passwd"}),
-            json!({"path": "ok.txt", "destination": "/etc/passwd"}),
-            json!({"path": 7}),
+            json!({"path": "ok.txt", "content": "x", "destination": "/etc/passwd"}),
+            json!({"path": 7, "content": "x"}),
+            // `content` is required by the route.
+            json!({"path": "ok.txt"}),
         ] {
             assert_eq!(
                 post_execution(&supervisor, parameters.clone()).await,

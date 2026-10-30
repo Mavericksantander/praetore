@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+- **Breaking (sandbox supervisor configuration): `schema_version` 1 → 2.**
+  Every route must now declare a closed schema of its action's top-level
+  `parameters`. At dispatch, before any Kubernetes request, the supervisor
+  answers 400 if `parameters` is not an object, has a key the route does not
+  declare, has a value of another kind, or lacks a required key. Only `path`
+  and `path_list` values get the lexical path check (no NUL, no leading `/`
+  or `\`, no drive/UNC prefix, no `..` segment); free text in `string`
+  values is not path-checked.
+  - Kinds: `path`, `path_list` (array of at most 64 `path` values, each
+    checked), `string`, `integer`, `boolean`. Nested objects are not
+    supported.
+  - `"key": "kind"` declares a **required** key. A key is optional only when
+    written as `"key": {"kind": "...", "optional": true}`.
+  - A version 1 file is refused at startup, not upgraded.
+    `SandboxSupervisor::new` returns, and `praetore-sandbox-supervisor`
+    exits with (`main` returns the error, so it is printed as
+    `Error: "<message>"`):
+    ```
+    sandbox supervisor configuration must have schema_version 2 (version 1 has no per-route `parameters` schema; see the CHANGELOG for the migration)
+    ```
+  - Migration: set `"schema_version": 2` and add `parameters` to every route.
+    Before (v1):
+    ```json
+    {"schema_version": 1, "runner_image": "…@sha256:…", "routes": [
+      {"tenant_id": "…", "action_type": "orders:create", "target": "orders-api",
+       "capability": "orders:write", "tool_profile": "orders-create"}]}
+    ```
+    After (v2):
+    ```json
+    {"schema_version": 2, "runner_image": "…@sha256:…", "routes": [
+      {"tenant_id": "…", "action_type": "orders:create", "target": "orders-api",
+       "capability": "orders:write", "tool_profile": "orders-create",
+       "parameters": {
+         "order_id": "string",
+         "quantity": "integer",
+         "attachments": {"kind": "path_list", "optional": true}}}]}
+    ```
+    Declare every key the tool actually receives: after the upgrade, a
+    request with an undeclared key is refused.
+
 - `crates/praetore-mcp/GUIDE.md`: a guide for external developers with a
   first-run walkthrough, the limits (only MCP `tools/call` through a wrapped
   server is governed; LOCAL/DEV keys; no approval flow for REQUIRE_APPROVAL;
