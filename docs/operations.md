@@ -189,7 +189,8 @@ provisioned production pin.
 gateway receipt's signed execution attestation (schema v1, v2 or v3) and the
 embedded evidence's `attester_signature` against the pinned evidence attester
 key; a missing or invalid evidence signature fails with
-`RECEIPT_EVIDENCE_SIGNATURE_INVALID`. The execution attestation binds the
+`RECEIPT_EVIDENCE_SIGNATURE_INVALID`. Both signatures must be exactly 128
+lowercase hex characters; uppercase or mixed case is rejected. The execution attestation binds the
 evidence `context_hash`, which excludes that signature, so both checks are
 required. A v3 attestation carries
 `not_dispatched_reason` (`approval_expired`, `dispatch_failed` or

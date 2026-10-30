@@ -121,6 +121,11 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
             receipt = json.loads(original)
             receipt["evidence"]["attester_signature"] = "0" * 128
             self.assertFalse(self.verify(json.dumps(receipt)), name)
+            signature = json.loads(original)["evidence"]["attester_signature"]
+            receipt["evidence"]["attester_signature"] = signature.upper()
+            self.assertFalse(self.verify(json.dumps(receipt)), name)
+            receipt["evidence"]["attester_signature"] = signature[:126]
+            self.assertFalse(self.verify(json.dumps(receipt)), name)
             receipt["evidence"]["attester_signature"] = None
             self.assertFalse(self.verify(json.dumps(receipt)), name)
             other = (FIXTURES / "attester-public-key.hex").read_text(
