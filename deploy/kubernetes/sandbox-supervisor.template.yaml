@@ -6,7 +6,7 @@ metadata:
 data:
   config.json: |
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "runner_image": "registry.example.com/praetore/tool-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "routes": [
         {
@@ -14,7 +14,8 @@ data:
           "action_type": "orders:create",
           "target": "orders-api",
           "capability": "orders:write",
-          "tool_profile": "orders-create"
+          "tool_profile": "orders-create",
+          "parameters": {"order_id": "string", "quantity": "integer"}
         }
       ]
     }
