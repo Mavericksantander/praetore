@@ -45,7 +45,12 @@
   only when compared like the filesystem compares names (case folding and/or
   NFC: APFS, HFS+, casefolded ext4/f2fs, unknown filesystems), not byte for
   byte, is `ambiguous` and hidden the same way; this covers case and NFD
-  variants of a denied name that does not exist yet.
+  variants of a denied name that does not exist yet. Case folding is full
+  Unicode case folding (new dependency `caseless`) iterated to a fixed point
+  (`ẞ`/`ß`/`ss`). A path that reaches a prefix's directory under another
+  spelling, compared by `(st_dev, st_ino)` (macOS `/System/Volumes/Data`
+  firmlinks, bind mounts), is `ambiguous` too; `policy check` warns about
+  prefixes written in the `/System/Volumes/Data` spelling.
 
 ## 0.3.0 - 2026-10-30
 

@@ -766,3 +766,95 @@ fn deny_path_prefix_catches_case_and_nfd_variants_of_a_missing_name_on_apfs() {
     );
     assert!(verify_cli(&home).status.success());
 }
+
+/// Independent review of `a9dbbdf`, Alta 1, as the reviewer ran it: DENY on
+/// a `.ssh` that does not exist yet (a stand-in for `~/.ssh` in a temp dir).
+/// `.ẞh` is the same entry on APFS; it must be refused before it exists
+/// (step 1) and after the server created it under that spelling (step 2).
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_path_prefix_catches_sharp_s_variants_of_dot_ssh_on_apfs() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let ssh = root.join(".ssh");
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-ssh", ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+                PolicyCondition::path_prefix("arguments.path", ssh.to_str().unwrap()),
+            ),
+        ],
+    );
+    let variant = root.join(".\u{1e9e}h");
+    let refused = |responses: &[Value], id: u32| {
+        by_id(responses, &json!(id))["result"]["isError"] == json!(true)
+    };
+    let (step1, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(60, &variant),
+            echo_path(61, &root.join(".\u{df}h")),
+            echo_path(62, &root.join(".SSH")),
+            echo_path(63, &root.join(".sh")),
+        ]),
+    );
+    for id in [60, 61, 62] {
+        assert!(refused(&step1, id), "id {id}: {stderr}");
+    }
+    assert!(!refused(&step1, 63), "{stderr}");
+
+    // What the server would have done had step 1 been allowed.
+    fs::create_dir(&variant).unwrap();
+    assert!(ssh.exists(), "APFS: .ẞh is .ssh");
+    let (step2, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![echo_path(64, &variant.join("authorized_keys"))]),
+    );
+    assert!(refused(&step2, 64), "{stderr}");
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 0, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `a9dbbdf`, Alta 2: `realpath` keeps the
+/// `/System/Volumes/Data` spelling of firmlinked directories. Includes the
+/// real `~/.ssh` (only `stat`; `echo` touches nothing).
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_path_prefix_catches_firmlink_spellings_on_macos() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::create_dir_all(root.join("vault")).unwrap();
+    let user_home = PathBuf::from(std::env::var("HOME").unwrap());
+    let data = |path: &Path| PathBuf::from(format!("/System/Volumes/Data{}", path.display()));
+    let deny = |id: &str, path: &Path| {
+        PolicyRule::new(id, ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+            PolicyCondition::path_prefix("arguments.path", path.to_str().unwrap()),
+        )
+    };
+    write_policy(
+        &home,
+        vec![
+            deny("deny-vault", &root.join("vault")),
+            deny("deny-ssh", &user_home.join(".ssh")),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(70, &root.join("vault").join("k")),
+            echo_path(71, &data(&root.join("vault").join("k"))),
+            echo_path(72, &data(&user_home.join(".ssh"))),
+            echo_path(73, &data(&user_home.join(".ssh").join("authorized_keys"))),
+            echo_path(74, &data(&root.join("notes.txt"))),
+        ]),
+    );
+    for (id, refused) in [(70, true), (71, true), (72, true), (73, true), (74, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}

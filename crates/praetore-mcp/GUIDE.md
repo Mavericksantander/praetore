@@ -82,9 +82,11 @@ Read these before relying on anything above.
    `/tmp/...` is such a path (`/tmp` → `/private/tmp`): use the resolved
    path in rules and arguments. On a filesystem that ignores case or Unicode
    normalization (APFS by default), a path that differs from a rule's prefix
-   only in case or normalization (`/x/SECRET` against `/x/secret`, NFD
-   against NFC) is also treated that way (`ambiguous`), even when it does not
-   exist yet. The receipt shows what was checked in
+   only in case or normalization (`/x/SECRET` or `/x/ẞECRET` against
+   `/x/secret`, NFD against NFC) is also treated that way (`ambiguous`), even
+   when it does not exist yet, and so is another spelling of the same
+   directory, such as the macOS firmlink `/System/Volumes/Data/Users/...`
+   for `/Users/...`. The receipt shows what was checked in
    `context["praetore.path_check"]`.
 5. **Time of check to time of use (TOCTOU).** The decision is made on the
    arguments when the call passes through the proxy. The MCP server opens

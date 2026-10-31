@@ -258,8 +258,10 @@ the server are never changed. Consequences:
   are symlinks to `/private/tmp` and `/private/var`, so `/tmp/x` is refused by
   a restrictive rule on that key and never allowed by an ALLOW rule.
   `policy deny|allow|require-approval` and `policy check` warn when a rule's
-  prefix exists and resolves to another path: a DENY rule on `/tmp/secret`
-  would not cover `/private/tmp/secret/x`.
+  prefix exists and resolves to another path (a DENY rule on `/tmp/secret`
+  refuses `/private/tmp/secret/x` only as `ambiguous`, and an ALLOW rule
+  never matches it), and when it is written in the `/System/Volumes/Data`
+  spelling of a firmlinked directory.
 * Case and Unicode normalization. For an existing entry `realpath` returns
   the stored spelling, so on APFS `/x/SECRET/f` (stored `secret`) or an NFD
   `cafe\u{301}` (stored NFC `café`) is `differs`. A name that does not exist
@@ -267,13 +269,28 @@ the server are never changed. Consequences:
   compared with every `--arg-path-prefix` value of the policy: if it is at
   or under one only once names are compared the way the filesystem compares
   them (case folding and/or NFC), and not byte for byte, it is `ambiguous`
-  and the engine sees the placeholder. Each differing segment uses the
+  and the engine sees the placeholder. Case folding is Unicode full case
+  folding (CaseFolding.txt C+F, crate `caseless`) followed by upper- and
+  lower-casing, repeated to a fixed point, so `ẞ`, `ß`, `ss` and `SS` are one
+  name; it is broader than APFS (`ı`/`I` and `İ`/`i` are also refused as
+  `ambiguous` although APFS keeps them apart). Each differing segment uses the
   sensitivity of its directory: on macOS `pathconf(_PC_CASE_SENSITIVE)`
   decides case, normalization is always ignored (APFS, HFS+); on Linux only
   ext4/f2fs/tmpfs directories without the casefold flag, xfs and btrfs count
   as byte for byte; anything else, or a failed probe, folds both (fail
   closed). On a case-sensitive filesystem `/x/SECRET` is an ordinary path and
   is not refused by a rule on `/x/secret`.
+* Other spellings of the same directory. `realpath` does not cross macOS
+  firmlinks: `/System/Volumes/Data/Users/u/.ssh` resolves to itself and is
+  the same directory as `/Users/u/.ssh`. So the deepest existing ancestor of
+  each policy prefix is also compared by `(st_dev, st_ino)` with every
+  existing ancestor of the argument; on a match, the rest of the argument
+  must start with the prefix's missing tail (names folded as above). Such a
+  path is `ambiguous`. This also covers bind mounts, a prefix written
+  through a symlink, and a hard link to a file that is itself a prefix. It
+  does not cover a hard link, created elsewhere, to a file *inside* a prefix
+  (there is no way to find the other names of a file); `/.vol/<dev>/<ino>`
+  paths do not resolve and are `unresolved`.
 * Relative values are not resolved; core already treats them as unsafe.
 * The check happens when the proxy decides. The server opens the path later,
   so a symlink created or swapped in between is not seen (TOCTOU, see
@@ -389,7 +406,9 @@ Things to know:
 * Path checks are point-in-time (TOCTOU). Arguments covered by a
   `PathPrefix` rule are resolved when the proxy decides; the MCP server opens
   the path afterwards. Replacing a directory with a symlink between the two
-  is not detected. Arguments no `PathPrefix` rule covers are never resolved.
+  is not detected, nor is a filesystem mounted, or a policy prefix created,
+  in between (filesystem sensitivity and identities are read at decision
+  time too). Arguments no `PathPrefix` rule covers are never resolved.
 * REQUIRE_APPROVAL is not supported. In enforce mode it is treated like DENY,
   with the text "requires human approval (not supported by praetore-mcp yet)".
 * The keys are LOCAL/DEV keys. See the trust model.

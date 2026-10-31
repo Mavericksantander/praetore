@@ -230,10 +230,11 @@ pub enum PathCheck {
     /// The path or its parent does not exist, is a dangling symlink, or is
     /// not UTF-8: it cannot be resolved now.
     Unresolved,
-    /// The path resolves to itself, but on a filesystem that ignores case
-    /// or Unicode normalization it may name an entry at or under a policy
-    /// `PathPrefix` that it does not match byte for byte (see
-    /// [`folds_into_prefix`]).
+    /// The path resolves to itself, but it may name an entry at or under a
+    /// policy `PathPrefix` that it does not match byte for byte: on a
+    /// filesystem that ignores case or Unicode normalization (see
+    /// [`folds_into_prefix`]), or through another spelling of the same
+    /// directory, such as a macOS firmlink (see [`aliases_prefix`]).
     Ambiguous,
 }
 
@@ -305,28 +306,50 @@ impl Insensitivity {
     };
 }
 
-/// Comparison key of a name under `mode`. Case folding is deliberately
-/// broader than any filesystem's (full upper- then lower-casing): a wider
-/// fold can only turn more paths into [`PathCheck::Ambiguous`].
+/// Bound on fold rounds; every scalar reaches a fixed point well within it
+/// (checked over all of Unicode by
+/// `fold_key_is_idempotent_and_covers_every_mapping`).
+const MAX_FOLD_ROUNDS: usize = 8;
+
+/// Comparison key of a name under `mode`.
+///
+/// Case: Unicode full case folding (CaseFolding.txt, status C+F, via
+/// `caseless`) and then upper- followed by lower-casing, repeated until the
+/// key stops changing, so `ẞ`, `ß`, `ss` and `SS` share a key. With
+/// normalization, every round works on NFD and the key is NFC: this contains
+/// the canonical caseless match of Unicode D145 (`NFD(toCasefold(NFD(x)))`)
+/// and is deliberately broader than any filesystem's folding (it also
+/// merges `ı`/`I` and `İ`/`i`); a wider fold can only turn more paths into
+/// [`PathCheck::Ambiguous`].
 fn fold_key(name: &str, mode: Insensitivity) -> String {
-    let chars: Vec<char> = if mode.normalization {
-        name.nfd().collect()
-    } else {
-        name.chars().collect()
+    let normalize = |text: String| -> String {
+        if mode.normalization {
+            text.nfd().collect()
+        } else {
+            text
+        }
     };
-    let folded: String = if mode.case {
-        chars
-            .into_iter()
-            .flat_map(char::to_uppercase)
-            .flat_map(char::to_lowercase)
-            .collect()
-    } else {
-        chars.into_iter().collect()
-    };
+    let mut key = normalize(name.to_owned());
+    if mode.case {
+        for _ in 0..MAX_FOLD_ROUNDS {
+            let folded = normalize(caseless::default_case_fold_str(&key));
+            let next = normalize(
+                folded
+                    .chars()
+                    .flat_map(char::to_uppercase)
+                    .flat_map(char::to_lowercase)
+                    .collect(),
+            );
+            if next == key {
+                break;
+            }
+            key = next;
+        }
+    }
     if mode.normalization {
-        folded.nfc().collect()
+        key.nfc().collect()
     } else {
-        folded
+        key
     }
 }
 
@@ -376,6 +399,86 @@ pub fn folds_into_prefix<'a>(
     })
 }
 
+fn join_segments(segments: &[&str]) -> String {
+    format!("/{}", segments.join("/"))
+}
+
+/// `(st_dev, st_ino)` of what `path` names, following symlinks.
+#[cfg(unix)]
+fn file_id(path: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+/// No portable identity outside Unix: the alias check is skipped there.
+#[cfg(not(unix))]
+fn file_id(_path: &str) -> Option<(u64, u64)> {
+    None
+}
+
+/// Returns a `prefix` that `path` reaches on disk under another spelling: a
+/// macOS firmlink (`/System/Volumes/Data/Users/u` is `/Users/u`), a bind
+/// mount, a hard link to the prefix itself, or a prefix written through a
+/// symlink. The deepest existing ancestor-or-self of the prefix is compared
+/// by `(st_dev, st_ino)` with each existing ancestor-or-self of `path`; on
+/// a match, the rest of `path` must start with the prefix's missing tail
+/// (names compared as the directory compares them). A `path` lexically at
+/// or under the prefix is left to core, which already matches it.
+pub fn aliases_prefix<'a>(
+    path: &str,
+    prefixes: &'a BTreeSet<String>,
+    insensitivity: impl Fn(&str) -> Insensitivity + Copy,
+) -> Option<&'a str> {
+    let path_segments = segments(path);
+    let mut ancestors: Option<Vec<Option<(u64, u64)>>> = None;
+    prefixes.iter().map(String::as_str).find(|prefix| {
+        let prefix_segments = segments(prefix);
+        if !prefix.starts_with('/') || path_segments.starts_with(&prefix_segments) {
+            return false;
+        }
+        let Some((depth, id)) = (0..=prefix_segments.len()).rev().find_map(|depth| {
+            file_id(&join_segments(&prefix_segments[..depth])).map(|id| (depth, id))
+        }) else {
+            return false;
+        };
+        let tail = &prefix_segments[depth..];
+        let ancestors = ancestors.get_or_insert_with(|| {
+            (0..=path_segments.len())
+                .map(|depth| file_id(&join_segments(&path_segments[..depth])))
+                .collect()
+        });
+        ancestors.iter().enumerate().any(|(index, ancestor)| {
+            let rest = &path_segments[index..];
+            *ancestor == Some(id)
+                && rest.len() >= tail.len()
+                && rest
+                    .iter()
+                    .zip(tail)
+                    .enumerate()
+                    .all(|(offset, (name, expected))| {
+                        name == expected || {
+                            let mode =
+                                insensitivity(&join_segments(&path_segments[..index + offset]));
+                            fold_key(name, mode) == fold_key(expected, mode)
+                        }
+                    })
+        })
+    })
+}
+
+/// The `/System/Volumes/Data` spelling of a macOS firmlinked path (or any
+/// path whose remainder is the same directory entry), for `policy check`.
+pub fn firmlink_alias(prefix: &str) -> Option<String> {
+    let rest = prefix.strip_prefix("/System/Volumes/Data")?;
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let id = file_id(prefix)?;
+    (file_id(rest) == Some(id)).then(|| rest.to_owned())
+}
+
 /// Sensitivity of the filesystem holding `dir`. When it cannot be
 /// established, the answer is [`Insensitivity::FULL`] (fail closed: at worst
 /// a path that folds into a policy prefix is refused).
@@ -404,54 +507,78 @@ mod platform {
     }
 }
 
+const EXT4_SUPER_MAGIC: u32 = 0xEF53;
+const F2FS_SUPER_MAGIC: u32 = 0xF2F5_2010;
+const TMPFS_MAGIC: u32 = 0x0102_1994;
+const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
+const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+
+/// Linux decision from the `statfs` magic and the directory's casefold flag
+/// (`None` when it could not be read). Only filesystems known to compare
+/// names byte for byte are sensitive: xfs, btrfs, and ext4/f2fs/tmpfs
+/// directories whose flags were read and lack `FS_CASEFOLD_FL`
+/// (casefolded directories also normalize). Anything else (vfat, exfat,
+/// ntfs, cifs, zfs, overlayfs..., or an unreadable flag) folds.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_insensitivity(kind: u32, casefold: Option<bool>) -> Insensitivity {
+    match (kind, casefold) {
+        (XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC, _) => Insensitivity::NONE,
+        (EXT4_SUPER_MAGIC | F2FS_SUPER_MAGIC | TMPFS_MAGIC, Some(false)) => Insensitivity::NONE,
+        _ => Insensitivity::FULL,
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
-    use super::Insensitivity;
-    use std::{ffi::CString, fs::File, os::fd::AsRawFd};
+    use super::{Insensitivity, linux_insensitivity};
+    use std::{
+        ffi::CString,
+        fs::OpenOptions,
+        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    };
 
-    const EXT4_SUPER_MAGIC: u32 = 0xEF53;
-    const F2FS_SUPER_MAGIC: u32 = 0xF2F5_2010;
-    const TMPFS_MAGIC: u32 = 0x0102_1994;
-    const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
-    const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
     /// `FS_CASEFOLD_FL` in `linux/fs.h`.
-    const FS_CASEFOLD_FL: libc::c_long = 0x4000_0000;
+    const FS_CASEFOLD_FL: libc::c_int = 0x4000_0000;
 
-    /// Only filesystems known to compare names byte for byte are treated as
-    /// sensitive; ext4, f2fs and tmpfs only for directories without the
-    /// casefold flag (casefolded directories also normalize). Anything else
-    /// (vfat, exfat, ntfs, cifs, zfs, overlayfs...) is treated as
-    /// insensitive.
     pub fn dir_insensitivity(dir: &str) -> Insensitivity {
         let Ok(path) = CString::new(dir) else {
             return Insensitivity::FULL;
         };
         // SAFETY: `statfs` is plain old data; all-zero is a valid value.
         let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `path` is NUL-terminated and `stats` is a valid out pointer.
+        // SAFETY: `path` is NUL-terminated and outlives the call; `stats`
+        // is a valid, exclusive out pointer of the type libc declares.
         if unsafe { libc::statfs(path.as_ptr(), &mut stats) } != 0 {
             return Insensitivity::FULL;
         }
+        // `f_type` is i64, u32 or i32 depending on the target; every magic
+        // fits in the low 32 bits.
         #[allow(clippy::unnecessary_cast)]
         let kind = stats.f_type as u32;
-        match kind {
-            XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC => Insensitivity::NONE,
-            EXT4_SUPER_MAGIC | F2FS_SUPER_MAGIC | TMPFS_MAGIC => match casefold(dir) {
-                Some(false) => Insensitivity::NONE,
-                // tmpfs gained FS_IOC_GETFLAGS (6.0) before casefolding (6.6).
-                None if kind == TMPFS_MAGIC => Insensitivity::NONE,
-                _ => Insensitivity::FULL,
-            },
-            _ => Insensitivity::FULL,
-        }
+        linux_insensitivity(kind, casefold(dir))
     }
 
+    /// The directory's `FS_CASEFOLD_FL`, or `None` when it cannot be read
+    /// (open or ioctl failure, including old kernels): the caller folds.
     fn casefold(dir: &str) -> Option<bool> {
-        let file = File::open(dir).ok()?;
-        let mut flags: libc::c_long = 0;
-        // SAFETY: the fd is open for the duration of the call and `flags`
-        // is large enough for the kernel's `int` result.
-        let result = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(dir)
+            .ok()?;
+        // The kernel writes an `int` (`put_user(flags, (int __user *)arg)`)
+        // although the request number is declared with `long`: a `c_long`
+        // buffer would put the flag in the wrong half on big-endian targets.
+        let mut flags: libc::c_int = 0;
+        // SAFETY: the fd is open for the whole call and `flags` is a valid,
+        // exclusive pointer to the `int` the kernel writes.
+        let result = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                libc::FS_IOC_GETFLAGS,
+                &mut flags as *mut libc::c_int,
+            )
+        };
         (result == 0).then_some(flags & FS_CASEFOLD_FL != 0)
     }
 }
@@ -470,9 +597,10 @@ mod platform {
 /// T-014: `PathPrefix` in core is lexical by design. Before evaluation, each
 /// absolute string argument under `keys` is resolved; unless it resolves to
 /// itself, the engine sees [`UNRESOLVED_PATH`] instead (fail closed). A path
-/// that resolves to itself but, on a case- or normalization-insensitive
-/// filesystem, names an entry at or under one of `prefixes` without matching
-/// it byte for byte is [`PathCheck::Ambiguous`] and hidden too. The bytes
+/// that resolves to itself but names an entry at or under one of `prefixes`
+/// without matching it byte for byte (case or normalization variants, a
+/// firmlink, bind mount or other alias of the same directory) is
+/// [`PathCheck::Ambiguous`] and hidden too. The bytes
 /// forwarded to the server are never changed, so the engine either sees
 /// exactly those bytes or the sentinel. Returns the record for
 /// [`PATH_CHECK_CONTEXT_KEY`], or `None` when no covered argument is present.
@@ -503,7 +631,8 @@ fn check_paths_with(
         let lexical = lexical.clone();
         let (mut check, resolved) = resolve_path(&lexical);
         if check == PathCheck::Same
-            && folds_into_prefix(&lexical, prefixes, insensitivity).is_some()
+            && (folds_into_prefix(&lexical, prefixes, insensitivity).is_some()
+                || aliases_prefix(&lexical, prefixes, insensitivity).is_some())
         {
             check = PathCheck::Ambiguous;
         }
@@ -845,6 +974,207 @@ mod tests {
         };
         assert!(folds_into_prefix("/r/SECRET", &rules, only_r).is_some());
         assert_eq!(folds_into_prefix("/R/secret", &rules, only_r), None);
+    }
+
+    /// Independent review of `a9dbbdf`, Alta 1: one upper/lower round left
+    /// `ẞ` -> `ß` -> `ss` with three different keys.
+    #[test]
+    fn fold_key_is_idempotent_and_covers_every_mapping() {
+        let mut checked = 0usize;
+        for c in (0..=0x10_FFFFu32).filter_map(char::from_u32) {
+            let name = c.to_string();
+            let key = fold_key(&name, Insensitivity::FULL);
+            assert_eq!(fold_key(&key, Insensitivity::FULL), key, "{c:?}");
+            for variant in [
+                c.to_uppercase().collect::<String>(),
+                c.to_lowercase().collect(),
+                caseless::default_case_fold_str(&name),
+                name.nfd().collect(),
+            ] {
+                assert_eq!(
+                    fold_key(&variant, Insensitivity::FULL),
+                    key,
+                    "{c:?} vs {variant:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, 0x11_0000 - 0x800);
+        let sharp = [
+            "\u{1e9e}",
+            "\u{df}",
+            "ss",
+            "SS",
+            "Ss",
+            "\u{17f}s",
+            "\u{17f}\u{17f}",
+        ];
+        for name in sharp {
+            assert_eq!(fold_key(name, Insensitivity::FULL), "ss", "{name:?}");
+        }
+        let rules = prefixes(&["/r/.ssh", "/r/stra\u{df}e"]);
+        for path in [
+            "/r/.\u{1e9e}h",
+            "/r/.\u{1e9e}h/authorized_keys",
+            "/r/.\u{df}h",
+            "/r/.SSH",
+            "/r/STRA\u{1e9e}E/",
+            "/r/strasse",
+        ] {
+            assert!(
+                folds_into_prefix(path, &rules, |_| Insensitivity::FULL).is_some(),
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Review Baja 4: a casefold flag that cannot be read folds, on every
+    /// filesystem type (tmpfs included).
+    #[test]
+    fn linux_decision_folds_unless_known_byte_for_byte() {
+        for kind in [EXT4_SUPER_MAGIC, F2FS_SUPER_MAGIC, TMPFS_MAGIC] {
+            assert_eq!(linux_insensitivity(kind, Some(false)), Insensitivity::NONE);
+            assert_eq!(linux_insensitivity(kind, Some(true)), Insensitivity::FULL);
+            assert_eq!(
+                linux_insensitivity(kind, None),
+                Insensitivity::FULL,
+                "{kind:#x}"
+            );
+        }
+        for kind in [XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC] {
+            assert_eq!(linux_insensitivity(kind, None), Insensitivity::NONE);
+        }
+        // procfs, overlayfs, vfat, an unknown magic.
+        for kind in [0x9fa0, 0x794c_7630, 0x4d44, 0xdead_beef] {
+            assert_eq!(linux_insensitivity(kind, Some(false)), Insensitivity::FULL);
+        }
+    }
+
+    /// Review Alta 2, portable part: another spelling of the same entry is
+    /// caught by `(st_dev, st_ino)` (a hard link to a denied file, a prefix
+    /// written through a symlink), and ordinary paths are untouched.
+    #[cfg(unix)]
+    #[test]
+    fn check_paths_hides_other_spellings_of_a_prefix() {
+        use std::os::unix::fs::symlink;
+        let (_temp, root) = canonical_tempdir();
+        fs::create_dir_all(root.join("real").join("secret")).unwrap();
+        fs::write(root.join("secret.txt"), b"s").unwrap();
+        fs::hard_link(root.join("secret.txt"), root.join("public.txt")).unwrap();
+        symlink(root.join("real"), root.join("link")).unwrap();
+        let rules = prefixes(&[
+            &text(&root.join("secret.txt")),
+            &text(&root.join("link").join("secret")),
+            &text(&root.join("link").join("missing")),
+        ]);
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        let check = |path: &Path| {
+            let path = text(path);
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record =
+                check_paths_with(&mut built, &keys, &rules, |_| Insensitivity::NONE).unwrap();
+            (
+                built["arguments.path"].as_str().unwrap().to_owned(),
+                record["arguments.path"]["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+        for path in [
+            root.join("public.txt"),
+            root.join("real").join("secret"),
+            root.join("real").join("secret").join("new"),
+            root.join("real").join("missing"),
+        ] {
+            assert_eq!(
+                check(&path),
+                (UNRESOLVED_PATH.to_owned(), "ambiguous".to_owned()),
+                "{}",
+                path.display()
+            );
+        }
+        for path in [
+            root.join("other.txt"),
+            root.join("real").join("public"),
+            root.join("real").join("missingx"),
+            root.join("secret.txt"),
+        ] {
+            assert_eq!(
+                check(&path),
+                (text(&path), "same".to_owned()),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// Review Alta 2 on this Mac: `realpath` keeps the
+    /// `/System/Volumes/Data` spelling, which is the same directory as the
+    /// firmlinked one (`/Users`, `/private`, ...).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_firmlink_spellings_are_ambiguous() {
+        let (_temp, root) = canonical_tempdir();
+        fs::create_dir_all(root.join("vault")).unwrap();
+        let data = |path: &Path| format!("/System/Volumes/Data{}", text(path));
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        let check = |path: &str, rules: &BTreeSet<String>| {
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths(&mut built, &keys, rules).unwrap();
+            (
+                built["arguments.path"].as_str().unwrap().to_owned(),
+                record["arguments.path"]["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+        let rules = prefixes(&[&text(&root.join("vault")), &text(&root.join("later"))]);
+        for path in [
+            data(&root.join("vault").join("k")),
+            data(&root.join("vault")),
+            data(&root.join("later")),
+        ] {
+            assert_eq!(
+                resolve_path(&path).0,
+                PathCheck::Same,
+                "realpath keeps {path}"
+            );
+            let result = check(&path, &rules);
+            eprintln!("firmlink: {path} -> {result:?}");
+            assert_eq!(result, (UNRESOLVED_PATH.to_owned(), "ambiguous".to_owned()));
+        }
+        let ordinary = data(&root.join("notes.txt"));
+        assert_eq!(
+            check(&ordinary, &rules),
+            (ordinary.clone(), "same".to_owned())
+        );
+
+        // The real home directory: only `stat` is used, nothing is written.
+        let home = std::env::var("HOME").unwrap();
+        let ssh = prefixes(&[&format!("{home}/.ssh")]);
+        for path in [
+            format!("/System/Volumes/Data{home}/.ssh"),
+            format!("/System/Volumes/Data{home}/.ssh/authorized_keys"),
+        ] {
+            let result = check(&path, &ssh);
+            eprintln!("firmlink: {path} -> {result:?}");
+            assert_eq!(result.0, UNRESOLVED_PATH, "{path}");
+        }
+        // The rule written in the Data spelling hides the usual one, and
+        // `policy check` points at it.
+        let data_rule = format!("/System/Volumes/Data{}", text(&root.join("vault")));
+        assert_eq!(
+            check(
+                &text(&root.join("vault").join("k")),
+                &prefixes(&[&data_rule])
+            )
+            .0,
+            UNRESOLVED_PATH
+        );
+        assert_eq!(firmlink_alias(&data_rule), Some(text(&root.join("vault"))));
+        assert_eq!(firmlink_alias(&text(&root.join("vault"))), None);
     }
 
     /// The adversarial finding on `ccea7be`: the denied directory does not

@@ -296,7 +296,16 @@ pub fn lint(policy: &Policy) -> Vec<String> {
                     crate::gate::resolve_path(prefix)
             {
                 warnings.push(format!(
-                    "rule {:?}: path prefix {prefix:?} resolves to {resolved:?}; a DENY/REQUIRE_APPROVAL rule does not cover arguments under {resolved:?} and an ALLOW rule never matches (arguments are resolved first), so use {resolved:?}",
+                    "rule {:?}: path prefix {prefix:?} resolves to {resolved:?}; arguments spelled {prefix:?} go through a symlink and arguments under {resolved:?} are ambiguous, so a DENY/REQUIRE_APPROVAL rule refuses both and an ALLOW rule matches neither; use {resolved:?}",
+                    rule.id
+                ));
+            }
+            if condition.operator == MatchOperator::PathPrefix
+                && let Some(prefix) = condition.expected.as_str()
+                && let Some(alias) = crate::gate::firmlink_alias(prefix)
+            {
+                warnings.push(format!(
+                    "rule {:?}: path prefix {prefix:?} is the firmlinked {alias:?}; clients use {alias:?}, which this rule treats as ambiguous (refused by DENY/REQUIRE_APPROVAL, never matched by ALLOW), so use {alias:?}",
                     rule.id
                 ));
             }
@@ -515,5 +524,33 @@ mod tests {
         );
         assert!(!warnings.contains("\"canonical\""), "{warnings}");
         assert!(!warnings.contains("\"not-yet\""), "{warnings}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lint_flags_firmlink_spellings_of_path_prefixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let data = format!("/System/Volumes/Data{}", root.display());
+        let mut policy = default_policy();
+        for (id, prefix) in [
+            ("data-spelling", data.as_str()),
+            ("usual", root.to_str().unwrap()),
+        ] {
+            policy.rules.push(
+                PolicyRule::new(id, ACTION_TYPE, PolicyEffect::Deny)
+                    .with_target("fs")
+                    .with_parameter_condition(PolicyCondition::path_prefix(
+                        "arguments.path",
+                        prefix,
+                    )),
+            );
+        }
+        let warnings = lint(&policy).join("\n");
+        assert!(
+            warnings.contains("\"data-spelling\"") && warnings.contains("firmlinked"),
+            "{warnings}"
+        );
+        assert!(!warnings.contains("\"usual\""), "{warnings}");
     }
 }
