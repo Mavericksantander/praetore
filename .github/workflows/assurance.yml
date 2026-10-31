@@ -372,7 +372,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
       - run: cargo build --release --locked --package praetore-mcp --target ${{ matrix.target }}
       - name: Install Rosetta 2 for the x86_64 smoke test
         if: matrix.target == 'x86_64-apple-darwin'
@@ -419,6 +419,15 @@ jobs:
       - name: Release notes exist for the tag
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
+      - name: Tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "praetore-mcp") | .version')
+          if [[ "v${version}" != "$GITHUB_REF_NAME" ]]; then
+            echo "error: tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
       - run: cargo build --release --locked --package praetore-verify
       - uses: actions/download-artifact@v4
         with:
@@ -460,13 +469,28 @@ jobs:
   release-publish:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: release-integrity
+    # Every gate must pass on the tag, not only the release artifacts.
+    needs:
+      - rust
+      - hook-evidence
+      - journal-chain
+      - macos
+      - verifier-features
+      - audit
+      - fuzz-smoke
+      - python-verify
+      - claude-code-hook-example
+      - replay-postgres
+      - sbom
+      - release-integrity
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release
       id-token: write # Sigstore keyless signing; CI holds no signing key
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: release-assets-${{ github.ref_name }}
@@ -485,6 +509,7 @@ jobs:
           cosign verify-blob --bundle release-assets/SHA256SUMS.sigstore.json \
             --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/assurance.yml@${GITHUB_REF}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
             release-assets/SHA256SUMS
       - name: Create the GitHub Release
         env:

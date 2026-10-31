@@ -62,14 +62,17 @@ Builds from other runs are workflow artifacts, and downloading them needs a
 GitHub login. The macOS binaries are **not signed or notarized**:
 Gatekeeper blocks a downloaded copy until you remove the quarantine
 attribute (`xattr -d com.apple.quarantine praetore-mcp`). Check the archive
-first:
+first, against `SHA256SUMS` from a release (after verifying its signature as
+in `docs/operations.md`) or the `.sha256` next to a workflow artifact:
 
 ```sh
-shasum -a 256 -c praetore-mcp-<version>-<target>.tar.gz.sha256
-# or, with the release-assets set:
-shasum -a 256 -c SHA256SUMS --ignore-missing
+shasum -a 256 -c SHA256SUMS --ignore-missing          # release
+shasum -a 256 -c praetore-mcp-<version>-<target>.tar.gz.sha256  # workflow artifact
 tar -xzf praetore-mcp-<version>-<target>.tar.gz
 ```
+
+The Linux binary is built on GitHub's `ubuntu-latest` runner and needs a
+glibc at least as new as that image's; build it yourself on older systems.
 
 To run the same smoke test on your own build: `python3 -I
 scripts/mcp-smoke.py target/release/praetore-mcp` (needs Node with `npx`).

@@ -23,6 +23,13 @@
   every PR the signing tooling is exercised with a throwaway key, including a
   changed `SHA256SUMS` that must not verify. CI still holds no long-lived
   signing key. The macOS binaries are not signed or notarized.
+- `release-publish` now needs every other `assurance.yml` gate, not only the
+  release artifacts; a tag that does not equal `v` plus the workspace version
+  fails before anything is published; its checkout keeps no token; the
+  signature check also pins the tagged commit
+  (`--certificate-github-workflow-sha`). CONTRIBUTING documents how to recover
+  from a failed release job. The smoke test runs on Node 24, which
+  `@modelcontextprotocol/server-filesystem@2.1.0` requires.
 - **Breaking (sandbox supervisor configuration): `schema_version` 1 → 2.**
   Every route must now declare a closed schema of its action's top-level
   `parameters`. At dispatch, before any Kubernetes request, the supervisor

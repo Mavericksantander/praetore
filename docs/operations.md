@@ -403,11 +403,13 @@ procedure in [CONTRIBUTING.md](../CONTRIBUTING.md) and verify a download with:
 cosign verify-blob --bundle SHA256SUMS.sigstore.json \
   --certificate-identity https://github.com/Mavericksantander/praetore/.github/workflows/assurance.yml@refs/tags/vX.Y.Z \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-sha "$(git rev-parse 'vX.Y.Z^{commit}')" \
   SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
 The signature proves that `SHA256SUMS` was produced by this repository's
-`assurance.yml` workflow for that tag; it does not prove who pushed the tag
+`assurance.yml` workflow for that tag at that commit
+(`--certificate-github-workflow-sha`); it does not prove who pushed the tag
 (check the signed tag with `git verify-tag`). The macOS binaries are not
 signed or notarized.
