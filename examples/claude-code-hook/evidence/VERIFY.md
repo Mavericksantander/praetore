@@ -172,7 +172,226 @@ requires an attester pin, so these sets **cannot be verified** with it, and
 nothing else in this repository verifies them. CI skips them. They are kept as
 a historical record only.
 
+## 6. Journal chains (sets 03, 04, 05)
+
+Each verifiable set also ships `journal-chain.jsonl`: its receipts, in file
+name order, as one hash-linked JSONL chain in the format of
+[`docs/proposals/journal-chain-jsonl.md`](../../../docs/proposals/journal-chain-jsonl.md).
+The receipts in `evidence/` are unchanged; the chain is generated from them
+with `praetore journal-export`. `unverified-v0/` has no chain (its receipts
+have no attester signature, so the exporter refuses them).
+
+Published heads (outputs obtained on 2026-10-31, Linux x86_64, 0.3.0 built
+from this branch):
+
+| Set | Entries | Head |
+|-----|---------|------|
+| 03-bundle-demo-reproducible | 22 | `4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a` |
+| 04-sesion-real-bloqueada-web-fetch | 8 | `f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0` |
+| 05-sesion-real-final | 118 | `79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9` |
+
+**What a head proves, and what it does not.** The link is an unkeyed
+SHA-256. Anyone who has the signed receipts (no private key needed) can
+delete, reorder or drop receipts and rebuild a chain that verifies on its
+own; whoever holds the attester key can also sign new receipts and build any
+chain. A head only detects deletion, reordering or truncation when the
+verifier compares against a head it obtained **from somewhere the producer
+does not control**. The table above lives in the same repository as the
+chains, so whoever can change the chain files can change this table too: it
+is not an external anchor. For it to mean something, copy the heads somewhere
+else (another repository, a public post, a signed message) and compare
+against that copy. The chain also says nothing about tool calls that never
+reached the hook, nor about whether the export is complete with respect to
+what happened.
+
+### Produce
+
+```sh
+cargo build --release --locked --package praetore-cli --package praetore-verify
+E=examples/claude-code-hook/evidence/05-sesion-real-final
+target/release/praetore journal-export --receipts-dir $E/evidence \
+  --attester-pin $E/attester-public-key.hex --output /tmp/chain.jsonl
+cmp /tmp/chain.jsonl $E/journal-chain.jsonl && echo identical
+```
+
+`journal-export` never overwrites `--output`. It checks every receipt against
+the pinned attester key before linking it and fails on an unsigned receipt,
+a bad signature, a repeated `evidence_id`, or anything in the directory that
+is not a regular `*.json` file. With `--tenant <uuid>` instead of
+`--receipts-dir` it reads the `praetore.execution_journal` rows of that
+tenant from `PRAETORE_GATEWAY_DATABASE_URL`, ordered by
+`(created_at, request_id)`.
+
+### Verify by hand
+
+```sh
+V=target/release/praetore-verify
+$V journal --journal $E/journal-chain.jsonl --attester-pin $E/attester-public-key.hex \
+  --policy $E/policy.json \
+  --expected-head 79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9
+echo "exit $?"
+sed '$d' $E/journal-chain.jsonl > /tmp/truncated.jsonl
+$V journal --journal /tmp/truncated.jsonl --attester-pin $E/attester-public-key.hex --policy $E/policy.json
+echo "exit $?"
+$V journal --journal /tmp/truncated.jsonl --attester-pin $E/attester-public-key.hex --policy $E/policy.json \
+  --expected-head 79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9
+echo "exit $?"
+```
+
+Real output. The truncated copy **passes** without `--expected-head` (a
+prefix of a valid chain is a valid chain) and fails with it:
+
+```text
+OK journal OK entries=118 expected_head_verified=true head="79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9" policy_verified=true verification_scope="historical_journal_integrity_and_attestation"
+exit 0
+OK journal OK entries=117 expected_head_verified=false head="4e517e29b4e016aa985695fb26a8eabd7d775915b648da3eaf206541cb1c198e" policy_verified=true verification_scope="historical_journal_integrity_and_attestation"
+exit 0
+journal: head 4e517e29b4e016aa985695fb26a8eabd7d775915b648da3eaf206541cb1c198e does not match the expected head
+ERROR journal JOURNAL_HEAD_MISMATCH
+exit 1
+```
+
+### Chain plus tampered copies (script)
+
+`verify-chain.sh <set> <expected head>` verifies the chain against the head,
+re-exports it from `evidence/` and compares byte for byte, then checks that
+five tampered copies are rejected: one receipt deleted, one receipt deleted
+and the chain rebuilt with the public tools, last line truncated, two lines
+swapped, one byte altered.
+
+```sh
+./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/05-sesion-real-final 79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9
+./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0
+./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/03-bundle-demo-reproducible 4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a
+```
+
+Real output, set 05:
+
+```text
+== 1. Compilar praetore y praetore-verify (cargo build --release --locked)
+
+== 2. Verificar la cadena publicada contra el head esperado
+{"ok":true,"command":"journal","code":"OK","details":{"entries":118,"expected_head_verified":true,"head":"79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
+
+== 3. Reproducir: exportar de nuevo desde evidence/ y comparar byte a byte
+{"command":"journal-export","entries":118,"head":"79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9","ok":true}
+OK: idéntica a journal-chain.jsonl
+
+== 4. Copia con un recibo borrado (línea 2 eliminada, sin recalcular)
+{"ok":false,"command":"journal","code":"JOURNAL_CHAIN_FAIL"}
+stderr: journal: entry 1: seq or prev does not match
+OK: copia con un recibo borrado rechazada (exit 1)
+
+== 5. Copia con un recibo borrado y la cadena recalculada (sin llave privada)
+{"ok":false,"command":"journal","code":"JOURNAL_HEAD_MISMATCH"}
+stderr: journal: head 23b30a9f558567127f1c6786b7f9c0e66ec31ad7c6e110140e945fc7c267c765 does not match the expected head
+OK: copia recalculada sin un recibo rechazada (exit 1)
+
+== 6. Copia truncada (sin la última línea)
+{"ok":false,"command":"journal","code":"JOURNAL_HEAD_MISMATCH"}
+stderr: journal: head 4e517e29b4e016aa985695fb26a8eabd7d775915b648da3eaf206541cb1c198e does not match the expected head
+OK: copia truncada rechazada (exit 1)
+
+== 7. Copia con dos líneas intercambiadas
+{"ok":false,"command":"journal","code":"JOURNAL_CHAIN_FAIL"}
+stderr: journal: entry 1: seq or prev does not match
+OK: copia reordenada rechazada (exit 1)
+
+== 8. Copia con un byte alterado en un recibo
+entrada seq=0: decision.reason alterado en el byte 1766
+{"ok":false,"command":"journal","code":"EVIDENCE_FAIL"}
+stderr: journal: entry 0: evidence error: evidence integrity verification failed
+OK: copia con un recibo alterado rechazada (exit 1)
+
+== RESULTADO: cadena verificada (118 entradas) y 5 copias manipuladas rechazadas
+```
+
+Real output, set 04:
+
+```text
+== 1. Compilar praetore y praetore-verify (cargo build --release --locked)
+
+== 2. Verificar la cadena publicada contra el head esperado
+{"ok":true,"command":"journal","code":"OK","details":{"entries":8,"expected_head_verified":true,"head":"f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
+
+== 3. Reproducir: exportar de nuevo desde evidence/ y comparar byte a byte
+{"command":"journal-export","entries":8,"head":"f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0","ok":true}
+OK: idéntica a journal-chain.jsonl
+
+== 4. Copia con un recibo borrado (línea 2 eliminada, sin recalcular)
+{"ok":false,"command":"journal","code":"JOURNAL_CHAIN_FAIL"}
+stderr: journal: entry 1: seq or prev does not match
+OK: copia con un recibo borrado rechazada (exit 1)
+
+== 5. Copia con un recibo borrado y la cadena recalculada (sin llave privada)
+{"ok":false,"command":"journal","code":"JOURNAL_HEAD_MISMATCH"}
+stderr: journal: head faed92c984f5c40524dabf87625195c49312a75941ea01465f75d42cb74d72da does not match the expected head
+OK: copia recalculada sin un recibo rechazada (exit 1)
+
+== 6. Copia truncada (sin la última línea)
+{"ok":false,"command":"journal","code":"JOURNAL_HEAD_MISMATCH"}
+stderr: journal: head 938adc88fe20e2fa9e8171acdb6aa927e1ddd7bf1a030c52644e65512aeff3eb does not match the expected head
+OK: copia truncada rechazada (exit 1)
+
+== 7. Copia con dos líneas intercambiadas
+{"ok":false,"command":"journal","code":"JOURNAL_CHAIN_FAIL"}
+stderr: journal: entry 1: seq or prev does not match
+OK: copia reordenada rechazada (exit 1)
+
+== 8. Copia con un byte alterado en un recibo
+entrada seq=0: decision.reason alterado en el byte 1758
+{"ok":false,"command":"journal","code":"EVIDENCE_FAIL"}
+stderr: journal: entry 0: evidence error: evidence integrity verification failed
+OK: copia con un recibo alterado rechazada (exit 1)
+
+== RESULTADO: cadena verificada (8 entradas) y 5 copias manipuladas rechazadas
+```
+
+Real output, set 03:
+
+```text
+== 1. Compilar praetore y praetore-verify (cargo build --release --locked)
+
+== 2. Verificar la cadena publicada contra el head esperado
+{"ok":true,"command":"journal","code":"OK","details":{"entries":22,"expected_head_verified":true,"head":"4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
+
+== 3. Reproducir: exportar de nuevo desde evidence/ y comparar byte a byte
+{"command":"journal-export","entries":22,"head":"4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a","ok":true}
+OK: idéntica a journal-chain.jsonl
+
+== 4. Copia con un recibo borrado (línea 2 eliminada, sin recalcular)
+{"ok":false,"command":"journal","code":"JOURNAL_CHAIN_FAIL"}
+stderr: journal: entry 1: seq or prev does not match
+OK: copia con un recibo borrado rechazada (exit 1)
+
+== 5. Copia con un recibo borrado y la cadena recalculada (sin llave privada)
+{"ok":false,"command":"journal","code":"JOURNAL_HEAD_MISMATCH"}
+stderr: journal: head 52f374c0f1de0a296c01e6ba52887f7c19e7418cc028cbf89fe29ff4e508bb1e does not match the expected head
+OK: copia recalculada sin un recibo rechazada (exit 1)
+
+== 6. Copia truncada (sin la última línea)
+{"ok":false,"command":"journal","code":"JOURNAL_HEAD_MISMATCH"}
+stderr: journal: head aa88be5bcf7d00076fe684c6fb3d53e54b3ccd5c437ed5502149ebbfcd082c84 does not match the expected head
+OK: copia truncada rechazada (exit 1)
+
+== 7. Copia con dos líneas intercambiadas
+{"ok":false,"command":"journal","code":"JOURNAL_CHAIN_FAIL"}
+stderr: journal: entry 1: seq or prev does not match
+OK: copia reordenada rechazada (exit 1)
+
+== 8. Copia con un byte alterado en un recibo
+entrada seq=0: decision.reason alterado en el byte 1997
+{"ok":false,"command":"journal","code":"EVIDENCE_FAIL"}
+stderr: journal: entry 0: evidence error: evidence integrity verification failed
+OK: copia con un recibo alterado rechazada (exit 1)
+
+== RESULTADO: cadena verificada (22 entradas) y 5 copias manipuladas rechazadas
+```
+
 ## CI
 
 The `hook-evidence` job in `.github/workflows/assurance.yml` runs
 `verify.sh` on sets 03, 04 and 05 and fails if any of them does not verify.
+The `journal-chain` job runs `verify-chain.sh` on the three chains with the
+heads above (pinned in the workflow, so a change to a chain file alone fails
+the job) and also checks that set 04 is rejected against the head of set 05.

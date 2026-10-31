@@ -1276,6 +1276,7 @@ dependencies = [
  "praetore-receipt",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "time",
  "uuid",
 ]
