@@ -392,8 +392,22 @@ public key supplied by an untrusted caller.
 
 For a `v*` tag, CI builds `praetore-verify` and the `praetore-mcp` archives
 for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and
-`x86_64-apple-darwin`, and uploads them with one `SHA256SUMS` as a workflow
-artifact (`scripts/release-checksums.sh`; the checks also run on every PR). CI also uploads CycloneDX workspace SBOM
-files. Follow the signed-tag procedure in [CONTRIBUTING.md](../CONTRIBUTING.md),
-download those artifacts, verify the checksum, and publish them with the
-release. CI does not sign artifacts or create releases automatically.
+`x86_64-apple-darwin`, writes one `SHA256SUMS` (`scripts/release-checksums.sh`;
+the checks also run on every PR), signs it with Sigstore keyless signing
+(`SHA256SUMS.sigstore.json`) and creates the GitHub Release with those files.
+CI also uploads CycloneDX workspace SBOM files as workflow artifacts; they
+are not attached to the release automatically. Follow the signed-tag
+procedure in [CONTRIBUTING.md](../CONTRIBUTING.md) and verify a download with:
+
+```sh
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity https://github.com/Mavericksantander/praetore/.github/workflows/assurance.yml@refs/tags/vX.Y.Z \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+The signature proves that `SHA256SUMS` was produced by this repository's
+`assurance.yml` workflow for that tag; it does not prove who pushed the tag
+(check the signed tag with `git verify-tag`). The macOS binaries are not
+signed or notarized.

@@ -13,8 +13,16 @@
   `LICENSE` and `NOTICE`, and that nothing else is in the set, then writes
   and re-checks one `SHA256SUMS` (the three archives and `praetore-verify`).
   `scripts/test-release-checksums.sh` covers those failures. Only a `v*` tag
-  keeps the result as the `release-assets-<tag>` artifact; CI still does not
-  create a GitHub Release. The macOS binaries are not signed or notarized.
+  keeps the result as the `release-assets-<tag>` artifact.
+- A pushed `v*` tag now creates the GitHub Release (job `release-publish`):
+  `SHA256SUMS` is signed with Sigstore keyless signing
+  (`SHA256SUMS.sigstore.json`, verified against the workflow identity before
+  publishing), the notes are the tag's `CHANGELOG.md` section
+  (`scripts/release-notes.sh`, tested by `scripts/test-release-notes.sh`), an
+  existing release is never overwritten, and `-` tags are pre-releases. On
+  every PR the signing tooling is exercised with a throwaway key, including a
+  changed `SHA256SUMS` that must not verify. CI still holds no long-lived
+  signing key. The macOS binaries are not signed or notarized.
 - Hash-linked JSONL export of receipts, as specified in
   `docs/proposals/journal-chain-jsonl.md` (now marked implemented):
   - `praetore_core::journal_chain`: the format, the link

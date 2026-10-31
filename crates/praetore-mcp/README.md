@@ -54,8 +54,12 @@ them and writes one `SHA256SUMS` covering the three archives and
 `praetore-verify` (`scripts/release-checksums.sh`); on a `v*` tag it is kept
 as the `release-assets-<tag>` artifact.
 
-These are workflow artifacts, not a GitHub Release, and downloading them
-needs a GitHub login. The macOS binaries are **not signed or notarized**:
+For a `v*` tag, CI also signs `SHA256SUMS` with Sigstore keyless signing
+(`SHA256SUMS.sigstore.json`) and publishes everything as a GitHub Release;
+the steps to verify a download are in
+[`docs/operations.md`](../../docs/operations.md#release-artifact-integrity).
+Builds from other runs are workflow artifacts, and downloading them needs a
+GitHub login. The macOS binaries are **not signed or notarized**:
 Gatekeeper blocks a downloaded copy until you remove the quarantine
 attribute (`xattr -d com.apple.quarantine praetore-mcp`). Check the archive
 first:
