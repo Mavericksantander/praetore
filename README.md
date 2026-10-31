@@ -531,9 +531,16 @@ cargo test -p praetore-gateway --test enforcement human_approval
   ([`docs/proposals/journal-chain-jsonl.md`](docs/proposals/journal-chain-jsonl.md)),
   and as specified it would not detect deletion, truncation or a recomputed
   chain either; the proposal lists what is missing.
-- **No sustained fuzzing campaign has been run.** A `path_prefix` fuzz
-  target exists ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs)),
-  but CI runs each target only as a 10-second smoke test.
+- **No sustained fuzzing campaign has been run.** CI fuzzes in bounded
+  runs only. Every target gets a 10-second smoke on each PR. The
+  `path_prefix` target
+  ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs))
+  also gets 5 minutes on PRs that touch `policy.rs` or `fuzz/` and 25
+  minutes daily, with a cached corpus
+  ([`.github/workflows/fuzz-path-prefix.yml`](.github/workflows/fuzz-path-prefix.yml));
+  the other targets get 60 seconds daily. That is minutes per day on one
+  hosted runner, not a continuous campaign such as OSS-Fuzz, and a clean
+  run does not prove the absence of bugs.
 
 </details>
 
