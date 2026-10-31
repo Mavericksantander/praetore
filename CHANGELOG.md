@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+- SAF-11 step 1, key custody (decisions 1-3 of the SAF-11 proposal, #44):
+  - `praetore_core::Signer` trait: receipts are signed by any signer, and
+    every signature it returns is verified against its public key before
+    use. `LocalSigner` is the in-process implementation;
+    `EvidenceAttesterKey` is now an alias of it. `Evidence::sign` and
+    `HighAssuranceConfig::new` accept any `Signer`. New error codes
+    `SIGNER_UNAVAILABLE` (transient; the request stays retryable and nothing
+    is authorized) and `SIGNER_FAIL`.
+  - New evidence `attester_algorithm` `ed25519-sha256-envelope`: Ed25519 over
+    `PRAETORE_SIGNATURE_ENVELOPE_V1\0ed25519-sha256\0 || domain ||
+    SHA-256(payload)`, a fixed 99-byte message for signers with a size limit
+    (AWS KMS `RAW`, 4096 bytes). `ed25519` receipts are unchanged and keep
+    verifying; a signature under one algorithm never verifies under the
+    other. Verifiers released before this change reject envelope receipts.
+    `praetore-verify evidence` supports it and reports
+    `details.attester_algorithm`. Golden vector
+    `docs/golden/evidence-envelope-v1.json`.
+  - `praetore-signer-pkcs11`: Ed25519 keys in a PKCS#11 token
+    (`CKM_EDDSA`); refuses extractable or non-sensitive keys, keys that were
+    ever extractable or not sensitive (`CKA_NEVER_EXTRACTABLE` /
+    `CKA_ALWAYS_SENSITIVE` false, for example imported in clear), mismatched
+    key pairs and keys other than the optional pinned one. Reconnects and
+    retries once when the session, key handle or login is lost, and checks
+    the PIN even when the process is already logged in. SoftHSM2 tests
+    (ignored by default) and a `pkcs11-softhsm` CI job that also checks the
+    HSM-signed receipts with `praetore-verify`.
+  - `praetore-signer-aws-kms`: Ed25519 keys in AWS KMS
+    (`ECC_NIST_EDWARDS25519`, `ED25519_SHA_512`, `RAW`), always with the
+    envelope. Tested against a stub; the `sdk` feature adds an adapter over
+    `aws-sdk-kms` (resolved in `Cargo.lock` to 1.99.0 and AWS crates that
+    build with Rust 1.88, the workspace MSRV),
+    tested against a fake HTTP connector. Not run against AWS and not wired
+    into the gateway service.
+  - Gateway service: each signing key comes from exactly one of
+    `..._KEY_HEX`, `..._KEY_FILE` (private file) or, with the `pkcs11`
+    feature, `..._PKCS11_KEY_LABEL`. The `http` and `sandbox` adapters refuse
+    hex keys in the environment unless
+    `PRAETORE_GATEWAY_DANGEROUSLY_ALLOW_SIGNING_KEYS_IN_ENV=yes`; the local
+    demo is unchanged. Key and PIN files are opened once with `O_NOFOLLOW`
+    and checked with `fstat` and a read cap. A PKCS#11 key requires a pinned
+    public key file. The same key for evidence and execution is refused.
+    `praetore_receipt::SignerExecutionAttester` signs execution attestations
+    with any `Signer` (format unchanged).
+  - Execution signer outages: new `ExecutionAttestationError::SignerUnavailable`
+    (distinct from `SignerFailed`) and `ExecutionAttestationSigner::check_available`.
+    The gateway checks the execution signer before committing a request or
+    claiming an approved dispatch, so an outage leaves the request
+    retryable; an outage after that check is closed by `Gateway::reconcile`.
+  - **Breaking:** a `..._KEY_HEX` value in upper or mixed case is now
+    refused (only lowercase hex is accepted). The execution `key_id` depends
+    on the key source: `local-demo-...` for a hex variable (as before),
+    `local-...` for a key file, `pkcs11-...` for a token; moving a key from
+    the environment to a file changes the `--key-id` verifiers pin. Key
+    files named through a final symlink (a Kubernetes Secret volume's
+    `<mount>/<key>`) must name `<mount>/..data/<key>` or use `subPath`.
 - Hash-linked JSONL export of receipts, as specified in
   `docs/proposals/journal-chain-jsonl.md` (now marked implemented):
   - `praetore_core::journal_chain`: the format, the link

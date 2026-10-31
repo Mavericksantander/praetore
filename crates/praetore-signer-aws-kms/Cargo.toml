@@ -1,0 +1,34 @@
+[package]
+name = "praetore-signer-aws-kms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "AWS KMS implementation of the PRÆTORE Signer trait (Ed25519 keys)."
+
+[features]
+default = []
+# The adapter over the official `aws-sdk-kms` client. Without it the crate
+# only has the signer logic and the `KmsClient` trait it calls.
+sdk = [
+    "dep:aws-sdk-kms",
+    "dep:aws-smithy-runtime-api",
+    "dep:aws-smithy-types",
+    "dep:tokio",
+]
+
+[dependencies]
+praetore-core = { path = "../praetore-core" }
+thiserror = "2.0"
+aws-sdk-kms = { version = "1.99.0", default-features = false, features = ["rt-tokio"], optional = true }
+aws-smithy-runtime-api = { version = "1.11.3", features = ["client", "http-1x"], optional = true }
+aws-smithy-types = { version = "1.4.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+
+[dev-dependencies]
+hex = "0.4.3"
+serde_json = "1.0"
+uuid = { version = "1.18", features = ["v4"] }

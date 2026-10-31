@@ -368,6 +368,8 @@ From the workspace `Cargo.toml` and each crate's `Cargo.toml`:
 | [`praetore-cli`](crates/praetore-cli) | Local PostgreSQL-backed gateway demo CLI (`praetore`). |
 | [`praetore-observe`](crates/praetore-observe) | Authenticated read-only observability API and UI for gateway journals. |
 | [`praetore-mcp`](crates/praetore-mcp) | Local stdio MCP proxy that records signed evidence for every `tools/call` (observe) or enforces policy (enforce). |
+| [`praetore-signer-pkcs11`](crates/praetore-signer-pkcs11) | PKCS#11 (HSM) implementation of the `Signer` trait. |
+| [`praetore-signer-aws-kms`](crates/praetore-signer-aws-kms) | AWS KMS implementation of the `Signer` trait (SDK adapter behind the `sdk` feature). |
 
 Other top-level directories: `fuzz/`, `packages/praetore-python/`, `docs/`,
 `examples/`, `scripts/`, `demo/`.
@@ -531,6 +533,16 @@ cargo test -p praetore-gateway --test enforcement human_approval
   ([`docs/proposals/journal-chain-jsonl.md`](docs/proposals/journal-chain-jsonl.md)),
   and as specified it would not detect deletion, truncation or a recomputed
   chain either; the proposal lists what is missing.
+- **Key custody is only partly solved (SAF-11 step 1).** Receipts can now
+  be signed by a key in a PKCS#11 token (tested against SoftHSM2, not a
+  hardware HSM) or in AWS KMS (tested against a stubbed client and a fake
+  HTTP connector, never against AWS), and the `http`/`sandbox` gateway
+  refuses signing keys in environment variables. Still missing: AWS KMS is
+  not wired into the gateway service, a key loaded from a file is still held
+  in process memory, attester keys have no validity windows or revocation,
+  and whoever controls the signer while the gateway is compromised can still
+  sign receipts. See
+  [`docs/crypto-and-policy.md`](docs/crypto-and-policy.md#signers-and-key-custody-saf-11-step-1).
 - **No sustained fuzzing campaign has been run.** A `path_prefix` fuzz
   target exists ([`fuzz/fuzz_targets/path_prefix.rs`](fuzz/fuzz_targets/path_prefix.rs)),
   but CI runs each target only as a 10-second smoke test.

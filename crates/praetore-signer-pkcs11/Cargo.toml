@@ -1,0 +1,33 @@
+[package]
+name = "praetore-signer-pkcs11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "PKCS#11 (HSM) implementation of the PRÆTORE Signer trait."
+
+[features]
+default = []
+# Test support: creates throwaway SoftHSM2 tokens. Never for deployments.
+softhsm-testing = ["dep:libc"]
+
+[dependencies]
+cryptoki = "0.12.1"
+libc = { version = "0.2", optional = true }
+praetore-core = { path = "../praetore-core" }
+secrecy = "0.10.3"
+sha2 = "0.11.0"
+thiserror = "2.0"
+zeroize = "1.8"
+
+[dev-dependencies]
+hex = "0.4.3"
+serde_json = "1.0"
+uuid = { version = "1.18", features = ["v4"] }
+
+[[test]]
+name = "softhsm"
+required-features = ["softhsm-testing"]
