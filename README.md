@@ -527,10 +527,13 @@ cargo test -p praetore-gateway --test enforcement human_approval
   adapters are unchanged.
 - **A third party cannot prove that no receipt was deleted from the
   journal.** Each receipt is signed on its own; nothing signs or publishes
-  the journal's sequence or head. A hash-linked export is only a proposal
-  ([`docs/proposals/journal-chain-jsonl.md`](docs/proposals/journal-chain-jsonl.md)),
-  and as specified it would not detect deletion, truncation or a recomputed
-  chain either; the proposal lists what is missing.
+  the journal's sequence or head. The hash-linked export
+  ([`docs/proposals/journal-chain-jsonl.md`](docs/proposals/journal-chain-jsonl.md))
+  does not detect deletion, truncation or a recomputed chain unless its head
+  was anchored outside the producer's control; the document lists what is
+  missing. Optional external timestamping of the head (RFC 3161 /
+  OpenTimestamps) is only a proposal:
+  [`SAF-13`](docs/proposals/SAF-13-anclaje-del-head-del-journal.md).
 - **No sustained fuzzing campaign has been run.** CI fuzzes in bounded
   runs only. Every target gets a 10-second smoke on each PR. The
   `path_prefix` target

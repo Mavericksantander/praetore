@@ -24,7 +24,10 @@ pub enum Source {
     /// A directory of `*.json` receipts, chained in byte order of file name.
     ReceiptsDir(PathBuf),
     /// `praetore.execution_journal` rows of one tenant, ordered by
-    /// `(created_at, request_id)`. Reads `PRAETORE_GATEWAY_DATABASE_URL`.
+    /// `(created_at, request_id, agent_id)`; the primary key is
+    /// `(tenant_id, agent_id, request_id)`, so `agent_id` makes the order
+    /// total. Both ids are `UUID`, compared byte by byte (the same order as
+    /// their lowercase hex text). Reads `PRAETORE_GATEWAY_DATABASE_URL`.
     Database { tenant_id: Uuid },
 }
 
@@ -162,24 +165,47 @@ fn read_receipts_dir(dir: &Path) -> CliResult<Vec<String>> {
         .collect()
 }
 
+/// Total order of one tenant's rows. Without `agent_id`, two agents of the
+/// same tenant reusing a `request_id` with equal `created_at` would come back
+/// in an unspecified order, and two exports of the same journal could differ.
+const JOURNAL_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
+     WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id LIMIT $2";
+
 fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut client = crate::connect_local_database(database_url)?;
-    let mut transaction = client.build_transaction().read_only(true).start()?;
-    transaction.query_one(
-        "SELECT set_config('praetore.tenant_id', $1, true)",
-        &[&tenant_id.to_string()],
-    )?;
+    // Same policy as `praetore run`: a privileged or owner role is allowed for
+    // the local demo, but then row-level security may not apply and only the
+    // tenant filter of the query isolates tenants.
+    if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
+        eprintln!("warning: {error} (the export query still filters by tenant)");
+    }
+    read_journal_rows(&mut client, tenant_id)
+}
+
+fn read_journal_rows(client: &mut postgres::Client, tenant_id: Uuid) -> CliResult<Vec<String>> {
+    let mut transaction = export_transaction(client, tenant_id)?;
     let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(
-        "SELECT evidence_json FROM praetore.execution_journal \
-         WHERE tenant_id = $1 ORDER BY created_at, request_id LIMIT $2",
-        &[&tenant_id, &limit],
-    )?;
+    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
     transaction.commit()?;
     if rows.len() > MAX_CHAIN_ENTRIES {
         return Err("too many journal rows for one export".into());
     }
     Ok(rows.iter().map(|row| row.get(0)).collect())
+}
+
+/// A READ ONLY transaction with `praetore.tenant_id` set for its duration
+/// only, which is what the `tenant_isolation` RLS policies (migration 0008)
+/// read.
+fn export_transaction(
+    client: &mut postgres::Client,
+    tenant_id: Uuid,
+) -> Result<postgres::Transaction<'_>, postgres::Error> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.query_one(
+        "SELECT set_config('praetore.tenant_id', $1, true)",
+        &[&tenant_id.to_string()],
+    )?;
+    Ok(transaction)
 }
 
 #[cfg(test)]
@@ -287,13 +313,87 @@ mod tests {
         assert!(read_receipts_dir(&set).is_err());
     }
 
+    /// Inserts one journal row (and its replay claim) as the connected role.
+    /// `created_at` is RFC 3339 text, or `None` for the column default.
+    fn insert_row(
+        client: &mut postgres::Client,
+        key: (Uuid, Uuid, Uuid),
+        json: &str,
+        created_at: Option<&str>,
+    ) {
+        let (tenant_id, agent_id, request_id) = key;
+        let mut tx = client.transaction().unwrap();
+        tx.query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&tenant_id.to_string()],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+             VALUES ($1, $2, $3)",
+            &[&tenant_id, &agent_id, &request_id],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO praetore.execution_journal \
+             (tenant_id, agent_id, request_id, request_digest, action_digest, \
+              authorization_status, execution_status, evidence_json, created_at) \
+             VALUES ($1, $2, $3, $4, $4, 'allowed', 'not_dispatched', $5, \
+                     COALESCE(($6::text)::timestamptz, clock_timestamp()))",
+            &[
+                &tenant_id,
+                &agent_id,
+                &request_id,
+                &"ab".repeat(32),
+                &json,
+                &created_at,
+            ],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn test_url() -> String {
+        let url = std::env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        crate::apply_migrations(&url).unwrap();
+        url
+    }
+
+    const RUNTIME_LOGIN: &str = "praetore_export_test_runtime";
+    const RUNTIME_PASSWORD: &str = "praetore-export-test";
+
+    /// URL of a LOGIN member of `praetore_runtime`, the NOLOGIN group role of
+    /// migration 0011 (operators are expected to create such a login role).
+    /// Created once per process by the admin URL, which needs CREATEROLE.
+    fn runtime_url(admin_url: &str) -> String {
+        static PROVISIONED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        PROVISIONED.get_or_init(|| {
+            crate::connect_local_database(admin_url)
+                .unwrap()
+                .batch_execute(&format!(
+                    "DO $$ BEGIN CREATE ROLE {RUNTIME_LOGIN} LOGIN; \
+                     EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; \
+                     ALTER ROLE {RUNTIME_LOGIN} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEROLE \
+                         NOCREATEDB PASSWORD '{RUNTIME_PASSWORD}'; \
+                     GRANT praetore_runtime TO {RUNTIME_LOGIN}"
+                ))
+                .unwrap();
+        });
+        let (scheme, rest) = admin_url.split_once("://").expect("URL form");
+        let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+        format!("{scheme}://{RUNTIME_LOGIN}:{RUNTIME_PASSWORD}@{host}")
+    }
+
+    fn sql_state(error: &postgres::Error) -> Option<&postgres::error::SqlState> {
+        error.code()
+    }
+
     /// Exports real `praetore.execution_journal` rows of one tenant. Run with:
     /// `PRAETORE_TEST_DATABASE_URL=postgresql://user@127.0.0.1:port/db cargo test -p praetore-cli -- --ignored journal_export`
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_export_reads_only_the_tenant_rows_in_insert_order() {
-        let url = std::env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
-        crate::apply_migrations(&url).unwrap();
+        let url = test_url();
         let set = set("04-sesion-real-bloqueada-web-fetch");
         let attester = read_attester_pin(&set.join("attester-public-key.hex")).unwrap();
         let receipts = read_receipts_dir(&set.join("evidence")).unwrap();
@@ -304,30 +404,18 @@ mod tests {
             .into_iter()
             .chain(receipts[..3].iter().map(|json| (tenant, json)))
         {
-            let evidence = Evidence::from_json(json).unwrap();
-            let (agent_id, request_id) = (Uuid::new_v4(), Uuid::new_v4());
-            let mut tx = client.transaction().unwrap();
-            tx.query_one(
-                "SELECT set_config('praetore.tenant_id', $1, true)",
-                &[&tenant_id.to_string()],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
-                 VALUES ($1, $2, $3)",
-                &[&tenant_id, &agent_id, &request_id],
-            )
-            .unwrap();
-            tx.execute(
-                "INSERT INTO praetore.execution_journal \
-                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
-                  authorization_status, execution_status, evidence_json) \
-                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'not_dispatched', $5)",
-                &[&tenant_id, &agent_id, &request_id, &"ab".repeat(32), json],
-            )
-            .unwrap();
-            tx.commit().unwrap();
-            assert!(evidence.attester_signature.is_some());
+            assert!(
+                Evidence::from_json(json)
+                    .unwrap()
+                    .attester_signature
+                    .is_some()
+            );
+            insert_row(
+                &mut client,
+                (tenant_id, Uuid::new_v4(), Uuid::new_v4()),
+                json,
+                None,
+            );
         }
         let rows = read_journal(&url, tenant).unwrap();
         assert_eq!(rows, receipts[..3].to_vec());
@@ -335,5 +423,265 @@ mod tests {
         let (_, expected) = export(&receipts[..3], &attester).unwrap();
         assert_eq!(head, expected);
         assert!(read_journal(&url, Uuid::new_v4()).unwrap().is_empty());
+    }
+
+    /// Connected as a login member of `praetore_runtime` (not the owner, not a
+    /// superuser), the export sees only its tenant even without the SQL
+    /// filter, sees nothing without the tenant setting, and cannot write.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_export_as_runtime_role_is_confined_by_row_level_security() {
+        use postgres::error::SqlState;
+        let admin_url = test_url();
+        let runtime_url = runtime_url(&admin_url);
+        let set = set("04-sesion-real-bloqueada-web-fetch");
+        let attester = read_attester_pin(&set.join("attester-public-key.hex")).unwrap();
+        let receipts = read_receipts_dir(&set.join("evidence")).unwrap();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut admin = crate::connect_local_database(&admin_url).unwrap();
+        // Interleaved: b, a, b, a.
+        for (tenant_id, json) in [
+            (b, &receipts[4]),
+            (a, &receipts[0]),
+            (b, &receipts[5]),
+            (a, &receipts[1]),
+        ] {
+            insert_row(
+                &mut admin,
+                (tenant_id, Uuid::new_v4(), Uuid::new_v4()),
+                json,
+                None,
+            );
+        }
+        let rows_of_a = receipts[..2].to_vec();
+        let rows_of_b = receipts[4..6].to_vec();
+
+        // It really is the least-privilege runtime role.
+        let mut runtime = crate::connect_local_database(&runtime_url).unwrap();
+        let role = runtime
+            .query_one(
+                "SELECT current_user::text, rolsuper, rolbypassrls, \
+                        pg_has_role(current_user, 'praetore_runtime', 'MEMBER') \
+                 FROM pg_catalog.pg_roles WHERE rolname = current_user",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(role.get::<_, String>(0), RUNTIME_LOGIN);
+        assert!(!role.get::<_, bool>(1) && !role.get::<_, bool>(2));
+        assert!(role.get::<_, bool>(3));
+        praetore_replay_postgres::verify_runtime_role(&mut runtime).unwrap();
+
+        // The export path, as the runtime role.
+        assert_eq!(read_journal(&runtime_url, a).unwrap(), rows_of_a);
+        assert_eq!(read_journal(&runtime_url, b).unwrap(), rows_of_b);
+        let (_, head) = export(&read_journal(&runtime_url, a).unwrap(), &attester).unwrap();
+        assert_eq!(head, export(&rows_of_a, &attester).unwrap().1);
+
+        // Second line: the export transaction without any tenant filter still
+        // returns only the rows of the tenant in `praetore.tenant_id`.
+        let unfiltered = "SELECT evidence_json, tenant_id FROM praetore.execution_journal \
+                          ORDER BY created_at, request_id, agent_id";
+        // These checks use their own SQL, not JOURNAL_QUERY, so they hold
+        // whatever filter the export query has.
+        let by_tenant = "SELECT evidence_json FROM praetore.execution_journal WHERE tenant_id = $1";
+        {
+            let mut tx = export_transaction(&mut runtime, a).unwrap();
+            let rows = tx.query(unfiltered, &[]).unwrap();
+            assert!(rows.iter().all(|row| row.get::<_, Uuid>(1) == a));
+            let json: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+            assert_eq!(json, rows_of_a);
+            // A filter naming the other tenant finds nothing.
+            assert!(tx.query(by_tenant, &[&b]).unwrap().is_empty());
+            tx.commit().unwrap();
+        }
+        // Contrast: a superuser bypasses RLS, so there the filter is the only line.
+        let superuser: bool = admin
+            .query_one(
+                "SELECT rolsuper FROM pg_roles WHERE rolname = current_user",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        if superuser {
+            let mut tx = export_transaction(&mut admin, a).unwrap();
+            let count: i64 = tx
+                .query_one(
+                    "SELECT count(*) FROM praetore.execution_journal WHERE tenant_id = $1",
+                    &[&b],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 2);
+            tx.commit().unwrap();
+        }
+
+        // Fails closed without the setting, or with an empty or wrong one:
+        // no rows, and an export of no rows is refused.
+        let count_all = "SELECT count(*) FROM praetore.execution_journal";
+        {
+            let mut tx = runtime.build_transaction().read_only(true).start().unwrap();
+            assert_eq!(tx.query_one(count_all, &[]).unwrap().get::<_, i64>(0), 0);
+            tx.query_one("SELECT set_config('praetore.tenant_id', '', true)", &[])
+                .unwrap();
+            assert_eq!(tx.query_one(count_all, &[]).unwrap().get::<_, i64>(0), 0);
+            tx.commit().unwrap();
+        }
+        {
+            let mut tx = runtime.build_transaction().read_only(true).start().unwrap();
+            tx.query_one(
+                "SELECT set_config('praetore.tenant_id', 'not-a-uuid', true)",
+                &[],
+            )
+            .unwrap();
+            let error = tx.query_one(count_all, &[]).unwrap_err();
+            assert_eq!(
+                sql_state(&error),
+                Some(&SqlState::INVALID_TEXT_REPRESENTATION)
+            );
+        }
+        {
+            let mut tx = export_transaction(&mut runtime, b).unwrap();
+            assert!(tx.query(by_tenant, &[&a]).unwrap().is_empty());
+            tx.commit().unwrap();
+        }
+        let unknown = read_journal(&runtime_url, Uuid::new_v4()).unwrap();
+        assert!(unknown.is_empty());
+        assert!(export(&unknown, &attester).is_err());
+
+        // The export transaction is READ ONLY: no insert or update gets through,
+        // even ones the runtime role is granted.
+        {
+            let mut tx = export_transaction(&mut runtime, a).unwrap();
+            let error = tx
+                .execute(
+                    "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                     VALUES ($1, $2, $3)",
+                    &[&a, &Uuid::new_v4(), &Uuid::new_v4()],
+                )
+                .unwrap_err();
+            assert_eq!(
+                sql_state(&error),
+                Some(&SqlState::READ_ONLY_SQL_TRANSACTION)
+            );
+        }
+        {
+            let mut tx = export_transaction(&mut runtime, a).unwrap();
+            let error = tx
+                .execute(
+                    "UPDATE praetore.execution_journal SET updated_at = updated_at \
+                     WHERE tenant_id = $1",
+                    &[&a],
+                )
+                .unwrap_err();
+            assert_eq!(
+                sql_state(&error),
+                Some(&SqlState::READ_ONLY_SQL_TRANSACTION)
+            );
+        }
+        // And the role has no DELETE at all, in or out of the export path.
+        {
+            let mut tx = runtime.transaction().unwrap();
+            tx.query_one(
+                "SELECT set_config('praetore.tenant_id', $1, true)",
+                &[&a.to_string()],
+            )
+            .unwrap();
+            let error = tx
+                .execute(
+                    "DELETE FROM praetore.execution_journal WHERE tenant_id = $1",
+                    &[&a],
+                )
+                .unwrap_err();
+            assert_eq!(sql_state(&error), Some(&SqlState::INSUFFICIENT_PRIVILEGE));
+        }
+        assert_eq!(read_journal(&runtime_url, a).unwrap(), rows_of_a);
+    }
+
+    /// Insert order differs from `(created_at, request_id, agent_id)`, with
+    /// equal `created_at` and an equal `(created_at, request_id)` pair.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_export_orders_by_created_at_then_request_id_then_agent_id() {
+        let admin_url = test_url();
+        let runtime_url = runtime_url(&admin_url);
+        let set = set("04-sesion-real-bloqueada-web-fetch");
+        let attester = read_attester_pin(&set.join("attester-public-key.hex")).unwrap();
+        let receipts = read_receipts_dir(&set.join("evidence")).unwrap();
+        let tenant = Uuid::new_v4();
+        let id = |text: &str| Uuid::parse_str(text).unwrap();
+        // UUIDs compare byte by byte, which is the order of their lowercase
+        // hex text: "0a..." < "a0..." < "ff...".
+        let (req_0a, req_a0, req_ff) = (
+            id("0a000000-0000-4000-8000-000000000000"),
+            id("a0000000-0000-4000-8000-000000000000"),
+            id("ffffffff-0000-4000-8000-000000000000"),
+        );
+        let (agent_00, agent_01, agent_ff) = (
+            id("00000000-0000-4000-8000-000000000001"),
+            id("01000000-0000-4000-8000-000000000000"),
+            id("ff000000-0000-4000-8000-000000000000"),
+        );
+        let (t0, t1) = ("2026-01-01T00:00:00.000001Z", "2026-01-01T00:00:00.000002Z");
+        // (created_at, request_id, agent_id), in insert order.
+        let inserts = [
+            (t1, req_a0, agent_00), // expected 3rd
+            (t1, req_0a, agent_ff), // expected 2nd: same t1 and request as the next one
+            (t0, req_ff, agent_01), // expected 0th: earliest, despite the largest ids
+            (t1, req_0a, agent_01), // expected 1st
+        ];
+        let mut admin = crate::connect_local_database(&admin_url).unwrap();
+        for (index, (created_at, request_id, agent_id)) in inserts.iter().enumerate() {
+            insert_row(
+                &mut admin,
+                (tenant, *agent_id, *request_id),
+                &receipts[index],
+                Some(created_at),
+            );
+        }
+        let expected: Vec<String> = [2, 3, 1, 0].map(|i| receipts[i].clone()).to_vec();
+        let uuid_matches_text: bool = admin
+            .query_one(
+                "WITH v (a, b, c) AS (SELECT $1::text, $2::text, $3::text) \
+                 SELECT (a::uuid < b::uuid) = (a < b) AND (b::uuid < c::uuid) = (b < c) \
+                    AND a::uuid < b::uuid AND b::uuid < c::uuid FROM v",
+                &[
+                    &req_0a.to_string(),
+                    &req_a0.to_string(),
+                    &req_ff.to_string(),
+                ],
+            )
+            .unwrap()
+            .get(0);
+        assert!(uuid_matches_text);
+
+        // The export path, as the runtime role and as the admin role.
+        assert_eq!(read_journal(&runtime_url, tenant).unwrap(), expected);
+        assert_eq!(read_journal(&admin_url, tenant).unwrap(), expected);
+        // With index scans off the rows come from the heap in insert order, so
+        // the result depends only on ORDER BY, not on which index the planner
+        // picks (the primary key is already sorted by agent_id).
+        let mut runtime = crate::connect_local_database(&runtime_url).unwrap();
+        runtime
+            .batch_execute("SET enable_indexscan = off; SET enable_bitmapscan = off")
+            .unwrap();
+        assert_eq!(read_journal_rows(&mut runtime, tenant).unwrap(), expected);
+
+        let (text, head) = export(&expected, &attester).unwrap();
+        let chain: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                value["evidence"]["evidence_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let ids: Vec<String> = expected
+            .iter()
+            .map(|json| Evidence::from_json(json).unwrap().evidence_id.to_string())
+            .collect();
+        assert_eq!(chain, ids);
+        assert_eq!(head.entries.get(), 4);
     }
 }
