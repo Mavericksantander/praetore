@@ -315,30 +315,43 @@ fn default_policy(root: &str, home: &str) -> Policy {
 /// Maps a Claude Code tool call onto a PRÆTORE action type, the capability it
 /// requires, and the parameters the policy matches on. Unknown tools map to
 /// `claude:tool`, which only the main session's authority grants.
-fn classify(tool_name: &str, input: &Value, cwd: Option<&str>) -> (String, &'static str, Value) {
+///
+/// A path is resolved through the filesystem first (see [`resolve_path`]).
+/// Unless it resolves to itself, the policy sees [`PATH_CHECK_FAILED`]
+/// instead: not an absolute path, so the engine treats it as unsafe and it
+/// matches every restrictive `PathPrefix` rule and no ALLOW one. The fourth
+/// value records the check for the signed request context.
+fn classify(
+    tool_name: &str,
+    input: &Value,
+    cwd: Option<&str>,
+) -> (String, &'static str, Value, Option<Value>) {
     let field = |key: &str| input.get(key).and_then(Value::as_str);
     let path_param = |path: Option<&str>| match path.or(cwd) {
-        Some(path) => json!({ "path": absolute(path, cwd) }),
+        Some(path) => {
+            let lexical = absolute(path, cwd);
+            let (status, resolved) = resolve_path(&lexical);
+            let seen = if status == PathStatus::Same {
+                lexical.clone()
+            } else {
+                PATH_CHECK_FAILED.to_string()
+            };
+            let check =
+                json!({ "lexical": lexical, "resolved": resolved, "status": status.as_str() });
+            (json!({ "path": seen }), Some(check))
+        }
         // No path: the parameter is absent, so no path-scoped ALLOW matches.
-        None => json!({}),
+        None => (json!({}), None),
+    };
+    let with_path = |action: &str, capability: &'static str, path: Option<&str>| {
+        let (parameters, check) = path_param(path);
+        (action.to_string(), capability, parameters, check)
     };
     match tool_name {
-        "Read" => (
-            "claude:read".into(),
-            "fs:read",
-            path_param(field("file_path")),
-        ),
-        "Grep" | "Glob" => ("claude:read".into(), "fs:read", path_param(field("path"))),
-        "Edit" | "MultiEdit" | "Write" => (
-            "claude:write".into(),
-            "fs:write",
-            path_param(field("file_path")),
-        ),
-        "NotebookEdit" => (
-            "claude:write".into(),
-            "fs:write",
-            path_param(field("notebook_path")),
-        ),
+        "Read" => with_path("claude:read", "fs:read", field("file_path")),
+        "Grep" | "Glob" => with_path("claude:read", "fs:read", field("path")),
+        "Edit" | "MultiEdit" | "Write" => with_path("claude:write", "fs:write", field("file_path")),
+        "NotebookEdit" => with_path("claude:write", "fs:write", field("notebook_path")),
         "Bash" => {
             let command = field("command").unwrap_or_default();
             let parameters = match shell::scan(command) {
@@ -351,28 +364,104 @@ fn classify(tool_name: &str, input: &Value, cwd: Option<&str>) -> (String, &'sta
                     "unanalyzable_reason": reason,
                 }),
             };
-            ("claude:exec".into(), "process:execute", parameters)
+            ("claude:exec".into(), "process:execute", parameters, None)
         }
         "WebFetch" | "WebSearch" => (
             "claude:network".into(),
             "network:invoke",
             json!({ "target": field("url").or(field("query")).unwrap_or_default() }),
+            None,
         ),
         "Agent" | "Task" => (
             "claude:delegate".into(),
             "agent:delegate",
             json!({ "subagent_type": field("subagent_type").unwrap_or_default() }),
+            None,
         ),
         other => (
             "claude:tool".into(),
             "tool:invoke",
             json!({ "tool": other }),
+            None,
         ),
     }
 }
 
+/// What the policy sees in place of a path that does not resolve to itself.
+const PATH_CHECK_FAILED: &str = "praetore-claude-hook:path-check-failed";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathStatus {
+    /// The path resolves to exactly itself: no symlink, `.` or `..` in it.
+    Same,
+    /// The path resolves somewhere else.
+    Differs,
+    /// The path cannot be resolved: relative, a dangling symlink, a `..`
+    /// below a missing directory, a component under a file, or not UTF-8.
+    Unresolved,
+}
+
+impl PathStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Differs => "differs",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+/// Resolves `lexical` with `fs::canonicalize`. For a path that does not
+/// exist yet (a new file, possibly in new directories), it resolves the
+/// deepest existing ancestor and appends the missing names. Those names
+/// cannot be symlinks because nothing exists there yet. Whatever exists at
+/// a missing name but cannot be resolved (a dangling symlink) is unresolved.
+fn resolve_path(lexical: &str) -> (PathStatus, Option<String>) {
+    use std::path::PathBuf;
+    let path = Path::new(lexical);
+    if !path.is_absolute() {
+        return (PathStatus::Unresolved, None);
+    }
+    let mut existing = path;
+    let mut missing = Vec::new();
+    let resolved: PathBuf = loop {
+        match fs::canonicalize(existing) {
+            Ok(base) => {
+                let mut resolved = base;
+                resolved.extend(missing.iter().rev());
+                break resolved;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if fs::symlink_metadata(existing).is_ok() {
+                    return (PathStatus::Unresolved, None);
+                }
+                let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+                    return (PathStatus::Unresolved, None);
+                };
+                missing.push(name);
+                existing = parent;
+            }
+            Err(_) => return (PathStatus::Unresolved, None),
+        }
+    };
+    let Ok(resolved) = resolved.into_os_string().into_string() else {
+        return (PathStatus::Unresolved, None);
+    };
+    let normalized = match lexical.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => lexical,
+    };
+    let status = if resolved == normalized {
+        PathStatus::Same
+    } else {
+        PathStatus::Differs
+    };
+    (status, Some(resolved))
+}
+
 /// Joins a relative path onto `cwd` without normalizing it. A `..` or `.`
-/// segment stays in the value, which PRÆTORE treats as unsafe (fail closed).
+/// segment stays in the value; [`resolve_path`] then reports it as `differs`
+/// or `unresolved`, so it fails closed.
 fn absolute(path: &str, cwd: Option<&str>) -> String {
     match cwd {
         Some(cwd) if !path.starts_with('/') => format!("{}/{path}", cwd.trim_end_matches('/')),
@@ -471,13 +560,16 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     )?)?)?;
     let engine = AuthorizationEngine::strict(policy, vec![pin])?;
 
-    let (action_type, capability, parameters) =
+    let (action_type, capability, parameters, path_check) =
         classify(&input.tool_name, &input.tool_input, input.cwd.as_deref());
     let action = Action::new(action_type, None, parameters)?.with_capability(capability);
     let mut request = AuthorizationRequest::new(identity, authority, action)?
         .with_context("agent", json!(agent))
         .with_context("profile", json!(profile_name))
         .with_context("tool", json!(input.tool_name));
+    if let Some(check) = path_check {
+        request = request.with_context("praetore.path_check", check);
+    }
     request.sign_intent(&key)?;
     let mut evidence = engine.evaluate(request)?;
     evidence.sign(&EvidenceAttesterKey::from_secret_bytes(&read_secret(
@@ -890,6 +982,73 @@ mod tests {
         // A relative path inside the project resolves against cwd.
         let verdict = f.decide(Some("explorer"), "Grep", json!({ "path": "src" }));
         assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paths_are_resolved_before_evaluation() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new("symlinks");
+        let outside = Fixture::new("symlinks-outside");
+        fs::write(outside.root.join("secret.txt"), "x").unwrap();
+        fs::create_dir(f.root.join("src")).unwrap();
+        fs::write(f.root.join("src/lib.rs"), "x").unwrap();
+        symlink(&outside.root, f.root.join("link")).unwrap();
+        symlink(f.root.join("src/lib.rs"), f.root.join("inside-link")).unwrap();
+        symlink(f.root.join("missing"), f.root.join("dangling")).unwrap();
+
+        let check = |agent: &str, tool: &str, path: String| {
+            let verdict = f.decide(Some(agent), tool, json!({ "file_path": path }));
+            let receipts = fs::read_to_string(f.state.join(RECEIPTS_FILE)).unwrap();
+            let last: Value = serde_json::from_str(receipts.lines().last().unwrap()).unwrap();
+            let context = &last["evidence"]["context"];
+            (
+                verdict.outcome,
+                context["praetore.path_check"]["status"].clone(),
+            )
+        };
+        let deny = DecisionOutcome::Deny;
+        let allow = DecisionOutcome::Allow;
+        // The symlink that leads out of the project no longer lets a read through.
+        assert_eq!(
+            check("explorer", "Read", f.path("link/secret.txt")),
+            (deny, json!("differs"))
+        );
+        assert_eq!(
+            check("coder", "Write", f.path("link/new.txt")),
+            (deny, json!("differs"))
+        );
+        // A symlink that stays inside is still refused: only resolved paths are allowed.
+        assert_eq!(
+            check("explorer", "Read", f.path("inside-link")),
+            (deny, json!("differs"))
+        );
+        assert_eq!(
+            check("coder", "Write", f.path("dangling")),
+            (deny, json!("unresolved"))
+        );
+        assert_eq!(
+            check("coder", "Write", f.path("src/lib.rs/x")),
+            (deny, json!("unresolved"))
+        );
+        assert_eq!(
+            check("explorer", "Read", f.path("src/../src/lib.rs")),
+            (deny, json!("differs"))
+        );
+        // Existing files, new files and new files in new directories resolve to themselves.
+        assert_eq!(
+            check("explorer", "Read", f.path("src/lib.rs")),
+            (allow, json!("same"))
+        );
+        assert_eq!(
+            check("coder", "Write", f.path("src/new.rs")),
+            (allow, json!("same"))
+        );
+        assert_eq!(
+            check("coder", "Write", f.path("docs/a/b.md")),
+            (allow, json!("same"))
+        );
+        verify_receipts(&f.state).unwrap();
     }
 
     #[test]

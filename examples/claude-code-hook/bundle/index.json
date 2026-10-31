@@ -180,8 +180,18 @@
     "tool_use_id": "demo"
   },
   {
+    "agent": "explorer",
+    "file": "evidence/0019-explorer-Read-Deny.json",
+    "outcome": "Deny",
+    "profile": "explorer",
+    "reason": "Policy 'claude-code-agents' v1: no matching rule; default deny",
+    "rule": null,
+    "tool_name": "Read",
+    "tool_use_id": "demo"
+  },
+  {
     "agent": "general-purpose",
-    "file": "evidence/0019-general-purpose-Read-Deny.json",
+    "file": "evidence/0020-general-purpose-Read-Deny.json",
     "outcome": "Deny",
     "profile": "unregistered",
     "reason": "authority does not permit capability: fs:read",
@@ -191,7 +201,7 @@
   },
   {
     "agent": "web-fetch",
-    "file": "evidence/0020-web-fetch-WebFetch-Allow.json",
+    "file": "evidence/0021-web-fetch-WebFetch-Allow.json",
     "outcome": "Allow",
     "profile": "web-fetch",
     "reason": "Policy rule 'allow-network' matched",
@@ -201,7 +211,7 @@
   },
   {
     "agent": "web-fetch",
-    "file": "evidence/0021-web-fetch-Read-Deny.json",
+    "file": "evidence/0022-web-fetch-Read-Deny.json",
     "outcome": "Deny",
     "profile": "web-fetch",
     "reason": "authority does not permit capability: fs:read",

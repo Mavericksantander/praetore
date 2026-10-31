@@ -27,6 +27,10 @@ STATE="$PROJECT/.claude/praetore"
 # rutas de quien regenera el bundle.
 HOME="$WORK/home" "$BIN" init "$STATE" --root "$PROJECT" --valid-days 3650
 
+# Un symlink dentro del proyecto que apunta afuera: el hook resuelve la ruta
+# antes de evaluar, así que no deja leer por ahí.
+ln -s /etc "$PROJECT/enlace-afuera"
+
 step "3. Pasar tool calls por el hook (mismo wrapper que usa Claude Code)"
 export CLAUDE_PROJECT_DIR="$PROJECT" PRAETORE_HOOK_BIN="$BIN"
 call() {
@@ -71,6 +75,7 @@ call coder    WebFetch '{"url":"https://example.com"}'            "usa la red"
 call coder    Agent '{"subagent_type":"coder"}'                   "delega a otro agente"
 call explorer Read  '{"file_path":"/etc/passwd"}'                 "lee fuera del proyecto"
 call explorer Read  '{"file_path":"../fuera.txt"}'                "lee con ruta relativa .."
+call explorer Read  "{\"file_path\":\"$P/enlace-afuera/passwd\"}" "lee por un symlink que sale"
 call general-purpose Read "{\"file_path\":\"$P/README.md\"}"      "agente sin autoridad"
 call web-fetch WebFetch '{"url":"https://example.com"}'          "lector web: usa la red"
 call web-fetch Read "{\"file_path\":\"$P/README.md\"}"         "lector web: lee un archivo"

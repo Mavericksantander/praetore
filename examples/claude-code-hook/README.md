@@ -47,9 +47,33 @@ Reglas de la policy por defecto:
 - Nadie escribe en `<raíz>/.git`.
 - `git push` requiere aprobación (ver abajo cómo se detecta).
 - Un comando que no se puede analizar requiere aprobación.
-- Los subagentes leen y escriben solo dentro de la raíz del proyecto. La
+- Los subagentes leen y escriben solo dentro de la raíz del proyecto, con la
+  ruta ya resuelta (un symlink que sale de la raíz no cuenta como dentro). La
   sesión principal además lee en cualquier lugar y escribe en
   `~/.claude/projects` y `/private/tmp`.
+
+### Resolución de rutas
+
+Como en [#59](https://github.com/Mavericksantander/praetore/pull/59),
+`PathPrefix` en core sigue siendo léxico y la resolución ocurre en el hook,
+antes de evaluar. Cada ruta (`file_path`, `notebook_path`, `path` de
+Grep/Glob, o `cwd`) se resuelve con `fs::canonicalize`. Para un archivo que
+todavía no existe, se resuelve el ancestro existente más profundo y se le
+agregan los nombres que faltan. Esos nombres no pueden ser symlinks porque
+todavía no existen.
+
+Si la ruta no se resuelve a sí misma (`differs`: un symlink en cualquier
+parte, `.` o `..`) o no se puede resolver (`unresolved`: un symlink colgante,
+una ruta bajo un archivo, `..` bajo un directorio inexistente), el motor no
+recibe la ruta sino `praetore-claude-hook:path-check-failed`. Como ese valor
+no es absoluto, core lo trata como inseguro: coincide con toda regla
+restrictiva de `PathPrefix` y con ninguna de permiso. El recibo guarda
+`context["praetore.path_check"] = {"lexical", "resolved", "status"}`, dentro
+del contenido firmado.
+
+Diferencia con #59: allí un archivo nuevo en un directorio que no existe se
+niega, porque solo se resuelve el padre. Aquí se resuelve el ancestro
+existente, para que `coder` pueda crear directorios nuevos.
 
 ### Detección de `git push`
 
@@ -71,7 +95,7 @@ una variable en posición de comando o junto a `push`, o un alias inline
 Desde la raíz de un clon:
 
 ```sh
-./examples/claude-code-hook/demo.sh     # regenera bundle/ con 21 tool calls fijas
+./examples/claude-code-hook/demo.sh     # regenera bundle/ con 22 tool calls fijas
 ./examples/claude-code-hook/verify.sh   # verifica bundle/ solo con praetore-verify
 ```
 
@@ -139,12 +163,11 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
 - **Lo que corre dentro de un comando permitido no se ve.** Un script
   (`./deploy.sh`), un `Makefile` o un alias de git definido en la
   configuración pueden hacer push sin que el comando lo diga.
-- **Las rutas se comparan como texto, sin resolverlas.** Un symlink dentro
-  del proyecto que apunte afuera deja pasar esa ruta: con `<raíz>/link` →
-  `/etc`, el explorer puede leer `<raíz>/link/passwd`, porque la policy ve
-  una ruta dentro de la raíz. Las rutas con `..` no pasan: el motor las trata
-  como inseguras y las niega, también cuando son absolutas. Resolver la ruta
-  antes de evaluar es lo que propone
-  [#59](https://github.com/Mavericksantander/praetore/pull/59).
+- **Ventana entre el chequeo y el uso.** La ruta se resuelve cuando el hook
+  evalúa, y la herramienta la abre después. Si en ese intervalo alguien
+  cambia un directorio por un symlink, la herramienta puede abrir otra cosa.
+- **macOS:** `/tmp` y `/var` son symlinks a `/private/...`. Una ruta como
+  `/tmp/x` no se resuelve a sí misma, así que se niega bajo cualquier regla de
+  ruta. Hay que usar rutas resueltas.
 - **Raíz fija.** La raíz de la policy es la ruta absoluta dada en `init`.
   Mover el proyecto exige otro `init`.
