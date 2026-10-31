@@ -36,6 +36,23 @@ jobs:
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
 
+  hook-evidence:
+    name: Claude Code hook evidence (sets 03, 04, 05)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # verify.sh exits non-zero if any receipt fails, if a policy digest does
+      # not match, or if a one-byte tampered copy is accepted.
+      - name: Verify set 03
+        run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/03-bundle-demo-reproducible
+      - name: Verify set 04
+        run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch
+      - name: Verify set 05
+        run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/05-sesion-real-final
+
   macos:
     name: macOS workspace link
     runs-on: macos-15

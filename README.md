@@ -321,17 +321,28 @@ flowchart LR
 
 | Item | Result |
 | --- | --- |
-| Receipts | 118 |
+| Receipts | [118](examples/claude-code-hook/evidence/05-sesion-real-final/) |
 | Allow | 117 |
 | Deny | 0 |
 | RequireApproval | 1 |
 | Tampered copies rejected | 20 of 20 |
 | Verification | Offline, with `praetore-verify` and public keys only |
+| Evidence | [`examples/claude-code-hook/evidence/`](examples/claude-code-hook/evidence/) |
+| How to verify | [`VERIFY.md`](examples/claude-code-hook/evidence/VERIFY.md) |
 
 Scope: this covers only the tool calls that went through the hook; anything
 an agent does by another path is outside it. The receipts prove integrity of
-what was recorded, not that the authority is still valid today. The receipts
-themselves are not published in this repository yet.
+what was recorded, not that the authority is still valid today. The receipts, keys
+and policy are in
+[`examples/claude-code-hook/evidence/`](examples/claude-code-hook/evidence/);
+commands and real outputs are in
+[`VERIFY.md`](examples/claude-code-hook/evidence/VERIFY.md), and CI re-verifies
+sets 03, 04 and 05.
+
+Note: the public keys ship with the evidence, so the checks prove integrity,
+not the identity of the signer. Session 04 left 33 denials without a receipt
+(documented in its
+[README](examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch/README.md)).
 
 ---
 
