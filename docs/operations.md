@@ -83,6 +83,50 @@ the configured keys; removing a key before those are dispatched leaves them
 `Gateway::reconcile` (`crash_recovered`). The single-key environment variables are accepted
 only for the local demo or a gateway with exactly one issuer-bound tenant.
 
+## Signing keys
+
+The gateway service signs with two keys: the evidence attester (decision
+receipts) and the execution attester (execution attestations). Each is read
+from exactly one source; setting none, or more than one, refuses to start.
+
+| Source | Evidence attester | Execution attester |
+| --- | --- | --- |
+| Hex variable | `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX` | `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX` |
+| File | `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE` | `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE` |
+| PKCS#11 key label (`pkcs11` feature) | `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_PKCS11_KEY_LABEL` | `PRAETORE_GATEWAY_EXECUTION_ATTESTER_PKCS11_KEY_LABEL` |
+
+- **Hex variables** are accepted by the `local-demo` adapter only. With
+  `http` or `sandbox` the service refuses to start unless
+  `PRAETORE_GATEWAY_DANGEROUSLY_ALLOW_SIGNING_KEYS_IN_ENV=yes` (any other
+  value is an error), and then logs a warning. Anything that can read the
+  process environment (`/proc/<pid>/environ`, a crash dump, `kubectl describe`
+  of a Pod spec) can read such a key.
+- **Key files** contain exactly 64 lowercase hex characters, optionally
+  followed by one newline, are regular files of at most 256 bytes and, on
+  Unix, must not be accessible by group or others (mode `0600` or `0400`; for
+  a Kubernetes Secret volume use `defaultMode: 0400`). The key is still held
+  in process memory.
+- **PKCS#11** (build with `--features pkcs11`) also needs
+  `PRAETORE_GATEWAY_PKCS11_MODULE` (module path),
+  `PRAETORE_GATEWAY_PKCS11_TOKEN_LABEL` and `PRAETORE_GATEWAY_PKCS11_PIN_FILE`
+  (the user PIN, same file rules). The private key must be an Ed25519 key that
+  is sensitive and not extractable. PKCS#11 login is shared by the process: if
+  both keys are in the same token, the PIN is checked once.
+- `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_ALGORITHM` is `ed25519` (default) or
+  `ed25519-sha256-envelope` (see
+  [crypto and policy](crypto-and-policy.md#signers-and-key-custody-saf-11-step-1)).
+  It does not apply to the execution key.
+- AWS KMS (`praetore-signer-aws-kms`) is not wired into the service yet.
+
+At startup the service logs the evidence `key_id`, its algorithm and the
+execution attestation `key_id`, never key material. The execution `key_id` is
+`local-demo-<public key hex>` for a hex variable (as before), `local-...` for
+a file and `pkcs11-...` for a token; pass it to
+`praetore-verify receipt --key-id`. A signer that becomes unavailable
+(`SIGNER_UNAVAILABLE`) makes the gateway answer `503
+authorization_unavailable` and authorize nothing; it never falls back to
+another key.
+
 ## Freshness snapshot
 
 With the `http` and `sandbox` adapters the gateway requires
@@ -151,7 +195,9 @@ Before deployment, verify that:
 - the policy digest matches an approved pin;
 - issuer pins are non-empty, time-bounded, and active;
 - an evidence attester key is configured separately from agent and issuer
-  keys, and evidence consumers trust its public key out of band;
+  keys, and evidence consumers trust its public key out of band; outside
+  development it is not passed in an environment variable (see
+  [Signing keys](#signing-keys));
 - a durable `ReplayGuard` is shared across all engine instances in the
   authorization domain, persists claims across restart and failover, rejects
   duplicates atomically, and fails closed when unavailable or full;

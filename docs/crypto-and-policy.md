@@ -164,6 +164,8 @@ uses these exact byte prefixes:
 * Evidence attestation: `PRAETORE_EVIDENCE_V1\0`
 * HighAssurance request intent: `PRAETORE_INTENT_V2\0`
 * HighAssurance evidence attestation: `PRAETORE_EVIDENCE_V2\0`
+* Envelope prefix of `ed25519-sha256-envelope` attester signatures (SAF-11):
+  `PRAETORE_SIGNATURE_ENVELOPE_V1\0ed25519-sha256\0`
 * Agent key fingerprint: `PRAETORE_AGENT_KEY_V1\0ed25519\0`
 * Issuer key ID: `PRAETORE_ISSUER_KEY_V1\0ed25519\0`
 
@@ -252,12 +254,84 @@ not update an agent registry or revoke the old key; those operations remain
 caller-owned.
 
 Evidence keeps the SHA-256 `context_hash` for integrity and can also carry an
-Ed25519 signature from a separate `EvidenceAttesterKey`. The signature covers
+Ed25519 signature from a separate evidence attester (`EvidenceAttesterKey`, or
+any `Signer`; see below). The signature covers
 the integrity payload and is verified offline with an independently trusted
 `VerifiedPublicKey` using `Evidence::verify_attester_signature`. Integrity
 alone is not authenticity. A valid signature proves only that the holder of
 the attester key signed that payload; it does not prove honest evaluation,
 non-repudiation against key/host compromise, or trusted key distribution.
+
+## Signers and key custody (SAF-11, step 1)
+
+Who holds a signing key is separate from what is signed. Evidence attester
+signatures and execution attestations are produced through the
+`praetore_core::Signer` trait (decision 1 of the SAF-11 proposal):
+
+* `LocalSigner` keeps an Ed25519 key in process memory (zeroized on drop).
+  `EvidenceAttesterKey` is now an alias of it, so existing code is unchanged.
+* `praetore-signer-pkcs11` keeps the key in a PKCS#11 token (an HSM;
+  SoftHSM2 in development and CI) and asks the token to sign with
+  `CKM_EDDSA` (pure Ed25519). Opening the signer fails unless the token has
+  exactly one Ed25519 private and public key with the label, the private key
+  is sensitive and not extractable, the public key matches the optional pin,
+  and a test signature verifies.
+* `praetore-signer-aws-kms` keeps the key in AWS KMS (`ECC_NIST_EDWARDS25519`,
+  `SIGN_VERIFY`, signing with `ED25519_SHA_512` and `MessageType` `RAW`). The
+  signer logic is tested against a stubbed `KmsClient`, and the `sdk` feature's
+  adapter over `aws-sdk-kms` is tested against a local fake HTTP connector. Neither
+  has been run against AWS.
+
+`praetore-core` depends on no SDK; each backend is its own crate. Every
+signature a signer returns is verified against the signer's public key
+before it is used, so a backend that answers with another key (for example a
+re-pointed KMS alias) or a malformed signature fails closed with
+`SIGNER_FAIL`. A backend that is down fails with `SIGNER_UNAVAILABLE`: nothing
+is signed, the engine signs before it claims the replay key, so the same
+request can be retried, and no other key is ever used instead. The gateway
+treats `SIGNER_UNAVAILABLE` as transient, like `TRUSTED_CLOCK_UNAVAILABLE`.
+
+The `attester_algorithm` field of evidence records how its signature was
+made. Both values are plain Ed25519 under the same key and `attester_key_id`:
+
+| `attester_algorithm` | Signed bytes | Used by |
+| --- | --- | --- |
+| `ed25519` | `domain \|\| payload` (unchanged) | `LocalSigner` and PKCS#11 by default; every existing receipt |
+| `ed25519-sha256-envelope` | `PRAETORE_SIGNATURE_ENVELOPE_V1\0ed25519-sha256\0 \|\| domain \|\| SHA-256(payload)` | AWS KMS (always); optional for the others |
+
+`domain` is `PRAETORE_EVIDENCE_V1\0` or `PRAETORE_EVIDENCE_V2\0` as before and
+`payload` is the same canonical attestation payload, so for evidence the
+envelope message is always 99 bytes, under the 4096-byte limit of KMS `RAW`
+signing. Ed25519ph (`ED25519_PH_SHA_512`) is not used: KMS would hash a
+second time and verifiers would need another Ed25519 variant. The evidence
+schema version does not change. The envelope prefix is not a prefix of any
+receipt domain nor the other way round, and the payload itself contains
+`attester_algorithm`, so a signature made under one algorithm never
+verifies under the other; relabelling a receipt changes the signed bytes.
+Unknown `attester_algorithm` values fail closed. Verifiers released before
+this change reject envelope receipts (their integrity check only knows
+`ed25519`), and `praetore-verify` reports the algorithm it verified in
+`details.attester_algorithm`. The vector
+[evidence-envelope-v1.json](golden/evidence-envelope-v1.json) fixes the
+envelope prefix, the signed message, the signature and a complete receipt
+(DEMO/TEST-ONLY key).
+
+Execution attestations have no algorithm field and keep their format: plain
+Ed25519 over `PRAETORE_EXECUTION_ATTESTATION_V1\0 || payload`, whose payload
+is always far below 4096 bytes. `praetore_receipt::SignerExecutionAttester`
+signs them with any `Signer`.
+
+The gateway service (`praetore-gateway-demo`) takes each key from exactly
+one source: a hex variable (`..._KEY_HEX`), a file (`..._KEY_FILE`, mode
+`0600`/`0400`), or, when built with the `pkcs11` feature, a PKCS#11 key label.
+The `http` and `sandbox` adapters refuse a hex key in the environment
+(decision 3) unless `PRAETORE_GATEWAY_DANGEROUSLY_ALLOW_SIGNING_KEYS_IN_ENV=yes`
+is set; the local demo is unchanged. See
+[operations](operations.md#signing-keys).
+
+Not done in this step: attester and execution pins with validity windows
+(decision 4), revocation (5), the transparency log (6-10), wiring AWS KMS
+into the gateway service, and running against a real HSM or AWS.
 
 ## Declarative matching
 
