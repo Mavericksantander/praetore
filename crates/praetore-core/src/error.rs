@@ -21,6 +21,8 @@ pub enum ErrorKind {
     FreshnessInvalid,
     FreshnessLeaseTooLong,
     TrustedClockUnavailable,
+    SignerUnavailable,
+    SignerFailure,
 }
 
 #[derive(Debug, Error)]
@@ -77,6 +79,16 @@ pub enum PraetoreError {
 
     #[error("freshness check failed")]
     FreshnessCheckFailed(crate::freshness::FreshnessError),
+
+    /// The signing backend (HSM, KMS) is unavailable. Transient: nothing was
+    /// signed or authorized, and the request may be retried.
+    #[error("signer is unavailable")]
+    SignerUnavailable,
+
+    /// The signing backend refused, is misconfigured, or returned an invalid
+    /// signature.
+    #[error("signer failed")]
+    SignerFailed,
 }
 
 impl PraetoreError {
@@ -99,6 +111,8 @@ impl PraetoreError {
             Self::ReplayDetected => ErrorKind::ReplayDetected,
             Self::ReplayGuardUnavailable => ErrorKind::ReplayGuardFailure,
             Self::TrustedClockUnavailable => ErrorKind::TrustedClockUnavailable,
+            Self::SignerUnavailable => ErrorKind::SignerUnavailable,
+            Self::SignerFailed => ErrorKind::SignerFailure,
             Self::FreshnessCheckFailed(crate::freshness::FreshnessError::Revoked) => {
                 ErrorKind::FreshnessRevoked
             }
@@ -141,6 +155,8 @@ impl PraetoreError {
             ErrorKind::FreshnessInvalid => "FRESHNESS_INVALID",
             ErrorKind::FreshnessLeaseTooLong => "FRESHNESS_LEASE_TOO_LONG",
             ErrorKind::TrustedClockUnavailable => "TRUSTED_CLOCK_UNAVAILABLE",
+            ErrorKind::SignerUnavailable => "SIGNER_UNAVAILABLE",
+            ErrorKind::SignerFailure => "SIGNER_FAIL",
         }
     }
 }

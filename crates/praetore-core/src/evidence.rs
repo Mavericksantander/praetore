@@ -1,5 +1,3 @@
-use ed25519_dalek::{Signature, Signer, SigningKey};
-use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,11 +18,11 @@ use crate::{
     identity::{AgentIdentity, VerifiedPublicKey},
     key_rotation::KeyRotationProof,
     policy::Policy,
+    signer::{LocalSigner, SignatureAlgorithm, Signer, attester_key_id, sign_message},
 };
 
 const EVIDENCE_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V1\0";
 const EVIDENCE_V2_SIGNATURE_DOMAIN: &[u8] = b"PRAETORE_EVIDENCE_V2\0";
-const ATTESTER_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_ATTESTER_KEY_V1\0ed25519\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,54 +63,9 @@ pub struct Evidence {
     pub semantics_version: Option<u8>,
 }
 
-pub struct EvidenceAttesterKey {
-    signing_key: SigningKey,
-}
-
-impl std::fmt::Debug for EvidenceAttesterKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EvidenceAttesterKey")
-            .field("key_id", &self.key_id())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Clone for EvidenceAttesterKey {
-    fn clone(&self) -> Self {
-        Self {
-            signing_key: self.signing_key.clone(),
-        }
-    }
-}
-
-impl EvidenceAttesterKey {
-    pub fn generate() -> Self {
-        Self {
-            signing_key: SigningKey::generate(&mut OsRng),
-        }
-    }
-
-    pub fn from_secret_bytes(secret: &[u8; 32]) -> Self {
-        Self {
-            signing_key: SigningKey::from_bytes(secret),
-        }
-    }
-
-    pub fn public_key(&self) -> crate::Result<VerifiedPublicKey> {
-        VerifiedPublicKey::from_bytes(&self.signing_key.verifying_key().to_bytes())
-    }
-
-    pub fn key_id(&self) -> String {
-        key_id(self.signing_key.verifying_key().as_bytes())
-    }
-}
-
-fn key_id(public_key: &[u8; 32]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(ATTESTER_KEY_ID_DOMAIN);
-    hasher.update(public_key);
-    hex::encode(hasher.finalize())
-}
+/// The in-process evidence attester key. Since SAF-11 it is one
+/// [`Signer`] implementation among others; see [`LocalSigner`].
+pub type EvidenceAttesterKey = LocalSigner;
 
 impl Evidence {
     pub fn new(
@@ -342,7 +295,11 @@ impl Evidence {
     /// Receipts signed before this rule existed may lack the digest; they
     /// still load and verify (read path), but [`Self::verify_policy`] reports
     /// them as unbound.
-    pub fn sign(&mut self, attester: &EvidenceAttesterKey) -> crate::Result<()> {
+    ///
+    /// `attester` may be any [`Signer`]: an in-process [`LocalSigner`], or a
+    /// PKCS#11 or KMS backend. Its [`Signer::algorithm`] is recorded as
+    /// `attester_algorithm`. On error the evidence is left unchanged.
+    pub fn sign<S: Signer + ?Sized>(&mut self, attester: &S) -> crate::Result<()> {
         if !self
             .policy_digest
             .as_deref()
@@ -377,37 +334,46 @@ impl Evidence {
         Ok(())
     }
 
-    fn sign_unchecked(&mut self, attester: &EvidenceAttesterKey) -> crate::Result<()> {
+    fn sign_unchecked<S: Signer + ?Sized>(&mut self, attester: &S) -> crate::Result<()> {
         if !self.verify_integrity() {
             return Err(crate::PraetoreError::EvidenceError(
                 "cannot sign evidence with invalid integrity hash".into(),
             ));
         }
 
-        self.attester_key_id = Some(attester.key_id());
-        self.attester_algorithm = Some("ed25519".into());
-        self.attester_signature = None;
-        self.context_hash = self.compute_context_hash().ok_or_else(|| {
+        let algorithm = attester.algorithm();
+        let mut signed = self.clone();
+        signed.attester_key_id = Some(attester_key_id(attester.verifying_key()));
+        signed.attester_algorithm = Some(algorithm.as_str().into());
+        signed.attester_signature = None;
+        signed.context_hash = signed.compute_context_hash().ok_or_else(|| {
             crate::PraetoreError::EvidenceError("evidence exceeds integrity limits".into())
         })?;
-        let payload = self.attestation_bytes()?;
-        let domain = self.attestation_domain();
-        let mut message = Vec::with_capacity(domain.len() + payload.len());
-        message.extend_from_slice(domain);
-        message.extend_from_slice(&payload);
-        self.attester_signature = Some(hex::encode(attester.signing_key.sign(&message).to_bytes()));
+        let payload = signed.attestation_bytes()?;
+        let signature = sign_message(attester, algorithm, signed.attestation_domain(), &payload)?;
+        signed.attester_signature = Some(hex::encode(signature));
+        *self = signed;
         Ok(())
     }
 
+    /// Verifies the attester signature against an externally pinned key.
+    ///
+    /// Both `attester_algorithm` values are accepted (`"ed25519"` and
+    /// `"ed25519-sha256-envelope"`, see [`SignatureAlgorithm`]); each only
+    /// verifies a signature made under that same algorithm. Any other value
+    /// fails.
     pub fn verify_attester_signature(&self, trusted_key: &VerifiedPublicKey) -> crate::Result<()> {
         if !self.verify_integrity() {
             return Err(crate::PraetoreError::EvidenceError(
                 "evidence integrity verification failed".into(),
             ));
         }
-        if self.attester_algorithm.as_deref() != Some("ed25519")
-            || self.attester_key_id.as_deref() != Some(key_id(&trusted_key.as_bytes()).as_str())
-        {
+        let algorithm = self
+            .attester_algorithm
+            .as_deref()
+            .and_then(SignatureAlgorithm::from_identifier)
+            .ok_or(crate::PraetoreError::IdentityVerificationFailed)?;
+        if self.attester_key_id.as_deref() != Some(attester_key_id(trusted_key).as_str()) {
             return Err(crate::PraetoreError::IdentityVerificationFailed);
         }
 
@@ -419,16 +385,9 @@ impl Evidence {
             .and_then(|signature| {
                 decode_lower_hex(signature).ok_or(crate::PraetoreError::IdentityVerificationFailed)
             })?;
-        let signature = Signature::from_slice(&signature)
-            .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)?;
         let payload = self.attestation_bytes()?;
-        let domain = self.attestation_domain();
-        let mut message = Vec::with_capacity(domain.len() + payload.len());
-        message.extend_from_slice(domain);
-        message.extend_from_slice(&payload);
-        trusted_key
-            .as_verifying_key()
-            .verify_strict(&message, &signature)
+        algorithm
+            .verify(trusted_key, self.attestation_domain(), &payload, &signature)
             .map_err(|_| crate::PraetoreError::IdentityVerificationFailed)
     }
 
@@ -464,7 +423,11 @@ impl Evidence {
         if evidence.is_high_assurance_shape()
             && (evidence.attester_signature.is_none()
                 || evidence.attester_key_id.is_none()
-                || evidence.attester_algorithm.as_deref() != Some("ed25519"))
+                || evidence
+                    .attester_algorithm
+                    .as_deref()
+                    .and_then(SignatureAlgorithm::from_identifier)
+                    .is_none())
         {
             return Err(crate::PraetoreError::EvidenceError(
                 "v2 evidence requires an attester signature".into(),
@@ -571,7 +534,7 @@ impl Evidence {
             || self
                 .attester_algorithm
                 .as_deref()
-                .is_some_and(|value| value != "ed25519")
+                .is_some_and(|value| SignatureAlgorithm::from_identifier(value).is_none())
             || self
                 .policy_digest
                 .as_deref()
@@ -937,6 +900,142 @@ mod tests {
         );
     }
 
+    fn envelope_attester(secret: u8) -> LocalSigner {
+        LocalSigner::from_secret_bytes(&[secret; 32])
+            .with_algorithm(SignatureAlgorithm::Ed25519Sha256Envelope)
+    }
+
+    /// Re-labels `evidence` with `algorithm` and recomputes its unkeyed
+    /// context hash, keeping the attester signature.
+    fn relabel(evidence: &Evidence, algorithm: &str) -> Evidence {
+        let mut relabelled = evidence.clone();
+        relabelled.attester_algorithm = Some(algorithm.into());
+        relabelled.context_hash = relabelled.compute_context_hash().unwrap();
+        assert!(relabelled.verify_integrity());
+        relabelled
+    }
+
+    #[test]
+    fn envelope_signed_evidence_verifies_and_records_its_algorithm() {
+        let attester = envelope_attester(54);
+        let mut evidence = test_evidence();
+        evidence.bind_policy_digest(hex::encode([53; 32])).unwrap();
+        evidence.sign(&attester).unwrap();
+
+        assert_eq!(
+            evidence.attester_algorithm.as_deref(),
+            Some("ed25519-sha256-envelope")
+        );
+        assert_eq!(evidence.attester_key_id, Some(attester.key_id()));
+        let key = attester.public_key().unwrap();
+        assert!(evidence.verify_attester_signature(&key).is_ok());
+        let imported = Evidence::from_json(&evidence.to_json().unwrap()).unwrap();
+        assert!(imported.verify_attester_signature(&key).is_ok());
+        assert!(
+            evidence
+                .verify_attester_signature(&envelope_attester(55).public_key().unwrap())
+                .is_err()
+        );
+        let mut tampered = evidence.clone();
+        tampered.trace_id = Some("changed".into());
+        tampered.context_hash = tampered.compute_context_hash().unwrap();
+        assert!(tampered.verify_attester_signature(&key).is_err());
+    }
+
+    #[test]
+    fn prehash_and_legacy_signatures_are_not_interchangeable() {
+        let mut legacy = test_evidence();
+        legacy.bind_policy_digest(hex::encode([53; 32])).unwrap();
+        let mut envelope = legacy.clone();
+        let legacy_attester = EvidenceAttesterKey::from_secret_bytes(&[56; 32]);
+        let envelope_attester = legacy_attester
+            .clone()
+            .with_algorithm(SignatureAlgorithm::Ed25519Sha256Envelope);
+        legacy.sign(&legacy_attester).unwrap();
+        envelope.sign(&envelope_attester).unwrap();
+        let key = legacy_attester.public_key().unwrap();
+        assert!(legacy.verify_attester_signature(&key).is_ok());
+        assert!(envelope.verify_attester_signature(&key).is_ok());
+        assert_ne!(legacy.attester_signature, envelope.attester_signature);
+
+        // A prehash (envelope) signature presented as a legacy one.
+        assert!(
+            relabel(&envelope, "ed25519")
+                .verify_attester_signature(&key)
+                .is_err()
+        );
+        // A legacy signature presented as a prehash one.
+        assert!(
+            relabel(&legacy, "ed25519-sha256-envelope")
+                .verify_attester_signature(&key)
+                .is_err()
+        );
+        // Swapping only the signatures between otherwise identical receipts.
+        let mut swapped = legacy.clone();
+        swapped.attester_signature = envelope.attester_signature.clone();
+        assert!(swapped.verify_attester_signature(&key).is_err());
+        let mut swapped = envelope.clone();
+        swapped.attester_signature = legacy.attester_signature.clone();
+        assert!(swapped.verify_attester_signature(&key).is_err());
+    }
+
+    #[test]
+    fn unknown_attester_algorithms_fail_closed() {
+        let attester = envelope_attester(57);
+        let mut evidence = test_evidence();
+        evidence.bind_policy_digest(hex::encode([53; 32])).unwrap();
+        evidence.sign(&attester).unwrap();
+        for unknown in ["ed25519ph", "Ed25519", "ed25519-sha512-envelope", ""] {
+            let mut forged = evidence.clone();
+            forged.attester_algorithm = Some(unknown.into());
+            assert!(forged.compute_context_hash().is_none());
+            assert!(!forged.verify_integrity());
+            assert!(
+                forged
+                    .verify_attester_signature(&attester.public_key().unwrap())
+                    .is_err()
+            );
+            let mut document: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+            document["attester_algorithm"] = json!(unknown);
+            assert!(Evidence::from_json(&document.to_string()).is_err());
+        }
+    }
+
+    struct FailingSigner(LocalSigner, crate::signer::SignerError);
+
+    impl Signer for FailingSigner {
+        fn algorithm(&self) -> SignatureAlgorithm {
+            SignatureAlgorithm::Ed25519Sha256Envelope
+        }
+        fn verifying_key(&self) -> &VerifiedPublicKey {
+            self.0.verifying_key()
+        }
+        fn sign_raw(&self, _message: &[u8]) -> Result<Vec<u8>, crate::signer::SignerError> {
+            Err(self.1)
+        }
+    }
+
+    #[test]
+    fn a_failing_signer_leaves_the_evidence_unsigned_and_unchanged() {
+        let mut evidence = test_evidence();
+        evidence.bind_policy_digest(hex::encode([53; 32])).unwrap();
+        let before = evidence.to_json().unwrap();
+        for (error, code) in [
+            (
+                crate::signer::SignerError::Unavailable,
+                "SIGNER_UNAVAILABLE",
+            ),
+            (crate::signer::SignerError::Rejected, "SIGNER_FAIL"),
+            (crate::signer::SignerError::InvalidSignature, "SIGNER_FAIL"),
+        ] {
+            let signer = FailingSigner(LocalSigner::from_secret_bytes(&[58; 32]), error);
+            assert_eq!(evidence.sign(&signer).unwrap_err().code(), code);
+            assert_eq!(evidence.to_json().unwrap(), before);
+            assert!(evidence.attester_signature.is_none());
+            assert!(evidence.attester_algorithm.is_none());
+        }
+    }
+
     fn digest_test_policy(effect: crate::policy::PolicyEffect) -> Policy {
         Policy::new(
             "receipt-policy",
@@ -1283,6 +1382,101 @@ mod tests {
             golden["evidence_json"].as_str().unwrap()
         );
         assert!(Evidence::from_json(golden["evidence_json"].as_str().unwrap()).is_ok());
+    }
+
+    /// Deterministic v4 evidence (no HighAssurance metadata, signature domain
+    /// V1) signed by the envelope algorithm with the DEMO/TEST-ONLY attester
+    /// secret `[9; 32]`.
+    fn golden_envelope_evidence() -> (Evidence, LocalSigner) {
+        let agent_key = AgentKeyPair::from_secret_bytes(&[7; 32]);
+        let agent_id: AgentId =
+            serde_json::from_str("\"00000000-0000-0000-0000-000000000002\"").unwrap();
+        let agent = agent_key.identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "golden-issuer", vec!["data:read".into()])
+                .with_validity(crate::authority::Validity {
+                    not_before: Some("2026-01-01T00:00:00Z".into()),
+                    not_after: Some("2027-01-01T00:00:00Z".into()),
+                });
+        authority.id = serde_json::from_str("\"00000000-0000-0000-0000-000000000001\"").unwrap();
+        authority
+            .sign_for_agent(&AgentKeyPair::from_secret_bytes(&[8; 32]), &agent)
+            .unwrap();
+        let action = Action::new("read_data", Some("dataset".into()), json!({}))
+            .unwrap()
+            .with_capability("data:read");
+        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        request.sign_intent(&agent_key).unwrap();
+        let mut evidence = request
+            .attest(Decision::allow(
+                "golden allow",
+                crate::DecidedBy::rule("golden-rule"),
+            ))
+            .unwrap();
+        evidence.evidence_id = Uuid::parse_str("00000000-0000-0000-0000-000000000005").unwrap();
+        evidence.context_hash = evidence.compute_context_hash().unwrap();
+        evidence
+            .bind_policy_digest(hex::encode(Sha256::digest(b"golden-policy")))
+            .unwrap();
+        let attester = LocalSigner::from_secret_bytes(&[9; 32])
+            .with_algorithm(SignatureAlgorithm::Ed25519Sha256Envelope);
+        evidence.sign(&attester).unwrap();
+        (evidence, attester)
+    }
+
+    #[test]
+    fn envelope_evidence_matches_committed_golden_vector() {
+        let (evidence, attester) = golden_envelope_evidence();
+        let payload = evidence.attestation_bytes().unwrap();
+        let message = SignatureAlgorithm::Ed25519Sha256Envelope
+            .signing_message(evidence.attestation_domain(), &payload);
+        let generated = json!({
+            "attester_algorithm": "ed25519-sha256-envelope",
+            "envelope_domain_hex": hex::encode(crate::signer::ENVELOPE_DOMAIN),
+            "signature_domain_hex": hex::encode(evidence.attestation_domain()),
+            "attester_public_key_hex": hex::encode(attester.public_key().unwrap().as_bytes()),
+            "attester_key_id": attester.key_id(),
+            "attestation_payload_sha256_hex": hex::encode(Sha256::digest(&payload)),
+            "signing_message_hex": hex::encode(&message),
+            "attester_signature_hex": evidence.attester_signature.clone().unwrap(),
+            "evidence_json": evidence.to_json().unwrap(),
+        });
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/golden/evidence-envelope-v1.json"
+        );
+        if std::env::var_os("UPDATE_GOLDEN_ENVELOPE").is_some() {
+            let mut text = serde_json::to_string_pretty(&generated).unwrap();
+            text.push('\n');
+            std::fs::write(path, text).unwrap();
+        }
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../../docs/golden/evidence-envelope-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(generated, golden);
+        assert_eq!(message.len(), 99);
+
+        // An independent check from the committed bytes alone: the signature
+        // is plain Ed25519 over `signing_message_hex`.
+        let key = VerifiedPublicKey::from_bytes(
+            &hex::decode(golden["attester_public_key_hex"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        key.verify_domain_message(
+            b"",
+            &hex::decode(golden["signing_message_hex"].as_str().unwrap()).unwrap(),
+            &hex::decode(golden["attester_signature_hex"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let imported = Evidence::from_json(golden["evidence_json"].as_str().unwrap()).unwrap();
+        imported.verify_attester_signature(&key).unwrap();
+        assert!(
+            relabel(&imported, "ed25519")
+                .verify_attester_signature(&key)
+                .is_err()
+        );
     }
 
     #[test]

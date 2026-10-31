@@ -1718,6 +1718,72 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
     );
 }
 
+/// SAF-11: a gateway whose evidence attester signs with the
+/// `ed25519-sha256-envelope` algorithm and whose execution key is behind the
+/// `Signer` trait produces receipts the offline verifier accepts, and the
+/// evidence signature cannot be relabelled as a legacy one.
+#[test]
+fn receipts_signed_through_the_signer_trait_verify_offline() {
+    let base = fixture(Some(PolicyEffect::Allow), false);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[43; 32])
+        .with_algorithm(praetore_core::SignatureAlgorithm::Ed25519Sha256Envelope);
+    let engine = production_engine(
+        base.policy.clone(),
+        base.issuer_public_key.clone(),
+        attester.clone(),
+        Arc::new(MemoryReplayGuard::default()),
+    );
+    let execution_signer: Arc<dyn praetore_core::Signer> =
+        Arc::new(praetore_core::LocalSigner::from_secret_bytes(&[44; 32]));
+    let execution_key = execution_signer.verifying_key().clone();
+    let gateway = Gateway::new(
+        engine,
+        Arc::new(MemoryJournal::default()),
+        Arc::new(LocalSetTool::default()),
+        Arc::new(
+            praetore_gateway::SignerExecutionAttester::new("saf11-execution", execution_signer)
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let receipt = gateway.execute(base.request.clone()).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(
+        receipt.evidence.attester_algorithm.as_deref(),
+        Some("ed25519-sha256-envelope")
+    );
+    let json = serde_json::to_string(&receipt).unwrap();
+    let evidence_key = attester.public_key().unwrap();
+    praetore_gateway::verify_gateway_receipt_json(
+        &json,
+        &execution_key,
+        "saf11-execution",
+        &evidence_key,
+    )
+    .unwrap();
+
+    let mut relabelled: Value = serde_json::from_str(&json).unwrap();
+    relabelled["evidence"]["attester_algorithm"] = json!("ed25519");
+    // Re-labelled and with a recomputed (unkeyed) context hash, the evidence
+    // is internally consistent but its signature no longer verifies.
+    let mut evidence = receipt.evidence.clone();
+    evidence.attester_algorithm = Some("ed25519".into());
+    let digest = evidence.policy_digest.clone().unwrap();
+    evidence.bind_policy_digest(digest).unwrap();
+    assert!(evidence.verify_integrity());
+    assert!(evidence.verify_attester_signature(&evidence_key).is_err());
+    assert_eq!(
+        praetore_gateway::verify_gateway_receipt_json(
+            &relabelled.to_string(),
+            &execution_key,
+            "saf11-execution",
+            &evidence_key,
+        )
+        .unwrap_err(),
+        ExecutionAttestationError::InvalidPayload
+    );
+}
+
 #[test]
 fn denied_or_unmatched_action_has_no_observable_tool_effect() {
     for effect in [Some(PolicyEffect::Deny), None] {

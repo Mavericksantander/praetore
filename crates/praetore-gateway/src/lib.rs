@@ -123,7 +123,7 @@ use uuid::Uuid;
 pub use praetore_receipt::{
     AuthorizationStatus, ExecutionAttestation, ExecutionAttestationError,
     ExecutionAttestationSigner, ExecutionStatus, GatewayReceipt, NotDispatchedReason,
-    action_digest, verify_gateway_receipt_json,
+    SignerExecutionAttester, action_digest, verify_gateway_receipt_json,
 };
 
 pub mod http_api;
@@ -139,6 +139,7 @@ fn is_transient_authorization_error(error: &PraetoreError) -> bool {
     matches!(
         error,
         PraetoreError::TrustedClockUnavailable
+            | PraetoreError::SignerUnavailable
             | PraetoreError::ReplayGuardUnavailable
             | PraetoreError::FreshnessCheckFailed(FreshnessError::Unavailable)
     )
