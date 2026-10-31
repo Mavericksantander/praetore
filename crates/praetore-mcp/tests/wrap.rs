@@ -83,20 +83,28 @@ fn wrap(home: &Home, mode: &str, lines: &[Value]) -> (Vec<Value>, String, Output
 
 fn wrap_raw(home: &Home, mode: &str, input: &str) -> (Vec<Value>, String, Output) {
     let server = fake_server();
-    let out = run(
-        &[
-            "wrap",
-            "--dir",
-            home.root.to_str().unwrap(),
-            "--name",
-            "fake",
-            "--mode",
-            mode,
-            "--",
-            server.to_str().unwrap(),
-        ],
-        input,
-    );
+    wrap_command(home, mode, input, &[server.to_str().unwrap()])
+}
+
+/// `wrap` with an arbitrary server command line.
+fn wrap_command(
+    home: &Home,
+    mode: &str,
+    input: &str,
+    command: &[&str],
+) -> (Vec<Value>, String, Output) {
+    let mut args = vec![
+        "wrap",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--name",
+        "fake",
+        "--mode",
+        mode,
+        "--",
+    ];
+    args.extend_from_slice(command);
+    let out = run(&args, input);
     let stdout = String::from_utf8(out.stdout.clone()).unwrap();
     let responses = stdout
         .lines()
@@ -942,5 +950,67 @@ fn deny_on_the_macos_data_volume_covers_dot_root_aliases() {
         assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `f9ae433`, Media 1, as the reviewer ran it: the
+/// server holds a file inside the DENY prefix on its fd 4, and `/dev/fd/4`
+/// (a pipe in the gate's own fd table, so `realpath` kept it) would reach
+/// that file. Every path under `/dev` or `/proc` is now `unresolved`.
+#[cfg(unix)]
+#[test]
+fn deny_path_prefix_catches_dev_fd_aliases_of_server_descriptors() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let vault = root.join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    let secret = vault.join("secret");
+    fs::write(&secret, "orig\n").unwrap();
+    fs::write(root.join("notes.txt"), "").unwrap();
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-vault", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    vault.to_str().unwrap(),
+                )),
+        ],
+    );
+    let append = |id: u32, path: &str| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"append",
+            "arguments":{"path":path,"text":"PWNED\n"}}})
+    };
+    let server = fake_server();
+    let input: String = session(vec![
+        append(10, secret.to_str().unwrap()),
+        append(12, "/dev/fd/4"),
+        append(13, "/DEV/fd/4"),
+        append(14, root.join("notes.txt").to_str().unwrap()),
+    ])
+    .iter()
+    .map(|line| format!("{line}\n"))
+    .collect();
+    let (responses, stderr, _) = wrap_command(
+        &home,
+        "enforce",
+        &input,
+        &[
+            "/bin/sh",
+            "-c",
+            "exec 4>>\"$0\" && exec \"$1\"",
+            secret.to_str().unwrap(),
+            server.to_str().unwrap(),
+        ],
+    );
+    for (id, refused) in [(10, true), (12, true), (13, true), (14, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "orig\n", "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "PWNED\n"
+    );
     assert!(verify_cli(&home).status.success());
 }

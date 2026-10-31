@@ -766,6 +766,40 @@ pub fn starts_at_dot_root(path: &str) -> bool {
         .is_some_and(|first| first.starts_with('.'))
 }
 
+/// Whether `path` lies under a root whose names the gate cannot resolve the
+/// way the server will, so it is `unresolved` (fail closed):
+///
+/// - every OS: `/dev` and `/proc`. Their entries are per process
+///   (`/dev/fd/N`, `/dev/stdin`, `/proc/self/fd/N`, `/proc/<pid>/root`,
+///   `/proc/<pid>/cwd`): the gate would resolve them with its own file
+///   descriptors and identity, the server opens them with its own. Accepted
+///   over-rejection: a tool that writes to `/dev/null` through an argument
+///   that a `PathPrefix` rule covers is refused by restrictive rules and
+///   never allowed by ALLOW ones.
+/// - macOS: a first segment that starts with `.` (see
+///   [`starts_at_dot_root`]), and every system volume mount under
+///   `/System/Volumes/<X>` other than `Data` (`Update/mnt1` is the live
+///   system volume with another `st_dev`; `Preboot`, `VM`, `Recovery`, ...
+///   hold no user files).
+///
+/// Names are compared as the directory compares them, so `/DEV/fd/4` is
+/// caught on a case-insensitive root.
+pub fn special_root(path: &str, insensitivity: impl Fn(&str) -> Insensitivity) -> bool {
+    let path_segments = segments(path);
+    let is = |index: usize, literal: &str| {
+        path_segments.get(index).is_some_and(|name| {
+            let mode = insensitivity(&join_segments(&path_segments[..index]));
+            fold_key(name, mode) == fold_key(literal, mode)
+        })
+    };
+    if is(0, "dev") || is(0, "proc") {
+        return true;
+    }
+    cfg!(target_os = "macos")
+        && (starts_at_dot_root(path)
+            || (is(0, "System") && is(1, "Volumes") && path_segments.len() > 2 && !is(2, "Data")))
+}
+
 /// T-014: `PathPrefix` in core is lexical by design. Before evaluation, each
 /// absolute string argument under `keys` is resolved; unless it resolves to
 /// itself, the engine sees [`UNRESOLVED_PATH`] instead (fail closed). A path
@@ -801,10 +835,17 @@ fn check_paths_with(
             continue;
         }
         let lexical = lexical.clone();
-        let (mut check, resolved) = if cfg!(target_os = "macos") && starts_at_dot_root(&lexical) {
+        let special = |path: &str| special_root(path, insensitivity);
+        let (mut check, resolved) = if special(&lexical) {
             (PathCheck::Unresolved, None)
         } else {
-            resolve_path(&lexical)
+            match resolve_path(&lexical) {
+                // A symlink that resolves into a special root.
+                (_, Some(resolved)) if special(&resolved) => {
+                    (PathCheck::Unresolved, Some(resolved))
+                }
+                result => result,
+            }
         };
         if check == PathCheck::Same
             && (folds_into_prefix(&lexical, prefixes, insensitivity).is_some()
@@ -1630,6 +1671,99 @@ mod tests {
             check(&ordinary, &format!("{r}/vault")),
             (ordinary.clone(), "same".to_owned())
         );
+    }
+
+    /// Review round 4, Media 1 and Baja 2: special roots.
+    #[test]
+    fn special_roots_are_recognised() {
+        let full = |_: &str| Insensitivity::FULL;
+        let none = |_: &str| Insensitivity::NONE;
+        for path in [
+            "/dev",
+            "/dev/fd/4",
+            "/dev/stdin",
+            "/dev/null",
+            "/proc/self/fd/3",
+            "/proc/1/root/etc",
+            "/proc/self/cwd/x",
+        ] {
+            assert!(special_root(path, full), "{path}");
+            assert!(special_root(path, none), "{path}");
+        }
+        assert!(special_root("/DEV/fd/4", full));
+        assert!(special_root("/Proc/self/fd/3", full));
+        assert!(!special_root("/DEV/fd/4", none));
+        for path in ["/", "/device", "/home/dev/x", "/srv/proc", "/Users/u/dev"] {
+            assert!(!special_root(path, full), "{path}");
+        }
+        let macos = cfg!(target_os = "macos");
+        for path in [
+            "/System/Volumes/Update/mnt1/usr/bin/true",
+            "/System/Volumes/Preboot/x",
+            "/System/Volumes/VM",
+            "/system/volumes/update/mnt1",
+            "/.nofollow/Users",
+        ] {
+            assert_eq!(special_root(path, full), macos, "{path}");
+        }
+        for path in [
+            "/System/Volumes",
+            "/System/Volumes/Data",
+            "/System/Volumes/Data/Users/u",
+            "/System/Volumes/DATA/Users/u",
+            "/System/Library/Caches",
+        ] {
+            assert!(!special_root(path, full), "{path}");
+        }
+    }
+
+    /// Review round 4, Media 1: `/dev/fd/N` names the *gate's* descriptor N.
+    #[cfg(unix)]
+    #[test]
+    fn dev_fd_of_a_pipe_is_unresolved() {
+        use std::os::fd::AsRawFd;
+        let (_temp, root) = canonical_tempdir();
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let rules = prefixes(&[&text(&root.join("vault"))]);
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        for path in [
+            format!("/dev/fd/{}", reader.as_raw_fd()),
+            "/dev/fd/0".to_owned(),
+            "/dev/stdin".to_owned(),
+            format!("/proc/self/fd/{}", reader.as_raw_fd()),
+        ] {
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths(&mut built, &keys, &rules).unwrap();
+            assert_eq!(built["arguments.path"], UNRESOLVED_PATH, "{path}");
+            assert_eq!(record["arguments.path"]["status"], "unresolved", "{path}");
+        }
+    }
+
+    /// Review round 4, Baja 2, on this Mac: `/System/Volumes/Update/mnt1` is
+    /// the live system volume (same `st_ino`, another `st_dev`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_volume_mounts_are_unresolved() {
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        let rules = prefixes(&["/usr/bin"]);
+        for path in [
+            "/System/Volumes/Update/mnt1/usr/bin/true",
+            "/System/Volumes/Preboot",
+        ] {
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths(&mut built, &keys, &rules).unwrap();
+            eprintln!("system volume: {path} -> {record}");
+            assert_eq!(built["arguments.path"], UNRESOLVED_PATH, "{path}");
+            assert_eq!(record["arguments.path"]["status"], "unresolved", "{path}");
+        }
+        // Control: the data volume and the usual spellings still resolve.
+        let mut built = build_parameters(
+            "fs",
+            &json!({"arguments": {"path": "/usr/bin/true"}}),
+            false,
+        );
+        let record = check_paths(&mut built, &keys, &rules).unwrap();
+        assert_eq!(record["arguments.path"]["status"], "same");
     }
 
     /// The adversarial finding on `ccea7be`: the denied directory does not

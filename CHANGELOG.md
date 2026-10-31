@@ -56,8 +56,11 @@
   `/System/Volumes`, or at or under `/System/Volumes/Data`. On Linux, XFS
   folds (it may be `ascii-ci`), and case-folding filesystems ignore trailing
   dots and spaces. On macOS, an argument whose first segment starts with
-  `.` (`/.nofollow/...`, `/.resolve/...`, `/.vol/...`) is `unresolved`. Not
-  covered: Linux bind mounts of a subdirectory of a prefix.
+  `.` (`/.nofollow/...`, `/.resolve/...`, `/.vol/...`) is `unresolved`, and
+  so is, on every OS, anything under `/dev` or `/proc` (per-process names
+  such as `/dev/fd/N`), and on macOS under `/System/Volumes/<X>` other than
+  `Data`. Not covered: Linux bind mounts of a subdirectory of a prefix, and
+  hard links to files inside a prefix.
 
 ## 0.3.0 - 2026-10-30
 

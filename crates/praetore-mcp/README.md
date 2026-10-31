@@ -299,9 +299,26 @@ the server are never changed. Consequences:
   `/Users/u/.ssh/x` and DENY `/usr` covers `/System/Volumes/Data/usr/local/x`.
   Not covered: a Linux bind mount of a *subdirectory* of a prefix mounted
   elsewhere (DENY `/home/u` with `/srv/x` bound from `/home/u/project`:
-  `/proc/self/mountinfo` is not read); a hard link, created elsewhere, to a
-  file *inside* a prefix (there is no way to find the other names of a
-  file).
+  `/proc/self/mountinfo` is not read).
+* **Hard links are not covered.** A hard link to a file inside a prefix
+  (`ln <prefix>/secret /elsewhere/f`) is the same file under an unrelated
+  name, and there is no way to find the other names of a file: the gate
+  sees `/elsewhere/f` as an ordinary path. An agent needs a tool that
+  creates hard links to exploit this; whoever created an existing link
+  already had access to the data. Only a hard link to a file that is itself
+  a prefix is caught (same `(st_dev, st_ino)`).
+* Per-process and system roots are `unresolved` on every OS: anything under
+  `/dev` or `/proc` (`/dev/fd/N`, `/dev/stdin`, `/proc/self/fd/N`,
+  `/proc/<pid>/root`, `/proc/<pid>/cwd`), compared with folding (so
+  `/DEV/fd/4` on a case-insensitive root), before and after resolution. The
+  gate would resolve `/dev/fd/N` with its own descriptors; the server opens
+  it with its own, where N may be a file inside a DENY prefix. Accepted
+  over-rejection: a tool that writes to `/dev/null` (or reads `/dev/stdin`)
+  through an argument a `PathPrefix` rule covers is refused by restrictive
+  rules and never allowed by ALLOW ones. On macOS the same holds for
+  `/System/Volumes/<X>` with X other than `Data` (`Update/mnt1` is the live
+  system volume under another `st_dev`; `Preboot`, `VM`, `Recovery`, ...
+  hold no user files).
 * macOS path-resolution aliases. `realpath` leaves `/.nofollow/<path>` (the
   same entry, without following symlinks) as it is, and `/.resolve/...` and
   `/.vol/<dev>/<ino>` are aliases too. On macOS every absolute argument whose
