@@ -49,8 +49,14 @@
   Unicode case folding (new dependency `caseless`) iterated to a fixed point
   (`ẞ`/`ß`/`ss`). A path that reaches a prefix's directory under another
   spelling, compared by `(st_dev, st_ino)` (macOS `/System/Volumes/Data`
-  firmlinks, bind mounts), is `ambiguous` too; `policy check` warns about
-  prefixes written in the `/System/Volumes/Data` spelling.
+  firmlinks, a bind mount of the prefix itself), is `ambiguous` too, and so
+  is a path whose other macOS spelling (`/System/Volumes/Data` added or
+  removed) is under a prefix (DENY `/System/Volumes/Data` covers
+  `/Users/...`). `policy check` warns about prefixes that are `/System`,
+  `/System/Volumes`, or at or under `/System/Volumes/Data`. On Linux, XFS
+  folds (it may be `ascii-ci`), and case-folding filesystems ignore trailing
+  dots and spaces. Not covered: Linux bind mounts of a subdirectory of a
+  prefix.
 
 ## 0.3.0 - 2026-10-30
 

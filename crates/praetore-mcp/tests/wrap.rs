@@ -858,3 +858,45 @@ fn deny_path_prefix_catches_firmlink_spellings_on_macos() {
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
     assert!(verify_cli(&home).status.success());
 }
+
+/// Independent review of `c5dc165`, Media 1, as the reviewer ran it: DENY on
+/// `/System/Volumes/Data` also covers `/private/var/...` and `~/.ssh`, which
+/// live on the data volume behind firmlinks.
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_on_the_macos_data_volume_covers_firmlinked_spellings() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::write(root.join("notes.txt"), b"x").unwrap();
+    let user_home = PathBuf::from(std::env::var("HOME").unwrap());
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-data", ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+                PolicyCondition::path_prefix("arguments.path", "/System/Volumes/Data"),
+            ),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(
+                80,
+                &PathBuf::from(format!(
+                    "/System/Volumes/Data{}",
+                    root.join("notes.txt").display()
+                )),
+            ),
+            echo_path(81, &root.join("notes.txt")),
+            echo_path(82, &user_home.join(".ssh").join("authorized_keys")),
+            echo_path(83, Path::new("/bin/ls")),
+        ]),
+    );
+    for (id, refused) in [(80, true), (81, true), (82, true), (83, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}

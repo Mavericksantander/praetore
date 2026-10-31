@@ -260,8 +260,10 @@ the server are never changed. Consequences:
   `policy deny|allow|require-approval` and `policy check` warn when a rule's
   prefix exists and resolves to another path (a DENY rule on `/tmp/secret`
   refuses `/private/tmp/secret/x` only as `ambiguous`, and an ALLOW rule
-  never matches it), and when it is written in the `/System/Volumes/Data`
-  spelling of a firmlinked directory.
+  never matches it), and when it is `/System`, `/System/Volumes`, or at or
+  under `/System/Volumes/Data` (it is, or contains, a firmlink target, so
+  arguments in the usual spelling such as `/Users/...` are `ambiguous`
+  against it).
 * Case and Unicode normalization. For an existing entry `realpath` returns
   the stored spelling, so on APFS `/x/SECRET/f` (stored `secret`) or an NFD
   `cafe\u{301}` (stored NFC `café`) is `differs`. A name that does not exist
@@ -276,9 +278,11 @@ the server are never changed. Consequences:
   `ambiguous` although APFS keeps them apart). Each differing segment uses the
   sensitivity of its directory: on macOS `pathconf(_PC_CASE_SENSITIVE)`
   decides case, normalization is always ignored (APFS, HFS+); on Linux only
-  ext4/f2fs/tmpfs directories without the casefold flag, xfs and btrfs count
-  as byte for byte; anything else, or a failed probe, folds both (fail
-  closed). On a case-sensitive filesystem `/x/SECRET` is an ordinary path and
+  ext4/f2fs/tmpfs directories without the casefold flag, and btrfs, count
+  as byte for byte; anything else (XFS too, which may be `ascii-ci`), or a
+  failed probe, folds both (fail closed). When case is folded, trailing `.`
+  and ` ` are ignored as well (Linux vfat/exfat drop them; macOS FAT keeps
+  them, so there it only costs a few extra refusals). On a case-sensitive filesystem `/x/SECRET` is an ordinary path and
   is not refused by a rule on `/x/secret`.
 * Other spellings of the same directory. `realpath` does not cross macOS
   firmlinks: `/System/Volumes/Data/Users/u/.ssh` resolves to itself and is
@@ -286,11 +290,27 @@ the server are never changed. Consequences:
   each policy prefix is also compared by `(st_dev, st_ino)` with every
   existing ancestor of the argument; on a match, the rest of the argument
   must start with the prefix's missing tail (names folded as above). Such a
-  path is `ambiguous`. This also covers bind mounts, a prefix written
-  through a symlink, and a hard link to a file that is itself a prefix. It
-  does not cover a hard link, created elsewhere, to a file *inside* a prefix
-  (there is no way to find the other names of a file); `/.vol/<dev>/<ino>`
-  paths do not resolve and are `unresolved`.
+  path is `ambiguous`. This also covers a bind mount of the prefix itself
+  (or of one of its ancestors), a prefix written through a symlink, and a
+  hard link to a file that is itself a prefix. On macOS the argument's other
+  spelling (`/System/Volumes/Data` added or removed, when its deepest
+  existing ancestor is the same `(st_dev, st_ino)` both ways) is also
+  compared with every prefix, so DENY `/System/Volumes/Data` covers
+  `/Users/u/.ssh/x` and DENY `/usr` covers `/System/Volumes/Data/usr/local/x`.
+  Not covered: a Linux bind mount of a *subdirectory* of a prefix mounted
+  elsewhere (DENY `/home/u` with `/srv/x` bound from `/home/u/project`:
+  `/proc/self/mountinfo` is not read); a hard link, created elsewhere, to a
+  file *inside* a prefix (there is no way to find the other names of a
+  file). `/.vol/<dev>/<ino>` paths do not resolve and are `unresolved`.
+* Cost: per covered argument and call, a few `stat`s per ancestor of the
+  argument and per distinct ancestor of the policy prefixes (memoized for
+  the call, stopping at the first missing one), plus the name comparisons.
+  Measured on a debug build: about 20-30 ms with 1000 prefixes, about 3 ms
+  with 60 prefixes of 1000 bytes. The policy is trusted; keep it small.
+* The check runs in the proxy's view of the filesystem. A server in another
+  mount namespace (`wrap -- docker run -v ...`, a chroot, a remote host)
+  may resolve the same string to a different file; the result is then
+  usually `unresolved` (fail closed), but nothing guarantees it.
 * Relative values are not resolved; core already treats them as unsafe.
 * The check happens when the proxy decides. The server opens the path later,
   so a symlink created or swapped in between is not seen (TOCTOU, see

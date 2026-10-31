@@ -302,10 +302,10 @@ pub fn lint(policy: &Policy) -> Vec<String> {
             }
             if condition.operator == MatchOperator::PathPrefix
                 && let Some(prefix) = condition.expected.as_str()
-                && let Some(alias) = crate::gate::firmlink_alias(prefix)
+                && let Some(warning) = crate::gate::firmlink_prefix_warning(prefix)
             {
                 warnings.push(format!(
-                    "rule {:?}: path prefix {prefix:?} is the firmlinked {alias:?}; clients use {alias:?}, which this rule treats as ambiguous (refused by DENY/REQUIRE_APPROVAL, never matched by ALLOW), so use {alias:?}",
+                    "rule {:?}: path prefix {prefix:?} {warning}",
                     rule.id
                 ));
             }

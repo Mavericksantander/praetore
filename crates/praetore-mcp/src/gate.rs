@@ -320,8 +320,26 @@ const MAX_FOLD_ROUNDS: usize = 8;
 /// the canonical caseless match of Unicode D145 (`NFD(toCasefold(NFD(x)))`)
 /// and is deliberately broader than any filesystem's folding (it also
 /// merges `ı`/`I` and `İ`/`i`); a wider fold can only turn more paths into
-/// [`PathCheck::Ambiguous`].
+/// [`PathCheck::Ambiguous`]. When case is folded, trailing `.` and ` ` are
+/// dropped too (vfat/exfat on Linux ignore them; macOS FAT does not, which
+/// only costs a few extra refusals there and on case-insensitive APFS).
 fn fold_key(name: &str, mode: Insensitivity) -> String {
+    // ASCII fast path, exact: NFC/NFD are the identity on ASCII and full
+    // case folding of ASCII is `to_ascii_lowercase` (checked against the
+    // slow path by `fold_key_is_idempotent_and_covers_every_mapping`).
+    if name.is_ascii() {
+        return if mode.case {
+            name.to_ascii_lowercase()
+                .trim_end_matches(['.', ' '])
+                .to_owned()
+        } else {
+            name.to_owned()
+        };
+    }
+    fold_key_slow(name, mode)
+}
+
+fn fold_key_slow(name: &str, mode: Insensitivity) -> String {
     let normalize = |text: String| -> String {
         if mode.normalization {
             text.nfd().collect()
@@ -346,8 +364,15 @@ fn fold_key(name: &str, mode: Insensitivity) -> String {
             key = next;
         }
     }
-    if mode.normalization {
+    let key: String = if mode.normalization {
         key.nfc().collect()
+    } else {
+        key
+    };
+    // vfat/exfat on Linux (and Windows) drop trailing dots and spaces when
+    // looking a name up; fold them on every case-folding filesystem.
+    if mode.case {
+        key.trim_end_matches(['.', ' ']).to_owned()
     } else {
         key
     }
@@ -418,19 +443,79 @@ fn file_id(_path: &str) -> Option<(u64, u64)> {
     None
 }
 
-/// Returns a `prefix` that `path` reaches on disk under another spelling: a
-/// macOS firmlink (`/System/Volumes/Data/Users/u` is `/Users/u`), a bind
-/// mount, a hard link to the prefix itself, or a prefix written through a
-/// symlink. The deepest existing ancestor-or-self of the prefix is compared
-/// by `(st_dev, st_ino)` with each existing ancestor-or-self of `path`; on
-/// a match, the rest of `path` must start with the prefix's missing tail
-/// (names compared as the directory compares them). A `path` lexically at
-/// or under the prefix is left to core, which already matches it.
+/// Per-call memo of [`file_id`]: policy prefixes usually share ancestors.
+#[derive(Default)]
+struct FileIds(std::cell::RefCell<std::collections::HashMap<String, Option<(u64, u64)>>>);
+
+impl FileIds {
+    fn get(&self, path: &str) -> Option<(u64, u64)> {
+        if let Some(id) = self.0.borrow().get(path) {
+            return *id;
+        }
+        let id = file_id(path);
+        self.0.borrow_mut().insert(path.to_owned(), id);
+        id
+    }
+
+    /// Depth and identity of the deepest existing ancestor-or-self of
+    /// `segments`, walking down from `/` and stopping at the first that
+    /// cannot be `stat`ed (nothing below it can be either).
+    fn deepest(&self, segments: &[&str]) -> Option<(usize, (u64, u64))> {
+        let mut found = None;
+        for depth in 0..=segments.len() {
+            match self.get(&join_segments(&segments[..depth])) {
+                Some(id) => found = Some((depth, id)),
+                None => break,
+            }
+        }
+        found
+    }
+}
+
+/// Whether `path_segments` is at or under `prefix_segments` once each
+/// differing name is compared the way its directory compares names.
+fn under_prefix_folded(
+    path_segments: &[&str],
+    prefix_segments: &[&str],
+    insensitivity: impl Fn(&str) -> Insensitivity,
+) -> bool {
+    path_segments.len() >= prefix_segments.len()
+        && path_segments
+            .iter()
+            .zip(prefix_segments)
+            .enumerate()
+            .all(|(index, (name, expected))| {
+                name == expected
+                    || fold_key(name, Insensitivity::FULL)
+                        == fold_key(expected, Insensitivity::FULL)
+                        && {
+                            let mode = insensitivity(&join_segments(&path_segments[..index]));
+                            fold_key(name, mode) == fold_key(expected, mode)
+                        }
+            })
+}
+
+/// Returns a `prefix` that `path` reaches on disk under another spelling of
+/// the prefix (or of one of its ancestors): a macOS firmlink
+/// (`/System/Volumes/Data/Users/u` is `/Users/u`), a bind mount of the
+/// prefix itself, a hard link to a file that is the prefix, or a prefix
+/// written through a symlink. The deepest existing ancestor-or-self of the
+/// prefix is compared by `(st_dev, st_ino)` with each existing
+/// ancestor-or-self of `path`; on a match, the rest of `path` must start
+/// with the prefix's missing tail (names compared as the directory compares
+/// them). A `path` lexically at or under the prefix is left to core, which
+/// already matches it. Aliases of a *descendant* of the prefix are the job
+/// of [`firmlink_spelling_into_prefix`] (macOS) and are not detected for
+/// Linux bind mounts of a subdirectory.
+///
+/// Cost per covered argument: one `stat` per ancestor of `path` and per
+/// distinct ancestor of the prefixes (memoized for the call).
 pub fn aliases_prefix<'a>(
     path: &str,
     prefixes: &'a BTreeSet<String>,
     insensitivity: impl Fn(&str) -> Insensitivity + Copy,
 ) -> Option<&'a str> {
+    let ids = FileIds::default();
     let path_segments = segments(path);
     let mut ancestors: Option<Vec<Option<(u64, u64)>>> = None;
     prefixes.iter().map(String::as_str).find(|prefix| {
@@ -438,45 +523,115 @@ pub fn aliases_prefix<'a>(
         if !prefix.starts_with('/') || path_segments.starts_with(&prefix_segments) {
             return false;
         }
-        let Some((depth, id)) = (0..=prefix_segments.len()).rev().find_map(|depth| {
-            file_id(&join_segments(&prefix_segments[..depth])).map(|id| (depth, id))
-        }) else {
+        let Some((depth, id)) = ids.deepest(&prefix_segments) else {
             return false;
         };
         let tail = &prefix_segments[depth..];
         let ancestors = ancestors.get_or_insert_with(|| {
             (0..=path_segments.len())
-                .map(|depth| file_id(&join_segments(&path_segments[..depth])))
+                .map(|depth| ids.get(&join_segments(&path_segments[..depth])))
                 .collect()
         });
         ancestors.iter().enumerate().any(|(index, ancestor)| {
             let rest = &path_segments[index..];
             *ancestor == Some(id)
-                && rest.len() >= tail.len()
-                && rest
-                    .iter()
-                    .zip(tail)
-                    .enumerate()
-                    .all(|(offset, (name, expected))| {
-                        name == expected || {
-                            let mode =
-                                insensitivity(&join_segments(&path_segments[..index + offset]));
-                            fold_key(name, mode) == fold_key(expected, mode)
-                        }
+                && under_prefix_folded(rest, tail, |dir: &str| {
+                    // `dir` is relative to the matching ancestor.
+                    let base = join_segments(&path_segments[..index]);
+                    insensitivity(&match (base.as_str(), dir) {
+                        (_, "/") => base.clone(),
+                        ("/", _) => dir.to_owned(),
+                        _ => format!("{base}{dir}"),
                     })
+                })
         })
+    })
+}
+
+/// macOS data volume: firmlinked directories (`/usr/share/firmlinks`:
+/// `/Users`, `/private`, `/usr/local`, `/System/Library/Caches`, ...) are
+/// also reachable under it.
+pub const MACOS_DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// The other macOS spelling of `path`: with [`MACOS_DATA_VOLUME`] added or
+/// removed, when the deepest existing ancestor-or-self of `path` is the same
+/// `(st_dev, st_ino)` under both spellings (everything below it then is
+/// too). `None` elsewhere, and for paths outside firmlinked directories.
+pub fn firmlink_spelling(path: &str) -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let path_segments = segments(path);
+    let ids = FileIds::default();
+    let (depth, id) = ids.deepest(&path_segments)?;
+    let existing = join_segments(&path_segments[..depth]);
+    let (other, other_existing) = match path.strip_prefix(MACOS_DATA_VOLUME) {
+        Some(rest) if rest.starts_with('/') => (
+            rest.to_owned(),
+            existing[MACOS_DATA_VOLUME.len()..].to_owned(),
+        ),
+        Some(_) => return None,
+        None => (
+            format!("{MACOS_DATA_VOLUME}{path}"),
+            format!("{MACOS_DATA_VOLUME}{existing}"),
+        ),
+    };
+    (!other_existing.is_empty() && file_id(&other_existing) == Some(id)).then_some(other)
+}
+
+/// Returns a `prefix` that the other macOS spelling of `path` (see
+/// [`firmlink_spelling`]) is at or under, with names folded, while `path`
+/// itself is not at or under it byte for byte. This catches what
+/// [`aliases_prefix`] cannot: a prefix that contains the firmlink target,
+/// such as DENY `/System/Volumes/Data` against `/Users/u/.ssh/x`, or DENY
+/// `/usr` against `/System/Volumes/Data/usr/local/x`.
+pub fn firmlink_spelling_into_prefix<'a>(
+    path: &str,
+    prefixes: &'a BTreeSet<String>,
+    insensitivity: impl Fn(&str) -> Insensitivity + Copy,
+) -> Option<&'a str> {
+    let other = firmlink_spelling(path)?;
+    let path_segments = segments(path);
+    let other_segments = segments(&other);
+    prefixes.iter().map(String::as_str).find(|prefix| {
+        let prefix_segments = segments(prefix);
+        prefix.starts_with('/')
+            && !path_segments.starts_with(&prefix_segments)
+            && under_prefix_folded(&other_segments, &prefix_segments, insensitivity)
     })
 }
 
 /// The `/System/Volumes/Data` spelling of a macOS firmlinked path (or any
 /// path whose remainder is the same directory entry), for `policy check`.
 pub fn firmlink_alias(prefix: &str) -> Option<String> {
-    let rest = prefix.strip_prefix("/System/Volumes/Data")?;
+    let rest = prefix.strip_prefix(MACOS_DATA_VOLUME)?;
     if !rest.starts_with('/') {
         return None;
     }
     let id = file_id(prefix)?;
     (file_id(rest) == Some(id)).then(|| rest.to_owned())
+}
+
+/// `policy check`: a prefix that is `/System`, `/System/Volumes`, or at or
+/// under `/System/Volumes/Data` contains (or is) a firmlink target, so
+/// arguments in the usual spelling (`/Users/...`, `/private/...`) are
+/// `ambiguous` against it.
+pub fn firmlink_prefix_warning(prefix: &str) -> Option<String> {
+    let trimmed = match prefix.strip_suffix('/') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => prefix,
+    };
+    let under_data =
+        trimmed == MACOS_DATA_VOLUME || trimmed.starts_with(&format!("{MACOS_DATA_VOLUME}/"));
+    if !(trimmed == "/System" || trimmed == "/System/Volumes" || under_data) {
+        return None;
+    }
+    Some(match firmlink_alias(trimmed) {
+        Some(alias) => format!(
+            "is the macOS data-volume spelling of the firmlinked {alias:?}; clients use {alias:?}, which this rule treats as ambiguous (refused by DENY/REQUIRE_APPROVAL, never matched by ALLOW), so use {alias:?}"
+        ),
+        None => "contains macOS firmlink targets (/Users, /private, /usr/local, /System/Library/Caches, ... live on /System/Volumes/Data): arguments in their usual spelling are ambiguous against it (refused by DENY/REQUIRE_APPROVAL, never matched by ALLOW); write the rule on the usual spelling instead".to_owned(),
+    })
 }
 
 /// Sensitivity of the filesystem holding `dir`. When it cannot be
@@ -510,19 +665,22 @@ mod platform {
 const EXT4_SUPER_MAGIC: u32 = 0xEF53;
 const F2FS_SUPER_MAGIC: u32 = 0xF2F5_2010;
 const TMPFS_MAGIC: u32 = 0x0102_1994;
+#[cfg_attr(not(test), allow(dead_code))]
 const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
 const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
 
 /// Linux decision from the `statfs` magic and the directory's casefold flag
 /// (`None` when it could not be read). Only filesystems known to compare
-/// names byte for byte are sensitive: xfs, btrfs, and ext4/f2fs/tmpfs
+/// names byte for byte are sensitive: btrfs, and ext4/f2fs/tmpfs
 /// directories whose flags were read and lack `FS_CASEFOLD_FL`
 /// (casefolded directories also normalize). Anything else (vfat, exfat,
-/// ntfs, cifs, zfs, overlayfs..., or an unreadable flag) folds.
+/// ntfs, cifs, zfs, overlayfs..., or an unreadable flag) folds. XFS folds
+/// too: a filesystem made with `mkfs.xfs -n version=ci` ignores ASCII case,
+/// and telling it apart needs `XFS_IOC_FSGEOMETRY`, which is not probed.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn linux_insensitivity(kind: u32, casefold: Option<bool>) -> Insensitivity {
     match (kind, casefold) {
-        (XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC, _) => Insensitivity::NONE,
+        (BTRFS_SUPER_MAGIC, _) => Insensitivity::NONE,
         (EXT4_SUPER_MAGIC | F2FS_SUPER_MAGIC | TMPFS_MAGIC, Some(false)) => Insensitivity::NONE,
         _ => Insensitivity::FULL,
     }
@@ -632,7 +790,8 @@ fn check_paths_with(
         let (mut check, resolved) = resolve_path(&lexical);
         if check == PathCheck::Same
             && (folds_into_prefix(&lexical, prefixes, insensitivity).is_some()
-                || aliases_prefix(&lexical, prefixes, insensitivity).is_some())
+                || aliases_prefix(&lexical, prefixes, insensitivity).is_some()
+                || firmlink_spelling_into_prefix(&lexical, prefixes, insensitivity).is_some())
         {
             check = PathCheck::Ambiguous;
         }
@@ -1000,6 +1159,26 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 0x11_0000 - 0x800);
+        // The ASCII fast path agrees with the slow path on every ASCII pair.
+        for a in 0u8..0x80 {
+            for b in [0u8, b'x', b'.', b' ', b'A'] {
+                let name: String = [a as char, b as char]
+                    .iter()
+                    .filter(|c| **c != '\0')
+                    .collect();
+                let apfs_cs = Insensitivity {
+                    case: false,
+                    normalization: true,
+                };
+                for mode in [Insensitivity::FULL, Insensitivity::NONE, apfs_cs] {
+                    assert_eq!(
+                        fold_key(&name, mode),
+                        fold_key_slow(&name, mode),
+                        "{name:?}"
+                    );
+                }
+            }
+        }
         let sharp = [
             "\u{1e9e}",
             "\u{df}",
@@ -1041,8 +1220,16 @@ mod tests {
                 "{kind:#x}"
             );
         }
-        for kind in [XFS_SUPER_MAGIC, BTRFS_SUPER_MAGIC] {
-            assert_eq!(linux_insensitivity(kind, None), Insensitivity::NONE);
+        assert_eq!(
+            linux_insensitivity(BTRFS_SUPER_MAGIC, None),
+            Insensitivity::NONE
+        );
+        // Review round 2, Baja 2: XFS may be `ascii-ci`; it folds.
+        for casefold in [None, Some(false)] {
+            assert_eq!(
+                linux_insensitivity(XFS_SUPER_MAGIC, casefold),
+                Insensitivity::FULL
+            );
         }
         // procfs, overlayfs, vfat, an unknown magic.
         for kind in [0x9fa0, 0x794c_7630, 0x4d44, 0xdead_beef] {
@@ -1175,6 +1362,151 @@ mod tests {
         );
         assert_eq!(firmlink_alias(&data_rule), Some(text(&root.join("vault"))));
         assert_eq!(firmlink_alias(&text(&root.join("vault"))), None);
+    }
+
+    /// Review round 2, Baja 3: on case-folding filesystems trailing dots and
+    /// spaces do not distinguish names (Linux vfat/exfat).
+    #[test]
+    fn fold_key_drops_trailing_dots_and_spaces_when_folding_case() {
+        for name in [
+            "secret.", "secret..", "secret ", "secret. ", "SECRET.", "secret",
+        ] {
+            assert_eq!(fold_key(name, Insensitivity::FULL), "secret", "{name:?}");
+        }
+        let apfs_cs = Insensitivity {
+            case: false,
+            normalization: true,
+        };
+        assert_eq!(fold_key("secret.", apfs_cs), "secret.");
+        assert_eq!(fold_key("secret.", Insensitivity::NONE), "secret.");
+        let rules = prefixes(&["/usb/secret"]);
+        for path in ["/usb/secret.", "/usb/SECRET. /x", "/usb/secret  "] {
+            assert!(
+                folds_into_prefix(path, &rules, |_| Insensitivity::FULL).is_some(),
+                "{path:?}"
+            );
+            assert_eq!(
+                folds_into_prefix(path, &rules, |_| apfs_cs),
+                None,
+                "{path:?}"
+            );
+        }
+        // Inner dots still matter.
+        assert_eq!(
+            folds_into_prefix("/usb/sec.ret", &rules, |_| Insensitivity::FULL),
+            None
+        );
+    }
+
+    /// Review round 2, Media 1 (`policy check` part): prefixes that contain
+    /// firmlink targets.
+    #[test]
+    fn firmlink_prefix_warning_names_prefixes_that_contain_firmlink_targets() {
+        for prefix in [
+            "/System",
+            "/System/",
+            "/System/Volumes",
+            "/System/Volumes/Data",
+            "/System/Volumes/Data/",
+            "/System/Volumes/Data/usr",
+            "/System/Volumes/Data/System/Library",
+            "/System/Volumes/Data/Users/u/.ssh",
+        ] {
+            assert!(firmlink_prefix_warning(prefix).is_some(), "{prefix}");
+        }
+        for prefix in [
+            "/Users/u",
+            "/Systemx",
+            "/System/Library",
+            "/System/VolumesX",
+            "/",
+        ] {
+            assert_eq!(firmlink_prefix_warning(prefix), None, "{prefix}");
+        }
+    }
+
+    /// Review round 2, Media 1, on this Mac: a prefix that *contains* a
+    /// firmlink target (or the other spelling of the argument falls under
+    /// the prefix) is caught through the argument's other spelling.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_prefixes_containing_firmlink_targets_are_ambiguous() {
+        let (_temp, root) = canonical_tempdir();
+        fs::write(root.join("f.txt"), b"x").unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        let check = |path: &str, prefix: &str| {
+            let rules = prefixes(&[prefix]);
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths(&mut built, &keys, &rules).unwrap();
+            (
+                built["arguments.path"].as_str().unwrap().to_owned(),
+                record["arguments.path"]["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+        let f = text(&root.join("f.txt"));
+        let hidden = [
+            // The reviewer's four cases.
+            (
+                format!("{home}/.ssh/authorized_keys"),
+                "/System/Volumes/Data".to_owned(),
+            ),
+            (f.clone(), "/System/Volumes".to_owned()),
+            (
+                "/usr/local/praetore-r2-new".to_owned(),
+                "/System/Volumes/Data/usr".to_owned(),
+            ),
+            (
+                "/System/Library/Caches/praetore-r2-new".to_owned(),
+                "/System/Volumes/Data/System/Library".to_owned(),
+            ),
+            // Symmetric: the data-volume spelling under a system-volume prefix.
+            (
+                "/System/Volumes/Data/usr/local/praetore-r2-new".to_owned(),
+                "/usr".to_owned(),
+            ),
+            (
+                "/System/Volumes/Data/System/Library/Caches/praetore-r2-new".to_owned(),
+                "/System/Library".to_owned(),
+            ),
+            // With folding: the other spelling only folds into the prefix.
+            (f.clone(), "/SYSTEM/Volumes/data".to_owned()),
+        ];
+        for (path, prefix) in &hidden {
+            assert_eq!(resolve_path(path).0, PathCheck::Same, "{path}");
+            let result = check(path, prefix);
+            eprintln!("firmlink r2: DENY {prefix:?} path {path:?} -> {result:?}");
+            assert_eq!(
+                result,
+                (UNRESOLVED_PATH.to_owned(), "ambiguous".to_owned()),
+                "DENY {prefix} path {path}"
+            );
+        }
+        // Controls: outside firmlinked directories there is no other
+        // spelling; inside, a prefix the other spelling is not under.
+        assert_eq!(firmlink_spelling("/bin/ls"), None);
+        assert_eq!(
+            firmlink_spelling(&f),
+            Some(format!("/System/Volumes/Data{f}"))
+        );
+        assert_eq!(
+            firmlink_spelling(&format!("/System/Volumes/Data{f}")),
+            Some(f.clone())
+        );
+        for (path, prefix) in [
+            ("/bin/ls".to_owned(), "/System/Volumes/Data"),
+            (f.clone(), "/System/Volumes/Data/Users"),
+            (text(&root.join("notes.txt")), "/System/Volumes/Data/usr"),
+        ] {
+            assert_eq!(
+                check(&path, prefix),
+                (path.clone(), "same".to_owned()),
+                "{path}"
+            );
+        }
     }
 
     /// The adversarial finding on `ccea7be`: the denied directory does not
