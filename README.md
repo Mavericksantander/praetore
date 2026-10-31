@@ -501,9 +501,13 @@ cargo test -p praetore-gateway --test enforcement human_approval
   submits to it. It cannot stop an agent, or any other process, from
   performing an action directly. Any client that executes an action itself
   after an `allowed` answer does so outside PRÆTORE's control.
-- **Path protection is local and lexical only.** `Prefix` and `PathPrefix`
-  compare strings and never consult the filesystem. **Symlinks are out of
-  scope.**
+- **Path protection in core is local and lexical only.** `Prefix` and
+  `PathPrefix` compare strings and never consult the filesystem; **symlinks
+  are out of scope for core.** `praetore-mcp` resolves the arguments its
+  `PathPrefix` rules cover before evaluation and fails closed when a path does
+  not resolve to itself (see
+  [`crates/praetore-mcp/README.md`](crates/praetore-mcp/README.md)); that
+  check is point-in-time (TOCTOU).
 - **The journal does not independently confirm execution.**
   - Approval and dispatch are separate steps: an approval moves an execution
     from `not_dispatched` to `approved_pending_dispatch`, and a separate

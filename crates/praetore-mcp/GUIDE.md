@@ -75,15 +75,31 @@ Read these before relying on anything above.
 3. **REQUIRE_APPROVAL has no approval flow.** A matching call is blocked in
    enforce mode, with the text "requires human approval (not supported by
    praetore-mcp yet)". There is no way to approve it and let it run.
-4. **Path rules are lexical; symlinks are not resolved.** `--arg-path-prefix
-   path=/allowed/dir` compares the text of the argument. A symlink inside
-   `/allowed/dir` that points outside it matches the rule. Resolving
-   symlinks before evaluation is planned work, not current behavior.
+4. **Path arguments must resolve to themselves.** For an argument that a
+   `--arg-path-prefix` rule covers, `wrap` resolves symlinks first. If the
+   path goes through a symlink, has `.`/`..`, or its parent does not exist,
+   restrictive path rules match it and ALLOW path rules do not. On macOS,
+   `/tmp/...` is such a path (`/tmp` → `/private/tmp`): use the resolved
+   path in rules and arguments. On a filesystem that ignores case or Unicode
+   normalization (APFS by default), a path that differs from a rule's prefix
+   only in case or normalization (`/x/SECRET` or `/x/ẞECRET` against
+   `/x/secret`, NFD against NFC) is also treated that way (`ambiguous`), even
+   when it does not exist yet, and so is another spelling of the same
+   directory, such as the macOS firmlink `/System/Volumes/Data/Users/...`
+   for `/Users/...`. The receipt shows what was checked in
+   `context["praetore.path_check"]`. **This is defense in depth for local
+   servers on the same host and mount namespace, not a guarantee**; the
+   structural fix is confining the server (T-013B, PR #61). Not covered:
+   hard links, TOCTOU (point 5), Linux bind mounts of a subdirectory, and
+   decoding the server applies to the path. **Not supported:** servers in
+   another namespace or on another host (`docker`, `podman`, `ssh`,
+   `chroot`; `wrap` warns at startup when it sees one) and network or FUSE
+   mounts that loop back to the same disk. See the README for details.
 5. **Time of check to time of use (TOCTOU).** The decision is made on the
    arguments when the call passes through the proxy. The MCP server opens
    the file afterwards. Anything that changes the filesystem in between (for
    example replacing a directory with a symlink) is not seen by the
-   decision. This stays true even after symlink resolution is added.
+   decision.
 6. **Observe mode does not block anything.** It records what enforce would
    have decided, labeled `praetore.mode: observe` in the signed receipt. Use
    it to try a policy, not to stop calls.
@@ -101,6 +117,8 @@ Read these before relying on anything above.
 | An action the policy denies happened, and `praetore-mcp receipts` has no receipt for it | The client used its own tool (Claude Code / Code session, Cursor's built-in tools, computer use), not the MCP server | Use a chat that calls the MCP tool, or ask for it by name ("use the `write_file` tool of `filesystem`"). See Limit 1. |
 | `receipts` says `no receipts yet` but the server is listed in the client | No `tools/call` reached the proxy yet, or the client was not restarted after `install` | Quit the client completely and reopen it; ask for an MCP tool by name. |
 | `wrap` prints `... is not initialized` and every tool call fails with `praetore-mcp is not ready` | `init` was not run for that `--dir` | `praetore-mcp init` (or `--dir` matching the one in the client config), then restart the client. Both modes refuse every `tools/call` until then. Builds up to `9735974` forwarded calls **without receipts** in observe in this state ([#48](https://github.com/Mavericksantander/praetore/pull/48)). |
+| A call on a `/tmp/...` (or other symlinked) path is refused, or never allowed, by a path rule | The argument does not resolve to itself (`/tmp` → `/private/tmp` on macOS) | Use the resolved path (`realpath /tmp/x`). `praetore-mcp receipts` and the receipt's `praetore.path_check` show `differs` and the resolved value. |
+| `policy deny ... --arg-path-prefix` prints `warning: ... resolves to ...` | The prefix itself goes through a symlink | Remove the rule and add it again with the resolved prefix; otherwise a DENY rule does not cover the resolved path. |
 | A new rule has no effect | The running `wrap` loaded the old policy | Restart the client. `praetore-mcp policy check` shows the digest it will load. |
 | The server does not start; `wrap` exits with 127 | The client could not find the server command (for example `npx`) with the PATH apps get from the desktop | Put the absolute path in the config, e.g. `/opt/homebrew/bin/npx` (check with `which npx`), then `install` again. In the macOS check, both apps found Homebrew's `npx` without this. |
 | `install` says the config `is not strict JSON` | The file has comments or trailing commas (JSONC) | Remove them, or wrap the server by hand with `praetore-mcp wrap ... -- <command>`. The file is never rewritten in this case. |

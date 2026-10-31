@@ -151,6 +151,62 @@ fn write_locked(out: &Mutex<io::Stdout>, bytes: &[u8]) -> io::Result<()> {
     stdout.flush()
 }
 
+/// Commands that usually run the server in another mount namespace or on
+/// another host. Heuristic, for a startup warning only.
+const OTHER_NAMESPACE_LAUNCHERS: &[&str] = &[
+    "docker",
+    "podman",
+    "nerdctl",
+    "ssh",
+    "chroot",
+    "lima",
+    "limactl",
+    "orb",
+    "orbctl",
+    "kubectl",
+    "multipass",
+    "wsl",
+    "flatpak",
+    "firejail",
+    "bwrap",
+    "systemd-nspawn",
+    "lxc",
+    "incus",
+    "distrobox",
+    "toolbox",
+    "nsenter",
+    "unshare",
+];
+
+/// The launcher in `command` (or behind `env`/`sudo`/`doas`) if it is one of
+/// [`OTHER_NAMESPACE_LAUNCHERS`].
+pub fn other_namespace_launcher(command: &str, args: &[String]) -> Option<String> {
+    let base = |word: &str| {
+        let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
+        name.strip_suffix(".exe").unwrap_or(name).to_owned()
+    };
+    let mut words = std::iter::once(command).chain(args.iter().map(String::as_str));
+    while let Some(word) = words.next() {
+        let name = base(word);
+        if OTHER_NAMESPACE_LAUNCHERS.contains(&name.as_str()) {
+            return Some(name);
+        }
+        if !matches!(name.as_str(), "env" | "sudo" | "doas") {
+            return None;
+        }
+        // Skip the wrapper's options and VAR=value assignments.
+        for next in words.by_ref() {
+            if !(next.starts_with('-') || next.contains('=')) {
+                let name = base(next);
+                return OTHER_NAMESPACE_LAUNCHERS
+                    .contains(&name.as_str())
+                    .then_some(name);
+            }
+        }
+    }
+    None
+}
+
 pub fn run(options: WrapOptions) -> i32 {
     let gate = Gate::load(&options.home, options.mode);
     // Without a gate no receipt can be written, so there is nothing to
@@ -167,6 +223,13 @@ pub fn run(options: WrapOptions) -> i32 {
             Mode::Enforce
         }
     };
+    if gate.as_ref().is_ok_and(Gate::has_path_rules)
+        && let Some(launcher) = other_namespace_launcher(&options.command, &options.args)
+    {
+        eprintln!(
+            "praetore-mcp: WARNING the server is started through {launcher:?}, which usually runs it in another mount namespace or on another host. Path rules are checked against THIS machine's filesystem; the server may resolve the same path to a different file. This setup is not supported by the path check (defense in depth only)."
+        );
+    }
     let mut evaluator = GateOrError(gate);
 
     #[cfg(windows)]
@@ -289,6 +352,36 @@ pub fn run(options: WrapOptions) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn other_namespace_launchers_are_recognised() {
+        let args = |list: &[&str]| list.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+        for (command, rest, expected) in [
+            ("docker", &["run", "-i", "img"][..], Some("docker")),
+            ("/usr/local/bin/podman", &["run"][..], Some("podman")),
+            ("ssh", &["host", "server"][..], Some("ssh")),
+            ("env", &["FOO=1", "-i", "docker", "run"][..], Some("docker")),
+            (
+                "sudo",
+                &["-E", "chroot", "/jail", "srv"][..],
+                Some("chroot"),
+            ),
+            ("C:\\bin\\docker.exe", &[][..], Some("docker")),
+            (
+                "npx",
+                &["-y", "@modelcontextprotocol/server-filesystem"][..],
+                None,
+            ),
+            ("env", &["node", "docker.js"][..], None),
+            ("/usr/bin/python3", &["ssh_server.py"][..], None),
+        ] {
+            assert_eq!(
+                other_namespace_launcher(command, &args(rest)).as_deref(),
+                expected,
+                "{command} {rest:?}"
+            );
+        }
+    }
 
     #[test]
     fn resolves_bare_commands_through_pathext() {
