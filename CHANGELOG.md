@@ -31,6 +31,21 @@
     only detects deletion or truncation if it was published outside the
     producer's control and passed as `--expected-head`; the heads in this
     repository are not such an anchor.
+- **T-014, `praetore-mcp`:** arguments covered by a `PathPrefix` rule are
+  resolved through the filesystem before evaluation. Unless an absolute value
+  resolves to itself (no symlink, `.`/`..`, dangling link or missing parent),
+  the engine sees `praetore-mcp:path-check-failed`, which core treats as an
+  unsafe path (every DENY / REQUIRE_APPROVAL `PathPrefix` rule matches, no
+  ALLOW one). Receipts record `context["praetore.path_check"]`; forwarded
+  bytes are unchanged. Core's `PathPrefix` stays lexical. Behavior change: on
+  macOS, `/tmp/...` arguments under such a rule are now refused or not
+  allowed; use resolved paths. `policy` commands and `policy check` warn
+  about prefixes that resolve elsewhere. The check is point-in-time (TOCTOU).
+  A path that resolves to itself but is at or under a policy `PathPrefix`
+  only when compared like the filesystem compares names (case folding and/or
+  NFC: APFS, HFS+, casefolded ext4/f2fs, unknown filesystems), not byte for
+  byte, is `ambiguous` and hidden the same way; this covers case and NFD
+  variants of a denied name that does not exist yet.
 
 ## 0.3.0 - 2026-10-30
 

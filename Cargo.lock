@@ -1189,6 +1189,7 @@ name = "praetore-mcp"
 version = "0.3.0"
 dependencies = [
  "hex",
+ "libc",
  "praetore-core",
  "rand_core 0.6.4",
  "serde",
@@ -1196,6 +1197,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "time",
+ "unicode-normalization",
  "uuid",
  "zeroize",
 ]

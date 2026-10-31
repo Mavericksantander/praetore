@@ -240,6 +240,45 @@ unknown flag) never writes anything. `policy check` also starts the same
 HighAssurance engine `wrap` uses, and warns about rules that will behave in
 surprising ways.
 
+**Path arguments are resolved before evaluation (T-014).** Core's
+`PathPrefix` is lexical by design. For every argument that some rule matches
+with `--arg-path-prefix` (any rule, any effect), `wrap` first resolves an
+absolute value through the filesystem (`canonicalize`; for a file that does
+not exist yet, its parent). Unless the value resolves to itself, the engine
+sees the placeholder `praetore-mcp:path-check-failed` instead, which core
+treats as an unsafe path: every DENY / REQUIRE_APPROVAL `PathPrefix` rule
+matches it and no ALLOW `PathPrefix` rule does. "Does not resolve to itself"
+means a symlink anywhere in the path, a `.`/`..` segment, a dangling symlink,
+or a parent that does not exist. The receipt records
+`context["praetore.path_check"][KEY] = {"lexical", "resolved", "status"}`
+(`same`, `differs`, `unresolved` or `ambiguous`), and the bytes forwarded to
+the server are never changed. Consequences:
+
+* Write rules and arguments with resolved paths. On macOS `/tmp` and `/var`
+  are symlinks to `/private/tmp` and `/private/var`, so `/tmp/x` is refused by
+  a restrictive rule on that key and never allowed by an ALLOW rule.
+  `policy deny|allow|require-approval` and `policy check` warn when a rule's
+  prefix exists and resolves to another path: a DENY rule on `/tmp/secret`
+  would not cover `/private/tmp/secret/x`.
+* Case and Unicode normalization. For an existing entry `realpath` returns
+  the stored spelling, so on APFS `/x/SECRET/f` (stored `secret`) or an NFD
+  `cafe\u{301}` (stored NFC `café`) is `differs`. A name that does not exist
+  yet cannot be checked that way, so a path that resolves to itself is also
+  compared with every `--arg-path-prefix` value of the policy: if it is at
+  or under one only once names are compared the way the filesystem compares
+  them (case folding and/or NFC), and not byte for byte, it is `ambiguous`
+  and the engine sees the placeholder. Each differing segment uses the
+  sensitivity of its directory: on macOS `pathconf(_PC_CASE_SENSITIVE)`
+  decides case, normalization is always ignored (APFS, HFS+); on Linux only
+  ext4/f2fs/tmpfs directories without the casefold flag, xfs and btrfs count
+  as byte for byte; anything else, or a failed probe, folds both (fail
+  closed). On a case-sensitive filesystem `/x/SECRET` is an ordinary path and
+  is not refused by a rule on `/x/secret`.
+* Relative values are not resolved; core already treats them as unsafe.
+* The check happens when the proxy decides. The server opens the path later,
+  so a symlink created or swapped in between is not seen (TOCTOU, see
+  Limitations).
+
 **Running wrappers do not reload the policy.** Each `wrap` process reads
 `policy.json` once, when it starts. Every `policy` command prints a reminder to
 restart the MCP client (or the wrapped servers). In enforce mode, an invalid
@@ -347,6 +386,10 @@ Things to know:
 
 * stdio transport only. HTTP / SSE / Streamable HTTP MCP servers are not
   proxied yet; `install` skips them.
+* Path checks are point-in-time (TOCTOU). Arguments covered by a
+  `PathPrefix` rule are resolved when the proxy decides; the MCP server opens
+  the path afterwards. Replacing a directory with a symlink between the two
+  is not detected. Arguments no `PathPrefix` rule covers are never resolved.
 * REQUIRE_APPROVAL is not supported. In enforce mode it is treated like DENY,
   with the text "requires human approval (not supported by praetore-mcp yet)".
 * The keys are LOCAL/DEV keys. See the trust model.

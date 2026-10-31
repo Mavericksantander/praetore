@@ -290,6 +290,16 @@ pub fn lint(policy: &Policy) -> Vec<String> {
             .iter()
             .any(|c| c.key.starts_with("arguments"));
         for condition in &rule.parameter_conditions {
+            if condition.operator == MatchOperator::PathPrefix
+                && let Some(prefix) = condition.expected.as_str()
+                && let (crate::gate::PathCheck::Differs, Some(resolved)) =
+                    crate::gate::resolve_path(prefix)
+            {
+                warnings.push(format!(
+                    "rule {:?}: path prefix {prefix:?} resolves to {resolved:?}; a DENY/REQUIRE_APPROVAL rule does not cover arguments under {resolved:?} and an ALLOW rule never matches (arguments are resolved first), so use {resolved:?}",
+                    rule.id
+                ));
+            }
             if let Some(field) = condition.key.strip_prefix("arguments.")
                 && field.contains('.')
             {
@@ -477,5 +487,33 @@ mod tests {
         );
         assert!(warnings.contains("\"ra\"") && warnings.contains("without required_capability"));
         assert!(warnings.contains("\"args\"") && warnings.contains("selector"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lint_flags_path_prefixes_that_do_not_resolve_to_themselves() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+        let rule = |id: &str, prefix: std::path::PathBuf| {
+            PolicyRule::new(id, ACTION_TYPE, PolicyEffect::Deny)
+                .with_target("fs")
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    prefix.to_str().unwrap(),
+                ))
+        };
+        let mut policy = default_policy();
+        policy.rules.push(rule("via-alias", root.join("alias")));
+        policy.rules.push(rule("canonical", root.join("real")));
+        policy.rules.push(rule("not-yet", root.join("missing")));
+        let warnings = lint(&policy).join("\n");
+        assert!(
+            warnings.contains("\"via-alias\"") && warnings.contains("resolves to"),
+            "{warnings}"
+        );
+        assert!(!warnings.contains("\"canonical\""), "{warnings}");
+        assert!(!warnings.contains("\"not-yet\""), "{warnings}");
     }
 }
