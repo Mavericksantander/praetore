@@ -163,9 +163,17 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
 - **Lo que corre dentro de un comando permitido no se ve.** Un script
   (`./deploy.sh`), un `Makefile` o un alias de git definido en la
   configuración pueden hacer push sin que el comando lo diga.
-- **Ventana entre el chequeo y el uso.** La ruta se resuelve cuando el hook
-  evalúa, y la herramienta la abre después. Si en ese intervalo alguien
-  cambia un directorio por un symlink, la herramienta puede abrir otra cosa.
+- **Ventana entre el chequeo y la escritura (límite conocido, igual que en
+  #59).** La ruta se resuelve cuando el hook evalúa, y la herramienta de
+  Claude Code la abre después. Si alguien crea un symlink justo en ese
+  intervalo, por ejemplo en el nombre todavía inexistente de un archivo
+  nuevo o en lugar de un directorio, la escritura pasa por él. Se cierra
+  abriendo la ruta por descriptor con
+  `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, como propone T-013 B
+  ([#61](https://github.com/Mavericksantander/praetore/pull/61)). Aquí quien
+  abre el archivo es la herramienta de Claude Code y no PRÆTORE, así que el
+  hook por sí solo no puede cerrarla: hace falta que un ejecutor confinado
+  como el de T-013 B sea el que abra el archivo.
 - **macOS:** `/tmp` y `/var` son symlinks a `/private/...`. Una ruta como
   `/tmp/x` no se resuelve a sí misma, así que se niega bajo cualquier regla de
   ruta. Hay que usar rutas resueltas.
