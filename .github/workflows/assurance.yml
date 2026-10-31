@@ -23,6 +23,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
+      # The AWS KMS SDK adapter (feature `sdk`), against a fake HTTP connector.
+      - run: cargo test -p praetore-signer-aws-kms --features sdk --locked
       - run: cargo run --locked --package praetore-core --example high_assurance
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
@@ -83,6 +85,47 @@ jobs:
           if ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch "$HEAD_05"; then
             echo "::error::set 04 verified against the head of set 05"; exit 1
           fi
+
+  pkcs11-softhsm:
+    name: PKCS#11 signer against SoftHSM2
+    runs-on: ubuntu-latest
+    env:
+      PRAETORE_TEST_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install SoftHSM2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y softhsm2
+          softhsm2-util --version
+          test -f "$PRAETORE_TEST_PKCS11_MODULE"
+      # Each test binary creates its own token in a temporary directory.
+      # The "N passed" checks fail the job if a test is renamed or skipped.
+      - name: SoftHSM2 signer tests
+        env:
+          PRAETORE_TEST_PKCS11_EXPORT_DIR: ${{ runner.temp }}/softhsm-receipts
+        run: |
+          set -euo pipefail
+          output="$(cargo test -p praetore-signer-pkcs11 --features softhsm-testing --locked --test softhsm -- --ignored --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 9 passed" <<<"$output" || { echo "::error::SoftHSM2 tests did not all run"; exit 1; }
+      - name: praetore-verify accepts the HSM-signed receipts and rejects a relabelled one
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/softhsm-receipts"
+          for receipt in evidence-legacy evidence-envelope; do
+            cargo run -q --locked -p praetore-verify -- evidence --evidence "$dir/$receipt.json" --attester-pin "$dir/attester-public-key.hex"
+          done
+          if cargo run -q --locked -p praetore-verify -- evidence --evidence "$dir/evidence-envelope-relabelled.json" --attester-pin "$dir/attester-public-key.hex"; then
+            echo "::error::an envelope signature relabelled as ed25519 was accepted"; exit 1
+          fi
+      - name: Gateway service loads PKCS#11 keys
+        run: |
+          set -euo pipefail
+          output="$(cargo test -p praetore-gateway-service --features pkcs11 --locked --lib -- --ignored --exact --nocapture signing_keys::tests::pkcs11_signer_loads_from_softhsm 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::the gateway PKCS#11 test did not run"; exit 1; }
 
   macos:
     name: macOS workspace link

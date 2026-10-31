@@ -1,17 +1,17 @@
-use ed25519_dalek::{Signer, SigningKey};
 use praetore_core::{
-    EvidenceAttesterKey, FreshnessProvider, HighAssuranceConfig, Policy, TrustedAuthorityIssuer,
+    FreshnessProvider, HighAssuranceConfig, Policy, Signer, TrustedAuthorityIssuer,
     canonical::parse_json_rejecting_duplicates, engine::AuthorizationEngine,
 };
 use praetore_gateway::{
-    ActionDispatcher, ExecutionAttestationError, ExecutionAttestationSigner, Gateway,
-    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher,
+    ActionDispatcher, ExecutionAttestationSigner, Gateway, HumanApprovalVerifier,
+    SignerExecutionAttester, http_api, local_demo::LocalDemoDispatcher,
 };
 use praetore_gateway_service::{
     api_auth::select_api_auth,
     approver_bindings::{parse_approver_bindings, single_approver},
     chrony_clock::ChronyClock,
     file_freshness::{DemoFreshnessProvider, FileFreshnessLimits, FileFreshnessProvider},
+    signing_keys::{self, KeySource, LoadedSigner},
 };
 use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use serde::Deserialize;
@@ -25,11 +25,6 @@ use std::{
 };
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
-
-struct LocalExecutionSigner {
-    key_id: String,
-    signing_key: SigningKey,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +40,14 @@ struct TenantIssuerBinding {
     issuer_key_ids: Vec<String>,
 }
 
+/// The gateway's keys: the evidence and execution attesters (SAF-11: any
+/// `Signer`) and the human approvers' public keys.
+struct GatewayKeys {
+    evidence: Arc<dyn Signer>,
+    execution: Arc<dyn ExecutionAttestationSigner>,
+    approval_verifiers: Vec<HumanApprovalVerifier>,
+}
+
 struct GatewayAdapterSetup {
     dispatcher: Arc<dyn ActionDispatcher>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
@@ -53,33 +56,6 @@ struct GatewayAdapterSetup {
     /// `http` and `sandbox`: refuse demo freshness, unauthenticated API
     /// access and unscoped multi-tenant approver keys.
     production_adapter: bool,
-}
-
-impl LocalExecutionSigner {
-    fn from_hex(value: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let bytes = hex::decode(value)?;
-        let secret: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| "execution attester key must be exactly 32 bytes")?;
-        let signing_key = SigningKey::from_bytes(&secret);
-        Ok(Self {
-            key_id: format!(
-                "local-demo-{}",
-                hex::encode(signing_key.verifying_key().as_bytes())
-            ),
-            signing_key,
-        })
-    }
-}
-
-impl ExecutionAttestationSigner for LocalExecutionSigner {
-    fn key_id(&self) -> &str {
-        &self.key_id
-    }
-
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError> {
-        Ok(self.signing_key.sign(message).to_bytes().to_vec())
-    }
 }
 
 fn required_env(name: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -215,8 +191,13 @@ fn build_gateway(
     audience: &str,
     require_trusted_clock: bool,
     production_adapter: bool,
-    approval_verifiers: Vec<HumanApprovalVerifier>,
+    keys: GatewayKeys,
 ) -> Result<Gateway, Box<dyn std::error::Error>> {
+    let GatewayKeys {
+        evidence: evidence_signer,
+        execution: execution_signer,
+        approval_verifiers,
+    } = keys;
     let policy_path = required_env("PRAETORE_GATEWAY_POLICY_FILE")?;
     let issuer_pin_path = required_env("PRAETORE_GATEWAY_ISSUER_PIN_FILE")?;
     let policy = Policy::from_json(&read_limited(&policy_path, 1_048_576)?)?;
@@ -225,19 +206,12 @@ fn build_gateway(
     }
     let policy_digest = policy.digest()?;
     let issuer_pins = load_issuer_pins(&read_limited(&issuer_pin_path, 1_048_576)?)?;
-    let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
-    let evidence_key_bytes: [u8; 32] = hex::decode(evidence_key_hex)?
-        .try_into()
-        .map_err(|_| "evidence attester key must be exactly 32 bytes")?;
-    let evidence_attester = EvidenceAttesterKey::from_secret_bytes(&evidence_key_bytes);
-
-    let mut config =
-        HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_attester)?
-            .with_audience(audience)
-            .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(
-                database.connect()?,
-            )))
-            .with_freshness_provider(freshness_provider(production_adapter, policy_digest)?);
+    let mut config = HighAssuranceConfig::new(policy_digest.clone(), issuer_pins, evidence_signer)?
+        .with_audience(audience)
+        .with_replay_guard(Arc::new(PostgresReplayGuard::from_client(
+            database.connect()?,
+        )))
+        .with_freshness_provider(freshness_provider(production_adapter, policy_digest)?);
     if let Some(bindings) = tenant_issuer_bindings {
         config = config.with_tenant_issuer_bindings(bindings);
     }
@@ -258,9 +232,6 @@ fn build_gateway(
         let database = database.clone();
         move || database.connect()
     })?);
-    let execution_signer = Arc::new(LocalExecutionSigner::from_hex(&required_env(
-        "PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX",
-    )?)?);
     let mut gateway = Gateway::new(engine, journal, dispatcher, execution_signer)?;
     for verifier in approval_verifiers {
         gateway = gateway.with_human_approval_verifier(verifier);
@@ -355,10 +326,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let database_url = required_env("PRAETORE_GATEWAY_DATABASE_URL")?;
-    let evidence_key_hex = required_env("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX")?;
-    let execution_key_hex = required_env("PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX")?;
-    validate_secret_key(&evidence_key_hex, "evidence attester")?;
-    validate_secret_key(&execution_key_hex, "execution attester")?;
 
     let adapter_setup = match env::var("PRAETORE_GATEWAY_ADAPTER").as_deref() {
         Ok("http") => {
@@ -409,7 +376,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
         }
     };
-    let approval_verifiers = approval_verifiers(adapter_setup.tenant_issuer_bindings.as_ref())?;
+    let (evidence, execution) = load_signers(adapter_setup.production_adapter)?;
+    let keys = GatewayKeys {
+        evidence,
+        execution,
+        approval_verifiers: approval_verifiers(adapter_setup.tenant_issuer_bindings.as_ref())?,
+    };
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL").ok();
     let database = prepare_database(
         &database_url,
@@ -423,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &adapter_setup.audience,
         adapter_setup.require_trusted_clock,
         adapter_setup.production_adapter,
-        approval_verifiers,
+        keys,
     )?);
     let address = match env::var("PRAETORE_GATEWAY_LISTEN_ADDR") {
         Ok(address) => address.parse::<std::net::SocketAddr>()?,
@@ -484,44 +456,44 @@ fn env_duration_ms(name: &str, default: u64) -> Result<StdDuration, Box<dyn std:
     Ok(StdDuration::from_millis(value))
 }
 
-fn validate_secret_key(value: &str, description: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = hex::decode(value)?;
-    if bytes.len() != 32 {
-        return Err(format!("{description} key must be exactly 32 bytes").into());
+/// Loads both signing keys before anything else is opened (SAF-11): exactly
+/// one source per key, and no hex key from the environment for `http` and
+/// `sandbox` without the explicit opt-in. Logs only public key identifiers.
+type Signers = (Arc<dyn Signer>, Arc<dyn ExecutionAttestationSigner>);
+
+fn load_signers(production_adapter: bool) -> Result<Signers, Box<dyn std::error::Error>> {
+    let env_lookup = |name: &str| env::var(name).ok();
+    let (evidence, execution) = signing_keys::load_signers(production_adapter, &env_lookup)?;
+    for (role, loaded) in [("evidence", &evidence), ("execution", &execution)] {
+        if production_adapter && loaded.source == KeySource::EnvironmentHex {
+            tracing::warn!(
+                role,
+                "signing key read from an environment variable by explicit opt-in; it is visible to anything that can read this process's environment"
+            );
+        }
     }
-    Ok(())
+    let execution_key_id = execution.execution_key_id();
+    tracing::info!(
+        evidence_key_id = %evidence.signer.key_id(),
+        evidence_algorithm = %evidence.signer.algorithm(),
+        evidence_key_source = ?evidence.source,
+        execution_key_id = %execution_key_id,
+        execution_key_source = ?execution.source,
+        "signing keys loaded"
+    );
+    let LoadedSigner {
+        signer: evidence, ..
+    } = evidence;
+    let execution: Arc<dyn ExecutionAttestationSigner> = Arc::new(SignerExecutionAttester::new(
+        execution_key_id,
+        execution.signer,
+    )?);
+    Ok((evidence, execution))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use praetore_core::VerifiedPublicKey;
-
-    #[test]
-    fn execution_signer_produces_ed25519_signatures_with_stable_key_id() {
-        let signer = LocalExecutionSigner::from_hex(&hex::encode([21; 32])).unwrap();
-        let signature = signer.sign(b"demo payload").unwrap();
-        let public_key =
-            VerifiedPublicKey::from_bytes(&signer.signing_key.verifying_key().to_bytes()).unwrap();
-
-        assert!(
-            public_key
-                .verify_domain_message(b"", b"demo payload", &signature)
-                .is_ok()
-        );
-        assert_eq!(
-            signer.key_id(),
-            LocalExecutionSigner::from_hex(&hex::encode([21; 32]))
-                .unwrap()
-                .key_id()
-        );
-    }
-
-    #[test]
-    fn invalid_secret_key_lengths_are_rejected() {
-        assert!(validate_secret_key(&hex::encode([0; 31]), "test").is_err());
-        assert!(validate_secret_key(&hex::encode([0; 32]), "test").is_ok());
-    }
 
     #[test]
     fn tenant_issuer_bindings_reject_reused_keys_and_tenants() {

@@ -7,3 +7,4 @@ pub mod file_freshness;
 pub mod http_dispatcher;
 pub mod sandbox_dispatcher;
 pub mod sandbox_supervisor;
+pub mod signing_keys;

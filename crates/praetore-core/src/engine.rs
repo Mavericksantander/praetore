@@ -4,7 +4,7 @@ use crate::{
     authorization::AuthorizationRequest,
     canonical::{decode_lower_hex, parse_json_rejecting_duplicates},
     decision::{DecidedBy, Decision, RecordedDecision},
-    evidence::{Evidence, EvidenceAttesterKey},
+    evidence::Evidence,
     freshness::{FreshnessError, FreshnessProvider},
     identity::VerifiedPublicKey,
     policy::Policy,
@@ -12,6 +12,7 @@ use crate::{
         AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
         ReplayGuardError,
     },
+    signer::Signer,
 };
 
 use serde::{Deserialize, Serialize};
@@ -263,7 +264,7 @@ pub struct HighAssuranceConfig {
     max_freshness_lease: Duration,
     trusted_issuers: Vec<TrustedAuthorityIssuer>,
     tenant_issuer_bindings: Option<HashMap<Uuid, Vec<String>>>,
-    evidence_attester: EvidenceAttesterKey,
+    evidence_attester: Arc<dyn Signer>,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
     freshness_provider: Option<Arc<dyn FreshnessProvider>>,
 }
@@ -281,7 +282,11 @@ impl std::fmt::Debug for HighAssuranceConfig {
                 "tenant_issuer_bindings_configured",
                 &self.tenant_issuer_bindings.is_some(),
             )
-            .field("evidence_attester", &self.evidence_attester)
+            .field("evidence_attester_key_id", &self.evidence_attester.key_id())
+            .field(
+                "evidence_attester_algorithm",
+                &self.evidence_attester.algorithm(),
+            )
             .field("replay_guard_configured", &self.replay_guard.is_some())
             .field(
                 "freshness_provider_configured",
@@ -292,10 +297,13 @@ impl std::fmt::Debug for HighAssuranceConfig {
 }
 
 impl HighAssuranceConfig {
-    pub fn new(
+    /// `evidence_attester` is any [`Signer`]: an `EvidenceAttesterKey`
+    /// (in-process [`crate::LocalSigner`]), an `Arc<dyn Signer>`, or a
+    /// PKCS#11/KMS backend.
+    pub fn new<S: Signer + 'static>(
         policy_digest: impl Into<String>,
         trusted_issuers: Vec<TrustedAuthorityIssuer>,
-        evidence_attester: EvidenceAttesterKey,
+        evidence_attester: S,
     ) -> Result<Self> {
         let policy_digest = policy_digest.into();
         let policy_pin_bytes = hex::decode(&policy_digest).map_err(|_| {
@@ -328,7 +336,7 @@ impl HighAssuranceConfig {
             max_freshness_lease: Duration::minutes(1),
             trusted_issuers,
             tenant_issuer_bindings: None,
-            evidence_attester,
+            evidence_attester: Arc::new(evidence_attester),
             replay_guard: None,
             freshness_provider: None,
         })
@@ -437,7 +445,7 @@ pub struct AuthorizationEngine {
     max_intent_lifetime: Duration,
     max_authority_lifetime: Duration,
     max_freshness_lease: Duration,
-    evidence_attester: Option<Arc<EvidenceAttesterKey>>,
+    evidence_attester: Option<Arc<dyn Signer>>,
     replay_guard: Option<Arc<dyn ReplayGuard>>,
     freshness_provider: Option<Arc<dyn FreshnessProvider>>,
 }
@@ -601,7 +609,7 @@ impl AuthorizationEngine {
             max_intent_lifetime: config.max_intent_lifetime,
             max_authority_lifetime: config.max_authority_lifetime,
             max_freshness_lease: config.max_freshness_lease,
-            evidence_attester: Some(Arc::new(config.evidence_attester)),
+            evidence_attester: Some(config.evidence_attester),
             replay_guard: config.replay_guard,
             freshness_provider: config.freshness_provider,
         };
@@ -712,7 +720,7 @@ impl AuthorizationEngine {
             .evidence_attester
             .as_ref()
             .ok_or(PraetoreError::PolicyIntegrityFailed)?;
-        evidence.verify_attester_signature(&attester.public_key()?)?;
+        evidence.verify_attester_signature(attester.verifying_key())?;
         evidence.verify_agent_intent()?;
 
         let intent = evidence
@@ -788,7 +796,7 @@ impl AuthorizationEngine {
             .evidence_attester
             .as_ref()
             .ok_or(PraetoreError::PolicyIntegrityFailed)?;
-        evidence.verify_attester_signature(&attester.public_key()?)?;
+        evidence.verify_attester_signature(attester.verifying_key())?;
         evidence.verify_agent_intent()?;
 
         let request = AuthorizationRequest {
@@ -1020,7 +1028,7 @@ impl AuthorizationEngine {
             }
         }
         if let Some(attester) = &self.evidence_attester {
-            evidence.sign(attester)?;
+            evidence.sign(attester.as_ref())?;
         }
         if self.mode == EvaluationMode::HighAssurance {
             let commit_now = self.clock.now()?;
@@ -1047,7 +1055,7 @@ impl AuthorizationEngine {
                     .evidence_attester
                     .as_ref()
                     .ok_or(PraetoreError::PolicyIntegrityFailed)?;
-                let trusted_attester = attester.public_key()?;
+                let trusted_attester = attester.verifying_key().clone();
                 evidence.verify_attester_signature(&trusted_attester)?;
                 let authorization = CompletedAuthorization::new(evidence);
                 match commit.commit_authorization(&authorization, &trusted_attester) {
@@ -1316,6 +1324,7 @@ impl AuthorizationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EvidenceAttesterKey;
     use crate::{
         action::Action,
         authority::{Authority, Validity},
@@ -1470,6 +1479,20 @@ mod tests {
         provider: Arc<dyn FreshnessProvider>,
         tenant_binding: Option<(Uuid, Uuid)>,
     ) -> (AuthorizationEngine, AuthorizationRequest) {
+        production_engine_with_attester(
+            policy,
+            provider,
+            tenant_binding,
+            Arc::new(EvidenceAttesterKey::generate()),
+        )
+    }
+
+    fn production_engine_with_attester(
+        policy: Policy,
+        provider: Arc<dyn FreshnessProvider>,
+        tenant_binding: Option<(Uuid, Uuid)>,
+        attester: Arc<dyn Signer>,
+    ) -> (AuthorizationEngine, AuthorizationRequest) {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let issuer_key = AgentKeyPair::generate();
@@ -1493,15 +1516,11 @@ mod tests {
             )
             .unwrap();
         let issuer_pin = production_test_pin(&issuer_key, high_assurance_validity());
-        let config = HighAssuranceConfig::new(
-            policy_digest,
-            vec![issuer_pin.clone()],
-            EvidenceAttesterKey::generate(),
-        )
-        .unwrap()
-        .with_audience("test-gateway")
-        .with_replay_guard(test_replay_guard())
-        .with_freshness_provider(provider);
+        let config = HighAssuranceConfig::new(policy_digest, vec![issuer_pin.clone()], attester)
+            .unwrap()
+            .with_audience("test-gateway")
+            .with_replay_guard(test_replay_guard())
+            .with_freshness_provider(provider);
         let config = if let Some((_, configured_tenant_id)) = tenant_binding {
             config.with_tenant_issuer_bindings(HashMap::from([(
                 configured_tenant_id,
@@ -3958,6 +3977,65 @@ mod tests {
         assert!(matches!(
             engine.evaluate(request),
             Err(PraetoreError::InvalidRequest(_))
+        ));
+    }
+
+    /// A remote signer that can be switched off, as an HSM or KMS outage.
+    struct SwitchableSigner {
+        inner: crate::LocalSigner,
+        available: AtomicBool,
+    }
+
+    impl Signer for SwitchableSigner {
+        fn algorithm(&self) -> crate::SignatureAlgorithm {
+            self.inner.algorithm()
+        }
+        fn verifying_key(&self) -> &VerifiedPublicKey {
+            self.inner.verifying_key()
+        }
+        fn max_message_len(&self) -> Option<usize> {
+            Some(4096)
+        }
+        fn sign_raw(&self, message: &[u8]) -> std::result::Result<Vec<u8>, crate::SignerError> {
+            if !self.available.load(Ordering::SeqCst) {
+                return Err(crate::SignerError::Unavailable);
+            }
+            self.inner.sign_raw(message)
+        }
+    }
+
+    #[test]
+    fn an_unavailable_signer_authorizes_nothing_and_the_request_stays_retryable() {
+        let signer = Arc::new(SwitchableSigner {
+            inner: crate::LocalSigner::generate()
+                .with_algorithm(crate::SignatureAlgorithm::Ed25519Sha256Envelope),
+            available: AtomicBool::new(false),
+        });
+        let (engine, request) = production_engine_with_attester(
+            allow_policy(),
+            test_freshness_provider(),
+            None,
+            signer.clone(),
+        );
+        let error = engine.evaluate(request.clone()).unwrap_err();
+        assert!(matches!(error, PraetoreError::SignerUnavailable));
+        assert_eq!(error.code(), "SIGNER_UNAVAILABLE");
+
+        // Signing happens before the replay claim, so once the signer is back
+        // the same signed request is evaluated (and claimed) exactly once.
+        signer.available.store(true, Ordering::SeqCst);
+        let evidence = engine.evaluate(request.clone()).unwrap();
+        assert_eq!(
+            evidence.attester_algorithm.as_deref(),
+            Some("ed25519-sha256-envelope")
+        );
+        evidence
+            .verify_attester_signature(signer.verifying_key())
+            .unwrap();
+        engine.validate_evidence_time_bounds(&evidence).unwrap();
+        assert!(matches!(
+            engine.evaluate(request),
+            Err(PraetoreError::ReplayDetected)
         ));
     }
 }

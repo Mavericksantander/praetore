@@ -205,6 +205,12 @@ impl VerifiedPublicKey {
         self.0.to_bytes()
     }
 
+    /// The public key of a signing key this crate holds. Such a key is never
+    /// small-order, so no check is needed.
+    pub(crate) fn from_verifying_key(key: VerifyingKey) -> Self {
+        Self(key)
+    }
+
     pub(crate) fn as_verifying_key(&self) -> &VerifyingKey {
         &self.0
     }

@@ -791,7 +791,9 @@ fn gateway_error_response(error: GatewayError) -> Response {
             | ErrorKind::EvidenceFailure
             | ErrorKind::FreshnessInvalid
             | ErrorKind::FreshnessLeaseTooLong
-            | ErrorKind::TrustedClockUnavailable => {
+            | ErrorKind::TrustedClockUnavailable
+            | ErrorKind::SignerUnavailable
+            | ErrorKind::SignerFailure => {
                 error_response(StatusCode::SERVICE_UNAVAILABLE, "authorization_unavailable")
             }
             _ => error_response(StatusCode::FORBIDDEN, "authorization_failed"),
