@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- `praetore journal-export --tenant` orders the journal rows by
+  `(created_at, request_id, agent_id)`. `(created_at, request_id)` was not a
+  total order (the key is `(tenant_id, agent_id, request_id)`), so two exports
+  of the same journal could differ. It now warns on stderr when the database
+  role is not the least-privilege runtime role. New PostgreSQL tests: export
+  as a login member of `praetore_runtime` confined by RLS without the SQL
+  filter, fail closed without the tenant setting, no writes; row order with
+  ties; and `praetore journal-export --tenant` plus `praetore-verify journal`
+  end to end against two gateways.
 - Hash-linked JSONL export of receipts, as specified in
   `docs/proposals/journal-chain-jsonl.md` (now marked implemented):
   - `praetore_core::journal_chain`: the format, the link
