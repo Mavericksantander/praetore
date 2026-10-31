@@ -266,6 +266,11 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 PolicyEffect::RequireApproval,
             )
             .with_capability("process:execute")
+            // `git_push` exists only for analyzable commands. Without this
+            // condition, an unanalyzable command (no `git_push` key) matched
+            // this rule as unknown under policy semantics v2 and was reported
+            // as a git push. The unanalyzable rule below still holds it.
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
             .with_parameter_condition(PolicyCondition::exact("git_push", json!(true))),
             // A command the scanner cannot analyze lexically might push, so it
             // is held for approval instead of allowed.
@@ -967,6 +972,24 @@ mod tests {
                 verdict.rule
             );
         }
+    }
+
+    #[test]
+    fn unanalyzable_command_without_push_is_not_reported_as_git_push() {
+        // Shape of receipt 0093 in evidence/05-sesion-real-final: a heredoc
+        // with no `git push`, held only because it cannot be analyzed.
+        let f = Fixture::new("heredoc");
+        let command = "cd docs && python3 - <<'E'\nprint('hola')\nE\ngrep -n x 01.md";
+        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert_eq!(
+            verdict.rule.as_deref(),
+            Some("approval-unanalyzable-command")
+        );
+
+        // An analyzable push still names approval-git-push.
+        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": "git push" }));
+        assert_eq!(verdict.rule.as_deref(), Some("approval-git-push"));
     }
 
     #[test]
