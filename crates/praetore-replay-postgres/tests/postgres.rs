@@ -4184,6 +4184,11 @@ fn postgres_closed_execution_and_approval_exclude_each_other() {
             });
             (close.join().unwrap(), approve.join().unwrap())
         });
+        // Exactly one side wins. Which side is timing; the split is not asserted.
+        assert!(
+            closed.is_ok() ^ approved.is_ok(),
+            "race {race}: exactly one side wins; close={closed:?} approval={approved:?}"
+        );
         match (closed, approved) {
             (Ok(changed), Err(error)) => {
                 assert_eq!(changed, 1, "race {race}");
@@ -4206,20 +4211,25 @@ fn postgres_closed_execution_and_approval_exclude_each_other() {
         }
         let reason = database_not_dispatched_reason(key);
         let decisions = database_rows_for_request("praetore.human_approvals", key.request_id);
+        let closed_row = reason.as_deref() == Some("dispatch_refused");
+        let approved_row = decisions == 1;
+        assert!(
+            !(closed_row && approved_row),
+            "race {race}: closure and an approval are both present (reason={reason:?}, decisions={decisions})"
+        );
         assert_eq!(
             journal_execution_status(key),
             "not_dispatched",
             "race {race}"
         );
-        if reason.as_deref() == Some("dispatch_refused") {
+        if closed_row {
             assert_eq!(decisions, 0, "race {race}");
         } else {
             assert!(reason.is_none(), "race {race}: {reason:?}");
-            assert_eq!(decisions, 1, "race {race}");
+            assert!(approved_row, "race {race}: decisions={decisions}");
         }
     }
     println!("closed-execution races: {races} run, {closes} closes won, {approvals} approvals won");
-    assert_eq!(closes + approvals, races);
 }
 
 #[test]

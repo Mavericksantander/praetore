@@ -184,6 +184,18 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$test did not run"; exit 1; }
           done
+      - name: Runtime-role check connects as the postgres superuser
+        run: |
+          set -euo pipefail
+          # The service logs in as praetore. postgres_runtime_role_must_not_own_or_bypass_the_schema
+          # reads session_user after SET ROLE and requires that name to be postgres
+          # (initdb's superuser). Give that role a TCP password, then run only this test as it.
+          container_id="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1)"
+          test -n "$container_id"
+          docker exec "$container_id" psql -U praetore -d praetore_test -v ON_ERROR_STOP=1 \
+            -c "ALTER ROLE postgres WITH LOGIN PASSWORD 'praetore-test'"
+          PRAETORE_TEST_DATABASE_URL=postgres://postgres:praetore-test@localhost:5432/praetore_test \
+            cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_runtime_role_must_not_own_or_bypass_the_schema
       - name: Stage replay-claim restart test
         env:
           PRAETORE_TEST_RESTART_PHASE: before
@@ -192,6 +204,10 @@ jobs:
         env:
           PRAETORE_TEST_JOURNAL_RESTART_PHASE: before
         run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_survives_server_restart_without_automatic_dispatch
+      - name: Stage approved-pending-dispatch restart test
+        env:
+          PRAETORE_TEST_APD_RESTART_PHASE: before
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_apd_and_migrations_survive_restart
       - name: Restart PostgreSQL service
         run: |
           container_id="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1)"
@@ -206,6 +222,10 @@ jobs:
         env:
           PRAETORE_TEST_JOURNAL_RESTART_PHASE: after
         run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_survives_server_restart_without_automatic_dispatch
+      - name: Verify approved-pending-dispatch recovery after restart
+        env:
+          PRAETORE_TEST_APD_RESTART_PHASE: after
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_apd_and_migrations_survive_restart
 
   sbom:
     name: CycloneDX SBOM
