@@ -1801,7 +1801,7 @@ fn receipts_signed_through_the_signer_trait_verify_offline() {
 /// `remaining` more times and then reports `Unavailable` until restored.
 struct FlakyExecutionSigner {
     inner: praetore_core::LocalSigner,
-    remaining: AtomicUsize,
+    remaining: Mutex<usize>,
     restored: AtomicBool,
 }
 
@@ -1809,7 +1809,7 @@ impl FlakyExecutionSigner {
     fn new(remaining: usize) -> Arc<Self> {
         Arc::new(Self {
             inner: praetore_core::LocalSigner::from_secret_bytes(&[45; 32]),
-            remaining: AtomicUsize::new(remaining),
+            remaining: Mutex::new(remaining),
             restored: AtomicBool::new(false),
         })
     }
@@ -1823,15 +1823,12 @@ impl praetore_core::Signer for FlakyExecutionSigner {
         praetore_core::Signer::verifying_key(&self.inner)
     }
     fn sign_raw(&self, message: &[u8]) -> Result<Vec<u8>, praetore_core::SignerError> {
-        if !self.restored.load(Ordering::SeqCst)
-            && self
-                .remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
-                    left.checked_sub(1)
-                })
-                .is_err()
-        {
-            return Err(praetore_core::SignerError::Unavailable);
+        if !self.restored.load(Ordering::SeqCst) {
+            let mut remaining = self.remaining.lock().unwrap();
+            if *remaining == 0 {
+                return Err(praetore_core::SignerError::Unavailable);
+            }
+            *remaining -= 1;
         }
         praetore_core::Signer::sign_raw(&self.inner, message)
     }
