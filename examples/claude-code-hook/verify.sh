@@ -41,15 +41,17 @@ done
 [ "$count" -gt 0 ] || fail "el bundle no tiene recibos"
 echo "OK: $count recibos verificados, todos ligados a la policy publicada"
 
-step "4. Alterar UN byte de una copia (Deny -> Allow) y comprobar que falla"
-FIRST_DENY="$(ls "$BUNDLE"/evidence/*-Deny.json | head -1)"
-python3 - "$FIRST_DENY" "$WORK/tampered.json" <<'PY'
+step "4. Alterar UN byte de una copia de un recibo y comprobar que falla"
+SAMPLE="$(ls "$BUNDLE"/evidence/*.json | head -1)"
+python3 - "$SAMPLE" "$WORK/tampered.json" <<'PY'
 import sys
 data = bytearray(open(sys.argv[1], "rb").read())
-offset = data.index(b'"outcome":"Deny"') + len('"outcome":"')
-data[offset:offset + 4] = b"Allo"  # "Deny" -> "Allo": se rompe el contenido firmado
+# Primera letra de decision.outcome (Allow, Deny o RequireApproval), en
+# mayúscula pasa a minúscula: se rompe el contenido firmado.
+offset = data.index(b'"outcome":"') + len('"outcome":"')
+data[offset] = data[offset] ^ 0x20
 open(sys.argv[2], "wb").write(data)
-print(f"{sys.argv[1].rsplit('/', 1)[-1]}: outcome alterado en el byte {offset}")
+print(f"{sys.argv[1].rsplit('/', 1)[-1]}: decision.outcome alterado en el byte {offset}")
 PY
 set +e
 "$VERIFY" evidence \

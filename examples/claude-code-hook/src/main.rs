@@ -40,13 +40,16 @@ const ATTESTER_PIN_FILE: &str = "attester-public-key.hex";
 const AGENTS_DIR: &str = "agents";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
 const MAIN_AGENT: &str = "main";
+/// Profile for any agent without an authority of its own: it holds no
+/// capability, so every request is denied, but with a signed receipt.
+const UNREGISTERED: &str = "unregistered";
 const SUBAGENTS: [&str; 3] = ["planner", "coder", "explorer"];
 const MAX_HOOK_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const AUTHORITY_LIFETIME_DAYS: i64 = 90;
 
 /// Capabilities granted to each agent's authority at `init`.
-const PROFILES: [(&str, &[&str]); 4] = [
+const PROFILES: [(&str, &[&str]); 6] = [
     (
         MAIN_AGENT,
         &[
@@ -61,6 +64,9 @@ const PROFILES: [(&str, &[&str]); 4] = [
     ("planner", &["fs:read"]),
     ("explorer", &["fs:read"]),
     ("coder", &["fs:read", "fs:write", "process:execute"]),
+    // Claude Code's built-in web reader: network only, no file access.
+    ("web-fetch", &["network:invoke"]),
+    (UNREGISTERED, &[]),
 ];
 
 type BoxError = Box<dyn std::error::Error>;
@@ -420,28 +426,41 @@ fn hook_output(verdict: &Verdict) -> Option<Value> {
 
 fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     let agent = input.agent_type.as_deref().unwrap_or(MAIN_AGENT);
-    if agent.is_empty()
-        || agent.len() > 64
-        || !agent
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
-    {
-        return Ok(denied(format!("invalid agent name {agent:?}")));
-    }
-    let profile_path = directory.join(AGENTS_DIR).join(format!("{agent}.json"));
-    if !profile_path.exists() {
+    if agent.len() > 64 {
         return Ok(denied(format!(
-            "no authority has been issued for agent '{agent}'"
+            "agent name longer than 64 bytes: {agent:?}"
         )));
     }
+    // Only a well-formed name can select a profile file; anything else, and
+    // any agent without an issued authority, is evaluated as `unregistered`.
+    let well_formed = !agent.is_empty()
+        && agent != UNREGISTERED
+        && agent
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    let profile_name = if well_formed
+        && directory
+            .join(AGENTS_DIR)
+            .join(format!("{agent}.json"))
+            .exists()
+    {
+        agent
+    } else {
+        UNREGISTERED
+    };
+    let profile_path = directory
+        .join(AGENTS_DIR)
+        .join(format!("{profile_name}.json"));
     let profile: AgentProfile = serde_json::from_slice(&read_bounded(&profile_path)?)?;
     let identity = AgentIdentity::from_json(&profile.identity.to_string())?;
     let authority = Authority::from_json(&profile.authority.to_string())?;
     let key = AgentKeyPair::from_secret_bytes(&read_secret(
-        &directory.join(AGENTS_DIR).join(format!("{agent}.key")),
+        &directory
+            .join(AGENTS_DIR)
+            .join(format!("{profile_name}.key")),
     )?);
     if key.public_key() != identity.verified_public_key()? {
-        return Err(format!("key for agent '{agent}' does not match its identity").into());
+        return Err(format!("key for profile '{profile_name}' does not match its identity").into());
     }
 
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
@@ -457,6 +476,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     let action = Action::new(action_type, None, parameters)?.with_capability(capability);
     let mut request = AuthorizationRequest::new(identity, authority, action)?
         .with_context("agent", json!(agent))
+        .with_context("profile", json!(profile_name))
         .with_context("tool", json!(input.tool_name));
     request.sign_intent(&key)?;
     let mut evidence = engine.evaluate(request)?;
@@ -464,7 +484,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         &directory.join(ATTESTER_KEY_FILE),
     )?))?;
 
-    append_receipt(directory, input, agent, &evidence)?;
+    append_receipt(directory, input, agent, profile_name, &evidence)?;
     let outcome = evidence.decision.outcome;
     Ok(Verdict {
         outcome,
@@ -498,12 +518,14 @@ fn append_receipt(
     directory: &Path,
     input: &HookInput,
     agent: &str,
+    profile: &str,
     evidence: &Evidence,
 ) -> Result<(), BoxError> {
     let line = json!({
         "tool_use_id": input.tool_use_id,
         "tool_name": input.tool_name,
         "agent": agent,
+        "profile": profile,
         "evidence": serde_json::from_str::<Value>(&evidence.to_json()?)?,
     });
     let mut options = fs::OpenOptions::new();
@@ -598,8 +620,9 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
         let tool = record["tool_name"].as_str().unwrap_or("unknown");
         let outcome = evidence.decision.outcome;
         let file = format!(
-            "evidence/{:04}-{agent}-{}-{outcome:?}.json",
+            "evidence/{:04}-{}-{}-{outcome:?}.json",
             number + 1,
+            agent.replace(|c: char| !c.is_ascii_alphanumeric() && c != '-', "_"),
             tool.replace(|c: char| !c.is_ascii_alphanumeric(), "_"),
         );
         fs::write(out.join(&file), evidence.to_json()?)?;
@@ -607,6 +630,7 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
             "file": file,
             "agent": agent,
             "tool_name": tool,
+            "profile": record["profile"],
             "tool_use_id": record["tool_use_id"],
             "outcome": outcome,
             "rule": deciding_rules(&evidence),
@@ -785,6 +809,18 @@ mod tests {
         assert_eq!(verdict.outcome, DecisionOutcome::Deny);
         let verdict = f.decide(Some("coder"), "Agent", json!({ "subagent_type": "coder" }));
         assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+
+        // The built-in web reader may use the network and nothing else.
+        let verdict = f.decide(
+            Some("web-fetch"),
+            "WebFetch",
+            json!({ "url": "https://x.test" }),
+        );
+        assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+        for (tool, input) in [("Read", read.clone()), ("Write", write.clone())] {
+            let verdict = f.decide(Some("web-fetch"), tool, input);
+            assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{tool}");
+        }
     }
 
     #[test]
@@ -860,10 +896,22 @@ mod tests {
     fn unknown_or_malformed_agents_are_denied() {
         let f = Fixture::new("unknown");
         let read = json!({ "file_path": f.path("README.md") });
-        for agent in ["general-purpose", "../main", "Main", ""] {
+        for agent in ["general-purpose", "../main", "Main", "", "unregistered"] {
             let verdict = f.decide(Some(agent), "Read", read.clone());
             assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{agent:?}");
+            assert!(verdict.reason.contains("fs:read"), "{}", verdict.reason);
         }
+        // Every one of those denials left a signed receipt under the
+        // `unregistered` profile that still names the requested agent.
+        let receipts = fs::read_to_string(f.state.join(RECEIPTS_FILE)).unwrap();
+        let records: Vec<Value> = receipts
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.len(), 5);
+        assert!(records.iter().all(|r| r["profile"] == UNREGISTERED));
+        assert_eq!(records[1]["agent"], "../main");
+        verify_receipts(&f.state).unwrap();
     }
 
     #[test]

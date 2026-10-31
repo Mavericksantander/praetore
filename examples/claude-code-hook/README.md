@@ -27,10 +27,18 @@ agente haga por otro camino queda fuera (ver Límites).
 | `main` (sesión principal, sin `agent_type`) | `fs:read`, `fs:write`, `process:execute`, `network:invoke`, `agent:delegate`, `tool:invoke` |
 | `planner`, `explorer` | `fs:read` |
 | `coder` | `fs:read`, `fs:write`, `process:execute` |
+| `web-fetch` (lector web incorporado de Claude Code) | `network:invoke` |
+| `unregistered` | ninguna |
 
-Cualquier otro `agent_type`, incluidos los agentes incorporados como
-`general-purpose`, no tiene autoridad emitida y se niega. Esa negación ocurre
-antes de evaluar, así que no deja recibo.
+Cualquier otro `agent_type`, incluidos agentes incorporados como
+`general-purpose`, se evalúa con el perfil `unregistered`. Ese perfil no
+tiene capacidades, así que toda solicitud se niega, pero con un recibo
+firmado que conserva el `agent_type` pedido. Así ninguna negación queda sin
+registrar.
+
+Darle red a `web-fetch` es una decisión de policy: en algunas instalaciones
+de Claude Code es la única vía para leer páginas web. Sácalo de `PROFILES`
+si no la quieres.
 
 Reglas de la policy por defecto:
 
@@ -63,7 +71,7 @@ una variable en posición de comando o junto a `push`, o un alias inline
 Desde la raíz de un clon:
 
 ```sh
-./examples/claude-code-hook/demo.sh     # regenera bundle/ con 19 tool calls fijas
+./examples/claude-code-hook/demo.sh     # regenera bundle/ con 21 tool calls fijas
 ./examples/claude-code-hook/verify.sh   # verifica bundle/ solo con praetore-verify
 ```
 

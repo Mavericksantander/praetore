@@ -14,7 +14,7 @@
         {
           "key": "path",
           "operator": "PathPrefix",
-          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.Gv3u9UGuzr/proyecto/.git"
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.xZEStVr4Yv/proyecto/.git"
         }
       ],
       "context_conditions": []
@@ -29,7 +29,7 @@
         {
           "key": "path",
           "operator": "PathPrefix",
-          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.Gv3u9UGuzr/proyecto/.claude"
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.xZEStVr4Yv/proyecto/.claude"
         }
       ],
       "context_conditions": [
@@ -54,7 +54,7 @@
         {
           "key": "path",
           "operator": "PathPrefix",
-          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.Gv3u9UGuzr/proyecto/.claude"
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.xZEStVr4Yv/proyecto/.claude"
         }
       ],
       "context_conditions": [
@@ -105,7 +105,7 @@
         {
           "key": "path",
           "operator": "PathPrefix",
-          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.Gv3u9UGuzr/proyecto"
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.xZEStVr4Yv/proyecto"
         }
       ],
       "context_conditions": []
@@ -135,7 +135,7 @@
         {
           "key": "path",
           "operator": "PathPrefix",
-          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.Gv3u9UGuzr/proyecto"
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.xZEStVr4Yv/proyecto"
         }
       ],
       "context_conditions": []
@@ -150,7 +150,7 @@
         {
           "key": "path",
           "operator": "PathPrefix",
-          "expected": "/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.Gv3u9UGuzr/home/.claude/projects"
+          "expected": "/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.xZEStVr4Yv/home/.claude/projects"
         }
       ],
       "context_conditions": [

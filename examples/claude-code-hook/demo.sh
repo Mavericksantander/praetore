@@ -72,7 +72,8 @@ call coder    Agent '{"subagent_type":"coder"}'                   "delega a otro
 call explorer Read  '{"file_path":"/etc/passwd"}'                 "lee fuera del proyecto"
 call explorer Read  '{"file_path":"../fuera.txt"}'                "lee con ruta relativa .."
 call general-purpose Read "{\"file_path\":\"$P/README.md\"}"      "agente sin autoridad"
-echo "(el agente sin autoridad se niega antes de evaluar, así que no deja recibo)"
+call web-fetch WebFetch '{"url":"https://example.com"}'          "lector web: usa la red"
+call web-fetch Read "{\"file_path\":\"$P/README.md\"}"         "lector web: lee un archivo"
 
 step "4. Verificar los recibos con el propio hook y exportar el bundle"
 "$BIN" verify "$STATE"
