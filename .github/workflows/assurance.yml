@@ -125,6 +125,25 @@ jobs:
       - run: python -m unittest discover -s packages/praetore-python/tests -v
       - run: ./examples/third-party-verification/verify.sh
 
+  claude-code-hook-example:
+    name: Claude Code hook example (standalone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # Not a workspace member: it has its own manifest and lockfile.
+      - run: cargo fmt --manifest-path examples/claude-code-hook/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path examples/claude-code-hook/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked
+      - name: Verify the committed bundle with praetore-verify only
+        run: ./examples/claude-code-hook/verify.sh
+      - name: Regenerate a bundle and verify it
+        run: |
+          ./examples/claude-code-hook/demo.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+          ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+
   replay-postgres:
     name: PostgreSQL replay guard integration
     runs-on: ubuntu-latest
