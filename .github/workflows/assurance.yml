@@ -215,13 +215,19 @@ jobs:
       - name: Runtime-role check connects as the postgres superuser
         run: |
           set -euo pipefail
-          # The service logs in as praetore. postgres_runtime_role_must_not_own_or_bypass_the_schema
-          # reads session_user after SET ROLE and requires that name to be postgres
-          # (initdb's superuser). Give that role a TCP password, then run only this test as it.
+          # initdb --username "$POSTGRES_USER" makes praetore the only superuser;
+          # there is no role named postgres. The test logs in as postgres and
+          # checks session_user, so create that role and then run only this test as it.
           container_id="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1)"
           test -n "$container_id"
-          docker exec "$container_id" psql -U praetore -d praetore_test -v ON_ERROR_STOP=1 \
-            -c "ALTER ROLE postgres WITH LOGIN PASSWORD 'praetore-test'"
+          exists="$(docker exec "$container_id" psql -U praetore -d praetore_test -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'postgres'")"
+          if [ "$exists" = "1" ]; then
+            docker exec "$container_id" psql -U praetore -d praetore_test -v ON_ERROR_STOP=1 \
+              -c "ALTER ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'praetore-test'"
+          else
+            docker exec "$container_id" psql -U praetore -d praetore_test -v ON_ERROR_STOP=1 \
+              -c "CREATE ROLE postgres LOGIN SUPERUSER PASSWORD 'praetore-test'"
+          fi
           PRAETORE_TEST_DATABASE_URL=postgres://postgres:praetore-test@localhost:5432/praetore_test \
             cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_runtime_role_must_not_own_or_bypass_the_schema
       - name: Stage replay-claim restart test
