@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Hash-linked JSONL export of receipts, as specified in
+  `docs/proposals/journal-chain-jsonl.md` (now marked implemented):
+  - `praetore_core::journal_chain`: the format, the link
+    (`SHA-256("PRAETORE_JOURNAL_LINK_V1\0" || u64_be(seq) || prev ||
+    context_hash || attester_signature)`), a producer (`ChainExporter`) and a
+    verifier (`verify_chain`) that share it.
+  - `praetore journal-export (--receipts-dir DIR | --tenant UUID)
+    --attester-pin HEX_FILE --output NEW_FILE` builds a chain from a
+    directory of receipts or from one tenant's `praetore.execution_journal`
+    rows, checking every receipt against the pinned attester key first. It
+    never overwrites the output.
+  - `praetore-verify journal --journal JSONL --attester-pin HEX_FILE
+    [--expected-head HEX] [--policy PATH]`, brought from
+    `feat/journal-chain-verifier` (`bfeade5`) by cherry-pick. Changes from
+    `bfeade5`: it uses the shared core code; adds `--expected-head`
+    (`JOURNAL_HEAD_MISMATCH`); every line, including the last, must end in
+    `\n` and `\r` is rejected (before, `lines()` accepted CRLF and a missing
+    final newline, and a file with only `\n` failed as `JOURNAL_CHAIN_FAIL`,
+    now `INVALID_REQUEST`); failures print the entry on stderr; test fixtures
+    updated for `Decision::allow(reason, DecidedBy)`.
+  - `examples/claude-code-hook/evidence/0{3,4,5}-*/journal-chain.jsonl`
+    (22, 8 and 118 entries; receipts unchanged), heads in `VERIFY.md`,
+    `verify-chain.sh`, and a `journal-chain` CI job that rejects a deleted,
+    deleted-and-relinked, truncated, reordered and altered copy.
+  - Limit: the link is unkeyed. Anyone with the receipts can rebuild a chain
+    over a subset, and the attester key holder can rebuild anything. A head
+    only detects deletion or truncation if it was published outside the
+    producer's control and passed as `--expected-head`; the heads in this
+    repository are not such an anchor.
 - **T-014, `praetore-mcp`:** arguments covered by a `PathPrefix` rule are
   resolved through the filesystem before evaluation. Unless an absolute value
   resolves to itself (no symlink, `.`/`..`, dangling link or missing parent),
@@ -12,6 +41,7 @@
   macOS, `/tmp/...` arguments under such a rule are now refused or not
   allowed; use resolved paths. `policy` commands and `policy check` warn
   about prefixes that resolve elsewhere. The check is point-in-time (TOCTOU).
+
 ## 0.3.0 - 2026-10-30
 
 - The gateway-service sandbox supervisor rejects a dispatch request when any

@@ -1,18 +1,28 @@
 # Propuesta: export encadenado del journal (JSONL)
 
-**Estado: propuesta.** No implementado en `main`. Ningún componente produce
-este formato. Un verificador de referencia quedó en la rama
-`feat/journal-chain-verifier` (commit `bfeade5`, subcomando
-`praetore-verify journal`), fuera de cualquier PR.
+**Estado: implementado** (rama `feat/journal-chain`, 31-oct-2026), con los
+límites de "Qué NO prueba", que siguen vigentes.
 
-El productor (exportador desde el journal Postgres) y el verificador irán
-juntos en un único PR futuro. Así no se publica un verificador para un
-formato que nadie genera.
+- Formato y link: `praetore_core::journal_chain`. Productor y verificador
+  usan la misma función de link.
+- Productor: `praetore journal-export (--receipts-dir DIR | --tenant UUID)
+  --attester-pin HEX_FILE --output NUEVO`. Desde un directorio encadena los
+  `*.json` en orden de nombre; desde el journal lee las filas del tenant en
+  `praetore.execution_journal` ordenadas por `(created_at, request_id)`.
+  Verifica cada recibo contra la clave fijada antes de encadenarlo y nunca
+  sobrescribe el archivo de salida.
+- Verificador: `praetore-verify journal --journal JSONL --attester-pin
+  HEX_FILE [--expected-head HEX] [--policy PATH]`. Viene de la rama
+  `feat/journal-chain-verifier` (commit `bfeade5`), integrado por
+  cherry-pick y alineado con `main`.
+- Evidencia: `examples/claude-code-hook/evidence/0{3,4,5}-*/journal-chain.jsonl`,
+  heads en `examples/claude-code-hook/evidence/VERIFY.md`, job de CI
+  `journal-chain`.
 
 ## Formato
 
-- Archivo UTF-8, una entrada por línea (`\n`), sin líneas vacías. Un archivo
-  vacío es inválido.
+- Archivo UTF-8, una entrada por línea; cada línea, incluida la última,
+  termina en `\n`. Sin líneas vacías ni `\r`. Un archivo vacío es inválido.
 - Cada línea es un objeto JSON con exactamente estos campos (cualquier otro
   campo se rechaza):
   - `seq`: entero sin signo. Es 0 en la primera línea y aumenta de 1 en 1.
@@ -49,9 +59,13 @@ Para cada línea, en orden:
 4. El `evidence_id` no se repite.
 5. Si se pasa `--policy`, el recibo registra ese digest de política
    (`Evidence::verify_policy`).
+6. Al final, si se pasa `--expected-head`, el link de la última entrada es
+   igual a ese valor (64 hex en minúsculas).
 
-Cualquier fallo termina con exit distinto de 0. El comportamiento es
-fail-closed.
+Cualquier fallo termina con exit distinto de 0, un código en stdout
+(`JOURNAL_CHAIN_FAIL`, `JOURNAL_HEAD_MISMATCH`, `EVIDENCE_FAIL`, `AUTH_FAIL`,
+`POLICY_MISMATCH`, `INVALID_REQUEST`, `INPUT_TOO_LARGE`) y un mensaje en
+stderr que indica la entrada. El comportamiento es fail-closed.
 
 ## Límites
 
@@ -61,25 +75,33 @@ fail-closed.
 
 ## Qué NO prueba
 
-El link es un SHA-256 **sin clave** y nadie firma ni publica el `head`. Por
-eso el formato, tal como está, **no** prueba que no se borró un recibo:
+El link es un SHA-256 **sin clave** y nadie firma el `head`. Quien tiene los
+recibos firmados (sin necesitar ninguna llave privada) puede borrar, mover o
+quitar recibos y recalcular `seq`, `prev` y el head; quien además tiene la
+llave del atestador puede firmar recibos nuevos y armar cualquier cadena. Por
+eso el head solo prueba algo si quedó **anclado fuera del control del
+productor** (publicado en otro lugar) y el verificador lo compara con
+`--expected-head`:
 
 - **Borrado en el medio, reordenamiento, inserción de recibos firmados
-  válidos:** no se detectan. Quien tenga el archivo puede quitar o mover
-  líneas y recalcular `seq` y `prev` de las siguientes; el verificador
-  acepta el resultado. Solo detecta ediciones de alguien que no recalcula
-  la cadena (errores accidentales, no un adversario).
-- **Truncado del final:** no se detecta. Un prefijo de una cadena válida es
-  una cadena válida, y no hay `head` esperado contra el cual comparar.
+  válidos:** sin `--expected-head` no se detectan si se recalcula la
+  cadena; el verificador solo detecta ediciones de quien no la recalcula.
+  Con un head anclado y `--expected-head`, la cadena recalculada da otro
+  head y se rechaza (`JOURNAL_HEAD_MISMATCH`).
+- **Truncado del final:** un prefijo de una cadena válida es una cadena
+  válida. Solo se detecta con `--expected-head`.
+- **Head publicado junto a la cadena:** los heads de `VERIFY.md` y del
+  workflow de CI están en el mismo repositorio que las cadenas. Quien pueda
+  cambiar una puede cambiar los otros: no son un ancla externa.
 - **Fork / equivocación:** no se detecta. El productor puede entregar
-  cadenas distintas a distintos auditores; cada una verifica.
-- **Reemplazo completo por una cadena recalculada:** no se detecta mientras
-  use recibos firmados por el atestador (cualquier subconjunto, en cualquier
-  orden). Lo único que no se puede es fabricar recibos: eso ya lo impide la
-  firma de cada recibo, no la cadena.
+  cadenas distintas a distintos auditores, cada una con su head.
+- **Reemplazo completo:** con la llave del atestador se puede rehacer todo,
+  incluidos los recibos. Lo único que no se puede sin esa llave es fabricar
+  recibos, y eso lo impide la firma de cada recibo, no la cadena.
 - Tampoco prueba que el export esté completo respecto del journal, ni que el
-  orden registrado sea el orden real de las decisiones, ni nada sobre la
-  autorización vigente, la frescura o el estado de replay.
+  orden registrado sea el orden real de las decisiones (el export desde el
+  journal ordena por `created_at`), ni nada sobre la autorización vigente,
+  la frescura o el estado de replay.
 
 ## Qué falta para que un tercero pruebe que no se borró nada
 
@@ -88,8 +110,9 @@ eso el formato, tal como está, **no** prueba que no se borró un recibo:
    recibo en el journal, con `seq` asignado por la base sin huecos.
 2. **Head firmado.** El atestador (o la clave del gateway) firma
    periódicamente `(seq, head, timestamp)` con un dominio propio, y el
-   verificador exige `--expected-head` o un head firmado contra la clave
-   fijada. Sin esto el truncado y el recálculo pasan.
+   verificador exige un head firmado contra la clave fijada. Hoy existe
+   `--expected-head`, que compara contra un valor que el auditor consiguió
+   por su cuenta; no hay head firmado.
 3. **Mejor aún, ligar el `prev` dentro del recibo firmado**, para que la
    firma de cada recibo cubra su posición y no se pueda reencadenar sin la
    clave del atestador.

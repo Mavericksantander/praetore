@@ -31,8 +31,10 @@ flowchart LR
 ## Contents
 
 - [Quickstart](#quickstart)
+- [Install with your AI coding agent](#install-with-your-ai-coding-agent)
 - [Third-party verification demo](#third-party-verification-demo)
 - [Human approval with `praetore approve`](#human-approval-with-praetore-approve)
+- [Claude Code hook: visual evidence](#claude-code-hook-visual-evidence)
 - [Verify evidence offline](#verify-evidence-offline)
 - [Workspace crates](#workspace-crates)
 - **Reference**
@@ -101,6 +103,131 @@ cargo run -p praetore-core --example high_assurance
 
 ---
 
+## Install with your AI coding agent
+
+This section is for people who prefer to let an AI coding agent (Claude Code,
+Cursor or a similar tool) do the installation. Copy the prompt below and paste
+it into your agent. The agent should explain every step and wait for your
+approval before it changes anything on your computer.
+
+PRÆTORE is pre-release software (v0.3.0). It has not been independently
+audited and comes with no security guarantees.
+
+### Prompt to copy
+
+```text
+Install praetore-mcp (PRÆTORE) for me, version v0.3.0, from the official
+repository https://github.com/Mavericksantander/praetore. Follow these rules
+exactly.
+
+Ground rules
+- Explain each step in plain language before you run it, and wait for my
+  explicit "yes" before you install anything, run `praetore-mcp init`, or
+  change any MCP client configuration. If I do not answer, do not continue.
+- Never use sudo. Everything installs in my user account (~/.cargo/bin and
+  ~/.praetore/mcp).
+- Never disable, uninstall, bypass or weaken PRÆTORE for yourself, and never
+  edit its policy or my client config without asking me first.
+- Only use commands and flags shown by `praetore-mcp --help`,
+  `praetore-mcp <command> --help` and `praetore-verify --help`. If something
+  you need is not there, stop and tell me.
+- Read crates/praetore-mcp/README.md and crates/praetore-mcp/GUIDE.md in the
+  repository at tag v0.3.0 before you start.
+
+Steps
+1. Check that Rust 1.88 or newer and Cargo are installed (`cargo --version`).
+   If not, tell me how to install them and stop.
+2. Install both tools from the official repository, pinned to v0.3.0:
+     cargo install --git https://github.com/Mavericksantander/praetore --tag v0.3.0 --locked praetore-mcp
+     cargo install --git https://github.com/Mavericksantander/praetore --tag v0.3.0 --locked praetore-verify
+   Then run `praetore-mcp --version` and show me the output.
+3. Run `praetore-mcp init`. Show me the files it created and explain them.
+4. Find my MCP client. `praetore-mcp install` supports
+   `--client claude-desktop`, `--client cursor` and `--client vscode`. If my
+   client is not one of these, stop and tell me.
+5. Back up the client config yourself (copy it to a file next to it with a
+   date in the name), in addition to the backup praetore-mcp writes.
+6. Show me the diff before applying anything:
+     praetore-mcp install --client <client> --mode observe --dry-run
+   Explain each change. Only after I say yes, apply it in observe mode:
+     praetore-mcp install --client <client> --mode observe
+   Then tell me to restart the client.
+7. Verify with real calls:
+   a. Make one harmless call through a wrapped MCP server (for example,
+      listing a directory) and show me the ALLOW receipt with
+      `praetore-mcp receipts --tail 5`.
+   b. With my approval, add a deny rule for a harmless tool, for example
+        praetore-mcp policy deny --id test-deny --server <server> --tool <tool>
+        praetore-mcp policy check
+      Ask me to restart the client, call that tool, and show me the DENY
+      receipt. Explain that in observe mode the call still runs; the receipt
+      only records what enforce mode would have blocked.
+   c. Run `praetore-mcp verify`. Then copy one receipt line from
+      ~/.praetore/mcp/receipts/<UTC date>.jsonl to a file and verify it with
+        praetore-verify evidence --evidence <file> \
+          --attester-pin ~/.praetore/mcp/attester-public-key.hex \
+          --issuer-pins ~/.praetore/mcp/issuer-pins.jsonl --require-intent
+      Show me the output and explain it.
+   d. Ask me whether to keep the test rule; remove it with
+      `praetore-mcp policy remove --id test-deny` if I say so.
+8. Explain how to roll back:
+     praetore-mcp uninstall --client <client> --dry-run
+     praetore-mcp uninstall --client <client>
+   or restore the backup file, then restart the client. To remove the
+   programs: `cargo uninstall praetore-mcp` and
+   `cargo uninstall praetore-verify`. ~/.praetore/mcp holds my keys and
+   receipts; delete it only if I ask.
+9. Do not switch to enforce mode unless I ask. If I do, use
+   `praetore-mcp uninstall --client <client>` and then
+   `praetore-mcp install --client <client> --mode enforce`, showing me the
+   `--dry-run` diff first.
+```
+
+### What the agent must explain to you
+
+Before you approve any step, the agent should explain these points in plain
+language:
+
+- **What PRÆTORE is.** `praetore-mcp` sits between your AI client and its MCP
+  servers. Every MCP tool call is checked against a policy, and the decision
+  is saved as a signed receipt that can be checked later.
+- **What it covers.** Only tool calls that go through an MCP server wrapped by
+  `praetore-mcp`. The client's own built-in tools (for example Claude Code's
+  Read/Write/Bash tools, or Cursor's built-in edit and terminal tools) are
+  **not** covered. If something happened and there is no receipt for it, it
+  did not go through PRÆTORE.
+- **Observe versus enforce.** Observe mode (the default) lets every call run
+  and only records what the policy decided. Enforce mode blocks calls the
+  policy denies or marks as needing approval.
+- **Where things live.** The keys, policy and receipts are in
+  `~/.praetore/mcp` (or `$PRAETORE_MCP_HOME`). The private keys are in
+  `~/.praetore/mcp/keys/`. They are local test keys: never share them or
+  paste them anywhere. Anyone who can read them can create receipts that
+  verify.
+- **What a receipt proves, and what it does not.** A receipt shows that this
+  installation recorded a decision for a tool call under a given policy, and
+  that the receipt was not changed afterwards. It does not prove that you or
+  the AI model intended the call, that the call actually ran, or who controls
+  the computer.
+- **Which files change.** Your MCP client config (for example
+  `~/.cursor/mcp.json` or `claude_desktop_config.json`), with a backup next
+  to it. New files in `~/.praetore/mcp`. Two programs in `~/.cargo/bin`.
+- **How to roll back.** `praetore-mcp uninstall --client <client>` restores
+  the original config entries, or you can restore the backup file.
+  `cargo uninstall praetore-mcp praetore-verify` removes the programs.
+- **Known limits.** Enforcement is cooperative: anyone who can edit the
+  client config can remove the wrapper. Path rules do not resolve symlinks,
+  and there is a time-of-check to time-of-use (TOCTOU) race: a file or
+  symlink can change after the decision and before the server uses it.
+  REQUIRE_APPROVAL has no approval flow yet; enforce mode blocks it. Policy
+  changes need a client restart.
+- **Pre-release.** This is v0.3.0, pre-release software with no security
+  guarantees. It has not been independently audited.
+- **You decide.** You approve each step. The agent should not continue
+  without your explicit yes.
+
+---
+
 ## Third-party verification demo
 
 One command signs a fictitious receipt, verifies it with public keys only,
@@ -156,6 +283,66 @@ praetore dispatch ./praetore-local <request_id>
   this is not key custody or separation of duties.
 
 Full guide: [`crates/praetore-cli/README.md`](crates/praetore-cli/README.md).
+
+---
+
+## Claude Code hook: visual evidence
+
+Recorded with `asciinema` and `agg` by
+[`scripts/record-hook-demo.sh`](scripts/record-hook-demo.sh), which uses
+throwaway test keys generated in a temporary `DEMO-TEST-KEYS-*` directory and
+deleted on exit. It shows one allowed, one denied and one approval-required
+tool call through [`examples/claude-code-hook`](examples/claude-code-hook),
+then `praetore-verify` accepting the receipts and rejecting a copy with one
+altered byte.
+
+![Claude Code hook demo: allow, deny, approval, then offline verification and a rejected tampered receipt](docs/img/hook-demo.gif)
+
+### Flow applied to the hook
+
+Based on `authorize` and `hook_output` in
+[`examples/claude-code-hook/src/main.rs`](examples/claude-code-hook/src/main.rs).
+
+```mermaid
+flowchart LR
+    A["Agent<br/>Claude Code PreToolUse event<br/>agent_type or main"] --> AU["Authority<br/>profile identity + signed authority<br/>unknown agent: unregistered, no capabilities"]
+    AU --> AC["Action<br/>classify tool_name / tool_input<br/>paths resolved in the hook<br/>intent signed with profile key"]
+    AC --> P["Policy<br/>AuthorizationEngine::strict<br/>policy v2, default deny<br/>issuer pin"]
+    P --> D{"Decision"}
+    D -->|Allow| D1["no hook output:<br/>Claude Code permissions apply"]
+    D -->|Deny| D2["permissionDecision: deny"]
+    D -->|RequireApproval| D3["permissionDecision: ask"]
+    D --> E["Evidence<br/>signed by attester key<br/>appended to receipts.jsonl"]
+    E --> V["praetore-verify / hook verify<br/>offline, public keys only"]
+    X["hook error"] -.->|fail closed| D2
+```
+
+### Session verified by the CTO
+
+| Item | Result |
+| --- | --- |
+| Receipts | [118](examples/claude-code-hook/evidence/05-sesion-real-final/) |
+| Allow | 117 |
+| Deny | 0 |
+| RequireApproval | 1 |
+| Tampered copies rejected | 20 of 20 |
+| Verification | Offline, with `praetore-verify` and public keys only |
+| Evidence | [`examples/claude-code-hook/evidence/`](examples/claude-code-hook/evidence/) |
+| How to verify | [`VERIFY.md`](examples/claude-code-hook/evidence/VERIFY.md) |
+
+Scope: this covers only the tool calls that went through the hook; anything
+an agent does by another path is outside it. The receipts prove integrity of
+what was recorded, not that the authority is still valid today. The receipts, keys
+and policy are in
+[`examples/claude-code-hook/evidence/`](examples/claude-code-hook/evidence/);
+commands and real outputs are in
+[`VERIFY.md`](examples/claude-code-hook/evidence/VERIFY.md), and CI re-verifies
+sets 03, 04 and 05.
+
+Note: the public keys ship with the evidence, so the checks prove integrity,
+not the identity of the signer. Session 04 left 33 denials without a receipt
+(documented in its
+[README](examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch/README.md)).
 
 ---
 
@@ -410,6 +597,11 @@ The following are **open pull requests, not merged** and not available on
   validated target-cluster integration needed to establish an end-to-end
   sandbox.
 * An accreditation, or a guarantee that a deployment is protected.
+
+**Application domains.** Beyond AI coding agents, defense and autonomy is an
+application domain for deterministic governance: non-lethal autonomous
+systems whose decisions are governed by policy and leave auditable evidence.
+This describes a direction, not a current capability or engagement.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
