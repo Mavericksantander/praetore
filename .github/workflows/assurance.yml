@@ -36,6 +36,15 @@ jobs:
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
 
+  macos:
+    name: macOS workspace link
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --locked
+      - run: cargo test -p praetore-python --locked
+
   verifier-features:
     name: Offline verifiers build without receipt signing
     runs-on: ubuntu-latest
