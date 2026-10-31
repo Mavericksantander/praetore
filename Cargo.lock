@@ -1231,6 +1231,7 @@ dependencies = [
  "praetore-core",
  "praetore-receipt",
  "pyo3",
+ "pyo3-build-config",
 ]
 
 [[package]]
