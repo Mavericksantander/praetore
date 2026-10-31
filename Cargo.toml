@@ -11,6 +11,8 @@ members = [
     "crates/praetore-cli",
     "crates/praetore-observe",
     "crates/praetore-mcp",
+    "crates/praetore-signer-pkcs11",
+    "crates/praetore-signer-aws-kms",
 ]
 
 [workspace.package]

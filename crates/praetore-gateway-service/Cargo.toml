@@ -21,6 +21,11 @@ path = "src/main.rs"
 name = "praetore-sandbox-supervisor"
 path = "src/sandbox_supervisor_main.rs"
 
+[features]
+default = []
+# Signing keys in a PKCS#11 token (HSM; SoftHSM2 for development and CI).
+pkcs11 = ["dep:praetore-signer-pkcs11"]
+
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.22"
@@ -32,6 +37,7 @@ postgres = "0.19"
 praetore-core = { path = "../praetore-core" }
 praetore-gateway = { path = "../praetore-gateway" }
 praetore-replay-postgres = { path = "../praetore-replay-postgres" }
+praetore-signer-pkcs11 = { path = "../praetore-signer-pkcs11", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -45,3 +51,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = "1.18"
+zeroize = "1.8"
+
+[dev-dependencies]
+# Only for the ignored SoftHSM2 test of the `pkcs11` feature.
+praetore-signer-pkcs11 = { path = "../praetore-signer-pkcs11", features = ["softhsm-testing"] }
