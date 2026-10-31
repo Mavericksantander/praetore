@@ -10,12 +10,18 @@
   and `path_list` values get the lexical path check; free text in `string`
   values is not path-checked. The check is fail-closed and much stricter
   than in 0.3.0. A `path` value, and every `path_list` element, is split on
-  both `/` and `\`, and every segment must match `[A-Za-z0-9._-]+` and must
-  not start with `.`. As a consequence the supervisor refuses:
+  both `/` and `\`; every segment must match `[A-Za-z0-9._-]+`, must not
+  start with `.` or `-`, and must be at most 255 bytes; the whole value must
+  be at most 1024 bytes (the in-process sandbox dispatcher's
+  `MAX_COMPONENT_BYTES` and `MAX_PATH_BYTES`). As a consequence the
+  supervisor refuses:
   - an empty value, an empty segment (`a//b`, a trailing separator as in
     `dir/`) and the segments `.` and `..`;
   - hidden names such as `.env` or `a/.git/config`, and `...` (a leading
     `.` is rejected on purpose; this may be relaxed later);
+  - option-like names such as `-rf`, `--` or `a/-n`, in case a tool profile
+    passes a path to a subprocess without `--`;
+  - a segment longer than 255 bytes or a value longer than 1024 bytes;
   - a leading `/`, `\` or `~`, and a drive or UNC prefix;
   - spaces and punctuation outside `._-` (`+`, `@`, `~`, `%`, `:`, ...);
     `%` is always refused, including names such as `100%.txt`;
@@ -23,14 +29,23 @@
     such as Cyrillic `а` (U+0430) or full-width `ａ` (U+FF41);
   - control characters, Unicode format (Cf) and bidi characters, and
     U+2028/U+2029 (also checked explicitly, as defense in depth).
+  - Not covered, because runners are Linux only: Windows reserved device
+    names (`CON`, `NUL`, `COM1`, `aux.txt`) and trailing dots (`a.`, `x..`).
+  - By design, only keys declared `path` or `path_list` are path-checked: a
+    `string` value such as `../../etc/passwd` is accepted. Declare as `path`
+    every key the runner uses as a path.
   - Path migration for callers: send `x` instead of `./x` and `dir`
     instead of `dir/`, and rename files whose names use spaces, non-ASCII
-    letters, other punctuation or a leading `.` (for example `informe año 2026.txt` →
-    `informe_ano_2026.txt`, `.env` → `env`) before routing them through a
-    `path` or `path_list` parameter. Free text belongs in a `string` key.
+    letters, other punctuation or a leading `.` or `-` (for example
+    `informe año 2026.txt` → `informe_ano_2026.txt`, `.env` → `env`) before
+    routing them through a `path` or `path_list` parameter. Free text
+    belongs in a `string` key.
   - Kinds: `path`, `path_list` (array of at most 64 `path` values, each
     checked), `string`, `integer`, `boolean`. Nested objects are not
     supported.
+  - Schema keys must match `[a-z0-9_]+` (at most 256 bytes); otherwise the
+    configuration is refused at startup. Rename keys such as `orderId`,
+    `order-id` or `Path` to `order_id` or `path`.
   - `"key": "kind"` declares a **required** key. A key is optional only when
     written as `"key": {"kind": "...", "optional": true}`.
   - A version 1 file is refused at startup, not upgraded.

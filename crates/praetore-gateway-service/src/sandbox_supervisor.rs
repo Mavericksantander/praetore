@@ -8,7 +8,10 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use praetore_core::{Action, Authority, canonical::parse_json_rejecting_duplicates};
-use praetore_gateway::{DispatchReport, ExecutionKey, action_digest, authority_tenant_id};
+use praetore_gateway::{
+    DispatchReport, ExecutionKey, action_digest, authority_tenant_id,
+    sandbox::{MAX_COMPONENT_BYTES, MAX_PATH_BYTES},
+};
 use reqwest::{Client, StatusCode as ClientStatus, Url};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer,
@@ -393,7 +396,7 @@ impl SandboxSupervisor {
                 || !valid_route_text(&route.target)
                 || !valid_route_text(&route.capability)
                 || route.parameters.len() > 64
-                || route.parameters.keys().any(|key| !valid_route_text(key))
+                || route.parameters.keys().any(|key| !valid_parameter_key(key))
             {
                 return Err("sandbox supervisor route contains invalid fields".into());
             }
@@ -653,12 +656,22 @@ fn value_matches_kind(kind: ParameterKind, value: &Value) -> bool {
     }
 }
 
-/// Lexical only, fail-closed. Every segment (split on both `/` and `\`, so the
-/// result does not depend on the host OS) must match `[A-Za-z0-9._-]+` and
-/// must not start with `.`: this refuses `.`, `..`, hidden names such as
-/// `.env`, spaces, and every non-ASCII character, including homoglyphs such
-/// as Cyrillic `а` or full-width `ａ`. Rejecting a leading `.` is a
-/// deliberate choice (over-rejecting is the safe side) that can be relaxed.
+/// Lexical only, fail-closed. The value must be at most [`MAX_PATH_BYTES`]
+/// and every segment (split on both `/` and `\`, so the result does not
+/// depend on the host OS) at most [`MAX_COMPONENT_BYTES`]; these are the
+/// limits of the in-process sandbox dispatcher. Every segment must match
+/// `[A-Za-z0-9._-]+` and must not start with `.` or `-`: this refuses `.`,
+/// `..`, hidden names such as `.env`, option-like names such as `-rf` (in
+/// case a tool profile passes a path to a subprocess without `--`), spaces,
+/// and every non-ASCII character, including homoglyphs such as Cyrillic `а`
+/// or full-width `ａ`. Rejecting a leading `.` or `-` is a deliberate choice
+/// (over-rejecting is the safe side) that can be relaxed.
+///
+/// Not covered, because runners are Linux only: Windows reserved device
+/// names (`CON`, `NUL`, `COM1`, `aux.txt`) and trailing dots (`a.`, `x..`),
+/// which Win32 would treat specially. Only keys declared as `path` or
+/// `path_list` are checked; a `string` value is free text by design, so a
+/// route must declare as `path` every key its runner uses as a path.
 ///
 /// The allowlist already implies the following, which are still checked
 /// explicitly as defense in depth: an empty value; NUL and every other
@@ -671,6 +684,7 @@ fn lexically_confined_text(text: &str) -> bool {
     let rooted = text.starts_with(['/', '\\']);
     let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
     !text.is_empty()
+        && text.len() <= MAX_PATH_BYTES
         && !rooted
         && !drive
         && !text.starts_with('~')
@@ -683,10 +697,12 @@ fn lexically_confined_text(text: &str) -> bool {
             .all(|segment| !matches!(segment, "" | "." | "..") && allowed_path_segment(segment))
 }
 
-/// `[A-Za-z0-9._-]+`, not starting with `.`.
+/// `[A-Za-z0-9._-]+`, not starting with `.` or `-`, at most
+/// [`MAX_COMPONENT_BYTES`].
 fn allowed_path_segment(segment: &str) -> bool {
     !segment.is_empty()
-        && !segment.starts_with('.')
+        && segment.len() <= MAX_COMPONENT_BYTES
+        && !segment.starts_with(['.', '-'])
         && segment
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
@@ -1092,6 +1108,17 @@ fn valid_profile(value: &str) -> bool {
                 })
                 && value.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
     )
+}
+
+/// A route's schema keys must be `[a-z0-9_]+` (at most 256 bytes), so keys
+/// that differ only in case, Unicode homoglyphs, bidi controls, spaces or
+/// path-like punctuation cannot be declared.
+fn valid_parameter_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 256
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 fn valid_route_text(value: &str) -> bool {
@@ -1626,6 +1653,62 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_config_requires_lowercase_ascii_schema_keys() {
+        let config = |parameters: Value| {
+            json!({
+                "schema_version": 2,
+                "runner_image": format!(
+                    "registry.example.com/praetore/tool-runner@sha256:{}",
+                    "a".repeat(64)
+                ),
+                "routes": [{
+                    "tenant_id": Uuid::from_u128(1),
+                    "action_type": "orders:create",
+                    "target": "orders-api",
+                    "capability": "orders:write",
+                    "tool_profile": "orders-create",
+                    "parameters": parameters
+                }]
+            })
+            .to_string()
+        };
+        let starts = |parameters: Value| {
+            SandboxSupervisor::new(
+                KubernetesApi {
+                    client: Client::new(),
+                    base_url: Url::parse("https://kubernetes.default.svc/").unwrap(),
+                },
+                &config(parameters),
+            )
+            .is_ok()
+        };
+        assert!(starts(json!({
+            "order_id_2": "string",
+            "x9": "integer",
+            "_": "boolean",
+            "a".repeat(256): "path"
+        })));
+        let mut started = Vec::new();
+        for parameters in [
+            json!({"path": "path", "Path": "string"}),
+            json!({"PATH": "string"}),
+            json!({"p\u{0430}th": "path"}),
+            json!({"pa\u{202E}th": "path"}),
+            json!({"a b/../c": "string"}),
+            json!({"order-id": "string"}),
+            json!({"order.id": "string"}),
+            json!({"path ": "path"}),
+            json!({"\u{00E9}": "string"}),
+            json!({"a".repeat(257): "string"}),
+        ] {
+            if starts(parameters.clone()) {
+                started.push(parameters.to_string());
+            }
+        }
+        assert!(started.is_empty(), "started with keys: {started:?}");
+    }
+
+    #[test]
     fn supervisor_config_requires_a_digest_pinned_runner_and_unique_routes() {
         let kubernetes = || KubernetesApi {
             client: Client::new(),
@@ -2109,6 +2192,40 @@ mod tests {
             "c\u{03BF}nfig",
         ]);
         assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_leading_dash_segments() {
+        let accepted = accepted_as_path_or_list_item(&[
+            "-rf", "-", "--", "a/-n", "dir\\-x", "--help", "a/b/-",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_limits_segment_and_path_length() {
+        // The limits of the in-process sandbox dispatcher.
+        assert_eq!(MAX_COMPONENT_BYTES, 255);
+        assert_eq!(MAX_PATH_BYTES, 1024);
+        let segment = "a".repeat(MAX_COMPONENT_BYTES);
+        // 254 + 3 * (1 + 255) + 2 = 1024 bytes, every segment within its limit.
+        let longest_path = format!("{}/{segment}/{segment}/{segment}/e", "a".repeat(254));
+        assert_eq!(longest_path.len(), MAX_PATH_BYTES);
+        let accepted = accepted_as_path_or_list_item(&[&segment, &longest_path]);
+        assert_eq!(accepted.len(), 4, "rejected a value within the limits");
+
+        let too_long_segment = "a".repeat(MAX_COMPONENT_BYTES + 1);
+        let accepted = accepted_as_path_or_list_item(&[
+            &too_long_segment,
+            &format!("dir/{too_long_segment}"),
+            &format!("{longest_path}e"),
+            "a/".repeat(2_000).trim_end_matches('/'),
+        ]);
+        let accepted: Vec<usize> = accepted.iter().map(String::len).collect();
+        assert!(
+            accepted.is_empty(),
+            "accepted values of lengths: {accepted:?}"
+        );
     }
 
     #[test]
