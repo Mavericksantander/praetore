@@ -4,11 +4,10 @@ use praetore_core::{
     engine::TrustedAuthorityIssuer,
     evidence::Evidence,
     identity::{AgentIdentity, VerifiedPublicKey},
+    journal_chain::{ChainLink, MAX_CHAIN_BYTES, verify_chain},
     policy::Policy,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
-use sha2::{Digest, Sha256};
+use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
@@ -19,10 +18,6 @@ use std::{
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const MAX_INPUT_BYTES: usize = 65_536;
-const MAX_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
-const MAX_JOURNAL_ENTRIES: usize = 4_096;
-const JOURNAL_LINK_DOMAIN: &[u8] = b"PRAETORE_JOURNAL_LINK_V1\0";
-const JOURNAL_GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputFormat {
@@ -66,6 +61,7 @@ enum Command {
     Journal {
         journal: PathBuf,
         attester_pin: PathBuf,
+        expected_head: Option<String>,
         policy: Option<PathBuf>,
     },
     PolicyDigest {
@@ -241,15 +237,22 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             }
         }
         "journal" => {
-            if values
-                .keys()
-                .any(|key| !matches!(key.as_str(), "--journal" | "--attester-pin" | "--policy"))
-            {
+            if values.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "--journal" | "--attester-pin" | "--expected-head" | "--policy"
+                )
+            }) {
                 return Err(CliError::usage());
             }
             Command::Journal {
                 journal: path("--journal")?,
                 attester_pin: path("--attester-pin")?,
+                expected_head: match values.get("--expected-head") {
+                    None => None,
+                    Some(Some(value)) => Some(value.clone()),
+                    Some(None) => return Err(CliError::usage()),
+                },
                 policy: optional_path("--policy"),
             }
         }
@@ -386,14 +389,37 @@ fn execute(command: Command) -> Result<Summary, CliError> {
         Command::Journal {
             journal,
             attester_pin,
+            expected_head,
             policy,
         } => {
+            let expected_head = expected_head
+                .as_deref()
+                .map(|value| {
+                    ChainLink::from_hex(value).ok_or(CliError {
+                        code: "INVALID_REQUEST",
+                    })
+                })
+                .transpose()?;
             let policy = policy.as_deref().map(read_policy).transpose()?;
             let attester = read_attester_pin(&attester_pin)?;
-            let text = read_limited_to(&journal, MAX_JOURNAL_BYTES)?;
-            let (entries, head) = verify_journal(&text, &attester, policy.as_ref())?;
-            details.insert("entries".into(), serde_json::Value::Number(entries.into()));
-            details.insert("head".into(), serde_json::Value::String(head));
+            let text = read_limited_to(&journal, MAX_CHAIN_BYTES)?;
+            let chain = verify_chain(&text, &attester, policy.as_ref(), expected_head.as_ref())
+                .map_err(|error| {
+                    eprintln!("journal: {error}");
+                    CliError { code: error.code() }
+                })?;
+            details.insert(
+                "entries".into(),
+                serde_json::Value::Number(chain.entries.get().into()),
+            );
+            details.insert(
+                "head".into(),
+                serde_json::Value::String(chain.head.to_hex()),
+            );
+            details.insert(
+                "expected_head_verified".into(),
+                serde_json::Value::Bool(expected_head.is_some()),
+            );
             details.insert(
                 "policy_verified".into(),
                 serde_json::Value::Bool(policy.is_some()),
@@ -455,77 +481,6 @@ fn execute(command: Command) -> Result<Summary, CliError> {
         code: "OK",
         details,
     })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JournalEntry<'a> {
-    seq: u64,
-    prev: String,
-    #[serde(borrow)]
-    evidence: &'a RawValue,
-}
-
-/// Link hash of one journal entry. Covers the position, the previous link
-/// and the receipt's context hash and attester signature, so reordering,
-/// dropping, inserting or swapping receipts breaks the chain.
-fn journal_link(seq: u64, prev: &str, evidence: &Evidence) -> Result<String, CliError> {
-    let signature = evidence
-        .attester_signature
-        .as_deref()
-        .ok_or(CliError { code: "AUTH_FAIL" })?;
-    let mut hasher = Sha256::new();
-    hasher.update(JOURNAL_LINK_DOMAIN);
-    hasher.update(seq.to_be_bytes());
-    hasher.update(prev.as_bytes());
-    hasher.update(evidence.context_hash.as_bytes());
-    hasher.update(signature.as_bytes());
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn verify_journal(
-    text: &str,
-    attester: &VerifiedPublicKey,
-    policy: Option<&Policy>,
-) -> Result<(u64, String), CliError> {
-    let chain_fail = || CliError {
-        code: "JOURNAL_CHAIN_FAIL",
-    };
-    let mut prev = JOURNAL_GENESIS.to_owned();
-    let mut seen = HashSet::new();
-    let mut count: u64 = 0;
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            return Err(chain_fail());
-        }
-        if count as usize >= MAX_JOURNAL_ENTRIES {
-            return Err(CliError {
-                code: "INPUT_TOO_LARGE",
-            });
-        }
-        let entry: JournalEntry<'_> = serde_json::from_str(line).map_err(|_| CliError {
-            code: "INVALID_REQUEST",
-        })?;
-        if entry.seq != count || entry.prev != prev {
-            return Err(chain_fail());
-        }
-        let evidence = Evidence::from_json(entry.evidence.get()).map_err(CliError::from_core)?;
-        evidence
-            .verify_attester_signature(attester)
-            .map_err(CliError::from_core)?;
-        if !seen.insert(evidence.evidence_id) {
-            return Err(chain_fail());
-        }
-        if let Some(policy) = policy {
-            verify_receipt_policy(&evidence, policy)?;
-        }
-        prev = journal_link(entry.seq, &prev, &evidence)?;
-        count += 1;
-    }
-    if count == 0 {
-        return Err(chain_fail());
-    }
-    Ok((count, prev))
 }
 
 fn read_policy(path: &Path) -> Result<Policy, CliError> {

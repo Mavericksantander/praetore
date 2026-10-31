@@ -128,7 +128,8 @@ fn code(output: &Output) -> String {
 }
 
 fn verify_journal(dir: &Dir, lines: &[String], pin_file: &str, policy: Option<&str>) -> Output {
-    let path = dir.write("journal.jsonl", lines.join("\n") + "\n");
+    let text: String = lines.iter().map(|line| format!("{line}\n")).collect();
+    let path = dir.write("journal.jsonl", text);
     let mut args = vec!["journal", "--journal", &path, "--attester-pin", pin_file];
     if let Some(policy) = policy {
         args.extend(["--policy", policy]);

@@ -53,6 +53,37 @@ jobs:
       - name: Verify set 05
         run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/05-sesion-real-final
 
+  journal-chain:
+    name: Journal chains (sets 03, 04, 05) and tampered copies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # The expected heads are pinned here, separately from the chain files, so
+    # a change to a chain file alone fails this job. They live in the same
+    # repository, so this is not an external anchor (see VERIFY.md).
+    env:
+      HEAD_03: 4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a
+      HEAD_04: f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0
+      HEAD_05: 79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # verify-chain.sh exits non-zero if the chain or its head does not
+      # verify, if re-exporting does not reproduce it byte for byte, or if any
+      # tampered copy (deleted receipt, deleted and re-linked, truncated,
+      # reordered, altered byte) is accepted.
+      - name: Chain of set 03
+        run: ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/03-bundle-demo-reproducible "$HEAD_03"
+      - name: Chain of set 04
+        run: ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch "$HEAD_04"
+      - name: Chain of set 05
+        run: ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/05-sesion-real-final "$HEAD_05"
+      - name: A wrong expected head is rejected
+        run: |
+          if ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch "$HEAD_05"; then
+            echo "::error::set 04 verified against the head of set 05"; exit 1
+          fi
+
   macos:
     name: macOS workspace link
     runs-on: macos-15
@@ -184,6 +215,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p praetore-replay-postgres --locked
+      - run: cargo test -p praetore-cli --locked -- --ignored --exact journal_export::tests::postgres_export_reads_only_the_tenant_rows_in_insert_order
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored claim_is_unique_and_survives_a_new_client
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored concurrent_connections_allow_exactly_one_claim
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored a_lost_database_connection_fails_closed_and_a_new_client_recovers
