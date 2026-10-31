@@ -53,6 +53,9 @@ pub fn classify_code(code: Option<&str>) -> KmsCallError {
     }
 }
 
+/// Owns a one-thread tokio runtime. Keep it for the life of the process
+/// (inside the signer): like any tokio runtime, it must not be dropped from
+/// within an async context.
 pub struct AwsSdkKmsClient {
     client: aws_sdk_kms::Client,
     runtime: tokio::runtime::Runtime,

@@ -212,10 +212,10 @@ fn decode_key_hex(text: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
         return None;
     }
     let mut key = Zeroizing::new([0u8; 32]);
-    for (index, pair) in text.chunks_exact(2).enumerate() {
-        let high = lower_hex_value(pair[0])?;
-        let low = lower_hex_value(pair[1])?;
-        key[index] = (high << 4) | low;
+    for (index, byte) in key.iter_mut().enumerate() {
+        let high = lower_hex_value(text[2 * index])?;
+        let low = lower_hex_value(text[2 * index + 1])?;
+        *byte = (high << 4) | low;
     }
     Some(key)
 }
