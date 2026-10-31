@@ -57,6 +57,14 @@ impl KeyRole {
         }
     }
 
+    /// The pinned public key of a PKCS#11 key (required with a label).
+    pub fn pkcs11_public_key_var(self) -> &'static str {
+        match self {
+            Self::EvidenceAttester => "PRAETORE_GATEWAY_EVIDENCE_ATTESTER_PKCS11_PUBLIC_KEY_FILE",
+            Self::ExecutionAttester => "PRAETORE_GATEWAY_EXECUTION_ATTESTER_PKCS11_PUBLIC_KEY_FILE",
+        }
+    }
+
     fn description(self) -> &'static str {
         match self {
             Self::EvidenceAttester => "evidence attester",
@@ -118,6 +126,7 @@ pub enum SigningKeyError {
     Pkcs11Unavailable(&'static str),
     Pkcs11Config(&'static str),
     Pkcs11(String),
+    SameKeyForBothRoles,
 }
 
 impl std::fmt::Display for SigningKeyError {
@@ -163,6 +172,10 @@ impl std::fmt::Display for SigningKeyError {
             ),
             Self::Pkcs11Config(var) => write!(f, "{var} is required for PKCS#11 keys"),
             Self::Pkcs11(message) => write!(f, "PKCS#11 signer: {message}"),
+            Self::SameKeyForBothRoles => write!(
+                f,
+                "the evidence attester and the execution attester must be different keys"
+            ),
         }
     }
 }
@@ -183,8 +196,47 @@ pub fn read_secret_key_file(
 }
 
 fn read_secret_file(path: &Path, var: &'static str) -> Result<Zeroizing<Vec<u8>>, SigningKeyError> {
+    read_limited_file(path, var, true)
+}
+
+/// Opens the last path component without following a symlink and, on Unix,
+/// without blocking on a FIFO.
+fn open_no_follow(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::open(path)
+    }
+}
+
+/// Opens `path` once and checks and reads that same open file: a regular
+/// file (`fstat` on the descriptor), at most 256 bytes (also enforced while
+/// reading), and with `private`, not accessible by group or others. A
+/// symlink as the last component is refused (`O_NOFOLLOW`); symlinks in
+/// the directories above it are followed.
+fn read_limited_file(
+    path: &Path,
+    var: &'static str,
+    private: bool,
+) -> Result<Zeroizing<Vec<u8>>, SigningKeyError> {
+    use std::io::Read;
     let error = |reason| SigningKeyError::SecretFile { var, reason };
-    let metadata = fs::metadata(path).map_err(|_| error("cannot be read"))?;
+    let file = open_no_follow(path).map_err(|open_error| {
+        #[cfg(unix)]
+        if open_error.raw_os_error() == Some(libc::ELOOP) {
+            return error("is a symbolic link; name the file itself");
+        }
+        let _ = open_error;
+        error("cannot be read")
+    })?;
+    let metadata = file.metadata().map_err(|_| error("cannot be read"))?;
     if !metadata.is_file() {
         return Err(error("is not a regular file"));
     }
@@ -192,7 +244,7 @@ fn read_secret_file(path: &Path, var: &'static str) -> Result<Zeroizing<Vec<u8>>
         return Err(error("is larger than 256 bytes"));
     }
     #[cfg(unix)]
-    {
+    if private {
         use std::os::unix::fs::PermissionsExt;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(error(
@@ -200,11 +252,30 @@ fn read_secret_file(path: &Path, var: &'static str) -> Result<Zeroizing<Vec<u8>>
             ));
         }
     }
-    let contents = Zeroizing::new(fs::read(path).map_err(|_| error("cannot be read"))?);
+    #[cfg(not(unix))]
+    let _ = private;
+    // Capacity for the limit plus one byte: no reallocation leaves copies.
+    let mut contents = Zeroizing::new(Vec::with_capacity(MAX_SECRET_FILE_BYTES as usize + 1));
+    file.take(MAX_SECRET_FILE_BYTES + 1)
+        .read_to_end(&mut contents)
+        .map_err(|_| error("cannot be read"))?;
     if contents.len() as u64 > MAX_SECRET_FILE_BYTES {
         return Err(error("is larger than 256 bytes"));
     }
     Ok(contents)
+}
+
+/// Reads a pinned Ed25519 public key: 64 lowercase hex characters,
+/// optionally followed by one newline (the `praetore-verify` pin format).
+pub fn read_public_key_file(
+    path: &Path,
+    var: &'static str,
+) -> Result<praetore_core::VerifiedPublicKey, SigningKeyError> {
+    let contents = read_limited_file(path, var, false)?;
+    let text = contents.strip_suffix(b"\n").unwrap_or(contents.as_slice());
+    let bytes = decode_key_hex(text).ok_or(SigningKeyError::InvalidHex(var))?;
+    praetore_core::VerifiedPublicKey::from_bytes(bytes.as_slice())
+        .map_err(|_| SigningKeyError::InvalidHex(var))
 }
 
 fn decode_key_hex(text: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
@@ -288,9 +359,24 @@ pub fn load_signer(
     }
 }
 
+/// Loads the evidence and the execution key and refuses the same key for
+/// both: each role keeps its own key, so revoking or rotating one does not
+/// silently affect the other.
+pub fn load_signers(
+    production: bool,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(LoadedSigner, LoadedSigner), SigningKeyError> {
+    let evidence = load_signer(KeyRole::EvidenceAttester, production, env)?;
+    let execution = load_signer(KeyRole::ExecutionAttester, production, env)?;
+    if evidence.signer.verifying_key() == execution.signer.verifying_key() {
+        return Err(SigningKeyError::SameKeyForBothRoles);
+    }
+    Ok((evidence, execution))
+}
+
 #[cfg(feature = "pkcs11")]
 fn pkcs11_signer(
-    _role: KeyRole,
+    role: KeyRole,
     label: &str,
     algorithm: SignatureAlgorithm,
     env: &dyn Fn(&str) -> Option<String>,
@@ -299,6 +385,12 @@ fn pkcs11_signer(
     let module = required(PKCS11_MODULE_VAR)?;
     let token_label = required(PKCS11_TOKEN_LABEL_VAR)?;
     let pin_path = required(PKCS11_PIN_FILE_VAR)?;
+    // The public key is pinned: a key pair regenerated in the token under
+    // the same label (by anyone with the user PIN) is refused at startup.
+    let expected_public_key = read_public_key_file(
+        Path::new(&required(role.pkcs11_public_key_var())?),
+        role.pkcs11_public_key_var(),
+    )?;
     let pin = read_secret_file(Path::new(&pin_path), PKCS11_PIN_FILE_VAR)?;
     let pin = pin.strip_suffix(b"\n").unwrap_or(pin.as_slice());
     let pin = std::str::from_utf8(pin)
@@ -314,7 +406,7 @@ fn pkcs11_signer(
         key_label: label.to_owned(),
         user_pin: cryptoki_pin(pin),
         algorithm,
-        expected_public_key: None,
+        expected_public_key: Some(expected_public_key),
     };
     praetore_signer_pkcs11::Pkcs11Signer::open(&config)
         .map(|signer| Arc::new(signer) as Arc<dyn Signer>)
@@ -531,6 +623,89 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn key_files_are_opened_once_without_following_a_final_symlink() {
+        let dir = TempDir::new();
+        let role = KeyRole::EvidenceAttester;
+        let real = dir.write("real", SECRET_HEX.as_bytes(), 0o600);
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let env = env_of(&[(role.file_var(), link.to_str().unwrap())]);
+        assert_eq!(
+            load_signer(role, true, &env).err().unwrap(),
+            SigningKeyError::SecretFile {
+                var: role.file_var(),
+                reason: "is a symbolic link; name the file itself",
+            }
+        );
+        // A symlink to /dev/zero is refused before anything is read.
+        let zero = dir.0.join("zero");
+        std::os::unix::fs::symlink("/dev/zero", &zero).unwrap();
+        let env = env_of(&[(role.file_var(), zero.to_str().unwrap())]);
+        assert!(matches!(
+            load_signer(role, true, &env).err().unwrap(),
+            SigningKeyError::SecretFile { .. }
+        ));
+        // A FIFO is refused without blocking.
+        let fifo = dir.0.join("fifo");
+        let fifo_c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let env = env_of(&[(role.file_var(), fifo.to_str().unwrap())]);
+        assert_eq!(
+            load_signer(role, true, &env).err().unwrap(),
+            SigningKeyError::SecretFile {
+                var: role.file_var(),
+                reason: "is not a regular file",
+            }
+        );
+        // An oversized file is refused.
+        let large = dir.write("large", &[b'a'; 4096], 0o600);
+        let env = env_of(&[(role.file_var(), &large)]);
+        assert_eq!(
+            load_signer(role, true, &env).err().unwrap(),
+            SigningKeyError::SecretFile {
+                var: role.file_var(),
+                reason: "is larger than 256 bytes",
+            }
+        );
+        // Symlinked directories above the file are followed (the layout of
+        // a Kubernetes Secret volume: <mount>/..data/<key>).
+        fs::create_dir(dir.0.join("versioned")).unwrap();
+        let versioned = dir.0.join("versioned").join("key");
+        fs::write(&versioned, SECRET_HEX).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&versioned, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        std::os::unix::fs::symlink(dir.0.join("versioned"), dir.0.join("..data")).unwrap();
+        let through_dir = dir.0.join("..data").join("key");
+        let env = env_of(&[(role.file_var(), through_dir.to_str().unwrap())]);
+        assert!(load_signer(role, true, &env).is_ok());
+    }
+
+    #[test]
+    fn the_same_key_for_evidence_and_execution_is_refused() {
+        let dir = TempDir::new();
+        let key = dir.write("key", SECRET_HEX.as_bytes(), 0o600);
+        let copy = dir.write("copy", SECRET_HEX.as_bytes(), 0o600);
+        let env = env_of(&[
+            (KeyRole::EvidenceAttester.file_var(), &key),
+            (KeyRole::ExecutionAttester.file_var(), &copy),
+        ]);
+        assert_eq!(
+            load_signers(true, &env).err().unwrap(),
+            SigningKeyError::SameKeyForBothRoles
+        );
+        let other = dir.write("other", "2b".repeat(32).as_bytes(), 0o600);
+        let env = env_of(&[
+            (KeyRole::EvidenceAttester.file_var(), &key),
+            (KeyRole::ExecutionAttester.file_var(), &other),
+        ]);
+        assert!(load_signers(true, &env).is_ok());
+    }
+
+    #[test]
     fn malformed_hex_in_the_environment_is_rejected_without_leaking() {
         let role = KeyRole::ExecutionAttester;
         for value in [&SECRET_HEX[..62], &SECRET_HEX.to_uppercase(), "zz"] {
@@ -581,7 +756,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "pkcs11")]
-    fn pkcs11_keys_need_module_token_and_pin_file() {
+    fn pkcs11_keys_need_module_token_pinned_public_key_and_pin_file() {
         let role = KeyRole::EvidenceAttester;
         let env = env_of(&[(role.pkcs11_label_var(), "praetore-evidence")]);
         assert_eq!(
@@ -589,12 +764,38 @@ mod tests {
             SigningKeyError::Pkcs11Config(PKCS11_MODULE_VAR)
         );
         let dir = TempDir::new();
-        let pin = dir.write("pin", b"1234\n", 0o644);
+        let pin = dir.write("pin-private", b"1234\n", 0o600);
+        // No pinned public key: refused before the token is opened.
+        let without_pin = [
+            (role.pkcs11_label_var(), "praetore-evidence"),
+            (PKCS11_MODULE_VAR, "/nonexistent/module.so"),
+            (PKCS11_TOKEN_LABEL_VAR, "praetore"),
+            (PKCS11_PIN_FILE_VAR, pin.as_str()),
+        ];
+        assert_eq!(
+            load_signer(role, true, &env_of(&without_pin))
+                .err()
+                .unwrap(),
+            SigningKeyError::Pkcs11Config(role.pkcs11_public_key_var())
+        );
+        let public_key = hex::encode(expected_public_key());
+        let public = dir.write("public.hex", format!("{public_key}\n").as_bytes(), 0o644);
+        let bad_public = dir.write("bad-public.hex", b"not hex\n", 0o644);
+        let mut with_bad_pin = without_pin.to_vec();
+        with_bad_pin.push((role.pkcs11_public_key_var(), bad_public.as_str()));
+        assert_eq!(
+            load_signer(role, true, &env_of(&with_bad_pin))
+                .err()
+                .unwrap(),
+            SigningKeyError::InvalidHex(role.pkcs11_public_key_var())
+        );
+        let readable_pin = dir.write("pin", b"1234\n", 0o644);
         let env = env_of(&[
             (role.pkcs11_label_var(), "praetore-evidence"),
             (PKCS11_MODULE_VAR, "/nonexistent/module.so"),
             (PKCS11_TOKEN_LABEL_VAR, "praetore"),
-            (PKCS11_PIN_FILE_VAR, &pin),
+            (PKCS11_PIN_FILE_VAR, &readable_pin),
+            (role.pkcs11_public_key_var(), &public),
         ]);
         let error = load_signer(role, true, &env).err().unwrap();
         assert!(matches!(
@@ -604,14 +805,9 @@ mod tests {
                 ..
             }
         ));
-        let pin = dir.write("pin-private", b"1234\n", 0o600);
-        let env = env_of(&[
-            (role.pkcs11_label_var(), "praetore-evidence"),
-            (PKCS11_MODULE_VAR, "/nonexistent/module.so"),
-            (PKCS11_TOKEN_LABEL_VAR, "praetore"),
-            (PKCS11_PIN_FILE_VAR, &pin),
-        ]);
-        let error = load_signer(role, true, &env).err().unwrap();
+        let mut complete = without_pin.to_vec();
+        complete.push((role.pkcs11_public_key_var(), public.as_str()));
+        let error = load_signer(role, true, &env_of(&complete)).err().unwrap();
         assert!(matches!(error, SigningKeyError::Pkcs11(_)));
         assert!(!error.to_string().contains("1234"));
     }
@@ -651,16 +847,62 @@ mod tests {
             ],
         );
         let pin = dir.write("pin", b"user-pin-5530\n", 0o600);
-        let env = env_of(&[
+        // The operator records each public key when the key is generated.
+        let public_key_of = |label: &str| {
+            let signer =
+                praetore_signer_pkcs11::Pkcs11Signer::open(&praetore_signer_pkcs11::Pkcs11Config {
+                    module: module.clone().into(),
+                    token_label: "praetore-service".into(),
+                    key_label: label.into(),
+                    user_pin: cryptoki_pin("user-pin-5530"),
+                    algorithm: SignatureAlgorithm::Ed25519,
+                    expected_public_key: None,
+                })
+                .unwrap();
+            hex::encode(signer.verifying_key().as_bytes())
+        };
+        let evidence_pin = dir.write("evidence.pub", public_key_of("evidence").as_bytes(), 0o644);
+        let execution_pin = dir.write(
+            "execution.pub",
+            public_key_of("execution").as_bytes(),
+            0o644,
+        );
+        let mut pairs = vec![
             (KeyRole::EvidenceAttester.pkcs11_label_var(), "evidence"),
             (KeyRole::ExecutionAttester.pkcs11_label_var(), "execution"),
             (EVIDENCE_ALGORITHM_VAR, "ed25519-sha256-envelope"),
-            (PKCS11_MODULE_VAR, &module),
+            (PKCS11_MODULE_VAR, module.as_str()),
             (PKCS11_TOKEN_LABEL_VAR, "praetore-service"),
-            (PKCS11_PIN_FILE_VAR, &pin),
-        ]);
-        let evidence = load_signer(KeyRole::EvidenceAttester, true, &env).unwrap();
-        let execution = load_signer(KeyRole::ExecutionAttester, true, &env).unwrap();
+            (PKCS11_PIN_FILE_VAR, pin.as_str()),
+            (
+                KeyRole::EvidenceAttester.pkcs11_public_key_var(),
+                evidence_pin.as_str(),
+            ),
+            (
+                KeyRole::ExecutionAttester.pkcs11_public_key_var(),
+                execution_pin.as_str(),
+            ),
+        ];
+        let (evidence, execution) = load_signers(true, &env_of(&pairs)).unwrap();
+        // A pin naming the other key (as after a key pair was regenerated
+        // under the label) is refused at startup.
+        pairs[6].1 = execution_pin.as_str();
+        assert_eq!(
+            load_signer(KeyRole::EvidenceAttester, true, &env_of(&pairs))
+                .err()
+                .unwrap(),
+            SigningKeyError::Pkcs11(
+                praetore_signer_pkcs11::Pkcs11SignerError::UnexpectedPublicKey.to_string()
+            )
+        );
+        // The same token key for both roles is refused.
+        pairs[6].1 = evidence_pin.as_str();
+        pairs[1].1 = "evidence";
+        pairs[7].1 = evidence_pin.as_str();
+        assert_eq!(
+            load_signers(true, &env_of(&pairs)).err().unwrap(),
+            SigningKeyError::SameKeyForBothRoles
+        );
         assert_eq!(evidence.source, KeySource::Pkcs11);
         assert_eq!(
             evidence.signer.algorithm(),

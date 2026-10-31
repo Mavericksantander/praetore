@@ -442,7 +442,7 @@ impl ApprovalExpiredReceipt {
         message.extend_from_slice(&canonical);
         let signature = signer
             .sign(&message)
-            .map_err(|_| ExecutionAttestationError::SignerFailed)?;
+            .map_err(praetore_receipt::signer_error)?;
         if signature.len() != 64 {
             return Err(ExecutionAttestationError::InvalidSignature);
         }
@@ -1311,6 +1311,9 @@ impl Gateway {
         pending: ApprovedPendingDispatch,
     ) -> Result<DispatchPermit, GatewayError> {
         let record = pending.record;
+        // An unavailable execution signer leaves the approval pending: it is
+        // checked before the dispatch is claimed and the effect happens.
+        self.execution_attester.check_available()?;
         // Fail closed without changing state: a record whose stored approval
         // no longer verifies is not dispatched, and is left for an operator.
         self.verify_recorded_approval(&record)?;
@@ -1537,7 +1540,17 @@ impl Gateway {
     ///
     /// Any adapter error is treated as outcome-unknown. The gateway never
     /// retries an operation automatically.
+    ///
+    /// The execution signer is checked first: if it is unavailable nothing
+    /// is committed and the same request can be retried. If it fails later,
+    /// after the commit (a race with that check), the execution is left
+    /// without its closing attestation and the call fails with
+    /// [`GatewayError::ExecutionAttestation`]; retrying the request then
+    /// answers `AlreadyRecorded`, and [`Gateway::reconcile`] signs the closing
+    /// attestation once the signer is back (for a dispatched action, only
+    /// what the adapter's reconciliation can establish).
     pub fn execute(&self, request: AuthorizationRequest) -> Result<GatewayReceipt, GatewayError> {
+        self.execution_attester.check_available()?;
         let evidence = self
             .engine
             .evaluate_with_atomic_commit(request, self.journal.as_ref())

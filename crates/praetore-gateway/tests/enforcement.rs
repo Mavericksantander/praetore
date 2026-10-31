@@ -85,9 +85,22 @@ impl TestExecutionAttester {
     }
 }
 
+thread_local! {
+    /// Makes `TestExecutionAttester::check_available` report an outage on
+    /// this test's thread only.
+    static EXECUTION_SIGNER_PROBE_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl ExecutionAttestationSigner for TestExecutionAttester {
     fn key_id(&self) -> &str {
         "test-execution-attester-v1"
+    }
+
+    fn check_available(&self) -> Result<(), ExecutionAttestationError> {
+        if EXECUTION_SIGNER_PROBE_FAILS.with(std::cell::Cell::get) {
+            return Err(ExecutionAttestationError::SignerUnavailable);
+        }
+        Ok(())
     }
 
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError> {
@@ -1782,6 +1795,216 @@ fn receipts_signed_through_the_signer_trait_verify_offline() {
         .unwrap_err(),
         ExecutionAttestationError::InvalidPayload
     );
+}
+
+/// An execution signer behind the `Signer` trait (HSM, KMS) that signs
+/// `remaining` more times and then reports `Unavailable` until restored.
+struct FlakyExecutionSigner {
+    inner: praetore_core::LocalSigner,
+    remaining: AtomicUsize,
+    restored: AtomicBool,
+}
+
+impl FlakyExecutionSigner {
+    fn new(remaining: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner: praetore_core::LocalSigner::from_secret_bytes(&[45; 32]),
+            remaining: AtomicUsize::new(remaining),
+            restored: AtomicBool::new(false),
+        })
+    }
+}
+
+impl praetore_core::Signer for FlakyExecutionSigner {
+    fn algorithm(&self) -> praetore_core::SignatureAlgorithm {
+        praetore_core::SignatureAlgorithm::Ed25519
+    }
+    fn verifying_key(&self) -> &VerifiedPublicKey {
+        praetore_core::Signer::verifying_key(&self.inner)
+    }
+    fn sign_raw(&self, message: &[u8]) -> Result<Vec<u8>, praetore_core::SignerError> {
+        if !self.restored.load(Ordering::SeqCst)
+            && self
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+        {
+            return Err(praetore_core::SignerError::Unavailable);
+        }
+        praetore_core::Signer::sign_raw(&self.inner, message)
+    }
+}
+
+struct FlakyGateway {
+    gateway: Gateway,
+    tool: Arc<LocalSetTool>,
+    journal: Arc<MemoryJournal>,
+    signer: Arc<FlakyExecutionSigner>,
+    request: AuthorizationRequest,
+    key: ExecutionKey,
+}
+
+fn flaky_gateway(effect: PolicyEffect, signatures_before_outage: usize) -> FlakyGateway {
+    let base = fixture(Some(effect), false);
+    let engine = production_engine(
+        base.policy.clone(),
+        base.issuer_public_key.clone(),
+        base.attester.clone(),
+        Arc::new(MemoryReplayGuard::default()),
+    );
+    let signer = FlakyExecutionSigner::new(signatures_before_outage);
+    let tool = Arc::new(LocalSetTool::default());
+    let journal = Arc::new(MemoryJournal::default());
+    let gateway = Gateway::new(
+        engine,
+        journal.clone(),
+        tool.clone(),
+        Arc::new(
+            praetore_gateway::SignerExecutionAttester::new("flaky-execution", signer.clone())
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *base.request.agent.id.as_uuid(),
+        request_id: base.request.request_id,
+    };
+    FlakyGateway {
+        gateway,
+        tool,
+        journal,
+        signer,
+        request: base.request,
+        key,
+    }
+}
+
+fn verify_flaky_receipt(receipt: &praetore_gateway::GatewayReceipt, signer: &FlakyExecutionSigner) {
+    receipt
+        .verify_with_test_evidence_attester(
+            praetore_core::Signer::verifying_key(signer),
+            "flaky-execution",
+        )
+        .unwrap();
+}
+
+/// SAF-11 review, MEDIO 3: the execution signer is checked before anything
+/// is committed, so an outage leaves the request retryable and the tool
+/// untouched.
+#[test]
+fn an_unavailable_execution_signer_commits_and_dispatches_nothing() {
+    for allow in [true, false] {
+        let effect = if allow {
+            PolicyEffect::Allow
+        } else {
+            PolicyEffect::Deny
+        };
+        let flaky = flaky_gateway(effect, 0);
+        assert!(matches!(
+            flaky.gateway.execute(flaky.request.clone()),
+            Err(GatewayError::ExecutionAttestation(
+                ExecutionAttestationError::SignerUnavailable
+            ))
+        ));
+        assert_eq!(flaky.tool.invocations(), 0);
+        assert!(flaky.journal.entry(flaky.key).is_none());
+
+        flaky.signer.restored.store(true, Ordering::SeqCst);
+        let receipt = flaky.gateway.execute(flaky.request.clone()).unwrap();
+        verify_flaky_receipt(&receipt, &flaky.signer);
+        let expected = if allow {
+            (ExecutionStatus::Confirmed, 1)
+        } else {
+            (ExecutionStatus::NotDispatched, 0)
+        };
+        assert_eq!((receipt.execution, flaky.tool.invocations()), expected);
+    }
+}
+
+/// SAF-11 review, MEDIO 3: if the signer fails after the check (a race),
+/// the error stays `SignerUnavailable`, the effect is not repeated, and
+/// `reconcile` signs the closing attestation once the signer is back.
+#[test]
+fn an_execution_signer_lost_after_dispatch_is_closed_by_reconcile() {
+    // One signature (the availability check) succeeds, then the outage.
+    let flaky = flaky_gateway(PolicyEffect::Allow, 1);
+    assert!(matches!(
+        flaky.gateway.execute(flaky.request.clone()),
+        Err(GatewayError::ExecutionAttestation(
+            ExecutionAttestationError::SignerUnavailable
+        ))
+    ));
+    assert_eq!(flaky.tool.invocations(), 1);
+    assert_eq!(
+        flaky.journal.entry(flaky.key).unwrap().execution,
+        ExecutionStatus::Dispatched
+    );
+    flaky.signer.restored.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        flaky.gateway.execute(flaky.request.clone()),
+        Err(GatewayError::Journal(JournalError::AlreadyRecorded))
+    ));
+    let receipt = flaky.gateway.reconcile(flaky.key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    verify_flaky_receipt(&receipt, &flaky.signer);
+    assert_eq!(flaky.tool.invocations(), 1);
+
+    // Same race on a DENY: the nonce is consumed without a receipt; nothing
+    // ran, and reconcile signs the not_dispatched receipt.
+    let flaky = flaky_gateway(PolicyEffect::Deny, 1);
+    assert!(matches!(
+        flaky.gateway.execute(flaky.request.clone()),
+        Err(GatewayError::ExecutionAttestation(
+            ExecutionAttestationError::SignerUnavailable
+        ))
+    ));
+    flaky.signer.restored.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        flaky.gateway.execute(flaky.request.clone()),
+        Err(GatewayError::Journal(JournalError::AlreadyRecorded))
+    ));
+    let receipt = flaky.gateway.reconcile(flaky.key).unwrap();
+    assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
+    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    verify_flaky_receipt(&receipt, &flaky.signer);
+    assert_eq!(flaky.tool.invocations(), 0);
+}
+
+/// SAF-11 review, MEDIO 3: on the approval path the execution signer is
+/// checked before the dispatch is claimed; an outage leaves the approval
+/// pending and nothing runs.
+#[test]
+fn an_unavailable_execution_signer_leaves_an_approval_pending() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let challenge = gateway.approval_challenge(key).unwrap();
+    let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+    gateway.resolve_human_approval(decision).unwrap();
+
+    EXECUTION_SIGNER_PROBE_FAILS.with(|fails| fails.set(true));
+    assert!(matches!(
+        gateway.dispatch_approved(key),
+        Err(GatewayError::ExecutionAttestation(
+            ExecutionAttestationError::SignerUnavailable
+        ))
+    ));
+    EXECUTION_SIGNER_PROBE_FAILS.with(|fails| fails.set(false));
+    assert_eq!(tool.invocations(), 0);
+    assert_eq!(
+        journal.get(key).unwrap().unwrap().execution,
+        ExecutionStatus::ApprovedPendingDispatch
+    );
+    let receipt = gateway.dispatch_approved(key).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(tool.invocations(), 1);
 }
 
 #[test]

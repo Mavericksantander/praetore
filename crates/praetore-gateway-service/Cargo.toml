@@ -53,6 +53,9 @@ tower = { version = "0.5", features = ["util"] }
 uuid = "1.18"
 zeroize = "1.8"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Only for the ignored SoftHSM2 test of the `pkcs11` feature.
 praetore-signer-pkcs11 = { path = "../praetore-signer-pkcs11", features = ["softhsm-testing"] }

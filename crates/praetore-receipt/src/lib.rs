@@ -105,6 +105,9 @@ impl NotDispatchedReason {
 pub enum ExecutionAttestationError {
     #[error("execution attestation signer failed")]
     SignerFailed,
+    /// The signer (HSM, KMS) is unavailable; nothing was signed. Transient.
+    #[error("execution attestation signer is unavailable")]
+    SignerUnavailable,
     #[error("execution attestation key identifier is invalid")]
     InvalidKeyId,
     #[error("execution attestation payload is invalid")]
@@ -123,9 +126,31 @@ pub enum ExecutionAttestationError {
 ///
 /// `message` contains the PRÆTORE execution-attestation domain separator and
 /// canonical payload. Implementations may delegate signing to a KMS/HSM.
+///
+/// `sign` returns [`ExecutionAttestationError::SignerUnavailable`] for a
+/// transient outage and [`ExecutionAttestationError::SignerFailed`] for
+/// anything else.
 pub trait ExecutionAttestationSigner: Send + Sync {
     fn key_id(&self) -> &str;
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError>;
+
+    /// Checks that the signer can sign now. The gateway calls it before it
+    /// commits or claims an execution, so an unavailable signer leaves the
+    /// request retryable instead of failing after the effect. The default
+    /// (an in-process key) is always available.
+    fn check_available(&self) -> Result<(), ExecutionAttestationError> {
+        Ok(())
+    }
+}
+
+/// Maps a signer error to the two outcomes callers distinguish.
+pub fn signer_error(error: ExecutionAttestationError) -> ExecutionAttestationError {
+    match error {
+        ExecutionAttestationError::SignerUnavailable => {
+            ExecutionAttestationError::SignerUnavailable
+        }
+        _ => ExecutionAttestationError::SignerFailed,
+    }
 }
 
 /// Signs execution attestations with any [`praetore_core::Signer`] (an
@@ -182,7 +207,26 @@ impl ExecutionAttestationSigner for SignerExecutionAttester {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ExecutionAttestationError> {
         praetore_core::signer::sign_exact(self.signer.as_ref(), message)
             .map(|signature| signature.to_vec())
-            .map_err(|_| ExecutionAttestationError::SignerFailed)
+            .map_err(map_signer_error)
+    }
+
+    /// Signs a fixed probe message (its own domain, never a valid
+    /// attestation) and verifies it. One extra signature per check.
+    fn check_available(&self) -> Result<(), ExecutionAttestationError> {
+        praetore_core::signer::sign_exact(self.signer.as_ref(), EXECUTION_SIGNER_PROBE)
+            .map(|_| ())
+            .map_err(map_signer_error)
+    }
+}
+
+#[cfg(feature = "signing")]
+const EXECUTION_SIGNER_PROBE: &[u8] = b"PRAETORE_EXECUTION_SIGNER_PROBE_V1\0";
+
+#[cfg(feature = "signing")]
+fn map_signer_error(error: praetore_core::SignerError) -> ExecutionAttestationError {
+    match error {
+        praetore_core::SignerError::Unavailable => ExecutionAttestationError::SignerUnavailable,
+        _ => ExecutionAttestationError::SignerFailed,
     }
 }
 
@@ -306,9 +350,7 @@ impl ExecutionAttestation {
         let mut message = Vec::with_capacity(EXECUTION_ATTESTATION_DOMAIN.len() + canonical.len());
         message.extend_from_slice(EXECUTION_ATTESTATION_DOMAIN);
         message.extend_from_slice(&canonical);
-        let signature = signer
-            .sign(&message)
-            .map_err(|_| ExecutionAttestationError::SignerFailed)?;
+        let signature = signer.sign(&message).map_err(signer_error)?;
         if signature.len() != 64 {
             return Err(ExecutionAttestationError::InvalidSignature);
         }

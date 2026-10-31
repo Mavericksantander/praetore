@@ -20,8 +20,12 @@
     `details.attester_algorithm`. Golden vector
     `docs/golden/evidence-envelope-v1.json`.
   - `praetore-signer-pkcs11`: Ed25519 keys in a PKCS#11 token
-    (`CKM_EDDSA`); refuses extractable or non-sensitive keys, mismatched key
-    pairs and keys other than the optional pinned one. SoftHSM2 tests
+    (`CKM_EDDSA`); refuses extractable or non-sensitive keys, keys that were
+    ever extractable or not sensitive (`CKA_NEVER_EXTRACTABLE` /
+    `CKA_ALWAYS_SENSITIVE` false, for example imported in clear), mismatched
+    key pairs and keys other than the optional pinned one. Reconnects and
+    retries once when the session, key handle or login is lost, and checks
+    the PIN even when the process is already logged in. SoftHSM2 tests
     (ignored by default) and a `pkcs11-softhsm` CI job that also checks the
     HSM-signed receipts with `praetore-verify`.
   - `praetore-signer-aws-kms`: Ed25519 keys in AWS KMS
@@ -36,10 +40,23 @@
     feature, `..._PKCS11_KEY_LABEL`. The `http` and `sandbox` adapters refuse
     hex keys in the environment unless
     `PRAETORE_GATEWAY_DANGEROUSLY_ALLOW_SIGNING_KEYS_IN_ENV=yes`; the local
-    demo is unchanged. `praetore_receipt::SignerExecutionAttester` signs
-    execution attestations with any `Signer` (format unchanged). The
-    execution `key_id` is `local-...` for a key file and `pkcs11-...` for a
-    token (`local-demo-...` for hex variables, as before).
+    demo is unchanged. Key and PIN files are opened once with `O_NOFOLLOW`
+    and checked with `fstat` and a read cap. A PKCS#11 key requires a pinned
+    public key file. The same key for evidence and execution is refused.
+    `praetore_receipt::SignerExecutionAttester` signs execution attestations
+    with any `Signer` (format unchanged).
+  - Execution signer outages: new `ExecutionAttestationError::SignerUnavailable`
+    (distinct from `SignerFailed`) and `ExecutionAttestationSigner::check_available`.
+    The gateway checks the execution signer before committing a request or
+    claiming an approved dispatch, so an outage leaves the request
+    retryable; an outage after that check is closed by `Gateway::reconcile`.
+  - **Breaking:** a `..._KEY_HEX` value in upper or mixed case is now
+    refused (only lowercase hex is accepted). The execution `key_id` depends
+    on the key source: `local-demo-...` for a hex variable (as before),
+    `local-...` for a key file, `pkcs11-...` for a token; moving a key from
+    the environment to a file changes the `--key-id` verifiers pin. Key
+    files named through a final symlink (a Kubernetes Secret volume's
+    `<mount>/<key>`) must name `<mount>/..data/<key>` or use `subPath`.
 - Hash-linked JSONL export of receipts, as specified in
   `docs/proposals/journal-chain-jsonl.md` (now marked implemented):
   - `praetore_core::journal_chain`: the format, the link

@@ -274,8 +274,13 @@ signatures and execution attestations are produced through the
   SoftHSM2 in development and CI) and asks the token to sign with
   `CKM_EDDSA` (pure Ed25519). Opening the signer fails unless the token has
   exactly one Ed25519 private and public key with the label, the private key
-  is sensitive and not extractable, the public key matches the optional pin,
-  and a test signature verifies.
+  is sensitive and not extractable and always was (`CKA_ALWAYS_SENSITIVE` and
+  `CKA_NEVER_EXTRACTABLE`, so a key imported in clear is refused), the public
+  key matches the optional pin (required by the gateway service), and a test
+  signature verifies. A lost session, key handle or login is recovered by
+  reconnecting and retrying once; the PIN is checked even when the process is
+  already logged in. There is no timeout around `C_Sign`: PKCS#11 cannot
+  cancel a call in progress.
 * `praetore-signer-aws-kms` keeps the key in AWS KMS (`ECC_NIST_EDWARDS25519`,
   `SIGN_VERIFY`, signing with `ED25519_SHA_512` and `MessageType` `RAW`). The
   signer logic is tested against a stubbed `KmsClient`, and the `sdk` feature's

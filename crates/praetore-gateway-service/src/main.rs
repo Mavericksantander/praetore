@@ -11,7 +11,7 @@ use praetore_gateway_service::{
     approver_bindings::{parse_approver_bindings, single_approver},
     chrony_clock::ChronyClock,
     file_freshness::{DemoFreshnessProvider, FileFreshnessLimits, FileFreshnessProvider},
-    signing_keys::{KeyRole, KeySource, LoadedSigner, load_signer},
+    signing_keys::{self, KeySource, LoadedSigner},
 };
 use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use serde::Deserialize;
@@ -463,8 +463,7 @@ type Signers = (Arc<dyn Signer>, Arc<dyn ExecutionAttestationSigner>);
 
 fn load_signers(production_adapter: bool) -> Result<Signers, Box<dyn std::error::Error>> {
     let env_lookup = |name: &str| env::var(name).ok();
-    let evidence = load_signer(KeyRole::EvidenceAttester, production_adapter, &env_lookup)?;
-    let execution = load_signer(KeyRole::ExecutionAttester, production_adapter, &env_lookup)?;
+    let (evidence, execution) = signing_keys::load_signers(production_adapter, &env_lookup)?;
     for (role, loaded) in [("evidence", &evidence), ("execution", &execution)] {
         if production_adapter && loaded.source == KeySource::EnvironmentHex {
             tracing::warn!(

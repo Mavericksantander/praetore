@@ -1,17 +1,44 @@
 //! A [`praetore_core::Signer`] backed by an Ed25519 key in a PKCS#11 token
 //! (an HSM, or SoftHSM2 for development and CI). SAF-11, decision 2.
 //!
-//! The private key never leaves the token: the signer only asks the token to
-//! sign (`CKM_EDDSA`, pure Ed25519, no prehash) and reads the public key once
-//! when it is opened. Opening fails closed if:
+//! The signer only asks the token to sign (`CKM_EDDSA`, pure Ed25519, no
+//! prehash) and reads the public key when it is opened. Opening fails closed
+//! if:
 //!
 //! * the module cannot be loaded, the token is not found, or login fails;
 //! * there is not exactly one private key and one public key with the label;
 //! * the key is not Ed25519 (`CKK_EC_EDWARDS` on `edwards25519`);
-//! * the private key is extractable or not sensitive;
+//! * the private key is extractable or not sensitive **now**, or **ever was**
+//!   (`CKA_NEVER_EXTRACTABLE` and `CKA_ALWAYS_SENSITIVE` must both be true).
+//!   A key imported in clear with `C_CreateObject`, or exported and then
+//!   locked, is refused: its material exists outside the token;
 //! * the public key differs from the pinned one (when one is configured);
 //! * a test signature made by the private key does not verify under the
 //!   public key object (a mismatched pair).
+//!
+//! **Lost sessions.** If a signature fails because the session, the key
+//! handle or the login was lost (`CKR_SESSION_HANDLE_INVALID`,
+//! `CKR_SESSION_CLOSED`, `CKR_OBJECT_HANDLE_INVALID`, `CKR_KEY_HANDLE_INVALID`,
+//! `CKR_USER_NOT_LOGGED_IN`, `CKR_DEVICE_REMOVED`, `CKR_TOKEN_NOT_PRESENT`,
+//! `CKR_DEVICE_ERROR`), the signer opens a new session, logs in again, looks
+//! the key up again (same checks, and its public key must be the one read at
+//! open) and retries the signature once. If that fails the error is
+//! [`SignerError::Unavailable`]; every signature is still verified against
+//! the public key read at open.
+//!
+//! **PIN and shared login.** PKCS#11 keeps one login per process and token.
+//! When the token answers `CKR_USER_ALREADY_LOGGED_IN` it has not checked the
+//! PIN, so the signer compares it with the PIN this process last logged in
+//! with successfully (a token has one user PIN): a different PIN is refused,
+//! and if the login was made by other code in the process the PIN cannot be
+//! checked and opening fails.
+//!
+//! **No timeout.** A `C_Sign` that hangs blocks the caller and, through the
+//! session lock, the other signatures of this signer. PKCS#11 has no way to
+//! cancel a call in progress (`C_CancelFunction` is a legacy function that
+//! returns `CKR_FUNCTION_NOT_PARALLEL`) and a session may not be used by two
+//! threads at once, so a timeout could only abandon the thread and its
+//! session. Use the HSM client library's own timeouts and monitor latency.
 //!
 //! Errors never contain the PIN or key material.
 
@@ -33,12 +60,15 @@ use cryptoki::{
 use praetore_core::{
     SignatureAlgorithm, Signer, SignerError, VerifiedPublicKey, signer::attester_key_id,
 };
+use secrecy::ExposeSecret;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 /// DER of the `id-Ed25519` OID (RFC 8410), one accepted `CKA_EC_PARAMS`.
 const ED25519_OID_DER: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
@@ -99,20 +129,34 @@ pub enum Pkcs11SignerError {
     NotEd25519,
     #[error("the PKCS#11 private key is extractable or not sensitive")]
     KeyExportable,
+    #[error(
+        "the PKCS#11 private key was imported or was once extractable or not sensitive \
+         (CKA_NEVER_EXTRACTABLE and CKA_ALWAYS_SENSITIVE must be true)"
+    )]
+    KeyNotGeneratedInToken,
     #[error("the PKCS#11 public key does not match the pinned public key")]
     UnexpectedPublicKey,
     #[error("the PKCS#11 private key does not match its public key object")]
     KeyPairMismatch,
 }
 
+/// A session logged in to the token and the private key found in it.
+struct Connection {
+    session: Session,
+    private_key: ObjectHandle,
+}
+
 /// An Ed25519 key held by a PKCS#11 token.
 pub struct Pkcs11Signer {
-    // Field order: the session closes before the module handle is dropped.
-    session: Mutex<Session>,
-    private_key: ObjectHandle,
+    // `None` after a lost session; the next signature reconnects.
+    connection: Mutex<Option<Connection>>,
+    module: Pkcs11,
+    module_path: PathBuf,
+    token_label: String,
+    key_label: String,
+    user_pin: Zeroizing<String>,
     verifying_key: VerifiedPublicKey,
     algorithm: SignatureAlgorithm,
-    _module: Pkcs11,
 }
 
 impl std::fmt::Debug for Pkcs11Signer {
@@ -160,22 +204,33 @@ fn function_name(function: Function) -> &'static str {
     }
 }
 
-/// Transient token conditions; everything else is a refusal.
-fn is_transient(rv: RvError) -> bool {
+/// The session, key handle or login is gone: reconnect and retry once.
+fn needs_reconnect(rv: RvError) -> bool {
     matches!(
         rv,
-        RvError::DeviceError
-            | RvError::DeviceMemory
-            | RvError::DeviceRemoved
+        RvError::SessionHandleInvalid
             | RvError::SessionClosed
-            | RvError::SessionHandleInvalid
-            | RvError::TokenNotPresent
-            | RvError::FunctionFailed
-            | RvError::HostMemory
+            | RvError::ObjectHandleInvalid
+            | RvError::KeyHandleInvalid
             | RvError::UserNotLoggedIn
+            | RvError::DeviceRemoved
+            | RvError::TokenNotPresent
+            | RvError::DeviceError
             | RvError::OperationActive
-            | RvError::SessionCount
     )
+}
+
+/// Transient token conditions (including the reconnect cases); everything
+/// else is a refusal.
+fn is_transient(rv: RvError) -> bool {
+    needs_reconnect(rv)
+        || matches!(
+            rv,
+            RvError::DeviceMemory
+                | RvError::FunctionFailed
+                | RvError::HostMemory
+                | RvError::SessionCount
+        )
 }
 
 /// Parses `CKA_EC_PARAMS`: only Ed25519 is accepted.
@@ -193,30 +248,97 @@ pub fn ed25519_point(point: &[u8]) -> Option<[u8; 32]> {
     }
 }
 
+/// SHA-256 of the PIN that last logged in successfully, per module and
+/// token, to check a PIN when the token reports `CKR_USER_ALREADY_LOGGED_IN`.
+type LoginRegistry = Mutex<HashMap<(PathBuf, String), [u8; 32]>>;
+
+fn verified_logins() -> &'static LoginRegistry {
+    static LOGINS: OnceLock<LoginRegistry> = OnceLock::new();
+    LOGINS.get_or_init(Default::default)
+}
+
+fn pin_digest(pin: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(b"PRAETORE_PKCS11_PIN_CHECK_V1\0");
+    hash.update(pin.as_bytes());
+    hash.finalize().into()
+}
+
+fn login(
+    session: &Session,
+    module_path: &Path,
+    token_label: &str,
+    pin: &str,
+) -> Result<(), Pkcs11SignerError> {
+    let key = (module_path.to_path_buf(), token_label.to_owned());
+    let digest = pin_digest(pin);
+    let mut logins = verified_logins()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match session.login(UserType::User, Some(&AuthPin::new(pin.into()))) {
+        Ok(()) => {
+            logins.insert(key, digest);
+            Ok(())
+        }
+        // The token did not check this PIN: compare it with the one that
+        // logged in. A token has a single user PIN.
+        Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => match logins.get(&key) {
+            Some(known) if *known == digest => Ok(()),
+            Some(_) => Err(Pkcs11SignerError::Login {
+                code: "PinIncorrect".into(),
+            }),
+            None => Err(Pkcs11SignerError::Login {
+                code: "UserAlreadyLoggedIn by other code; PIN cannot be checked".into(),
+            }),
+        },
+        Err(CryptokiError::Pkcs11(rv, _)) => Err(Pkcs11SignerError::Login {
+            code: format!("{rv:?}"),
+        }),
+        Err(error) => Err(call_error(error)),
+    }
+}
+
+/// Opens a session, logs in and finds and checks the key pair.
+fn connect(
+    module: &Pkcs11,
+    module_path: &Path,
+    token_label: &str,
+    key_label: &str,
+    pin: &str,
+) -> Result<(Connection, VerifiedPublicKey), Pkcs11SignerError> {
+    let slot = find_token(module, token_label)?;
+    let session = module.open_ro_session(slot).map_err(call_error)?;
+    login(&session, module_path, token_label, pin)?;
+    let private_key = single_key(&session, ObjectClass::PRIVATE_KEY, key_label)?;
+    let public_key = single_key(&session, ObjectClass::PUBLIC_KEY, key_label)?;
+    check_private_key(&session, private_key)?;
+    let verifying_key = read_public_key(&session, public_key)?;
+    Ok((
+        Connection {
+            session,
+            private_key,
+        },
+        verifying_key,
+    ))
+}
+
 impl Pkcs11Signer {
     /// Loads the module, logs in to the token and checks the key pair. See
     /// the crate documentation for every check.
     pub fn open(config: &Pkcs11Config) -> Result<Self, Pkcs11SignerError> {
         let module = load_module(&config.module)?;
-        let slot = find_token(&module, &config.token_label)?;
-        let session = module.open_ro_session(slot).map_err(call_error)?;
-        // PKCS#11 login state is shared by every session of this process on
-        // the token: if another signer is already logged in, the token does
-        // not check this PIN again.
-        match session.login(UserType::User, Some(&config.user_pin)) {
-            Ok(()) | Err(CryptokiError::Pkcs11(RvError::UserAlreadyLoggedIn, _)) => {}
-            Err(CryptokiError::Pkcs11(rv, _)) => {
-                return Err(Pkcs11SignerError::Login {
-                    code: format!("{rv:?}"),
-                });
-            }
-            Err(error) => return Err(call_error(error)),
-        }
-
-        let private_key = single_key(&session, ObjectClass::PRIVATE_KEY, &config.key_label)?;
-        let public_key = single_key(&session, ObjectClass::PUBLIC_KEY, &config.key_label)?;
-        check_private_key(&session, private_key)?;
-        let verifying_key = read_public_key(&session, public_key)?;
+        let module_path = config
+            .module
+            .canonicalize()
+            .map_err(|_| Pkcs11SignerError::ModuleLoad)?;
+        let pin = Zeroizing::new(config.user_pin.expose_secret().to_owned());
+        let (connection, verifying_key) = connect(
+            &module,
+            &module_path,
+            &config.token_label,
+            &config.key_label,
+            &pin,
+        )?;
         if config
             .expected_public_key
             .as_ref()
@@ -226,11 +348,14 @@ impl Pkcs11Signer {
         }
 
         let signer = Self {
-            session: Mutex::new(session),
-            private_key,
+            connection: Mutex::new(Some(connection)),
+            module,
+            module_path,
+            token_label: config.token_label.clone(),
+            key_label: config.key_label.clone(),
+            user_pin: pin,
             verifying_key,
             algorithm: config.algorithm,
-            _module: module,
         };
         praetore_core::signer::sign_exact(&signer, SELF_TEST_MESSAGE).map_err(
             |error| match error {
@@ -242,6 +367,30 @@ impl Pkcs11Signer {
             },
         )?;
         Ok(signer)
+    }
+
+    /// A new session for the same key. Its public key must be the one read
+    /// at open; a different or missing key is a refusal, not an outage.
+    fn reconnect(&self) -> Result<Connection, SignerError> {
+        match connect(
+            &self.module,
+            &self.module_path,
+            &self.token_label,
+            &self.key_label,
+            &self.user_pin,
+        ) {
+            Ok((connection, key)) if key == self.verifying_key => Ok(connection),
+            Ok(_) => Err(SignerError::Rejected),
+            Err(
+                Pkcs11SignerError::Login { .. }
+                | Pkcs11SignerError::KeyNotFound
+                | Pkcs11SignerError::NotEd25519
+                | Pkcs11SignerError::KeyExportable
+                | Pkcs11SignerError::KeyNotGeneratedInToken
+                | Pkcs11SignerError::TokenAmbiguous,
+            ) => Err(SignerError::Rejected),
+            Err(_) => Err(SignerError::Unavailable),
+        }
     }
 }
 
@@ -315,11 +464,14 @@ fn check_private_key(session: &Session, key: ObjectHandle) -> Result<(), Pkcs11S
                 AttributeType::Sign,
                 AttributeType::Sensitive,
                 AttributeType::Extractable,
+                AttributeType::AlwaysSensitive,
+                AttributeType::NeverExtractable,
             ],
         )
         .map_err(call_error)?;
-    let (mut key_type, mut params, mut sign, mut sensitive, mut extractable) =
-        (None, None, None, None, None);
+    let (mut key_type, mut params, mut sign) = (None, None, None);
+    let (mut sensitive, mut extractable, mut always_sensitive, mut never_extractable) =
+        (None, None, None, None);
     for attribute in attributes {
         match attribute {
             Attribute::KeyType(value) => key_type = Some(value),
@@ -327,6 +479,8 @@ fn check_private_key(session: &Session, key: ObjectHandle) -> Result<(), Pkcs11S
             Attribute::Sign(value) => sign = Some(value),
             Attribute::Sensitive(value) => sensitive = Some(value),
             Attribute::Extractable(value) => extractable = Some(value),
+            Attribute::AlwaysSensitive(value) => always_sensitive = Some(value),
+            Attribute::NeverExtractable(value) => never_extractable = Some(value),
             _ => {}
         }
     }
@@ -338,6 +492,10 @@ fn check_private_key(session: &Session, key: ObjectHandle) -> Result<(), Pkcs11S
     }
     if sensitive != Some(true) || extractable != Some(false) {
         return Err(Pkcs11SignerError::KeyExportable);
+    }
+    // A missing attribute counts as false: fail closed.
+    if always_sensitive != Some(true) || never_extractable != Some(true) {
+        return Err(Pkcs11SignerError::KeyNotGeneratedInToken);
     }
     Ok(())
 }
@@ -384,19 +542,45 @@ impl Signer for Pkcs11Signer {
         &self.verifying_key
     }
 
+    /// Signs with the current session; on a lost session, handle or login
+    /// reconnects and retries once (see the crate documentation).
     fn sign_raw(&self, message: &[u8]) -> Result<Vec<u8>, SignerError> {
-        let session = self.session.lock().map_err(|_| SignerError::Unavailable)?;
-        session
-            .sign(
-                &Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Pure)),
-                self.private_key,
-                message,
-            )
-            .map_err(|error| match error {
-                CryptokiError::Pkcs11(rv, _) if is_transient(rv) => SignerError::Unavailable,
-                CryptokiError::Pkcs11(RvError::DataLenRange, _) => SignerError::MessageTooLarge,
-                _ => SignerError::Rejected,
-            })
+        let mut connection = self.connection.lock().unwrap_or_else(|poisoned| {
+            // A panic while signing: drop the session and reconnect.
+            let mut guard = poisoned.into_inner();
+            *guard = None;
+            self.connection.clear_poison();
+            guard
+        });
+        let mechanism = Mechanism::Eddsa(EddsaParams::new(EddsaSignatureScheme::Pure));
+        for attempt in 0..2 {
+            if connection.is_none() {
+                *connection = Some(self.reconnect()?);
+            }
+            let Some(current) = connection.as_ref() else {
+                return Err(SignerError::Unavailable);
+            };
+            match current
+                .session
+                .sign(&mechanism, current.private_key, message)
+            {
+                Ok(signature) => return Ok(signature),
+                Err(CryptokiError::Pkcs11(rv, _)) if needs_reconnect(rv) => {
+                    *connection = None;
+                    if attempt == 1 {
+                        return Err(SignerError::Unavailable);
+                    }
+                }
+                Err(CryptokiError::Pkcs11(rv, _)) if is_transient(rv) => {
+                    return Err(SignerError::Unavailable);
+                }
+                Err(CryptokiError::Pkcs11(RvError::DataLenRange, _)) => {
+                    return Err(SignerError::MessageTooLarge);
+                }
+                Err(_) => return Err(SignerError::Rejected),
+            }
+        }
+        Err(SignerError::Unavailable)
     }
 }
 
@@ -434,9 +618,19 @@ mod tests {
 
     #[test]
     fn transient_and_permanent_token_errors_are_told_apart() {
-        assert!(is_transient(RvError::DeviceRemoved));
-        assert!(is_transient(RvError::SessionHandleInvalid));
-        assert!(!is_transient(RvError::KeyHandleInvalid));
+        for rv in [
+            RvError::DeviceRemoved,
+            RvError::SessionHandleInvalid,
+            RvError::ObjectHandleInvalid,
+            RvError::KeyHandleInvalid,
+            RvError::UserNotLoggedIn,
+            RvError::TokenNotPresent,
+        ] {
+            assert!(needs_reconnect(rv), "{rv:?}");
+            assert!(is_transient(rv), "{rv:?}");
+        }
+        assert!(is_transient(RvError::DeviceMemory));
+        assert!(!needs_reconnect(RvError::DeviceMemory));
         assert!(!is_transient(RvError::MechanismInvalid));
         assert!(!is_transient(RvError::PinIncorrect));
     }

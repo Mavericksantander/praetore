@@ -109,7 +109,7 @@ jobs:
           set -euo pipefail
           output="$(cargo test -p praetore-signer-pkcs11 --features softhsm-testing --locked --test softhsm -- --ignored --nocapture 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
-          grep -q "test result: ok. 6 passed" <<<"$output" || { echo "::error::SoftHSM2 tests did not all run"; exit 1; }
+          grep -q "test result: ok. 9 passed" <<<"$output" || { echo "::error::SoftHSM2 tests did not all run"; exit 1; }
       - name: praetore-verify accepts the HSM-signed receipts and rejects a relabelled one
         run: |
           set -euo pipefail

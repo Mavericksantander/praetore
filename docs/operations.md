@@ -103,15 +103,29 @@ from exactly one source; setting none, or more than one, refuses to start.
   of a Pod spec) can read such a key.
 - **Key files** contain exactly 64 lowercase hex characters, optionally
   followed by one newline, are regular files of at most 256 bytes and, on
-  Unix, must not be accessible by group or others (mode `0600` or `0400`; for
-  a Kubernetes Secret volume use `defaultMode: 0400`). The key is still held
-  in process memory.
+  Unix, must not be accessible by group or others (mode `0600` or `0400`). The
+  file is opened once with `O_NOFOLLOW` and checked with `fstat` on that
+  descriptor, so the **last path component must not be a symlink**. A
+  Kubernetes Secret volume exposes each key as a symlink (`<mount>/<key> ->
+  ..data/<key>`): name `<mount>/..data/<key>` (directory symlinks are
+  followed) or mount the key with `subPath`, and use `defaultMode: 0400`. The
+  key is still held in process memory.
 - **PKCS#11** (build with `--features pkcs11`) also needs
   `PRAETORE_GATEWAY_PKCS11_MODULE` (module path),
-  `PRAETORE_GATEWAY_PKCS11_TOKEN_LABEL` and `PRAETORE_GATEWAY_PKCS11_PIN_FILE`
-  (the user PIN, same file rules). The private key must be an Ed25519 key that
-  is sensitive and not extractable. PKCS#11 login is shared by the process: if
-  both keys are in the same token, the PIN is checked once.
+  `PRAETORE_GATEWAY_PKCS11_TOKEN_LABEL`, `PRAETORE_GATEWAY_PKCS11_PIN_FILE`
+  (the user PIN, same file rules) and, for each key, its pinned public key in
+  `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_PKCS11_PUBLIC_KEY_FILE` /
+  `PRAETORE_GATEWAY_EXECUTION_ATTESTER_PKCS11_PUBLIC_KEY_FILE` (64 lowercase
+  hex characters, the `praetore-verify` pin format; required: a key pair
+  regenerated under the same label is refused at startup). The private key
+  must be an Ed25519 key generated in the token: sensitive, not extractable,
+  and with `CKA_ALWAYS_SENSITIVE` and `CKA_NEVER_EXTRACTABLE` true, so a key
+  imported in clear is refused. If the session or login is lost (HSM session
+  timeout, logout, token reinserted) the signer reconnects and retries once
+  per signature. PKCS#11 login is shared by the process: the PIN of a second
+  key in the same token is compared with the one that logged in.
+- The evidence and the execution key must be **different keys**; the same
+  key for both is refused at startup.
 - `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_ALGORITHM` is `ed25519` (default) or
   `ed25519-sha256-envelope` (see
   [crypto and policy](crypto-and-policy.md#signers-and-key-custody-saf-11-step-1)).
@@ -123,9 +137,24 @@ execution attestation `key_id`, never key material. The execution `key_id` is
 `local-demo-<public key hex>` for a hex variable (as before), `local-...` for
 a file and `pkcs11-...` for a token; pass it to
 `praetore-verify receipt --key-id`. A signer that becomes unavailable
-(`SIGNER_UNAVAILABLE`) makes the gateway answer `503
-authorization_unavailable` and authorize nothing; it never falls back to
-another key.
+never makes the gateway fall back to another key:
+
+- Evidence signer (`SIGNER_UNAVAILABLE`): `503 authorization_unavailable`,
+  nothing is committed, and the same request can be retried.
+- Execution signer: the gateway signs a probe message with it before it
+  commits a new request or claims an approved dispatch (one extra signature
+  per request: with KMS this doubles the execution-key `Sign` calls). If it is
+  unavailable the answer is `503 execution_state_unavailable`, nothing is
+  committed or dispatched, and the request (or the approved dispatch) can be
+  retried. If it fails after that check and after the commit (a narrow race),
+  the execution is left without its closing attestation: for an ALLOW the
+  adapter may already have run, the state is `dispatched`, and a retry of the
+  request answers `409`. Once the signer is back, `Gateway::reconcile` signs
+  the closing attestation: `confirmed` or `failed` when the adapter's
+  read-only reconciliation can establish the outcome, otherwise
+  `outcome_unknown` (the adapter output is not recovered). A DENY or a
+  dispatch refusal in that race consumes the request ID without a receipt;
+  nothing ran, and `reconcile` signs the `not_dispatched` receipt.
 
 ## Freshness snapshot
 

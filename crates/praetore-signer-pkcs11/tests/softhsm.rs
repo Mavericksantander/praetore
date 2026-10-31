@@ -31,6 +31,8 @@ const SO_PIN: &str = "so-pin-0000";
 const USER_PIN: &str = "user-pin-7391";
 const KEY_LABEL: &str = "praetore-evidence";
 const EXTRACTABLE_LABEL: &str = "praetore-extractable";
+const IMPORTED_LABEL: &str = "praetore-imported";
+const EXPORTED_LABEL: &str = "praetore-exported-then-locked";
 
 struct Token {
     module: PathBuf,
@@ -53,6 +55,7 @@ fn token() -> &'static Token {
             uuid::Uuid::new_v4()
         ));
         let conf = softhsm_testing::write_config(&root);
+        softhsm_testing::remove_at_exit(root.clone());
         // SAFETY: runs once, inside `OnceLock::get_or_init`, before any test
         // loads the module; the other test threads are blocked on this
         // initialization and do not read the environment meanwhile.
@@ -71,8 +74,14 @@ fn token() -> &'static Token {
                     label: EXTRACTABLE_LABEL,
                     extractable: true,
                 },
+                TestKey {
+                    label: EXPORTED_LABEL,
+                    extractable: true,
+                },
             ],
         );
+        softhsm_testing::lock_exported_key(&module, TOKEN_LABEL, USER_PIN, EXPORTED_LABEL);
+        softhsm_testing::import_key(&module, TOKEN_LABEL, USER_PIN, IMPORTED_LABEL, [0x42; 32]);
         Token { module }
     })
 }
@@ -324,4 +333,73 @@ fn softhsm_enforces_the_pinned_public_key() {
         Pkcs11Signer::open(&pinned).unwrap_err(),
         Pkcs11SignerError::UnexpectedPublicKey
     );
+}
+
+#[test]
+#[ignore = "requires SoftHSM2 (PRAETORE_TEST_PKCS11_MODULE)"]
+fn softhsm_refuses_keys_imported_in_clear_or_once_extractable() {
+    let _serial = serial();
+    // Imported with C_CreateObject and CKA_VALUE, marked sensitive and not
+    // extractable: the same key exists outside the token.
+    assert_eq!(
+        Pkcs11Signer::open(&config(
+            IMPORTED_LABEL,
+            USER_PIN,
+            SignatureAlgorithm::Ed25519
+        ))
+        .unwrap_err(),
+        Pkcs11SignerError::KeyNotGeneratedInToken
+    );
+    // Generated extractable, then locked: it may have been exported.
+    assert_eq!(
+        Pkcs11Signer::open(&config(
+            EXPORTED_LABEL,
+            USER_PIN,
+            SignatureAlgorithm::Ed25519
+        ))
+        .unwrap_err(),
+        Pkcs11SignerError::KeyNotGeneratedInToken
+    );
+}
+
+#[test]
+#[ignore = "requires SoftHSM2 (PRAETORE_TEST_PKCS11_MODULE)"]
+fn softhsm_signer_recovers_after_the_process_is_logged_out() {
+    let _serial = serial();
+    let signer = signer(SignatureAlgorithm::Ed25519);
+    let (_, key) = pinned_key(&signer);
+    receipt(&signer).verify_attester_signature(&key).unwrap();
+    // Another component (or an HSM session timeout) logs the process out:
+    // the signer's key handle and login are gone.
+    softhsm_testing::logout_process(&token().module, TOKEN_LABEL, USER_PIN);
+    for _ in 0..3 {
+        let evidence = receipt(&signer);
+        evidence.verify_attester_signature(&key).unwrap();
+    }
+    let message = b"PRAETORE_TEST\0after logout";
+    softhsm_testing::logout_process(&token().module, TOKEN_LABEL, USER_PIN);
+    let signature = praetore_core::signer::sign_exact(&signer, message).unwrap();
+    key.verify_domain_message(b"", message, &signature).unwrap();
+}
+
+#[test]
+#[ignore = "requires SoftHSM2 (PRAETORE_TEST_PKCS11_MODULE)"]
+fn softhsm_checks_the_pin_when_the_process_is_already_logged_in() {
+    let _serial = serial();
+    let first = signer(SignatureAlgorithm::Ed25519);
+    // The token reports CKR_USER_ALREADY_LOGGED_IN and does not check it.
+    assert_eq!(
+        Pkcs11Signer::open(&config(
+            KEY_LABEL,
+            "wrong-pin-5678",
+            SignatureAlgorithm::Ed25519
+        ))
+        .unwrap_err(),
+        Pkcs11SignerError::Login {
+            code: "PinIncorrect".into()
+        }
+    );
+    // The right PIN is still accepted while logged in.
+    let second = signer(SignatureAlgorithm::Ed25519);
+    assert_eq!(first.verifying_key(), second.verifying_key());
 }

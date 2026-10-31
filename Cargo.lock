@@ -1489,6 +1489,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
+ "libc",
  "postgres",
  "praetore-core",
  "praetore-gateway",
@@ -1614,10 +1615,14 @@ version = "0.3.0"
 dependencies = [
  "cryptoki",
  "hex",
+ "libc",
  "praetore-core",
+ "secrecy",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
