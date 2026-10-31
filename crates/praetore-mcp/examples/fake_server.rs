@@ -44,6 +44,7 @@ fn main() {
                     let text = arguments["text"].as_str().unwrap_or_default();
                     let written = std::fs::OpenOptions::new()
                         .append(true)
+                        .create(true)
                         .open(path)
                         .and_then(|mut file| file.write_all(text.as_bytes()));
                     eprintln!("fake_server: append {path:?} -> {written:?}");

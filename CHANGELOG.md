@@ -59,8 +59,15 @@
   `.` (`/.nofollow/...`, `/.resolve/...`, `/.vol/...`) is `unresolved`, and
   so is, on every OS, anything under `/dev` or `/proc` (per-process names
   such as `/dev/fd/N`), and on macOS under `/System/Volumes/<X>` other than
-  `Data`. Not covered: Linux bind mounts of a subdirectory of a prefix, and
-  hard links to files inside a prefix.
+  `Data`. When names fold, Unicode 16 `Default_Ignorable_Code_Point`s and
+  U+F000-F0FF are dropped from the fold key (HFS+, macOS ExFAT), and a
+  segment made only of them is `unresolved`. `wrap` warns at startup when
+  the server command looks like `docker`, `podman`, `ssh`, `chroot`, ...
+  and the policy has path rules. This is defense in depth for local
+  servers in the same namespace, not a guarantee (structural fix: T-013B).
+  Not covered: Linux bind mounts of a subdirectory of a prefix, hard links
+  to files inside a prefix, TOCTOU, server-side decoding; not supported:
+  other namespaces or hosts, network/FUSE loopback mounts.
 
 ## 0.3.0 - 2026-10-30
 

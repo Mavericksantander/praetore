@@ -87,7 +87,14 @@ Read these before relying on anything above.
    when it does not exist yet, and so is another spelling of the same
    directory, such as the macOS firmlink `/System/Volumes/Data/Users/...`
    for `/Users/...`. The receipt shows what was checked in
-   `context["praetore.path_check"]`.
+   `context["praetore.path_check"]`. **This is defense in depth for local
+   servers on the same host and mount namespace, not a guarantee**; the
+   structural fix is confining the server (T-013B, PR #61). Not covered:
+   hard links, TOCTOU (point 5), Linux bind mounts of a subdirectory, and
+   decoding the server applies to the path. **Not supported:** servers in
+   another namespace or on another host (`docker`, `podman`, `ssh`,
+   `chroot`; `wrap` warns at startup when it sees one) and network or FUSE
+   mounts that loop back to the same disk. See the README for details.
 5. **Time of check to time of use (TOCTOU).** The decision is made on the
    arguments when the call passes through the proxy. The MCP server opens
    the file afterwards. Anything that changes the filesystem in between (for

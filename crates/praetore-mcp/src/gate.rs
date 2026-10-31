@@ -323,6 +323,9 @@ const MAX_FOLD_ROUNDS: usize = 8;
 /// [`PathCheck::Ambiguous`]. When case is folded, trailing `.` and ` ` are
 /// dropped too (vfat/exfat on Linux ignore them; macOS FAT does not, which
 /// only costs a few extra refusals there and on case-insensitive APFS).
+/// When case or normalization is folded, every
+/// `Default_Ignorable_Code_Point` and the SFM private-use range U+F000-F0FF
+/// are dropped as well (HFS+ and macOS ExFAT ignore some of them).
 fn fold_key(name: &str, mode: Insensitivity) -> String {
     // ASCII fast path, exact: NFC/NFD are the identity on ASCII and full
     // case folding of ASCII is `to_ascii_lowercase` (checked against the
@@ -339,7 +342,74 @@ fn fold_key(name: &str, mode: Insensitivity) -> String {
     fold_key_slow(name, mode)
 }
 
+/// `Default_Ignorable_Code_Point` from Unicode 16.0.0
+/// `DerivedCoreProperties.txt` (2024-05-31, sha256 `39d35161f2954497f69e08bd
+/// b9e701493f476a3d30222de20028feda36c1dabd`), adjacent ranges merged.
+const DEFAULT_IGNORABLE: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+];
+
+/// Private-use range that macOS ExFAT and SMB use for the SFM mapping of
+/// characters NTFS forbids; macOS ExFAT ignores some of it at the end of a
+/// name.
+const SFM_PRIVATE_USE: (u32, u32) = (0xF000, 0xF0FF);
+
+/// Whether a name comparison that folds may ignore `c`: HFS+ ignores
+/// U+200C-200F, U+202A-202E, U+206A-206F and U+FEFF anywhere in a name,
+/// macOS ExFAT a leading U+FEFF and trailing SFM private-use characters.
+/// Every `Default_Ignorable_Code_Point` and the SFM range are dropped.
+fn is_fold_ignorable(c: char) -> bool {
+    let c = u32::from(c);
+    (SFM_PRIVATE_USE.0..=SFM_PRIVATE_USE.1).contains(&c)
+        || DEFAULT_IGNORABLE
+            .binary_search_by(|&(low, high)| {
+                if high < c {
+                    std::cmp::Ordering::Less
+                } else if low > c {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+}
+
+/// A non-empty segment made only of ignorable characters names, on a
+/// folding filesystem, something the gate cannot pin down (an empty name or
+/// the directory itself): such paths are `unresolved`.
+fn has_ignorable_only_segment(path: &str, insensitivity: impl Fn(&str) -> Insensitivity) -> bool {
+    let path_segments = segments(path);
+    path_segments.iter().enumerate().any(|(index, name)| {
+        !name.is_empty() && name.chars().all(is_fold_ignorable) && {
+            let mode = insensitivity(&join_segments(&path_segments[..index]));
+            mode.case || mode.normalization
+        }
+    })
+}
+
 fn fold_key_slow(name: &str, mode: Insensitivity) -> String {
+    let name: String = if mode.case || mode.normalization {
+        name.chars().filter(|&c| !is_fold_ignorable(c)).collect()
+    } else {
+        name.to_owned()
+    };
+    let name = name.as_str();
     let normalize = |text: String| -> String {
         if mode.normalization {
             text.nfd().collect()
@@ -835,7 +905,9 @@ fn check_paths_with(
             continue;
         }
         let lexical = lexical.clone();
-        let special = |path: &str| special_root(path, insensitivity);
+        let special = |path: &str| {
+            special_root(path, insensitivity) || has_ignorable_only_segment(path, insensitivity)
+        };
         let (mut check, resolved) = if special(&lexical) {
             (PathCheck::Unresolved, None)
         } else {
@@ -897,6 +969,11 @@ impl Gate {
             path_keys,
             path_prefixes,
         })
+    }
+
+    /// Whether some rule matches an argument with `PathPrefix`.
+    pub fn has_path_rules(&self) -> bool {
+        !self.path_keys.is_empty()
     }
 
     /// Evaluates and returns the attested evidence without journaling it.
@@ -1764,6 +1841,144 @@ mod tests {
         );
         let record = check_paths(&mut built, &keys, &rules).unwrap();
         assert_eq!(record["arguments.path"]["status"], "same");
+    }
+
+    /// Review round 5, Media 1: the reviewer's 51 aliases (48 on HFS+, 3 on
+    /// macOS ExFAT) of a DENY `vault` that does not exist yet.
+    fn round5_aliases() -> Vec<String> {
+        let mut aliases = Vec::new();
+        let hfs = (0x200C..=0x200F)
+            .chain(0x202A..=0x202E)
+            .chain(0x206A..=0x206F)
+            .chain([0xFEFF])
+            .map(|c| char::from_u32(c).unwrap());
+        for c in hfs {
+            aliases.push(format!("va{c}ult"));
+            aliases.push(format!("{c}vault"));
+            aliases.push(format!("vault{c}"));
+        }
+        aliases.extend(["vault\u{F000}", "vault\u{F02A}", "\u{FEFF}vault"].map(str::to_owned));
+        aliases
+    }
+
+    #[test]
+    fn fold_key_drops_ignorable_code_points_when_folding() {
+        let aliases = round5_aliases();
+        assert_eq!(aliases.len(), 51);
+        let rules = prefixes(&["/vol/vault"]);
+        let apfs_cs = Insensitivity {
+            case: false,
+            normalization: true,
+        };
+        for alias in &aliases {
+            let path = format!("/vol/{alias}");
+            for mode in [Insensitivity::FULL, apfs_cs] {
+                assert_eq!(fold_key(alias, mode), "vault", "{alias:?}");
+                assert!(
+                    folds_into_prefix(&path, &rules, |_| mode).is_some(),
+                    "{alias:?}"
+                );
+            }
+            assert_eq!(
+                folds_into_prefix(&path, &rules, |_| Insensitivity::NONE),
+                None
+            );
+        }
+        // The table is sorted, disjoint, and matches spot checks.
+        assert!(DEFAULT_IGNORABLE.windows(2).all(|w| w[0].1 < w[1].0));
+        for c in [
+            '\u{AD}',
+            '\u{200B}',
+            '\u{2065}',
+            '\u{FE0F}',
+            '\u{E0001}',
+            '\u{E0FFF}',
+            '\u{F000}',
+            '\u{F0FF}',
+        ] {
+            assert!(is_fold_ignorable(c), "{c:?}");
+        }
+        for c in [
+            'a',
+            ' ',
+            '\u{200A}',
+            '\u{2070}',
+            '\u{FEFE}',
+            '\u{F100}',
+            '\u{E1000}',
+        ] {
+            assert!(!is_fold_ignorable(c), "{c:?}");
+        }
+    }
+
+    /// A segment made only of ignorables is `unresolved` where names fold.
+    #[cfg(unix)]
+    #[test]
+    fn ignorable_only_segments_are_unresolved_where_names_fold() {
+        let (_temp, root) = canonical_tempdir();
+        let rules = prefixes(&[&text(&root.join("vault"))]);
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        let check = |path: &str, mode: Insensitivity| {
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths_with(&mut built, &keys, &rules, |_| mode).unwrap();
+            (
+                built["arguments.path"].as_str().unwrap().to_owned(),
+                record["arguments.path"]["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+        for name in ["\u{200C}", "\u{FEFF}\u{200D}", "\u{F02A}"] {
+            let path = format!("{}/{name}", text(&root));
+            assert_eq!(
+                check(&path, Insensitivity::FULL),
+                (UNRESOLVED_PATH.to_owned(), "unresolved".to_owned()),
+                "{name:?}"
+            );
+            assert_eq!(check(&path, Insensitivity::NONE).1, "same", "{name:?}");
+        }
+        let alias = format!("{}/va\u{200C}ult", text(&root));
+        assert_eq!(check(&alias, Insensitivity::FULL).1, "ambiguous");
+        assert_eq!(check(&alias, Insensitivity::NONE).1, "same");
+    }
+
+    /// Review round 5 on a real HFS+ volume (`hdiutil create -fs HFS+`):
+    /// set `PRAETORE_TEST_HFS_ROOT` to a writable directory on it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "needs an HFS+ volume: set PRAETORE_TEST_HFS_ROOT"]
+    fn hfs_ignorable_aliases_of_a_missing_prefix_are_hidden() {
+        let root = PathBuf::from(std::env::var("PRAETORE_TEST_HFS_ROOT").unwrap());
+        let root = fs::canonicalize(root).unwrap();
+        let vault = root.join("vault");
+        let rules = prefixes(&[&text(&vault)]);
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        eprintln!(
+            "HFS+: dir_insensitivity = {:?}",
+            dir_insensitivity(&text(&root))
+        );
+        let (mut aliased, mut hidden) = (0, 0);
+        for alias in round5_aliases().into_iter().take(48) {
+            let path = text(&root.join(&alias));
+            // Ground truth: the filesystem treats the alias as `vault`.
+            fs::write(&vault, b"x").unwrap();
+            let same = fs::metadata(&path).is_ok_and(|m| {
+                use std::os::unix::fs::MetadataExt;
+                m.ino() == fs::metadata(&vault).unwrap().ino()
+            });
+            fs::remove_file(&vault).unwrap();
+            assert!(same, "HFS+ does not alias {alias:?}");
+            aliased += 1;
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths(&mut built, &keys, &rules).unwrap();
+            assert_eq!(
+                built["arguments.path"], UNRESOLVED_PATH,
+                "{alias:?}: {record}"
+            );
+            hidden += 1;
+        }
+        eprintln!("HFS+: aliased={aliased} hidden={hidden}");
     }
 
     /// The adversarial finding on `ccea7be`: the denied directory does not

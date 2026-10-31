@@ -1014,3 +1014,64 @@ fn deny_path_prefix_catches_dev_fd_aliases_of_server_descriptors() {
     );
     assert!(verify_cli(&home).status.success());
 }
+
+/// Independent review of `419e66f`, Media 1, as the reviewer ran it, on a
+/// real HFS+ volume: HFS+ ignores U+200C (and other invisible code points)
+/// in names, so `va\u{200C}ult` would create the `vault` a DENY names
+/// before it exists. Set `PRAETORE_TEST_HFS_ROOT` to a writable directory
+/// on an HFS+ volume (`hdiutil create -fs HFS+ ...`).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs an HFS+ volume: set PRAETORE_TEST_HFS_ROOT"]
+fn deny_path_prefix_catches_hfs_ignorable_aliases_of_a_missing_name() {
+    let hfs = fs::canonicalize(std::env::var("PRAETORE_TEST_HFS_ROOT").unwrap()).unwrap();
+    let vault = hfs.join("vault");
+    let _ = fs::remove_file(&vault);
+    let (_temp, home) = init_home();
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-vault", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    vault.to_str().unwrap(),
+                )),
+        ],
+    );
+    let append = |id: u32, name: &str| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"append",
+            "arguments":{"path":hfs.join(name).to_str().unwrap(),"text":"PLANTED\n"}}})
+    };
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            append(10, "vault"),
+            append(11, "VAULT"),
+            append(12, "vault."),
+            append(13, "va\u{200C}ult"),
+            append(14, "\u{FEFF}vault"),
+            append(15, "vault\u{206F}"),
+            append(16, "notes.txt"),
+        ]),
+    );
+    for (id, refused) in [
+        (10, true),
+        (11, true),
+        (12, true),
+        (13, true),
+        (14, true),
+        (15, true),
+        (16, false),
+    ] {
+        let reply = by_id(&responses, &json!(id));
+        eprintln!("HFS+ e2e id {id}: isError={}", reply["result"]["isError"]);
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert!(
+        !vault.exists(),
+        "the agent created the denied entry: {stderr}"
+    );
+    fs::remove_file(hfs.join("notes.txt")).unwrap();
+    assert!(verify_cli(&home).status.success());
+}

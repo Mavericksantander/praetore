@@ -240,7 +240,18 @@ unknown flag) never writes anything. `policy check` also starts the same
 HighAssurance engine `wrap` uses, and warns about rules that will behave in
 surprising ways.
 
-**Path arguments are resolved before evaluation (T-014).** Core's
+**Path arguments are resolved before evaluation (T-014).** This is
+**defense in depth for local servers on the same host and in the same mount
+namespace as `wrap`, not a guarantee.** The proxy can only check a path
+string against its own view of the filesystem; the server opens it later,
+in its own process, and every filesystem has its own rules for which names
+are the same entry. The structural fix is to confine the server itself
+(T-013B, PR #61: open inside a confined root, component by component, and
+check the opened descriptor). Known limits, all documented below: hard
+links, TOCTOU, Linux bind mounts of a subdirectory, servers in another
+namespace or on another host (**not supported**), network and FUSE mounts
+that loop back to the same disk (**not supported**), and any decoding the
+server applies to the path (`%2F`, `file://`, `~`, trimming). Core's
 `PathPrefix` is lexical by design. For every argument that some rule matches
 with `--arg-path-prefix` (any rule, any effect), `wrap` first resolves an
 absolute value through the filesystem (`canonicalize`; for a file that does
@@ -331,10 +342,31 @@ the server are never changed. Consequences:
   the call, stopping at the first missing one), plus the name comparisons.
   Measured on a debug build: about 20-30 ms with 1000 prefixes, about 3 ms
   with 60 prefixes of 1000 bytes. The policy is trusted; keep it small.
-* The check runs in the proxy's view of the filesystem. A server in another
-  mount namespace (`wrap -- docker run -v ...`, a chroot, a remote host)
-  may resolve the same string to a different file; the result is then
-  usually `unresolved` (fail closed), but nothing guarantees it.
+* **Not supported: a server in another mount namespace or on another host**
+  (`wrap -- docker run -v ...`, `podman`, `ssh`, a chroot). The check runs
+  in the proxy's view of the filesystem, and the server may resolve the same
+  string to a different file. Example: with DENY `/usr/bin`, `/bin/curl`
+  is `same` on a Mac (where `/bin` is a real directory) but is
+  `/usr/bin/curl` inside a merged-usr Debian image. `wrap` prints a
+  warning at startup when the command looks like `docker`, `podman`,
+  `nerdctl`, `ssh`, `chroot`, `kubectl`, `bwrap`, ... (also behind
+  `env`/`sudo`) and the policy has path rules; the heuristic does not see
+  wrapper scripts.
+* **Not supported: network and FUSE mounts that expose the same files**
+  under another `st_dev` (SMB/NFS to `localhost`, `bindfs`/`sshfs` with
+  macFUSE or FSKit, Linux `/run/user/<uid>/doc` or `gvfs`). They are the same
+  family as a bind mount of a subdirectory.
+* Server-side decoding (`%2F`, `file://`, `~`/`$HOME` expansion, trimming)
+  happens after the decision and is invisible to the gate. Non-absolute
+  forms are already unsafe for core; an absolute path the server decodes
+  further is not covered.
+* Ignorable characters: when a filesystem folds names, every Unicode 16
+  `Default_Ignorable_Code_Point` and the SFM private-use range U+F000-F0FF
+  are dropped from the fold key (HFS+ ignores U+200C-200F, U+202A-202E,
+  U+206A-206F and U+FEFF anywhere in a name; macOS ExFAT a leading U+FEFF
+  and trailing U+F000-range characters), and a segment made only of them is
+  `unresolved`. Checked on a real HFS+ image against the 48 HFS+ aliases a
+  reviewer found.
 * Relative values are not resolved; core already treats them as unsafe.
 * The check happens when the proxy decides. The server opens the path later,
   so a symlink created or swapped in between is not seen (TOCTOU, see
