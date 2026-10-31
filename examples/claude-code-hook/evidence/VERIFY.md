@@ -220,7 +220,7 @@ a bad signature, a repeated `evidence_id`, or anything in the directory that
 is not a regular `*.json` file. With `--tenant <uuid>` instead of
 `--receipts-dir` it reads the `praetore.execution_journal` rows of that
 tenant from `PRAETORE_GATEWAY_DATABASE_URL`, ordered by
-`(created_at, request_id)`.
+`(created_at, request_id, agent_id)`.
 
 ### Verify by hand
 
