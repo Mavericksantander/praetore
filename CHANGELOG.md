@@ -7,9 +7,16 @@
   `parameters`. At dispatch, before any Kubernetes request, the supervisor
   answers 400 if `parameters` is not an object, has a key the route does not
   declare, has a value of another kind, or lacks a required key. Only `path`
-  and `path_list` values get the lexical path check (no NUL, no leading `/`
-  or `\`, no drive/UNC prefix, no `..` segment); free text in `string`
-  values is not path-checked.
+  and `path_list` values get the lexical path check; free text in `string`
+  values is not path-checked. The check is fail-closed and, compared with
+  0.3.0, also refuses more: a `path` value (and every `path_list` element)
+  is rejected when it is empty; has an empty, `.` or `..` segment (`/` and
+  `\` are both separators, so `./a`, `a/./b`, `a//b` and a trailing
+  separator are refused); starts with `/`, `\` or `~`, or with a drive or
+  UNC prefix; contains `%`; or contains any control character (C0, DEL, C1
+  such as NEL), a Unicode format (Cf) or bidirectional control character,
+  or U+2028/U+2029. Callers that sent `./x` or `dir/` must send `x` or
+  `dir`.
   - Kinds: `path`, `path_list` (array of at most 64 `path` values, each
     checked), `string`, `integer`, `boolean`. Nested objects are not
     supported.

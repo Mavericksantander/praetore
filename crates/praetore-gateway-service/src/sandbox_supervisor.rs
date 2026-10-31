@@ -618,9 +618,9 @@ fn valid_dispatch_request(request: &DispatchRequest, idempotency: &str) -> bool 
 }
 
 /// T-013 fix A: `parameters` must be an object whose keys are all declared by
-/// the route, each value of the declared kind. Only `path` values get the
-/// lexical check, so free text that merely looks like a path is not refused.
-/// Declared keys may be absent.
+/// the route, each value of the declared kind, and every required key must be
+/// present. Only `path` and `path_list` values get the lexical check, so free
+/// text that merely looks like a path is not refused.
 fn parameters_match_schema(schema: &BTreeMap<String, ParameterSpec>, parameters: &Value) -> bool {
     let Value::Object(entries) = parameters else {
         return false;
@@ -653,17 +653,60 @@ fn value_matches_kind(kind: ParameterKind, value: &Value) -> bool {
     }
 }
 
-/// Lexical only: rejects NUL, a root (`/` or `\`), a drive or UNC prefix and
-/// any `..` segment. Both separators are checked so the result does not
-/// depend on the host OS. Symlinks are not resolved here (fix B).
+/// Lexical only, fail-closed. Rejects an empty value; NUL and every other
+/// control character (C0, DEL, C1 such as NEL); Unicode format (Cf) and
+/// bidirectional controls, plus the line and paragraph separators, which
+/// could make the value shown to an approver or written to a log differ from
+/// the one used; a root (`/` or `\`); a drive or UNC prefix; a leading `~`
+/// (home expansion); any `%` (URL decoding downstream would bypass these
+/// checks); and any empty, `.` or `..` segment (so `a//b`, `./a`, `a/.` and a
+/// trailing separator are refused). Both separators are checked so the result
+/// does not depend on the host OS. Symlinks are not resolved here (fix B).
 fn lexically_confined_text(text: &str) -> bool {
     let bytes = text.as_bytes();
     let rooted = text.starts_with(['/', '\\']);
     let drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    !text.contains('\0')
+    !text.is_empty()
         && !rooted
         && !drive
-        && !text.split(['/', '\\']).any(|segment| segment == "..")
+        && !text.starts_with('~')
+        && !text.contains('%')
+        && !text
+            .chars()
+            .any(|character| character.is_control() || is_format_or_bidi_char(character))
+        && text
+            .split(['/', '\\'])
+            .all(|segment| !matches!(segment, "" | "." | ".."))
+}
+
+/// Unicode general category Cf (format: bidirectional embeddings, overrides
+/// and isolates, marks, zero-width characters, tags, ...) plus U+2028/U+2029.
+/// Written out because `std` exposes no general-category lookup.
+fn is_format_or_bidi_char(character: char) -> bool {
+    matches!(
+        character,
+        '\u{00AD}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
 }
 
 fn is_json_content_type(headers: &HeaderMap) -> bool {
@@ -1881,7 +1924,7 @@ mod tests {
     fn sandbox_dispatch_accepts_declared_values_and_free_text() {
         for parameters in [
             json!({"path": "data/report.txt"}),
-            json!({"path": "./a/b..c/..."}),
+            json!({"path": "a/b..c/..."}),
             // Only `path` values are checked: free text that looks like a
             // path, a URL or `..` is not refused.
             json!({
@@ -1894,6 +1937,123 @@ mod tests {
             assert!(
                 parameters_match_schema(&path_schema(), &parameters),
                 "rejected: {parameters}"
+            );
+        }
+    }
+
+    /// Every value in `values` that the schema accepts, either as the `path`
+    /// value or as the second element of the `files` path list.
+    fn accepted_as_path_or_list_item(values: &[&str]) -> Vec<String> {
+        let mut accepted = Vec::new();
+        for value in values {
+            if parameters_match_schema(&path_schema(), &json!({"path": value})) {
+                accepted.push(format!("path={value:?}"));
+            }
+            let list = json!({"path": "ok", "files": ["ok", value]});
+            if parameters_match_schema(&path_schema(), &list) {
+                accepted.push(format!("files[1]={value:?}"));
+            }
+        }
+        accepted
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_empty_path() {
+        let accepted = accepted_as_path_or_list_item(&[""]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_dot_and_empty_segments() {
+        let accepted = accepted_as_path_or_list_item(&[
+            ".", "./", ".\\", "./.", "a/./b", "a/.", "a\\.\\b", "./a", "a//b", "a\\\\b", "a/",
+            "a\\", "a/\\b",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_control_characters() {
+        let accepted = accepted_as_path_or_list_item(&[
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "\u{1b}[2J",
+            "a\u{1b}[2Jb",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{9b}b",
+            "a\u{1}b",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_format_and_bidi_characters() {
+        let mut values = Vec::new();
+        for character in ('\u{202A}'..='\u{202E}')
+            .chain('\u{2066}'..='\u{2069}')
+            .chain([
+                '\u{200E}',
+                '\u{200F}',
+                '\u{061C}',
+                '\u{200B}',
+                '\u{200D}',
+                '\u{2060}',
+                '\u{FEFF}',
+                '\u{00AD}',
+                '\u{2028}',
+                '\u{2029}',
+                '\u{E0041}',
+            ])
+        {
+            values.push(format!("a{character}txt.exe"));
+        }
+        let values: Vec<&str> = values.iter().map(String::as_str).collect();
+        let accepted = accepted_as_path_or_list_item(&values);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_leading_tilde() {
+        let accepted = accepted_as_path_or_list_item(&["~", "~/x", "~root/.ssh/id_rsa", "~\\x"]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_percent() {
+        let accepted = accepted_as_path_or_list_item(&[
+            "%2e%2e/etc/passwd",
+            "a%2Fb",
+            "a%00",
+            "%",
+            "dir/100%.txt",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_still_accepts_plain_relative_paths() {
+        for value in [
+            "dir/file.txt",
+            "dir/sub/file-1.txt",
+            "dir\\sub\\file_2.txt",
+            "file.txt",
+            ".hidden",
+            "a/b..c/...",
+            "a~b/c~",
+            "informe año 2026.txt",
+        ] {
+            assert!(
+                parameters_match_schema(&path_schema(), &json!({"path": value})),
+                "path {value:?} was rejected"
+            );
+            assert!(
+                parameters_match_schema(
+                    &path_schema(),
+                    &json!({"path": "ok", "files": ["ok", value]})
+                ),
+                "files item {value:?} was rejected"
             );
         }
     }
