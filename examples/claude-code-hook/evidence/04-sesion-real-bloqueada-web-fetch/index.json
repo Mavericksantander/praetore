@@ -1,0 +1,74 @@
+[
+  {
+    "agent": "main",
+    "file": "evidence/0001-main-Glob-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Glob",
+    "tool_use_id": "toolu_01T73R48uWvkSG5QAXjamrM9"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0002-main-Read-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01SVoWpLXb1RtarETRR2ribo"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0003-main-Read-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01DdusE8oV2f1DYcLei66ivo"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0004-main-Read-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01GKtWKLRsS17tAQbXmymFyi"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0005-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01FYiPk2pSqAh72N3RJTZC6k"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0006-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_015JQReAGQWKJ7TKfZoVJvBE"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0007-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01PLNwx4YaCtZ3zgF6AHgNEo"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0008-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01Ew6A2TMWCjrzuhfbDoTUfN"
+  }
+]
