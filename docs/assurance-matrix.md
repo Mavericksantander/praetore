@@ -16,6 +16,7 @@ absence of defects.
 | Signed authority and optional subject-key comparison | verifier authority command and `TrustedAuthorityIssuer::verify_authority_at` | `authority_and_policy_digest_commands_verify_and_report_stable_results` | `rust` |
 | Policy digest reporting | `Policy::from_json` and `Policy::digest` in verifier | policy digest integration case and golden-vector unit tests | `rust` |
 | Parser/evaluator no-panic exploration | `fuzz/fuzz_targets/*.rs` | Six seeded libFuzzer target corpora, including HighAssurance evaluation | `fuzz-smoke` (10 seconds per target) |
+| `PathPrefix` confinement against an independent oracle | `fuzz/fuzz_targets/path_prefix.rs`, seeds in `fuzz/corpus/path_prefix`, `fuzz/path_prefix.dict` | Allow, Deny and RequireApproval rules agree with a separate whole-segment model under semantics v1 and v2 | `fuzz-path-prefix` (5 minutes on PRs touching `policy.rs` or `fuzz/`, 25 minutes daily, cached corpus) |
 | Dependency advisory gate | committed `Cargo.lock` and RustSec audit | `cargo audit --locked` | `audit` |
 | Python verification behavior stays Rust-backed | `crates/praetore-python/src/lib.rs` and `praetore` package | `packages/praetore-python/tests/test_verify.py` | `python-verify` |
 | HighAssurance revalidates request, trust, freshness and policy at the replay-commit boundary | production engine before standalone replay claim or atomic authorization commit | advancing-clock regression proves an expired freshness lease is rejected without consuming the replay ID; request signature, intent, authority, active pins, production config and decision are also rechecked | `rust` |
@@ -47,7 +48,8 @@ absence of defects.
   CLI. `--require-intent` is only accepted with external issuer pins.
 - Standalone authority verification can compare subject-key binding against an
   `AgentIdentity` only when the optional `--agent` input is provided.
-- Fuzz CI runs bounded smoke intervals. It is not an exhaustive campaign.
+- Fuzz CI runs bounded intervals (10-second smoke per target, 60 seconds daily,
+  and 5 or 25 minutes for `path_prefix`). It is not an exhaustive campaign.
 - Python exposes evidence verification only. Policy evaluation and authority
   verification remain in Rust/CLI.
 - The legacy core `ReplayGuard` contract remains standalone. The reference

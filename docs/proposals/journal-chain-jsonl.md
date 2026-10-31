@@ -8,7 +8,9 @@ límites de "Qué NO prueba", que siguen vigentes.
 - Productor: `praetore journal-export (--receipts-dir DIR | --tenant UUID)
   --attester-pin HEX_FILE --output NUEVO`. Desde un directorio encadena los
   `*.json` en orden de nombre; desde el journal lee las filas del tenant en
-  `praetore.execution_journal` ordenadas por `(created_at, request_id)`.
+  `praetore.execution_journal` ordenadas por `(created_at, request_id,
+  agent_id)` (`agent_id` desempata dos agentes que reusan un `request_id`;
+  los UUID se comparan byte a byte, igual que su texto hex en minúsculas).
   Verifica cada recibo contra la clave fijada antes de encadenarlo y nunca
   sobrescribe el archivo de salida.
 - Verificador: `praetore-verify journal --journal JSONL --attester-pin
