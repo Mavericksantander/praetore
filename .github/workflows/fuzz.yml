@@ -33,7 +33,7 @@ jobs:
           - evidence_verify
           - engine_evaluate_dev
           - engine_evaluate_high_assurance
-          - path_prefix
+          # path_prefix has its own longer daily run in fuzz-path-prefix.yml.
     env:
       FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}
     steps:

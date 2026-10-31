@@ -1,0 +1,117 @@
+name: Fuzz path_prefix
+
+# Dedicated, longer libFuzzer run for the `PathPrefix` confinement target
+# (fuzz/fuzz_targets/path_prefix.rs). The other targets keep the 10-second
+# smoke in assurance.yml and the daily 60-second run in fuzz.yml.
+#
+# Budgets: 5 minutes on PRs and pushes that touch the matcher or the fuzz
+# harness, 25 minutes in the daily scheduled run.
+
+on:
+  pull_request:
+    paths:
+      - crates/praetore-core/src/policy.rs
+      - crates/praetore-core/Cargo.toml
+      - fuzz/**
+      - .github/workflows/fuzz-path-prefix.yml
+  push:
+    branches:
+      - main
+    paths:
+      - crates/praetore-core/src/policy.rs
+      - crates/praetore-core/Cargo.toml
+      - fuzz/**
+      - .github/workflows/fuzz-path-prefix.yml
+  schedule:
+    # Daily at 06:41 UTC, after the 06:17 run of fuzz.yml.
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds of fuzzing"
+        required: false
+        default: "1500"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-path-prefix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  path-prefix:
+    name: Fuzz path_prefix
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FUZZ_SECONDS: ${{ github.event.inputs.seconds || (github.event_name == 'schedule' && '1500') || '300' }}
+      # Working corpus, persisted with actions/cache. The committed seeds in
+      # fuzz/corpus/path_prefix are passed read-only as a second directory:
+      # libFuzzer writes new inputs only to the first one.
+      CORPUS_DIR: fuzz/corpus-cache/path_prefix
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly install cargo-fuzz --locked
+      - run: cargo +nightly check --manifest-path fuzz/Cargo.toml --locked
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CORPUS_DIR }}
+          key: fuzz-corpus-path_prefix-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: fuzz-corpus-path_prefix-
+      - name: Prepare corpus
+        run: |
+          mkdir -p "$CORPUS_DIR"
+          echo "Restored corpus entries: $(find "$CORPUS_DIR" -type f | wc -l)"
+      # The target checks a logic oracle over safe Rust (praetore-core has no
+      # `unsafe`), so it is built without a sanitizer: about 5x more
+      # executions per second than ASan. The ASan build of this target still
+      # runs in the assurance.yml smoke job.
+      - name: Fuzz path_prefix
+        run: |
+          set -o pipefail
+          case "$FUZZ_SECONDS" in ''|*[!0-9]*) echo "seconds must be an integer"; exit 1;; esac
+          cargo +nightly fuzz run --sanitizer none --fuzz-dir fuzz path_prefix \
+            "$CORPUS_DIR" fuzz/corpus/path_prefix -- \
+            -max_total_time="$FUZZ_SECONDS" \
+            -dict="$GITHUB_WORKSPACE/fuzz/path_prefix.dict" \
+            -timeout=10 \
+            -print_final_stats=1 2>&1 | tee fuzz-path_prefix.log
+      # Minimized on every run, before the corpus is saved, so the cache stays
+      # small and keeps only inputs that add coverage. It takes seconds at
+      # this corpus size.
+      - name: Minimize corpus
+        run: |
+          cargo +nightly fuzz cmin --sanitizer none --fuzz-dir fuzz path_prefix "$CORPUS_DIR"
+          echo "Minimized corpus entries: $(find "$CORPUS_DIR" -type f | wc -l)"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### path_prefix: ${FUZZ_SECONDS}s (${{ github.event_name }})"
+            echo
+            echo '```'
+            grep -E '^stat::|^#[0-9]+[[:space:]]+DONE|panicked|SUMMARY' fuzz-path_prefix.log || true
+            echo "corpus entries: $(find "$CORPUS_DIR" -type f | wc -l)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save corpus
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CORPUS_DIR }}
+          key: fuzz-corpus-path_prefix-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-path_prefix-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/path_prefix/
+            fuzz-path_prefix.log
+          if-no-files-found: ignore
+          retention-days: 30
