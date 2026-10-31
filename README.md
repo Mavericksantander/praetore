@@ -34,6 +34,7 @@ flowchart LR
 - [Install with your AI coding agent](#install-with-your-ai-coding-agent)
 - [Third-party verification demo](#third-party-verification-demo)
 - [Human approval with `praetore approve`](#human-approval-with-praetore-approve)
+- [Claude Code hook: visual evidence](#claude-code-hook-visual-evidence)
 - [Verify evidence offline](#verify-evidence-offline)
 - [Workspace crates](#workspace-crates)
 - **Reference**
@@ -285,6 +286,55 @@ Full guide: [`crates/praetore-cli/README.md`](crates/praetore-cli/README.md).
 
 ---
 
+## Claude Code hook: visual evidence
+
+Recorded with `asciinema` and `agg` by
+[`scripts/record-hook-demo.sh`](scripts/record-hook-demo.sh), which uses
+throwaway test keys generated in a temporary `DEMO-TEST-KEYS-*` directory and
+deleted on exit. It shows one allowed, one denied and one approval-required
+tool call through [`examples/claude-code-hook`](examples/claude-code-hook),
+then `praetore-verify` accepting the receipts and rejecting a copy with one
+altered byte.
+
+![Claude Code hook demo: allow, deny, approval, then offline verification and a rejected tampered receipt](docs/img/hook-demo.gif)
+
+### Flow applied to the hook
+
+Based on `authorize` and `hook_output` in
+[`examples/claude-code-hook/src/main.rs`](examples/claude-code-hook/src/main.rs).
+
+```mermaid
+flowchart LR
+    A["Agent<br/>Claude Code PreToolUse event<br/>agent_type or main"] --> AU["Authority<br/>profile identity + signed authority<br/>unknown agent: unregistered, no capabilities"]
+    AU --> AC["Action<br/>classify tool_name / tool_input<br/>paths resolved in the hook<br/>intent signed with profile key"]
+    AC --> P["Policy<br/>AuthorizationEngine::strict<br/>policy v2, default deny<br/>issuer pin"]
+    P --> D{"Decision"}
+    D -->|Allow| D1["no hook output:<br/>Claude Code permissions apply"]
+    D -->|Deny| D2["permissionDecision: deny"]
+    D -->|RequireApproval| D3["permissionDecision: ask"]
+    D --> E["Evidence<br/>signed by attester key<br/>appended to receipts.jsonl"]
+    E --> V["praetore-verify / hook verify<br/>offline, public keys only"]
+    X["hook error"] -.->|fail closed| D2
+```
+
+### Session verified by the CTO
+
+| Item | Result |
+| --- | --- |
+| Receipts | 118 |
+| Allow | 117 |
+| Deny | 0 |
+| RequireApproval | 1 |
+| Tampered copies rejected | 20 of 20 |
+| Verification | Offline, with `praetore-verify` and public keys only |
+
+Scope: this covers only the tool calls that went through the hook; anything
+an agent does by another path is outside it. The receipts prove integrity of
+what was recorded, not that the authority is still valid today. The receipts
+themselves are not published in this repository yet.
+
+---
+
 ## Verify evidence offline
 
 See the full [offline verifier reference](#verify-evidence-offline-reference) below (all commands and expected outputs).
@@ -532,6 +582,11 @@ The following are **open pull requests, not merged** and not available on
   validated target-cluster integration needed to establish an end-to-end
   sandbox.
 * An accreditation, or a guarantee that a deployment is protected.
+
+**Application domains.** Beyond AI coding agents, defense and autonomy is an
+application domain for deterministic governance: non-lethal autonomous
+systems whose decisions are governed by policy and leave auditable evidence.
+This describes a direction, not a current capability or engagement.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
