@@ -8,15 +8,26 @@
   answers 400 if `parameters` is not an object, has a key the route does not
   declare, has a value of another kind, or lacks a required key. Only `path`
   and `path_list` values get the lexical path check; free text in `string`
-  values is not path-checked. The check is fail-closed and, compared with
-  0.3.0, also refuses more: a `path` value (and every `path_list` element)
-  is rejected when it is empty; has an empty, `.` or `..` segment (`/` and
-  `\` are both separators, so `./a`, `a/./b`, `a//b` and a trailing
-  separator are refused); starts with `/`, `\` or `~`, or with a drive or
-  UNC prefix; contains `%`; or contains any control character (C0, DEL, C1
-  such as NEL), a Unicode format (Cf) or bidirectional control character,
-  or U+2028/U+2029. Callers that sent `./x` or `dir/` must send `x` or
-  `dir`.
+  values is not path-checked. The check is fail-closed and much stricter
+  than in 0.3.0. A `path` value, and every `path_list` element, is split on
+  both `/` and `\`, and every segment must match `[A-Za-z0-9._-]+` and must
+  not start with `.`. As a consequence the supervisor refuses:
+  - an empty value, an empty segment (`a//b`, a trailing separator as in
+    `dir/`) and the segments `.` and `..`;
+  - hidden names such as `.env` or `a/.git/config`, and `...` (a leading
+    `.` is rejected on purpose; this may be relaxed later);
+  - a leading `/`, `\` or `~`, and a drive or UNC prefix;
+  - spaces and punctuation outside `._-` (`+`, `@`, `~`, `%`, `:`, ...);
+    `%` is always refused, including names such as `100%.txt`;
+  - every non-ASCII character, including accented letters and homoglyphs
+    such as Cyrillic `а` (U+0430) or full-width `ａ` (U+FF41);
+  - control characters, Unicode format (Cf) and bidi characters, and
+    U+2028/U+2029 (also checked explicitly, as defense in depth).
+  - Path migration for callers: send `x` instead of `./x` and `dir`
+    instead of `dir/`, and rename files whose names use spaces, non-ASCII
+    letters, other punctuation or a leading `.` (for example `informe año 2026.txt` →
+    `informe_ano_2026.txt`, `.env` → `env`) before routing them through a
+    `path` or `path_list` parameter. Free text belongs in a `string` key.
   - Kinds: `path`, `path_list` (array of at most 64 `path` values, each
     checked), `string`, `integer`, `boolean`. Nested objects are not
     supported.

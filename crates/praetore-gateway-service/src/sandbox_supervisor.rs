@@ -653,15 +653,19 @@ fn value_matches_kind(kind: ParameterKind, value: &Value) -> bool {
     }
 }
 
-/// Lexical only, fail-closed. Rejects an empty value; NUL and every other
-/// control character (C0, DEL, C1 such as NEL); Unicode format (Cf) and
-/// bidirectional controls, plus the line and paragraph separators, which
-/// could make the value shown to an approver or written to a log differ from
-/// the one used; a root (`/` or `\`); a drive or UNC prefix; a leading `~`
-/// (home expansion); any `%` (URL decoding downstream would bypass these
-/// checks); and any empty, `.` or `..` segment (so `a//b`, `./a`, `a/.` and a
-/// trailing separator are refused). Both separators are checked so the result
-/// does not depend on the host OS. Symlinks are not resolved here (fix B).
+/// Lexical only, fail-closed. Every segment (split on both `/` and `\`, so the
+/// result does not depend on the host OS) must match `[A-Za-z0-9._-]+` and
+/// must not start with `.`: this refuses `.`, `..`, hidden names such as
+/// `.env`, spaces, and every non-ASCII character, including homoglyphs such
+/// as Cyrillic `а` or full-width `ａ`. Rejecting a leading `.` is a
+/// deliberate choice (over-rejecting is the safe side) that can be relaxed.
+///
+/// The allowlist already implies the following, which are still checked
+/// explicitly as defense in depth: an empty value; NUL and every other
+/// control character; Unicode format (Cf) and bidirectional controls and
+/// U+2028/U+2029; a root (`/` or `\`); a drive or UNC prefix; a leading `~`;
+/// any `%`; and any empty, `.` or `..` segment (so `a//b`, `./a` and a
+/// trailing separator are refused). Symlinks are not resolved here (fix B).
 fn lexically_confined_text(text: &str) -> bool {
     let bytes = text.as_bytes();
     let rooted = text.starts_with(['/', '\\']);
@@ -676,7 +680,16 @@ fn lexically_confined_text(text: &str) -> bool {
             .any(|character| character.is_control() || is_format_or_bidi_char(character))
         && text
             .split(['/', '\\'])
-            .all(|segment| !matches!(segment, "" | "." | ".."))
+            .all(|segment| !matches!(segment, "" | "." | "..") && allowed_path_segment(segment))
+}
+
+/// `[A-Za-z0-9._-]+`, not starting with `.`.
+fn allowed_path_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && !segment.starts_with('.')
+        && segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 /// Unicode general category Cf (format: bidirectional embeddings, overrides
@@ -1924,7 +1937,7 @@ mod tests {
     fn sandbox_dispatch_accepts_declared_values_and_free_text() {
         for parameters in [
             json!({"path": "data/report.txt"}),
-            json!({"path": "a/b..c/..."}),
+            json!({"path": "a/b..c/d..."}),
             // Only `path` values are checked: free text that looks like a
             // path, a URL or `..` is not refused.
             json!({
@@ -2033,16 +2046,81 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_dispatch_rejects_leading_dot_segments() {
+        let accepted = accepted_as_path_or_list_item(&[
+            ".env",
+            "dir/.env",
+            ".hidden",
+            "a/.git/config",
+            "a\\.ssh\\id_rsa",
+            "...",
+            "a/...",
+            "a/..x",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_characters_outside_the_ascii_allowlist() {
+        let accepted = accepted_as_path_or_list_item(&[
+            "informe año 2026.txt",
+            "a b",
+            "dir/a b.txt",
+            "a+b",
+            "a@b",
+            "a:b",
+            "a~b",
+            "c~",
+            "a*b",
+            "a?b",
+            "a\"b",
+            "a<b>",
+            "a|b",
+            "a;b",
+            "a$b",
+            "a`b",
+            "a'b",
+            "a=b",
+            "a,b",
+            "a#b",
+            "a&b",
+            "a(b)",
+            "a!b",
+            "a[b]",
+            "a{b}",
+            "é.txt",
+            "日本.txt",
+            "a\u{1F600}",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
+    fn sandbox_dispatch_rejects_homoglyphs() {
+        let accepted = accepted_as_path_or_list_item(&[
+            // Cyrillic `а` (U+0430) for Latin `a`.
+            "d\u{0430}ta.txt",
+            "etc/p\u{0430}sswd",
+            // Full-width `ａ` (U+FF41), solidus (U+FF0F) and full stop (U+FF0E).
+            "\u{FF41}.txt",
+            "a\u{FF0F}b",
+            "\u{FF0E}\u{FF0E}/x",
+            // Greek omicron (U+03BF) for Latin `o`.
+            "c\u{03BF}nfig",
+        ]);
+        assert!(accepted.is_empty(), "accepted: {accepted:?}");
+    }
+
+    #[test]
     fn sandbox_dispatch_still_accepts_plain_relative_paths() {
         for value in [
             "dir/file.txt",
             "dir/sub/file-1.txt",
             "dir\\sub\\file_2.txt",
             "file.txt",
-            ".hidden",
-            "a/b..c/...",
-            "a~b/c~",
-            "informe año 2026.txt",
+            "a/b..c/d...",
+            "Data_2026/v1.2-final.tar.gz",
+            "UPPER/lower-123",
         ] {
             assert!(
                 parameters_match_schema(&path_schema(), &json!({"path": value})),
