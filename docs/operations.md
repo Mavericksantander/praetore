@@ -268,6 +268,9 @@ not used: the gateway's injected, trusted clock decides expiry (and is signed
 into expiration receipts), and the database clock may be skewed relative to
 it. A dispatch without the setting is refused.
 
+Migrations are forward-only. There is no down migration; rolling one back
+means restoring a backup taken before it was applied.
+
 #### TLS
 
 Every connection (gateway, CLI, `praetore-observe`) validates its URL before

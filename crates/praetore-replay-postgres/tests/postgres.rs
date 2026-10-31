@@ -2967,7 +2967,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0010_approved_pending_dispatch",
             "0011_runtime_role",
             "0012_dispatch_requires_live_approval",
-            "0013_dispatch_refused"
+            "0013_dispatch_refused",
+            "0014_closed_execution_row_lock"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -3892,4 +3893,456 @@ fn postgres_concurrent_human_approval_dispatches_exactly_once() {
         assert_eq!(database_invocation_count(key), 1, "race {race}");
         assert_eq!(database_effect_count(key), 1, "race {race}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_refused (0013), locked by 0014
+// ---------------------------------------------------------------------------
+
+const DISPATCH_REFUSED_CLOSE: &str =
+    "execution_status = 'not_dispatched', not_dispatched_reason = 'dispatch_refused'";
+
+fn migration_checksum(sql: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(sql.as_bytes()))
+}
+
+fn db_message(error: postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map(|db| db.message().to_owned())
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn insert_human_approval(client: &mut Client, key: ExecutionKey) -> Result<u64, postgres::Error> {
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&key.tenant_id.to_string()],
+        )
+        .unwrap();
+    let digest = "0".repeat(64);
+    let inserted = transaction.execute(
+        "INSERT INTO praetore.human_approvals \
+             (approval_id, tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+              action_digest, policy_digest, outcome, approver_key_id, expires_at, decision_json) \
+         VALUES ($1, $2, $3, $4, $5, $6, $6, $6, 'approve', 'sql-test', \
+                 clock_timestamp() + interval '1 minute', '{}'::jsonb)",
+        &[
+            &Uuid::new_v4(),
+            &key.tenant_id,
+            &key.agent_id,
+            &key.request_id,
+            &Uuid::new_v4(),
+            &digest,
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(inserted)
+}
+
+fn tenant_scoped<T>(
+    client: &mut Client,
+    tenant: Uuid,
+    body: impl FnOnce(&mut postgres::Transaction<'_>) -> Result<T, postgres::Error>,
+) -> Result<T, postgres::Error> {
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .batch_execute("SET LOCAL ROLE praetore_replay_test")
+        .unwrap();
+    transaction
+        .query_one(
+            "SELECT set_config('praetore.tenant_id', $1, true)",
+            &[&tenant.to_string()],
+        )
+        .unwrap();
+    let value = body(&mut transaction)?;
+    transaction.commit()?;
+    Ok(value)
+}
+
+fn authorized_allowed_key() -> ExecutionKey {
+    let allowed = create_postgres_gateway(Uuid::new_v4());
+    let evidence = evaluate_and_commit(&allowed, allowed.request.clone());
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *evidence.agent.id.as_uuid(),
+        request_id: evidence.request_id,
+    };
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::Authorized
+    );
+    key
+}
+
+fn undecided_approval_key() -> ExecutionKey {
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
+    assert_eq!(
+        pending.evidence.decision.outcome,
+        DecisionOutcome::RequireApproval
+    );
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    assert_eq!(
+        connect_journal().get(key).unwrap().unwrap().execution,
+        ExecutionStatus::NotDispatched
+    );
+    assert!(database_not_dispatched_reason(key).is_none());
+    assert_eq!(
+        database_rows_for_request("praetore.human_approvals", key.request_id),
+        0
+    );
+    key
+}
+
+fn journal_execution_status(key: ExecutionKey) -> String {
+    connect_client()
+        .query_one(
+            "SELECT execution_status FROM praetore.execution_journal \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap()
+        .get(0)
+}
+
+fn journal_visible_to(client: &mut Client, tenant: Uuid, key: ExecutionKey) -> i64 {
+    tenant_scoped(client, tenant, |transaction| {
+        transaction
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal \
+                 WHERE agent_id = $1 AND request_id = $2",
+                &[&key.agent_id, &key.request_id],
+            )
+            .map(|row| row.get(0))
+    })
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_dispatch_refused_close_is_final_and_tenant_isolated() {
+    let mut admin = connect_client();
+
+    let allowed = authorized_allowed_key();
+    assert_eq!(
+        admin_update(&mut admin, allowed, DISPATCH_REFUSED_CLOSE).unwrap(),
+        1
+    );
+    assert_eq!(journal_execution_status(allowed), "not_dispatched");
+    assert_eq!(
+        database_not_dispatched_reason(allowed).as_deref(),
+        Some("dispatch_refused")
+    );
+    let write_once =
+        db_message(admin_update(&mut admin, allowed, "not_dispatched_reason = NULL").unwrap_err());
+    assert!(write_once.contains("write-once"), "{write_once}");
+    let reopen = db_message(
+        admin_update(
+            &mut admin,
+            allowed,
+            "execution_status = 'approved_pending_dispatch'",
+        )
+        .unwrap_err(),
+    );
+    assert!(
+        reopen.contains("invalid execution journal state transition"),
+        "{reopen}"
+    );
+    assert!(reopen.contains("approved_pending_dispatch"), "{reopen}");
+    assert_eq!(
+        database_not_dispatched_reason(allowed).as_deref(),
+        Some("dispatch_refused")
+    );
+    let closed = db_message(insert_human_approval(&mut admin, allowed).unwrap_err());
+    assert!(
+        closed.contains("execution is closed without dispatch"),
+        "{closed}"
+    );
+
+    let undecided = undecided_approval_key();
+    assert_eq!(
+        admin_update(&mut admin, undecided, DISPATCH_REFUSED_CLOSE).unwrap(),
+        1
+    );
+    assert_eq!(journal_execution_status(undecided), "not_dispatched");
+    assert_eq!(
+        database_not_dispatched_reason(undecided).as_deref(),
+        Some("dispatch_refused")
+    );
+    let write_once = db_message(
+        admin_update(
+            &mut admin,
+            undecided,
+            "not_dispatched_reason = 'approval_expired'",
+        )
+        .unwrap_err(),
+    );
+    assert!(write_once.contains("write-once"), "{write_once}");
+    let reopen = db_message(
+        admin_update(
+            &mut admin,
+            undecided,
+            "execution_status = 'approved_pending_dispatch'",
+        )
+        .unwrap_err(),
+    );
+    assert!(
+        reopen.contains("invalid execution journal state transition"),
+        "{reopen}"
+    );
+    assert!(reopen.contains("approved_pending_dispatch"), "{reopen}");
+    let closed = db_message(insert_human_approval(&mut admin, undecided).unwrap_err());
+    assert!(
+        closed.contains("execution is closed without dispatch"),
+        "{closed}"
+    );
+    assert_eq!(
+        database_rows_for_request("praetore.human_approvals", undecided.request_id),
+        0
+    );
+    assert_eq!(
+        database_not_dispatched_reason(undecided).as_deref(),
+        Some("dispatch_refused")
+    );
+
+    let other_tenant = Uuid::new_v4();
+    assert_eq!(
+        journal_visible_to(&mut admin, undecided.tenant_id, undecided),
+        1
+    );
+    assert_eq!(journal_visible_to(&mut admin, other_tenant, undecided), 0);
+    let changed = tenant_scoped(&mut admin, other_tenant, |transaction| {
+        transaction.execute(
+            "UPDATE praetore.execution_journal \
+             SET not_dispatched_reason = NULL, updated_at = clock_timestamp() \
+             WHERE agent_id = $1 AND request_id = $2",
+            &[&undecided.agent_id, &undecided.request_id],
+        )
+    })
+    .unwrap();
+    assert_eq!(changed, 0);
+    let digest = "0".repeat(64);
+    let inserted = tenant_scoped(&mut admin, other_tenant, |transaction| {
+        transaction.execute(
+            "INSERT INTO praetore.human_approvals \
+                 (approval_id, tenant_id, agent_id, request_id, evidence_id, evidence_hash, \
+                  action_digest, policy_digest, outcome, approver_key_id, expires_at, \
+                  decision_json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $6, $6, 'approve', 'sql-test', \
+                     clock_timestamp() + interval '1 minute', '{}'::jsonb)",
+            &[
+                &Uuid::new_v4(),
+                &undecided.tenant_id,
+                &undecided.agent_id,
+                &undecided.request_id,
+                &Uuid::new_v4(),
+                &digest,
+            ],
+        )
+    });
+    assert!(
+        inserted.is_err(),
+        "tenant B inserted an approval for tenant A: {inserted:?}"
+    );
+    assert_eq!(
+        database_not_dispatched_reason(undecided).as_deref(),
+        Some("dispatch_refused")
+    );
+    assert_eq!(
+        database_rows_for_request("praetore.human_approvals", undecided.request_id),
+        0
+    );
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_closed_execution_and_approval_exclude_each_other() {
+    let races = 32;
+    let mut closes = 0;
+    let mut approvals = 0;
+    for race in 0..races {
+        let key = undecided_approval_key();
+        let mut closer = connect_client();
+        let mut approver = connect_client();
+        let barrier = std::sync::Barrier::new(2);
+        let (closed, approved) = thread::scope(|scope| {
+            let barrier = &barrier;
+            let close = scope.spawn(|| {
+                barrier.wait();
+                admin_update(&mut closer, key, DISPATCH_REFUSED_CLOSE)
+            });
+            let approve = scope.spawn(|| {
+                barrier.wait();
+                insert_human_approval(&mut approver, key)
+            });
+            (close.join().unwrap(), approve.join().unwrap())
+        });
+        match (closed, approved) {
+            (Ok(changed), Err(error)) => {
+                assert_eq!(changed, 1, "race {race}");
+                let message = db_message(error);
+                assert!(
+                    message.contains("execution is closed without dispatch"),
+                    "race {race}: {message}"
+                );
+                closes += 1;
+            }
+            (Err(error), Ok(changed)) => {
+                assert_eq!(changed, 1, "race {race}");
+                let message = db_message(error);
+                assert!(message.contains("write-once"), "race {race}: {message}");
+                approvals += 1;
+            }
+            (closed, approved) => {
+                panic!("race {race}: close={closed:?} approval={approved:?}");
+            }
+        }
+        let reason = database_not_dispatched_reason(key);
+        let decisions = database_rows_for_request("praetore.human_approvals", key.request_id);
+        assert_eq!(
+            journal_execution_status(key),
+            "not_dispatched",
+            "race {race}"
+        );
+        if reason.as_deref() == Some("dispatch_refused") {
+            assert_eq!(decisions, 0, "race {race}");
+        } else {
+            assert!(reason.is_none(), "race {race}: {reason:?}");
+            assert_eq!(decisions, 1, "race {race}");
+        }
+    }
+    println!("closed-execution races: {races} run, {closes} closes won, {approvals} approvals won");
+    assert_eq!(closes + approvals, races);
+}
+
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_transition_v2_function_is_dropped() {
+    initialize_test_database();
+    let mut client = connect_client();
+    {
+        let mut function_count = |name: &str| -> i64 {
+            client
+                .query_one(
+                    "SELECT count(*) FROM pg_proc p \
+                     JOIN pg_namespace n ON n.oid = p.pronamespace \
+                     WHERE n.nspname = 'praetore' AND p.proname = $1",
+                    &[&name],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(
+            function_count("validate_execution_journal_transition_v2"),
+            0
+        );
+        assert_eq!(
+            function_count("validate_execution_journal_transition_v3"),
+            1
+        );
+    }
+    let referencing_triggers: i64 = client
+        .query_one(
+            "SELECT count(*) FROM pg_trigger tg \
+             JOIN pg_proc p ON p.oid = tg.tgfoid \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'praetore' \
+               AND p.proname = 'validate_execution_journal_transition_v2'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(referencing_triggers, 0);
+
+    let row = client
+        .query_one(
+            "SELECT p.prosecdef, pg_get_functiondef(p.oid), \
+                    has_function_privilege('public', p.oid, 'EXECUTE'), tg.tgname \
+             FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_trigger tg ON tg.tgfoid = p.oid AND NOT tg.tgisinternal \
+             WHERE n.nspname = 'praetore' \
+               AND p.proname = 'refuse_decision_for_closed_execution'",
+            &[],
+        )
+        .unwrap();
+    let security_definer: bool = row.get(0);
+    let definition: String = row.get(1);
+    let public_execute: bool = row.get(2);
+    let trigger: String = row.get(3);
+    assert!(!security_definer);
+    assert!(!definition.contains("SECURITY DEFINER"), "{definition}");
+    assert!(definition.contains("FOR UPDATE"), "{definition}");
+    assert!(definition.contains("search_path"), "{definition}");
+    assert!(definition.contains("pg_catalog"), "{definition}");
+    assert!(definition.contains("pg_temp"), "{definition}");
+    assert!(!public_execute);
+    assert_eq!(trigger, "human_approvals_refuse_closed_execution");
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_0013_database_applies_only_0014() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    let end = praetore_replay_postgres::MIGRATIONS
+        .iter()
+        .position(|(version, _)| *version == "0014_closed_execution_row_lock")
+        .expect("0014 is registered");
+    // 0011 grants on this table. The runner creates it before any migration;
+    // a database already at 0013 has it, with 0001-0013 recorded.
+    client
+        .batch_execute(
+            "CREATE SCHEMA IF NOT EXISTS praetore; \
+             CREATE TABLE praetore.schema_migrations (\
+                 version TEXT PRIMARY KEY, \
+                 checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
+        )
+        .unwrap();
+    apply_legacy_migrations_through(&mut client, end);
+    for (version, sql) in &praetore_replay_postgres::MIGRATIONS[..end] {
+        client
+            .execute(
+                "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
+                &[version, &migration_checksum(sql)],
+            )
+            .unwrap();
+    }
+    let v2_before: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'praetore' \
+               AND p.proname = 'validate_execution_journal_transition_v2')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(v2_before, "0013 leaves the v2 function in place");
+
+    let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    let again = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    println!("0013 database applied {applied:?}; second run applied {again:?}");
+    assert_eq!(applied, vec!["0014_closed_execution_row_lock"]);
+    assert!(again.is_empty());
+    let v2_after: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'praetore' \
+               AND p.proname = 'validate_execution_journal_transition_v2')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!v2_after);
+    assert_eq!(recorded_versions(&mut client), all_versions());
 }
