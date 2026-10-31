@@ -275,6 +275,138 @@ unknown flag) never writes anything. `policy check` also starts the same
 HighAssurance engine `wrap` uses, and warns about rules that will behave in
 surprising ways.
 
+**Path arguments are resolved before evaluation (T-014).** This is
+**defense in depth for local servers on the same host and in the same mount
+namespace as `wrap`, not a guarantee.** The proxy can only check a path
+string against its own view of the filesystem; the server opens it later,
+in its own process, and every filesystem has its own rules for which names
+are the same entry. The structural fix is to confine the server itself
+(T-013B, PR #61: open inside a confined root, component by component, and
+check the opened descriptor). Known limits, all documented below: hard
+links, TOCTOU, Linux bind mounts of a subdirectory, servers in another
+namespace or on another host (**not supported**), network and FUSE mounts
+that loop back to the same disk (**not supported**), and any decoding the
+server applies to the path (`%2F`, `file://`, `~`, trimming). Core's
+`PathPrefix` is lexical by design. For every argument that some rule matches
+with `--arg-path-prefix` (any rule, any effect), `wrap` first resolves an
+absolute value through the filesystem (`canonicalize`; for a file that does
+not exist yet, its parent). Unless the value resolves to itself, the engine
+sees the placeholder `praetore-mcp:path-check-failed` instead, which core
+treats as an unsafe path: every DENY / REQUIRE_APPROVAL `PathPrefix` rule
+matches it and no ALLOW `PathPrefix` rule does. "Does not resolve to itself"
+means a symlink anywhere in the path, a `.`/`..` segment, a dangling symlink,
+or a parent that does not exist. The receipt records
+`context["praetore.path_check"][KEY] = {"lexical", "resolved", "status"}`
+(`same`, `differs`, `unresolved` or `ambiguous`), and the bytes forwarded to
+the server are never changed. Consequences:
+
+* Write rules and arguments with resolved paths. On macOS `/tmp` and `/var`
+  are symlinks to `/private/tmp` and `/private/var`, so `/tmp/x` is refused by
+  a restrictive rule on that key and never allowed by an ALLOW rule.
+  `policy deny|allow|require-approval` and `policy check` warn when a rule's
+  prefix exists and resolves to another path (a DENY rule on `/tmp/secret`
+  refuses `/private/tmp/secret/x` only as `ambiguous`, and an ALLOW rule
+  never matches it), and when it is `/System`, `/System/Volumes`, or at or
+  under `/System/Volumes/Data` (it is, or contains, a firmlink target, so
+  arguments in the usual spelling such as `/Users/...` are `ambiguous`
+  against it).
+* Case and Unicode normalization. For an existing entry `realpath` returns
+  the stored spelling, so on APFS `/x/SECRET/f` (stored `secret`) or an NFD
+  `cafe\u{301}` (stored NFC `café`) is `differs`. A name that does not exist
+  yet cannot be checked that way, so a path that resolves to itself is also
+  compared with every `--arg-path-prefix` value of the policy: if it is at
+  or under one only once names are compared the way the filesystem compares
+  them (case folding and/or NFC), and not byte for byte, it is `ambiguous`
+  and the engine sees the placeholder. Case folding is Unicode full case
+  folding (CaseFolding.txt C+F, crate `caseless`) followed by upper- and
+  lower-casing, repeated to a fixed point, so `ẞ`, `ß`, `ss` and `SS` are one
+  name; it is broader than APFS (`ı`/`I` and `İ`/`i` are also refused as
+  `ambiguous` although APFS keeps them apart). Each differing segment uses the
+  sensitivity of its directory: on macOS `pathconf(_PC_CASE_SENSITIVE)`
+  decides case, normalization is always ignored (APFS, HFS+); on Linux only
+  ext4/f2fs/tmpfs directories without the casefold flag, and btrfs, count
+  as byte for byte; anything else (XFS too, which may be `ascii-ci`), or a
+  failed probe, folds both (fail closed). When case is folded, trailing `.`
+  and ` ` are ignored as well (Linux vfat/exfat drop them; macOS FAT keeps
+  them, so there it only costs a few extra refusals). On a case-sensitive filesystem `/x/SECRET` is an ordinary path and
+  is not refused by a rule on `/x/secret`.
+* Other spellings of the same directory. `realpath` does not cross macOS
+  firmlinks: `/System/Volumes/Data/Users/u/.ssh` resolves to itself and is
+  the same directory as `/Users/u/.ssh`. So the deepest existing ancestor of
+  each policy prefix is also compared by `(st_dev, st_ino)` with every
+  existing ancestor of the argument; on a match, the rest of the argument
+  must start with the prefix's missing tail (names folded as above). Such a
+  path is `ambiguous`. This also covers a bind mount of the prefix itself
+  (or of one of its ancestors), a prefix written through a symlink, and a
+  hard link to a file that is itself a prefix. On macOS the argument's other
+  spelling (`/System/Volumes/Data` added or removed, when its deepest
+  existing ancestor is the same `(st_dev, st_ino)` both ways) is also
+  compared with every prefix, so DENY `/System/Volumes/Data` covers
+  `/Users/u/.ssh/x` and DENY `/usr` covers `/System/Volumes/Data/usr/local/x`.
+  Not covered: a Linux bind mount of a *subdirectory* of a prefix mounted
+  elsewhere (DENY `/home/u` with `/srv/x` bound from `/home/u/project`:
+  `/proc/self/mountinfo` is not read).
+* **Hard links are not covered.** A hard link to a file inside a prefix
+  (`ln <prefix>/secret /elsewhere/f`) is the same file under an unrelated
+  name, and there is no way to find the other names of a file: the gate
+  sees `/elsewhere/f` as an ordinary path. An agent needs a tool that
+  creates hard links to exploit this; whoever created an existing link
+  already had access to the data. Only a hard link to a file that is itself
+  a prefix is caught (same `(st_dev, st_ino)`).
+* Per-process and system roots are `unresolved` on every OS: anything under
+  `/dev` or `/proc` (`/dev/fd/N`, `/dev/stdin`, `/proc/self/fd/N`,
+  `/proc/<pid>/root`, `/proc/<pid>/cwd`), compared with folding (so
+  `/DEV/fd/4` on a case-insensitive root), before and after resolution. The
+  gate would resolve `/dev/fd/N` with its own descriptors; the server opens
+  it with its own, where N may be a file inside a DENY prefix. Accepted
+  over-rejection: a tool that writes to `/dev/null` (or reads `/dev/stdin`)
+  through an argument a `PathPrefix` rule covers is refused by restrictive
+  rules and never allowed by ALLOW ones. On macOS the same holds for
+  `/System/Volumes/<X>` with X other than `Data` (`Update/mnt1` is the live
+  system volume under another `st_dev`; `Preboot`, `VM`, `Recovery`, ...
+  hold no user files).
+* macOS path-resolution aliases. `realpath` leaves `/.nofollow/<path>` (the
+  same entry, without following symlinks) as it is, and `/.resolve/...` and
+  `/.vol/<dev>/<ino>` are aliases too. On macOS every absolute argument whose
+  first segment starts with `.` is `unresolved` (fail closed, also for
+  unknown magic directories and for `/.NOFOLLOW`). A stock Mac has nothing
+  else there (`/.file` is an empty mode-000 file, `/.VolumeIcon.icns` a
+  symlink).
+* Cost: per covered argument and call, a few `stat`s per ancestor of the
+  argument and per distinct ancestor of the policy prefixes (memoized for
+  the call, stopping at the first missing one), plus the name comparisons.
+  Measured on a debug build: about 20-30 ms with 1000 prefixes, about 3 ms
+  with 60 prefixes of 1000 bytes. The policy is trusted; keep it small.
+* **Not supported: a server in another mount namespace or on another host**
+  (`wrap -- docker run -v ...`, `podman`, `ssh`, a chroot). The check runs
+  in the proxy's view of the filesystem, and the server may resolve the same
+  string to a different file. Example: with DENY `/usr/bin`, `/bin/curl`
+  is `same` on a Mac (where `/bin` is a real directory) but is
+  `/usr/bin/curl` inside a merged-usr Debian image. `wrap` prints a
+  warning at startup when the command looks like `docker`, `podman`,
+  `nerdctl`, `ssh`, `chroot`, `kubectl`, `bwrap`, ... (also behind
+  `env`/`sudo`) and the policy has path rules; the heuristic does not see
+  wrapper scripts.
+* **Not supported: network and FUSE mounts that expose the same files**
+  under another `st_dev` (SMB/NFS to `localhost`, `bindfs`/`sshfs` with
+  macFUSE or FSKit, Linux `/run/user/<uid>/doc` or `gvfs`). They are the same
+  family as a bind mount of a subdirectory.
+* Server-side decoding (`%2F`, `file://`, `~`/`$HOME` expansion, trimming)
+  happens after the decision and is invisible to the gate. Non-absolute
+  forms are already unsafe for core; an absolute path the server decodes
+  further is not covered.
+* Ignorable characters: when a filesystem folds names, every Unicode 16
+  `Default_Ignorable_Code_Point` and the SFM private-use range U+F000-F0FF
+  are dropped from the fold key (HFS+ ignores U+200C-200F, U+202A-202E,
+  U+206A-206F and U+FEFF anywhere in a name; macOS ExFAT a leading U+FEFF
+  and trailing U+F000-range characters), and a segment made only of them is
+  `unresolved`. Checked on a real HFS+ image against the 48 HFS+ aliases a
+  reviewer found.
+* Relative values are not resolved; core already treats them as unsafe.
+* The check happens when the proxy decides. The server opens the path later,
+  so a symlink created or swapped in between is not seen (TOCTOU, see
+  Limitations).
+
 **Running wrappers do not reload the policy.** Each `wrap` process reads
 `policy.json` once, when it starts. Every `policy` command prints a reminder to
 restart the MCP client (or the wrapped servers). In enforce mode, an invalid
@@ -382,6 +514,12 @@ Things to know:
 
 * stdio transport only. HTTP / SSE / Streamable HTTP MCP servers are not
   proxied yet; `install` skips them.
+* Path checks are point-in-time (TOCTOU). Arguments covered by a
+  `PathPrefix` rule are resolved when the proxy decides; the MCP server opens
+  the path afterwards. Replacing a directory with a symlink between the two
+  is not detected, nor is a filesystem mounted, or a policy prefix created,
+  in between (filesystem sensitivity and identities are read at decision
+  time too). Arguments no `PathPrefix` rule covers are never resolved.
 * REQUIRE_APPROVAL is not supported. In enforce mode it is treated like DENY,
   with the text "requires human approval (not supported by praetore-mcp yet)".
 * The keys are LOCAL/DEV keys. See the trust model.

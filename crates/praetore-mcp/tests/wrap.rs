@@ -83,20 +83,28 @@ fn wrap(home: &Home, mode: &str, lines: &[Value]) -> (Vec<Value>, String, Output
 
 fn wrap_raw(home: &Home, mode: &str, input: &str) -> (Vec<Value>, String, Output) {
     let server = fake_server();
-    let out = run(
-        &[
-            "wrap",
-            "--dir",
-            home.root.to_str().unwrap(),
-            "--name",
-            "fake",
-            "--mode",
-            mode,
-            "--",
-            server.to_str().unwrap(),
-        ],
-        input,
-    );
+    wrap_command(home, mode, input, &[server.to_str().unwrap()])
+}
+
+/// `wrap` with an arbitrary server command line.
+fn wrap_command(
+    home: &Home,
+    mode: &str,
+    input: &str,
+    command: &[&str],
+) -> (Vec<Value>, String, Output) {
+    let mut args = vec![
+        "wrap",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--name",
+        "fake",
+        "--mode",
+        mode,
+        "--",
+    ];
+    args.extend_from_slice(command);
+    let out = run(&args, input);
     let stdout = String::from_utf8(out.stdout.clone()).unwrap();
     let responses = stdout
         .lines()
@@ -192,7 +200,11 @@ fn observe_forwards_and_records_verifiable_observe_receipt() {
 
 #[test]
 fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
-    let (_temp, home) = init_home();
+    let (temp, home) = init_home();
+    // A path that resolves to itself: `/tmp` is a symlink on macOS, and
+    // paths covered by a PathPrefix rule are resolved first (T-014).
+    let ok_path = fs::canonicalize(temp.path()).unwrap().join("ok");
+    let ok_path = ok_path.to_str().unwrap();
     write_policy(
         &home,
         vec![
@@ -211,7 +223,7 @@ fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
         "enforce",
         &session(vec![
             json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/tmp/x"}}}),
-            json!({"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"echo","arguments":{"path":"/tmp/ok"}}}),
+            json!({"jsonrpc":"2.0","id":"e","method":"tools/call","params":{"name":"echo","arguments":{"path":ok_path}}}),
             json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/secret/keys"}}}),
         ]),
     );
@@ -401,8 +413,11 @@ fn init_is_idempotent_and_keys_are_private() {
 
 #[test]
 fn rules_generated_by_policy_commands_enforce_end_to_end() {
-    let (_temp, home) = init_home();
+    let (temp, home) = init_home();
     let dir = home.root.to_str().unwrap();
+    // Resolves to itself (not `/tmp`, a symlink on macOS): see T-014.
+    let ok_path = fs::canonicalize(temp.path()).unwrap().join("ok");
+    let ok_path = ok_path.to_str().unwrap();
     for args in [
         vec![
             "policy",
@@ -441,7 +456,7 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
         "enforce",
         &session(vec![
             json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"delete_file","arguments":{"path":"/tmp/x"}}}),
-            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/tmp/ok"}}}),
+            json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"path":ok_path}}}),
             json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{"path":"/secret/key"}}}),
         ]),
     );
@@ -520,5 +535,543 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
             .iter()
             .all(|e| e.action.parameters["tool"] == "delete_file")
     );
+    assert!(verify_cli(&home).status.success());
+}
+
+fn write_rules(home: &Home, rules: Vec<PolicyRule>) {
+    let policy = Policy::new_v2("test-policy", 1, rules);
+    fs::write(
+        home.policy(),
+        serde_json::to_string_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+}
+
+fn echo_path(id: u32, path: &Path) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"echo","arguments":{"path":path.to_str().unwrap()}}})
+}
+
+/// `<canonical tmp>/sandbox/{file, link -> outside/secret, dirlink -> outside}`.
+#[cfg(unix)]
+fn symlink_tree(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::symlink;
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let sandbox = root.join("sandbox");
+    let outside = root.join("outside");
+    fs::create_dir_all(&sandbox).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(sandbox.join("file"), b"x").unwrap();
+    fs::write(outside.join("secret"), b"s").unwrap();
+    symlink(outside.join("secret"), sandbox.join("link")).unwrap();
+    symlink(&outside, sandbox.join("dirlink")).unwrap();
+    (sandbox, outside)
+}
+
+/// T-014, the case `praetore-core/tests/path_escape_gaps.rs` documents as a
+/// core limitation: a symlink inside an ALLOW PathPrefix whose target is
+/// outside. praetore-mcp resolves it before evaluation, so it is not allowed.
+#[cfg(unix)]
+#[test]
+fn allow_path_prefix_does_not_allow_a_symlink_that_leaves_it() {
+    let (temp, home) = init_home();
+    let (sandbox, outside) = symlink_tree(&temp);
+    write_rules(
+        &home,
+        vec![
+            PolicyRule::new("sandbox-only", ACTION_TYPE, PolicyEffect::Allow)
+                .with_capability(CAPABILITY)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    sandbox.to_str().unwrap(),
+                )),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(10, &sandbox.join("file")),
+            echo_path(11, &sandbox.join("link")),
+            echo_path(12, &sandbox.join("dirlink").join("new")),
+            echo_path(13, &sandbox.join("missing-dir").join("new")),
+            echo_path(14, &sandbox.join("new-file")),
+        ]),
+    );
+    for (id, refused) in [(10, false), (11, true), (12, true), (13, true), (14, false)] {
+        assert_eq!(
+            by_id(&responses, &json!(id))["result"]["isError"],
+            refused,
+            "id {id}: {stderr}"
+        );
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 2, "{stderr}");
+
+    let evidence = journal(&home);
+    let outcomes: Vec<_> = evidence.iter().map(|e| e.decision.outcome).collect();
+    use DecisionOutcome::{Allow, Deny};
+    assert_eq!(outcomes, [Allow, Deny, Deny, Deny, Allow]);
+    let check = |i: usize| &evidence[i].context["praetore.path_check"]["arguments.path"];
+    assert_eq!(check(0)["status"], "same");
+    assert_eq!(check(1)["status"], "differs");
+    assert_eq!(check(1)["lexical"], sandbox.join("link").to_str().unwrap());
+    assert_eq!(
+        check(1)["resolved"],
+        outside.join("secret").to_str().unwrap()
+    );
+    assert_eq!(check(2)["resolved"], outside.join("new").to_str().unwrap());
+    assert_eq!(check(3)["status"], "unresolved");
+    assert_eq!(check(3)["resolved"], Value::Null);
+    // The engine saw the placeholder; the server got the client's bytes.
+    assert_eq!(
+        evidence[1].action.parameters["arguments.path"],
+        "praetore-mcp:path-check-failed"
+    );
+    assert_eq!(
+        evidence[1].action.parameters["arguments"]["path"],
+        sandbox.join("link").to_str().unwrap()
+    );
+
+    let verify = verify_cli(&home);
+    let report = String::from_utf8_lossy(&verify.stdout);
+    assert!(verify.status.success(), "{report}");
+    assert!(report.contains("5 verified, 0 failed"), "{report}");
+}
+
+/// The default policy shape (allow everything, deny one directory): a path
+/// that only reaches the denied directory through a symlink is denied, and
+/// so is one whose parent does not exist yet.
+#[cfg(unix)]
+#[test]
+fn deny_path_prefix_catches_symlinks_into_it_and_unresolvable_paths() {
+    let (temp, home) = init_home();
+    let (sandbox, outside) = symlink_tree(&temp);
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-outside", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    outside.to_str().unwrap(),
+                )),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(20, &sandbox.join("file")),
+            echo_path(21, &sandbox.join("link")),
+            echo_path(22, &sandbox.join("dirlink").join("secret")),
+            echo_path(23, &sandbox.join("missing-dir").join("x")),
+            echo_path(24, &outside.join("secret")),
+        ]),
+    );
+    for (id, refused) in [(20, false), (21, true), (22, true), (23, true), (24, true)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+        if refused {
+            let text = reply["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("deny-outside"), "id {id}: {text}");
+        }
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Observe still forwards everything, and its receipts record the check.
+#[cfg(unix)]
+#[test]
+fn observe_records_the_path_check_and_forwards() {
+    let (temp, home) = init_home();
+    let (sandbox, outside) = symlink_tree(&temp);
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-outside", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    outside.to_str().unwrap(),
+                )),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "observe",
+        &session(vec![echo_path(30, &sandbox.join("link"))]),
+    );
+    assert_eq!(by_id(&responses, &json!(30))["result"]["isError"], false);
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    let evidence = journal(&home);
+    assert_eq!(evidence[0].decision.outcome, DecisionOutcome::Deny);
+    assert_eq!(
+        evidence[0].context["praetore.path_check"]["arguments.path"]["status"],
+        "differs"
+    );
+}
+
+/// T-014, adversarial finding on `ccea7be`: on APFS a case or NFD variant of
+/// a denied name that does not exist yet is the same entry; enforce refuses
+/// it although core's `PathPrefix` is lexical, and still allows the rest.
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_path_prefix_catches_case_and_nfd_variants_of_a_missing_name_on_apfs() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let deny = |id: &str, path: PathBuf| {
+        PolicyRule::new(id, ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+            PolicyCondition::path_prefix("arguments.path", path.to_str().unwrap()),
+        )
+    };
+    write_policy(
+        &home,
+        vec![
+            deny("deny-vault", root.join("vault")),
+            deny("deny-cafe", root.join("caf\u{e9}")),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(40, &root.join("notes.txt")),
+            echo_path(41, &root.join("vault")),
+            echo_path(42, &root.join("VAULT")),
+            echo_path(43, &root.join("Vault").join("x")),
+            echo_path(44, &root.join("cafe\u{301}")),
+            echo_path(45, &root.join("CAF\u{c9}")),
+        ]),
+    );
+    for (id, refused) in [
+        (40, false),
+        (41, true),
+        (42, true),
+        (43, true),
+        (44, true),
+        (45, true),
+    ] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    let statuses: Vec<String> = journal(&home)
+        .iter()
+        .filter_map(|evidence| {
+            evidence.context.get("praetore.path_check")?["arguments.path"]["status"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            "same",
+            "same",
+            "ambiguous",
+            "unresolved",
+            "ambiguous",
+            "ambiguous"
+        ]
+    );
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `a9dbbdf`, Alta 1, as the reviewer ran it: DENY on
+/// a `.ssh` that does not exist yet (a stand-in for `~/.ssh` in a temp dir).
+/// `.ẞh` is the same entry on APFS; it must be refused before it exists
+/// (step 1) and after the server created it under that spelling (step 2).
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_path_prefix_catches_sharp_s_variants_of_dot_ssh_on_apfs() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let ssh = root.join(".ssh");
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-ssh", ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+                PolicyCondition::path_prefix("arguments.path", ssh.to_str().unwrap()),
+            ),
+        ],
+    );
+    let variant = root.join(".\u{1e9e}h");
+    let refused = |responses: &[Value], id: u32| {
+        by_id(responses, &json!(id))["result"]["isError"] == json!(true)
+    };
+    let (step1, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(60, &variant),
+            echo_path(61, &root.join(".\u{df}h")),
+            echo_path(62, &root.join(".SSH")),
+            echo_path(63, &root.join(".sh")),
+        ]),
+    );
+    for id in [60, 61, 62] {
+        assert!(refused(&step1, id), "id {id}: {stderr}");
+    }
+    assert!(!refused(&step1, 63), "{stderr}");
+
+    // What the server would have done had step 1 been allowed.
+    fs::create_dir(&variant).unwrap();
+    assert!(ssh.exists(), "APFS: .ẞh is .ssh");
+    let (step2, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![echo_path(64, &variant.join("authorized_keys"))]),
+    );
+    assert!(refused(&step2, 64), "{stderr}");
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 0, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `a9dbbdf`, Alta 2: `realpath` keeps the
+/// `/System/Volumes/Data` spelling of firmlinked directories. Includes the
+/// real `~/.ssh` (only `stat`; `echo` touches nothing).
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_path_prefix_catches_firmlink_spellings_on_macos() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::create_dir_all(root.join("vault")).unwrap();
+    let user_home = PathBuf::from(std::env::var("HOME").unwrap());
+    let data = |path: &Path| PathBuf::from(format!("/System/Volumes/Data{}", path.display()));
+    let deny = |id: &str, path: &Path| {
+        PolicyRule::new(id, ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+            PolicyCondition::path_prefix("arguments.path", path.to_str().unwrap()),
+        )
+    };
+    write_policy(
+        &home,
+        vec![
+            deny("deny-vault", &root.join("vault")),
+            deny("deny-ssh", &user_home.join(".ssh")),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(70, &root.join("vault").join("k")),
+            echo_path(71, &data(&root.join("vault").join("k"))),
+            echo_path(72, &data(&user_home.join(".ssh"))),
+            echo_path(73, &data(&user_home.join(".ssh").join("authorized_keys"))),
+            echo_path(74, &data(&root.join("notes.txt"))),
+        ]),
+    );
+    for (id, refused) in [(70, true), (71, true), (72, true), (73, true), (74, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `c5dc165`, Media 1, as the reviewer ran it: DENY on
+/// `/System/Volumes/Data` also covers `/private/var/...` and `~/.ssh`, which
+/// live on the data volume behind firmlinks.
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_on_the_macos_data_volume_covers_firmlinked_spellings() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::write(root.join("notes.txt"), b"x").unwrap();
+    let user_home = PathBuf::from(std::env::var("HOME").unwrap());
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-data", ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+                PolicyCondition::path_prefix("arguments.path", "/System/Volumes/Data"),
+            ),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(
+                80,
+                &PathBuf::from(format!(
+                    "/System/Volumes/Data{}",
+                    root.join("notes.txt").display()
+                )),
+            ),
+            echo_path(81, &root.join("notes.txt")),
+            echo_path(82, &user_home.join(".ssh").join("authorized_keys")),
+            echo_path(83, Path::new("/bin/ls")),
+        ]),
+    );
+    for (id, refused) in [(80, true), (81, true), (82, true), (83, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `d300e25`, Media 1, as the reviewer ran it:
+/// `/.nofollow/<path>` resolves to itself on macOS and is the same entry; a
+/// DENY on `/System/Volumes/Data` must still refuse it.
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_on_the_macos_data_volume_covers_dot_root_aliases() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::write(root.join("notes.txt"), b"x").unwrap();
+    let user_home = PathBuf::from(std::env::var("HOME").unwrap());
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-data", ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+                PolicyCondition::path_prefix("arguments.path", "/System/Volumes/Data"),
+            ),
+        ],
+    );
+    let nofollow = |path: &Path| PathBuf::from(format!("/.nofollow{}", path.display()));
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(90, &root.join("notes.txt")),
+            echo_path(91, &nofollow(&root.join("notes.txt"))),
+            echo_path(
+                92,
+                &nofollow(&user_home.join(".ssh").join("authorized_keys")),
+            ),
+            echo_path(
+                93,
+                &PathBuf::from(format!("/.NOFOLLOW{}", root.join("notes.txt").display())),
+            ),
+            echo_path(94, Path::new("/bin/ls")),
+        ]),
+    );
+    for (id, refused) in [(90, true), (91, true), (92, true), (93, true), (94, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `f9ae433`, Media 1, as the reviewer ran it: the
+/// server holds a file inside the DENY prefix on its fd 4, and `/dev/fd/4`
+/// (a pipe in the gate's own fd table, so `realpath` kept it) would reach
+/// that file. Every path under `/dev` or `/proc` is now `unresolved`.
+#[cfg(unix)]
+#[test]
+fn deny_path_prefix_catches_dev_fd_aliases_of_server_descriptors() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let vault = root.join("vault");
+    fs::create_dir_all(&vault).unwrap();
+    let secret = vault.join("secret");
+    fs::write(&secret, "orig\n").unwrap();
+    fs::write(root.join("notes.txt"), "").unwrap();
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-vault", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    vault.to_str().unwrap(),
+                )),
+        ],
+    );
+    let append = |id: u32, path: &str| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"append",
+            "arguments":{"path":path,"text":"PWNED\n"}}})
+    };
+    let server = fake_server();
+    let input: String = session(vec![
+        append(10, secret.to_str().unwrap()),
+        append(12, "/dev/fd/4"),
+        append(13, "/DEV/fd/4"),
+        append(14, root.join("notes.txt").to_str().unwrap()),
+    ])
+    .iter()
+    .map(|line| format!("{line}\n"))
+    .collect();
+    let (responses, stderr, _) = wrap_command(
+        &home,
+        "enforce",
+        &input,
+        &[
+            "/bin/sh",
+            "-c",
+            "exec 4>>\"$0\" && exec \"$1\"",
+            secret.to_str().unwrap(),
+            server.to_str().unwrap(),
+        ],
+    );
+    for (id, refused) in [(10, true), (12, true), (13, true), (14, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(fs::read_to_string(&secret).unwrap(), "orig\n", "{stderr}");
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "PWNED\n"
+    );
+    assert!(verify_cli(&home).status.success());
+}
+
+/// Independent review of `419e66f`, Media 1, as the reviewer ran it, on a
+/// real HFS+ volume: HFS+ ignores U+200C (and other invisible code points)
+/// in names, so `va\u{200C}ult` would create the `vault` a DENY names
+/// before it exists. Set `PRAETORE_TEST_HFS_ROOT` to a writable directory
+/// on an HFS+ volume (`hdiutil create -fs HFS+ ...`).
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "needs an HFS+ volume: set PRAETORE_TEST_HFS_ROOT"]
+fn deny_path_prefix_catches_hfs_ignorable_aliases_of_a_missing_name() {
+    let hfs = fs::canonicalize(std::env::var("PRAETORE_TEST_HFS_ROOT").unwrap()).unwrap();
+    let vault = hfs.join("vault");
+    let _ = fs::remove_file(&vault);
+    let (_temp, home) = init_home();
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-vault", ACTION_TYPE, PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::path_prefix(
+                    "arguments.path",
+                    vault.to_str().unwrap(),
+                )),
+        ],
+    );
+    let append = |id: u32, name: &str| {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"append",
+            "arguments":{"path":hfs.join(name).to_str().unwrap(),"text":"PLANTED\n"}}})
+    };
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            append(10, "vault"),
+            append(11, "VAULT"),
+            append(12, "vault."),
+            append(13, "va\u{200C}ult"),
+            append(14, "\u{FEFF}vault"),
+            append(15, "vault\u{206F}"),
+            append(16, "notes.txt"),
+        ]),
+    );
+    for (id, refused) in [
+        (10, true),
+        (11, true),
+        (12, true),
+        (13, true),
+        (14, true),
+        (15, true),
+        (16, false),
+    ] {
+        let reply = by_id(&responses, &json!(id));
+        eprintln!("HFS+ e2e id {id}: isError={}", reply["result"]["isError"]);
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert!(
+        !vault.exists(),
+        "the agent created the denied entry: {stderr}"
+    );
+    fs::remove_file(hfs.join("notes.txt")).unwrap();
     assert!(verify_cli(&home).status.success());
 }

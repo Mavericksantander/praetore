@@ -279,3 +279,51 @@ fn init_never_chmods_an_existing_home_and_creates_new_dirs_private() {
     assert_eq!(mode(&temp.path().join("a")), 0o700);
     assert_eq!(mode(&fresh), 0o700);
 }
+
+#[cfg(unix)]
+#[test]
+fn adding_a_rule_with_a_symlinked_path_prefix_warns() {
+    let (_temp, home) = init();
+    let dir = home.to_str().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(base.path()).unwrap();
+    std::fs::create_dir(root.join("real")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+    let alias = format!("path={}", root.join("alias").display());
+    let out = run(&[
+        "policy",
+        "deny",
+        "--id",
+        "via-alias",
+        "--tool",
+        "write_file",
+        "--arg-path-prefix",
+        &alias,
+        "--dir",
+        dir,
+    ]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("warning: rule \"via-alias\": path prefix")
+            && stdout.contains("resolves to"),
+        "{stdout}"
+    );
+    let real = format!("path={}", root.join("real").display());
+    let out = run(&[
+        "policy",
+        "deny",
+        "--id",
+        "canonical",
+        "--tool",
+        "write_file",
+        "--arg-path-prefix",
+        &real,
+        "--dir",
+        dir,
+    ]);
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("warning"),
+        "{out:?}"
+    );
+}

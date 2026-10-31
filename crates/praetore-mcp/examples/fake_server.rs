@@ -1,7 +1,8 @@
 //! A tiny stdio MCP server for tests and demos. TEST-ONLY.
 //!
-//! Tools: `echo` (returns its arguments) and `delete_file` (pretends to
-//! delete `arguments.path`). Every executed tools/call is also logged to
+//! Tools: `echo` (returns its arguments), `delete_file` (pretends to
+//! delete `arguments.path`) and `append` (really appends `arguments.text` to
+//! `arguments.path`, for path-alias tests). Every executed tools/call is also logged to
 //! stderr as `fake_server: EXECUTED <tool>` so tests can see what ran.
 
 use serde_json::{Value, json};
@@ -37,6 +38,17 @@ fn main() {
             Some("tools/call") => {
                 let name = message["params"]["name"].as_str().unwrap_or("?").to_owned();
                 eprintln!("fake_server: EXECUTED {name}");
+                if name == "append" {
+                    let arguments = &message["params"]["arguments"];
+                    let path = arguments["path"].as_str().unwrap_or_default();
+                    let text = arguments["text"].as_str().unwrap_or_default();
+                    let written = std::fs::OpenOptions::new()
+                        .append(true)
+                        .create(true)
+                        .open(path)
+                        .and_then(|mut file| file.write_all(text.as_bytes()));
+                    eprintln!("fake_server: append {path:?} -> {written:?}");
+                }
                 json!({"content": [{"type": "text",
                     "text": format!("{name} ok: {}", message["params"]["arguments"])}],
                     "isError": false})

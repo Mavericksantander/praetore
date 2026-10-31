@@ -133,6 +133,43 @@
     only detects deletion or truncation if it was published outside the
     producer's control and passed as `--expected-head`; the heads in this
     repository are not such an anchor.
+- **T-014, `praetore-mcp`:** arguments covered by a `PathPrefix` rule are
+  resolved through the filesystem before evaluation. Unless an absolute value
+  resolves to itself (no symlink, `.`/`..`, dangling link or missing parent),
+  the engine sees `praetore-mcp:path-check-failed`, which core treats as an
+  unsafe path (every DENY / REQUIRE_APPROVAL `PathPrefix` rule matches, no
+  ALLOW one). Receipts record `context["praetore.path_check"]`; forwarded
+  bytes are unchanged. Core's `PathPrefix` stays lexical. Behavior change: on
+  macOS, `/tmp/...` arguments under such a rule are now refused or not
+  allowed; use resolved paths. `policy` commands and `policy check` warn
+  about prefixes that resolve elsewhere. The check is point-in-time (TOCTOU).
+  A path that resolves to itself but is at or under a policy `PathPrefix`
+  only when compared like the filesystem compares names (case folding and/or
+  NFC: APFS, HFS+, casefolded ext4/f2fs, unknown filesystems), not byte for
+  byte, is `ambiguous` and hidden the same way; this covers case and NFD
+  variants of a denied name that does not exist yet. Case folding is full
+  Unicode case folding (new dependency `caseless`) iterated to a fixed point
+  (`ẞ`/`ß`/`ss`). A path that reaches a prefix's directory under another
+  spelling, compared by `(st_dev, st_ino)` (macOS `/System/Volumes/Data`
+  firmlinks, a bind mount of the prefix itself), is `ambiguous` too, and so
+  is a path whose other macOS spelling (`/System/Volumes/Data` added or
+  removed) is under a prefix (DENY `/System/Volumes/Data` covers
+  `/Users/...`). `policy check` warns about prefixes that are `/System`,
+  `/System/Volumes`, or at or under `/System/Volumes/Data`. On Linux, XFS
+  folds (it may be `ascii-ci`), and case-folding filesystems ignore trailing
+  dots and spaces. On macOS, an argument whose first segment starts with
+  `.` (`/.nofollow/...`, `/.resolve/...`, `/.vol/...`) is `unresolved`, and
+  so is, on every OS, anything under `/dev` or `/proc` (per-process names
+  such as `/dev/fd/N`), and on macOS under `/System/Volumes/<X>` other than
+  `Data`. When names fold, Unicode 16 `Default_Ignorable_Code_Point`s and
+  U+F000-F0FF are dropped from the fold key (HFS+, macOS ExFAT), and a
+  segment made only of them is `unresolved`. `wrap` warns at startup when
+  the server command looks like `docker`, `podman`, `ssh`, `chroot`, ...
+  and the policy has path rules. This is defense in depth for local
+  servers in the same namespace, not a guarantee (structural fix: T-013B).
+  Not covered: Linux bind mounts of a subdirectory of a prefix, hard links
+  to files inside a prefix, TOCTOU, server-side decoding; not supported:
+  other namespaces or hosts, network/FUSE loopback mounts.
 
 ## 0.3.0 - 2026-10-30
 
