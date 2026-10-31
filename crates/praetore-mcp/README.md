@@ -49,8 +49,10 @@ binary runs `scripts/mcp-smoke.py`: one allowed `read_text_file` and one
 denied `write_file` through `npx @modelcontextprotocol/server-filesystem@2.1.0`,
 then `verify`. Each run uploads
 `praetore-mcp-<version>-<target>.tar.gz` (the binary, `LICENSE`, `NOTICE`)
-and its `.sha256` as workflow artifacts. On a `v*` tag, `Release checksums`
-re-checks them and writes one `SHA256SUMS` with `praetore-verify`.
+and its `.sha256` as workflow artifacts. `Release checksums` then re-checks
+them and writes one `SHA256SUMS` covering the three archives and
+`praetore-verify` (`scripts/release-checksums.sh`); on a `v*` tag it is kept
+as the `release-assets-<tag>` artifact.
 
 These are workflow artifacts, not a GitHub Release, and downloading them
 needs a GitHub login. The macOS binaries are **not signed or notarized**:
@@ -60,6 +62,8 @@ first:
 
 ```sh
 shasum -a 256 -c praetore-mcp-<version>-<target>.tar.gz.sha256
+# or, with the release-assets set:
+shasum -a 256 -c SHA256SUMS --ignore-missing
 tar -xzf praetore-mcp-<version>-<target>.tar.gz
 ```
 

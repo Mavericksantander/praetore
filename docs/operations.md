@@ -390,8 +390,10 @@ public key supplied by an untrusted caller.
 
 ## Release artifact integrity
 
-For a `v*` tag, CI builds `praetore-verify` and uploads the binary and
-`SHA256SUMS` as a workflow artifact. CI also uploads CycloneDX workspace SBOM
+For a `v*` tag, CI builds `praetore-verify` and the `praetore-mcp` archives
+for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and
+`x86_64-apple-darwin`, and uploads them with one `SHA256SUMS` as a workflow
+artifact (`scripts/release-checksums.sh`; the checks also run on every PR). CI also uploads CycloneDX workspace SBOM
 files. Follow the signed-tag procedure in [CONTRIBUTING.md](../CONTRIBUTING.md),
 download those artifacts, verify the checksum, and publish them with the
 release. CI does not sign artifacts or create releases automatically.

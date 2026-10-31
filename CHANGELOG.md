@@ -7,8 +7,14 @@
   `scripts/mcp-smoke.py` on each (a real allowed and a real denied
   `tools/call` through `@modelcontextprotocol/server-filesystem@2.1.0`, then
   `verify`), and uploads `.tar.gz` archives with `.sha256` files as workflow
-  artifacts. On `v*` tags, `Release checksums` re-checks them and includes
-  them in `SHA256SUMS`. The macOS binaries are not signed or notarized.
+  artifacts. `Release checksums` now runs on every run, not only on `v*`
+  tags: `scripts/release-checksums.sh` checks each runner's `.sha256`, that
+  all three targets are present, that each archive holds only the binary,
+  `LICENSE` and `NOTICE`, and that nothing else is in the set, then writes
+  and re-checks one `SHA256SUMS` (the three archives and `praetore-verify`).
+  `scripts/test-release-checksums.sh` covers those failures. Only a `v*` tag
+  keeps the result as the `release-assets-<tag>` artifact; CI still does not
+  create a GitHub Release. The macOS binaries are not signed or notarized.
 - Hash-linked JSONL export of receipts, as specified in
   `docs/proposals/journal-chain-jsonl.md` (now marked implemented):
   - `praetore_core::journal_chain`: the format, the link

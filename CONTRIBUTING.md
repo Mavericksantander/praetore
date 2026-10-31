@@ -121,8 +121,10 @@ cargo cyclonedx --manifest-path crates/praetore-gateway/Cargo.toml --format json
 cargo cyclonedx --manifest-path fuzz/Cargo.toml --format json --all
 ```
 
-Release tags also build the `praetore-verify` binary and publish a `SHA256SUMS`
-file as a workflow artifact. Before publishing a release:
+Release tags also build the `praetore-verify` binary and the `praetore-mcp`
+archives (Linux x86_64, macOS arm64 and x86_64) and publish them with one
+`SHA256SUMS` file as the `release-assets-vX.Y.Z` workflow artifact. The same
+checks run on every PR without keeping the artifact. Before publishing a release:
 
 1. Update the `Unreleased` section in `CHANGELOG.md` and verify the release
    version matches the workspace package version.
