@@ -900,3 +900,47 @@ fn deny_on_the_macos_data_volume_covers_firmlinked_spellings() {
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
     assert!(verify_cli(&home).status.success());
 }
+
+/// Independent review of `d300e25`, Media 1, as the reviewer ran it:
+/// `/.nofollow/<path>` resolves to itself on macOS and is the same entry; a
+/// DENY on `/System/Volumes/Data` must still refuse it.
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_on_the_macos_data_volume_covers_dot_root_aliases() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    fs::write(root.join("notes.txt"), b"x").unwrap();
+    let user_home = PathBuf::from(std::env::var("HOME").unwrap());
+    write_policy(
+        &home,
+        vec![
+            PolicyRule::new("deny-data", ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+                PolicyCondition::path_prefix("arguments.path", "/System/Volumes/Data"),
+            ),
+        ],
+    );
+    let nofollow = |path: &Path| PathBuf::from(format!("/.nofollow{}", path.display()));
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(90, &root.join("notes.txt")),
+            echo_path(91, &nofollow(&root.join("notes.txt"))),
+            echo_path(
+                92,
+                &nofollow(&user_home.join(".ssh").join("authorized_keys")),
+            ),
+            echo_path(
+                93,
+                &PathBuf::from(format!("/.NOFOLLOW{}", root.join("notes.txt").display())),
+            ),
+            echo_path(94, Path::new("/bin/ls")),
+        ]),
+    );
+    for (id, refused) in [(90, true), (91, true), (92, true), (93, true), (94, false)] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    assert!(verify_cli(&home).status.success());
+}

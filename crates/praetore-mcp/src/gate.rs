@@ -568,7 +568,7 @@ pub fn firmlink_spelling(path: &str) -> Option<String> {
     let (other, other_existing) = match path.strip_prefix(MACOS_DATA_VOLUME) {
         Some(rest) if rest.starts_with('/') => (
             rest.to_owned(),
-            existing[MACOS_DATA_VOLUME.len()..].to_owned(),
+            existing.strip_prefix(MACOS_DATA_VOLUME)?.to_owned(),
         ),
         Some(_) => return None,
         None => (
@@ -752,6 +752,20 @@ mod platform {
     }
 }
 
+/// Whether the first segment of an absolute path starts with `.`. On macOS
+/// these are path-resolution aliases that `realpath` leaves as they are:
+/// `/.nofollow/<path>` (the same entry without following symlinks),
+/// `/.resolve/<n>/<path>`, `/.vol/<dev>/<ino>`. A stock Mac has nothing
+/// else there but `/.file` (an empty, mode-000 file) and the
+/// `/.VolumeIcon.icns` symlink. Treating every such first segment as
+/// unresolved is fail closed for unknown magic directories too, and is case
+/// independent (`/.NOFOLLOW`).
+pub fn starts_at_dot_root(path: &str) -> bool {
+    segments(path)
+        .first()
+        .is_some_and(|first| first.starts_with('.'))
+}
+
 /// T-014: `PathPrefix` in core is lexical by design. Before evaluation, each
 /// absolute string argument under `keys` is resolved; unless it resolves to
 /// itself, the engine sees [`UNRESOLVED_PATH`] instead (fail closed). A path
@@ -787,7 +801,11 @@ fn check_paths_with(
             continue;
         }
         let lexical = lexical.clone();
-        let (mut check, resolved) = resolve_path(&lexical);
+        let (mut check, resolved) = if cfg!(target_os = "macos") && starts_at_dot_root(&lexical) {
+            (PathCheck::Unresolved, None)
+        } else {
+            resolve_path(&lexical)
+        };
         if check == PathCheck::Same
             && (folds_into_prefix(&lexical, prefixes, insensitivity).is_some()
                 || aliases_prefix(&lexical, prefixes, insensitivity).is_some()
@@ -1507,6 +1525,111 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// Review round 3: first segments that start with `.` (macOS magic
+    /// path-resolution directories).
+    #[test]
+    fn dot_root_first_segments_are_recognised() {
+        for path in [
+            "/.nofollow/Users/u/.ssh",
+            "/.NOFOLLOW/x",
+            "/.resolve/1/Users",
+            "/.vol/16777231/2",
+            "/.file",
+            "/.x/",
+            "/./Users",
+            "/../Users",
+        ] {
+            assert!(starts_at_dot_root(path), "{path}");
+        }
+        for path in [
+            "/",
+            "/Users/u/.ssh",
+            "/private/var/.nofollow",
+            "/x.nofollow/y",
+        ] {
+            assert!(!starts_at_dot_root(path), "{path}");
+        }
+    }
+
+    /// Review round 3, Media 1, on this Mac: `/.nofollow/<path>` resolves to
+    /// itself and is the same entry as `<path>`; it is now `unresolved`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dot_root_aliases_are_unresolved() {
+        let (_temp, root) = canonical_tempdir();
+        fs::create_dir_all(root.join("vault")).unwrap();
+        fs::write(root.join("notes.txt"), b"x").unwrap();
+        let home = std::env::var("HOME").unwrap();
+        let r = text(&root);
+        let keys = BTreeSet::from(["arguments.path".to_owned()]);
+        let check = |path: &str, prefix: &str| {
+            let rules = prefixes(&[prefix]);
+            let mut built = build_parameters("fs", &json!({"arguments": {"path": path}}), false);
+            let record = check_paths(&mut built, &keys, &rules).unwrap();
+            (
+                built["arguments.path"].as_str().unwrap().to_owned(),
+                record["arguments.path"]["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            )
+        };
+        // The magic prefix really is an alias here, and realpath keeps it.
+        let nofollow = format!("/.nofollow{r}/notes.txt");
+        assert_eq!(file_id(&nofollow), file_id(&format!("{r}/notes.txt")));
+        assert_eq!(fs::canonicalize(&nofollow).unwrap(), Path::new(&nofollow));
+        for (path, prefix) in [
+            (
+                format!("/.nofollow{home}/.ssh/authorized_keys"),
+                "/System/Volumes/Data".to_owned(),
+            ),
+            (
+                format!("/.nofollow{home}/.ssh/authorized_keys"),
+                "/System".to_owned(),
+            ),
+            (nofollow.clone(), "/System/Volumes/Data".to_owned()),
+            (
+                format!("/.nofollow{r}/later"),
+                "/System/Volumes/Data".to_owned(),
+            ),
+            (
+                "/.nofollow/System/Volumes/Data/usr/local/r3-new".to_owned(),
+                "/usr".to_owned(),
+            ),
+            (
+                "/.nofollow/usr/local/r3-new".to_owned(),
+                "/System/Volumes/Data/usr".to_owned(),
+            ),
+            (
+                "/.nofollow/System/Library/Caches/r3-new".to_owned(),
+                "/System/Volumes/Data/System/Library".to_owned(),
+            ),
+            (
+                format!("/.NOFOLLOW{r}/notes.txt"),
+                "/System/Volumes/Data".to_owned(),
+            ),
+            (
+                format!("/.resolve/1{r}/notes.txt"),
+                "/System/Volumes/Data".to_owned(),
+            ),
+            (format!("/.nofollow{r}/vault/k"), format!("{r}/vault")),
+        ] {
+            let result = check(&path, &prefix);
+            eprintln!("dot-root: DENY {prefix:?} path {path:?} -> {result:?}");
+            assert_eq!(
+                result,
+                (UNRESOLVED_PATH.to_owned(), "unresolved".to_owned()),
+                "DENY {prefix} path {path}"
+            );
+        }
+        // Control: the usual spelling of an ordinary path is unchanged.
+        let ordinary = format!("{r}/notes.txt");
+        assert_eq!(
+            check(&ordinary, &format!("{r}/vault")),
+            (ordinary.clone(), "same".to_owned())
+        );
     }
 
     /// The adversarial finding on `ccea7be`: the denied directory does not

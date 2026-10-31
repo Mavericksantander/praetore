@@ -55,8 +55,9 @@
   `/Users/...`). `policy check` warns about prefixes that are `/System`,
   `/System/Volumes`, or at or under `/System/Volumes/Data`. On Linux, XFS
   folds (it may be `ascii-ci`), and case-folding filesystems ignore trailing
-  dots and spaces. Not covered: Linux bind mounts of a subdirectory of a
-  prefix.
+  dots and spaces. On macOS, an argument whose first segment starts with
+  `.` (`/.nofollow/...`, `/.resolve/...`, `/.vol/...`) is `unresolved`. Not
+  covered: Linux bind mounts of a subdirectory of a prefix.
 
 ## 0.3.0 - 2026-10-30
 

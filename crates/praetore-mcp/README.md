@@ -301,7 +301,14 @@ the server are never changed. Consequences:
   elsewhere (DENY `/home/u` with `/srv/x` bound from `/home/u/project`:
   `/proc/self/mountinfo` is not read); a hard link, created elsewhere, to a
   file *inside* a prefix (there is no way to find the other names of a
-  file). `/.vol/<dev>/<ino>` paths do not resolve and are `unresolved`.
+  file).
+* macOS path-resolution aliases. `realpath` leaves `/.nofollow/<path>` (the
+  same entry, without following symlinks) as it is, and `/.resolve/...` and
+  `/.vol/<dev>/<ino>` are aliases too. On macOS every absolute argument whose
+  first segment starts with `.` is `unresolved` (fail closed, also for
+  unknown magic directories and for `/.NOFOLLOW`). A stock Mac has nothing
+  else there (`/.file` is an empty mode-000 file, `/.VolumeIcon.icns` a
+  symlink).
 * Cost: per covered argument and call, a few `stat`s per ancestor of the
   argument and per distinct ancestor of the policy prefixes (memoized for
   the call, stopping at the first missing one), plus the name comparisons.
