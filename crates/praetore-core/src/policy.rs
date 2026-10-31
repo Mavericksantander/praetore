@@ -928,7 +928,14 @@ pub enum MatchOperator {
     /// already normalized: no `.` or `..` segments, no empty segments
     /// (`//`), no `\\`, no NUL and no `%` at all. A single trailing `/` is
     /// allowed. `/srv/agent` matches `/srv/agent` and `/srv/agent/x`, not
-    /// `/srv/agentx`. A rule prefix that breaks these rules is rejected when
+    /// `/srv/agentx`.
+    ///
+    /// The string `//` on its own is the one exception to the empty-segment
+    /// rule: it is read as the root `/` plus the allowed trailing `/`, so it
+    /// is accepted, as a rule prefix and as a value, and means the root. Other
+    /// repeated separators are not: `///`, `//srv`, `/srv//x` and `/srv//`
+    /// contain an empty segment and are rejected (as a prefix) or unsafe (as
+    /// a value). A rule prefix that breaks these rules is rejected when
     /// the policy loads. A value that breaks them is unsafe: it always
     /// matches `Deny` and `RequireApproval` rules and never matches `Allow`
     /// rules, under every semantics version.
