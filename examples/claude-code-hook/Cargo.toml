@@ -1,0 +1,24 @@
+[package]
+name = "praetore-claude-hook"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "LicenseRef-PRAETORE-OPEN-CORE"
+authors = ["PRÆTOR TECHNOLOGIES"]
+publish = false
+description = "Example: a Claude Code PreToolUse hook that authorizes tool calls with PRÆTORE."
+
+# Standalone example, deliberately not a member of the repository workspace.
+[workspace]
+
+[[bin]]
+name = "praetore-claude-hook"
+path = "src/main.rs"
+
+[dependencies]
+hex = "0.4.3"
+praetore-core = { path = "../../crates/praetore-core" }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+time = { version = "0.3", features = ["formatting"] }

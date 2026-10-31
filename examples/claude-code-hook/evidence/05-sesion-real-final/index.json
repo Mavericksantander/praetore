@@ -1,0 +1,1182 @@
+[
+  {
+    "agent": "main",
+    "file": "evidence/0001-main-Glob-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Glob",
+    "tool_use_id": "toolu_01Cguask2EEcw2QkCGbCWTxK"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0002-main-ToolSearch-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-other-tools' matched",
+    "rule": "allow-other-tools",
+    "tool_name": "ToolSearch",
+    "tool_use_id": "toolu_01HZFMQMNRh86Se4rzriaWeX"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0003-main-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01VHdaacnwVTi2Uajgq3g1CT"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0004-main-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_016ztyuQ6brc83LRB2httf45"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0005-main-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project, allow-read-main",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01VdstrszP2MkBEyaREnxD7F"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0006-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01RMa9C3dgPiBNheZzA5XkSL"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0007-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01E1M5kZny2QkQJCcAuvz2Fq"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0008-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_017uoD7Sb8jAmbUDZvgCj5f8"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0009-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01M6HRDHaxX43SzVRPV9fPEY"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0010-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01W2oEnkJehtVAoq77KGF542"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0011-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01H2RoNUu81d4cH4VfU5kLU7"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0012-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01Ur5oB3bYEF5AnHr8t5f4JU"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0013-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01Ajvzzcqx3AMoQSuTyHnh9w"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0014-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01GPjaTFuftMedt69Hr5W4pQ"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0015-main-WebSearch-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebSearch",
+    "tool_use_id": "toolu_013CTpCrzXHamVdJZF2ZxAft"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0016-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01ApkvbDasiCTE5zK8xMfVrb"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0017-main-WebSearch-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebSearch",
+    "tool_use_id": "toolu_0131aXWKD9MTTAaUVKfepURY"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0018-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01AM26Gw29Q3DwW4nAkT4DQ9"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0019-main-WebSearch-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebSearch",
+    "tool_use_id": "toolu_01A6xX1Uqqq7tv3UFNmnUFxC"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0020-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01GXvbocHYgsCZEdDqB4nHbi"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0021-main-WebSearch-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebSearch",
+    "tool_use_id": "toolu_01W5YrCDhcPPwC935hSPBR9g"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0022-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01W2EgUGw2BVYGrBXrdgpYTw"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0023-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01YVea5837G4xLNSWiiVAosv"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0024-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_019RkCEfkhN14uszTss165Pa"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0025-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01XGDo7WczgHVDZHPzHHLSzi"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0026-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_015w4Xw4hKNdmSc2xKK2RkzX"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0027-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01KC5iYkRwj6fTGEDL3NUkVi"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0028-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01WrwfKuubF5WbwaukTHUSzk"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0029-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01JewxRwHnTqz3X5Hg6eC6zz"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0030-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01CAGQ44tZV7wSf6D2oYoGAU"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0031-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01SbJUehfQAURLU36e8GfRvd"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0032-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01M6hXMT4mpmR62Uv9pfXJkn"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0033-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01WTBe3vjKnAHwwrnqWbto3v"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0034-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01DLZp3fYkhFkavHPg8XPDFN"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0035-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01MSh6Tn36XDbYu2jEXUBumB"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0036-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_014AhfMuVUToM3JagNZmHUea"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0037-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01LdZUNZ9mNC1tbLTh1sWcYc"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0038-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_0123TJyhCNeNDtAFCM2hQcRk"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0039-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01QsK6udy5FhYeoSYNVC5QGR"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0040-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01HTC6P7J5SViYup1x7QjrLQ"
+  },
+  {
+    "agent": "web-fetch",
+    "file": "evidence/0041-web-fetch-WebFetch-Allow.json",
+    "outcome": "Allow",
+    "profile": "web-fetch",
+    "reason": "Policy rule 'allow-network' matched",
+    "rule": "allow-network",
+    "tool_name": "WebFetch",
+    "tool_use_id": "toolu_01Sg9AQoo3MBhiBQTUvu3MUR"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0042-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01SX2Bds8anRrTepGuEVjMb8"
+  },
+  {
+    "agent": "planner",
+    "file": "evidence/0043-planner-Glob-Allow.json",
+    "outcome": "Allow",
+    "profile": "planner",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Glob",
+    "tool_use_id": "toolu_01TmbB4XAHXzWkvzb7pr7drN"
+  },
+  {
+    "agent": "planner",
+    "file": "evidence/0044-planner-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "planner",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01ACxnwfm7ZJV4HqciTF9i3J"
+  },
+  {
+    "agent": "planner",
+    "file": "evidence/0045-planner-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "planner",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_019eAj8teaVCEDyKJvcFEDT7"
+  },
+  {
+    "agent": "planner",
+    "file": "evidence/0046-planner-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "planner",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01AkXR7ShG2VSFxXjLPfGsGc"
+  },
+  {
+    "agent": "planner",
+    "file": "evidence/0047-planner-Grep-Allow.json",
+    "outcome": "Allow",
+    "profile": "planner",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Grep",
+    "tool_use_id": "toolu_01F7avXwEFX3GLmcJpwJ96Eg"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0048-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01WhRfTTej2FiQEjsE22z2AN"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0049-coder-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01BYVMq1dD3EvM2PvZS3qF3n"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0050-coder-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01HGQENxhFk4KUgohZ2Xf8w1"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0051-coder-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01C6Shfz5vryZNuYmVWVeY65"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0052-coder-Grep-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Grep",
+    "tool_use_id": "toolu_01Gofv4jNBR7bgqv483D1T22"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0053-coder-Write-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Write",
+    "tool_use_id": "toolu_01LTqDsNricgCrpM7oMnEUkW"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0054-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01495bbzD6nRygRaqkFsLe1y"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0055-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01QP6vMfkHqLiJbVqDvUUjHf"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0056-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01Sbmu98XmWnBHpe2WudFC24"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0057-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01Xp3cYLTawK1stVfWjhDkuq"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0058-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_019SV3S6xGntuqx6F2L322Gd"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0059-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01KaJpkr1gCsjHdYJKhRRQXd"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0060-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_012GHBegmsETPUWcm9Z1LGQV"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0061-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01K45L17AQWVvY42zK6raLZo"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0062-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01PqYf1G8X3tidaqQzqBvBMt"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0063-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01GyEwEr4YGdQSRoEDQkWm9h"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0064-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01VwxrmxczHuNfihmGm7rLzB"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0065-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_014x8g2ky5HFCMkDNTugkJ63"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0066-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_018qhaURPwvBLBF2yTWuXRCV"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0067-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01SCzpHurTPnV8yy136Asvvb"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0068-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01MXAhx1kSRx4wDtPvsm9ms9"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0069-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01SFBTSBfgEsitQ7PMpF7Cc2"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0070-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01G8hAZefpZEWpyqiSc38rM9"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0071-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01GPqjHCNZiw6LRaTixJNdKP"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0072-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_013Gvivy4bPyUGGUG5wkN2Sy"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0073-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01W6wxBudyShAxNtKvFisomq"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0074-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01TxK9NqY2hipppyGkXNjtbk"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0075-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01KsC7cKHvDXTdB2gPLJrM4c"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0076-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_018BvfDDafduNLFffWvmxoTm"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0077-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_0146fx6a9tn6AwWDamDdAK9M"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0078-coder-Grep-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Grep",
+    "tool_use_id": "toolu_01JJtMJFBfstAbh1g4nxmPQb"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0079-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01BmKDPsczCdC3TqoSZpfzgk"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0080-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_011CQpSRdor98ajkZQGZETro"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0081-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01W6hQ7gWoa29KrJarHaB7wi"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0082-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01Bebiy9LJfho6o6yFgPdKqF"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0083-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01Q4x3xVwQSAAqDjUXLfjxBg"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0084-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01CSQvdEm4zKr7AyoGd5uesq"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0085-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01RwkDeMghfSpzADTcnBU134"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0086-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01AivP5vG2Z6Kqg3mvcxryNs"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0087-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01FWw8bK1nP1uQPqHn1fGSdp"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0088-explorer-Grep-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Grep",
+    "tool_use_id": "toolu_01BE8iL6nqCxP4z1mxeqpCgM"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0089-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_01HQbTrU3ZA9ijVf2y7oU3hE"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0090-coder-Bash-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-exec' matched",
+    "rule": "allow-exec",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_014kGPKNNixJDbwpeQ1yTHqX"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0091-coder-Bash-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-exec' matched",
+    "rule": "allow-exec",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_017vf1DVVQviHAFKsJG3weyo"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0092-coder-Bash-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-exec' matched",
+    "rule": "allow-exec",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_013VSnVpTVQLfQqQuuQ9fQb1"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0093-coder-Bash-RequireApproval.json",
+    "outcome": "RequireApproval",
+    "profile": "coder",
+    "reason": "Policy rule 'approval-git-push' matched",
+    "rule": "approval-git-push, approval-unanalyzable-command",
+    "tool_name": "Bash",
+    "tool_use_id": "toolu_01A2ARM2Dcf97yLZVxehGP97"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0094-coder-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01SYXC5BuFgdh1UPzZbqm2iU"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0095-coder-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01EjxABaY2JyjT4ViTiBVdzF"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0096-coder-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01EUivr8YQ64wBD2hqj7kKM2"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0097-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01UBZrFTABHEPtuZ27fovr9f"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0098-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01Q9ghTmr2zBCbJr2cfdZbqB"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0099-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01FVizM3YXKEv3Ar1sB9M5jp"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0100-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01AxsDzvcTXBpvq3LSRMohgi"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0101-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_01G5UXBDAWcutVXLy3DV4JSM"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0102-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_015eetPntZqTifBxcpbqFiBm"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0103-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_011q6wMQyumuDQ1wEBZnLK4A"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0104-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_019PX2b2X73wGPsjEAcjw57e"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0105-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_011gaE2qfb5CuAWjxEdgMqLg"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0106-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_013UEyuUxu7Q1Kj4uv6P7eAS"
+  },
+  {
+    "agent": "coder",
+    "file": "evidence/0107-coder-Edit-Allow.json",
+    "outcome": "Allow",
+    "profile": "coder",
+    "reason": "Policy rule 'allow-write-project' matched",
+    "rule": "allow-write-project",
+    "tool_name": "Edit",
+    "tool_use_id": "toolu_013NnsC2J3TKsiDGSYiNPvdR"
+  },
+  {
+    "agent": "main",
+    "file": "evidence/0108-main-Agent-Allow.json",
+    "outcome": "Allow",
+    "profile": "main",
+    "reason": "Policy rule 'allow-delegate' matched",
+    "rule": "allow-delegate",
+    "tool_name": "Agent",
+    "tool_use_id": "toolu_019Z9Z1DwF7RqbwB5HeyzQic"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0109-explorer-Glob-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Glob",
+    "tool_use_id": "toolu_01EWtwbFMvV9iefeonfQPSoo"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0110-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01FsCkfbspJ2nJnwLLDXAtKQ"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0111-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01PXRbc53pVyiZJynJHYhvH5"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0112-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01FDoi5HLzsdUR4LSrLZrjDN"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0113-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01J2CmJqPBhs6oMrbv5Gf8PL"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0114-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01ExQm2Wy5JyLowCoHykWonq"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0115-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01Gysznh96jc8Cntfz574eEL"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0116-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01YaAE7GUD9jqZPXzULC6Jqz"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0117-explorer-Read-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Read",
+    "tool_use_id": "toolu_01Bq7xRrT2wNLXoQFwQvLHAr"
+  },
+  {
+    "agent": "explorer",
+    "file": "evidence/0118-explorer-Grep-Allow.json",
+    "outcome": "Allow",
+    "profile": "explorer",
+    "reason": "Policy rule 'allow-read-project' matched",
+    "rule": "allow-read-project",
+    "tool_name": "Grep",
+    "tool_use_id": "toolu_01JPgr48exuvK9VD2VVJE9Ju"
+  }
+]

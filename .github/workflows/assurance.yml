@@ -36,6 +36,63 @@ jobs:
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
 
+  hook-evidence:
+    name: Claude Code hook evidence (sets 03, 04, 05)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # verify.sh exits non-zero if any receipt fails, if a policy digest does
+      # not match, or if a one-byte tampered copy is accepted.
+      - name: Verify set 03
+        run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/03-bundle-demo-reproducible
+      - name: Verify set 04
+        run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch
+      - name: Verify set 05
+        run: ./examples/claude-code-hook/verify.sh examples/claude-code-hook/evidence/05-sesion-real-final
+
+  journal-chain:
+    name: Journal chains (sets 03, 04, 05) and tampered copies
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # The expected heads are pinned here, separately from the chain files, so
+    # a change to a chain file alone fails this job. They live in the same
+    # repository, so this is not an external anchor (see VERIFY.md).
+    env:
+      HEAD_03: 4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a
+      HEAD_04: f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0
+      HEAD_05: 79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # verify-chain.sh exits non-zero if the chain or its head does not
+      # verify, if re-exporting does not reproduce it byte for byte, or if any
+      # tampered copy (deleted receipt, deleted and re-linked, truncated,
+      # reordered, altered byte) is accepted.
+      - name: Chain of set 03
+        run: ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/03-bundle-demo-reproducible "$HEAD_03"
+      - name: Chain of set 04
+        run: ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch "$HEAD_04"
+      - name: Chain of set 05
+        run: ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/05-sesion-real-final "$HEAD_05"
+      - name: A wrong expected head is rejected
+        run: |
+          if ./examples/claude-code-hook/verify-chain.sh examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch "$HEAD_05"; then
+            echo "::error::set 04 verified against the head of set 05"; exit 1
+          fi
+
+  macos:
+    name: macOS workspace link
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --workspace --locked
+      - run: cargo test -p praetore-python --locked
+
   verifier-features:
     name: Offline verifiers build without receipt signing
     runs-on: ubuntu-latest
@@ -116,6 +173,25 @@ jobs:
       - run: python -m unittest discover -s packages/praetore-python/tests -v
       - run: ./examples/third-party-verification/verify.sh
 
+  claude-code-hook-example:
+    name: Claude Code hook example (standalone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      # Not a workspace member: it has its own manifest and lockfile.
+      - run: cargo fmt --manifest-path examples/claude-code-hook/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path examples/claude-code-hook/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked
+      - name: Verify the committed bundle with praetore-verify only
+        run: ./examples/claude-code-hook/verify.sh
+      - name: Regenerate a bundle and verify it
+        run: |
+          ./examples/claude-code-hook/demo.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+          ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+
   replay-postgres:
     name: PostgreSQL replay guard integration
     runs-on: ubuntu-latest
@@ -139,6 +215,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p praetore-replay-postgres --locked
+      - run: cargo test -p praetore-cli --locked -- --ignored --exact journal_export::tests::postgres_export_reads_only_the_tenant_rows_in_insert_order
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored claim_is_unique_and_survives_a_new_client
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored concurrent_connections_allow_exactly_one_claim
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored a_lost_database_connection_fails_closed_and_a_new_client_recovers
@@ -184,6 +261,24 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$test did not run"; exit 1; }
           done
+      - name: Runtime-role check connects as the postgres superuser
+        run: |
+          set -euo pipefail
+          # initdb --username "$POSTGRES_USER" makes praetore the only superuser;
+          # there is no role named postgres. The test logs in as postgres and
+          # checks session_user, so create that role and then run only this test as it.
+          container_id="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1)"
+          test -n "$container_id"
+          exists="$(docker exec "$container_id" psql -U praetore -d praetore_test -tAc "SELECT 1 FROM pg_roles WHERE rolname = 'postgres'")"
+          if [ "$exists" = "1" ]; then
+            docker exec "$container_id" psql -U praetore -d praetore_test -v ON_ERROR_STOP=1 \
+              -c "ALTER ROLE postgres WITH LOGIN SUPERUSER PASSWORD 'praetore-test'"
+          else
+            docker exec "$container_id" psql -U praetore -d praetore_test -v ON_ERROR_STOP=1 \
+              -c "CREATE ROLE postgres LOGIN SUPERUSER PASSWORD 'praetore-test'"
+          fi
+          PRAETORE_TEST_DATABASE_URL=postgres://postgres:praetore-test@localhost:5432/praetore_test \
+            cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_runtime_role_must_not_own_or_bypass_the_schema
       - name: Stage replay-claim restart test
         env:
           PRAETORE_TEST_RESTART_PHASE: before
@@ -192,6 +287,10 @@ jobs:
         env:
           PRAETORE_TEST_JOURNAL_RESTART_PHASE: before
         run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_survives_server_restart_without_automatic_dispatch
+      - name: Stage approved-pending-dispatch restart test
+        env:
+          PRAETORE_TEST_APD_RESTART_PHASE: before
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_apd_and_migrations_survive_restart
       - name: Restart PostgreSQL service
         run: |
           container_id="$(docker ps --filter 'ancestor=postgres:16' --format '{{.ID}}' | head -n 1)"
@@ -206,6 +305,10 @@ jobs:
         env:
           PRAETORE_TEST_JOURNAL_RESTART_PHASE: after
         run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored postgres_journal_survives_server_restart_without_automatic_dispatch
+      - name: Verify approved-pending-dispatch recovery after restart
+        env:
+          PRAETORE_TEST_APD_RESTART_PHASE: after
+        run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_apd_and_migrations_survive_restart
 
   sbom:
     name: CycloneDX SBOM

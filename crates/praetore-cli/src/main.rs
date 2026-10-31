@@ -26,6 +26,8 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod journal_export;
+
 const POLICY_FILE: &str = "policy.json";
 const ISSUER_PIN_FILE: &str = "issuer-pin.json";
 const ISSUER_KEY_FILE: &str = "issuer.key";
@@ -273,6 +275,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             ensure_no_arguments(args)?;
             dispatch_approved(Path::new(&directory), &execution_id, agent.as_deref())
         }
+        "journal-export" => journal_export::run(journal_export::parse(args)?),
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -315,6 +318,7 @@ fn print_usage() {
            praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
+           praetore journal-export (--receipts-dir <dir> | --tenant <uuid>) --attester-pin <hex file> --output <new file>\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );

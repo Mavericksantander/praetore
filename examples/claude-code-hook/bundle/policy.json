@@ -1,0 +1,222 @@
+{
+  "id": "claude-code-agents",
+  "version": 1,
+  "canonical_version": 1,
+  "semantics_version": 2,
+  "rules": [
+    {
+      "id": "deny-git-internals",
+      "action_type": "claude:write",
+      "effect": "Deny",
+      "required_capability": null,
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.nmQCQcTjpc/proyecto/.git"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "deny-subagent-governance-writes",
+      "action_type": "claude:write",
+      "effect": "Deny",
+      "required_capability": null,
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.nmQCQcTjpc/proyecto/.claude"
+        }
+      ],
+      "context_conditions": [
+        {
+          "key": "agent",
+          "operator": "In",
+          "expected": [
+            "planner",
+            "coder",
+            "explorer"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "approval-main-governance-writes",
+      "action_type": "claude:write",
+      "effect": "RequireApproval",
+      "required_capability": "fs:write",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.nmQCQcTjpc/proyecto/.claude"
+        }
+      ],
+      "context_conditions": [
+        {
+          "key": "agent",
+          "operator": "Exact",
+          "expected": "main"
+        }
+      ]
+    },
+    {
+      "id": "approval-git-push",
+      "action_type": "claude:exec",
+      "effect": "RequireApproval",
+      "required_capability": "process:execute",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "git_push",
+          "operator": "Exact",
+          "expected": true
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "approval-unanalyzable-command",
+      "action_type": "claude:exec",
+      "effect": "RequireApproval",
+      "required_capability": "process:execute",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "analyzable",
+          "operator": "Exact",
+          "expected": false
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-read-project",
+      "action_type": "claude:read",
+      "effect": "Allow",
+      "required_capability": "fs:read",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.nmQCQcTjpc/proyecto"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-read-main",
+      "action_type": "claude:read",
+      "effect": "Allow",
+      "required_capability": "fs:read",
+      "target": null,
+      "parameter_conditions": [],
+      "context_conditions": [
+        {
+          "key": "agent",
+          "operator": "Exact",
+          "expected": "main"
+        }
+      ]
+    },
+    {
+      "id": "allow-write-project",
+      "action_type": "claude:write",
+      "effect": "Allow",
+      "required_capability": "fs:write",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/private/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.nmQCQcTjpc/proyecto"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-write-main-claude-home",
+      "action_type": "claude:write",
+      "effect": "Allow",
+      "required_capability": "fs:write",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/var/folders/4g/ccmj10gx1ps5r0lm7xtpnzwm0000gn/T/tmp.nmQCQcTjpc/home/.claude/projects"
+        }
+      ],
+      "context_conditions": [
+        {
+          "key": "agent",
+          "operator": "Exact",
+          "expected": "main"
+        }
+      ]
+    },
+    {
+      "id": "allow-write-main-tmp",
+      "action_type": "claude:write",
+      "effect": "Allow",
+      "required_capability": "fs:write",
+      "target": null,
+      "parameter_conditions": [
+        {
+          "key": "path",
+          "operator": "PathPrefix",
+          "expected": "/private/tmp"
+        }
+      ],
+      "context_conditions": [
+        {
+          "key": "agent",
+          "operator": "Exact",
+          "expected": "main"
+        }
+      ]
+    },
+    {
+      "id": "allow-exec",
+      "action_type": "claude:exec",
+      "effect": "Allow",
+      "required_capability": "process:execute",
+      "target": null,
+      "parameter_conditions": [],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-network",
+      "action_type": "claude:network",
+      "effect": "Allow",
+      "required_capability": "network:invoke",
+      "target": null,
+      "parameter_conditions": [],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-delegate",
+      "action_type": "claude:delegate",
+      "effect": "Allow",
+      "required_capability": "agent:delegate",
+      "target": null,
+      "parameter_conditions": [],
+      "context_conditions": []
+    },
+    {
+      "id": "allow-other-tools",
+      "action_type": "claude:tool",
+      "effect": "Allow",
+      "required_capability": "tool:invoke",
+      "target": null,
+      "parameter_conditions": [],
+      "context_conditions": []
+    }
+  ]
+}

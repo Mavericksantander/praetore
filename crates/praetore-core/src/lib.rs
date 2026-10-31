@@ -8,6 +8,7 @@ pub mod error;
 pub mod evidence;
 pub mod freshness;
 pub mod identity;
+pub mod journal_chain;
 pub mod key_rotation;
 pub mod policy;
 pub mod replay;
