@@ -700,3 +700,69 @@ fn observe_records_the_path_check_and_forwards() {
         "differs"
     );
 }
+
+/// T-014, adversarial finding on `ccea7be`: on APFS a case or NFD variant of
+/// a denied name that does not exist yet is the same entry; enforce refuses
+/// it although core's `PathPrefix` is lexical, and still allows the rest.
+#[cfg(target_os = "macos")]
+#[test]
+fn deny_path_prefix_catches_case_and_nfd_variants_of_a_missing_name_on_apfs() {
+    let (temp, home) = init_home();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let deny = |id: &str, path: PathBuf| {
+        PolicyRule::new(id, ACTION_TYPE, PolicyEffect::Deny).with_parameter_condition(
+            PolicyCondition::path_prefix("arguments.path", path.to_str().unwrap()),
+        )
+    };
+    write_policy(
+        &home,
+        vec![
+            deny("deny-vault", root.join("vault")),
+            deny("deny-cafe", root.join("caf\u{e9}")),
+        ],
+    );
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(vec![
+            echo_path(40, &root.join("notes.txt")),
+            echo_path(41, &root.join("vault")),
+            echo_path(42, &root.join("VAULT")),
+            echo_path(43, &root.join("Vault").join("x")),
+            echo_path(44, &root.join("cafe\u{301}")),
+            echo_path(45, &root.join("CAF\u{c9}")),
+        ]),
+    );
+    for (id, refused) in [
+        (40, false),
+        (41, true),
+        (42, true),
+        (43, true),
+        (44, true),
+        (45, true),
+    ] {
+        let reply = by_id(&responses, &json!(id));
+        assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
+    }
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    let statuses: Vec<String> = journal(&home)
+        .iter()
+        .filter_map(|evidence| {
+            evidence.context.get("praetore.path_check")?["arguments.path"]["status"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            "same",
+            "same",
+            "ambiguous",
+            "unresolved",
+            "ambiguous",
+            "ambiguous"
+        ]
+    );
+    assert!(verify_cli(&home).status.success());
+}

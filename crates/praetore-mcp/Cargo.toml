@@ -25,8 +25,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
+unicode-normalization = "0.1.26"
 uuid = { version = "1.18", features = ["v4"] }
 zeroize = "1"
+
+# T-014: filesystem case/normalization sensitivity (pathconf, statfs, ioctl).
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3"

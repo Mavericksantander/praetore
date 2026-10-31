@@ -41,6 +41,11 @@
   macOS, `/tmp/...` arguments under such a rule are now refused or not
   allowed; use resolved paths. `policy` commands and `policy check` warn
   about prefixes that resolve elsewhere. The check is point-in-time (TOCTOU).
+  A path that resolves to itself but is at or under a policy `PathPrefix`
+  only when compared like the filesystem compares names (case folding and/or
+  NFC: APFS, HFS+, casefolded ext4/f2fs, unknown filesystems), not byte for
+  byte, is `ambiguous` and hidden the same way; this covers case and NFD
+  variants of a denied name that does not exist yet.
 
 ## 0.3.0 - 2026-10-30
 

@@ -251,8 +251,8 @@ matches it and no ALLOW `PathPrefix` rule does. "Does not resolve to itself"
 means a symlink anywhere in the path, a `.`/`..` segment, a dangling symlink,
 or a parent that does not exist. The receipt records
 `context["praetore.path_check"][KEY] = {"lexical", "resolved", "status"}`
-(`same`, `differs` or `unresolved`), and the bytes forwarded to the server are
-never changed. Consequences:
+(`same`, `differs`, `unresolved` or `ambiguous`), and the bytes forwarded to
+the server are never changed. Consequences:
 
 * Write rules and arguments with resolved paths. On macOS `/tmp` and `/var`
   are symlinks to `/private/tmp` and `/private/var`, so `/tmp/x` is refused by
@@ -260,6 +260,20 @@ never changed. Consequences:
   `policy deny|allow|require-approval` and `policy check` warn when a rule's
   prefix exists and resolves to another path: a DENY rule on `/tmp/secret`
   would not cover `/private/tmp/secret/x`.
+* Case and Unicode normalization. For an existing entry `realpath` returns
+  the stored spelling, so on APFS `/x/SECRET/f` (stored `secret`) or an NFD
+  `cafe\u{301}` (stored NFC `café`) is `differs`. A name that does not exist
+  yet cannot be checked that way, so a path that resolves to itself is also
+  compared with every `--arg-path-prefix` value of the policy: if it is at
+  or under one only once names are compared the way the filesystem compares
+  them (case folding and/or NFC), and not byte for byte, it is `ambiguous`
+  and the engine sees the placeholder. Each differing segment uses the
+  sensitivity of its directory: on macOS `pathconf(_PC_CASE_SENSITIVE)`
+  decides case, normalization is always ignored (APFS, HFS+); on Linux only
+  ext4/f2fs/tmpfs directories without the casefold flag, xfs and btrfs count
+  as byte for byte; anything else, or a failed probe, folds both (fail
+  closed). On a case-sensitive filesystem `/x/SECRET` is an ordinary path and
+  is not refused by a rule on `/x/secret`.
 * Relative values are not resolved; core already treats them as unsafe.
 * The check happens when the proxy decides. The server opens the path later,
   so a symlink created or swapped in between is not seen (TOCTOU, see

@@ -80,7 +80,11 @@ Read these before relying on anything above.
    path goes through a symlink, has `.`/`..`, or its parent does not exist,
    restrictive path rules match it and ALLOW path rules do not. On macOS,
    `/tmp/...` is such a path (`/tmp` → `/private/tmp`): use the resolved
-   path in rules and arguments. The receipt shows what was checked in
+   path in rules and arguments. On a filesystem that ignores case or Unicode
+   normalization (APFS by default), a path that differs from a rule's prefix
+   only in case or normalization (`/x/SECRET` against `/x/secret`, NFD
+   against NFC) is also treated that way (`ambiguous`), even when it does not
+   exist yet. The receipt shows what was checked in
    `context["praetore.path_check"]`.
 5. **Time of check to time of use (TOCTOU).** The decision is made on the
    arguments when the call passes through the proxy. The MCP server opens
