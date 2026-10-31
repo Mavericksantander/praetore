@@ -95,7 +95,7 @@ assert_eq!(digest.len(), 64);
 
 When constructing conditions directly, `PolicyCondition::new` accepts a
 `MatchOperator`; the convenience constructors `exact`, `prefix`,
-`one_of`, and the numeric constructors are generally clearer.
+`path_prefix`, `one_of`, and the numeric constructors are generally clearer.
 
 ## Condition operators
 
@@ -103,8 +103,17 @@ When constructing conditions directly, `PolicyCondition::new` accepts a
 | --- | --- | --- |
 | `Exact` | JSON value equality; types matter (`1` is not `"1"`) | Any bounded JSON value |
 | `Prefix` | Actual value is a string beginning with the expected string | Non-empty string |
+| `PathPrefix` | Actual value is an absolute, normalized path inside the expected path on whole segments (`/srv/agent` matches `/srv/agent` and `/srv/agent/x`, not `/srv/agentx`); purely lexical, byte for byte | Absolute, normalized path: no `.`, `..` or empty segments, no `\`, `%` or NUL; one trailing `/` allowed. `//` alone is accepted and means the root; `///`, `//srv` and `/srv//x` are rejected |
 | `In` | Actual JSON value equals one element of the expected array | Non-empty array |
 | `GreaterThan`, `GreaterThanOrEqual`, `LessThan`, `LessThanOrEqual` | Numeric comparison | JSON number |
+
+`PathPrefix` applies the same rules to the actual value. A value that breaks
+them (relative, `..`, `.`, an empty segment such as `/srv//x`, `\`, `%` or NUL)
+is unsafe: it always matches DENY and REQUIRE_APPROVAL rules and never matches
+ALLOW rules, in every semantics version, even when it lies outside the rule's
+prefix. As with the rule prefix, the value `//` on its own is the root, not an
+unsafe value. Symlinks, Unicode look-alikes and percent-decoding are out of
+scope; see the `MatchOperator::PathPrefix` documentation.
 
 Prefix matching is string-only. Membership compares JSON values exactly,
 except that a numerically equal integer and float are equal (see below).
