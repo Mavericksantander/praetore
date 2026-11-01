@@ -16,6 +16,8 @@ mod shell;
 
 #[cfg(test)]
 mod attribution_tests;
+#[cfg(test)]
+mod tests_g7;
 
 use std::{
     collections::BTreeMap,
@@ -26,9 +28,10 @@ use std::{
 };
 
 use praetore_core::{
-    Action, AgentId, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, DecisionOutcome,
-    Evidence, EvidenceAttesterKey, Policy, PolicyCondition, PolicyEffect, PolicyRule,
-    TrustedAuthorityIssuer, authority::Validity, engine::AuthorizationEngine,
+    Action, AgentId, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest,
+    ClassifiedAction, DecisionOutcome, Evidence, EvidenceAttesterKey, Policy, PolicyCondition,
+    PolicyEffect, PolicyRule, PraetoreError, RecordedPolicy, TrustedAuthorityIssuer,
+    authority::Validity, engine::AuthorizationEngine,
 };
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -111,6 +114,10 @@ struct Verdict {
     outcome: DecisionOutcome,
     rule: Option<String>,
     reason: String,
+    /// G7: the tool call is a safety action. PRÆTORE made no decision: the
+    /// hook adds none (Claude Code's own permission rules apply), and
+    /// nothing was signed or appended to `receipts.jsonl`.
+    not_governed: bool,
 }
 
 fn main() -> ExitCode {
@@ -334,11 +341,23 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 .with_capability("tool:invoke"),
         ],
     )
+    // G7 (policy format 2): every action type the hook produces, declared.
+    // No safety action is declared by default, so a `safety:*` tool is
+    // refused as unclassified until the policy declares it Safety.
+    .with_mission_actions([
+        "claude:read",
+        "claude:write",
+        "claude:exec",
+        "claude:network",
+        "claude:delegate",
+        "claude:tool",
+    ])
 }
 
-/// Maps a Claude Code tool call onto a PRÆTORE action type, the capability it
-/// requires, and the parameters the policy matches on. Unknown tools map to
-/// `claude:tool`, which only the main session's authority grants.
+/// Maps a Claude Code tool call onto a PRÆTORE action type (the same as
+/// [`action_type_of`]), the capability it requires, and the parameters the
+/// policy matches on. Unknown tools map to `claude:tool`, which only the main
+/// session's authority grants.
 ///
 /// A path is resolved through the filesystem first (see [`resolve_path`]).
 /// Unless it resolves to itself, the policy sees [`PATH_CHECK_FAILED`]
@@ -402,6 +421,11 @@ fn classify(
             json!({ "subagent_type": field("subagent_type").unwrap_or_default() }),
             None,
         ),
+        // G7: `authorize` answers safety actions before it gets here; this
+        // arm keeps the type in step with `action_type_of`.
+        name if name.starts_with(praetore_core::policy::SAFETY_ACTION_PREFIX) => {
+            (name.into(), "tool:invoke", json!({ "tool": name }), None)
+        }
         other => (
             "claude:tool".into(),
             "tool:invoke",
@@ -500,7 +524,11 @@ fn run_hook(directory: &Path) {
             outcome: DecisionOutcome::Deny,
             rule: None,
             reason: format!("hook error, failing closed: {error}"),
+            not_governed: false,
         });
+    if verdict.not_governed {
+        eprintln!("PRÆTORE: {}", verdict.reason);
+    }
     if let Some(output) = hook_output(&verdict) {
         println!("{output}");
     }
@@ -518,6 +546,9 @@ fn read_hook_input() -> Result<HookInput, BoxError> {
 }
 
 fn hook_output(verdict: &Verdict) -> Option<Value> {
+    if verdict.not_governed {
+        return None;
+    }
     let decision = match verdict.outcome {
         DecisionOutcome::Allow => return None,
         DecisionOutcome::RequireApproval => "ask",
@@ -581,7 +612,54 @@ fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Va
     (claims, None)
 }
 
+/// G7: tools whose name starts with `safety:` are safety actions of that
+/// exact type; the policy must declare them `Safety`. Every other tool maps
+/// to a `claude:*` mission action (see [`classify`]).
+fn action_type_of(tool_name: &str) -> String {
+    match tool_name {
+        "Read" | "Grep" | "Glob" => "claude:read".into(),
+        "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => "claude:write".into(),
+        "Bash" => "claude:exec".into(),
+        "WebFetch" | "WebSearch" => "claude:network".into(),
+        "Agent" | "Task" => "claude:delegate".into(),
+        name if name.starts_with(praetore_core::policy::SAFETY_ACTION_PREFIX) => name.into(),
+        _ => "claude:tool".into(),
+    }
+}
+
+fn load_policy(directory: &Path) -> Result<Policy, BoxError> {
+    Ok(Policy::from_json(&String::from_utf8(read_bounded(
+        &directory.join(POLICY_FILE),
+    )?)?)?)
+}
+
 fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+    // G7: classify the call against the policy before anything else: before
+    // any agent key or profile is read, anything is signed or evaluated, or
+    // a receipt is appended. A safety action gets no decision from PRÆTORE,
+    // so a PRÆTORE failure after this point cannot hold it.
+    let policy = load_policy(directory)?;
+    let action_type = action_type_of(&input.tool_name);
+    match policy.classify(Action::new(action_type, None, json!({}))?) {
+        Ok(ClassifiedAction::Mission(_)) => {}
+        Ok(ClassifiedAction::Safety(action)) => {
+            return Ok(Verdict {
+                outcome: DecisionOutcome::Deny,
+                rule: None,
+                reason: format!(
+                    "{}: {}",
+                    action.not_governed().code(),
+                    action.not_governed()
+                ),
+                not_governed: true,
+            });
+        }
+        Err(error @ PraetoreError::UnclassifiedAction { .. }) => {
+            // Refused before evaluation, so there is no signed receipt.
+            return Ok(denied(format!("{}: {error}", error.code())));
+        }
+        Err(error) => return Err(error.into()),
+    }
     // Only the absence of `agent_type` is the main session. An explicit
     // `main` (a subagent defined with `name: main`) or `unregistered` is a
     // reserved name and is evaluated as `unregistered`.
@@ -651,9 +729,6 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
         &directory.join(ISSUER_PIN_FILE),
     )?)?)?;
-    let policy = Policy::from_json(&String::from_utf8(read_bounded(
-        &directory.join(POLICY_FILE),
-    )?)?)?;
     let engine = AuthorizationEngine::strict(policy, vec![pin])?;
 
     let (action_type, capability, mut parameters, path_check) =
@@ -665,6 +740,9 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         parameters.insert(PROFILE_CONSTRAINT.into(), json!(profile_name));
     }
     let action = Action::new(action_type, None, parameters)?.with_capability(capability);
+    let action = engine.policy().classify(action)?.into_mission()?;
+    #[cfg(test)]
+    tests_g7::SIGNATURES.with(|count| count.set(count.get() + 1));
     let mut request = AuthorizationRequest::new(identity, authority, action)?
         .with_context("agent", json!(agent))
         .with_context("profile", json!(profile_name))
@@ -704,6 +782,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         outcome,
         rule: deciding_rules(&evidence),
         reason,
+        not_governed: false,
     })
 }
 
@@ -725,6 +804,7 @@ fn denied(reason: String) -> Verdict {
         outcome: DecisionOutcome::Deny,
         rule: None,
         reason,
+        not_governed: false,
     }
 }
 
@@ -735,6 +815,8 @@ fn append_receipt(
     profile: &str,
     evidence: &Evidence,
 ) -> Result<(), BoxError> {
+    #[cfg(test)]
+    tests_g7::APPENDS.with(|count| count.set(count.get() + 1));
     let line = json!({
         "tool_use_id": input.tool_use_id,
         "tool_name": input.tool_name,
@@ -856,10 +938,13 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
         &directory.join(ISSUER_PIN_FILE),
     )?)?)?;
     let attester = read_attester_pin(directory)?;
-    let policy_digest = Policy::from_json(&String::from_utf8(read_bounded(
+    // Historical: hook state created before G7 has a policy format 1
+    // document. It is only digested here, never evaluated.
+    let policy_digest = RecordedPolicy::from_json(&String::from_utf8(read_bounded(
         &directory.join(POLICY_FILE),
     )?)?)?
-    .digest()?;
+    .digest()
+    .to_owned();
     let receipts = fs::read_to_string(directory.join(RECEIPTS_FILE))?;
     let now = OffsetDateTime::now_utc();
     let mut tally: BTreeMap<(String, String), usize> = BTreeMap::new();
