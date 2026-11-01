@@ -458,9 +458,21 @@ async fn mission_action_reaches_the_engine_and_fails_closed_with_the_journal_dow
     assert_eq!(probes.dispatcher.0.get(), 0, "nothing was dispatched");
 }
 
-/// Captures WARN events (message and fields) on the current thread.
+/// Captures WARN events (message and fields) for the whole test process.
+/// Installed once as the global default, so the callsite interest does not
+/// depend on which test thread registered it first; each test filters the
+/// lines by its own (random) agent id.
 #[derive(Default, Clone)]
 struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+fn warn_capture() -> &'static WarnCapture {
+    static CAPTURE: std::sync::OnceLock<WarnCapture> = std::sync::OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = WarnCapture::default();
+        tracing::subscriber::set_global_default(capture.clone()).expect("one global subscriber");
+        capture
+    })
+}
 
 struct FieldText<'a>(&'a mut String);
 
@@ -517,12 +529,11 @@ async fn post_raw(gateway: Gateway, body: &Value) -> (StatusCode, Vec<(String, V
 
 /// G7 (gateway): every action type with the reserved `safety:` prefix gets
 /// the same answer, declared Safety or not: byte-identical status, headers
-/// and body, no engine call and no journal row. Only the undeclared one is
-/// logged (WARN, unsigned), with the claimed agent id and the escaped type.
+/// and body, no engine call and no journal row. Each is logged once (WARN,
+/// unsigned) with the same fields and `declared` true or false.
 #[tokio::test]
 async fn reserved_safety_prefix_answers_the_same_declared_or_not() {
-    let capture = WarnCapture::default();
-    let _guard = tracing::subscriber::set_default(capture.clone());
+    let capture = warn_capture();
     let declared_id = "g7-gateway-prefix-declared";
     let undeclared_id = "g7-gateway-prefix-undeclared";
     let (declared_gateway, declared_probes, mut declared) = setup(declared_id);
@@ -531,7 +542,6 @@ async fn reserved_safety_prefix_answers_the_same_declared_or_not() {
     undeclared["action"]["action_type"] = json!("safety:hold\u{200b}");
 
     let declared_response = post_raw(declared_gateway, &declared).await;
-    let warnings_after_declared = capture.0.lock().unwrap().len();
     let undeclared_response = post_raw(undeclared_gateway, &undeclared).await;
 
     assert_eq!(declared_response.0, StatusCode::UNPROCESSABLE_ENTITY);
@@ -541,18 +551,45 @@ async fn reserved_safety_prefix_answers_the_same_declared_or_not() {
     declared_probes.assert_untouched();
     undeclared_probes.assert_untouched();
 
-    let warnings = capture.0.lock().unwrap().clone();
-    assert_eq!(
-        warnings_after_declared, 0,
-        "a declared Safety action is not logged"
-    );
-    assert_eq!(warnings.len(), 1, "{warnings:?}");
-    let warning = &warnings[0];
-    assert!(warning.contains("undeclared safety action"), "{warning}");
+    // Exactly one event per request at the prefix gate, declared or not,
+    // with the same fields; only `declared` differs.
+    let lines_for = |body: &Value| {
+        let agent_id = body["agent"]["id"].as_str().unwrap().to_owned();
+        capture
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(&agent_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let declared_lines = lines_for(&declared);
+    let undeclared_lines = lines_for(&undeclared);
+    assert_eq!(declared_lines.len(), 1, "{declared_lines:?}");
+    assert_eq!(undeclared_lines.len(), 1, "{undeclared_lines:?}");
+    for line in declared_lines.iter().chain(&undeclared_lines) {
+        assert!(
+            line.contains("safety action refused as not governed"),
+            "{line}"
+        );
+        assert!(line.contains("claimed_agent_id="), "{line}");
+        assert!(line.contains("action_type="), "{line}");
+    }
     assert!(
-        warning.contains("safety:hold\\u{200b}"),
-        "escaped: {warning}"
+        declared_lines[0].contains("declared=true"),
+        "{declared_lines:?}"
     );
-    let agent_id = undeclared["agent"]["id"].as_str().unwrap();
-    assert!(warning.contains(agent_id), "{warning}");
+    assert!(
+        declared_lines[0].contains("action_type=safety:halt "),
+        "{declared_lines:?}"
+    );
+    assert!(
+        undeclared_lines[0].contains("declared=false"),
+        "{undeclared_lines:?}"
+    );
+    assert!(
+        undeclared_lines[0].contains("action_type=safety:hold\\u{200b}"),
+        "escaped: {undeclared_lines:?}"
+    );
 }

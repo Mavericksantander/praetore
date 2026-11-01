@@ -444,7 +444,8 @@ struct ApprovalErrorContext {
 /// execution journal. Before anything else (G7), an action type with the
 /// reserved `safety:` prefix gets 422 `safety_action_not_governed`, declared
 /// Safety or not, with no evaluation, replay claim, journal write, signature
-/// or dispatch (an undeclared one is only logged; see docs/threat-model.md).
+/// or dispatch; each is logged once (WARN, `declared=true|false`) and an
+/// undeclared one gets no receipt (see docs/threat-model.md).
 /// Any other action type is classified against the engine policy's
 /// `action_classes`: an undeclared one is verified like a mission request and
 /// refused with a signed DENY (engine guard `unclassified_action`), answered
@@ -518,21 +519,23 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     // no engine, journal or signing work, so the answer depends only on the
     // public prefix rule and cannot be used to enumerate `action_classes`.
     if let Some(claimed) = reserved_safety_action(json) {
-        if state
+        let declared = state
             .gateway
             .policy()
             .action_classes
             .get(&claimed.action_type)
-            != Some(&praetore_core::ActionClass::Safety)
-        {
-            // Not declared: no receipt (see docs/threat-model.md), only this
-            // unsigned trace. The agent id is the request's claim, unverified.
-            tracing::warn!(
-                claimed_agent_id = %claimed.agent_id,
-                action_type = %claimed.action_type_display,
-                "undeclared safety action refused as not governed; no receipt"
-            );
-        }
+            == Some(&praetore_core::ActionClass::Safety);
+        // One unsigned WARN for every request at this gate, declared or not,
+        // with the same fields, so both branches do the same work. Nothing
+        // is signed or journaled: an undeclared one gets no receipt (see
+        // docs/threat-model.md). The agent id is the request's claim,
+        // unverified.
+        tracing::warn!(
+            claimed_agent_id = %claimed.agent_id,
+            action_type = %claimed.action_type_display,
+            declared,
+            "safety action refused as not governed; no receipt"
+        );
         return error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             "safety_action_not_governed",

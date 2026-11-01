@@ -145,8 +145,11 @@ call. An `AuthorizationRequest` carries a `MissionAction`, which only
 `POST /v1/execute` first answers every action type with the reserved
 `safety:` prefix with 422 `safety_action_not_governed`, declared Safety or
 not, with no evaluation, replay claim, journal write, signature or dispatch,
-also when the journal is unavailable (an undeclared one is only logged, so
-the answer cannot be used to enumerate the table). Other actions are then
+also when the journal is unavailable. Every such request writes the same
+unsigned WARN line, with `declared=true|false`, and an undeclared one gets no
+receipt, so the answer cannot be used to enumerate the table. `SAFETY:x` is
+not the reserved prefix: it is classified, and an authenticated request for
+it gets a signed `unclassified` DENY. Other actions are then
 classified against `Gateway::policy()`. An undeclared one goes to
 `Gateway::refuse_unclassified`: the engine verifies it like a mission
 request and commits a signed DENY (engine guard `unclassified_action`) with

@@ -156,22 +156,29 @@ Trust boundaries are explicit:
   every action type that starts with `safety:` with the same 422
   `safety_action_not_governed`, before any verification, engine, journal or
   signing work, whether the policy declares it `Safety` or not. An
-  undeclared `safety:*` therefore gets no receipt at the gateway, only an
-  unsigned WARN log line with the claimed agent id and the escaped action
-  type. The reason is that the answer then depends only on the public prefix
+  undeclared `safety:*` therefore gets no receipt at the gateway. Every
+  request at this gate, declared or not, writes the same unsigned WARN log
+  line (claimed agent id and action type, bounded and escaped, and
+  `declared=true|false`), so both branches do the same work and operators
+  still see attempts on undeclared names. Only the exact lowercase prefix
+  `safety:` takes this path: `SAFETY:x` or `safety：x` (full-width colon)
+  cannot be declared and go through the unclassified path, which, for an
+  authenticated and verified request, leaves a signed `unclassified` DENY. The reason is that the answer then depends only on the public prefix
   rule, so an authenticated agent cannot use it to enumerate the Safety part
   of `action_classes`. `praetore-mcp` and the hook keep the signed
   `unclassified` DENY for an undeclared `safety:*`; there the Safety part of
   the table is observable by design (a declared one is forwarded or gets no
   decision).
-* Known limits: response timing is not uniform (an undeclared action skips
-  rule evaluation; on the reserved-prefix path the WARN line is written only
-  for an undeclared type), and in `praetore-mcp` observe mode a policy DENY
-  is forwarded while an undeclared action is refused.
+* Known limits: response timing is not uniform. An undeclared action skips
+  rule evaluation. On the reserved-prefix path both branches now log the
+  same line, which reduces the timing difference between a declared and an
+  undeclared `safety:*` but does not eliminate it (the table lookup and the
+  `declared` value still differ). In `praetore-mcp` observe mode a policy
+  DENY is forwarded while an undeclared action is refused.
 * Text meant for people escapes characters that render invisibly or reorder
   text (zero-width, bidi, control) as `\u{XXXX}`: `praetore-verify
-  --format text`, `praetore-mcp` tables and stderr lines, and the gateway's
-  WARN line. Receipts, JSONL exports and JSON output keep the exact bytes.
+  --format text`, `praetore-mcp` tables and stderr lines, the hook's stderr
+  lines, and the gateway's WARN line. Receipts, JSONL exports and JSON output keep the exact bytes.
   `praetore journal-export` writes JSONL and a JSON summary only, so it has
   no text rendering of action types. Audits should select unclassified
   refusals by `decided_by` (`engine_guard` / `unclassified_action`), not by

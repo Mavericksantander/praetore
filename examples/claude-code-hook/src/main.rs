@@ -526,8 +526,11 @@ fn run_hook(directory: &Path) {
     let verdict = read_hook_input()
         .and_then(|input| authorize(directory, &input))
         .unwrap_or_else(fail_closed);
+    // stderr is for people: invisible, bidi and control characters in tool
+    // names and reasons are escaped (`praetore_core::display`).
+    let shown = praetore_core::display::escape_for_display;
     if verdict.not_governed {
-        eprintln!("PRÆTORE: {}", verdict.reason);
+        eprintln!("PRÆTORE: {}", shown(&verdict.reason));
     }
     if verdict.outcome == DecisionOutcome::Deny && verdict.evidence_id.is_some() {
         // The model only sees the uniform text (see `hook_output`); the rule
@@ -537,9 +540,9 @@ fn run_hook(directory: &Path) {
             verdict
                 .rule
                 .as_deref()
-                .map(|rule| format!(" [rule {rule}]"))
+                .map(|rule| format!(" [rule {}]", shown(rule)))
                 .unwrap_or_default(),
-            verdict.reason
+            shown(&verdict.reason)
         );
     }
     if let Some(output) = hook_output(&verdict) {

@@ -78,15 +78,18 @@
   with the same 422 `safety_action_not_governed` (same body, headers and
   code path), declared Safety or not, before any verification, engine,
   journal or signing work. An undeclared `safety:*` gets no receipt at the
-  gateway, only an unsigned WARN log line with the claimed agent id and the
-  escaped, bounded action type, so the answer cannot be used to enumerate
-  the table. `praetore-mcp` and the hook keep the signed `unclassified`
+  gateway. Every request at this gate writes the same unsigned WARN line
+  (claimed agent id and action type, bounded and escaped, and
+  `declared=true|false`), so the answer cannot be used to enumerate the
+  table; the remaining timing difference is a documented limit. `SAFETY:x`
+  (not the exact prefix) goes through the unclassified path and gets a
+  signed DENY when the request is authenticated. `praetore-mcp` and the hook keep the signed `unclassified`
   DENY for it.
 - Human-facing text escapes characters that render invisibly or reorder text
   (zero-width, bidi, control) as `\u{XXXX}`: `praetore-verify --format text`
   (which now also reports `receipt_action_type`, `receipt_tool`,
   `receipt_decision` and `receipt_decided_by`), `praetore-mcp` tables and
-  stderr, and the gateway's WARN line (`praetore_core::display`). JSON
+  stderr, the hook's stderr, and the gateway's WARN line (`praetore_core::display`). JSON
   output and receipts stay exact. `UNCLASSIFIED_DENY_REASON` and
   `UNCLASSIFIED_ACTION_GUARD` are public constants in `praetore-core`.
 - **Breaking (behaviour change, praetore-mcp observe mode).** A call whose
