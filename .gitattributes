@@ -1,0 +1,3 @@
+# Mutation patches for scripts/g7-mutation-test.sh: blank context lines
+# carry the single space that the patch format requires.
+scripts/g7-mutants/*.patch -whitespace
