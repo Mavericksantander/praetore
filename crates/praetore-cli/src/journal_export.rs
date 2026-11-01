@@ -201,10 +201,7 @@ fn export_transaction(
     tenant_id: Uuid,
 ) -> Result<postgres::Transaction<'_>, postgres::Error> {
     let mut transaction = client.build_transaction().read_only(true).start()?;
-    transaction.query_one(
-        "SELECT set_config('praetore.tenant_id', $1, true)",
-        &[&tenant_id.to_string()],
-    )?;
+    praetore_replay_postgres::set_tenant_context(&mut transaction, tenant_id)?;
     Ok(transaction)
 }
 

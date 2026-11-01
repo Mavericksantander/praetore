@@ -23,6 +23,10 @@
 //! pair before executing and refuses any other transaction control, so a
 //! crash can never leave a migration applied but unrecorded.
 //!
+//! The baseline check is best effort: it inspects an untrusted database from
+//! inside it. It does not validate stored rows, and it cannot defend against
+//! a superuser who edits the system catalogs directly.
+//!
 //! Every statement runs with `search_path = pg_catalog, pg_temp` (restored
 //! afterwards), and a session with `session_replication_role` other than
 //! `origin` is refused, so neither a shadowing catalog view or operator nor
@@ -117,7 +121,15 @@ pub enum MigrationError {
 impl std::fmt::Display for MigrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Database(error) => write!(f, "migration failed: {error}"),
+            Self::Database(error) => match error.as_db_error() {
+                Some(db) => write!(
+                    f,
+                    "migration failed: {} (SQLSTATE {})",
+                    db.message(),
+                    db.code().code()
+                ),
+                None => write!(f, "migration failed: {error}"),
+            },
             Self::Modified(version) => {
                 write!(f, "migration {version} was modified after it was applied")
             }
@@ -228,13 +240,17 @@ fn apply_locked(client: &mut Client) -> Result<Vec<&'static str>, MigrationError
                 &[],
             )?
             .get(0);
+        // The baseline check and the recording of 0001-0009 commit (or roll
+        // back) together, with the praetore tables locked, so the schema
+        // cannot change between the comparison and the record.
+        let mut transaction = client.transaction()?;
+        transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
         let baseline = if has_schema {
-            check_0009_baseline(client)?;
+            check_0009_baseline(&mut transaction)?;
             true
         } else {
             false
         };
-        let mut transaction = client.transaction()?;
         transaction.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS praetore; \
              CREATE TABLE praetore.schema_migrations (\
@@ -491,32 +507,74 @@ fn check_session_fires_triggers(client: &mut Client) -> Result<(), MigrationErro
 /// change search_path, row_security or session_replication_role, default
 /// privileges, and the schema owner.
 ///
-/// Needs the privileges that applying 0001-0009 needs (CREATE on the
-/// database for the scratch schema). Nothing is committed.
-fn check_0009_baseline(client: &mut Client) -> Result<(), MigrationError> {
-    let mut transaction = client.transaction()?;
-    transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
-    let live_problems = live_only_problems(&mut transaction)?;
+/// The comparison runs in the transaction that then records 0001-0009, with
+/// the praetore tables locked (SHARE ROW EXCLUSIVE); the scratch schema lives
+/// in a savepoint that is always rolled back. Needs the privileges that
+/// applying 0001-0009 needs (CREATE on the database for the scratch schema).
+///
+/// Limits: this is a best-effort check of a database from inside it. It is
+/// structural only: rows already stored (for example events written while
+/// triggers were disabled) are not validated, and a legitimate
+/// `VALIDATE CONSTRAINT` on the `NOT VALID` foreign keys of 0003/0007 is
+/// reported as a difference (fail closed). It cannot defend against a
+/// superuser who edits the system catalogs directly: whoever controls the
+/// server as superuser controls what the catalogs say.
+fn check_0009_baseline(transaction: &mut postgres::Transaction<'_>) -> Result<(), MigrationError> {
+    let tables: Vec<String> = transaction
+        .query(
+            "SELECT pg_catalog.format('%I.%I', n.nspname, c.relname) \
+             FROM pg_catalog.pg_class c \
+             JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+             WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+               AND (c.relkind OPERATOR(pg_catalog.=) 'r' OR c.relkind OPERATOR(pg_catalog.=) 'p') \
+             ORDER BY 1",
+            &[],
+        )?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    if !tables.is_empty() {
+        transaction.batch_execute(&format!(
+            "LOCK TABLE {} IN SHARE ROW EXCLUSIVE MODE",
+            tables.join(", ")
+        ))?;
+    }
+    let live_problems = live_only_problems(transaction)?;
     if !live_problems.is_empty() {
-        transaction.rollback()?;
         return Err(MigrationError::UnrecognizedSchema(live_problems.join("; ")));
     }
     let scratch = format!("praetore_baseline_{}", uuid::Uuid::new_v4().simple());
+    let mut savepoint = transaction.savepoint("praetore_baseline_scratch")?;
     for (version, sql) in MIGRATIONS {
         let body = transactional_body(version, sql)?;
-        transaction.batch_execute(&rewrite_schema(body, &scratch))?;
+        savepoint
+            .batch_execute(&rewrite_schema(body, &scratch))
+            .map_err(|error| {
+                MigrationError::UnrecognizedSchema(format!(
+                    "could not apply {version} to a scratch schema to compare with: {}",
+                    database_cause(&error)
+                ))
+            })?;
         if version == BASELINE_VERSION {
             break;
         }
     }
-    let live = schema_dump(&mut transaction, "praetore", "praetore")?;
-    let expected = schema_dump(&mut transaction, &scratch, &scratch)?;
-    transaction.rollback()?;
+    let live = schema_dump(&mut savepoint, "praetore", "praetore")?;
+    let expected = schema_dump(&mut savepoint, &scratch, &scratch)?;
+    savepoint.rollback()?;
     let differences = dump_differences(&live, &expected);
     if differences.is_empty() {
         Ok(())
     } else {
         Err(MigrationError::UnrecognizedSchema(differences.join("; ")))
+    }
+}
+
+/// The server's message and SQLSTATE, not only "db error".
+fn database_cause(error: &postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db) => format!("{} (SQLSTATE {})", db.message(), db.code().code()),
+        None => error.to_string(),
     }
 }
 
@@ -578,9 +636,12 @@ fn norm(expression: &str) -> String {
 
 /// Canonical dump of schema `$1`, with the name `$2` normalized to
 /// `praetore`: the schema (owner, ACL); every relation (kind, persistence,
-/// RLS and FORCE RLS, partition flag, owner, ACL, index or view definition);
+/// RLS and FORCE RLS, partition flag, `relhastriggers`, `relhasrules`,
+/// replica identity, access method, owner, ACL, index or view definition,
+/// index flags `indisvalid`/`indisready`/`indislive`/`indimmediate`, and
+/// sequence parameters from `pg_sequence`);
 /// every column (type, NOT NULL, default, identity, generated, collation,
-/// column ACL); every constraint (`pg_get_constraintdef`, deferrable,
+/// column ACL; collation with its schema); every constraint (`pg_get_constraintdef`, deferrable,
 /// validated, inheritance); every function (result, language, SECURITY
 /// DEFINER, `SET`, volatility, parallel, kind, STRICT, LEAKPROOF, `prosrc`,
 /// owner, ACL, so overloads are separate keys); every non-internal trigger
@@ -662,11 +723,38 @@ fn schema_dump(
              ('row security', c.relrowsecurity::pg_catalog.text), \
              ('force row security', c.relforcerowsecurity::pg_catalog.text), \
              ('partition', c.relispartition::pg_catalog.text), \
+             ('has triggers', c.relhastriggers::pg_catalog.text), \
+             ('has rules', c.relhasrules::pg_catalog.text), \
+             ('replica identity', c.relreplident::pg_catalog.text), \
+             ('access method', (SELECT am.amname::pg_catalog.text FROM pg_catalog.pg_am am \
+                                WHERE am.oid {eq} c.relam)), \
              ('owner', {relation_owner}), \
              ('acl', {relation_acl}), \
              ('definition', CASE WHEN c.relkind {eq} 'i' THEN {index_def} \
                                  WHEN c.relkind {eq} 'v' OR c.relkind {eq} 'm' THEN {view_def} \
                             END)) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('relation praetore.', c.relname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         JOIN pg_catalog.pg_index i ON i.indexrelid {eq} c.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('index valid', i.indisvalid::pg_catalog.text), \
+             ('index ready', i.indisready::pg_catalog.text), \
+             ('index live', i.indislive::pg_catalog.text), \
+             ('index immediate', i.indimmediate::pg_catalog.text), \
+             ('index replica identity', i.indisreplident::pg_catalog.text)) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('relation praetore.', c.relname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         JOIN pg_catalog.pg_sequence q ON q.seqrelid {eq} c.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('sequence type', pg_catalog.format_type(q.seqtypid, NULL)), \
+             ('sequence start', q.seqstart::pg_catalog.text), \
+             ('sequence increment', q.seqincrement::pg_catalog.text), \
+             ('sequence max', q.seqmax::pg_catalog.text), \
+             ('sequence min', q.seqmin::pg_catalog.text), \
+             ('sequence cache', q.seqcache::pg_catalog.text), \
+             ('sequence cycle', q.seqcycle::pg_catalog.text)) f(field, value) \
          UNION ALL \
          SELECT pg_catalog.concat('column praetore.', c.relname, '.', a.attname), f.field, f.value \
          FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
@@ -678,8 +766,7 @@ fn schema_dump(
                           WHERE d.adrelid {eq} a.attrelid AND d.adnum {eq} a.attnum)), \
              ('identity', a.attidentity::pg_catalog.text), \
              ('generated', a.attgenerated::pg_catalog.text), \
-             ('collation', (SELECT co.collname::pg_catalog.text FROM pg_catalog.pg_collation co \
-                            WHERE co.oid {eq} a.attcollation)), \
+             ('collation', {column_collation}), \
              ('acl', {column_acl})) f(field, value) \
          WHERE a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped \
          UNION ALL \
@@ -790,6 +877,10 @@ fn schema_dump(
         column_type = norm("pg_catalog.format_type(a.atttypid, a.atttypmod)"),
         column_default = norm("pg_catalog.pg_get_expr(d.adbin, d.adrelid)"),
         column_acl = acl_sql("a.attacl"),
+        column_collation = norm(&format!(
+            "CASE WHEN a.attcollation {eq} 0::pg_catalog.oid THEN NULL \
+                  ELSE a.attcollation::pg_catalog.regcollation END"
+        )),
         constraint_def = norm("pg_catalog.pg_get_constraintdef(con.oid)"),
         function_arguments = norm("pg_catalog.pg_get_function_identity_arguments(p.oid)"),
         function_result = norm("pg_catalog.pg_get_function_result(p.oid)"),
@@ -959,6 +1050,94 @@ fn live_only_problems(
         problems.push(format!(
             "default privileges of {role} in {schema} (object type {kind}) are not allowed"
         ));
+    }
+    for row in transaction.query(
+        "SELECT p.oid::pg_catalog.regprocedure::pg_catalog.text \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) p.pronamespace \
+         JOIN pg_catalog.pg_namespace owner_ns \
+           ON owner_ns.nspname OPERATOR(pg_catalog.=) 'praetore' \
+         WHERE p.prosecdef \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'praetore' \
+           AND pg_catalog.pg_has_role(p.proowner, owner_ns.nspowner, 'USAGE') \
+         ORDER BY 1",
+        &[],
+    )? {
+        let function: String = row.get(0);
+        problems.push(format!(
+            "SECURITY DEFINER function {function} outside praetore runs with the rights of the \
+             praetore owner"
+        ));
+    }
+    for row in transaction.query(
+        "WITH RECURSIVE \
+             owner_role AS (SELECT n.nspowner AS oid FROM pg_catalog.pg_namespace n \
+                            WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+             migrator AS (SELECT r.oid FROM pg_catalog.pg_roles r \
+                          WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER), \
+             acting(role) AS ( \
+                 SELECT oid FROM owner_role \
+                 UNION \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN acting a ON m.roleid OPERATOR(pg_catalog.=) a.role), \
+             migrator_groups(role) AS ( \
+                 SELECT oid FROM migrator \
+                 UNION \
+                 SELECT m.roleid FROM pg_catalog.pg_auth_members m \
+                 JOIN migrator_groups g ON m.member OPERATOR(pg_catalog.=) g.role) \
+         SELECT r.rolname::pg_catalog.text, r.rolcanlogin, \
+                EXISTS (SELECT 1 FROM migrator_groups g \
+                        WHERE g.role OPERATOR(pg_catalog.=) a.role) \
+         FROM acting a JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.role \
+         WHERE NOT EXISTS (SELECT 1 FROM migrator \
+                           WHERE migrator.oid OPERATOR(pg_catalog.=) a.role) \
+         ORDER BY 1",
+        &[],
+    )? {
+        let (role, can_login, on_migrator_path): (String, bool, bool) =
+            (row.get(0), row.get(1), row.get(2));
+        if !on_migrator_path {
+            problems.push(format!(
+                "role {role} can act as the praetore owner (it is, or is a member of, the \
+                 owner role) but is not the migrating role or one of its groups"
+            ));
+        } else if can_login {
+            problems.push(format!(
+                "role {role} owns praetore or links the migrating role to the owner, and can \
+                 log in; the owner and the roles in between must be NOLOGIN"
+            ));
+        }
+    }
+    for row in transaction.query(
+        "SELECT p.pubname::pg_catalog.text FROM pg_catalog.pg_publication p \
+         WHERE p.puballtables ORDER BY 1",
+        &[],
+    )? {
+        let name: String = row.get(0);
+        problems.push(format!("publication {name} is FOR ALL TABLES"));
+    }
+    let has_schema_publications: bool = transaction
+        .query_one(
+            "SELECT pg_catalog.to_regclass('pg_catalog.pg_publication_namespace') IS NOT NULL",
+            &[],
+        )?
+        .get(0);
+    if has_schema_publications {
+        for row in transaction.query(
+            "SELECT p.pubname::pg_catalog.text FROM pg_catalog.pg_publication p \
+             JOIN pg_catalog.pg_publication_namespace pn \
+               ON pn.pnpubid OPERATOR(pg_catalog.=) p.oid \
+             JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) pn.pnnspid \
+             WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' ORDER BY 1",
+            &[],
+        )? {
+            let name: String = row.get(0);
+            problems.push(format!(
+                "publication {name} includes TABLES IN SCHEMA praetore"
+            ));
+        }
     }
     Ok(problems)
 }

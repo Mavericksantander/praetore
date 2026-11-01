@@ -3207,7 +3207,12 @@ impl TestRole {
 
 impl Drop for TestRole {
     fn drop(&mut self) {
-        let _ = connect_client().batch_execute(&format!("DROP ROLE IF EXISTS {}", self.name));
+        // DROP OWNED also revokes grants on shared objects such as
+        // configuration parameters (GRANT SET ON PARAMETER).
+        let _ = connect_client().batch_execute(&format!(
+            "DROP OWNED BY {name}; DROP ROLE IF EXISTS {name}",
+            name = self.name
+        ));
     }
 }
 
@@ -3545,6 +3550,293 @@ fn postgres_migrations_baseline_reapplied_legacy_migrations_are_accepted() {
         "the caller's search_path is restored"
     );
     assert_eq!(recorded_versions(&mut client), all_versions());
+}
+
+/// Moves the schema, its tables (with their indexes, sequences and row
+/// types) and its functions to `role`.
+fn transfer_praetore_ownership(role: &str) -> String {
+    format!(
+        "DO $do$ DECLARE r record; BEGIN \
+           EXECUTE pg_catalog.format('ALTER SCHEMA praetore OWNER TO %I', '{role}'); \
+           FOR r IN SELECT c.oid::regclass AS t FROM pg_class c \
+                    JOIN pg_namespace n ON n.oid = c.relnamespace \
+                    WHERE n.nspname = 'praetore' AND c.relkind = 'r' LOOP \
+             EXECUTE pg_catalog.format('ALTER TABLE %s OWNER TO %I', r.t, '{role}'); \
+           END LOOP; \
+           FOR r IN SELECT p.oid::regprocedure AS f FROM pg_proc p \
+                    JOIN pg_namespace n ON n.oid = p.pronamespace \
+                    WHERE n.nspname = 'praetore' LOOP \
+             EXECUTE pg_catalog.format('ALTER FUNCTION %s OWNER TO %I', r.f, '{role}'); \
+           END LOOP; \
+         END $do$;"
+    )
+}
+
+/// A migrated scratch database and a LOGIN member of praetore_runtime.
+/// `runtime` must outlive the returned database.
+fn migrated_with_runtime(runtime: &TestRole) -> ScratchDatabase {
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    admin
+        .batch_execute(&format!("GRANT praetore_runtime TO {}", runtime.name))
+        .unwrap();
+    scratch
+}
+
+/// Round 2, H2: a `public.set_config` that swaps the tenant, picked up
+/// through a database-level search_path. The runtime check refuses to start,
+/// and the tenant context still binds the requested tenant.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_tenant_context_ignores_hostile_search_path() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    admin
+        .batch_execute(
+            "CREATE FUNCTION public.set_config(name text, value text, is_local boolean) \
+               RETURNS text LANGUAGE sql AS $$ SELECT pg_catalog.set_config(name, \
+                 CASE WHEN name = 'praetore.tenant_id' \
+                      THEN '22222222-2222-2222-2222-222222222222' ELSE value END, is_local) $$;",
+        )
+        .unwrap();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    admin
+        .batch_execute(&format!(
+            "GRANT praetore_runtime TO {runtime}; \
+             ALTER DATABASE {db} SET search_path = public, pg_catalog",
+            runtime = runtime.name,
+            db = scratch.name
+        ))
+        .unwrap();
+
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let error = praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect_err("a runtime session with a hostile search_path must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("search_path=public, pg_catalog"),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+
+    // Even when started anyway, and with the session's own search_path
+    // hostile too (as ALTER SYSTEM would leave it), the claim is written
+    // under the requested tenant.
+    let tenant = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let request_id = Uuid::new_v4();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    client
+        .batch_execute("SET search_path = public, pg_catalog")
+        .unwrap();
+    let guard = PostgresReplayGuard::from_client(client);
+    guard
+        .claim_once(tenant, Uuid::new_v4(), request_id)
+        .expect("claim under the requested tenant");
+    let stored: Uuid = admin
+        .query_one(
+            "SELECT tenant_id FROM praetore.replay_claims WHERE request_id = $1",
+            &[&request_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, tenant);
+}
+
+const OWNER_BACKDOOR: &str = "CREATE FUNCTION public.maintenance(sql text) RETURNS void \
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog \
+      AS $$ BEGIN EXECUTE sql; END $$; \
+    GRANT EXECUTE ON FUNCTION public.maintenance(text) TO PUBLIC;";
+
+/// Round 2, H1: a SECURITY DEFINER function of the praetore owner outside
+/// praetore.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_owner_security_definer_function_elsewhere_fails_closed() {
+    assert_tampered_baseline_refused(
+        OWNER_BACKDOOR,
+        "SECURITY DEFINER function public.maintenance(text) outside praetore",
+    );
+}
+
+/// Round 2, H1 at runtime: the runtime role may not execute such a function.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_refuses_executable_owner_security_definer_function() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("least-privilege runtime role is accepted");
+    scratch.connect().batch_execute(OWNER_BACKDOOR).unwrap();
+    let error = praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect_err("an executable owner SECURITY DEFINER function must be refused");
+    let message = error.to_string();
+    assert!(message.contains("public.maintenance(text)"), "{message}");
+    eprintln!("refused as expected: {message}");
+}
+
+/// Round 2, M1: only the migrating role (and NOLOGIN groups it belongs to)
+/// may act as the praetore owner.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_owner_role_memberships_fail_closed() {
+    let owner = TestRole::create("NOLOGIN");
+    let intruder = TestRole::create("LOGIN");
+    let login_owner = TestRole::create("LOGIN");
+    // Legitimate: a NOLOGIN owner role with the migrating role as its only member.
+    {
+        let scratch = ScratchDatabase::create();
+        let mut client = scratch.connect();
+        apply_legacy_migrations_through(&mut client, 9);
+        client
+            .batch_execute(&format!(
+                "{} GRANT {} TO CURRENT_USER;",
+                transfer_praetore_ownership(&owner.name),
+                owner.name
+            ))
+            .unwrap();
+        let applied = praetore_replay_postgres::apply_migrations(&mut client)
+            .expect("a NOLOGIN owner group of the migrating role is accepted");
+        assert_eq!(
+            applied.len(),
+            praetore_replay_postgres::MIGRATIONS.len() - 9
+        );
+    }
+    // Another member of the owner role.
+    assert_tampered_baseline_refused(
+        &format!(
+            "{} GRANT {owner} TO CURRENT_USER; GRANT {owner} TO {intruder};",
+            transfer_praetore_ownership(&owner.name),
+            owner = owner.name,
+            intruder = intruder.name
+        ),
+        &format!("role {} can act as the praetore owner", intruder.name),
+    );
+    // An owner that can log in, with the migrating role made its member.
+    assert_tampered_baseline_refused(
+        &format!(
+            "{} GRANT {owner} TO CURRENT_USER;",
+            transfer_praetore_ownership(&login_owner.name),
+            owner = login_owner.name
+        ),
+        &format!("role {} owns praetore", login_owner.name),
+    );
+}
+
+/// Round 2, M2: sequence parameters.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_changed_sequence_fails_closed() {
+    assert_tampered_baseline_refused(
+        "ALTER SEQUENCE praetore.execution_journal_events_event_id_seq \
+           INCREMENT BY -1 MINVALUE -9223372036854775808 MAXVALUE 1 START WITH 1 RESTART;",
+        "relation praetore.execution_journal_events_event_id_seq differs from 0009 in: \
+         sequence increment, sequence max, sequence min",
+    );
+    assert_tampered_baseline_refused(
+        "ALTER SEQUENCE praetore.execution_journal_events_event_id_seq MAXVALUE 3 CYCLE;",
+        "relation praetore.execution_journal_events_event_id_seq differs from 0009 in: \
+         sequence cycle, sequence max",
+    );
+}
+
+/// Round 2, M3: a parameter grant that lets the runtime turn triggers off
+/// after the check.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_refuses_parameter_grants() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let group = TestRole::create("NOLOGIN");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("least-privilege runtime role is accepted");
+    let mut admin = scratch.connect();
+    for (grant, revoke) in [
+        (
+            format!(
+                "GRANT SET ON PARAMETER session_replication_role TO {}",
+                runtime.name
+            ),
+            format!(
+                "REVOKE SET ON PARAMETER session_replication_role FROM {}",
+                runtime.name
+            ),
+        ),
+        (
+            format!(
+                "GRANT {group} TO {runtime}; \
+                 GRANT SET ON PARAMETER session_replication_role TO {group}",
+                group = group.name,
+                runtime = runtime.name
+            ),
+            format!(
+                "REVOKE SET ON PARAMETER session_replication_role FROM {}",
+                group.name
+            ),
+        ),
+    ] {
+        admin.batch_execute(&grant).unwrap();
+        let result = praetore_replay_postgres::verify_runtime_role(&mut client);
+        admin.batch_execute(&revoke).unwrap();
+        let error = result.expect_err("a SET grant on session_replication_role must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("GRANT SET ON PARAMETER session_replication_role"),
+            "{message}"
+        );
+        eprintln!("refused as expected: {message}");
+    }
+}
+
+/// Round 2, H3: catalog flags written by a superuser. (The check cannot
+/// defend against arbitrary catalog edits; these flags are cheap to compare.)
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_catalog_flags_fail_closed() {
+    assert_tampered_baseline_refused(
+        "UPDATE pg_catalog.pg_index SET indisvalid = false, indisready = false \
+           WHERE indexrelid = 'praetore.replay_claims_pkey'::regclass;",
+        "relation praetore.replay_claims_pkey differs from 0009 in: index ready, index valid",
+    );
+    assert_tampered_baseline_refused(
+        "UPDATE pg_catalog.pg_class SET relhastriggers = false \
+           WHERE oid = 'praetore.execution_journal_events'::regclass;",
+        "relation praetore.execution_journal_events differs from 0009 in: has triggers",
+    );
+}
+
+/// Round 2, lows: collation with its schema, FOR ALL TABLES publications,
+/// and the real cause when the comparison cannot run.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_round2_lows_fail_closed() {
+    assert_tampered_baseline_refused(
+        "CREATE COLLATION public.\"default\" \
+           (provider = icu, locale = 'und-u-ks-level2', deterministic = false); \
+         ALTER TABLE praetore.human_approvals \
+           ALTER COLUMN outcome TYPE text COLLATE public.\"default\";",
+        "column praetore.human_approvals.outcome differs from 0009 in: collation",
+    );
+    assert_tampered_baseline_refused(
+        "CREATE PUBLICATION t015_all FOR ALL TABLES;",
+        "publication t015_all is FOR ALL TABLES",
+    );
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    client
+        .batch_execute("SET statement_timeout = '1ms'")
+        .unwrap();
+    let error = praetore_replay_postgres::apply_migrations(&mut client)
+        .expect_err("the comparison cannot finish in 1 ms");
+    let message = error.to_string();
+    // query_canceled (statement timeout), independent of lc_messages.
+    assert!(message.contains("SQLSTATE 57014"), "{message}");
+    assert!(!message.ends_with("db error"), "{message}");
+    eprintln!("refused as expected: {message}");
 }
 
 #[test]

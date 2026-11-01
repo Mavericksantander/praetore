@@ -367,6 +367,12 @@ pub enum RuntimeRoleError {
     /// `session_replication_role` (here the value) is not `origin`, for
     /// example through `ALTER DATABASE ... SET session_replication_role`.
     TriggersDisabled(String),
+    /// A setting or parameter grant that disables triggers or row-level
+    /// security, or changes name resolution, for this role or database.
+    UnsafeSetting(String),
+    /// The role may execute a SECURITY DEFINER function that runs with the
+    /// rights of the `praetore` schema owner.
+    OwnerFunctionExecutable(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -389,6 +395,16 @@ impl fmt::Display for RuntimeRoleError {
                     "runtime database role {role} has CREATE on schema praetore"
                 )
             }
+            Self::UnsafeSetting(setting) => write!(
+                f,
+                "runtime database session is exposed to {setting}; the append-only triggers, \
+                 row-level security or name resolution could be changed"
+            ),
+            Self::OwnerFunctionExecutable(function) => write!(
+                f,
+                "runtime database role may execute SECURITY DEFINER function(s) {function} \
+                 owned with the rights of the praetore schema owner"
+            ),
             Self::TriggersDisabled(value) => write!(
                 f,
                 "runtime session has session_replication_role = {value}; the append-only \
@@ -420,7 +436,22 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// REFERENCES) on any `praetore` table; and a session whose
 /// `session_replication_role` is not `origin` (triggers would not fire).
 pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> {
-    let replication_role: String = client
+    // Read-only and rolled back; `SET LOCAL` pins name resolution so the
+    // checks themselves cannot be shadowed through search_path.
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let result = verify_runtime_role_in(&mut transaction);
+    transaction.rollback()?;
+    result
+}
+
+fn verify_runtime_role_in(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<(), RuntimeRoleError> {
+    let replication_role: String = transaction
         .query_one(
             "SELECT pg_catalog.current_setting('session_replication_role')",
             &[],
@@ -429,32 +460,38 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
     if replication_role != "origin" {
         return Err(RuntimeRoleError::TriggersDisabled(replication_role));
     }
-    let row = client.query_one("SELECT session_user::text, current_user::text", &[])?;
+    if let Some(setting) = unsafe_runtime_setting(transaction)? {
+        return Err(RuntimeRoleError::UnsafeSetting(setting));
+    }
+    let row = transaction.query_one(
+        "SELECT session_user::pg_catalog.text, current_user::pg_catalog.text",
+        &[],
+    )?;
     let mut roles: Vec<String> = vec![row.get(0), row.get(1)];
     roles.dedup();
     for role in roles {
-        let row = client.query_one(
+        let row = transaction.query_one(
             "SELECT \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_roles privileged \
                          WHERE (privileged.rolsuper OR privileged.rolbypassrls \
                                 OR privileged.rolcreaterole) \
                            AND pg_catalog.pg_has_role($1, privileged.oid, 'MEMBER')), \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n \
-                         WHERE n.nspname = 'praetore' \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
                            AND pg_catalog.pg_has_role($1, n.nspowner, 'MEMBER')) \
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE n.nspname = 'praetore' \
+                         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
                            AND pg_catalog.pg_has_role($1, c.relowner, 'MEMBER')) \
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-                         WHERE n.nspname = 'praetore' \
+                         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
                            AND pg_catalog.pg_has_role($1, p.proowner, 'MEMBER')), \
                  COALESCE((SELECT pg_catalog.has_schema_privilege($1, n.oid, 'CREATE') \
-                           FROM pg_catalog.pg_namespace n WHERE n.nspname = 'praetore'), false), \
+                           FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), false), \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE n.nspname = 'praetore' AND c.relkind IN ('r', 'p') \
+                         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' AND c.relkind IN ('r', 'p') \
                            AND pg_catalog.has_table_privilege($1, c.oid, \
                                'DELETE, TRUNCATE, UPDATE, TRIGGER, REFERENCES'))",
             &[&role],
@@ -472,7 +509,108 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
             return Err(RuntimeRoleError::ExcessTablePrivilege(role));
         }
     }
+    if let Some(function) = owner_function_executable(transaction)? {
+        return Err(RuntimeRoleError::OwnerFunctionExecutable(function));
+    }
     Ok(())
+}
+
+/// Settings that would disable the append-only triggers or row-level
+/// security, or change how the runtime's SQL resolves names, for this
+/// session: a `search_path`, `row_security` or `session_replication_role`
+/// set for this database or all databases and for this login role or all
+/// roles (`pg_db_role_setting`); a session-start value of `row_security` or
+/// `session_replication_role` that is not the built-in default (for example
+/// from `ALTER SYSTEM`); and a `GRANT SET` or `GRANT ALTER SYSTEM` on one of
+/// those parameters to PUBLIC or to a role the session or current role
+/// belongs to (`pg_parameter_acl`, PostgreSQL 15 and later).
+fn unsafe_runtime_setting(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "SELECT ( \
+             SELECT pg_catalog.string_agg(s.setting, ', ' ORDER BY s.setting) \
+             FROM pg_catalog.pg_db_role_setting rs \
+             CROSS JOIN LATERAL pg_catalog.unnest(rs.setconfig) s(setting) \
+             WHERE (rs.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                    OR rs.setdatabase OPERATOR(pg_catalog.=) \
+                       (SELECT d.oid FROM pg_catalog.pg_database d \
+                        WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())) \
+               AND (rs.setrole OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                    OR rs.setrole OPERATOR(pg_catalog.=) \
+                       (SELECT r.oid FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER) \
+                    OR rs.setrole OPERATOR(pg_catalog.=) \
+                       (SELECT r.oid FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)) \
+               AND (pg_catalog.starts_with(s.setting, 'search_path=') \
+                    OR pg_catalog.starts_with(s.setting, 'row_security=') \
+                    OR pg_catalog.starts_with(s.setting, 'session_replication_role='))), \
+             ( \
+             SELECT pg_catalog.string_agg( \
+                        pg_catalog.concat(p.name, '=', p.reset_val, ' (', p.source, ')'), ', ' \
+                        ORDER BY p.name) \
+             FROM pg_catalog.pg_settings p \
+             WHERE (p.name OPERATOR(pg_catalog.=) 'row_security' \
+                    OR p.name OPERATOR(pg_catalog.=) 'session_replication_role') \
+               AND p.reset_val OPERATOR(pg_catalog.<>) p.boot_val), \
+             pg_catalog.to_regclass('pg_catalog.pg_parameter_acl') IS NOT NULL",
+        &[],
+    )?;
+    if let Some(settings) = row.get::<_, Option<String>>(0) {
+        return Ok(Some(format!("{settings} (ALTER DATABASE/ROLE ... SET)")));
+    }
+    if let Some(settings) = row.get::<_, Option<String>>(1) {
+        return Ok(Some(settings));
+    }
+    if row.get::<_, bool>(2) {
+        let granted: Option<String> = transaction
+            .query_one(
+                "SELECT pg_catalog.string_agg(DISTINCT pg_catalog.concat( \
+                     'GRANT ', a.privilege_type, ' ON PARAMETER ', pa.parname, ' TO ', \
+                     CASE WHEN a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' \
+                          ELSE pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text END), ', ') \
+                 FROM pg_catalog.pg_parameter_acl pa \
+                 CROSS JOIN LATERAL pg_catalog.aclexplode(pa.paracl) a \
+                 WHERE (pa.parname OPERATOR(pg_catalog.=) 'search_path' \
+                        OR pa.parname OPERATOR(pg_catalog.=) 'row_security' \
+                        OR pa.parname OPERATOR(pg_catalog.=) 'session_replication_role') \
+                   AND (a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                        OR pg_catalog.pg_has_role(SESSION_USER, a.grantee, 'MEMBER') \
+                        OR pg_catalog.pg_has_role(CURRENT_USER, a.grantee, 'MEMBER'))",
+                &[],
+            )?
+            .get(0);
+        if let Some(granted) = granted {
+            return Ok(Some(granted));
+        }
+    }
+    Ok(None)
+}
+
+/// A SECURITY DEFINER function, in any schema but `pg_catalog` and
+/// `information_schema`, that runs with the rights of the `praetore` schema
+/// owner (its owner has that owner's privileges) and that the session or
+/// current role may execute: calling it would act as the owner.
+fn owner_function_executable(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "SELECT pg_catalog.string_agg(p.oid::pg_catalog.regprocedure::pg_catalog.text, ', ' \
+                    ORDER BY p.oid::pg_catalog.regprocedure::pg_catalog.text) \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) p.pronamespace \
+         JOIN pg_catalog.pg_namespace owner_ns \
+           ON owner_ns.nspname OPERATOR(pg_catalog.=) 'praetore' \
+         WHERE p.prosecdef \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
+           AND pg_catalog.pg_has_role(p.proowner, owner_ns.nspowner, 'USAGE') \
+           AND (pg_catalog.has_function_privilege(SESSION_USER, p.oid, 'EXECUTE') \
+                OR pg_catalog.has_function_privilege(CURRENT_USER, p.oid, 'EXECUTE'))",
+        &[],
+    )?;
+    Ok(row.get(0))
 }
 
 #[cfg(test)]

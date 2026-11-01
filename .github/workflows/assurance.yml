@@ -284,6 +284,14 @@ jobs:
             postgres_migrations_baseline_changed_constraints_fail_closed \
             postgres_migrations_baseline_columns_indexes_and_extra_objects_fail_closed \
             postgres_migrations_baseline_reapplied_legacy_migrations_are_accepted \
+            postgres_runtime_tenant_context_ignores_hostile_search_path \
+            postgres_migrations_baseline_owner_security_definer_function_elsewhere_fails_closed \
+            postgres_runtime_role_refuses_executable_owner_security_definer_function \
+            postgres_migrations_baseline_owner_role_memberships_fail_closed \
+            postgres_migrations_baseline_changed_sequence_fails_closed \
+            postgres_runtime_role_refuses_parameter_grants \
+            postgres_migrations_baseline_catalog_flags_fail_closed \
+            postgres_migrations_baseline_round2_lows_fail_closed \
             postgres_migrations_unknown_version_refuses_to_start \
             postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered \
             postgres_apd_sigkill_between_approve_and_claim \

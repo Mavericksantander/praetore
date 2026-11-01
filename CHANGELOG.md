@@ -33,6 +33,36 @@
 - `crates/praetore-replay-postgres/migrations/.gitattributes` keeps the
   migrations LF (`*.sql text eol=lf`): their bytes are checksummed and
   compared.
+- Runtime connections no longer depend on search_path: every runtime
+  transaction (`set_tenant_context`, now public and also used by
+  `praetore journal-export`) starts with
+  `SET LOCAL search_path = pg_catalog, pg_temp` and sets the tenant with
+  `pg_catalog.set_config`, so a `public.set_config` cannot swap the tenant
+  the RLS policies filter by. `verify_runtime_role` runs its checks under
+  the same search_path and also refuses (`RuntimeRoleError::UnsafeSetting`)
+  a `search_path`, `row_security` or `session_replication_role` set for the
+  database or the login role, a non-default session-start value of
+  `row_security` or `session_replication_role` (for example from
+  `ALTER SYSTEM`), and a `GRANT SET`/`ALTER SYSTEM ON PARAMETER` on those
+  parameters to PUBLIC or to a role it belongs to; and
+  (`RuntimeRoleError::OwnerFunctionExecutable`) any SECURITY DEFINER
+  function outside `pg_catalog`/`information_schema` that runs with the
+  praetore owner's rights and that the runtime role may execute.
+- The baseline check also refuses SECURITY DEFINER functions outside
+  `praetore` that run with the owner's rights; any role that can act as the
+  owner other than the migrating role and NOLOGIN groups it belongs to (the
+  owner must be the migrating role or such a group); `FOR ALL TABLES` and
+  `TABLES IN SCHEMA praetore` publications. The dump adds sequence
+  parameters, index flags (`indisvalid`, `indisready`, `indislive`,
+  `indimmediate`), `relhastriggers`, `relhasrules`, replica identity, access
+  method and the column collation with its schema. The comparison and the
+  recording of 0001-0009 now run in one transaction with the praetore
+  tables locked, and a failing comparison names the server's error.
+- Limits of the baseline check: it inspects an untrusted database from
+  inside it and is best effort. It is structural only (stored rows are not
+  validated; a legitimate `VALIDATE CONSTRAINT` on the `NOT VALID` foreign
+  keys is refused), and it cannot defend against a superuser who edits the
+  system catalogs directly.
 - New ignored PostgreSQL tests, run in CI with `--exact`, one per case
   above.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
