@@ -176,9 +176,16 @@ impl Fixture {
     }
 
     fn verify(&self, evidence_json: &str) -> Value {
+        let output = self.run_evidence(evidence_json, &["--format", "json"]);
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.success(), summary["ok"] == true);
+        summary
+    }
+
+    fn run_evidence(&self, evidence_json: &str, extra: &[&str]) -> Output {
         let path = self.directory.join(format!("{}.json", Uuid::new_v4()));
         fs::write(&path, evidence_json).unwrap();
-        let output = run(&[
+        let mut args: Vec<String> = vec![
             "evidence".into(),
             "--evidence".into(),
             path.to_string_lossy().into_owned(),
@@ -193,12 +200,9 @@ impl Fixture {
                 .to_string_lossy()
                 .into_owned(),
             "--require-intent".into(),
-            "--format".into(),
-            "json".into(),
-        ]);
-        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(output.status.success(), summary["ok"] == true);
-        summary
+        ];
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        run(&args)
     }
 
     /// Rewrites `decided_at` (and `freshness_valid_until`, which must not be
@@ -312,4 +316,32 @@ fn shifting_the_decision_time_without_the_attester_key_fails() {
     let summary = fixture.verify(&serde_json::to_string(&shifted).unwrap());
     assert_eq!(summary["ok"], false);
     assert_eq!(summary["code"], "AUTH_FAIL", "{summary}");
+}
+
+#[test]
+fn high_assurance_receipt_passes_with_require_decision_time() {
+    let fixture = Fixture::new();
+    let evidence = fixture.evidence.to_json().unwrap();
+
+    let output = fixture.run_evidence(&evidence, &["--require-decision-time", "--format", "json"]);
+    assert!(output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["code"], "OK", "{summary}");
+    assert_eq!(summary["details"]["authority_checked_at"], DECIDED_AT);
+    assert_eq!(
+        summary["details"]["authority_checked_at_source"],
+        "receipt_decided_at"
+    );
+
+    // Text output puts the time source right after the result code.
+    let output = fixture.run_evidence(&evidence, &["--require-decision-time"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with(
+            "OK evidence OK authority_checked_at_source=\"receipt_decided_at\" authority_checked_at=\"2026-01-15T12:00:00Z\""
+        ),
+        "{text}"
+    );
+    assert_eq!(text.matches("authority_checked_at_source=").count(), 1);
 }
