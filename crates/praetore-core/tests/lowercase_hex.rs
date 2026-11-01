@@ -37,7 +37,7 @@ fn fixture() -> Fixture {
     let action = Action::new("read_data", None, serde_json::json!({}))
         .unwrap()
         .with_capability("data:read");
-    let mut request = AuthorizationRequest::new(agent, authority.clone(), action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority.clone(), mission(action)).unwrap();
     request.sign_intent(&agent_key).unwrap();
     Fixture {
         issuer_key,
@@ -146,4 +146,28 @@ fn issuer_pin_public_key_must_be_lowercase() {
         assert_ne!(altered, json);
         assert!(TrustedAuthorityIssuer::from_pin_json(&altered).is_err());
     }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

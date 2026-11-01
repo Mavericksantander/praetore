@@ -5,12 +5,13 @@ use uuid::Uuid;
 
 use crate::{
     Result,
-    action::Action,
+    action::{Action, MissionAction},
     authority::Authority,
     canonical::{MAX_JSON_VALUE_BYTES, canonical_json, decode_lower_hex, validate_json_value},
     decision::Decision,
     evidence::Evidence,
     identity::{AgentIdentity, AgentKeyPair, REQUEST_INTENT_DOMAIN},
+    policy::Policy,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -20,23 +21,66 @@ const MAX_INTENT_BYTES: usize = MAX_JSON_VALUE_BYTES - 8192;
 const MAX_CONTEXT_KEYS: usize = 128;
 const MAX_CONTEXT_KEY_BYTES: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-/// An agent's request to authorize one action under one delegated authority.
+#[derive(Debug, Clone, Serialize)]
+/// An agent's request to authorize one mission action under one delegated
+/// authority.
 ///
 /// Strict and HighAssurance engines require the agent to sign the intent with
 /// the key bound to the authority's subject. See the runnable
 /// `quickstart` example for issuance, signing, evaluation, and verification.
+///
+/// `action` is a [`MissionAction`], which only
+/// [`Policy::classify`] produces, so a request can never carry a safety
+/// action (G7). It serializes exactly like an [`Action`]; the JSON form is
+/// read back with [`Self::from_json`], which classifies the action against
+/// a policy first.
+///
+/// A [`SafetyAction`](crate::SafetyAction) does not fit:
+///
+/// ```compile_fail,E0308
+/// use praetore_core::{
+///     Action, ActionClass, AgentId, AgentKeyPair, Authority, AuthorizationRequest,
+///     ClassifiedAction, Policy,
+/// };
+/// use serde_json::json;
+///
+/// let policy = Policy::new_v2("p", 1, vec![]).with_action_class("safety:halt", ActionClass::Safety);
+/// let ClassifiedAction::Safety(halt) =
+///     policy.classify(Action::new("safety:halt", None, json!({})).unwrap()).unwrap()
+/// else {
+///     unreachable!()
+/// };
+/// let agent = AgentKeyPair::from_secret_bytes(&[7; 32]).identity(AgentId::new());
+/// let authority = Authority::new(agent.id.clone(), "issuer", vec![]);
+/// // E0308: expected `MissionAction`, found `SafetyAction`.
+/// let _ = AuthorizationRequest::new(agent, authority, halt);
+/// ```
 pub struct AuthorizationRequest {
     pub request_id: Uuid,
     pub agent: AgentIdentity,
     pub authority: Authority,
-    pub action: Action,
+    pub action: MissionAction,
     pub trace_id: Option<String>,
     pub context: BTreeMap<String, Value>,
     pub agent_signature: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub intent_v2: Option<AuthorizationIntentV2>,
+}
+
+/// The JSON form of an [`AuthorizationRequest`] before its action is
+/// classified. Private: the only way out is [`AuthorizationRequest::from_json`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationRequestDocument {
+    request_id: Uuid,
+    agent: AgentIdentity,
+    authority: Authority,
+    action: Action,
+    trace_id: Option<String>,
+    context: BTreeMap<String, Value>,
+    agent_signature: Option<String>,
+    #[serde(default)]
+    intent_v2: Option<AuthorizationIntentV2>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -49,7 +93,7 @@ pub struct AuthorizationIntentV2 {
 }
 
 impl AuthorizationRequest {
-    pub fn new(agent: AgentIdentity, authority: Authority, action: Action) -> Result<Self> {
+    pub fn new(agent: AgentIdentity, authority: Authority, action: MissionAction) -> Result<Self> {
         agent.validate()?;
 
         if agent.id != authority.subject {
@@ -73,7 +117,16 @@ impl AuthorizationRequest {
         })
     }
 
-    pub fn from_json(json: &str) -> Result<Self> {
+    /// Parses a serialized request and classifies its action against
+    /// `policy` before anything else looks at it.
+    ///
+    /// A `Safety` action returns
+    /// [`PraetoreError::SafetyActionNotGoverned`](crate::PraetoreError::SafetyActionNotGoverned)
+    /// and an undeclared one
+    /// [`PraetoreError::UnclassifiedAction`](crate::PraetoreError::UnclassifiedAction);
+    /// neither is validated further, evaluated, signed or recorded. Malformed
+    /// JSON and invalid fields return `InvalidRequest`.
+    pub fn from_json(json: &str, policy: &Policy) -> Result<Self> {
         if json.len() > MAX_JSON_VALUE_BYTES {
             return Err(crate::PraetoreError::InvalidRequest(
                 "authorization request exceeds maximum size".into(),
@@ -81,8 +134,19 @@ impl AuthorizationRequest {
         }
         let value = crate::canonical::parse_json_rejecting_duplicates(json)
             .map_err(crate::PraetoreError::InvalidRequest)?;
-        let request: Self = serde_json::from_value(value)
+        let document: AuthorizationRequestDocument = serde_json::from_value(value)
             .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
+        let action = policy.classify(document.action)?.into_mission()?;
+        let request = Self {
+            request_id: document.request_id,
+            agent: document.agent,
+            authority: document.authority,
+            action,
+            trace_id: document.trace_id,
+            context: document.context,
+            agent_signature: document.agent_signature,
+            intent_v2: document.intent_v2,
+        };
         request.validate()?;
         Ok(request)
     }
@@ -172,7 +236,7 @@ impl AuthorizationRequest {
                 request_id: self.request_id,
                 agent: &self.agent,
                 authority: &self.authority,
-                action: &self.action,
+                action: self.action.action(),
                 trace_id: &self.trace_id,
                 context: &self.context,
                 intent_v2,
@@ -184,7 +248,7 @@ impl AuthorizationRequest {
                 request_id: self.request_id,
                 agent: &self.agent,
                 authority: &self.authority,
-                action: &self.action,
+                action: self.action.action(),
                 trace_id: &self.trace_id,
                 context: &self.context,
             })
@@ -271,7 +335,7 @@ impl AuthorizationRequest {
             self.request_id,
             self.agent,
             self.authority,
-            self.action,
+            self.action.into_action(),
             decision,
             self.trace_id,
             self.context,
@@ -370,11 +434,25 @@ mod tests {
         .unwrap()
     }
 
+    fn test_policy() -> Policy {
+        Policy::new_v2("p", 1, vec![])
+            .with_mission_actions(["read_data"])
+            .with_action_class("safety:halt", crate::policy::ActionClass::Safety)
+    }
+
+    fn mission(action: Action) -> MissionAction {
+        test_policy()
+            .classify(action)
+            .unwrap()
+            .into_mission()
+            .unwrap()
+    }
+
     fn test_request() -> AuthorizationRequest {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        AuthorizationRequest::new(agent, authority, test_action()).unwrap()
+        AuthorizationRequest::new(agent, authority, mission(test_action())).unwrap()
     }
 
     #[test]
@@ -404,7 +482,7 @@ mod tests {
             vec!["read:data".into()],
         );
 
-        let result = AuthorizationRequest::new(agent, authority, test_action());
+        let result = AuthorizationRequest::new(agent, authority, mission(test_action()));
 
         assert!(matches!(
             result,
@@ -421,7 +499,7 @@ mod tests {
 
         authority.issuer = String::new();
 
-        let result = AuthorizationRequest::new(agent, authority, test_action());
+        let result = AuthorizationRequest::new(agent, authority, mission(test_action()));
 
         assert!(matches!(
             result,
@@ -441,10 +519,10 @@ mod tests {
             parameters: json!({}),
         };
 
-        let result = AuthorizationRequest::new(agent, authority, action);
-
+        let _ = (agent, authority);
+        // An invalid action never becomes a MissionAction.
         assert!(matches!(
-            result,
+            test_policy().classify(action),
             Err(crate::PraetoreError::InvalidRequest(_))
         ));
     }
@@ -541,7 +619,7 @@ mod tests {
         let keypair = AgentKeyPair::generate();
         let agent = keypair.identity(AgentId::new());
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
-        let mut request = AuthorizationRequest::new(agent, authority, test_action())
+        let mut request = AuthorizationRequest::new(agent, authority, mission(test_action()))
             .unwrap()
             .with_context("region", serde_json::json!("santiago"));
 
@@ -560,7 +638,8 @@ mod tests {
         let other_keypair = AgentKeyPair::generate();
         let agent = keypair.identity(AgentId::new());
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, mission(test_action())).unwrap();
 
         assert!(matches!(
             request.sign_intent(&other_keypair),
@@ -573,7 +652,8 @@ mod tests {
         let keypair = AgentKeyPair::from_secret_bytes(&[41; 32]);
         let agent = keypair.identity(AgentId::new());
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, mission(test_action())).unwrap();
         let issued_at = OffsetDateTime::parse("2026-06-01T12:00:00Z", &Rfc3339).unwrap();
         request
             .sign_intent_v2(
@@ -601,18 +681,46 @@ mod tests {
 
     #[test]
     fn request_import_rejects_duplicate_unknown_and_oversized_json() {
+        let policy = test_policy();
         assert!(
             AuthorizationRequest::from_json(
-                r#"{"request_id":"00000000-0000-0000-0000-000000000001","request_id":"00000000-0000-0000-0000-000000000002"}"#
+                r#"{"request_id":"00000000-0000-0000-0000-000000000001","request_id":"00000000-0000-0000-0000-000000000002"}"#,
+                &policy
             )
             .is_err()
         );
         let mut document = serde_json::to_value(test_request()).unwrap();
+        assert!(AuthorizationRequest::from_json(&document.to_string(), &policy).is_ok());
         document["unexpected"] = json!(true);
-        assert!(AuthorizationRequest::from_json(&document.to_string()).is_err());
+        assert!(AuthorizationRequest::from_json(&document.to_string(), &policy).is_err());
 
         let oversized = format!("{{\"padding\":\"{}\"}}", "x".repeat(MAX_JSON_VALUE_BYTES));
-        assert!(AuthorizationRequest::from_json(&oversized).is_err());
+        assert!(AuthorizationRequest::from_json(&oversized, &policy).is_err());
+    }
+
+    #[test]
+    fn request_import_classifies_the_action_before_anything_else() {
+        let policy = test_policy();
+        let mut document = serde_json::to_value(test_request()).unwrap();
+        document["action"]["action_type"] = json!("safety:halt");
+        assert!(matches!(
+            AuthorizationRequest::from_json(&document.to_string(), &policy),
+            Err(crate::PraetoreError::SafetyActionNotGoverned { action_type }) if action_type == "safety:halt"
+        ));
+        document["action"]["action_type"] = json!("fs:delete");
+        assert!(matches!(
+            AuthorizationRequest::from_json(&document.to_string(), &policy),
+            Err(crate::PraetoreError::UnclassifiedAction { action_type }) if action_type == "fs:delete"
+        ));
+    }
+
+    #[test]
+    fn mission_action_serializes_exactly_like_its_action() {
+        let action = test_action();
+        assert_eq!(
+            serde_json::to_string(&mission(action.clone())).unwrap(),
+            serde_json::to_string(&action).unwrap()
+        );
     }
 
     #[test]
@@ -636,7 +744,7 @@ mod tests {
         let action = Action::new("read_data", Some("dataset".into()), json!({}))
             .unwrap()
             .with_capability("data:read");
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
         request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
 
         assert_eq!(

@@ -16,9 +16,12 @@ use praetore_core::{
     engine::TrustedAuthorityIssuer,
     evidence::EvidenceAttesterKey,
     identity::{AgentId, AgentKeyPair},
-    policy::{Policy, PolicyEffect, PolicyRule},
+    policy::{Policy, PolicyEffect, PolicyRule, RecordedPolicy},
 };
 use std::{fs, path::PathBuf};
+
+/// The policy document the committed fixture recorded (format 1).
+const RECORDED_POLICY_V1: &str = r#"{"id":"DEMO-third-party-policy","version":1,"canonical_version":1,"rules":[{"id":"allow-read-report","action_type":"read_report","effect":"Allow","required_capability":"reports:read","target":null,"parameter_conditions":[],"context_conditions":[]}]}"#;
 
 fn main() {
     let out = PathBuf::from(
@@ -45,6 +48,12 @@ fn main() {
     authority.id = serde_json::from_str("\"00000000-0000-0000-0000-00000000d002\"").unwrap();
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
 
+    // The committed fixture records a policy format 1 document (written
+    // before G7), so regenerating gives the same bytes and the same digest.
+    // It is only digested here, never evaluated: `RecordedPolicy` cannot
+    // decide anything. The action is classified with the format 2 policy
+    // that declares the same rules.
+    let recorded_policy = RecordedPolicy::from_json(RECORDED_POLICY_V1).unwrap();
     let policy = Policy::new(
         "DEMO-third-party-policy",
         1,
@@ -52,7 +61,8 @@ fn main() {
             PolicyRule::new("allow-read-report", "read_report", PolicyEffect::Allow)
                 .with_capability("reports:read"),
         ],
-    );
+    )
+    .with_mission_actions(["read_report"]);
 
     let action = Action::new(
         "read_report",
@@ -61,6 +71,7 @@ fn main() {
     )
     .unwrap()
     .with_capability("reports:read");
+    let action = policy.classify(action).unwrap().into_mission().unwrap();
     let mut request = AuthorizationRequest::new(agent.clone(), authority.clone(), action).unwrap();
     request.request_id = "00000000-0000-0000-0000-00000000d003".parse().unwrap();
     request.sign_intent(&agent_key).unwrap();
@@ -73,7 +84,7 @@ fn main() {
     evidence.evidence_id = "00000000-0000-0000-0000-00000000d004".parse().unwrap();
     // Recomputes the context hash, which also covers the fixed evidence_id.
     evidence
-        .bind_policy_digest(policy.digest().unwrap())
+        .bind_policy_digest(recorded_policy.digest().to_owned())
         .unwrap();
     evidence.sign(&attester).unwrap();
 
@@ -94,5 +105,5 @@ fn main() {
     write("issuer-pins.jsonl", format!("{issuer_pin}\n"));
     write("authority.json", serde_json::to_string(&authority).unwrap());
     write("agent.json", serde_json::to_string(&agent).unwrap());
-    write("policy.json", serde_json::to_string(&policy).unwrap());
+    write("policy.json", RECORDED_POLICY_V1.to_owned());
 }

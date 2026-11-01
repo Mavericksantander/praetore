@@ -247,7 +247,9 @@ impl Evidence {
             request_id: self.request_id,
             agent: self.agent.clone(),
             authority: self.authority.clone(),
-            action: self.action.clone(),
+            // Rebuilt only to check the agent's signature over the recorded
+            // bytes; this request is never evaluated.
+            action: crate::action::MissionAction::recorded_for_signature_check(self.action.clone()),
             trace_id: self.trace_id.clone(),
             context: self.context.clone(),
             agent_signature: self.agent_signature.clone(),
@@ -376,12 +378,23 @@ impl Evidence {
     /// This only compares digests. Call [`Self::verify_attester_signature`]
     /// against a pinned key to know the digest was not altered.
     pub fn verify_policy(&self, policy: &Policy) -> crate::Result<()> {
+        self.verify_policy_digest(&policy.digest()?)
+    }
+
+    /// Like [`Self::verify_policy`], for a policy document as recorded,
+    /// format 1 or 2 (see [`crate::RecordedPolicy`]). Historical receipts
+    /// that bound a format 1 digest verify against their format 1 document;
+    /// the document is only digested, never evaluated.
+    pub fn verify_recorded_policy(&self, policy: &crate::RecordedPolicy) -> crate::Result<()> {
+        self.verify_policy_digest(policy.digest())
+    }
+
+    fn verify_policy_digest(&self, expected: &str) -> crate::Result<()> {
         let recorded = self.policy_digest.as_deref().ok_or_else(|| {
             crate::PraetoreError::EvidenceError(
                 "evidence does not record a policy digest (legacy receipt)".into(),
             )
         })?;
-        let expected = policy.digest()?;
         if recorded.len() != expected.len()
             || !bool::from(recorded.as_bytes().ct_eq(expected.as_bytes()))
         {
@@ -953,11 +966,11 @@ mod tests {
     }
 
     fn digest_test_policy(effect: crate::policy::PolicyEffect) -> Policy {
-        Policy::new(
+        crate::test_support::mission_policy(Policy::new(
             "receipt-policy",
             3,
             vec![crate::policy::PolicyRule::new("read", "read_data", effect)],
-        )
+        ))
     }
 
     #[test]
@@ -1195,7 +1208,12 @@ mod tests {
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
         let now = OffsetDateTime::parse("2026-06-01T12:00:00Z", &Rfc3339).unwrap();
         let policy_digest = "a".repeat(64);
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -1266,7 +1284,9 @@ mod tests {
         let action = Action::new("read_data", Some("dataset".into()), json!({}))
             .unwrap()
             .with_capability("data:read");
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         request.request_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
         request.sign_intent(&agent_key).unwrap();
         // The golden vector predates `decided_by`: it is a legacy receipt.

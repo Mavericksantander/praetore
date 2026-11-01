@@ -164,13 +164,19 @@ mod tests {
         let action = Action::new("identity:rotate_key", None, serde_json::json!({}))
             .unwrap()
             .with_capability("identity:rotate");
-        let mut request =
-            AuthorizationRequest::new(agent.clone(), authority.clone(), action).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent.clone(),
+            authority.clone(),
+            crate::test_support::mission(action),
+        )
+        .unwrap();
         let proof =
             KeyRotationProof::sign(&new_key, &agent, &authority, request.request_id).unwrap();
-        request.action.parameters = serde_json::json!({
+        let mut action = request.action.action().clone();
+        action.parameters = serde_json::json!({
             "key_rotation_proof": proof.to_value().unwrap()
         });
+        request.action = crate::test_support::mission(action);
         request.sign_intent(&old_key).unwrap();
         request
     }

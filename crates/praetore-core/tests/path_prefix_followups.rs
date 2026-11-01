@@ -12,7 +12,7 @@ fn policy_with(conditions: Vec<PolicyCondition>, effect: PolicyEffect) -> Policy
         PolicyRule::new("r", "modify_file", effect),
         |rule, condition| rule.with_parameter_condition(condition),
     );
-    Policy::new("followups", 1, vec![rule])
+    mission_policy(Policy::new("followups", 1, vec![rule]))
 }
 
 fn valid(conditions: Vec<PolicyCondition>) -> bool {
@@ -61,20 +61,20 @@ fn outcome(policy: &Policy, path: &str) -> DecisionOutcome {
     let authority = Authority::new(agent.id.clone(), "i", vec![]);
     let action = Action::new("modify_file", None, json!({ "path": path })).unwrap();
     policy
-        .evaluate(&agent, &authority, &action)
+        .evaluate(&agent, &authority, &mission((action).clone()))
         .unwrap()
         .outcome
 }
 
 fn allow_all_plus(restrictive: PolicyRule) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "followups",
         1,
         vec![
             PolicyRule::new("allow-all", "modify_file", PolicyEffect::Allow),
             restrictive,
         ],
-    )
+    ))
 }
 
 // Pins the accepted over-restriction: unsafe values outside the prefix still
@@ -105,4 +105,28 @@ fn unsafe_values_outside_prefix_still_trigger_restrictive_rules() {
         assert_eq!(outcome(&policy, "/home/a/../b"), expected);
         assert_eq!(outcome(&policy, "/home/fine.txt"), DecisionOutcome::Allow);
     }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

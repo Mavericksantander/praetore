@@ -4,7 +4,7 @@ use std::{
 };
 
 use praetore_core::{
-    Action, AgentId, AgentIdentity, AgentKeyFingerprint, AgentKeyPair, Authority,
+    Action, ActionClass, AgentId, AgentIdentity, AgentKeyFingerprint, AgentKeyPair, Authority,
     AuthorizationRequest, DecisionOutcome, Evidence, EvidenceAttesterKey, FreshnessError,
     FreshnessLease, FreshnessProvider, HighAssuranceConfig, Policy, PolicyCondition, PolicyEffect,
     PolicyRule, ReplayGuard, ReplayGuardError, Result, TrustedAuthorityIssuer,
@@ -71,6 +71,7 @@ impl FreshnessProvider for DemonstrationFreshnessProvider {
 }
 
 fn make_request(
+    policy: &Policy,
     agent_key: &AgentKeyPair,
     agent: &AgentIdentity,
     authority: &Authority,
@@ -81,6 +82,9 @@ fn make_request(
         serde_json::json!({"classification": "public", "region": "west"}),
     )?
     .with_capability("data:read");
+    // Only a Mission action fits in a request; a `safety:*` action would
+    // return SafetyActionNotGoverned here.
+    let action = policy.classify(action)?.into_mission()?;
     let mut request = AuthorizationRequest::new(agent.clone(), authority.clone(), action)?
         .with_context("region", serde_json::json!("west"));
     request.sign_intent(agent_key)?;
@@ -88,6 +92,7 @@ fn make_request(
 }
 
 fn make_high_assurance_request(
+    policy: &Policy,
     agent_key: &AgentKeyPair,
     agent: &AgentIdentity,
     authority: &Authority,
@@ -100,6 +105,9 @@ fn make_high_assurance_request(
         serde_json::json!({"classification": "public", "region": "west"}),
     )?
     .with_capability("data:read");
+    // Only a Mission action fits in a request; a `safety:*` action would
+    // return SafetyActionNotGoverned here.
+    let action = policy.classify(action)?.into_mission()?;
     let mut request = AuthorizationRequest::new(agent.clone(), authority.clone(), action)?
         .with_context("region", serde_json::json!("west"));
     request.sign_intent_v2(
@@ -171,14 +179,18 @@ fn main() -> Result<()> {
                     vec![serde_json::json!("west"), serde_json::json!("central")],
                 )),
         ],
-    );
+    )
+    // G7: every action type is classified explicitly.
+    .with_mission_actions(["read_data"])
+    .with_action_class("safety:halt", ActionClass::Safety);
     let issuer_pin = TrustedAuthorityIssuer::new("quickstart-issuer", issuer_key.public_key())?
         .with_validity(validity)?;
     let policy_digest = policy.digest()?;
 
     let strict_engine =
         AuthorizationEngine::strict_with_clock(policy.clone(), now, vec![issuer_pin.clone()])?;
-    let strict_evidence = strict_engine.evaluate(make_request(&agent_key, &agent, &authority)?)?;
+    let strict_evidence =
+        strict_engine.evaluate(make_request(&policy, &agent_key, &agent, &authority)?)?;
     assert_eq!(strict_evidence.decision.outcome, DecisionOutcome::Allow);
     verify_common_evidence(
         &strict_evidence,
@@ -195,12 +207,14 @@ fn main() -> Result<()> {
             .with_audience("quickstart-gateway")
             .with_replay_guard(Arc::new(LocalReplayGuard::default()))
             .with_freshness_provider(Arc::new(DemonstrationFreshnessProvider));
+    let high_assurance_policy = policy.clone();
     let high_assurance_engine = AuthorizationEngine::production_with_clock(
         policy,
         high_assurance_config,
         FixedClock::new("2026-06-01T12:00:00Z"),
     )?;
     let high_assurance_evidence = high_assurance_engine.evaluate(make_high_assurance_request(
+        &high_assurance_policy,
         &agent_key,
         &agent,
         &authority,

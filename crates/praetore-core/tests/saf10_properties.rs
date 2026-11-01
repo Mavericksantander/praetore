@@ -44,7 +44,7 @@ fn rules() -> impl Strategy<Value = Vec<(bool, PolicyEffect)>> {
 }
 
 fn policy(rules: &[(bool, PolicyEffect)]) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "saf10",
         1,
         rules
@@ -58,7 +58,9 @@ fn policy(rules: &[(bool, PolicyEffect)]) -> Policy {
                 )
             })
             .collect(),
-    )
+    ))
+    // "a" is declared even when no rule names it (default deny).
+    .with_mission_actions(["a"])
 }
 
 fn evaluate(policy: &Policy) -> DecisionOutcome {
@@ -66,7 +68,7 @@ fn evaluate(policy: &Policy) -> DecisionOutcome {
     let authority = Authority::new(agent.id.clone(), "i", vec![]);
     let action = Action::new("a", None, json!({})).unwrap();
     policy
-        .evaluate(&agent, &authority, &action)
+        .evaluate(&agent, &authority, &mission((action).clone()))
         .unwrap()
         .outcome
 }
@@ -86,7 +88,7 @@ const MAIN_A797BEA_DIGEST: &str =
 const MAIN_A797BEA_JSON: &str = r#"{"id":"saf10-digest-vector","version":3,"canonical_version":1,"rules":[{"id":"allow-read","action_type":"read_data","effect":"Allow","required_capability":"read:data","target":null,"parameter_conditions":[],"context_conditions":[]},{"id":"approve-write","action_type":"write_data","effect":"RequireApproval","required_capability":"write:data","target":null,"parameter_conditions":[{"key":"table","operator":"Exact","expected":"users"}],"context_conditions":[]},{"id":"deny-drop","action_type":"drop_table","effect":"Deny","required_capability":null,"target":null,"parameter_conditions":[],"context_conditions":[]}]}"#;
 
 fn digest_vector_policy() -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "saf10-digest-vector",
         3,
         vec![
@@ -100,7 +102,7 @@ fn digest_vector_policy() -> Policy {
                 )),
             PolicyRule::new("deny-drop", "drop_table", PolicyEffect::Deny),
         ],
-    )
+    ))
 }
 
 mod today {
@@ -150,15 +152,25 @@ mod today {
         }
     }
 
-    /// Property 8 (policy part): a policy without the new optional fields
-    /// keeps the exact digest and JSON it had on main a797bea.
+    /// Property 8 (policy part): the format 1 document from main a797bea
+    /// keeps its exact digest for historical verification (G7), while it can
+    /// no longer be loaded for evaluation. The same rules in format 2 have a
+    /// stable digest of their own.
     #[test]
     fn p8_policy_digest_vector_is_unchanged() {
+        let recorded = praetore_core::RecordedPolicy::from_json(MAIN_A797BEA_JSON).unwrap();
+        assert_eq!(recorded.format_version(), 1);
+        assert_eq!(recorded.digest(), MAIN_A797BEA_DIGEST);
+        assert!(matches!(
+            Policy::from_json(MAIN_A797BEA_JSON),
+            Err(praetore_core::PraetoreError::PolicyFormatUnsupported { found: 1, .. })
+        ));
+
         let policy = digest_vector_policy();
-        assert_eq!(policy.digest().unwrap(), MAIN_A797BEA_DIGEST);
-        assert_eq!(serde_json::to_string(&policy).unwrap(), MAIN_A797BEA_JSON);
-        let parsed = Policy::from_json(MAIN_A797BEA_JSON).unwrap();
-        assert_eq!(parsed.digest().unwrap(), MAIN_A797BEA_DIGEST);
+        let json = serde_json::to_string(&policy).unwrap();
+        let parsed = Policy::from_json(&json).unwrap();
+        assert_eq!(parsed.digest().unwrap(), policy.digest().unwrap());
+        assert_ne!(policy.digest().unwrap(), MAIN_A797BEA_DIGEST);
     }
 }
 
@@ -187,7 +199,9 @@ mod full {
         let agent = AgentKeyPair::from_secret_bytes(&[7; 32]).identity(AgentId::new());
         let authority = Authority::new(agent.id.clone(), "i", vec![]);
         let action = Action::new("a", None, json!({})).unwrap();
-        policy.evaluate(&agent, &authority, &action).unwrap()
+        policy
+            .evaluate(&agent, &authority, &mission((action).clone()))
+            .unwrap()
     }
 
     proptest! {
@@ -271,7 +285,10 @@ mod full {
         if let Some(delta) = delta {
             rule["delta_ms"] = json!(delta);
         }
-        let mut doc = json!({"id": "p", "version": 1, "canonical_version": 1, "rules": [rule]});
+        let mut doc = json!({
+            "format_version": 2, "id": "p", "version": 1, "canonical_version": 1,
+            "action_classes": {"a": "Mission"}, "rules": [rule]
+        });
         if let Some(max) = max {
             doc["max_approval_ms"] = json!(max);
         }
@@ -449,7 +466,7 @@ mod full {
     #[test]
     fn recover_effect_requires_positive_deadline_and_identifier() {
         for (id, deadline) in [("", 500), (" x", 500), ("safe-hold", 0)] {
-            let policy = Policy::new(
+            let policy = mission_policy(Policy::new(
                 "p",
                 1,
                 vec![PolicyRule::new(
@@ -460,7 +477,7 @@ mod full {
                         deadline_ms: deadline,
                     },
                 )],
-            );
+            ));
             assert!(policy.validate().is_err(), "{id:?} {deadline}");
         }
     }
@@ -471,4 +488,28 @@ mod full {
         let json = r#"{"outcome":"Allow","reason":"x","contributions":[],"recovery":{"recovery_id":"s","rule_id":"r","reason":"x","deadline_ms":1}}"#;
         assert!(serde_json::from_str::<praetore_core::Decision>(json).is_err());
     }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

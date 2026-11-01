@@ -14,20 +14,20 @@ fn outcome(policy: &Policy, path: Value) -> DecisionOutcome {
     let authority = Authority::new(agent.id.clone(), "path-issuer", vec![]);
     let action = Action::new("modify_file", None, json!({ "path": path })).unwrap();
     policy
-        .evaluate(&agent, &authority, &action)
+        .evaluate(&agent, &authority, &mission((action).clone()))
         .unwrap()
         .outcome
 }
 
 fn allow_with(condition: PolicyCondition) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "path-policy",
         1,
         vec![
             PolicyRule::new("safe", "modify_file", PolicyEffect::Allow)
                 .with_parameter_condition(condition),
         ],
-    )
+    ))
 }
 
 // Same case as #19's ignored `safe_path_prefix_rejects_dot_dot_traversal`
@@ -108,7 +108,7 @@ fn path_prefix_allows_only_normalized_paths_inside_prefix() {
 
 #[test]
 fn path_prefix_invalid_value_triggers_restrictive_rule_under_v2() {
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "path-policy",
         1,
         vec![
@@ -117,7 +117,7 @@ fn path_prefix_invalid_value_triggers_restrictive_rule_under_v2() {
             PolicyRule::new("guard", "modify_file", PolicyEffect::RequireApproval)
                 .with_parameter_condition(PolicyCondition::path_prefix("path", "/srv/agent")),
         ],
-    );
+    ));
     // Malformed path: the allow rule does not match, the restrictive one does.
     assert_eq!(
         outcome(&policy, json!("/srv/agent/../x")),
@@ -165,9 +165,9 @@ fn allow_all_plus(restrictive: PolicyRule, v2: bool) -> Policy {
         restrictive,
     ];
     if v2 {
-        Policy::new_v2("path-policy", 1, rules)
+        mission_policy(Policy::new_v2("path-policy", 1, rules))
     } else {
-        Policy::new("path-policy", 1, rules)
+        mission_policy(Policy::new("path-policy", 1, rules))
     }
 }
 
@@ -264,9 +264,9 @@ fn allow_never_matches_unsafe_values_in_v1_and_v2() {
                     .with_parameter_condition(condition),
             ];
             let policy = if v2 {
-                Policy::new_v2("path-policy", 1, rules)
+                mission_policy(Policy::new_v2("path-policy", 1, rules))
             } else {
-                Policy::new("path-policy", 1, rules)
+                mission_policy(Policy::new("path-policy", 1, rules))
             };
             for value in [
                 "/srv/agent/../etc",
@@ -311,4 +311,28 @@ fn lexical_limits_are_not_normalized() {
             "{literal:?}"
         );
     }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

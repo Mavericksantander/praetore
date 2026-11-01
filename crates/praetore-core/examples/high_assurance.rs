@@ -1,6 +1,6 @@
 use praetore_core::{
-    Action, AgentId, AgentKeyPair, Authority, AuthorizationRequest, EvidenceAttesterKey, Policy,
-    PolicyEffect, PolicyRule, Result, TrustedAuthorityIssuer,
+    Action, ActionClass, AgentId, AgentKeyPair, Authority, AuthorizationRequest,
+    EvidenceAttesterKey, Policy, PolicyEffect, PolicyRule, Result, TrustedAuthorityIssuer,
     authority::Validity,
     engine::{AuthorizationEngine, Clock, FixedClock},
     freshness::{FreshnessError, FreshnessLease, FreshnessProvider},
@@ -83,16 +83,6 @@ fn main() -> Result<()> {
             .with_validity(validity.clone());
     authority.sign_for_agent(&issuer_key, &agent)?;
 
-    let mut request = AuthorizationRequest::new(
-        agent,
-        authority,
-        Action::new(
-            "read_data",
-            Some("example-dataset".into()),
-            serde_json::json!({}),
-        )?
-        .with_capability("data:read"),
-    )?;
     let policy = Policy::new_v2(
         "example-policy",
         1,
@@ -100,7 +90,17 @@ fn main() -> Result<()> {
             PolicyRule::new("allow-example-read", "read_data", PolicyEffect::Allow)
                 .with_capability("data:read"),
         ],
-    );
+    )
+    .with_mission_actions(["read_data"])
+    .with_action_class("safety:halt", ActionClass::Safety);
+    let action = Action::new(
+        "read_data",
+        Some("example-dataset".into()),
+        serde_json::json!({}),
+    )?
+    .with_capability("data:read");
+    let mut request =
+        AuthorizationRequest::new(agent, authority, policy.classify(action)?.into_mission()?)?;
     request.sign_intent_v2(
         &agent_key,
         "example-gateway",

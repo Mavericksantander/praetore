@@ -59,14 +59,20 @@ fn action(action_type: &str, target: Option<&str>, parameters: Value) -> Action 
 
 /// Evaluates `action` against `policy` through the development engine with an
 /// authority granting `capabilities`, and returns the (unsigned) evidence.
-fn evaluate(policy: Policy, capabilities: &[&str], action: Action) -> Evidence {
+fn evaluate(mut policy: Policy, capabilities: &[&str], action: Action) -> Evidence {
+    // The action's type is a declared Mission action; whether a rule matches
+    // it is what each test checks.
+    policy
+        .action_classes
+        .entry(action.action_type.clone())
+        .or_insert(praetore_core::ActionClass::Mission);
     let agent = new_agent();
     let authority = Authority::new(
         agent.id.clone(),
         "praetore-root",
         capabilities.iter().map(|c| (*c).to_string()).collect(),
     );
-    let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     AuthorizationEngine::development(policy)
         .evaluate(request)
         .unwrap()
@@ -74,7 +80,7 @@ fn evaluate(policy: Policy, capabilities: &[&str], action: Action) -> Evidence {
 
 fn evaluate_read(rules: Vec<PolicyRule>) -> Evidence {
     evaluate(
-        Policy::new_v2("decision-tests", 3, rules),
+        mission_policy(Policy::new_v2("decision-tests", 3, rules)),
         &["read_data"],
         action("read_data", Some("db"), json!({})),
     )
@@ -242,7 +248,7 @@ fn no_matching_rule_is_a_default_deny_without_contributions() {
 #[test]
 fn engine_guard_denials_record_the_guard_and_skip_policy_rules() {
     // The policy would allow; the engine denies before consulting it.
-    let policy = || Policy::new_v2("guards", 1, vec![allow("allow-read")]);
+    let policy = || mission_policy(Policy::new_v2("guards", 1, vec![allow("allow-read")]));
 
     // authority_capability: the authority does not grant the capability.
     let evidence = evaluate(
@@ -265,7 +271,7 @@ fn engine_guard_denials_record_the_guard_and_skip_policy_rules() {
     let agent = new_agent();
     let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
     let bare = Action::new("read_data", Some("db".into()), json!({})).unwrap();
-    let request = AuthorizationRequest::new(agent, authority, bare).unwrap();
+    let request = AuthorizationRequest::new(agent, authority, mission(bare)).unwrap();
     let evidence = AuthorizationEngine::development(policy())
         .evaluate(request)
         .unwrap();
@@ -282,9 +288,12 @@ fn engine_guard_denials_record_the_guard_and_skip_policy_rules() {
     let agent = new_agent();
     let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
         .with_constraint("target", "other-db");
-    let request =
-        AuthorizationRequest::new(agent, authority, action("read_data", Some("db"), json!({})))
-            .unwrap();
+    let request = AuthorizationRequest::new(
+        agent,
+        authority,
+        mission(action("read_data", Some("db"), json!({}))),
+    )
+    .unwrap();
     let evidence = AuthorizationEngine::development(policy())
         .evaluate(request)
         .unwrap();
@@ -305,7 +314,7 @@ fn unbound_restrictive_rule_denies_and_is_recorded_as_unbound() {
     // The authority lacks the approval rule's capability: the rule still
     // applies (it cannot be escaped) but denies instead of offering approval.
     let evidence = evaluate(
-        Policy::new_v2(
+        mission_policy(Policy::new_v2(
             "unbound",
             1,
             vec![
@@ -313,7 +322,7 @@ fn unbound_restrictive_rule_denies_and_is_recorded_as_unbound() {
                 PolicyRule::new("approve-read", "read_data", PolicyEffect::RequireApproval)
                     .with_capability("read_data:reviewed"),
             ],
-        ),
+        )),
         &["read_data"],
         action("read_data", Some("db"), json!({})),
     );
@@ -357,7 +366,7 @@ fn unbound_deny_rule_applies_its_effect_and_is_an_ordinary_rule() {
             Some("db")
         };
         let evidence = evaluate(
-            Policy::new_v2("unbound-deny", 1, rules),
+            mission_policy(Policy::new_v2("unbound-deny", 1, rules)),
             &["read_data"],
             action("read_data", target, json!({})),
         );
@@ -551,7 +560,11 @@ fn receipt_with_the_previous_deny_then_recover_reason_still_verifies() {
     )
     .unwrap();
     assert_eq!(evidence.evidence_schema_version, 4);
-    let policy = Policy::new_v2("decision-tests", 3, vec![deny("d"), recover("r")]);
+    let policy = mission_policy(Policy::new_v2(
+        "decision-tests",
+        3,
+        vec![deny("d"), recover("r")],
+    ));
     evidence
         .bind_policy_digest(policy.digest().unwrap())
         .unwrap();
@@ -579,7 +592,7 @@ fn no_rule_specificity_a_narrow_allow_never_overrides_a_broad_deny() {
     let broad_deny = deny("broad-deny");
     for rules in permutations(&[narrow_allow.clone(), broad_deny]) {
         let evidence = evaluate(
-            Policy::new_v2("specificity", 1, rules),
+            mission_policy(Policy::new_v2("specificity", 1, rules)),
             &["read_data"],
             action("read_data", Some("db"), json!({"table": "users"})),
         );
@@ -597,7 +610,7 @@ fn no_rule_specificity_a_narrow_allow_never_overrides_a_broad_deny() {
     ] {
         for rules in permutations(&[narrow_deny.clone(), broad_allow.clone()]) {
             let evidence = evaluate(
-                Policy::new_v2("specificity", 1, rules),
+                mission_policy(Policy::new_v2("specificity", 1, rules)),
                 &["read_data"],
                 action("read_data", Some(target), json!({})),
             );
@@ -654,7 +667,7 @@ fn engine_decisions_round_trip_and_have_a_stable_canonical_form() {
     let deny_rule = PolicyRule::new("deny-delete", "delete_data", PolicyEffect::Deny)
         .with_capability("delete_data");
     let evidence = evaluate(
-        Policy::new_v2("golden-decision", 1, vec![deny_rule]),
+        mission_policy(Policy::new_v2("golden-decision", 1, vec![deny_rule])),
         &["delete_data"],
         action("delete_data", Some("db"), json!({})),
     );
@@ -699,7 +712,7 @@ fn engine_decisions_round_trip_and_have_a_stable_canonical_form() {
         evaluate_read(vec![recover("r")]),
         evaluate_read(vec![]),
         evaluate(
-            Policy::new_v2("g", 1, vec![allow("a")]),
+            mission_policy(Policy::new_v2("g", 1, vec![allow("a")])),
             &[],
             action("read_data", None, json!({})),
         ),
@@ -822,4 +835,28 @@ fn tampered_golden_legacy_decision_is_rejected() {
             "tampered golden decision accepted: {label}"
         );
     }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

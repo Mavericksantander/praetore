@@ -14,7 +14,7 @@ pub mod policy;
 pub mod replay;
 pub mod storage_record;
 
-pub use action::Action;
+pub use action::{Action, ClassifiedAction, MissionAction, SafetyAction};
 pub use authority::{Authority, AuthorityId};
 pub use authorization::{AuthorizationIntentV2, AuthorizationRequest};
 pub use decision::{
@@ -30,8 +30,8 @@ pub use freshness::{FreshnessError, FreshnessLease, FreshnessProvider};
 pub use identity::{AgentId, AgentIdentity, AgentKeyFingerprint, AgentKeyPair, VerifiedPublicKey};
 pub use key_rotation::KeyRotationProof;
 pub use policy::{
-    ControlLoop, MatchOperator, Policy, PolicyCondition, PolicyDocumentError, PolicyEffect,
-    PolicyLimit, PolicyRule,
+    ActionClass, ActionClassError, ActionClassProposal, ControlLoop, MatchOperator, Policy,
+    PolicyCondition, PolicyDocumentError, PolicyEffect, PolicyLimit, PolicyRule, RecordedPolicy,
 };
 pub use replay::{
     AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
@@ -40,3 +40,26 @@ pub use replay::{
 pub use storage_record::{
     RecordedMigration, StorageRecord, StorageRecordPayload, StorageRecordSigner,
 };
+
+/// Helpers for this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::{Action, ActionClass, MissionAction, Policy};
+
+    /// Declares every action type a rule of `policy` names as Mission.
+    pub(crate) fn mission_policy(mut policy: Policy) -> Policy {
+        for rule in &policy.rules {
+            policy
+                .action_classes
+                .entry(rule.action_type.clone())
+                .or_insert(ActionClass::Mission);
+        }
+        policy
+    }
+
+    /// Wraps `action` as a mission action without a policy. The engine still
+    /// checks it against its own policy's `action_classes`.
+    pub(crate) fn mission(action: Action) -> MissionAction {
+        MissionAction::classified(action)
+    }
+}
