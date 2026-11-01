@@ -777,7 +777,11 @@ fn create_postgres_approval_gateway_with_clock(
             .with_capability("local:write"),
         ],
     );
-    let now = OffsetDateTime::now_utc();
+    // Sign the intent at the engine's time when a clock is injected, so the
+    // intent window never depends on host time elapsed during the test.
+    let now = clock
+        .as_ref()
+        .map_or_else(OffsetDateTime::now_utc, praetore_core::engine::Clock::now);
     let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
     request.request_id = request_id;
     request
@@ -3270,8 +3274,14 @@ fn scratch_journal(scratch: &ScratchDatabase) -> PostgresExecutionJournal {
 #[test]
 #[ignore = "requires a PostgreSQL superuser; run in assurance CI"]
 fn postgres_apd_parse_record_rejects_forged_apd_rows() {
+    // Fixed base time inside `test_validity()`; every intent, approval and
+    // expiry instant derives from this clock, never from the host clock.
     let clock = SharedClock(Arc::new(std::sync::Mutex::new(
-        OffsetDateTime::now_utc() + Duration::seconds(1),
+        OffsetDateTime::parse(
+            "2026-06-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap(),
     )));
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let approved = approved_pending(&fixture);
