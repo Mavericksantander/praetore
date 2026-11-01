@@ -28,7 +28,7 @@ jobs:
           PRAETORE_REQUIRE_OPENAT2: "1"
         run: |
           cargo test --locked -p praetore-sandbox-fs -- --nocapture
-          cargo test --locked -p praetore-gateway --lib sandbox::tests::race -- --nocapture
+          cargo test --locked -p praetore-gateway --lib -- --nocapture sandbox::tests::race sandbox::tests::require_openat2
       - run: cargo run --locked --package praetore-core --example high_assurance
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
