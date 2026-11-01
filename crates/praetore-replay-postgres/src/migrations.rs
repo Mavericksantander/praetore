@@ -6,15 +6,13 @@
 //! append-only). A session advisory lock serializes concurrent runners.
 //!
 //! Databases created before this runner have no control table. If such a
-//! database matches the schema left by 0009 (every expected tenant column,
-//! constraint and forced RLS present; the functions in `praetore` exactly the
-//! ones 0001-0009 create, with the same body, SECURITY DEFINER, `SET`
-//! search_path, language and volatility, and no other overload; the
-//! non-internal triggers exactly the ones 0001-0009 create, with the same
-//! events, function, columns and enabled state; the RLS policies exactly the
-//! `tenant_isolation` ones with the same USING and WITH CHECK; and nothing
-//! from 0010), 0001-0009 are recorded as applied without executing them and
-//! only the newer migrations run. Any other pre-existing `praetore` schema is
+//! database matches the schema left by 0009, 0001-0009 are recorded as
+//! applied without executing them and only the newer migrations run. The
+//! match is live against live (`check_0009_baseline`): 0001-0009 are applied
+//! into a scratch schema in a transaction that is rolled back, and a
+//! canonical dump of both schemas (definitions, owners, ACLs, rules,
+//! inheritance, dependents) must be identical. Any other pre-existing
+//! `praetore` schema is
 //! refused (fail closed). A control table that records a version this binary
 //! does not know is refused too, so an older binary never runs against a
 //! newer schema.
@@ -24,6 +22,11 @@
 //! top-level `BEGIN;` ... `COMMIT;` pair (0007-0009 do); the runner strips that
 //! pair before executing and refuses any other transaction control, so a
 //! crash can never leave a migration applied but unrecorded.
+//!
+//! Every statement runs with `search_path = pg_catalog, pg_temp` (restored
+//! afterwards), and a session with `session_replication_role` other than
+//! `origin` is refused, so neither a shadowing catalog view or operator nor
+//! disabled triggers can change what is checked or created.
 
 use postgres::Client;
 use sha2::{Digest, Sha256};
@@ -106,6 +109,9 @@ pub enum MigrationError {
     ExplicitTransactionControl(&'static str),
     /// The schema is not current and this connection may not migrate it.
     Pending(&'static str),
+    /// The migrating session would not enforce triggers or foreign keys
+    /// (`session_replication_role` other than `origin`).
+    UnsafeSession(String),
 }
 
 impl std::fmt::Display for MigrationError {
@@ -132,6 +138,7 @@ impl std::fmt::Display for MigrationError {
                 "database schema is not current (migration {version} is not applied); \
                  run the migration step with the owner role first"
             ),
+            Self::UnsafeSession(reason) => write!(f, "refusing to migrate: {reason}"),
         }
     }
 }
@@ -147,21 +154,34 @@ impl From<postgres::Error> for MigrationError {
 /// Applies pending migrations and returns the versions applied by this call
 /// (empty when the schema is already current).
 pub fn apply_migrations(client: &mut Client) -> Result<Vec<&'static str>, MigrationError> {
-    client.execute("SELECT pg_advisory_lock($1)", &[&MIGRATION_LOCK_KEY])?;
-    let result = apply_locked(client);
-    let unlock = client.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATION_LOCK_KEY]);
-    let applied = result?;
-    unlock?;
-    Ok(applied)
+    with_safe_search_path(client, |client| {
+        check_session_fires_triggers(client)?;
+        client.execute(
+            "SELECT pg_catalog.pg_advisory_lock($1)",
+            &[&MIGRATION_LOCK_KEY],
+        )?;
+        let result = apply_locked(client);
+        let unlock = client.execute(
+            "SELECT pg_catalog.pg_advisory_unlock($1)",
+            &[&MIGRATION_LOCK_KEY],
+        );
+        let applied = result?;
+        unlock?;
+        Ok(applied)
+    })
 }
 
 /// Read-only check for connections that must not migrate (the runtime role):
 /// every bundled migration is recorded with its checksum and nothing newer
 /// is recorded. Needs only SELECT on `praetore.schema_migrations`.
 pub fn verify_schema_current(client: &mut Client) -> Result<(), MigrationError> {
+    with_safe_search_path(client, verify_schema_current_inner)
+}
+
+fn verify_schema_current_inner(client: &mut Client) -> Result<(), MigrationError> {
     let has_control: bool = client
         .query_one(
-            "SELECT to_regclass('praetore.schema_migrations') IS NOT NULL",
+            "SELECT pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
             &[],
         )?
         .get(0);
@@ -196,14 +216,15 @@ const BASELINE_VERSION: &str = "0009_human_approval_expirations";
 fn apply_locked(client: &mut Client) -> Result<Vec<&'static str>, MigrationError> {
     let has_control: bool = client
         .query_one(
-            "SELECT to_regclass('praetore.schema_migrations') IS NOT NULL",
+            "SELECT pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
             &[],
         )?
         .get(0);
     if !has_control {
         let has_schema: bool = client
             .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'praetore')",
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace \
+                 WHERE nspname OPERATOR(pg_catalog.=) 'praetore')",
                 &[],
             )?
             .get(0);
@@ -411,559 +432,535 @@ fn checksum(sql: &str) -> String {
     hex::encode(Sha256::digest(sql.as_bytes()))
 }
 
-/// Objects that 0001-0009 leave behind, as `(kind, table, name)`.
-const BASELINE_OBJECTS: &[(&str, &str, &str)] = &[
-    ("column", "replay_claims", "tenant_id"),
-    ("column", "execution_journal", "tenant_id"),
-    ("column", "execution_journal_events", "tenant_id"),
-    ("column", "execution_attestations", "tenant_id"),
-    ("column", "human_approvals", "tenant_id"),
-    ("column", "human_approval_expirations", "receipt_id"),
-    ("constraint", "replay_claims", "replay_claims_pkey"),
-    ("constraint", "execution_journal", "execution_journal_pkey"),
-    (
-        "constraint",
-        "execution_journal",
-        "execution_journal_replay_claim_fk",
-    ),
-    (
-        "constraint",
-        "execution_journal",
-        "execution_journal_execution_status_check",
-    ),
-    (
-        "constraint",
-        "execution_journal",
-        "execution_journal_authorization_execution_check",
-    ),
-    (
-        "constraint",
-        "execution_journal_events",
-        "execution_journal_events_journal_fk",
-    ),
-    (
-        "constraint",
-        "execution_journal_events",
-        "execution_journal_events_to_status_check",
-    ),
-    (
-        "constraint",
-        "execution_journal_events",
-        "execution_journal_events_from_status_check",
-    ),
-    (
-        "constraint",
-        "execution_attestations",
-        "execution_attestations_journal_fk",
-    ),
-    (
-        "constraint",
-        "execution_attestations",
-        "execution_attestations_identity_status_key",
-    ),
-    (
-        "constraint",
-        "human_approvals",
-        "human_approvals_journal_fk",
-    ),
-    (
-        "constraint",
-        "human_approvals",
-        "human_approvals_identity_key",
-    ),
-    (
-        "constraint",
-        "human_approval_expirations",
-        "human_approval_expirations_pkey",
-    ),
-    ("forced_rls", "replay_claims", ""),
-    ("forced_rls", "execution_journal", ""),
-    ("forced_rls", "execution_journal_events", ""),
-    ("forced_rls", "execution_attestations", ""),
-    ("forced_rls", "human_approvals", ""),
-    ("forced_rls", "human_approval_expirations", ""),
-];
+/// Search path for every statement the runner sends. Catalog tables,
+/// functions, operators and types resolve in `pg_catalog`; a `public.pg_proc`
+/// view or a `public.=` operator cannot shadow them, whatever search_path
+/// the database, the role or the caller's session sets.
+const SAFE_SEARCH_PATH: &str = "pg_catalog, pg_temp";
 
-/// A function that 0001-0009 leave in the `praetore` schema. Every one is a
-/// PL/pgSQL trigger function without arguments, VOLATILE, not STRICT, not
-/// LEAKPROOF, PARALLEL UNSAFE; only these two attributes vary. The expected
-/// body is not copied here: it is read from the last
-/// `CREATE OR REPLACE FUNCTION` of that function in the bundled 0001-0009
-/// text, whose checksums are pinned.
-struct BaselineFunction {
-    name: &'static str,
-    security_definer: bool,
-    /// The single `proconfig` entry, as PostgreSQL stores `SET ...`.
-    config: Option<&'static str>,
+/// Runs `body` with `search_path` set to `SAFE_SEARCH_PATH` for the session,
+/// then restores the caller's value.
+fn with_safe_search_path<T>(
+    client: &mut Client,
+    body: impl FnOnce(&mut Client) -> Result<T, MigrationError>,
+) -> Result<T, MigrationError> {
+    let previous: String = client
+        .query_one("SELECT pg_catalog.current_setting('search_path')", &[])?
+        .get(0);
+    client.batch_execute(&format!("SET search_path = {SAFE_SEARCH_PATH}"))?;
+    let result = body(client);
+    let restore = client.execute(
+        "SELECT pg_catalog.set_config('search_path', $1, false)",
+        &[&previous],
+    );
+    let value = result?;
+    restore?;
+    Ok(value)
 }
 
-const BASELINE_FUNCTIONS: &[BaselineFunction] = &[
-    BaselineFunction {
-        name: "validate_execution_journal_transition",
-        security_definer: false,
-        config: None,
-    },
-    BaselineFunction {
-        name: "record_execution_journal_transition",
-        security_definer: true,
-        config: Some("search_path=pg_catalog, praetore, pg_temp"),
-    },
-    BaselineFunction {
-        name: "reject_execution_journal_event_mutation",
-        security_definer: false,
-        config: None,
-    },
-    BaselineFunction {
-        name: "reject_execution_attestation_mutation",
-        security_definer: false,
-        config: None,
-    },
-    BaselineFunction {
-        name: "reject_human_approval_mutation",
-        security_definer: false,
-        config: None,
-    },
-    BaselineFunction {
-        name: "restrict_journal_delete_with_expiration",
-        security_definer: false,
-        config: None,
-    },
-    BaselineFunction {
-        name: "reject_human_approval_expiration_mutation",
-        security_definer: false,
-        config: None,
-    },
-    BaselineFunction {
-        name: "enforce_approval_resolution_exclusive",
-        security_definer: false,
-        config: None,
-    },
-];
-
-/// `pg_trigger.tgtype` bits.
-const ROW: i32 = 1;
-const BEFORE: i32 = 2;
-const INSERT: i32 = 4;
-const DELETE: i32 = 8;
-const UPDATE: i32 = 16;
-const TRUNCATE: i32 = 32;
-
-/// Triggers that 0001-0009 leave behind, as
-/// `(table, trigger, tgtype, function, UPDATE OF columns)`. Every one is
-/// enabled (`O`), has no arguments, no WHEN clause, no transition tables and
-/// is not a constraint trigger.
-const BASELINE_TRIGGERS: &[(&str, &str, i32, &str, &str)] = &[
-    (
-        "execution_journal",
-        "execution_journal_transition",
-        BEFORE | UPDATE | ROW,
-        "validate_execution_journal_transition",
-        "",
-    ),
-    (
-        "execution_journal",
-        "execution_journal_event_log",
-        INSERT | UPDATE | ROW,
-        "record_execution_journal_transition",
-        "execution_status",
-    ),
-    (
-        "execution_journal",
-        "execution_journal_expiration_restrict",
-        BEFORE | DELETE | ROW,
-        "restrict_journal_delete_with_expiration",
-        "",
-    ),
-    (
-        "execution_journal_events",
-        "execution_journal_events_immutable",
-        BEFORE | UPDATE | DELETE | ROW,
-        "reject_execution_journal_event_mutation",
-        "",
-    ),
-    (
-        "execution_journal_events",
-        "execution_journal_events_no_truncate",
-        BEFORE | TRUNCATE,
-        "reject_execution_journal_event_mutation",
-        "",
-    ),
-    (
-        "execution_attestations",
-        "execution_attestations_immutable",
-        BEFORE | UPDATE | DELETE | ROW,
-        "reject_execution_attestation_mutation",
-        "",
-    ),
-    (
-        "execution_attestations",
-        "execution_attestations_no_truncate",
-        BEFORE | TRUNCATE,
-        "reject_execution_attestation_mutation",
-        "",
-    ),
-    (
-        "human_approvals",
-        "human_approvals_immutable",
-        BEFORE | UPDATE | DELETE | ROW,
-        "reject_human_approval_mutation",
-        "",
-    ),
-    (
-        "human_approvals",
-        "human_approvals_no_truncate",
-        BEFORE | TRUNCATE,
-        "reject_human_approval_mutation",
-        "",
-    ),
-    (
-        "human_approvals",
-        "human_approvals_exclusive",
-        BEFORE | INSERT | ROW,
-        "enforce_approval_resolution_exclusive",
-        "",
-    ),
-    (
-        "human_approval_expirations",
-        "human_approval_expirations_immutable",
-        BEFORE | UPDATE | DELETE | ROW,
-        "reject_human_approval_expiration_mutation",
-        "",
-    ),
-    (
-        "human_approval_expirations",
-        "human_approval_expirations_no_truncate",
-        BEFORE | TRUNCATE,
-        "reject_human_approval_expiration_mutation",
-        "",
-    ),
-    (
-        "human_approval_expirations",
-        "human_approval_expirations_exclusive",
-        BEFORE | INSERT | ROW,
-        "enforce_approval_resolution_exclusive",
-        "",
-    ),
-];
-
-/// Tables that carry exactly one RLS policy, `tenant_isolation`
-/// (0008 and 0009): PERMISSIVE, FOR ALL, TO PUBLIC, with this expression as
-/// both USING and WITH CHECK.
-const BASELINE_POLICY_TABLES: &[&str] = &[
-    "replay_claims",
-    "execution_journal",
-    "execution_journal_events",
-    "execution_attestations",
-    "human_approvals",
-    "human_approval_expirations",
-];
-const BASELINE_POLICY_NAME: &str = "tenant_isolation";
-const BASELINE_POLICY_EXPRESSION: &str =
-    "tenant_id = NULLIF(current_setting('praetore.tenant_id', true), '')::UUID";
-
-/// Fails with `UnrecognizedSchema` naming the first object that is missing or
-/// differs from what 0001-0009 leave behind, or when anything from 0010 is
-/// already present.
-fn check_0009_baseline(client: &mut Client) -> Result<(), MigrationError> {
-    for &(kind, table, name) in BASELINE_OBJECTS {
-        let query = match kind {
-            "column" => {
-                "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-                 WHERE table_schema = 'praetore' AND table_name = $1 AND column_name = $2)"
-            }
-            "constraint" => {
-                "SELECT EXISTS (SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid \
-                 JOIN pg_namespace n ON n.oid = t.relnamespace \
-                 WHERE n.nspname = 'praetore' AND t.relname = $1 AND c.conname = $2)"
-            }
-            _ => {
-                "SELECT EXISTS (SELECT 1 FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace \
-                 WHERE n.nspname = 'praetore' AND t.relname = $1 AND $2 = '' \
-                   AND t.relrowsecurity AND t.relforcerowsecurity)"
-            }
-        };
-        let present: bool = client.query_one(query, &[&table, &name])?.get(0);
-        if !present {
-            return Err(unrecognized(if name.is_empty() {
-                format!("forced row level security on {table}")
-            } else {
-                name.to_owned()
-            }));
-        }
-    }
-    let newer: bool = client
+/// Refuses a session in which triggers (including the internal triggers
+/// behind foreign keys) do not fire.
+fn check_session_fires_triggers(client: &mut Client) -> Result<(), MigrationError> {
+    let role: String = client
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = 'praetore' AND table_name = 'execution_journal' \
-               AND column_name = 'not_dispatched_reason')",
+            "SELECT pg_catalog.current_setting('session_replication_role')",
             &[],
         )?
         .get(0);
-    if newer {
-        return Err(unrecognized("not_dispatched_reason".to_owned()));
-    }
-    check_baseline_functions(client)?;
-    check_baseline_triggers(client)?;
-    check_baseline_policies(client)
-}
-
-fn unrecognized(detail: String) -> MigrationError {
-    MigrationError::UnrecognizedSchema(detail)
-}
-
-/// Every function in the `praetore` schema must be one of
-/// `BASELINE_FUNCTIONS`, with no arguments (so an added overload is refused),
-/// the expected attributes and a `prosrc` byte-identical to the body in the
-/// bundled migration text. `prosrc` is stored verbatim, so this comparison
-/// does not depend on how a PostgreSQL version renders definitions.
-fn check_baseline_functions(client: &mut Client) -> Result<(), MigrationError> {
-    let rows = client.query(
-        "SELECT p.proname, pg_get_function_identity_arguments(p.oid), \
-                format_type(p.prorettype, NULL), l.lanname, p.prosecdef, p.proconfig, \
-                p.provolatile::text, p.proparallel::text, p.prokind::text, p.proisstrict, \
-                p.proleakproof, p.proretset, p.prosrc \
-         FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-         JOIN pg_language l ON l.oid = p.prolang \
-         WHERE n.nspname = 'praetore' ORDER BY 1, 2",
-        &[],
-    )?;
-    for row in &rows {
-        let name: &str = row.get(0);
-        let arguments: &str = row.get(1);
-        let object = format!("function praetore.{name}({arguments})");
-        let Some(expected) = BASELINE_FUNCTIONS
-            .iter()
-            .find(|function| function.name == name && arguments.is_empty())
-        else {
-            return Err(unrecognized(format!(
-                "{object} is not created by 0001-0009"
-            )));
-        };
-        let config: Option<Vec<String>> = row.get(5);
-        let expected_config = expected.config.map(|entry| vec![entry.to_owned()]);
-        let mut differences = Vec::new();
-        if row.get::<_, &str>(2) != "trigger" || row.get::<_, bool>(11) {
-            differences.push("return type");
-        }
-        if row.get::<_, &str>(3) != "plpgsql" {
-            differences.push("language");
-        }
-        if row.get::<_, bool>(4) != expected.security_definer {
-            differences.push("SECURITY DEFINER");
-        }
-        if config != expected_config {
-            differences.push("SET (search_path)");
-        }
-        if row.get::<_, &str>(6) != "v" {
-            differences.push("volatility");
-        }
-        if row.get::<_, &str>(7) != "u" {
-            differences.push("parallel safety");
-        }
-        if row.get::<_, &str>(8) != "f" {
-            differences.push("kind");
-        }
-        if row.get::<_, bool>(9) {
-            differences.push("STRICT");
-        }
-        if row.get::<_, bool>(10) {
-            differences.push("LEAKPROOF");
-        }
-        if Some(row.get::<_, &str>(12)) != baseline_function_body(expected.name) {
-            differences.push("body");
-        }
-        if !differences.is_empty() {
-            return Err(unrecognized(format!(
-                "{object} differs from 0009 in: {}",
-                differences.join(", ")
-            )));
-        }
-    }
-    for expected in BASELINE_FUNCTIONS {
-        if !rows
-            .iter()
-            .any(|row| row.get::<_, &str>(0) == expected.name)
-        {
-            return Err(unrecognized(format!(
-                "function praetore.{}() is missing",
-                expected.name
-            )));
-        }
+    if role != "origin" {
+        return Err(MigrationError::UnsafeSession(format!(
+            "session_replication_role is {role}, so triggers and foreign keys do not fire; \
+             it must be origin"
+        )));
     }
     Ok(())
 }
 
-/// Every non-internal trigger on a `praetore` table must be one of
-/// `BASELINE_TRIGGERS`, compared by catalog fields rather than by rendered
-/// text: events and timing, level, the function it runs, `UPDATE OF`
-/// columns, enabled state, arguments, WHEN clause, transition tables.
-fn check_baseline_triggers(client: &mut Client) -> Result<(), MigrationError> {
-    let rows = client.query(
-        "SELECT t.relname, g.tgname, g.tgtype::int4, g.tgenabled::text, g.tgnargs::int4, \
-                g.tgqual IS NULL AND g.tgconstraint = 0 \
-                    AND g.tgoldtable IS NULL AND g.tgnewtable IS NULL, \
-                fn.nspname, p.proname, pg_get_function_identity_arguments(p.oid), \
-                COALESCE((SELECT string_agg(a.attname, ',' ORDER BY a.attnum) \
-                          FROM pg_attribute a \
-                          WHERE a.attrelid = g.tgrelid AND a.attnum = ANY (g.tgattr)), '') \
-         FROM pg_trigger g JOIN pg_class t ON t.oid = g.tgrelid \
-         JOIN pg_namespace n ON n.oid = t.relnamespace \
-         JOIN pg_proc p ON p.oid = g.tgfoid \
-         JOIN pg_namespace fn ON fn.oid = p.pronamespace \
-         WHERE n.nspname = 'praetore' AND NOT g.tgisinternal ORDER BY 1, 2",
-        &[],
-    )?;
-    for row in &rows {
-        let table: &str = row.get(0);
-        let name: &str = row.get(1);
-        let object = format!("trigger {name} on praetore.{table}");
-        let Some(&(_, _, tgtype, function, columns)) = BASELINE_TRIGGERS
-            .iter()
-            .find(|(t, n, ..)| *t == table && *n == name)
-        else {
-            return Err(unrecognized(format!(
-                "{object} is not created by 0001-0009"
-            )));
-        };
-        let mut differences = Vec::new();
-        if row.get::<_, i32>(2) != tgtype {
-            differences.push("timing, events or level");
-        }
-        if row.get::<_, &str>(3) != "O" {
-            differences.push("enabled state");
-        }
-        if row.get::<_, i32>(4) != 0 {
-            differences.push("arguments");
-        }
-        if !row.get::<_, bool>(5) {
-            differences.push("WHEN clause, constraint or transition tables");
-        }
-        if row.get::<_, &str>(6) != "praetore"
-            || row.get::<_, &str>(7) != function
-            || !row.get::<_, &str>(8).is_empty()
-        {
-            differences.push("function");
-        }
-        if row.get::<_, &str>(9) != columns {
-            differences.push("UPDATE OF columns");
-        }
-        if !differences.is_empty() {
-            return Err(unrecognized(format!(
-                "{object} differs from 0009 in: {}",
-                differences.join(", ")
-            )));
-        }
-    }
-    for &(table, name, ..) in BASELINE_TRIGGERS {
-        if !rows
-            .iter()
-            .any(|row| row.get::<_, &str>(0) == table && row.get::<_, &str>(1) == name)
-        {
-            return Err(unrecognized(format!(
-                "trigger {name} on praetore.{table} is missing"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Every RLS policy on a `praetore` table must be `tenant_isolation` on one
-/// of `BASELINE_POLICY_TABLES`, so an extra permissive policy is refused.
-/// The USING and WITH CHECK expressions are compared with the same server's
-/// rendering of `BASELINE_POLICY_EXPRESSION` on a temporary table, created
-/// in a transaction that is rolled back, so the result does not depend on
-/// how a PostgreSQL version prints expressions.
-fn check_baseline_policies(client: &mut Client) -> Result<(), MigrationError> {
+/// The 0009 baseline check.
+///
+/// In one transaction that is always rolled back, 0001-0009 are applied into
+/// a fresh scratch schema (their text with the schema name rewritten, see
+/// `rewrite_schema`), and the same canonical dump (`schema_dump`) is taken
+/// of `praetore` and of the scratch schema. Both are rendered by the same
+/// server under `SAFE_SEARCH_PATH` with the schema names normalized, so the
+/// expected values come from this server and not from constants that a
+/// PostgreSQL version could render differently. Any difference fails with
+/// `UnrecognizedSchema` naming the objects. A few properties that the dump
+/// cannot express (they are not per-schema) are checked on the live
+/// database only: event triggers, per-database or per-role settings that
+/// change search_path, row_security or session_replication_role, default
+/// privileges, and the schema owner.
+///
+/// Needs the privileges that applying 0001-0009 needs (CREATE on the
+/// database for the scratch schema). Nothing is committed.
+fn check_0009_baseline(client: &mut Client) -> Result<(), MigrationError> {
     let mut transaction = client.transaction()?;
-    transaction.batch_execute(&format!(
-        "CREATE TEMPORARY TABLE praetore_baseline_policy_reference (tenant_id UUID); \
-         CREATE POLICY reference ON pg_temp.praetore_baseline_policy_reference \
-             USING ({BASELINE_POLICY_EXPRESSION}) WITH CHECK ({BASELINE_POLICY_EXPRESSION})"
-    ))?;
-    let reference = transaction.query_one(
-        "SELECT pg_get_expr(polqual, polrelid), pg_get_expr(polwithcheck, polrelid) \
-         FROM pg_policy \
-         WHERE polrelid = 'pg_temp.praetore_baseline_policy_reference'::regclass",
-        &[],
-    )?;
-    let expected_qual: Option<String> = reference.get(0);
-    let expected_check: Option<String> = reference.get(1);
-    let rows = transaction.query(
-        "SELECT t.relname, p.polname, p.polcmd::text, p.polpermissive, \
-                p.polroles = '{0}'::oid[], \
-                pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid) \
-         FROM pg_policy p JOIN pg_class t ON t.oid = p.polrelid \
-         JOIN pg_namespace n ON n.oid = t.relnamespace \
-         WHERE n.nspname = 'praetore' ORDER BY 1, 2",
-        &[],
-    )?;
-    transaction.rollback()?;
-    if expected_qual.is_none() || expected_check.is_none() {
-        return Err(unrecognized(
-            "reference policy expression could not be rendered".to_owned(),
-        ));
+    transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
+    let live_problems = live_only_problems(&mut transaction)?;
+    if !live_problems.is_empty() {
+        transaction.rollback()?;
+        return Err(MigrationError::UnrecognizedSchema(live_problems.join("; ")));
     }
-    for row in &rows {
-        let table: &str = row.get(0);
-        let name: &str = row.get(1);
-        let object = format!("policy praetore.{table}.{name}");
-        if name != BASELINE_POLICY_NAME || !BASELINE_POLICY_TABLES.contains(&table) {
-            return Err(unrecognized(format!(
-                "{object} is not created by 0001-0009"
-            )));
-        }
-        let mut differences = Vec::new();
-        if row.get::<_, &str>(2) != "*" {
-            differences.push("command");
-        }
-        if !row.get::<_, bool>(3) {
-            differences.push("PERMISSIVE");
-        }
-        if !row.get::<_, bool>(4) {
-            differences.push("roles");
-        }
-        if row.get::<_, Option<String>>(5) != expected_qual {
-            differences.push("USING");
-        }
-        if row.get::<_, Option<String>>(6) != expected_check {
-            differences.push("WITH CHECK");
-        }
-        if !differences.is_empty() {
-            return Err(unrecognized(format!(
-                "{object} differs from 0009 in: {}",
-                differences.join(", ")
-            )));
-        }
-    }
-    for table in BASELINE_POLICY_TABLES {
-        if !rows.iter().any(|row| row.get::<_, &str>(0) == *table) {
-            return Err(unrecognized(format!(
-                "policy praetore.{table}.{BASELINE_POLICY_NAME} is missing"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Body (the text between the `$$` delimiters) of the last
-/// `CREATE OR REPLACE FUNCTION praetore.<name>()` in 0001-0009.
-fn baseline_function_body(name: &str) -> Option<&'static str> {
-    let header = format!("CREATE OR REPLACE FUNCTION praetore.{name}()");
-    let mut body = None;
+    let scratch = format!("praetore_baseline_{}", uuid::Uuid::new_v4().simple());
     for (version, sql) in MIGRATIONS {
-        for (start, end) in top_level_statements(sql) {
-            let statement = skip_leading_comments(&sql[start..end]);
-            if statement.starts_with(&header) {
-                let open = statement.find("$$")? + 2;
-                let close = open + statement[open..].find("$$")?;
-                body = Some(&statement[open..close]);
-            }
-        }
+        let body = transactional_body(version, sql)?;
+        transaction.batch_execute(&rewrite_schema(body, &scratch))?;
         if version == BASELINE_VERSION {
             break;
         }
     }
-    body
+    let live = schema_dump(&mut transaction, "praetore", "praetore")?;
+    let expected = schema_dump(&mut transaction, &scratch, &scratch)?;
+    transaction.rollback()?;
+    let differences = dump_differences(&live, &expected);
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        Err(MigrationError::UnrecognizedSchema(differences.join("; ")))
+    }
+}
+
+/// `sql` with every reference to the `praetore` schema (`praetore.x`,
+/// `CREATE SCHEMA ... praetore`, `search_path = ..., praetore, ...`) replaced
+/// by `schema`. The `praetore.tenant_id` setting name is not a schema
+/// reference and is kept.
+fn rewrite_schema(sql: &str, schema: &str) -> String {
+    const NAME: &str = "praetore";
+    let is_identifier = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let mut out = String::with_capacity(sql.len() + 64);
+    let mut rest = sql;
+    while let Some(index) = rest.find(NAME) {
+        let (before, tail) = rest.split_at(index);
+        let after = &tail[NAME.len()..];
+        let boundary_before = !before.chars().next_back().is_some_and(is_identifier);
+        let boundary_after = !after.chars().next().is_some_and(is_identifier);
+        out.push_str(before);
+        if boundary_before && boundary_after && !after.starts_with(".tenant_id") {
+            out.push_str(schema);
+        } else {
+            out.push_str(NAME);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `key -> field -> value` for every object in one schema.
+type SchemaDump = std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
+/// Owner and ACL grantee/grantor: the schema owner as `OWNER`, PUBLIC as
+/// `PUBLIC`, any other role by name.
+fn role_sql(column: &str) -> String {
+    format!(
+        "CASE WHEN {column} OPERATOR(pg_catalog.=) ns.own THEN 'OWNER' \
+              WHEN {column} OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' \
+              ELSE pg_catalog.pg_get_userbyid({column})::pg_catalog.text END"
+    )
+}
+
+/// An ACL as sorted `grantee:grantor:privilege:grantable` entries.
+fn acl_sql(acl: &str) -> String {
+    format!(
+        "(SELECT pg_catalog.string_agg(entry, ',' ORDER BY entry) FROM ( \
+             SELECT pg_catalog.concat({grantee}, ':', {grantor}, ':', a.privilege_type, ':', \
+                                      a.is_grantable) AS entry \
+             FROM pg_catalog.aclexplode({acl}) a) entries)",
+        grantee = role_sql("a.grantee"),
+        grantor = role_sql("a.grantor"),
+    )
+}
+
+/// A rendered definition with the dumped schema's name replaced by `praetore`.
+fn norm(expression: &str) -> String {
+    format!("pg_catalog.replace(({expression})::pg_catalog.text, $2, 'praetore')")
+}
+
+/// Canonical dump of schema `$1`, with the name `$2` normalized to
+/// `praetore`: the schema (owner, ACL); every relation (kind, persistence,
+/// RLS and FORCE RLS, partition flag, owner, ACL, index or view definition);
+/// every column (type, NOT NULL, default, identity, generated, collation,
+/// column ACL); every constraint (`pg_get_constraintdef`, deferrable,
+/// validated, inheritance); every function (result, language, SECURITY
+/// DEFINER, `SET`, volatility, parallel, kind, STRICT, LEAKPROOF, `prosrc`,
+/// owner, ACL, so overloads are separate keys); every non-internal trigger
+/// (`pg_get_triggerdef`, enabled) and the enabled state of the internal
+/// ones; every RLS policy (command, permissive, roles, USING, WITH CHECK);
+/// every rewrite rule; inheritance and partitions in either direction; types;
+/// operators, collations, conversions, operator classes and families,
+/// extended statistics, text search objects and extensions in the schema;
+/// and every object outside the schema that depends on a relation, function
+/// or type in it.
+fn schema_dump(
+    transaction: &mut postgres::Transaction<'_>,
+    schema: &str,
+    normalized_name: &str,
+) -> Result<SchemaDump, MigrationError> {
+    let eq = "OPERATOR(pg_catalog.=)";
+    let relation_acl_kind =
+        format!("CASE WHEN c.relkind {eq} 'S' THEN 's' ELSE 'r' END::pg_catalog.\"char\"");
+    let in_schema_relation = |column: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM pg_catalog.pg_class x \
+                     WHERE x.oid {eq} {column} AND x.relnamespace {eq} ns.oid)"
+        )
+    };
+    let other_objects = [
+        ("operator", "pg_operator", "oprname", "oprnamespace"),
+        ("collation", "pg_collation", "collname", "collnamespace"),
+        ("conversion", "pg_conversion", "conname", "connamespace"),
+        ("operator class", "pg_opclass", "opcname", "opcnamespace"),
+        ("operator family", "pg_opfamily", "opfname", "opfnamespace"),
+        ("statistics", "pg_statistic_ext", "stxname", "stxnamespace"),
+        (
+            "text search configuration",
+            "pg_ts_config",
+            "cfgname",
+            "cfgnamespace",
+        ),
+        (
+            "text search dictionary",
+            "pg_ts_dict",
+            "dictname",
+            "dictnamespace",
+        ),
+        (
+            "text search parser",
+            "pg_ts_parser",
+            "prsname",
+            "prsnamespace",
+        ),
+        (
+            "text search template",
+            "pg_ts_template",
+            "tmplname",
+            "tmplnamespace",
+        ),
+        ("extension", "pg_extension", "extname", "extnamespace"),
+    ]
+    .iter()
+    .map(|(label, catalog, name, namespace)| {
+        format!(
+            "SELECT pg_catalog.concat('{label} praetore.', o.{name}), 'present', '1' \
+             FROM ns JOIN pg_catalog.{catalog} o ON o.{namespace} {eq} ns.oid"
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" UNION ALL ");
+    let query = format!(
+        "WITH ns AS (SELECT n.oid, n.nspowner AS own, n.nspacl FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname {eq} $1::pg_catalog.name) \
+         SELECT 'schema praetore', f.field, f.value FROM ns CROSS JOIN LATERAL (VALUES \
+             ('owner', 'OWNER'), \
+             ('acl', {schema_acl})) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('relation praetore.', c.relname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('kind', c.relkind::pg_catalog.text), \
+             ('persistence', c.relpersistence::pg_catalog.text), \
+             ('row security', c.relrowsecurity::pg_catalog.text), \
+             ('force row security', c.relforcerowsecurity::pg_catalog.text), \
+             ('partition', c.relispartition::pg_catalog.text), \
+             ('owner', {relation_owner}), \
+             ('acl', {relation_acl}), \
+             ('definition', CASE WHEN c.relkind {eq} 'i' THEN {index_def} \
+                                 WHEN c.relkind {eq} 'v' OR c.relkind {eq} 'm' THEN {view_def} \
+                            END)) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('column praetore.', c.relname, '.', a.attname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         JOIN pg_catalog.pg_attribute a ON a.attrelid {eq} c.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('type', {column_type}), \
+             ('not null', a.attnotnull::pg_catalog.text), \
+             ('default', (SELECT {column_default} FROM pg_catalog.pg_attrdef d \
+                          WHERE d.adrelid {eq} a.attrelid AND d.adnum {eq} a.attnum)), \
+             ('identity', a.attidentity::pg_catalog.text), \
+             ('generated', a.attgenerated::pg_catalog.text), \
+             ('collation', (SELECT co.collname::pg_catalog.text FROM pg_catalog.pg_collation co \
+                            WHERE co.oid {eq} a.attcollation)), \
+             ('acl', {column_acl})) f(field, value) \
+         WHERE a.attnum OPERATOR(pg_catalog.>) 0 AND NOT a.attisdropped \
+         UNION ALL \
+         SELECT pg_catalog.concat('constraint praetore.', \
+                    COALESCE((SELECT r.relname FROM pg_catalog.pg_class r WHERE r.oid {eq} con.conrelid), \
+                             (SELECT t.typname FROM pg_catalog.pg_type t WHERE t.oid {eq} con.contypid)), \
+                    '.', con.conname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_constraint con ON con.connamespace {eq} ns.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('type', con.contype::pg_catalog.text), \
+             ('definition', {constraint_def}), \
+             ('deferrable', con.condeferrable::pg_catalog.text), \
+             ('deferred', con.condeferred::pg_catalog.text), \
+             ('validated', con.convalidated::pg_catalog.text), \
+             ('local', con.conislocal::pg_catalog.text), \
+             ('inherited count', con.coninhcount::pg_catalog.text), \
+             ('no inherit', con.connoinherit::pg_catalog.text)) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('function praetore.', p.proname, '(', \
+                    {function_arguments}, ')'), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_proc p ON p.pronamespace {eq} ns.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('result', {function_result}), \
+             ('language', (SELECT l.lanname::pg_catalog.text FROM pg_catalog.pg_language l \
+                           WHERE l.oid {eq} p.prolang)), \
+             ('SECURITY DEFINER', p.prosecdef::pg_catalog.text), \
+             ('SET (search_path)', {function_config}), \
+             ('volatility', p.provolatile::pg_catalog.text), \
+             ('parallel', p.proparallel::pg_catalog.text), \
+             ('kind', p.prokind::pg_catalog.text), \
+             ('STRICT', p.proisstrict::pg_catalog.text), \
+             ('LEAKPROOF', p.proleakproof::pg_catalog.text), \
+             ('returns set', p.proretset::pg_catalog.text), \
+             ('body', {function_body}), \
+             ('owner', {function_owner}), \
+             ('acl', {function_acl})) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('trigger ', g.tgname, ' on praetore.', c.relname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         JOIN pg_catalog.pg_trigger g ON g.tgrelid {eq} c.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('definition', {trigger_def}), \
+             ('enabled', g.tgenabled::pg_catalog.text)) f(field, value) \
+         WHERE NOT g.tgisinternal \
+         UNION ALL \
+         SELECT pg_catalog.concat('internal triggers on praetore.', c.relname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         CROSS JOIN LATERAL (SELECT \
+             pg_catalog.count(*)::pg_catalog.text AS total, \
+             pg_catalog.count(*) FILTER (WHERE g.tgenabled OPERATOR(pg_catalog.<>) 'O')::pg_catalog.text \
+                 AS not_origin \
+             FROM pg_catalog.pg_trigger g WHERE g.tgrelid {eq} c.oid AND g.tgisinternal) i \
+         CROSS JOIN LATERAL (VALUES ('count', i.total), ('not enabled', i.not_origin)) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('policy praetore.', c.relname, '.', pol.polname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         JOIN pg_catalog.pg_policy pol ON pol.polrelid {eq} c.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('command', pol.polcmd::pg_catalog.text), \
+             ('permissive', pol.polpermissive::pg_catalog.text), \
+             ('roles', (SELECT pg_catalog.string_agg(role_name, ',' ORDER BY role_name) FROM \
+                          (SELECT {policy_role} AS role_name \
+                           FROM pg_catalog.unnest(pol.polroles) r(rid)) roles)), \
+             ('USING', {policy_using}), \
+             ('WITH CHECK', {policy_check})) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('rule ', rw.rulename, ' on praetore.', c.relname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace {eq} ns.oid \
+         JOIN pg_catalog.pg_rewrite rw ON rw.ev_class {eq} c.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('definition', {rule_def}), \
+             ('enabled', rw.ev_enabled::pg_catalog.text)) f(field, value) \
+         UNION ALL \
+         SELECT pg_catalog.concat('inheritance ', {child}, ' of ', {parent}), 'present', '1' \
+         FROM ns JOIN pg_catalog.pg_inherits h \
+             ON {parent_in_schema} OR {child_in_schema} \
+         UNION ALL \
+         SELECT pg_catalog.concat('type praetore.', t.typname), f.field, f.value \
+         FROM ns JOIN pg_catalog.pg_type t ON t.typnamespace {eq} ns.oid \
+         CROSS JOIN LATERAL (VALUES \
+             ('kind', t.typtype::pg_catalog.text), \
+             ('owner', {type_owner}), \
+             ('acl', {type_acl})) f(field, value) \
+         UNION ALL \
+         {other_objects} \
+         UNION ALL \
+         SELECT pg_catalog.concat('dependent ', {dependent_identity}, ' (', o.type, ')'), \
+                'present', '1' \
+         FROM ns JOIN pg_catalog.pg_depend d ON \
+             (d.refclassid {eq} 'pg_catalog.pg_class'::pg_catalog.regclass \
+                 AND {referenced_relation}) \
+             OR (d.refclassid {eq} 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc x \
+                             WHERE x.oid {eq} d.refobjid AND x.pronamespace {eq} ns.oid)) \
+             OR (d.refclassid {eq} 'pg_catalog.pg_type'::pg_catalog.regclass \
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_type x \
+                             WHERE x.oid {eq} d.refobjid AND x.typnamespace {eq} ns.oid)) \
+         CROSS JOIN LATERAL pg_catalog.pg_identify_object(d.classid, d.objid, d.objsubid) o \
+         WHERE o.schema IS NULL \
+            OR NOT (o.schema {eq} $1::pg_catalog.text OR o.schema {eq} 'pg_toast')",
+        schema_acl = acl_sql("COALESCE(ns.nspacl, pg_catalog.acldefault('n', ns.own))"),
+        relation_owner = role_sql("c.relowner"),
+        relation_acl = acl_sql(&format!(
+            "COALESCE(c.relacl, pg_catalog.acldefault({relation_acl_kind}, c.relowner))"
+        )),
+        index_def = norm("pg_catalog.pg_get_indexdef(c.oid)"),
+        view_def = norm("pg_catalog.pg_get_viewdef(c.oid)"),
+        column_type = norm("pg_catalog.format_type(a.atttypid, a.atttypmod)"),
+        column_default = norm("pg_catalog.pg_get_expr(d.adbin, d.adrelid)"),
+        column_acl = acl_sql("a.attacl"),
+        constraint_def = norm("pg_catalog.pg_get_constraintdef(con.oid)"),
+        function_arguments = norm("pg_catalog.pg_get_function_identity_arguments(p.oid)"),
+        function_result = norm("pg_catalog.pg_get_function_result(p.oid)"),
+        function_config = norm("pg_catalog.array_to_string(p.proconfig, ';')"),
+        function_body = norm("p.prosrc"),
+        function_owner = role_sql("p.proowner"),
+        function_acl = acl_sql("COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))"),
+        trigger_def = norm("pg_catalog.pg_get_triggerdef(g.oid)"),
+        policy_role = role_sql("r.rid"),
+        policy_using = norm("pg_catalog.pg_get_expr(pol.polqual, pol.polrelid)"),
+        policy_check = norm("pg_catalog.pg_get_expr(pol.polwithcheck, pol.polrelid)"),
+        rule_def = norm("pg_catalog.pg_get_ruledef(rw.oid)"),
+        child = norm("h.inhrelid::pg_catalog.regclass"),
+        parent = norm("h.inhparent::pg_catalog.regclass"),
+        parent_in_schema = in_schema_relation("h.inhparent"),
+        child_in_schema = in_schema_relation("h.inhrelid"),
+        type_owner = role_sql("t.typowner"),
+        type_acl = acl_sql("COALESCE(t.typacl, pg_catalog.acldefault('T', t.typowner))"),
+        dependent_identity = norm("o.identity"),
+        referenced_relation = in_schema_relation("d.refobjid"),
+    );
+    let mut dump = SchemaDump::new();
+    for row in transaction.query(&query, &[&schema, &normalized_name])? {
+        let key: String = row.get(0);
+        let field: String = row.get(1);
+        let value: Option<String> = row.get(2);
+        dump.entry(key)
+            .or_default()
+            .insert(field, value.unwrap_or_else(|| "<none>".to_owned()));
+    }
+    Ok(dump)
+}
+
+/// At most this many differences are named in one error.
+const MAX_REPORTED_DIFFERENCES: usize = 10;
+
+fn dump_differences(live: &SchemaDump, expected: &SchemaDump) -> Vec<String> {
+    // Whole objects first, their parts (columns, types, dependency rows)
+    // last, so the most telling difference is named within the limit.
+    let rank = |key: &str| {
+        [
+            "schema ",
+            "setting",
+            "relation ",
+            "function ",
+            "trigger ",
+            "policy ",
+            "rule ",
+            "inheritance ",
+            "constraint ",
+            "internal ",
+            "column ",
+            "type ",
+            "dependent ",
+        ]
+        .iter()
+        .position(|prefix| key.starts_with(prefix))
+        .unwrap_or(1)
+    };
+    let mut keys: Vec<&String> = live.keys().chain(expected.keys()).collect();
+    keys.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+    keys.dedup();
+    let mut differences = Vec::new();
+    for key in keys {
+        let difference = match (live.get(key), expected.get(key)) {
+            (Some(_), None) => format!("{key} is not created by 0001-0009"),
+            (None, Some(_)) => format!("{key} is missing"),
+            (Some(found), Some(wanted)) if found != wanted => {
+                let mut fields: Vec<&String> = found.keys().chain(wanted.keys()).collect();
+                fields.sort();
+                fields.dedup();
+                let changed: Vec<&str> = fields
+                    .into_iter()
+                    .filter(|field| found.get(*field) != wanted.get(*field))
+                    .map(String::as_str)
+                    .collect();
+                format!("{key} differs from 0009 in: {}", changed.join(", "))
+            }
+            _ => continue,
+        };
+        differences.push(difference);
+        if differences.len() == MAX_REPORTED_DIFFERENCES {
+            differences.push("...".to_owned());
+            break;
+        }
+    }
+    differences
+}
+
+/// Checks on the live database that a per-schema dump cannot express.
+fn live_only_problems(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Vec<String>, MigrationError> {
+    let mut problems = Vec::new();
+    for row in transaction.query(
+        "SELECT e.evtname::pg_catalog.text FROM pg_catalog.pg_event_trigger e ORDER BY 1",
+        &[],
+    )? {
+        let name: String = row.get(0);
+        problems.push(format!(
+            "event trigger {name} exists; it would run as the migrating role"
+        ));
+    }
+    for row in transaction.query(
+        "SELECT COALESCE(r.rolname::pg_catalog.text, 'all roles'), \
+                COALESCE(d.datname::pg_catalog.text, 'all databases'), s.setting \
+         FROM pg_catalog.pg_db_role_setting rs \
+         LEFT JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) rs.setrole \
+         LEFT JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) rs.setdatabase \
+         CROSS JOIN LATERAL pg_catalog.unnest(rs.setconfig) s(setting) \
+         WHERE (rs.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                OR d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) \
+           AND (pg_catalog.starts_with(s.setting, 'session_replication_role=') \
+                OR pg_catalog.starts_with(s.setting, 'row_security=') \
+                OR pg_catalog.starts_with(s.setting, 'search_path=')) \
+         ORDER BY 1, 2, 3",
+        &[],
+    )? {
+        let (role, database, setting): (String, String, String) =
+            (row.get(0), row.get(1), row.get(2));
+        problems.push(format!(
+            "setting {setting} for {role} in {database} is not allowed"
+        ));
+    }
+    let owner = transaction.query_one(
+        "WITH RECURSIVE member_of(role) AS ( \
+             SELECT r.oid FROM pg_catalog.pg_roles r \
+             WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER \
+             UNION \
+             SELECT m.roleid FROM pg_catalog.pg_auth_members m \
+             JOIN member_of ON m.member OPERATOR(pg_catalog.=) member_of.role) \
+         SELECT pg_catalog.pg_get_userbyid(n.nspowner)::pg_catalog.text, \
+                CURRENT_USER::pg_catalog.text, \
+                EXISTS (SELECT 1 FROM member_of \
+                        WHERE member_of.role OPERATOR(pg_catalog.=) n.nspowner) \
+         FROM pg_catalog.pg_namespace n \
+         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'",
+        &[],
+    )?;
+    let (schema_owner, migrator, is_member): (String, String, bool) =
+        (owner.get(0), owner.get(1), owner.get(2));
+    if !is_member {
+        problems.push(format!(
+            "schema praetore is owned by {schema_owner}, and the migrating role {migrator} \
+             is neither that role nor a member of it"
+        ));
+    }
+    for row in transaction.query(
+        "SELECT pg_catalog.pg_get_userbyid(a.defaclrole)::pg_catalog.text, \
+                COALESCE((SELECT n.nspname::pg_catalog.text FROM pg_catalog.pg_namespace n \
+                          WHERE n.oid OPERATOR(pg_catalog.=) a.defaclnamespace), 'all schemas'), \
+                a.defaclobjtype::pg_catalog.text \
+         FROM pg_catalog.pg_default_acl a \
+         WHERE a.defaclnamespace OPERATOR(pg_catalog.=) \
+                   (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                    WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
+            OR a.defaclrole OPERATOR(pg_catalog.=) \
+                   (SELECT n.nspowner FROM pg_catalog.pg_namespace n \
+                    WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
+            OR a.defaclrole OPERATOR(pg_catalog.=) \
+                   (SELECT r.oid FROM pg_catalog.pg_roles r \
+                    WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER) \
+         ORDER BY 1, 2, 3",
+        &[],
+    )? {
+        let (role, schema, kind): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        problems.push(format!(
+            "default privileges of {role} in {schema} (object type {kind}) are not allowed"
+        ));
+    }
+    Ok(problems)
 }
 
 #[cfg(test)]
@@ -1010,138 +1007,54 @@ mod tests {
         );
     }
 
-    /// Statements of 0001-0009 that start with `prefix`.
-    fn baseline_statements(prefix: &str) -> Vec<&'static str> {
-        let mut found = Vec::new();
+    #[test]
+    fn rewrite_schema_replaces_every_schema_reference_and_keeps_the_tenant_setting() {
+        let scratch = "praetore_baseline_test";
         for (version, sql) in MIGRATIONS {
-            for (start, end) in top_level_statements(sql) {
-                let statement = skip_leading_comments(&sql[start..end]);
-                if statement.starts_with(prefix) {
-                    found.push(statement);
-                }
-            }
+            let rewritten = rewrite_schema(transactional_body(version, sql).unwrap(), scratch);
+            let leftover = rewritten
+                .replace(scratch, "")
+                .replace("praetore.tenant_id", "");
+            assert!(!leftover.contains("praetore"), "{version}: {leftover}");
             if version == BASELINE_VERSION {
                 break;
             }
         }
-        found
-    }
-
-    #[test]
-    fn baseline_functions_are_exactly_those_created_by_0001_to_0009() {
-        let mut created: Vec<&str> = baseline_statements("CREATE OR REPLACE FUNCTION praetore.")
-            .iter()
-            .map(|statement| {
-                statement["CREATE OR REPLACE FUNCTION praetore.".len()..]
-                    .split_once("()")
-                    .expect("baseline functions take no arguments")
-                    .0
-            })
-            .collect();
-        created.sort_unstable();
-        created.dedup();
-        let mut expected: Vec<&str> = BASELINE_FUNCTIONS.iter().map(|f| f.name).collect();
-        expected.sort_unstable();
-        assert_eq!(created, expected);
-        assert!(baseline_statements("CREATE FUNCTION").is_empty());
-        for function in BASELINE_FUNCTIONS {
-            let header = format!("CREATE OR REPLACE FUNCTION praetore.{}()", function.name);
-            let last = *baseline_statements(&header).last().unwrap();
-            let (attributes, _) = last.split_once("$$").unwrap();
-            assert!(attributes.contains("RETURNS TRIGGER"), "{}", function.name);
-            assert!(attributes.contains("LANGUAGE plpgsql"), "{}", function.name);
-            assert_eq!(
-                attributes.contains("SECURITY DEFINER"),
-                function.security_definer,
-                "{}",
-                function.name
-            );
-            assert_eq!(
-                attributes.contains("SET search_path = pg_catalog, praetore, pg_temp"),
-                function.config.is_some(),
-                "{}",
-                function.name
-            );
-            for attribute in ["STABLE", "IMMUTABLE", "STRICT", "LEAKPROOF", "PARALLEL"] {
-                assert!(!attributes.contains(attribute), "{}", function.name);
-            }
-            let body = baseline_function_body(function.name).unwrap();
-            assert!(last.ends_with(&format!("$${body}$$")), "{}", function.name);
-            assert!(
-                body.trim_start().starts_with("BEGIN") || body.trim_start().starts_with("DECLARE")
-            );
-        }
-        // 0007's version replaces 0006's, which replaced 0002's.
-        let validate = baseline_function_body("validate_execution_journal_transition").unwrap();
-        assert!(validate.contains("NEW.tenant_id <> OLD.tenant_id"));
-    }
-
-    #[test]
-    fn baseline_triggers_are_exactly_those_created_by_0001_to_0009() {
-        let mut created: Vec<(String, String, String)> = baseline_statements("CREATE TRIGGER ")
-            .iter()
-            .map(|statement| {
-                let words: Vec<&str> = statement.split_whitespace().collect();
-                let on = words.iter().position(|word| *word == "ON").unwrap();
-                let function = statement
-                    .split_once("EXECUTE FUNCTION praetore.")
-                    .unwrap()
-                    .1
-                    .trim_end_matches("()");
-                (
-                    words[on + 1].trim_start_matches("praetore.").to_owned(),
-                    words[2].to_owned(),
-                    function.to_owned(),
-                )
-            })
-            .collect();
-        created.sort();
-        created.dedup();
-        let mut expected: Vec<(String, String, String)> = BASELINE_TRIGGERS
-            .iter()
-            .map(|(table, name, _, function, _)| {
-                (
-                    (*table).to_owned(),
-                    (*name).to_owned(),
-                    (*function).to_owned(),
-                )
-            })
-            .collect();
-        expected.sort();
-        assert_eq!(created, expected);
-        for (_, name, tgtype, ..) in BASELINE_TRIGGERS {
-            let statement = *baseline_statements(&format!("CREATE TRIGGER {name}\n"))
-                .last()
-                .unwrap();
-            let header = statement.split_once(" ON ").unwrap().0;
-            let mut bits = 0;
-            for (word, bit) in [
-                ("BEFORE", BEFORE),
-                ("INSERT", INSERT),
-                ("DELETE", DELETE),
-                ("UPDATE", UPDATE),
-                ("TRUNCATE", TRUNCATE),
-            ] {
-                if header.contains(word) {
-                    bits |= bit;
-                }
-            }
-            if statement.contains("FOR EACH ROW") {
-                bits |= ROW;
-            }
-            assert_eq!(bits, *tgtype, "{name}");
-        }
-    }
-
-    #[test]
-    fn baseline_policy_expression_matches_0009() {
-        let policy = baseline_statements(
-            "CREATE POLICY tenant_isolation ON praetore.human_approval_expirations",
+        assert_eq!(
+            rewrite_schema(
+                "CREATE SCHEMA IF NOT EXISTS praetore; SET search_path = pg_catalog, praetore, \
+                 pg_temp; praetore.t; praetore_runtime; my_praetore; \
+                 current_setting('praetore.tenant_id', true)",
+                "s"
+            ),
+            "CREATE SCHEMA IF NOT EXISTS s; SET search_path = pg_catalog, s, \
+             pg_temp; s.t; praetore_runtime; my_praetore; \
+             current_setting('praetore.tenant_id', true)"
         );
-        assert_eq!(policy.len(), 1);
-        let compact: String = policy[0].split_whitespace().collect();
-        let expected: String = BASELINE_POLICY_EXPRESSION.split_whitespace().collect();
-        assert_eq!(compact.matches(&format!("({expected})")).count(), 2);
+    }
+
+    #[test]
+    fn dump_differences_name_missing_extra_and_changed_objects() {
+        let dump = |entries: &[(&str, &str, &str)]| {
+            let mut dump = SchemaDump::new();
+            for (key, field, value) in entries {
+                dump.entry((*key).to_owned())
+                    .or_default()
+                    .insert((*field).to_owned(), (*value).to_owned());
+            }
+            dump
+        };
+        let expected = dump(&[("a", "body", "x"), ("b", "owner", "OWNER")]);
+        assert!(dump_differences(&expected, &expected).is_empty());
+        let live = dump(&[("a", "body", "y"), ("c", "present", "1")]);
+        assert_eq!(
+            dump_differences(&live, &expected),
+            vec![
+                "a differs from 0009 in: body",
+                "b is missing",
+                "c is not created by 0001-0009"
+            ]
+        );
     }
 
     #[test]

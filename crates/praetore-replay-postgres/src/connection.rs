@@ -363,6 +363,10 @@ pub enum RuntimeRoleError {
     /// TRUNCATE, table-wide UPDATE, TRIGGER or REFERENCES) on a `praetore`
     /// table, e.g. a leftover `GRANT ALL` or membership in `pg_write_all_data`.
     ExcessTablePrivilege(String),
+    /// The session does not fire triggers or enforce foreign keys:
+    /// `session_replication_role` (here the value) is not `origin`, for
+    /// example through `ALTER DATABASE ... SET session_replication_role`.
+    TriggersDisabled(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -385,6 +389,11 @@ impl fmt::Display for RuntimeRoleError {
                     "runtime database role {role} has CREATE on schema praetore"
                 )
             }
+            Self::TriggersDisabled(value) => write!(
+                f,
+                "runtime session has session_replication_role = {value}; the append-only \
+                 triggers and foreign keys would not fire (it must be origin)"
+            ),
             Self::ExcessTablePrivilege(role) => write!(
                 f,
                 "runtime database role {role} holds DELETE, TRUNCATE, table-wide UPDATE, TRIGGER or \
@@ -408,8 +417,18 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// relation or function in it (directly or through membership), holder of
 /// CREATE on the schema, CREATEROLE, or holder of a table privilege beyond
 /// `praetore_runtime`'s grants (DELETE, TRUNCATE, table-wide UPDATE, TRIGGER,
-/// REFERENCES) on any `praetore` table.
+/// REFERENCES) on any `praetore` table; and a session whose
+/// `session_replication_role` is not `origin` (triggers would not fire).
 pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> {
+    let replication_role: String = client
+        .query_one(
+            "SELECT pg_catalog.current_setting('session_replication_role')",
+            &[],
+        )?
+        .get(0);
+    if replication_role != "origin" {
+        return Err(RuntimeRoleError::TriggersDisabled(replication_role));
+    }
     let row = client.query_one("SELECT session_user::text, current_user::text", &[])?;
     let mut roles: Vec<String> = vec![row.get(0), row.get(1)];
     roles.dedup();

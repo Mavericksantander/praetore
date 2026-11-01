@@ -4,24 +4,37 @@
 
 - The 0009 baseline check in `praetore-replay-postgres` (a `praetore`
   schema without migration records, recorded as 0001-0009 without running
-  them) now compares definitions, not only names. Every function in
-  `praetore` must be one of the eight trigger functions 0001-0009 create,
-  with no arguments (an added overload is refused), the same `prosrc` byte
-  for byte as the last `CREATE OR REPLACE FUNCTION` in the bundled
-  0001-0009 text, and the same SECURITY DEFINER, `SET search_path`,
-  language, return type, volatility, STRICT, LEAKPROOF and parallel
-  setting. Every non-internal trigger on a `praetore` table must be one of
-  the thirteen 0001-0009 create, with the same timing, events, level,
-  function, `UPDATE OF` columns, enabled state, and no arguments, WHEN
-  clause or transition tables. The RLS policies must be exactly the six
-  `tenant_isolation` policies (PERMISSIVE, FOR ALL, TO PUBLIC) whose USING
-  and WITH CHECK equal the server's own rendering of the 0008/0009
-  expression on a temporary table in a rolled-back transaction; an extra
-  policy is refused (this needs the TEMP privilege on the database, which
-  PostgreSQL grants to PUBLIC by default). Forced RLS on `human_approval_expirations` is now
-  checked too. Any difference refuses the migration and names the object.
-  `MigrationError::UnrecognizedSchema` now carries a `String`. Six new
-  ignored PostgreSQL tests, run in CI with `--exact`.
+  them) now compares the live schema with 0001-0009 applied by the same
+  server, not names. In a transaction that is always rolled back, 0001-0009
+  run in a scratch schema (schema name rewritten; the `praetore.tenant_id`
+  setting is kept), and a canonical dump of both schemas must be identical:
+  relations (kind, RLS and FORCE RLS, owner, ACL, index and view
+  definitions), columns (type, NOT NULL, default, identity, collation,
+  column ACL), constraints (`pg_get_constraintdef`), functions (`prosrc`,
+  result, language, SECURITY DEFINER, `SET search_path`, volatility,
+  STRICT, LEAKPROOF, parallel, owner, ACL; overloads are separate),
+  triggers (`pg_get_triggerdef`, enabled, internal triggers), RLS policies
+  (command, roles, USING, WITH CHECK), rewrite rules, inheritance and
+  partitions, types, other objects in the schema, and objects in other
+  schemas that depend on it. The schema owner must be the migrating role
+  or one it is a member of; event triggers, default privileges for the
+  schema or owner, and per-database or per-role `search_path`,
+  `row_security` or `session_replication_role` settings are refused. Any
+  difference refuses the migration and names the objects
+  (`MigrationError::UnrecognizedSchema` now carries a `String`).
+- The migration runner sends every statement with
+  `search_path = pg_catalog, pg_temp` (the caller's value is restored) and
+  catalog names qualified, so a `public.pg_proc` view or a `public.=`
+  operator cannot shadow the catalog. It refuses a session with
+  `session_replication_role` other than `origin`
+  (`MigrationError::UnsafeSession`), fresh database or not, and
+  `verify_runtime_role` refuses such a runtime session
+  (`RuntimeRoleError::TriggersDisabled`).
+- `crates/praetore-replay-postgres/migrations/.gitattributes` keeps the
+  migrations LF (`*.sql text eol=lf`): their bytes are checksummed and
+  compared.
+- New ignored PostgreSQL tests, run in CI with `--exact`, one per case
+  above.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed
