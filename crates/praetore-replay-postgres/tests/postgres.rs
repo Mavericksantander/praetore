@@ -735,6 +735,18 @@ fn create_postgres_approval_gateway(request_id: Uuid) -> PostgresApprovalFixture
 #[derive(Clone)]
 struct SharedClock(Arc<std::sync::Mutex<OffsetDateTime>>);
 
+impl SharedClock {
+    /// Starts at the fixed `TEST_NOW`, inside `test_validity()`, so no
+    /// validity check depends on the host clock.
+    fn at_test_now() -> Self {
+        Self(Arc::new(std::sync::Mutex::new(test_now())))
+    }
+}
+
+fn test_now() -> OffsetDateTime {
+    FixedClock::try_new(TEST_NOW).unwrap().now()
+}
+
 impl praetore_core::engine::Clock for SharedClock {
     fn now(&self) -> OffsetDateTime {
         *self.0.lock().unwrap()
@@ -778,11 +790,9 @@ fn create_postgres_approval_gateway_with_clock(
             .with_capability("local:write"),
         ],
     );
-    // Sign the intent at the engine's time when a clock is injected, so the
-    // intent window never depends on host time elapsed during the test.
-    let now = clock
-        .as_ref()
-        .map_or_else(OffsetDateTime::now_utc, praetore_core::engine::Clock::now);
+    // Intents are signed at the engine's (injected) time, never host time.
+    let clock = clock.unwrap_or_else(SharedClock::at_test_now);
+    let now = clock.now();
     let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
     request.request_id = request_id;
     request
@@ -803,11 +813,7 @@ fn create_postgres_approval_gateway_with_clock(
         .with_audience("postgres-test-gateway")
         .with_replay_guard(Arc::new(connect_guard()))
         .with_freshness_provider(Arc::new(TestFreshness));
-    let engine = match clock {
-        Some(clock) => AuthorizationEngine::production_with_clock(policy, config, clock),
-        None => AuthorizationEngine::production(policy, config),
-    }
-    .unwrap();
+    let engine = AuthorizationEngine::production_with_clock(policy, config, clock).unwrap();
     let adapter = Arc::new(PostgresTestAdapter::new(None));
     let approver_key = SigningKey::from_bytes(&[84; 32]);
     let verifier = HumanApprovalVerifier::new(
@@ -1960,10 +1966,7 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
 #[test]
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
 fn postgres_approval_expiration_is_signed_unique_exclusive_and_append_only() {
-    // Start slightly ahead so the intent (signed at host time) is already valid.
-    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
-        OffsetDateTime::now_utc() + Duration::seconds(1),
-    )));
+    let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let pending = fixture.gateway.execute(fixture.request).unwrap();
     let key = ExecutionKey {
@@ -2113,9 +2116,7 @@ fn postgres_approval_expiration_is_signed_unique_exclusive_and_append_only() {
 #[test]
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
 fn postgres_journal_row_with_expiration_receipt_cannot_be_deleted() {
-    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
-        OffsetDateTime::now_utc() + Duration::seconds(1),
-    )));
+    let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let pending = fixture.gateway.execute(fixture.request).unwrap();
     let key = ExecutionKey {
@@ -2155,9 +2156,7 @@ fn postgres_journal_row_with_expiration_receipt_cannot_be_deleted() {
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
 fn postgres_concurrent_expiration_detection_records_exactly_one_receipt() {
     for _ in 0..20 {
-        let clock = SharedClock(Arc::new(std::sync::Mutex::new(
-            OffsetDateTime::now_utc() + Duration::seconds(1),
-        )));
+        let clock = SharedClock::at_test_now();
         let fixture =
             create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
         let pending = fixture.gateway.execute(fixture.request).unwrap();
@@ -2495,7 +2494,7 @@ fn postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered() {
         ))
     ));
     assert!(matches!(
-        connect_journal().claim_dispatch(key, OffsetDateTime::now_utc()),
+        connect_journal().claim_dispatch(key, test_now()),
         Err(JournalError::InvalidTransition)
     ));
     assert!(recovering.resolve_human_approval(decision).is_err());
@@ -2567,14 +2566,12 @@ fn postgres_apd_concurrent_claims_dispatch_exactly_once() {
 #[test]
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
 fn postgres_apd_expiry_before_claim_closes_as_approval_expired() {
-    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
-        OffsetDateTime::now_utc() + Duration::seconds(1),
-    )));
+    let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let key = approved_pending(&fixture);
-    // The engine clock (not the host clock) passes the 20 s window.
+    // The engine clock passes the 20 s window.
     *clock.0.lock().unwrap() += Duration::seconds(25);
-    assert!(OffsetDateTime::now_utc() < clock.now());
+    assert_eq!(clock.now(), test_now() + Duration::seconds(25));
 
     assert!(matches!(
         fixture.gateway.dispatch_approved(key),
@@ -2622,9 +2619,8 @@ fn postgres_apd_journal_checks_use_the_injected_clock() {
         &time::format_description::well_known::Rfc3339,
     )
     .unwrap();
-    // Host clock is before expiry; the injected clock is not. The journal
-    // must follow the injected clock.
-    assert!(OffsetDateTime::now_utc() < expires_at);
+    // The fixture runs at the fixed TEST_NOW (host time is irrelevant): the
+    // journal must decide only from the time it is given.
     let journal = connect_journal();
     assert!(matches!(
         journal.record_human_approval(key, &decision, expires_at),
@@ -5165,15 +5161,7 @@ fn scratch_journal(scratch: &ScratchDatabase) -> PostgresExecutionJournal {
 #[test]
 #[ignore = "requires a PostgreSQL superuser; run in assurance CI"]
 fn postgres_apd_parse_record_rejects_forged_apd_rows() {
-    // Fixed base time inside `test_validity()`; every intent, approval and
-    // expiry instant derives from this clock, never from the host clock.
-    let clock = SharedClock(Arc::new(std::sync::Mutex::new(
-        OffsetDateTime::parse(
-            "2026-06-01T00:00:00Z",
-            &time::format_description::well_known::Rfc3339,
-        )
-        .unwrap(),
-    )));
+    let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let approved = approved_pending(&fixture);
 

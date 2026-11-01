@@ -1089,7 +1089,8 @@ fn approval_fixture_full(
         ],
     );
     edit(&mut policy);
-    let now = OffsetDateTime::now_utc();
+    // Fixed base inside long_validity(); never host time.
+    let now = FixedClock::try_new(NOW).unwrap().now();
     let clock = Arc::new(Mutex::new(now));
     let policy_digest = policy.digest().unwrap();
     let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
@@ -4385,7 +4386,7 @@ fn approval_refused_at_submission_is_closed_terminally_and_never_approvable() {
         // PostgreSQL), not only the gateway.
         assert!(
             journal
-                .record_human_approval(key, &decision, OffsetDateTime::now_utc())
+                .record_human_approval(key, &decision, FixedClock::try_new(NOW).unwrap().now())
                 .is_err()
         );
     }
