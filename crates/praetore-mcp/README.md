@@ -19,8 +19,9 @@ what it does not cover, and has a troubleshooting table.
 
 ## Install
 
-`praetore-mcp` is not published on crates.io and there are no prebuilt
-binaries yet. Install it with Cargo, without cloning the repository. The
+`praetore-mcp` is not published on crates.io. Install it with Cargo, without
+cloning the repository (below), or use a CI-built binary (see "Prebuilt
+binaries"). The
 workspace declares `rust-version = "1.88"` (checked with Rust 1.94); building
 praetore-mcp needs no PostgreSQL, Node or Python.
 
@@ -38,6 +39,43 @@ or reinstalling it to a different location.
 
 From a clone of the repository: `cargo install --locked --path
 crates/praetore-mcp`, or `cargo build --release -p praetore-mcp`.
+
+### Prebuilt binaries
+
+The `Assurance gates` workflow builds `praetore-mcp` with `--release
+--locked` for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and
+`x86_64-apple-darwin` (cross-built on Apple silicon). Before packaging, each
+binary runs `scripts/mcp-smoke.py`: one allowed `read_text_file` and one
+denied `write_file` through `npx @modelcontextprotocol/server-filesystem@2.1.0`,
+then `verify`. Each run uploads
+`praetore-mcp-<version>-<target>.tar.gz` (the binary, `LICENSE`, `NOTICE`)
+and its `.sha256` as workflow artifacts. `Release checksums` then re-checks
+them and writes one `SHA256SUMS` covering the three archives and
+`praetore-verify` (`scripts/release-checksums.sh`); on a `v*` tag it is kept
+as the `release-assets-<tag>` artifact.
+
+For a `v*` tag, CI also signs `SHA256SUMS` with Sigstore keyless signing
+(`SHA256SUMS.sigstore.json`) and publishes everything as a GitHub Release;
+the steps to verify a download are in
+[`docs/operations.md`](../../docs/operations.md#release-artifact-integrity).
+Builds from other runs are workflow artifacts, and downloading them needs a
+GitHub login. The macOS binaries are **not signed or notarized**:
+Gatekeeper blocks a downloaded copy until you remove the quarantine
+attribute (`xattr -d com.apple.quarantine praetore-mcp`). Check the archive
+first, against `SHA256SUMS` from a release (after verifying its signature as
+in `docs/operations.md`) or the `.sha256` next to a workflow artifact:
+
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing          # release
+shasum -a 256 -c praetore-mcp-<version>-<target>.tar.gz.sha256  # workflow artifact
+tar -xzf praetore-mcp-<version>-<target>.tar.gz
+```
+
+The Linux binary is built on GitHub's `ubuntu-latest` runner and needs a
+glibc at least as new as that image's; build it yourself on older systems.
+
+To run the same smoke test on your own build: `python3 -I
+scripts/mcp-smoke.py target/release/praetore-mcp` (needs Node with `npx`).
 
 ## 5-minute quickstart
 

@@ -351,22 +351,178 @@ jobs:
             fuzz/*.cdx.json
           if-no-files-found: error
 
+  mcp-binaries:
+    name: praetore-mcp ${{ matrix.target }} build and smoke
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          # Cross-built on Apple silicon; the smoke test runs it under Rosetta 2.
+          - os: macos-15
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: cargo build --release --locked --package praetore-mcp --target ${{ matrix.target }}
+      - name: Install Rosetta 2 for the x86_64 smoke test
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
+      - name: Show binary architecture
+        run: file target/${{ matrix.target }}/release/praetore-mcp
+      # A real tools/call allowed and one denied, through npx and
+      # @modelcontextprotocol/server-filesystem@2.1.0, then `verify`.
+      - name: End-to-end smoke test of the release binary
+        run: python3 -I scripts/mcp-smoke.py target/${{ matrix.target }}/release/praetore-mcp
+      - name: Package binary with its checksum
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then version="${GITHUB_SHA::12}"; fi
+          name="praetore-mcp-${version}-${{ matrix.target }}"
+          mkdir -p "mcp-assets/${name}"
+          cp target/${{ matrix.target }}/release/praetore-mcp "mcp-assets/${name}/"
+          cp LICENSE NOTICE "mcp-assets/${name}/"
+          # No AppleDouble ._ entries from macOS extended attributes.
+          COPYFILE_DISABLE=1 tar -C mcp-assets -czf "mcp-assets/${name}.tar.gz" "${name}"
+          cd mcp-assets
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          cat "${name}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcp-${{ matrix.target }}
+          path: |
+            mcp-assets/*.tar.gz
+            mcp-assets/*.tar.gz.sha256
+          if-no-files-found: error
+
   release-integrity:
     name: Release checksums
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs on every push and PR so SHA256SUMS is checked before a tag needs
+    # it; only a v* tag keeps the result as release-assets-<tag>.
+    needs: mcp-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --locked --package praetore-verify
-      - name: Prepare checksummed release asset
+      - run: scripts/test-release-checksums.sh
+      - run: scripts/test-release-notes.sh
+      - name: Release notes exist for the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
+      - name: Tag matches the workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          mkdir release-assets
-          cp target/release/praetore-verify release-assets/
-          cd release-assets
-          sha256sum praetore-verify > SHA256SUMS
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "praetore-mcp") | .version')
+          if [[ "v${version}" != "$GITHUB_REF_NAME" ]]; then
+            echo "error: tag $GITHUB_REF_NAME does not match workspace version $version"
+            exit 1
+          fi
+      - run: cargo build --release --locked --package praetore-verify
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mcp-*
+          path: mcp-assets
+          merge-multiple: true
+      - name: Prepare checksummed release assets
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then version="${GITHUB_SHA::12}"; fi
+          scripts/release-checksums.sh "$version" mcp-assets target/release/praetore-verify release-assets
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      # Exercises the signing tooling on every run with a throwaway key and no
+      # transparency-log upload; the tag job below signs keylessly instead.
+      - name: Sign and verify SHA256SUMS with a throwaway key
+        run: |
+          work=$(mktemp -d)
+          (cd "$work" && COSIGN_PASSWORD= cosign generate-key-pair)
+          COSIGN_PASSWORD= cosign sign-blob --yes --key "$work/cosign.key" --tlog-upload=false \
+            --bundle "$work/SHA256SUMS.bundle" release-assets/SHA256SUMS
+          cosign verify-blob --key "$work/cosign.pub" --insecure-ignore-tlog=true \
+            --bundle "$work/SHA256SUMS.bundle" release-assets/SHA256SUMS
+          cp release-assets/SHA256SUMS "$work/tampered"
+          echo "0000  extra" >> "$work/tampered"
+          if cosign verify-blob --key "$work/cosign.pub" --insecure-ignore-tlog=true \
+              --bundle "$work/SHA256SUMS.bundle" "$work/tampered"; then
+            echo "error: a changed SHA256SUMS verified"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: release-assets-${{ github.ref_name }}
           path: release-assets/*
           if-no-files-found: error
+
+  release-publish:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Every gate must pass on the tag, not only the release artifacts.
+    needs:
+      - rust
+      - hook-evidence
+      - journal-chain
+      - macos
+      - verifier-features
+      - audit
+      - fuzz-smoke
+      - python-verify
+      - claude-code-hook-example
+      - replay-postgres
+      - sbom
+      - release-integrity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # Sigstore keyless signing; CI holds no signing key
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ github.ref_name }}
+          path: release-assets
+      - name: Re-check SHA256SUMS
+        run: cd release-assets && sha256sum -c SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      - name: Sign SHA256SUMS (Sigstore keyless)
+        run: |
+          cosign sign-blob --yes --bundle release-assets/SHA256SUMS.sigstore.json \
+            release-assets/SHA256SUMS
+      - name: Verify the signature against this workflow's identity
+        run: |
+          cosign verify-blob --bundle release-assets/SHA256SUMS.sigstore.json \
+            --certificate-identity "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/assurance.yml@${GITHUB_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            release-assets/SHA256SUMS
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
+          # Never overwrite or add to an existing release.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            echo "error: release $GITHUB_REF_NAME already exists"
+            exit 1
+          fi
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "PRÆTORE $GITHUB_REF_NAME" --notes-file release-notes.md \
+            "${prerelease[@]}" release-assets/*

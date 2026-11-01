@@ -39,7 +39,7 @@ absence of defects.
 | End-to-end HighAssurance integration stays runnable | `crates/praetore-core/examples/high_assurance.rs` | workspace example command | `rust` |
 | Rust tests, lint, format, patch hygiene | workspace CI workflow | workspace test suite; Clippy `-D warnings`; workspace and fuzz rustfmt; `git diff --check` | `rust` |
 | Software inventory | CycloneDX Cargo integration | SBOMs for all workspace packages and standalone fuzz package uploaded as CI artifacts | `sbom` |
-| Release binary integrity | tag-triggered verifier build/checksum job | `SHA256SUMS` uploaded with release binary | `release-integrity` |
+| Release binary integrity | verifier and `praetore-mcp` (Linux x86_64, macOS arm64/x86_64) build and checksum job on every run; artifact kept on tags | `SHA256SUMS` over the three `praetore-mcp` archives and `praetore-verify`; `scripts/test-release-checksums.sh`; Sigstore keyless signature `SHA256SUMS.sigstore.json` and GitHub Release on tags | `mcp-binaries`, `release-integrity`, `release-publish` |
 
 ## Scope limitations
 
