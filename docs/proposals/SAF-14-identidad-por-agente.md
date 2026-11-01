@@ -52,7 +52,7 @@ llave por home); en el hook de Claude Code identifica al **perfil**
   parámetro `k` con valor `v` (`engine.rs:1240-1264`).
 - `praetore-verify evidence` verifica atestador, policy y, con
   `--issuer-pins`, `verify_subject_identity` más la autoridad contra los pins
-  (`crates/praetore-verify/src/main.rs:297-330`, `550-585`); con
+  (`crates/praetore-verify/src/main.rs:297-330`, `553-585`); con
   `--require-intent`, la firma del agente. **No informa ni compara el agent
   id**: cualquier agente con una autoridad del emisor pineado pasa.
 - Hallazgo lateral: `praetore-verify` comprueba la vigencia de la autoridad
@@ -121,6 +121,12 @@ agente. La frase del fundador se queda corta: aquí ni siquiera hay perfil.
      atestador (en `context`), no el emisor. Un `coder.{json,key}` copiado
      sobre `explorer.{json,key}` hacía que el explorer firmara como el coder
      y recibiera sus capacidades, sin error.
+  4. (Revisión independiente, M2; ya pasaba antes de este PR.) Un
+     `agent_type` explícito `"main"` daba el perfil `main`, igual que la
+     ausencia de `agent_type` (`main.rs:522`). Un subagente definido con
+     `name: main` (por ejemplo `.claude/agents/main.md` en un repositorio)
+     recibía la llave, las capacidades y las reglas `main_only` de la sesión
+     principal, y su recibo no se distinguía del de ella.
 - Granularidad real: **perfil**, no instancia. Dos subagentes `coder` en
   paralelo comparten llave. Claude Code documenta un `agent_id` por instancia
   de subagente en los campos comunes de los hooks ("Unique identifier for the
@@ -135,7 +141,8 @@ agente. La frase del fundador se queda corta: aquí ni siquiera hay perfil.
 - Las credenciales HTTP son tokens por **tenant** con rol `agent` o
   `approver` (`http_api.rs:43-48`, `80-92`); el tenant del request sale del
   constraint `tenant_id` de su autoridad (`http_api.rs:505-512`). La llave de
-  replay es `(tenant, agent id, request id)` (`engine.rs:950-951`).
+  replay es `(agent id, request id)` (`engine.rs:950`), reclamada bajo el
+  tenant de la autoridad (`engine.rs:951`).
 - Por lo tanto el gateway ya admite muchos agentes por tenant (cada uno con su
   identidad y su autoridad del emisor pineado). Lo que no hace es ligar el
   token a un agente: un token `agent` del tenant A puede enviar requests
@@ -162,6 +169,13 @@ bajo agentes cooperativos:
 - editar el nombre del agente en cualquier copia sin firmar (`index.json`,
   la línea de `receipts.jsonl`, el nombre del archivo) se detecta; editarlo
   en el recibo rompe las firmas;
+- agregar al bundle un recibo que nadie verificó tampoco cuenta: `verify.sh`
+  y `check-attribution.py` aceptan en `evidence/` solo archivos regulares
+  `*.json` no ocultos y fallan ante cualquier otra entrada (archivo oculto,
+  directorio, symlink, otro nombre). Antes del arreglo (revisión, M1), un
+  `evidence/.X.json` con firmas rotas y su entrada en `index.json` no pasaba
+  por `praetore-verify` (el glob de bash no ve ocultos) pero sí entraba en la
+  atribución (`os.listdir` los ve), con exit 0;
 - cada perfil queda acotado por su autoridad: un explorer con solo `fs:read`
   no escribe aunque la policy lo permitiera para otro perfil.
 
@@ -175,7 +189,14 @@ bajo agentes cooperativos:
   cooperativos, no contención**.
 - No prueba qué proceso usó la llave. El hook elige el perfil por el
   `agent_type` que Claude Code le pasa; si Claude Code (o algo que se haga
-  pasar por él en stdin) dice `coder`, el hook firma como `coder`.
+  pasar por él en stdin) dice `coder`, el hook firma como `coder`. Cualquier
+  agente con `process:execute` puede correr el binario del hook con un stdin
+  inventado (`agent_type: explorer`, un `agent_id` de una instancia que nunca
+  existió) y obtener un recibo `explorer` que verifica. `claude.agent_id` y
+  `claude.session_id` prueban solo lo que el hook recibió por stdin. El
+  constraint de §4.2 impide usar la autoridad de un perfil como otro, no que
+  quien llega a los archivos del home firme como cualquier perfil con su
+  propio par llave/autoridad.
 - No protege contra quien tiene la llave del atestador: puede fabricar
   recibos válidos para cualquier agente cuya llave tenga, y las llaves de
   agente están en el mismo directorio.
@@ -228,6 +249,24 @@ intenta.
   vacía) y obligaría a que la policy tenga una regla `RequireApproval`
   específica para ese caso. Denegar deja rastro firmado y obliga a declarar
   el perfil (como pasó con `web-fetch`, set 04).
+- **PROPUESTA 3b (implementada, revisión M2):** el perfil `main` sale **solo**
+  de la ausencia de `agent_type`. Los nombres reservados explícitos `main` y
+  `unregistered` se evalúan como `unregistered` (Deny con recibo firmado que
+  conserva el `agent_type` pedido). Además, las condiciones de contexto de la
+  policy por defecto miran `profile` (el perfil cuya llave firma) y no
+  `agent` (el `agent_type` crudo), así que un request `unregistered` que diga
+  `agent_type: main` no cumple las reglas `main_only` aunque tuviera
+  capacidades.
+- **PROPUESTA 3c (implementada, revisión B2):** un `agent_id` o `session_id`
+  numérico se guarda como su texto JSON canónico (`123` ⇒ `"123"`), para que
+  un cambio de tipo en Claude Code no deniegue todas las llamadas. Uno que no
+  es string ni número, o de más de 128 bytes UTF-8, se evalúa como
+  `unregistered`: Deny **con recibo firmado** que registra en
+  `context["praetore.claim_rejected"]` la clave, el motivo, el tipo JSON o el
+  largo en bytes, y **no** el valor (que lo controla quien llama). Un
+  `agent_type` de más de 64 bytes sigue denegándose **sin** recibo: el nombre
+  es el dato que se rechaza y registrarlo sería guardar en el recibo un
+  valor arbitrario del llamador.
 
 ### 4.2 Autoridad por agente
 
@@ -313,7 +352,8 @@ intenta.
   - `action.parameters["praetore.agent_profile"]`: el perfil (la policy lo
     ve; ninguna regla actual lo usa);
   - `context["claude.agent_id"]`, `context["claude.session_id"]`: solo si
-    Claude Code los envía (≤128 bytes; más largo ⇒ deny).
+    Claude Code los envía (string o número, ≤128 bytes; si no ⇒ Deny bajo
+    `unregistered` con `context["praetore.claim_rejected"]`).
 - `index.json` (sin firmar, no es parte del recibo): nuevo campo
   `agent_id`; `agent` y `profile` salen ahora de lo firmado.
 - `praetore-verify`: sin cambios en este PR (PROPUESTA 12 para el futuro).
@@ -326,10 +366,18 @@ intenta.
 
 ## 9. Migración y compatibilidad
 
-- Hook, estado existente (sin constraint): sigue funcionando. `authorize`
-  solo exige el constraint si la autoridad lo trae; `verify` y `export`
-  aceptan recibos sin él. Para obtener el constraint: `init` en un directorio
-  nuevo (como cualquier re-emisión del hook).
+- Hook, estado existente (sin constraint): **falla cerrado** (revisión B1).
+  `authorize` rechaza una autoridad sin `praetore.agent_profile` con un
+  mensaje que pide correr `praetore-claude-hook init` en un directorio nuevo;
+  Claude Code recibe `deny` con ese motivo en cada llamada hasta migrar. Así
+  un home viejo, donde un archivo de perfil copiado sobre otro no se puede
+  detectar, no sigue evaluando en silencio. `verify` y `export` siguen
+  aceptando los recibos ya escritos sin el constraint.
+- Hook, `verify` local: compara la identidad que firmó cada recibo con el
+  `agents/<perfil>.json` **actual**. Reemplazar o re-emitir ese archivo hace
+  fallar los recibos anteriores en `verify` (el mensaje lo dice). Los
+  terceros verifican contra los pins del bundle exportado, no contra ese
+  archivo.
 - Hook, bundles existentes: verifican igual (ver §13). El chequeo nuevo de
   `verify.sh` exige que `index.json` coincida con lo firmado; los bundles
   exportados por el hook siempre lo cumplieron (el campo venía del mismo
@@ -364,12 +412,20 @@ intenta.
    - `index.json` lleva el `agent_id` del recibo;
    - `claude.agent_id` y `claude.session_id` quedan firmados; uno de 129
      bytes deniega;
-   - recibos committeados de 03, 04 y 05 se leen con su atribución.
+   - recibos committeados de 03, 04 y 05 se leen con su atribución;
+   - (revisión) `agent_type: "main"` y `"unregistered"` explícitos dan Deny
+     bajo `unregistered` con recibo, y la ausencia de `agent_type` sigue
+     siendo `main` (M2); un home sin el constraint falla cerrado pidiendo
+     `init` (B1); `agent_id` numérico se acepta, uno objeto o de 129 bytes
+     deniega con recibo firmado que no guarda el valor (B2); los resúmenes
+     escapan los `agent_type` no registrados (I1).
 2. `test-attribution.sh` (e2e, en CI): regenera un bundle con `demo.sh`,
    verifica con `verify.sh`, muestra dos agent ids distintos (coder y
    explorer) con autoridades emitidas para su perfil, y rechaza tres
    re-atribuciones (en `index.json`, en `context`, cambiando identidad y
-   autoridad).
+   autoridad) y tres entradas de `evidence/` sin verificar: el recibo oculto
+   de la revisión (`.0099-coder-Bash-Allow.json`, firmas rotas), un symlink
+   y un directorio, cada uno con su entrada en `index.json` (M1).
 3. Los tests nuevos fallan contra `dfbe047` (salida real en el PR).
 4. `verify.sh` pasa sobre `bundle/`, 03, 04 y 05; `test-verify.sh` pasa.
 5. MCP (cuando se implemente): un e2e con dos clientes instalados
@@ -382,17 +438,25 @@ intenta.
 - `init`: cada autoridad lleva `praetore.agent_profile=<perfil>`.
 - `authorize`: añade `praetore.agent_profile` a los parámetros de la acción
   (el motor exige el constraint); falla cerrado si el archivo de perfil trae
-  una autoridad emitida para otro perfil; registra `claude.agent_id` y
-  `claude.session_id` en el contexto firmado si llegan.
+  una autoridad emitida para otro perfil o ninguna (home anterior a SAF-14);
+  registra `claude.agent_id` y `claude.session_id` en el contexto firmado si
+  llegan (PROPUESTA 3c); trata `main`/`unregistered` explícitos como
+  `unregistered` (PROPUESTA 3b).
+- Policy por defecto: las condiciones de contexto miran `profile`, no `agent`.
 - `verify`: cuenta por los nombres firmados; falla si el `agent`/`profile`
   sin firmar de la línea no coincide, si el perfil firmado no coincide con el
   constraint, o si la identidad que firmó no es la de `agents/<perfil>.json`;
-  imprime el agent id de cada perfil.
+  imprime el agent id de cada perfil. Los `agent_type` no registrados se
+  muestran como `unregistered(agent_type="…")` escapados a ASCII, para que
+  `"coder "` o una `о` cirílica no se lean como el perfil `coder`.
 - `export`: `index.json` toma `agent` y `profile` de lo firmado, añade
   `agent_id`, y se niega a exportar una línea cuyo campo sin firmar difiere.
-- `verify.sh`: los pasos 5 y 6 (con `check-attribution.py`) exigen que
-  `index.json` diga lo mismo que los recibos firmados (agente, perfil, agent
-  id), una identidad por perfil, y rechazan una copia re-atribuida.
+- `verify.sh`: el paso 3 falla ante cualquier entrada de `evidence/` que no
+  sea un archivo regular `*.json` no oculto, y `check-attribution.py` aplica
+  la misma regla, así que los dos leen el mismo conjunto (M1). Los pasos 5 y
+  6 exigen que `index.json` diga lo mismo que los recibos firmados (agente,
+  perfil, agent id), una identidad por perfil, y rechazan una copia
+  re-atribuida.
 - No cambia: el formato del recibo, `praetore-core`, `praetore-verify`,
   `praetore-mcp`, el gateway, la evidencia committeada.
 

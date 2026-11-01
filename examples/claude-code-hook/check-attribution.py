@@ -6,7 +6,9 @@ The agent name appears twice in a bundle: signed inside each receipt
 issuer-signed authority constraint praetore.agent_profile) and unsigned in
 index.json and in the file name. verify.sh runs this only after
 praetore-verify accepted every receipt, so the signed fields read here are
-authenticated; this script only compares them with the unsigned copies.
+authenticated; this script only compares them with the unsigned copies. Both
+accept only regular, non-hidden *.json files in evidence/ and fail on any
+other entry, so they read the same set of files.
 
 Usage: check-attribution.py <bundle> [index.json]
 Exits 0 when every entry agrees with its signed receipt, 1 otherwise.
@@ -25,7 +27,21 @@ def check(bundle, index_path):
     errors = []
     index = json.load(open(index_path))
     evidence_dir = os.path.join(bundle, "evidence")
-    on_disk = {"evidence/" + f for f in os.listdir(evidence_dir) if f.endswith(".json")}
+    # Same rule as step 3 of verify.sh, so this reads exactly the receipts
+    # praetore-verify checked: only regular, non-hidden *.json files. Any
+    # other entry (hidden file, directory, symlink, other name) fails.
+    on_disk = set()
+    with os.scandir(evidence_dir) as entries:
+        for entry in entries:
+            if (
+                entry.name.startswith(".")
+                or not entry.name.endswith(".json")
+                or entry.is_symlink()
+                or not entry.is_file(follow_symlinks=False)
+            ):
+                errors.append(f"evidence/{entry.name}: entrada no permitida (solo archivos regulares *.json no ocultos)")
+            else:
+                on_disk.add("evidence/" + entry.name)
     listed = collections.Counter(entry.get("file") for entry in index)
     for name in sorted(on_disk | set(listed), key=str):
         if listed[name] != 1 or name not in on_disk:
@@ -64,7 +80,11 @@ def check(bundle, index_path):
             issuer_bound[profile] += 1
         ids[profile].add(agent_id)
         profiles[agent_id].add(profile)
-        tally[(agent, evidence["decision"]["outcome"])] += 1
+        # Any agent_type outside a registered profile is shown escaped to
+        # ASCII under unregistered, so "coder " or a Cyrillic "о" cannot be
+        # read as the coder profile.
+        label = f"unregistered(agent_type={json.dumps(agent)})" if profile == UNREGISTERED else profile
+        tally[(label, evidence["decision"]["outcome"])] += 1
 
     # A bundle comes from one `init`: one identity per profile and vice versa.
     for profile, found in sorted(ids.items()):

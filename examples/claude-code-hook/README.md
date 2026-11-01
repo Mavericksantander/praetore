@@ -35,7 +35,11 @@ agente haga por otro camino queda fuera (ver Límites).
 | `unregistered` | ninguna |
 
 Cualquier otro `agent_type`, incluidos agentes incorporados como
-`general-purpose`, se evalúa con el perfil `unregistered`. Ese perfil no
+`general-purpose` y los nombres reservados `main` y `unregistered` cuando
+llegan explícitos (solo la ausencia de `agent_type` es la sesión principal),
+se evalúa con el perfil `unregistered`. También un `agent_id` o `session_id`
+que no es string ni número, o de más de 128 bytes UTF-8 (el recibo registra
+el motivo, no el valor). Ese perfil no
 tiene capacidades, así que toda solicitud se niega, pero con un recibo
 firmado que conserva el `agent_type` pedido. Así ninguna negación queda sin
 registrar.
@@ -166,6 +170,12 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
   la intención la firmó la clave de ese **perfil de agente**, que la
   autoridad la emitió el emisor pineado para esa clave, y bajo qué policy se
   decidió.
+- **Un home anterior a SAF-14 falla cerrado.** Si las autoridades no traen
+  `praetore.agent_profile`, el hook deniega cada llamada con un mensaje que
+  pide correr `init` en un directorio nuevo. Los recibos ya escritos siguen
+  verificando. `verify` compara cada recibo con el `agents/<perfil>.json`
+  actual: reemplazar o re-emitir ese archivo hace fallar los recibos
+  anteriores (los terceros verifican con los pins del bundle).
 - **Atribuye al perfil, no aísla.** La firma dice qué perfil (`agent_type`)
   pidió la acción, y con SAF-14 el emisor firma para qué perfil emitió cada
   identidad. Pero las claves de todos los perfiles y la del atestador viven

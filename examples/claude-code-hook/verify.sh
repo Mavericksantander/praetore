@@ -33,9 +33,19 @@ step "3. Verificar cada recibo: integridad, firma del atestador, autoridad pinea
 # Glob a un array, sin `ls | head`: con cientos de recibos, `head` cerraba el
 # pipe, `ls` recibía SIGPIPE y pipefail hacía salir el script con 141 aunque
 # todo hubiera verificado.
-shopt -s nullglob
-receipts=("$BUNDLE"/evidence/*.json)
-shopt -u nullglob
+# Con dotglob el glob incluye los archivos ocultos. Cualquier entrada que no
+# sea un archivo regular *.json no oculto hace fallar: así este paso y
+# check-attribution.py (paso 5, misma regla) leen exactamente los mismos
+# archivos y ninguno queda sin verificar.
+shopt -s nullglob dotglob
+receipts=("$BUNDLE"/evidence/*)
+shopt -u nullglob dotglob
+for entry in "${receipts[@]}"; do
+  name="$(basename "$entry")"
+  if [[ "$name" == .* || "$name" != *.json || -L "$entry" || ! -f "$entry" ]]; then
+    fail "evidence/$name: entrada no permitida (solo archivos regulares *.json no ocultos)"
+  fi
+done
 [ "${#receipts[@]}" -gt 0 ] || fail "el bundle no tiene recibos"
 for evidence in "${receipts[@]}"; do
   # --policy: praetore-verify exige que el recibo registre el digest de la

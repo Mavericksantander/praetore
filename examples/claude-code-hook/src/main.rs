@@ -99,9 +99,9 @@ struct HookInput {
     /// Claude Code's id for the subagent instance the hook fires in. It is
     /// recorded in the signed context; it does not select a key.
     #[serde(default)]
-    agent_id: Option<String>,
+    agent_id: Option<Value>,
     #[serde(default)]
-    session_id: Option<String>,
+    session_id: Option<Value>,
     #[serde(default)]
     cwd: Option<String>,
 }
@@ -246,7 +246,9 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
 
 fn default_policy(root: &str, home: &str) -> Policy {
     let subagents = SUBAGENTS.iter().map(|a| json!(a)).collect::<Vec<_>>();
-    let main_only = || PolicyCondition::exact("agent", json!(MAIN_AGENT));
+    // Conditions match the profile whose key signs, not the raw agent_type:
+    // an unregistered request may carry any agent_type, including `main`.
+    let main_only = || PolicyCondition::exact("profile", json!(MAIN_AGENT));
     Policy::new_v2(
         "claude-code-agents",
         1,
@@ -265,7 +267,7 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 "path",
                 format!("{root}/.claude"),
             ))
-            .with_context_condition(PolicyCondition::one_of("agent", subagents)),
+            .with_context_condition(PolicyCondition::one_of("profile", subagents)),
             PolicyRule::new(
                 "approval-main-governance-writes",
                 "claude:write",
@@ -535,17 +537,69 @@ fn hook_output(verdict: &Verdict) -> Option<Value> {
     }))
 }
 
+/// Instance and session ids as Claude Code reports them, ready for the
+/// signed context, or why one was rejected. A string is kept as is; a number
+/// becomes its canonical JSON text, so a future numeric id does not deny
+/// every call. The rejection names the key, the JSON type and the length,
+/// never the value.
+fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Value>) {
+    let mut claims = Vec::new();
+    for (key, value) in [
+        ("claude.agent_id", &input.agent_id),
+        ("claude.session_id", &input.session_id),
+    ] {
+        let text = match value {
+            None | Some(Value::Null) => continue,
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Number(number)) => number.to_string(),
+            Some(other) => {
+                let kind = match other {
+                    Value::Bool(_) => "boolean",
+                    Value::Array(_) => "array",
+                    _ => "object",
+                };
+                return (
+                    Vec::new(),
+                    Some(json!({ "key": key, "reason": "not a string or number", "type": kind })),
+                );
+            }
+        };
+        if text.len() > MAX_CLAIM_BYTES {
+            return (
+                Vec::new(),
+                Some(json!({
+                    "key": key,
+                    "reason": format!("longer than {MAX_CLAIM_BYTES} bytes (UTF-8)"),
+                    "bytes": text.len(),
+                })),
+            );
+        }
+        if !text.is_empty() {
+            claims.push((key, text));
+        }
+    }
+    (claims, None)
+}
+
 fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+    // Only the absence of `agent_type` is the main session. An explicit
+    // `main` (a subagent defined with `name: main`) or `unregistered` is a
+    // reserved name and is evaluated as `unregistered`.
     let agent = input.agent_type.as_deref().unwrap_or(MAIN_AGENT);
+    let reserved = input.agent_type.is_some() && (agent == MAIN_AGENT || agent == UNREGISTERED);
     if agent.len() > 64 {
         return Ok(denied(format!(
             "agent name longer than 64 bytes: {agent:?}"
         )));
     }
-    // Only a well-formed name can select a profile file; anything else, and
-    // any agent without an issued authority, is evaluated as `unregistered`.
+    let (claims, rejected_claim) = instance_claims(input);
+    // Only a well-formed name can select a profile file; anything else, any
+    // agent without an issued authority, and any request whose instance or
+    // session id is rejected, is evaluated as `unregistered`: no capability,
+    // so it is denied, with a signed receipt.
     let well_formed = !agent.is_empty()
-        && agent != UNREGISTERED
+        && !reserved
+        && rejected_claim.is_none()
         && agent
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
@@ -575,14 +629,23 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     }
     // A profile file copied over another (say `coder.*` saved as
     // `explorer.*`) would sign as the wrong agent; the issuer-signed profile
-    // name catches it. State created before this constraint has none.
-    if let Some(issued_for) = profile_constraint(&authority)
-        && issued_for != profile_name
-    {
-        return Err(format!(
-            "authority in profile '{profile_name}' was issued for profile '{issued_for}'"
-        )
-        .into());
+    // name catches it. State created before SAF-14 has no such name and
+    // cannot catch it, so it is refused (fail closed) until re-initialized.
+    match profile_constraint(&authority) {
+        Some(issued_for) if issued_for == profile_name => {}
+        Some(issued_for) => {
+            return Err(format!(
+                "authority in profile '{profile_name}' was issued for profile '{issued_for}'"
+            )
+            .into());
+        }
+        None => {
+            return Err(format!(
+                "hook state at {} predates SAF-14: the authority of profile '{profile_name}' does not name its profile ({PROFILE_CONSTRAINT}). Run `praetore-claude-hook init` into a new directory and point the hook at it; receipts already written still verify with `verify`",
+                directory.display()
+            )
+            .into());
+        }
     }
 
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
@@ -609,21 +672,12 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     if let Some(check) = path_check {
         request = request.with_context("praetore.path_check", check);
     }
-    // Instance and session ids as Claude Code reports them: signed claims
-    // made with the profile key, not separate keys (see SAF-14).
-    for (key, value) in [
-        ("claude.agent_id", &input.agent_id),
-        ("claude.session_id", &input.session_id),
-    ] {
-        match value.as_deref() {
-            Some(value) if value.len() > MAX_CLAIM_BYTES => {
-                return Ok(denied(format!("{key} longer than {MAX_CLAIM_BYTES} bytes")));
-            }
-            Some(value) if !value.is_empty() => {
-                request = request.with_context(key, json!(value));
-            }
-            _ => {}
-        }
+    // Signed claims made with the profile key, not separate keys (SAF-14).
+    for (key, value) in claims {
+        request = request.with_context(key, json!(value));
+    }
+    if let Some(rejected) = &rejected_claim {
+        request = request.with_context("praetore.claim_rejected", rejected.clone());
     }
     request.sign_intent(&key)?;
     let mut evidence = engine.evaluate(request)?;
@@ -633,10 +687,23 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
 
     append_receipt(directory, input, agent, profile_name, &evidence)?;
     let outcome = evidence.decision.outcome;
+    let reason = match &rejected_claim {
+        Some(rejected) => format!(
+            "{} {}; evaluated as '{UNREGISTERED}': {}",
+            rejected["key"].as_str().unwrap_or_default(),
+            rejected["reason"].as_str().unwrap_or_default(),
+            evidence.decision.reason
+        ),
+        None if reserved => format!(
+            "agent_type {agent:?} is reserved; evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
+        None => evidence.decision.reason.clone(),
+    };
     Ok(Verdict {
         outcome,
         rule: deciding_rules(&evidence),
-        reason: evidence.decision.reason.clone(),
+        reason,
     })
 }
 
@@ -704,6 +771,23 @@ struct Attribution {
     profile: String,
     /// The profile is also named in the issuer-signed authority.
     issuer_bound: bool,
+}
+
+impl Attribution {
+    /// How the summaries name the agent. A registered profile is shown by
+    /// its name (always `[a-z0-9_-]`). Any other `agent_type` is shown under
+    /// `unregistered`, escaped to ASCII, so `"coder "` or a Cyrillic `о`
+    /// cannot be read as the `coder` profile.
+    fn label(&self) -> String {
+        if self.profile == UNREGISTERED {
+            format!(
+                "unregistered(agent_type=\"{}\")",
+                self.agent.escape_default()
+            )
+        } else {
+            self.profile.clone()
+        }
+    }
 }
 
 /// Reads the attribution from the signed request context and checks it
@@ -806,8 +890,11 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
                 .join(format!("{}.json", attribution.profile));
             let profile: AgentProfile = serde_json::from_slice(&read_bounded(&profile_path)?)?;
             if AgentIdentity::from_json(&profile.identity.to_string())? != evidence.agent {
+                // The comparison is with the current file: replacing or
+                // re-issuing agents/<profile>.json makes the receipts signed
+                // before it fail here (third parties check pins instead).
                 return Err(format!(
-                    "signed by an identity that is not the one of profile '{}'",
+                    "signed by an identity that is not the current one in agents/{}.json (was that file replaced or re-issued after this receipt?)",
                     attribution.profile
                 )
                 .into());
@@ -818,10 +905,10 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
         match check() {
             Ok((attribution, agent_id, outcome)) => {
                 issuer_bound += usize::from(attribution.issuer_bound);
-                identities.insert(attribution.profile, agent_id);
                 *tally
-                    .entry((attribution.agent, format!("{outcome:?}")))
+                    .entry((attribution.label(), format!("{outcome:?}")))
                     .or_default() += 1;
+                identities.insert(attribution.profile, agent_id);
             }
             Err(error) => {
                 failures += 1;
@@ -830,7 +917,7 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
         }
     }
     for ((agent, outcome), count) in &tally {
-        println!("{agent:<9} {outcome:<16} {count}");
+        println!("{agent:<16} {outcome:<16} {count}");
     }
     for (profile, agent_id) in &identities {
         println!("profile {profile:<12} agent id {agent_id}");
@@ -1287,6 +1374,27 @@ mod tests {
             assert_eq!(attribution.profile, profile, "{file}");
             assert!(!attribution.issuer_bound, "{file}");
         }
+    }
+
+    #[test]
+    fn summaries_escape_unregistered_agent_types() {
+        let label = |agent: &str, profile: &str| {
+            Attribution {
+                agent: agent.into(),
+                profile: profile.into(),
+                issuer_bound: true,
+            }
+            .label()
+        };
+        assert_eq!(label("coder", "coder"), "coder");
+        assert_eq!(
+            label("c\u{43e}der", UNREGISTERED),
+            "unregistered(agent_type=\"c\\u{43e}der\")"
+        );
+        assert_eq!(
+            label("coder ", UNREGISTERED),
+            "unregistered(agent_type=\"coder \")"
+        );
     }
 
     #[test]

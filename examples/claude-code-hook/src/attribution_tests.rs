@@ -209,3 +209,123 @@ fn instance_and_session_ids_are_signed_claims() {
     .unwrap();
     assert_eq!(verdict.outcome, DecisionOutcome::Deny);
 }
+
+// Independent review of #79 (8108bbb): M2, B1 and B2.
+
+#[test]
+fn an_explicit_main_agent_type_is_not_the_main_session() {
+    // M2: a subagent defined with `name: main` arrives as agent_type "main".
+    let s = State::new("explicit-main");
+    let outside = json!({ "tool_input": { "file_path": "/etc/hosts" } });
+    let main = authorize(&s.state, &s.input(None, "Read", "x", outside.clone())).unwrap();
+    assert_eq!(main.outcome, DecisionOutcome::Allow, "{main:?}");
+    for reserved in ["main", "unregistered"] {
+        let verdict = authorize(
+            &s.state,
+            &s.input(Some(reserved), "Read", "x", outside.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            verdict.outcome,
+            DecisionOutcome::Deny,
+            "{reserved}: {verdict:?}"
+        );
+    }
+    let records = s.receipts();
+    assert_eq!(records.len(), 3, "every decision leaves a signed receipt");
+    let main_id = &records[0]["evidence"]["agent"]["id"];
+    for record in &records[1..] {
+        assert_eq!(record["evidence"]["context"]["profile"], "unregistered");
+        assert_ne!(&record["evidence"]["agent"]["id"], main_id);
+    }
+    assert_eq!(records[1]["evidence"]["context"]["agent"], "main");
+    verify_receipts(&s.state).unwrap();
+}
+
+#[test]
+fn a_home_without_the_profile_constraint_fails_closed() {
+    // B1: re-issue explorer's authority the way `init` did before SAF-14
+    // (no praetore.agent_profile), under a fresh issuer.
+    let s = State::new("legacy");
+    let agents = s.state.join(AGENTS_DIR);
+    let profile: Value =
+        serde_json::from_slice(&fs::read(agents.join("explorer.json")).unwrap()).unwrap();
+    let identity = AgentIdentity::from_json(&profile["identity"].to_string()).unwrap();
+    let now = OffsetDateTime::now_utc();
+    let validity = Validity {
+        not_before: Some((now - Duration::minutes(5)).format(&Rfc3339).unwrap()),
+        not_after: Some((now + Duration::days(30)).format(&Rfc3339).unwrap()),
+    };
+    let issuer = AgentKeyPair::from_secret_bytes(&random_secret().unwrap());
+    let mut authority = Authority::new(identity.id.clone(), ISSUER, vec!["fs:read".into()])
+        .with_validity(validity.clone());
+    authority.sign_for_agent(&issuer, &identity).unwrap();
+    let legacy = json!({ "identity": profile["identity"], "authority": authority });
+    fs::write(agents.join("explorer.json"), legacy.to_string()).unwrap();
+    let pin = TrustedAuthorityIssuer::new(ISSUER, issuer.public_key())
+        .unwrap()
+        .with_validity(validity)
+        .unwrap();
+    fs::write(
+        s.state.join(ISSUER_PIN_FILE),
+        pin.export_pin_json().unwrap(),
+    )
+    .unwrap();
+
+    let result = authorize(
+        &s.state,
+        &s.input(Some("explorer"), "Read", "README.md", json!({})),
+    );
+    let error = match result {
+        Ok(verdict) => panic!("a pre-SAF-14 home still evaluated: {verdict:?}"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("init"), "{error}");
+}
+
+#[test]
+fn instance_ids_that_are_not_strings_or_too_long_are_denied_with_a_receipt() {
+    // B2.
+    let s = State::new("claims");
+    // A numeric id is kept as its canonical text instead of denying.
+    let numeric = json!({ "agent_id": 123, "session_id": 7 });
+    let verdict = authorize(
+        &s.state,
+        &s.input(Some("explorer"), "Read", "README.md", numeric),
+    )
+    .unwrap();
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow, "{verdict:?}");
+    // An object, and 43 three-byte characters (129 bytes), are denied.
+    let cases = [
+        json!({ "agent_id": { "nested": "secret-value" } }),
+        json!({ "session_id": "\u{20ac}".repeat(43) }),
+    ];
+    for extra in cases {
+        let verdict = authorize(
+            &s.state,
+            &s.input(Some("explorer"), "Read", "README.md", extra),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{verdict:?}");
+    }
+    let records = s.receipts();
+    assert_eq!(records.len(), 3, "each denial leaves a signed receipt");
+    assert_eq!(records[0]["evidence"]["context"]["claude.agent_id"], "123");
+    assert_eq!(records[0]["evidence"]["context"]["claude.session_id"], "7");
+    for record in &records[1..] {
+        let context = &record["evidence"]["context"];
+        assert_eq!(context["profile"], "unregistered");
+        assert!(context["praetore.claim_rejected"].is_object(), "{context}");
+        // The rejected value itself is not recorded.
+        let text = record.to_string();
+        assert!(
+            !text.contains("secret-value") && !text.contains('\u{20ac}'),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        records[2]["evidence"]["context"]["praetore.claim_rejected"]["bytes"],
+        129
+    );
+    verify_receipts(&s.state).unwrap();
+}

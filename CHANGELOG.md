@@ -25,8 +25,23 @@
   now fails closed instead of signing as the other agent). Claude Code's
   `agent_id` and `session_id`, when present, are recorded in the signed
   context (over 128 bytes: deny). `index.json` gains `agent_id`. The receipt
-  format does not change; existing state and the committed evidence sets
-  still verify. New `test-attribution.sh` (in CI).
+  format does not change; the committed evidence sets still verify. New
+  `test-attribution.sh` (in CI).
+- `examples/claude-code-hook`, fixes from the independent review of #79:
+  `verify.sh` and `check-attribution.py` accept in `evidence/` only regular,
+  non-hidden `*.json` files and fail on anything else. Before, a hidden
+  `evidence/.X.json` with broken signatures skipped `praetore-verify` (the
+  bash glob ignores dotfiles) but was counted in the attribution (exit 0).
+  An explicit `agent_type: "main"` (a subagent named `main`) no longer gets
+  the main session's profile; explicit `main` and `unregistered` are
+  evaluated as `unregistered` (Deny, signed receipt), and the default
+  policy's context conditions match the signing `profile` instead of the raw
+  `agent`. State created before the `praetore.agent_profile` constraint now
+  fails closed with a message to re-run `init`. A numeric `agent_id` or
+  `session_id` is recorded as its canonical text; one that is not a string
+  or number, or over 128 bytes, is denied under `unregistered` with a signed
+  receipt that records the reason in `praetore.claim_rejected`, not the
+  value. Summaries show unregistered `agent_type` values escaped to ASCII.
 
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
