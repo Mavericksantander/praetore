@@ -2,6 +2,116 @@
 
 ## Unreleased
 
+- **Breaking (journal chain format):** the journal export gains signed
+  storage records. Adopting a legacy baseline writes a record signed with
+  the evidence attester key into `praetore.storage_records` (migration
+  0015, append-only) in the adoption transaction; adoption without a signer
+  is refused (`MigrationError::AdoptionRequiresSigner`). `praetore
+  journal-export --database` exports them as a database-level chain
+  (`record` lines), and a tenant export of a database with records starts
+  with a `database_head` reference to that chain. `praetore-verify journal`
+  verifies both, and `--database-journal`/`--expected-database-head` check
+  the reference. Chains without records are unchanged; older verifiers
+  refuse chains with the new lines. See
+  `docs/proposals/journal-chain-jsonl.md`.
+- Migration checks accept event triggers and global revoke-only default
+  privileges only when listed explicitly (`PRAETORE_TRUSTED_EVENT_TRIGGERS`,
+  `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES`; off by default; listed event
+  triggers are verified at startup and refused if they cannot be). Default
+  privileges in schemas other than `praetore` are no longer considered.
+  Relaxations are logged at startup and reported by `praetore doctor`.
+  `docs/operations.md` documents them and recommends
+  `PRAETORE_RUNTIME_LOGINS` in production.
+- **Breaking:** an existing `praetore` schema without migration records is
+  no longer adopted silently. `apply_migrations` refuses it
+  (`MigrationError::LegacyBaselineNotAdopted`). Adoption is explicit:
+  `PRAETORE_ADOPT_LEGACY_BASELINE=1` for the gateway service,
+  `praetore run <directory> --adopt-legacy-baseline` (or the same variable)
+  for the CLI, `apply_migrations_with` and `MigrationOptions` in the
+  library. An adoption is recorded in `praetore.schema_migrations`
+  (`adopted_legacy_baseline`, `adopted_by`, `baseline_structure_sha256`,
+  with `applied_at`), returned by `legacy_baseline_adoption`, logged by the
+  gateway service and printed by `praetore doctor`. The record is
+  informative and not tamper-evident; `baseline_structure_sha256` identifies
+  the compared 0001-0009 structure for the server version, not the
+  database. `praetore doctor` flags the most direct inconsistency
+  (`migration_record_inconsistency`). Fresh databases and databases with
+  migration records are unaffected.
+- `apply_migrations` compares the `praetore` structure with a scratch apply
+  of the recorded migrations on every run (before migrating forward and
+  after applying), checks owners on every run, and runs migrations as the
+  schema owner when it is a NOLOGIN group of the migrating role
+  (`MigrationError::SchemaDrift`, `MigrationError::InvalidConfiguration`).
+- `verify_runtime_role` also checks ownership of every `praetore` object,
+  members of the schema owner (allowed only through
+  `PRAETORE_SCHEMA_OWNER_MEMBERS`), non-superuser members of
+  `pg_read_all_data`/`pg_write_all_data`, objects elsewhere that depend on
+  `praetore`, `WITH GRANT OPTION`, the exact documented `praetore_observe`
+  columns, and SECURITY DEFINER functions with the owner's rights that any
+  other role may execute. Other login members of `praetore_runtime` are
+  reported at startup and by `praetore doctor`, and refused when
+  `PRAETORE_RUNTIME_LOGINS` lists the allowed ones.
+- `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS` entries must be
+  schema-qualified with their signature; they are resolved by OID, an
+  entry that does not resolve is a configuration error, superuser-owned
+  ones are logged with a warning, and `praetore run` reads the variable.
+- `docs/threat-model.md` describes the trust perimeter of these checks.
+- `apply_migrations` checks the database environment on every run, fresh,
+  adopted or current (`MigrationError::UnsafeDatabase`).
+  `verify_runtime_role` checks schema ACLs (`RuntimeRoleError::UnexpectedGrant`):
+  only the grants the migrations make and the documented `praetore_observe`
+  shape are accepted. SECURITY DEFINER functions with the owner's rights are
+  refused unless listed in `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`
+  (semicolon-separated; logged at startup).
+- The 0009 baseline check in `praetore-replay-postgres` (a `praetore`
+  schema without migration records, recorded as 0001-0009 without running
+  them) now compares the live schema with 0001-0009 applied by the same
+  server, not names. In a transaction that is always rolled back, 0001-0009
+  run in a scratch schema (schema name rewritten; the `praetore.tenant_id`
+  setting is kept), and a canonical dump of both schemas must be identical:
+  relations (kind, RLS and FORCE RLS, owner, ACL, index and view
+  definitions), columns (type, NOT NULL, default, identity, collation,
+  column ACL), constraints (`pg_get_constraintdef`), functions (`prosrc`,
+  result, language, SECURITY DEFINER, `SET search_path`, volatility,
+  STRICT, LEAKPROOF, parallel, owner, ACL; overloads are separate),
+  triggers (`pg_get_triggerdef`, enabled, internal triggers), RLS policies
+  (command, roles, USING, WITH CHECK), rewrite rules, inheritance and
+  partitions, types, other objects in the schema, and objects in other
+  schemas that depend on it. The schema owner must be the migrating role
+  or one it is a member of; event triggers, default privileges for the
+  schema or owner, and per-database or per-role `search_path`,
+  `row_security` or `session_replication_role` settings are refused. Any
+  difference refuses the migration and names the objects
+  (`MigrationError::UnrecognizedSchema` now carries a `String`).
+- The migration runner sends every statement with
+  `search_path = pg_catalog, pg_temp` (the caller's value is restored) and
+  catalog names qualified. It refuses a session with
+  `session_replication_role` other than `origin`
+  (`MigrationError::UnsafeSession`), fresh database or not.
+- `crates/praetore-replay-postgres/migrations/.gitattributes` keeps the
+  migrations LF (`*.sql text eol=lf`): their bytes are checksummed and
+  compared.
+- `verify_runtime_role` also refuses
+  (`RuntimeRoleError::OwnerFunctionExecutable`) a SECURITY DEFINER function
+  outside `pg_catalog`/`information_schema` that runs with the praetore
+  owner's rights and that the runtime role may execute.
+- The baseline check also refuses SECURITY DEFINER functions outside
+  `praetore` that run with the owner's rights; any role that can act as the
+  owner other than the migrating role and NOLOGIN groups it belongs to (the
+  owner must be the migrating role or such a group); `FOR ALL TABLES` and
+  `TABLES IN SCHEMA praetore` publications. The dump adds sequence
+  parameters, index flags (`indisvalid`, `indisready`, `indislive`,
+  `indimmediate`), `relhastriggers`, `relhasrules`, replica identity, access
+  method and the column collation with its schema. The comparison and the
+  recording of 0001-0009 now run in one transaction with the praetore
+  tables locked, and a failing comparison names the server's error.
+- Limits of the baseline check: it inspects an untrusted database from
+  inside it and is best effort. It is structural only (stored rows are not
+  validated; a legitimate `VALIDATE CONSTRAINT` on the `NOT VALID` foreign
+  keys is refused), and it cannot defend against a superuser who edits the
+  system catalogs directly.
+- New ignored PostgreSQL tests, run in CI with `--exact`, one per case
+  above.
 - **Breaking (engine, Development mode): no `action_type` fallback for rule
   capabilities.** In Development, a matching `Allow` or `RequireApproval`
   rule without `required_capability` was still applied when the authority

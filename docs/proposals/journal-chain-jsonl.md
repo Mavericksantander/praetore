@@ -35,6 +35,51 @@ límites de "Qué NO prueba", que siguen vigentes.
     claves duplicadas y campos desconocidos.
 - Cada `evidence_id` aparece una sola vez en el archivo.
 
+## Storage records and the database chain (format v1, extension)
+
+Facts about the journal database itself, today only the adoption of a legacy
+0001-0009 schema (`kind: "legacy_baseline_adopted"`), are signed **storage
+records**. The migration runner writes one in the same transaction as the
+adoption, into `praetore.storage_records` (migration 0015, append-only by
+trigger), signed with the evidence attester key that the binary passes in
+(`MigrationOptions::record_signer`). Without a signer, adoption is refused.
+
+- A `StorageRecord` v1 is a JSON object with exactly `schema_version` (1),
+  `kind`, `record_id`, `recorded_at` (RFC 3339), `database`,
+  `database_oid`, `recorded_by`, `migrations` (`[{version, checksum}]`),
+  `structure_sha256`, `key_id` (the attester key id), `record_hash` and
+  `signature`. The payload is every field but the last two, as compact JSON
+  in that order; `record_hash = hex(SHA-256("PRAETORE_STORAGE_RECORD_V1\0" ||
+  payload))` and `signature = hex(Ed25519("PRAETORE_STORAGE_RECORD_V1\0" ||
+  payload))`.
+- **Database chain** (`praetore journal-export --database --attester-pin
+  HEX_FILE --output NEW`): the storage records in `(created_at, record_id)`
+  order. Each line is `{"seq","prev","record"}`, with the record link
+  `SHA-256("PRAETORE_JOURNAL_RECORD_V1\0" || u64_be(seq) || ascii(prev) ||
+  ascii(record_hash) || ascii(signature))`.
+- **Tenant chain** (`--tenant UUID`): when the database has storage records,
+  its first line is a reference to the database chain read in the same
+  snapshot: `{"seq":0,"prev":"<64 zeros>","database_head":{"schema_version":1,
+  "entries":N,"head":"<64 hex>"}}`, with link
+  `SHA-256("PRAETORE_JOURNAL_DATABASE_HEAD_V1\0" || u64_be(seq) ||
+  ascii(prev) || ascii(head) || u64_be(entries))`. The receipts follow, as
+  before. Without storage records the tenant chain is exactly the v1 format.
+- Every line has exactly one of `evidence`, `record` or `database_head`. A
+  chain holds either records only (database chain) or receipts with an
+  optional first-line reference (tenant chain); anything else is refused
+  (`JOURNAL_CHAIN_FAIL`). Each kind has its own link domain, so a record
+  line cannot stand in for a receipt line.
+- `praetore-verify journal` verifies both kinds (record hash and signature
+  against the attester pin, `record_id` unique). With `--database-journal
+  JSONL` (verified too) or `--expected-database-head HEX`, a tenant chain
+  must carry a matching reference (`JOURNAL_HEAD_MISMATCH` otherwise).
+- **Compatibility.** Chains without storage records or references are
+  unchanged and verify as before. Verifiers older than this extension refuse
+  chains that contain `record` or `database_head` lines (`INVALID_REQUEST`):
+  fail closed. The limits of "Qué NO prueba" apply equally to the database
+  chain: removing a record from the middle is detected only if the chain is
+  not recomputed, or with an anchored head.
+
 ## Link
 
 ```

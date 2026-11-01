@@ -37,18 +37,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // superuser, BYPASSRLS or write-capable role, and a session in which
     // triggers or row-level security could be switched off. It runs once,
     // at startup; queries pin their search_path per transaction regardless.
-    let allow_settings_env = praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV;
-    let options = praetore_replay_postgres::RuntimeRoleOptions::from_allow_settings(
-        &env::var(allow_settings_env).unwrap_or_default(),
-    )?;
+    let options =
+        praetore_replay_postgres::RuntimeRoleOptions::from_config(|name| env::var(name).ok())?;
     let relaxed = options.relaxed();
     if relaxed.is_empty() {
         tracing::info!("runtime role check: no refusal relaxed");
     } else {
         tracing::warn!(
             ?relaxed,
-            "runtime role check relaxed by {allow_settings_env}"
+            trusted_security_definer = ?options.trusted_security_definer(),
+            "runtime role check relaxed explicitly"
         );
+    }
+    for function in
+        praetore_replay_postgres::describe_trusted_security_definer(&mut client, &options)?
+    {
+        if function.owner_is_superuser {
+            tracing::warn!(
+                function = %function.resolved,
+                owner = %function.owner,
+                "trusted SECURITY DEFINER function is owned by a superuser"
+            );
+        }
     }
     praetore_replay_postgres::verify_runtime_role_with(&mut client, &options)?;
     let reader = Arc::new(PostgresObservabilityReader::from_client(client)?);

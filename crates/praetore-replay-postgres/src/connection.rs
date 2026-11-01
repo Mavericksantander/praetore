@@ -392,6 +392,22 @@ pub enum RuntimeRoleError {
     /// collation outside `pg_catalog` and `praetore`, so its behaviour is
     /// defined by whoever owns that schema.
     ForeignDependency(String),
+    /// The role may execute a SECURITY DEFINER function that runs with the
+    /// rights of the `praetore` schema owner.
+    OwnerFunctionExecutable(String),
+    /// A privilege on the `praetore` schema or an object in it that neither
+    /// the owner nor the migrations grant (see `unexpected_grants`).
+    UnexpectedGrant(String),
+    /// An object in `praetore` is not owned by the schema owner.
+    MixedOwnership(String),
+    /// A role other than the explicitly allowed ones can act as the
+    /// praetore owner, read or write all data, or use praetore_runtime.
+    UnexpectedMember(String),
+    /// An object outside `praetore` depends on a praetore relation,
+    /// function or type (a view, rule, trigger, constraint or function).
+    ExternalDependent(String),
+    /// A runtime option could not be applied.
+    InvalidConfiguration(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -427,6 +443,27 @@ impl fmt::Display for RuntimeRoleError {
                 f,
                 "runtime database session is exposed to {setting}; the append-only triggers, \
                  row-level security or name resolution could be changed"
+            ),
+            Self::MixedOwnership(objects) => write!(
+                f,
+                "praetore objects are not all owned by the schema owner: {objects}"
+            ),
+            Self::UnexpectedMember(members) => write!(f, "unexpected role membership: {members}"),
+            Self::ExternalDependent(objects) => write!(
+                f,
+                "objects outside praetore depend on praetore objects: {objects}"
+            ),
+            Self::InvalidConfiguration(reason) => {
+                write!(f, "invalid runtime role configuration: {reason}")
+            }
+            Self::UnexpectedGrant(grants) => write!(
+                f,
+                "praetore objects carry grants the migrations do not make: {grants}"
+            ),
+            Self::OwnerFunctionExecutable(function) => write!(
+                f,
+                "runtime database role may execute SECURITY DEFINER function(s) {function} \
+                 that run with the rights of the praetore schema owner"
             ),
             Self::ExcessTablePrivilege(role) => write!(
                 f,
@@ -474,6 +511,9 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeRoleOptions {
     allow_search_path: bool,
+    trusted_security_definer: Vec<String>,
+    runtime_logins: Vec<String>,
+    schema_owner_members: Vec<String>,
 }
 
 impl RuntimeRoleOptions {
@@ -506,14 +546,201 @@ impl RuntimeRoleOptions {
         Ok(options)
     }
 
+    /// Environment variable the gateway and praetore-observe read for
+    /// trusted SECURITY DEFINER functions (semicolon-separated
+    /// `regprocedure` names, for example `public.helper(integer)`).
+    pub const TRUSTED_SECURITY_DEFINER_ENV: &'static str =
+        "PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS";
+
+    /// Trusts the SECURITY DEFINER functions named in `value`
+    /// (semicolon-separated `regprocedure` names): they are not reported by
+    /// the owner-rights check. Nothing is trusted by default.
+    pub fn with_trusted_security_definer(mut self, value: &str) -> Self {
+        self.trusted_security_definer = split_names(value, ';');
+        self
+    }
+
+    /// Environment variable for `with_runtime_logins` (comma-separated
+    /// exact role names).
+    pub const RUNTIME_LOGINS_ENV: &'static str = "PRAETORE_RUNTIME_LOGINS";
+    /// Environment variable for `with_schema_owner_members` (comma-separated
+    /// exact role names).
+    pub const SCHEMA_OWNER_MEMBERS_ENV: &'static str = "PRAETORE_SCHEMA_OWNER_MEMBERS";
+
+    /// The login roles allowed to be members of `praetore_runtime`. When
+    /// set, any other login member is refused; when empty, other login
+    /// members are only reported (`runtime_role_members`), because
+    /// `praetore_runtime` is a cluster-wide role shared by every instance
+    /// and database.
+    pub fn with_runtime_logins(mut self, value: &str) -> Self {
+        self.runtime_logins = split_names(value, ',');
+        self
+    }
+
+    /// Roles allowed to be members of the praetore schema owner (for
+    /// example the migrating role of a NOLOGIN owner group). Any other
+    /// member is refused; none is allowed by default.
+    pub fn with_schema_owner_members(mut self, value: &str) -> Self {
+        self.schema_owner_members = split_names(value, ',');
+        self
+    }
+
+    /// The trusted SECURITY DEFINER functions, for the startup log.
+    pub fn trusted_security_definer(&self) -> &[String] {
+        &self.trusted_security_definer
+    }
+
+    /// All runtime-role options from configuration values (the binaries
+    /// pass their environment): `PRAETORE_RUNTIME_ALLOW_SETTINGS`,
+    /// `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`,
+    /// `PRAETORE_RUNTIME_LOGINS` and `PRAETORE_SCHEMA_OWNER_MEMBERS`. The
+    /// library itself reads no environment.
+    pub fn from_config(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let value = |name: &str| lookup(name).unwrap_or_default();
+        Ok(Self::from_allow_settings(&value(Self::ALLOW_SETTINGS_ENV))?
+            .with_trusted_security_definer(&value(Self::TRUSTED_SECURITY_DEFINER_ENV))
+            .with_runtime_logins(&value(Self::RUNTIME_LOGINS_ENV))
+            .with_schema_owner_members(&value(Self::SCHEMA_OWNER_MEMBERS_ENV)))
+    }
+
     /// The relaxed refusals, for the startup log.
     pub fn relaxed(&self) -> Vec<&'static str> {
         let mut relaxed = Vec::new();
         if self.allow_search_path {
             relaxed.push("search_path");
         }
+        if !self.trusted_security_definer.is_empty() {
+            relaxed.push("trusted SECURITY DEFINER functions");
+        }
+        if !self.schema_owner_members.is_empty() {
+            relaxed.push("schema owner members");
+        }
         relaxed
     }
+}
+
+fn split_names(value: &str, separator: char) -> Vec<String> {
+    value
+        .split(separator)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A trusted SECURITY DEFINER function, resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedSecurityDefiner {
+    /// The configured entry.
+    pub name: String,
+    /// The function it resolved to, as `regprocedure` renders it.
+    pub resolved: String,
+    pub oid: u32,
+    pub owner: String,
+    pub owner_is_superuser: bool,
+}
+
+/// Resolves trusted SECURITY DEFINER entries with `to_regprocedure` under
+/// `pg_catalog, pg_temp`, so aliases (`int4` and `integer`) resolve alike.
+/// Every entry must be schema-qualified with a full signature
+/// (`schema.name(argtypes)`) and must resolve; otherwise it is a
+/// configuration error.
+pub(crate) fn resolve_trusted_security_definer(
+    transaction: &mut impl postgres::GenericClient,
+    names: &[String],
+) -> Result<Vec<TrustedSecurityDefiner>, String> {
+    let mut resolved = Vec::new();
+    for name in names {
+        let qualified = name
+            .split_once('(')
+            .is_some_and(|(function, _)| function.contains('.'))
+            && name.ends_with(')');
+        if !qualified {
+            return Err(format!(
+                "trusted SECURITY DEFINER function {name:?} must be schema-qualified with its \
+                 full signature, e.g. public.helper(integer)"
+            ));
+        }
+        let row = transaction
+            .query_one(
+                "SELECT f.oid::pg_catalog.regprocedure::pg_catalog.text, f.oid, \
+                        pg_catalog.pg_get_userbyid(p.proowner)::pg_catalog.text, r.rolsuper \
+                 FROM (SELECT pg_catalog.to_regprocedure($1)::pg_catalog.oid AS oid) f \
+                 LEFT JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) f.oid \
+                 LEFT JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) p.proowner",
+                &[name],
+            )
+            .map_err(|error| format!("cannot resolve {name:?}: {error}"))?;
+        let Some(text) = row.get::<_, Option<String>>(0) else {
+            return Err(format!(
+                "trusted SECURITY DEFINER function {name:?} does not exist"
+            ));
+        };
+        resolved.push(TrustedSecurityDefiner {
+            name: name.clone(),
+            resolved: text,
+            oid: row.get(1),
+            owner: row.get(2),
+            owner_is_superuser: row.get(3),
+        });
+    }
+    Ok(resolved)
+}
+
+/// Resolves the trusted SECURITY DEFINER functions of `options` for the
+/// startup log (the binaries warn about those owned by a superuser).
+pub fn describe_trusted_security_definer(
+    client: &mut Client,
+    options: &RuntimeRoleOptions,
+) -> Result<Vec<TrustedSecurityDefiner>, RuntimeRoleError> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let resolved =
+        resolve_trusted_security_definer(&mut transaction, &options.trusted_security_definer)
+            .map_err(RuntimeRoleError::InvalidConfiguration);
+    transaction.rollback()?;
+    resolved
+}
+
+/// Login members of `praetore_runtime` other than this session's roles, for
+/// the startup log and `praetore doctor`.
+pub fn runtime_role_members(client: &mut Client) -> Result<Vec<String>, RuntimeRoleError> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let members = other_runtime_logins(&mut transaction)?;
+    transaction.rollback()?;
+    Ok(members)
+}
+
+fn other_runtime_logins(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Vec<String>, RuntimeRoleError> {
+    Ok(transaction
+        .query(
+            "WITH RECURSIVE members(role) AS ( \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) m.roleid \
+                 WHERE g.rolname OPERATOR(pg_catalog.=) 'praetore_runtime' \
+                 UNION \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN members ON m.roleid OPERATOR(pg_catalog.=) members.role) \
+             SELECT r.rolname::pg_catalog.text FROM members \
+             JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) members.role \
+             WHERE r.rolcanlogin \
+               AND r.rolname OPERATOR(pg_catalog.<>) SESSION_USER \
+               AND r.rolname OPERATOR(pg_catalog.<>) CURRENT_USER \
+             ORDER BY 1",
+            &[],
+        )?
+        .iter()
+        .map(|row| row.get(0))
+        .collect())
 }
 
 /// `verify_runtime_role` with explicitly relaxed refusals.
@@ -612,6 +839,21 @@ fn verify_runtime_role_in(
         if row.get::<_, bool>(3) {
             return Err(RuntimeRoleError::ExcessTablePrivilege(role));
         }
+    }
+    if let Some(function) = owner_function_executable(transaction, options)? {
+        return Err(RuntimeRoleError::OwnerFunctionExecutable(function));
+    }
+    if let Some(grants) = unexpected_grants(transaction)? {
+        return Err(RuntimeRoleError::UnexpectedGrant(grants));
+    }
+    if let Some(objects) = mixed_ownership(transaction)? {
+        return Err(RuntimeRoleError::MixedOwnership(objects));
+    }
+    if let Some(members) = unexpected_members(transaction, options)? {
+        return Err(RuntimeRoleError::UnexpectedMember(members));
+    }
+    if let Some(objects) = external_dependents(transaction)? {
+        return Err(RuntimeRoleError::ExternalDependent(objects));
     }
     Ok(())
 }
@@ -768,6 +1010,312 @@ fn unsafe_runtime_setting(
         }
     }
     Ok(None)
+}
+
+/// Every privilege on the `praetore` schema, its relations (sequences and
+/// views included), their columns and its functions, against what the
+/// migrations intend: the object owner's own; `praetore_runtime`'s grants
+/// from 0011 (schema USAGE; SELECT on `schema_migrations` and
+/// `execution_journal_events`; SELECT and INSERT on `replay_claims`,
+/// `execution_journal`, `execution_attestations`, `human_approvals` and
+/// `human_approval_expirations`; SELECT on `storage_records` (0015);
+/// UPDATE of `execution_status`,
+/// `output_json`, `not_dispatched_reason` and `updated_at`); the
+/// documented `praetore_observe` shape exactly (schema USAGE; column SELECT
+/// on the ten `execution_journal` and seven `execution_journal_events`
+/// columns of docs/observability-mvp.md); and PUBLIC EXECUTE on functions
+/// that are not SECURITY DEFINER. No grant other than the owner's may carry
+/// WITH GRANT OPTION. Anything
+/// else, for example a grant made through `ALTER DEFAULT PRIVILEGES` before
+/// the first migration, is reported (up to ten entries).
+fn unexpected_grants(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH ns AS (SELECT n.oid, n.nspowner, n.nspacl FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         entries(object, kind, rel, col, owner, grantee, privilege, secdef, grantable) AS ( \
+             SELECT 'schema praetore', 'n', ''::pg_catalog.text, ''::pg_catalog.text, \
+                    ns.nspowner, a.grantee, a.privilege_type, false, a.is_grantable \
+             FROM ns CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(ns.nspacl, pg_catalog.acldefault('n', ns.nspowner))) a \
+             UNION ALL \
+             SELECT pg_catalog.concat('relation praetore.', c.relname), 'r', \
+                    c.relname::pg_catalog.text, ''::pg_catalog.text, \
+                    c.relowner, a.grantee, a.privilege_type, false, a.is_grantable \
+             FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(c.relacl, pg_catalog.acldefault( \
+                 CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'S' THEN 's' ELSE 'r' END::pg_catalog.\"char\", \
+                 c.relowner))) a \
+             WHERE NOT (c.relkind OPERATOR(pg_catalog.=) 'i' OR c.relkind OPERATOR(pg_catalog.=) 'I' \
+                        OR c.relkind OPERATOR(pg_catalog.=) 'c' OR c.relkind OPERATOR(pg_catalog.=) 't') \
+             UNION ALL \
+             SELECT pg_catalog.concat('column praetore.', c.relname, '.', att.attname), 'c', \
+                    c.relname::pg_catalog.text, att.attname::pg_catalog.text, \
+                    c.relowner, a.grantee, a.privilege_type, false, a.is_grantable \
+             FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid \
+             JOIN pg_catalog.pg_attribute att ON att.attrelid OPERATOR(pg_catalog.=) c.oid \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) a \
+             WHERE att.attacl IS NOT NULL \
+             UNION ALL \
+             SELECT pg_catalog.concat('function ', p.oid::pg_catalog.regprocedure), 'f', \
+                    ''::pg_catalog.text, ''::pg_catalog.text, \
+                    p.proowner, a.grantee, a.privilege_type, p.prosecdef, a.is_grantable \
+             FROM ns JOIN pg_catalog.pg_proc p ON p.pronamespace OPERATOR(pg_catalog.=) ns.oid \
+             CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) a), \
+         runtime_allowed(kind, rel, col, privilege) AS (VALUES \
+             ('n', '', '', 'USAGE'), \
+             ('r', 'schema_migrations', '', 'SELECT'), \
+             ('r', 'storage_records', '', 'SELECT'), \
+             ('r', 'replay_claims', '', 'SELECT'), ('r', 'replay_claims', '', 'INSERT'), \
+             ('r', 'execution_journal', '', 'SELECT'), ('r', 'execution_journal', '', 'INSERT'), \
+             ('r', 'execution_journal_events', '', 'SELECT'), \
+             ('r', 'execution_attestations', '', 'SELECT'), \
+             ('r', 'execution_attestations', '', 'INSERT'), \
+             ('r', 'human_approvals', '', 'SELECT'), ('r', 'human_approvals', '', 'INSERT'), \
+             ('r', 'human_approval_expirations', '', 'SELECT'), \
+             ('r', 'human_approval_expirations', '', 'INSERT'), \
+             ('c', 'execution_journal', 'execution_status', 'UPDATE'), \
+             ('c', 'execution_journal', 'output_json', 'UPDATE'), \
+             ('c', 'execution_journal', 'not_dispatched_reason', 'UPDATE'), \
+             ('c', 'execution_journal', 'updated_at', 'UPDATE')), \
+         observe_allowed(rel, col) AS (VALUES \
+             ('execution_journal', 'tenant_id'), ('execution_journal', 'agent_id'), \
+             ('execution_journal', 'request_id'), ('execution_journal', 'request_digest'), \
+             ('execution_journal', 'action_digest'), \
+             ('execution_journal', 'authorization_status'), \
+             ('execution_journal', 'execution_status'), ('execution_journal', 'evidence_json'), \
+             ('execution_journal', 'created_at'), ('execution_journal', 'updated_at'), \
+             ('execution_journal_events', 'event_id'), ('execution_journal_events', 'tenant_id'), \
+             ('execution_journal_events', 'agent_id'), ('execution_journal_events', 'request_id'), \
+             ('execution_journal_events', 'from_status'), \
+             ('execution_journal_events', 'to_status'), \
+             ('execution_journal_events', 'occurred_at')), \
+         unexpected AS ( \
+             SELECT pg_catalog.concat(e.object, ': ', e.privilege, \
+                        CASE WHEN e.grantable THEN ' WITH GRANT OPTION' ELSE '' END, ' to ', \
+                        CASE WHEN e.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' \
+                             ELSE pg_catalog.pg_get_userbyid(e.grantee)::pg_catalog.text END) AS entry \
+             FROM entries e \
+             LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid OPERATOR(pg_catalog.=) e.grantee \
+             WHERE NOT ( \
+                 e.grantee OPERATOR(pg_catalog.=) e.owner \
+                 OR (e.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                     AND e.kind OPERATOR(pg_catalog.=) 'f' \
+                     AND e.privilege OPERATOR(pg_catalog.=) 'EXECUTE' AND NOT e.secdef \
+                     AND NOT e.grantable) \
+                 OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_runtime' AND NOT e.grantable \
+                     AND EXISTS (SELECT 1 FROM runtime_allowed ra \
+                                 WHERE ra.kind OPERATOR(pg_catalog.=) e.kind \
+                                   AND ra.rel OPERATOR(pg_catalog.=) e.rel \
+                                   AND ra.col OPERATOR(pg_catalog.=) e.col \
+                                   AND ra.privilege OPERATOR(pg_catalog.=) e.privilege)) \
+                 OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_observe' AND NOT e.grantable \
+                     AND ((e.kind OPERATOR(pg_catalog.=) 'n' \
+                           AND e.privilege OPERATOR(pg_catalog.=) 'USAGE') \
+                          OR (e.kind OPERATOR(pg_catalog.=) 'c' \
+                              AND e.privilege OPERATOR(pg_catalog.=) 'SELECT' \
+                              AND EXISTS (SELECT 1 FROM observe_allowed oa \
+                                          WHERE oa.rel OPERATOR(pg_catalog.=) e.rel \
+                                            AND oa.col OPERATOR(pg_catalog.=) e.col)))))) \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT entry FROM unexpected ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
+/// Objects in `praetore` (relations, functions, types) not owned by the
+/// schema owner. Up to ten entries.
+fn mixed_ownership(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH ns AS (SELECT n.oid, n.nspowner FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         objects(entry) AS ( \
+             SELECT pg_catalog.concat('relation praetore.', c.relname, ' (', \
+                        pg_catalog.pg_get_userbyid(c.relowner), ')') \
+             FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid \
+             WHERE c.relowner OPERATOR(pg_catalog.<>) ns.nspowner \
+             UNION ALL \
+             SELECT pg_catalog.concat('function ', p.oid::pg_catalog.regprocedure, ' (', \
+                        pg_catalog.pg_get_userbyid(p.proowner), ')') \
+             FROM ns JOIN pg_catalog.pg_proc p ON p.pronamespace OPERATOR(pg_catalog.=) ns.oid \
+             WHERE p.proowner OPERATOR(pg_catalog.<>) ns.nspowner \
+             UNION ALL \
+             SELECT pg_catalog.concat('type praetore.', t.typname, ' (', \
+                        pg_catalog.pg_get_userbyid(t.typowner), ')') \
+             FROM ns JOIN pg_catalog.pg_type t ON t.typnamespace OPERATOR(pg_catalog.=) ns.oid \
+             WHERE t.typowner OPERATOR(pg_catalog.<>) ns.nspowner) \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT entry FROM objects ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
+/// Memberships that grant another role the owner's rights or blanket data
+/// access: any member (direct or not) of the praetore schema owner that is
+/// not explicitly allowed (`with_schema_owner_members`); any
+/// non-superuser member of `pg_read_all_data` or `pg_write_all_data`; and,
+/// when `with_runtime_logins` is set, any other login member of
+/// `praetore_runtime`.
+fn unexpected_members(
+    transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let mut problems: Vec<String> = transaction
+        .query(
+            "WITH RECURSIVE owner_members(role) AS ( \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN pg_catalog.pg_namespace n ON n.nspowner OPERATOR(pg_catalog.=) m.roleid \
+                 WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                 UNION \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN owner_members o ON m.roleid OPERATOR(pg_catalog.=) o.role), \
+             data_members(role, via) AS ( \
+                 SELECT m.member, g.rolname FROM pg_catalog.pg_auth_members m \
+                 JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) m.roleid \
+                 WHERE g.rolname OPERATOR(pg_catalog.=) 'pg_read_all_data' \
+                    OR g.rolname OPERATOR(pg_catalog.=) 'pg_write_all_data' \
+                 UNION \
+                 SELECT m.member, d.via FROM pg_catalog.pg_auth_members m \
+                 JOIN data_members d ON m.roleid OPERATOR(pg_catalog.=) d.role) \
+             SELECT pg_catalog.concat('role ', r.rolname, ' is a member of the praetore owner') \
+             FROM owner_members o JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) o.role \
+             WHERE NOT (r.rolname::pg_catalog.text OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])) \
+             UNION ALL \
+             SELECT pg_catalog.concat('role ', r.rolname, ' is a member of ', d.via) \
+             FROM data_members d JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) d.role \
+             WHERE NOT r.rolsuper \
+             ORDER BY 1",
+            &[&options.schema_owner_members],
+        )?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    if !options.runtime_logins.is_empty() {
+        for login in other_runtime_logins(transaction)? {
+            if !options.runtime_logins.contains(&login) {
+                problems.push(format!(
+                    "login {login} is a member of praetore_runtime but not in {}",
+                    RuntimeRoleOptions::RUNTIME_LOGINS_ENV
+                ));
+            }
+        }
+    }
+    problems.truncate(10);
+    Ok((!problems.is_empty()).then(|| problems.join(", ")))
+}
+
+/// Objects outside `praetore` and `pg_toast` that depend (`pg_depend`) on a
+/// praetore relation, function or type: views, materialized views, rules,
+/// triggers, constraints, defaults, policies or functions elsewhere that
+/// would act on praetore data with their own owner's rights. Up to ten.
+fn external_dependents(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH ns AS (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         referenced AS ( \
+             SELECT d.classid, d.objid, d.objsubid FROM pg_catalog.pg_depend d CROSS JOIN ns \
+             WHERE (d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass \
+                    AND EXISTS (SELECT 1 FROM pg_catalog.pg_class x \
+                                WHERE x.oid OPERATOR(pg_catalog.=) d.refobjid \
+                                  AND x.relnamespace OPERATOR(pg_catalog.=) ns.oid)) \
+                OR (d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                    AND EXISTS (SELECT 1 FROM pg_catalog.pg_proc x \
+                                WHERE x.oid OPERATOR(pg_catalog.=) d.refobjid \
+                                  AND x.pronamespace OPERATOR(pg_catalog.=) ns.oid)) \
+                OR (d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                    AND EXISTS (SELECT 1 FROM pg_catalog.pg_type x \
+                                WHERE x.oid OPERATOR(pg_catalog.=) d.refobjid \
+                                  AND x.typnamespace OPERATOR(pg_catalog.=) ns.oid))), \
+         dependents AS ( \
+             SELECT pg_catalog.concat(o.type, ' ', o.identity) AS entry, \
+                    CASE \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_class c \
+                                  WHERE c.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                            THEN (SELECT p.pronamespace FROM pg_catalog.pg_proc p \
+                                  WHERE p.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                            THEN (SELECT t.typnamespace FROM pg_catalog.pg_type t \
+                                  WHERE t.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                            THEN (SELECT con.connamespace FROM pg_catalog.pg_constraint con \
+                                  WHERE con.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_policy'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_policy pol \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pol.polrelid \
+                                  WHERE pol.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_trigger'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_trigger g \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) g.tgrelid \
+                                  WHERE g.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_attrdef ad \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) ad.adrelid \
+                                  WHERE ad.oid OPERATOR(pg_catalog.=) r.objid) \
+                        WHEN r.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_rewrite rw \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) rw.ev_class \
+                                  WHERE rw.oid OPERATOR(pg_catalog.=) r.objid) \
+                    END AS dependent_namespace \
+             FROM referenced r \
+             CROSS JOIN LATERAL pg_catalog.pg_identify_object(r.classid, r.objid, r.objsubid) o) \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT DISTINCT entry FROM dependents CROSS JOIN ns \
+               WHERE dependents.dependent_namespace IS NOT NULL \
+                 AND dependents.dependent_namespace OPERATOR(pg_catalog.<>) ns.oid \
+                 AND dependents.dependent_namespace OPERATOR(pg_catalog.<>) \
+                     'pg_toast'::pg_catalog.regnamespace::pg_catalog.oid \
+               ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
+/// A SECURITY DEFINER function, in any schema but `pg_catalog` and
+/// `information_schema`, that runs with the rights of the `praetore` schema
+/// owner (its owner has that owner's privileges, superusers included) and
+/// that any role other than its owner may execute (PUBLIC included): calling
+/// it would act as the owner. Functions the operator trusts explicitly
+/// (`RuntimeRoleOptions::with_trusted_security_definer`) are not reported;
+/// nothing is trusted by default.
+fn owner_function_executable(
+    transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let trusted: Vec<u32> =
+        resolve_trusted_security_definer(transaction, &options.trusted_security_definer)
+            .map_err(RuntimeRoleError::InvalidConfiguration)?
+            .iter()
+            .map(|function| function.oid)
+            .collect();
+    let row = transaction.query_one(
+        "SELECT pg_catalog.string_agg(p.oid::pg_catalog.regprocedure::pg_catalog.text, ', ' \
+                    ORDER BY p.oid::pg_catalog.regprocedure::pg_catalog.text) \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) p.pronamespace \
+         JOIN pg_catalog.pg_namespace owner_ns \
+           ON owner_ns.nspname OPERATOR(pg_catalog.=) 'praetore' \
+         WHERE p.prosecdef \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+           AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
+           AND pg_catalog.pg_has_role(p.proowner, owner_ns.nspowner, 'USAGE') \
+           AND NOT (p.oid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[])) \
+           AND EXISTS (SELECT 1 FROM pg_catalog.aclexplode( \
+                           COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) a \
+                       WHERE a.privilege_type OPERATOR(pg_catalog.=) 'EXECUTE' \
+                         AND a.grantee OPERATOR(pg_catalog.<>) p.proowner)",
+        &[&trusted],
+    )?;
+    Ok(row.get(0))
 }
 
 #[cfg(test)]

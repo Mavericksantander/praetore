@@ -313,3 +313,159 @@ fn producer_links_match_the_documented_formula() {
     }
     assert_eq!(prev, fx.expected());
 }
+
+fn storage_record() -> praetore_core::StorageRecord {
+    use praetore_core::StorageRecordSigner;
+    let key = attester();
+    key.sign_storage_record(praetore_core::StorageRecordPayload {
+        schema_version: 1,
+        kind: "legacy_baseline_adopted".into(),
+        record_id: uuid::Uuid::new_v4(),
+        recorded_at: "2026-11-01T12:00:00.000000Z".into(),
+        database: "praetore".into(),
+        database_oid: 16384,
+        recorded_by: "mig".into(),
+        migrations: vec![praetore_core::RecordedMigration {
+            version: "0001_replay_claims".into(),
+            checksum: "a".repeat(64),
+        }],
+        structure_sha256: "b".repeat(64),
+        key_id: key.key_id(),
+    })
+    .unwrap()
+}
+
+fn run_verify(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Storage records: the database chain verifies with `praetore-verify
+/// journal`, a tenant chain's reference to its head verifies with
+/// `--database-journal` or `--expected-database-head`, and a mismatch, an
+/// altered record or a removed record fails.
+#[test]
+fn database_journal_and_tenant_reference_verify() {
+    use praetore_core::journal_chain::DatabaseHead;
+    let fx = Fixture::new();
+    let key = attester().public_key().unwrap();
+    let mut database = ChainExporter::new(&key);
+    for _ in 0..3 {
+        database.push_record(&storage_record()).unwrap();
+    }
+    let (database_text, database_head) = database.finish().unwrap();
+    let database_path = fx.dir.write("database.jsonl", &database_text);
+    let mut tenant = ChainExporter::new(&key);
+    tenant
+        .push_database_head(&DatabaseHead::from(database_head))
+        .unwrap();
+    for receipt in &fx.receipts {
+        tenant.push(receipt).unwrap();
+    }
+    let (tenant_text, _) = tenant.finish().unwrap();
+    let tenant_path = fx.dir.write("tenant.jsonl", &tenant_text);
+
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &database_path,
+        "--attester-pin",
+        &fx.pin,
+        "--format",
+        "json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["kind"], "database");
+    assert_eq!(summary["details"]["head"], database_head.head.to_hex());
+
+    for reference in [
+        vec!["--database-journal", database_path.as_str()],
+        vec!["--expected-database-head", &database_head.head.to_hex()],
+    ] {
+        let mut args = vec![
+            "journal",
+            "--journal",
+            &tenant_path,
+            "--attester-pin",
+            &fx.pin,
+        ];
+        args.extend(reference.iter().copied());
+        args.extend(["--format", "json"]);
+        let output = run_verify(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["details"]["kind"], "tenant");
+        assert_eq!(summary["details"]["database_head_verified"], true);
+        assert_eq!(
+            summary["details"]["database_head"]["head"],
+            database_head.head.to_hex()
+        );
+    }
+
+    // A tenant chain checked against another database head fails.
+    let other_head = "c".repeat(64);
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &tenant_path,
+        "--attester-pin",
+        &fx.pin,
+        "--expected-database-head",
+        &other_head,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "JOURNAL_HEAD_MISMATCH");
+    // An old chain without a reference fails when one is required.
+    let old_path = fx.dir.write("old.jsonl", &fx.text);
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &old_path,
+        "--attester-pin",
+        &fx.pin,
+        "--database-journal",
+        &database_path,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "JOURNAL_HEAD_MISMATCH");
+    // An altered record fails; a removed record breaks the chain.
+    let altered = database_text.replacen("\"recorded_by\":\"mig\"", "\"recorded_by\":\"xyz\"", 1);
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &fx.dir.write("altered.jsonl", altered),
+        "--attester-pin",
+        &fx.pin,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "EVIDENCE_FAIL");
+    let lines: Vec<String> = database_text.lines().map(str::to_owned).collect();
+    let removed = join(&[lines[0].clone(), lines[2].clone()]);
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &fx.dir.write("removed.jsonl", removed),
+        "--attester-pin",
+        &fx.pin,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "JOURNAL_CHAIN_FAIL");
+    // The old chain alone still verifies unchanged.
+    let output = fx.verify(&fx.text, Some(&fx.expected()));
+    assert!(output.status.success());
+}

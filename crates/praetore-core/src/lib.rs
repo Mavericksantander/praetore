@@ -12,6 +12,7 @@ pub mod journal_chain;
 pub mod key_rotation;
 pub mod policy;
 pub mod replay;
+pub mod storage_record;
 
 pub use action::Action;
 pub use authority::{Authority, AuthorityId};
@@ -35,4 +36,7 @@ pub use policy::{
 pub use replay::{
     AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
     ReplayGuardError,
+};
+pub use storage_record::{
+    RecordedMigration, StorageRecord, StorageRecordPayload, StorageRecordSigner,
 };

@@ -164,10 +164,89 @@ fn parse_tenant_issuer_bindings(
 }
 
 fn apply_migrations(database: &DatabaseConnector) -> Result<(), Box<dyn std::error::Error>> {
+    let options = migration_options()?;
     let mut client = database.connect()?;
-    let applied = praetore_replay_postgres::apply_migrations(&mut client)?;
+    for status in praetore_replay_postgres::event_trigger_report(
+        &mut client,
+        &options.trusted_event_triggers,
+    )? {
+        match &status.problem {
+            None => tracing::warn!(
+                event_trigger = %status.name,
+                "trusted event trigger verified; it runs during migrations"
+            ),
+            Some(problem) => tracing::error!(%problem, "event trigger refused"),
+        }
+    }
+    let applied = praetore_replay_postgres::apply_migrations_with(&mut client, &options)?;
     tracing::info!(?applied, "database migrations applied");
+    if let Some(adoption) = praetore_replay_postgres::legacy_baseline_adoption(&mut client)? {
+        tracing::warn!(%adoption, "schema adopted from a legacy baseline");
+    }
     Ok(())
+}
+
+/// Explicit migration options from the environment, logged at startup:
+/// PRAETORE_ADOPT_LEGACY_BASELINE (off by default) and
+/// PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS (none by default).
+fn migration_options()
+-> Result<praetore_replay_postgres::MigrationOptions, Box<dyn std::error::Error>> {
+    use praetore_replay_postgres::MigrationOptions;
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let adopt_legacy_baseline = MigrationOptions::parse_adopt_legacy_baseline(
+        std::env::var(MigrationOptions::ADOPT_LEGACY_BASELINE_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    // Adopting a legacy baseline writes a record signed with the evidence
+    // attester key; without the key there is no signer and adoption fails.
+    let record_signer: Option<std::sync::Arc<dyn praetore_core::StorageRecordSigner>> =
+        if adopt_legacy_baseline {
+            match std::env::var("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX") {
+                Ok(key) => {
+                    let bytes: [u8; 32] = hex::decode(key)?
+                        .try_into()
+                        .map_err(|_| "evidence attester key must be exactly 32 bytes")?;
+                    Some(std::sync::Arc::new(EvidenceAttesterKey::from_secret_bytes(
+                        &bytes,
+                    )))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+    let options = MigrationOptions {
+        adopt_legacy_baseline,
+        trusted_security_definer: MigrationOptions::parse_list(&env(
+            MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV,
+        )),
+        record_signer,
+        trusted_event_triggers: MigrationOptions::parse_list(&env(
+            MigrationOptions::TRUSTED_EVENT_TRIGGERS_ENV,
+        )),
+        trusted_default_privileges: MigrationOptions::parse_list(&env(
+            MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV,
+        )),
+    };
+    praetore_replay_postgres::parse_trusted_default_privileges(
+        &options.trusted_default_privileges,
+    )?;
+    if options.trusted_security_definer.is_empty()
+        && options.trusted_event_triggers.is_empty()
+        && options.trusted_default_privileges.is_empty()
+    {
+        tracing::info!(adopt_legacy_baseline, "migration options: no check relaxed");
+    } else {
+        tracing::warn!(
+            adopt_legacy_baseline,
+            trusted_security_definer = ?options.trusted_security_definer,
+            trusted_event_triggers = ?options.trusted_event_triggers,
+            trusted_default_privileges = ?options.trusted_default_privileges,
+            "migration checks relaxed explicitly"
+        );
+    }
+    Ok(options)
 }
 
 /// Validates both database URLs (including TLS: non-loopback hosts need
@@ -192,7 +271,12 @@ fn prepare_database(
     }
     let options = runtime_role_options()?;
     let mut client = runtime.connect()?;
-    if let Err(error) = praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
+    let verified = praetore_replay_postgres::verify_runtime_role_with(&mut client, &options);
+    log_runtime_role_context(&mut client, &options)?;
+    if let Some(adoption) = praetore_replay_postgres::legacy_baseline_adoption(&mut client)? {
+        tracing::warn!(%adoption, "schema adopted from a legacy baseline");
+    }
+    if let Err(error) = verified {
         if production {
             return Err(error.into());
         }
@@ -206,16 +290,45 @@ fn prepare_database(
 /// (PRAETORE_RUNTIME_ALLOW_SETTINGS; none by default), logged at startup.
 fn runtime_role_options()
 -> Result<praetore_replay_postgres::RuntimeRoleOptions, Box<dyn std::error::Error>> {
-    let name = praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV;
-    let value = std::env::var(name).unwrap_or_default();
-    let options = praetore_replay_postgres::RuntimeRoleOptions::from_allow_settings(&value)?;
+    let options =
+        praetore_replay_postgres::RuntimeRoleOptions::from_config(|name| std::env::var(name).ok())?;
     let relaxed = options.relaxed();
     if relaxed.is_empty() {
         tracing::info!("runtime role check: no refusal relaxed");
     } else {
-        tracing::warn!(?relaxed, "runtime role check relaxed by {name}");
+        tracing::warn!(
+            ?relaxed,
+            trusted_security_definer = ?options.trusted_security_definer(),
+            "runtime role check relaxed explicitly"
+        );
     }
     Ok(options)
+}
+
+/// Startup log of what the runtime check accepts explicitly or only reports:
+/// trusted SECURITY DEFINER functions (a warning for each one owned by a
+/// superuser) and other login members of praetore_runtime.
+fn log_runtime_role_context(
+    client: &mut postgres::Client,
+    options: &praetore_replay_postgres::RuntimeRoleOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for function in praetore_replay_postgres::describe_trusted_security_definer(client, options)? {
+        if function.owner_is_superuser {
+            tracing::warn!(
+                function = %function.resolved,
+                owner = %function.owner,
+                "trusted SECURITY DEFINER function is owned by a superuser; whoever can execute \
+                 it acts with its owner's privileges"
+            );
+        } else {
+            tracing::info!(function = %function.resolved, owner = %function.owner, "trusted SECURITY DEFINER function");
+        }
+    }
+    let members = praetore_replay_postgres::runtime_role_members(client)?;
+    if !members.is_empty() {
+        tracing::warn!(?members, "other login members of praetore_runtime");
+    }
+    Ok(())
 }
 
 /// `praetore-gateway-demo migrate`: applies migrations with

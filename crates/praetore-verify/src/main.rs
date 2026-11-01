@@ -4,7 +4,9 @@ use praetore_core::{
     engine::TrustedAuthorityIssuer,
     evidence::Evidence,
     identity::{AgentIdentity, VerifiedPublicKey},
-    journal_chain::{ChainLink, MAX_CHAIN_BYTES, verify_chain},
+    journal_chain::{
+        ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES, verify_journal,
+    },
     policy::Policy,
 };
 use serde::Serialize;
@@ -64,6 +66,8 @@ enum Command {
         attester_pin: PathBuf,
         expected_head: Option<String>,
         policy: Option<PathBuf>,
+        database_journal: Option<PathBuf>,
+        expected_database_head: Option<String>,
     },
     PolicyDigest {
         policy: PathBuf,
@@ -86,7 +90,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -256,9 +260,16 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             if values.keys().any(|key| {
                 !matches!(
                     key.as_str(),
-                    "--journal" | "--attester-pin" | "--expected-head" | "--policy"
+                    "--journal"
+                        | "--attester-pin"
+                        | "--expected-head"
+                        | "--policy"
+                        | "--database-journal"
+                        | "--expected-database-head"
                 )
-            }) {
+            }) || (values.contains_key("--database-journal")
+                && values.contains_key("--expected-database-head"))
+            {
                 return Err(CliError::usage());
             }
             Command::Journal {
@@ -270,6 +281,12 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                     Some(None) => return Err(CliError::usage()),
                 },
                 policy: optional_path("--policy"),
+                database_journal: optional_path("--database-journal"),
+                expected_database_head: match values.get("--expected-database-head") {
+                    None => None,
+                    Some(Some(value)) => Some(value.clone()),
+                    Some(None) => return Err(CliError::usage()),
+                },
             }
         }
         "policy-digest" => {
@@ -425,6 +442,8 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             attester_pin,
             expected_head,
             policy,
+            database_journal,
+            expected_database_head,
         } => {
             let expected_head = expected_head
                 .as_deref()
@@ -436,12 +455,64 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 .transpose()?;
             let policy = policy.as_deref().map(read_policy).transpose()?;
             let attester = read_attester_pin(&attester_pin)?;
+            let expected_database = match (&database_journal, &expected_database_head) {
+                (Some(path), _) => {
+                    let text = read_limited_to(path, MAX_CHAIN_BYTES)?;
+                    let summary =
+                        verify_journal(&text, &attester, None, None, None).map_err(|error| {
+                            eprintln!("database journal: {error}");
+                            CliError { code: error.code() }
+                        })?;
+                    if summary.kind != JournalKind::Database {
+                        eprintln!("database journal: not a database journal");
+                        return Err(CliError {
+                            code: "INVALID_REQUEST",
+                        });
+                    }
+                    Some(ExpectedDatabaseHead {
+                        head: summary.head.head,
+                        entries: Some(summary.head.entries),
+                    })
+                }
+                (None, Some(value)) => Some(ExpectedDatabaseHead {
+                    head: ChainLink::from_hex(value).ok_or(CliError {
+                        code: "INVALID_REQUEST",
+                    })?,
+                    entries: None,
+                }),
+                (None, None) => None,
+            };
             let text = read_limited_to(&journal, MAX_CHAIN_BYTES)?;
-            let chain = verify_chain(&text, &attester, policy.as_ref(), expected_head.as_ref())
-                .map_err(|error| {
-                    eprintln!("journal: {error}");
-                    CliError { code: error.code() }
-                })?;
+            let summary = verify_journal(
+                &text,
+                &attester,
+                policy.as_ref(),
+                expected_head.as_ref(),
+                expected_database.as_ref(),
+            )
+            .map_err(|error| {
+                eprintln!("journal: {error}");
+                CliError { code: error.code() }
+            })?;
+            let chain = summary.head;
+            let (kind, database_head) = match summary.kind {
+                JournalKind::Database => ("database", None),
+                JournalKind::Tenant { database_head } => ("tenant", database_head),
+            };
+            details.insert("kind".into(), serde_json::Value::String(kind.into()));
+            details.insert(
+                "database_head".into(),
+                database_head.map_or(serde_json::Value::Null, |reference| {
+                    serde_json::json!({
+                        "entries": reference.entries.get(),
+                        "head": reference.head.to_hex(),
+                    })
+                }),
+            );
+            details.insert(
+                "database_head_verified".into(),
+                serde_json::Value::Bool(expected_database.is_some()),
+            );
             details.insert(
                 "entries".into(),
                 serde_json::Value::Number(chain.entries.get().into()),
