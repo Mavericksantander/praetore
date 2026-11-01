@@ -42,6 +42,15 @@
   or number, or over 128 bytes, is denied under `unregistered` with a signed
   receipt that records the reason in `praetore.claim_rejected`, not the
   value. Summaries show unregistered `agent_type` values escaped to ASCII.
+- `examples/claude-code-hook`, second review of #79: `verify.sh` copies the
+  bundle to a temporary directory first and runs every step on that copy,
+  so it verifies and attributes the same bytes (a receipt replaced in the
+  original between steps 3 and 5 used to be counted unverified, exit 0).
+  `check-attribution.py` and the hook's `verify` fail on a repeated receipt
+  (same `evidence_id`, or same agent id and `request_id`), which counted one
+  decision several times. `test-verify.sh` now signs 1000 distinct receipts
+  with the hook instead of copying `bundle/`, since copies of one receipt
+  are now an invalid bundle.
 
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with

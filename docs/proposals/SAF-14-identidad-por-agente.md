@@ -126,7 +126,11 @@ agente. La frase del fundador se queda corta: aquí ni siquiera hay perfil.
      ausencia de `agent_type` (`main.rs:522`). Un subagente definido con
      `name: main` (por ejemplo `.claude/agents/main.md` en un repositorio)
      recibía la llave, las capacidades y las reglas `main_only` de la sesión
-     principal, y su recibo no se distinguía del de ella.
+     principal, y su recibo no se distinguía del de ella. Tras el arreglo,
+     `agent_type: null` sigue tratándose como ausente (`Option<String>`
+     deserializa `null` como `None`), o sea como `main`. Claude Code no
+     manda `null` para un subagente, y quien inventa el stdin puede omitir
+     el campo igual (§2); no da ninguna capacidad nueva.
 - Granularidad real: **perfil**, no instancia. Dos subagentes `coder` en
   paralelo comparten llave. Claude Code documenta un `agent_id` por instancia
   de subagente en los campos comunes de los hooks ("Unique identifier for the
@@ -176,6 +180,16 @@ bajo agentes cooperativos:
   `evidence/.X.json` con firmas rotas y su entrada en `index.json` no pasaba
   por `praetore-verify` (el glob de bash no ve ocultos) pero sí entraba en la
   atribución (`os.listdir` los ve), con exit 0;
+- `verify.sh` copia el bundle a un directorio temporal al empezar y hace todos
+  los pasos sobre esa copia, así que verifica y atribuye los mismos bytes.
+  Antes de este arreglo (revisión, ronda 2, B1-r2), un archivo reemplazado en
+  el original entre el paso 3 y el 5 se atribuía sin verificar;
+- cada decisión cuenta una vez: un recibo repetido en el bundle (mismo
+  `evidence_id`, o mismo agent id y `request_id`), sea una copia con otro
+  nombre o un hard link, hace fallar `verify.sh` y el `verify` del hook
+  (ronda 2, B2-r2). Esto no detecta un recibo **borrado**: para eso está la
+  cadena del journal (`journal-chain.jsonl`, #69) con un head anclado fuera
+  (SAF-13);
 - cada perfil queda acotado por su autoridad: un explorer con solo `fs:read`
   no escribe aunque la policy lo permitiera para otro perfil.
 
@@ -266,7 +280,19 @@ intenta.
   largo en bytes, y **no** el valor (que lo controla quien llama). Un
   `agent_type` de más de 64 bytes sigue denegándose **sin** recibo: el nombre
   es el dato que se rechaza y registrarlo sería guardar en el recibo un
-  valor arbitrario del llamador.
+  valor arbitrario del llamador. Tampoco dejan recibo, y fallan cerrado al
+  leer el evento, un `agent_type` que no es string y un número que serde no
+  puede leer (por ejemplo `1e400`).
+  - **Colisiones de la canonicalización numérica** (sin cambio de
+    comportamiento; revisión, ronda 2, I1-r2): el recibo no dice si el valor
+    original era número ni qué número exacto era. Lo firmado en
+    `claude.agent_id` queda así: `1` y `"1"` dan `"1"`; `1e2`, `100.0` y
+    `"100.0"` dan `"100.0"`; `-0` da `"-0.0"`; `18446744073709551616` y
+    `18446744073709551617` dan los dos `"1.8446744073709552e+19"` (pierde
+    precisión fuera de ±2^53); `1e308` da `"1e+308"`. No cambia ninguna
+    decisión: el id no elige llave y solo afirma lo que llegó por stdin. Si
+    importara, se puede firmar el tipo (`claude.agent_id_type`) o rechazar
+    los números fuera del rango entero exacto (pregunta 9).
 
 ### 4.2 Autoridad por agente
 
@@ -425,7 +451,11 @@ intenta.
    re-atribuciones (en `index.json`, en `context`, cambiando identidad y
    autoridad) y tres entradas de `evidence/` sin verificar: el recibo oculto
    de la revisión (`.0099-coder-Bash-Allow.json`, firmas rotas), un symlink
-   y un directorio, cada uno con su entrada en `index.json` (M1).
+   y un directorio, cada uno con su entrada en `index.json` (M1); copias
+   válidas de un recibo con otros nombres y un hard link (B2-r2); y un
+   recibo reemplazado en el original mientras `verify.sh` corre, que no debe
+   cambiar el resultado, más la comprobación de que `verify.sh` no usa la
+   ruta original después de copiarla (B1-r2).
 3. Los tests nuevos fallan contra `dfbe047` (salida real en el PR).
 4. `verify.sh` pasa sobre `bundle/`, 03, 04 y 05; `test-verify.sh` pasa.
 5. MCP (cuando se implemente): un e2e con dos clientes instalados
@@ -451,9 +481,15 @@ intenta.
   `"coder "` o una `о` cirílica no se lean como el perfil `coder`.
 - `export`: `index.json` toma `agent` y `profile` de lo firmado, añade
   `agent_id`, y se niega a exportar una línea cuyo campo sin firmar difiere.
-- `verify.sh`: el paso 3 falla ante cualquier entrada de `evidence/` que no
-  sea un archivo regular `*.json` no oculto, y `check-attribution.py` aplica
-  la misma regla, así que los dos leen el mismo conjunto (M1). Los pasos 5 y
+- `verify.sh`: el paso 0 copia el bundle a un directorio temporal y todos los
+  pasos leen solo esa copia (`unset SOURCE` con `set -u`: un uso posterior
+  del original hace fallar el script) (B1-r2). El paso 3 falla ante cualquier
+  entrada de `evidence/` que no sea un archivo regular `*.json` no oculto, y
+  `check-attribution.py` aplica la misma regla (M1) y rechaza recibos
+  repetidos (B2-r2); el `verify` del hook también.
+- `test-verify.sh` firma con el hook 1000 recibos distintos en vez de copiar
+  los de `bundle/`, porque copias del mismo recibo ahora son, con razón, un
+  bundle inválido. Los pasos 5 y
   6 exigen que `index.json` diga lo mismo que los recibos firmados (agente,
   perfil, agent id), una identidad por perfil, y rechazan una copia
   re-atribuida.
@@ -481,3 +517,5 @@ intenta.
 8. Confirmar con un evento real de Claude Code si `PreToolUse` dentro de un
    subagente trae `agent_id` (la doc lo lista en campos comunes, no en
    `PreToolUse`).
+9. ¿Se firma el tipo de `claude.agent_id`/`session_id` o se rechazan los
+   números fuera de ±2^53, para evitar las colisiones de PROPUESTA 3c?

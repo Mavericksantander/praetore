@@ -329,3 +329,21 @@ fn instance_ids_that_are_not_strings_or_too_long_are_denied_with_a_receipt() {
     );
     verify_receipts(&s.state).unwrap();
 }
+
+// Second independent review of #79 (988cb3e): B2-r2.
+
+#[test]
+fn a_receipt_repeated_in_the_journal_fails_verification() {
+    let s = State::new("duplicate");
+    s.decide(Some("coder"), "Write", "a.rs");
+    s.decide(Some("explorer"), "Read", "README.md");
+    verify_receipts(&s.state).unwrap();
+    // The coder's signed receipt appended again: every signature is valid.
+    let mut records = s.receipts();
+    records.push(records[0].clone());
+    s.write_receipts(&records);
+    assert!(
+        verify_receipts(&s.state).is_err(),
+        "verify counted one decision twice"
+    );
+}

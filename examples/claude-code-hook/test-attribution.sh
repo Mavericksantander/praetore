@@ -9,7 +9,10 @@
 #      b. editar context.agent/context.profile dentro del recibo;
 #      c. poner en el recibo la identidad y la autoridad del coder;
 #   4. verify.sh rechaza en evidence/ un recibo oculto (firmas rotas), un
-#      symlink y un directorio, aunque index.json los liste.
+#      symlink y un directorio, aunque index.json los liste;
+#   5. rechaza un recibo repetido (copias con otros nombres, hard link);
+#   6. verifica y atribuye la copia que tomó al empezar, aunque el original
+#      cambie durante la verificación.
 # Uso, desde la raíz de un clon:
 #   ./examples/claude-code-hook/test-attribution.sh [verify.sh]
 set -euo pipefail
@@ -139,6 +142,82 @@ PY
 inject hidden-receipt
 inject symlink-receipt
 inject directory-entry
+
+# 5. Un recibo repetido (revisión de #79, ronda 2, B2-r2): copias válidas de
+#    un recibo del coder con otros nombres, y un hard link, cada uno con su
+#    entrada en index.json. Todas las firmas valen; contarían una decisión
+#    varias veces.
+duplicate() {
+  local name="$1" copy="$WORK/$1"
+  cp -R "$WORK/bundle" "$copy"
+  python3 -I - "$copy" "$name" <<'PY'
+import json, os, shutil, sys
+bundle, case = sys.argv[1], sys.argv[2]
+index = json.load(open(f"{bundle}/index.json"))
+entry = next(e for e in index if e["agent"] == "coder" and e["outcome"] == "Allow")
+copies = range(9000, 9005) if case == "copied-receipts" else [9000]
+for n in copies:
+    name = f"evidence/{n}-coder-Bash-Allow.json"
+    if case == "copied-receipts":
+        shutil.copy(f"{bundle}/{entry['file']}", f"{bundle}/{name}")
+    else:
+        os.link(f"{bundle}/{entry['file']}", f"{bundle}/{name}")
+    index.append(dict(entry, file=name))
+json.dump(index, open(f"{bundle}/index.json", "w"), indent=2)
+print(entry["file"], "x", len(copies))
+PY
+  rc=$(verify "$copy" "$WORK/$name.log")
+  if [ "$rc" -ne 0 ] && grep -q "repetido" "$WORK/$name.log"; then
+    pass "$name: rechazado (exit $rc): $(grep -m1 'repetido' "$WORK/$name.log")"
+  else
+    fail "$name: aceptado o sin motivo (exit $rc): $(grep -m1 'recibos verificados' "$WORK/$name.log" || true)"
+  fi
+}
+
+duplicate copied-receipts
+duplicate hard-link
+
+# 6. Cambiar un recibo del bundle mientras verify.sh corre (ronda 2, B1-r2).
+#    verify.sh debe verificar y atribuir la copia que tomó al empezar: con el
+#    original reemplazado tras el paso 3, el resultado es el del bundle sin
+#    tocar. El script, además, no debe leer el original después de copiarlo.
+copy="$WORK/swap"
+cp -R "$WORK/bundle" "$copy"
+target=$(python3 -I - "$copy" <<'PY'
+import json, sys
+bundle = sys.argv[1]
+index = json.load(open(f"{bundle}/index.json"))
+entry = next(e for e in index if e["agent"] == "coder" and e["outcome"] == "Deny")
+ev = json.load(open(f"{bundle}/{entry['file']}"))
+ev["decision"]["outcome"] = "Allow"  # la firma ya no vale
+json.dump(ev, open(f"{bundle}/forged.tmp", "w"))
+entry["outcome"] = "Allow"
+json.dump(index, open(f"{bundle}/index.json", "w"), indent=2)
+print(entry["file"])
+PY
+)
+set +e
+"$VERIFY_SH" "$copy" 2>&1 | while IFS= read -r line; do
+  printf '%s\n' "$line"
+  case "$line" in "== 4."*) mv "$copy/forged.tmp" "$copy/$target" ;; esac
+done >"$WORK/swap.log"
+rc=${PIPESTATUS[0]}
+set -e
+summary() { sed -n '/^== 5\./,/^OK: cada/p' "$1" | grep -v '^== \|^OK:'; }
+if [ -e "$copy/forged.tmp" ]; then
+  fail "swap-after-copy: el reemplazo no se hizo"
+elif [ "$rc" -eq 0 ] && [ "$(summary "$WORK/swap.log")" = "$(summary "$WORK/good.log")" ]; then
+  pass "swap-after-copy: $target reemplazado durante la verificación; exit 0 con el resultado del bundle sin tocar"
+else
+  fail "swap-after-copy: exit $rc y un resultado distinto del bundle sin tocar"
+  diff <(summary "$WORK/good.log") <(summary "$WORK/swap.log") || true
+fi
+if grep -q '^unset SOURCE$' "$VERIFY_SH" &&
+  ! sed -n '/^unset SOURCE$/,$p' "$VERIFY_SH" | grep -q '\$SOURCE\|\${SOURCE'; then
+  pass "verify.sh no lee el bundle original después de copiarlo"
+else
+  fail "verify.sh no trabaja sobre una copia (falta 'unset SOURCE' o usa SOURCE después)"
+fi
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures test(s) fallaron"

@@ -8,17 +8,37 @@
 # Sale con 0 solo si praetore-verify acepta todos los recibos (con la policy
 # publicada) y rechaza la copia alterada, e index.json atribuye cada recibo al
 # agente que lo firmó y una copia re-atribuida se rechaza; con 1 en cualquier
-# otro caso.
+# otro caso. Verifica y atribuye una copia del bundle tomada al empezar (paso
+# 0): lo que cambie en el original después no entra en el resultado.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BUNDLE="$(cd "${1:-$HERE/bundle}" && pwd)"
+SOURCE="$(cd "${1:-$HERE/bundle}" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FALLO: %s\n' "$*" >&2; exit 1; }
+
+step "0. Copiar el bundle a un directorio temporal"
+# Los pasos 3 y 5 leen los mismos bytes: los de esta copia. Antes cada paso
+# abría el original por su cuenta, y un archivo cambiado entre el paso 3 y el
+# 5 se atribuía sin verificar. `evidence/.` copia el contenido del directorio;
+# con -R, un symlink o un archivo especial dentro se copia como tal y la
+# regla de nombres del paso 3 lo rechaza.
+mkdir "$WORK/bundle" "$WORK/bundle/evidence"
+for file in index.json attester-public-key.hex issuer-pins.jsonl policy.json; do
+  [ -f "$SOURCE/$file" ] || fail "falta $file en el bundle"
+  cp "$SOURCE/$file" "$WORK/bundle/$file"
+done
+[ -d "$SOURCE/evidence" ] || fail "el bundle no tiene evidence/"
+cp -R "$SOURCE/evidence/." "$WORK/bundle/evidence/"
+echo "copia de $SOURCE en $WORK/bundle"
+# Desde aquí solo se lee la copia. Con `set -u`, cualquier uso posterior de
+# SOURCE hace fallar el script.
+readonly BUNDLE="$WORK/bundle"
+unset SOURCE
 
 step "1. Compilar praetore-verify (cargo build --release --locked)"
 cargo build --quiet --release --locked --manifest-path "$ROOT/Cargo.toml" --package praetore-verify
@@ -41,7 +61,7 @@ shopt -s nullglob dotglob
 receipts=("$BUNDLE"/evidence/*)
 shopt -u nullglob dotglob
 for entry in "${receipts[@]}"; do
-  name="$(basename "$entry")"
+  name="${entry##*/}"
   if [[ "$name" == .* || "$name" != *.json || -L "$entry" || ! -f "$entry" ]]; then
     fail "evidence/$name: entrada no permitida (solo archivos regulares *.json no ocultos)"
   fi

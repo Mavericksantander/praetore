@@ -866,8 +866,12 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     let mut identities: BTreeMap<String, String> = BTreeMap::new();
     let mut issuer_bound = 0usize;
     let mut failures = 0usize;
+    // One decision per receipt: a line copied or replayed into the journal
+    // would count one decision twice.
+    let mut seen_evidence: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen_request: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (index, line) in receipts.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let check = || -> Result<(Attribution, String, DecisionOutcome), BoxError> {
+        let mut check = || -> Result<(Attribution, String, DecisionOutcome), BoxError> {
             let record: Value = serde_json::from_str(line)?;
             let evidence = Evidence::from_json(&record["evidence"].to_string())?;
             if !evidence.verify_integrity() {
@@ -900,6 +904,19 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
                 .into());
             }
             let agent_id = evidence.agent.id.as_uuid().to_string();
+            let line_number = index + 1;
+            if let Some(first) = seen_evidence.insert(evidence.evidence_id.to_string(), line_number)
+            {
+                return Err(format!("evidence_id repeated (first on line {first})").into());
+            }
+            if let Some(first) = seen_request.insert(
+                (agent_id.clone(), evidence.request_id.to_string()),
+                line_number,
+            ) {
+                return Err(
+                    format!("(agent id, request_id) repeated (first on line {first})").into(),
+                );
+            }
             Ok((attribution, agent_id, evidence.decision.outcome))
         };
         match check() {

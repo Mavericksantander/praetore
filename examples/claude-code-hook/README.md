@@ -107,7 +107,9 @@ Desde la raíz de un clon:
 ./examples/claude-code-hook/verify.sh   # verifica bundle/ solo con praetore-verify
 ```
 
-`verify.sh` hace lo siguiente:
+`verify.sh` hace lo siguiente, sobre una copia del bundle que toma al
+empezar (verifica y atribuye los mismos bytes, aunque el original cambie
+mientras corre):
 
 1. Compila `praetore-verify` con `--locked`.
 2. Verifica cada recibo con
@@ -117,15 +119,16 @@ Desde la raíz de un clon:
 3. Altera un byte de una copia y comprueba que la verificación falla.
 4. Con `check-attribution.py`, exige que `index.json` (sin firmar) nombre el
    mismo agente, perfil y agent id que cada recibo firmado, que cada recibo
-   tenga una entrada y que haya una identidad por perfil. Imprime el agent
-   id de cada perfil.
+   tenga una entrada, que ningún recibo esté repetido (mismo `evidence_id`, o
+   mismo agent id y `request_id`) y que haya una identidad por perfil.
+   Imprime el agent id de cada perfil.
 5. Re-atribuye un recibo en una copia de `index.json` y comprueba que el
    paso 4 la rechaza.
 
 Sale con 0 solo si praetore-verify acepta todos los recibos y rechaza la copia
 alterada, e `index.json` coincide con lo firmado; con 1 en cualquier otro
-caso. `test-verify.sh` lo comprueba con un bundle de 1000 recibos y con uno
-que tiene un recibo alterado. `test-attribution.sh` regenera un bundle y
+caso. `test-verify.sh` lo comprueba con 1000 recibos distintos que firma el
+hook en un estado temporal, y con uno de ellos alterado. `test-attribution.sh` regenera un bundle y
 comprueba que coder y explorer firman con identidades distintas y que tres
 re-atribuciones (en `index.json`, en el contexto firmado y cambiando
 identidad y autoridad) se rechazan.

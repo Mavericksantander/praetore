@@ -8,7 +8,9 @@ index.json and in the file name. verify.sh runs this only after
 praetore-verify accepted every receipt, so the signed fields read here are
 authenticated; this script only compares them with the unsigned copies. Both
 accept only regular, non-hidden *.json files in evidence/ and fail on any
-other entry, so they read the same set of files.
+other entry, and verify.sh runs both on one copy of the bundle, so they read
+the same bytes. A receipt that appears twice (same evidence_id, or same
+agent id and request_id) fails: the counts are one per decision.
 
 Usage: check-attribution.py <bundle> [index.json]
 Exits 0 when every entry agrees with its signed receipt, 1 otherwise.
@@ -51,6 +53,11 @@ def check(bundle, index_path):
     profiles = collections.defaultdict(set)
     issuer_bound = collections.Counter()
     tally = collections.Counter()
+    # One decision per receipt: the same evidence_id, or the same request
+    # (agent id, request_id), twice in a bundle (copies under other names,
+    # hard links) would count one decision several times.
+    seen_evidence = {}
+    seen_request = {}
     for entry in index:
         name = entry.get("file")
         if name not in on_disk:
@@ -64,6 +71,14 @@ def check(bundle, index_path):
         # Receipts from before context.profile (set 04): the profile is the agent.
         profile = context.get("profile", agent)
         agent_id = evidence["agent"]["id"]
+        for seen, key, what in (
+            (seen_evidence, evidence["evidence_id"], "evidence_id"),
+            (seen_request, (agent_id, evidence["request_id"]), "(agent id, request_id)"),
+        ):
+            if key in seen:
+                errors.append(f"{name}: {what} repetido, ya está en {seen[key]}")
+            else:
+                seen[key] = name
         if profile != UNREGISTERED and profile != agent:
             errors.append(f"{name}: agente firmado {agent!r} y perfil firmado {profile!r} difieren")
         if entry.get("agent") != agent:
