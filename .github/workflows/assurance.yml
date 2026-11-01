@@ -188,6 +188,7 @@ jobs:
       - run: cargo +nightly fuzz run --fuzz-dir fuzz engine_evaluate_dev -- -max_total_time=10
       - run: cargo +nightly fuzz run --fuzz-dir fuzz engine_evaluate_high_assurance -- -max_total_time=10
       - run: cargo +nightly fuzz run --fuzz-dir fuzz path_prefix -- -max_total_time=10
+      - run: cargo +nightly fuzz run --fuzz-dir fuzz safety_namespace -- -max_total_time=10
 
   python-verify:
     name: Python evidence verification

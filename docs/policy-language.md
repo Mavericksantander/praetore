@@ -151,7 +151,11 @@ rejects the whole policy, with the typed error
   (`UndeclaredActionType`);
 * an `action_type` starting with `safety:` is not declared `Safety`
   (`SafetyPrefixNotSafety`), or a `Safety` entry is not `safety:` followed by
-  a name that starts with an ASCII letter or digit (`SafetyWithoutPrefix`);
+  a name that starts with an ASCII letter or digit (`SafetyWithoutPrefix`),
+  or is longer than `MAX_SAFETY_ACTION_NAME_BYTES` = 128 bytes
+  (`SafetyNameTooLong`). A `Safety` entry is valid exactly when
+  `SafetyActionName::parse` accepts it (see
+  [the safety namespace manifest](#safety-namespace-manifest-g2));
 * a key has a character outside printable ASCII (`!` to `~`): whitespace,
   a control or format character such as a zero-width space, or any
   non-ASCII character such as a homoglyph or a full-width letter
@@ -221,6 +225,71 @@ the hook and the `praetore-mcp` gate refuse every tool call, `safety:*`
 included. `praetore-mcp` also refuses every call when the rest of its home
 cannot be loaded (missing or mismatched keys, pins or authority). A safety failsafe must therefore not depend on PRÆTORE; see
 [the threat model](threat-model.md#mission-and-safety-actions-g7-limits).
+
+### Safety namespace manifest (G2)
+
+`SafetyActionName::parse` is the one validator of `safety:*` names: the
+exact ASCII prefix `safety:`, then a name that starts with an ASCII letter
+or digit, printable ASCII only (no whitespace, control or format
+characters, homoglyphs or full-width characters), at most 128 bytes. Each
+failure is a typed `SafetyNameError` (`Empty`, `TooLong`,
+`NotPrintableAscii`, `MissingPrefix`, `InvalidNameStart`). Policy loading
+uses it for every `Safety` entry, and so will the ingestion path for safety
+actions (SAF-09.5), so the two cannot disagree on what a safety name is.
+
+A safety namespace manifest is a signed statement of the `Safety` names one
+format 2 policy declares. An executor of an AI-enabled system and PRÆTORE
+compare it to confirm that they share the same namespace, and an executor
+can tell when it holds the manifest of another policy version.
+
+```bash
+# The namespace key: its own 32-byte secret, owner-only, not the attester
+# or issuer key.
+(umask 077; openssl rand -hex 32 > namespace.key)
+praetore policy safety-manifest --policy policy.json --key namespace.key \
+  --output safety-manifest.json
+praetore-verify safety-manifest --manifest safety-manifest.json \
+  --pin namespace.pin --policy policy.json
+```
+
+`praetore policy safety-manifest` prints the `public_key` to put in the pin
+file (64 lowercase hex characters, the same format as an attester pin). It
+never overwrites: an existing `--output` file is an error and stays as it
+was. `--issued-at <RFC 3339>` fixes the issue time; the same policy, time
+and key always give the same bytes.
+
+The manifest (`SafetyNamespaceManifest`, schema version 1) is canonical
+JSON with these fields:
+
+| Field | Value |
+| --- | --- |
+| `schema_version` | `1` |
+| `policy_digest` | the policy's digest |
+| `policy_id`, `policy_version` | the policy's `id` and `version` |
+| `safety_actions` | every name declared `Safety`, sorted by byte value, without duplicates |
+| `issued_at` | RFC 3339 UTC |
+| `key_id` | `hex(SHA-256("PRAETORE_SAFETY_NAMESPACE_KEY_V1\0ed25519\0" \|\| public key))` |
+| `signature` | `hex(Ed25519("PRAETORE_SAFETY_NAMESPACE_V1\0" \|\| canonical JSON of every other field))` |
+
+`praetore-verify safety-manifest` checks the signature against the pinned
+key; with `--policy` it also requires the same id, version, digest and
+exactly the same list. A reordered or duplicated list, an unknown field or
+another schema version is rejected. The reference vector is
+[`docs/golden/safety-namespace-manifest-v1.json`](golden/safety-namespace-manifest-v1.json),
+derived from `docs/golden/canonical-policy-v2.json`.
+
+The manifest is signed by a dedicated namespace key
+(`SafetyNamespaceKey`), held by whoever releases the policy. It is not the
+evidence attester key, which is online on the decision path, and not the
+authority issuer key, which grants capabilities. The key id has its own
+domain, so the same public key never has the same id in two roles.
+
+For the ingestion path, `manifest.classify_name(&name)` answers `Declared`
+or `Undeclared`. An undeclared name is a value, not an error, so it can be
+recorded (marked `undeclared`) rather than dropped.
+
+The manifest authorizes nothing. No engine, gateway, gate or hook reads it;
+see [the threat model](threat-model.md#safety-namespace-manifest-g2).
 
 ### Format 1 documents and historical evidence
 

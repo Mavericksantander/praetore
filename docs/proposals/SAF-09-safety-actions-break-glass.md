@@ -26,6 +26,29 @@ Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at e
 > policy invalid. See [G7 requirements](#g7-requirements) and
 > [docs/policy-language.md](../policy-language.md#action-classes-policy-format-2).
 
+> **G2 update (safety namespace).** Implemented as the first part of
+> SAF-09.5; the ingestion process itself is not:
+>
+> 1. `SafetyActionName::parse` is the one validator of `safety:*` names
+>    (exact ASCII prefix, printable ASCII, a name that starts with an ASCII
+>    letter or digit, at most 128 bytes, typed `SafetyNameError`). Policy
+>    loading uses it for every `Safety` entry; the ingestion path will use
+>    it too.
+> 2. `SafetyNamespaceManifest` (schema version 1) is a signed statement of
+>    the `Safety` names of one format 2 policy, bound to its digest, built
+>    deterministically by `SafetyNamespaceManifest::from_policy`. It is
+>    signed by a dedicated namespace key under the domain
+>    `PRAETORE_SAFETY_NAMESPACE_V1\0`, not by the evidence attester key or
+>    the authority issuer key. `praetore policy safety-manifest` writes it
+>    (never overwrites); `praetore-verify safety-manifest` verifies it, and
+>    with `--policy` checks that it matches that policy exactly.
+> 3. `manifest.classify_name(&name)` answers `Declared` or `Undeclared`, so
+>    the ingestion path can record an undeclared name instead of dropping it.
+>
+> The manifest authorizes nothing and is not read on the decision path. See
+> [docs/policy-language.md](../policy-language.md#safety-namespace-manifest-g2)
+> and [the threat model](../threat-model.md#safety-namespace-manifest-g2).
+
 **Scope (PROPUESTA, superseded by G7 for the classification):** an optional,
 opt-in extension that lives outside the core. It does not change
 `praetore-core`, the gateway crates, their APIs or their semantics, and it is
@@ -37,11 +60,14 @@ nothing in PRÆTORE changes. Break-glass (§2) is still only this proposal.
 - **SAF-09.3 (implemented by G7).** Every mission action requires a
   synchronously signed decision before it runs. Fail closed: no decision
   means no execution.
-- **SAF-09.5 (pending a separate change, not implemented).** Safety-action
+- **SAF-09.5 (partly implemented: G2 done, G1 pending).** Safety-action
   ingestion is isolated from the decision path, with its own process,
   credentials and key. An ingestion failure does not affect the executor.
-  Until it exists, PRÆTORE keeps no record of safety actions: the G7 entry
-  points refuse them with `SAFETY_ACTION_NOT_GOVERNED` and write nothing.
+  G2 provides the shared name validator and the signed safety namespace
+  manifest the ingestion process will check names against; the ingestion
+  process itself (G1) is a separate change. Until it exists, PRÆTORE keeps
+  no record of safety actions: the G7 entry points refuse them with
+  `SAFETY_ACTION_NOT_GOVERNED` and write nothing.
 
 What G7 does not do: it does not decide or record safety actions (only
 `praetore-mcp`, as a transparent proxy, passes a declared one through to the

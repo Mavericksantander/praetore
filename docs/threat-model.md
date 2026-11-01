@@ -184,6 +184,52 @@ Trust boundaries are explicit:
   refusals by `decided_by` (`engine_guard` / `unclassified_action`), not by
   the action type.
 
+### Safety namespace manifest (G2)
+
+What a verified manifest shows: the holder of the pinned namespace key
+stated that the format 2 policy with digest `policy_digest` (id
+`policy_id`, version `policy_version`) declares exactly the `Safety` names
+in `safety_actions`. With `--policy`, `praetore-verify safety-manifest` also
+shows that the given policy file is that policy. An executor of an
+AI-enabled system and PRÆTORE that both hold a verified manifest for the
+same digest agree on the safety namespace, and an executor holding the
+manifest of another version sees `POLICY_MISMATCH`.
+
+What it does not show or do:
+
+* It authorizes nothing. It grants no capability, and holding it permits no
+  action, mission or safety.
+* It is not consulted on the decision path. No engine, gateway, gate or
+  hook reads it; a missing, stale or invalid manifest changes no decision
+  and no G7 answer. A safety failsafe must still not depend on PRÆTORE.
+* It says nothing about what a safety action does, whether an executor
+  implements it, or whether it ran. A name in the manifest is only a name
+  the policy author declared `Safety`.
+* It is not a freshness or revocation statement: a manifest for an old
+  policy version still verifies. Executors compare `policy_version` and
+  `policy_digest` with the policy they expect; there is no anti-rollback.
+* Pin provisioning is outside PRÆTORE, as for the other pins. Whoever holds
+  the namespace key can sign any namespace for any digest.
+
+Key separation: the namespace key (`SafetyNamespaceKey`) is a role of its
+own. It is not the evidence attester key, which is online on the decision
+path, and not the authority issuer key, which grants capabilities, so a
+compromise of either does not let an attacker publish a namespace, and the
+namespace key can stay offline with the policy release. Its signature
+domain `PRAETORE_SAFETY_NAMESPACE_V1\0` and key id domain
+`PRAETORE_SAFETY_NAMESPACE_KEY_V1\0ed25519\0` are distinct from, and
+prefix-free with, every other domain in the repository
+(`crates/praetore-core/tests/safety_namespace.rs` scans them), so even the
+same key bytes used in two roles give signatures that do not verify across
+roles and key ids that differ. Using one key for two roles is still a
+deployment error.
+
+Names: `SafetyActionName::parse` is shared by policy loading and the
+manifest, so a name the policy accepts is exactly a name the manifest and
+the future ingestion path accept. Text output escapes invisible characters
+(a policy id may contain them); JSON output and the manifest file keep the
+exact bytes.
+
 ## Invariants and traceability
 
 | Invariant / requirement | Enforcing code | Test coverage | Threat |
@@ -204,6 +250,8 @@ Trust boundaries are explicit:
 | Single timestamp per evaluation | `AuthorizationEngine::evaluate` passes one snapshot to all checks | `evaluation_uses_one_clock_snapshot` | Clock/rollback |
 | CLI does not trust document-embedded keys | `praetore-verify` reads attester and issuer pins from separate command-line paths | `evidence_command_verifies_trusted_signature_intent_and_authority`, `evidence_command_rejects_tampered_documents_and_wrong_pins` | Operator pin provisioning |
 | CLI emits stable machine result and failure status | verifier `Summary` and exit handling | `verify_cli` integration tests | Input/output transport is operator-controlled |
+| One validator of `safety:*` names (G2) | `SafetyActionName::parse`, used by `Policy::validate` for every `Safety` entry and by `SafetyNamespaceManifest` | `safety_action_name_rules_are_pinned`, `policy_loading_accepts_a_safety_entry_exactly_when_the_shared_validator_does` | Homoglyph / invisible-character names |
+| A safety namespace manifest verifies only under its pinned key and domain (G2) | `SafetyNamespaceManifest::verify`, `SAFETY_NAMESPACE_DOMAIN` | `tampering_with_any_signed_field_is_rejected`, `manifest_signatures_do_not_cross_domains`, `no_domain_is_a_prefix_of_another` | Namespace forgery / cross-protocol signature reuse |
 | Python verification is Rust-backed | `praetore-python` PyO3 crate calls core evidence APIs | Python `test_verify.py` good, tampered, and wrong-key fixtures | Python API intentionally has no evaluate or policy features |
 | Parser surfaces are fuzzed in bounded CI smoke | `fuzz/fuzz_targets` and seed corpora | Each target is run by `fuzz-smoke` workflow job | A short smoke run is not exhaustive fuzz coverage |
 | Build and dependency controls run in CI | `.github/workflows/assurance.yml` | `rust`, `audit`, `fuzz-smoke`, `python-verify`, `sbom`, and `release-integrity` jobs | Hosted CI and action supply chain remain trusted dependencies |
