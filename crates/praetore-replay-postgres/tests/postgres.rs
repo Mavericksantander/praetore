@@ -684,17 +684,17 @@ fn create_postgres_gateway(request_id: Uuid) -> PostgresGatewayFixture {
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "postgres-gateway-test",
         1,
         vec![
             PolicyRule::new("allow-local-write", "local:set_value", PolicyEffect::Allow)
                 .with_capability("local:write"),
         ],
-    );
+    ));
     let clock = FixedClock::try_new(TEST_NOW).unwrap();
     let now = clock.now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request.request_id = request_id;
     request
         .sign_intent_v2(
@@ -778,7 +778,7 @@ fn create_postgres_approval_gateway_with_clock(
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "postgres-human-approval",
         1,
         vec![
@@ -789,11 +789,11 @@ fn create_postgres_approval_gateway_with_clock(
             )
             .with_capability("local:write"),
         ],
-    );
+    ));
     // Intents are signed at the engine's (injected) time, never host time.
     let clock = clock.unwrap_or_else(SharedClock::at_test_now);
     let now = clock.now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request.request_id = request_id;
     request
         .sign_intent_v2(
@@ -1330,7 +1330,9 @@ fn postgres_journal_rejects_execution_key_reused_with_different_action() {
     };
     assert!(connect_journal().get(first_key).unwrap().is_some());
     let mut changed = fixture.request.clone();
-    changed.action.parameters["value"] = json!("different");
+    let mut action = changed.action.action().clone();
+    action.parameters["value"] = json!("different");
+    changed.action = mission(action);
     changed.request_id = first.evidence.request_id;
     changed
         .sign_intent_v2(
@@ -6266,4 +6268,226 @@ fn postgres_migrations_0013_database_applies_only_0014() {
         .get(0);
     assert!(!v2_after);
     assert_eq!(recorded_versions(&mut client), all_versions());
+}
+
+/// G7: with the PostgreSQL journal down (its connection terminated and every
+/// reconnect refused), the gateway HTTP API answers a safety action with
+/// `safety_action_not_governed` within 100 ms, without calling the engine
+/// and without a replay claim or journal row. The mission control request in
+/// the same state reaches the engine and fails closed.
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    initialize_test_database();
+    let fixture = create_postgres_gateway(Uuid::new_v4());
+    let policy_id = "postgres-g7-journal-down";
+    let mut policy = fixture
+        .policy
+        .clone()
+        .with_action_class("safety:halt", praetore_core::ActionClass::Safety);
+    policy.id = policy_id.into();
+    let mut request = fixture.request.clone();
+    let now = FixedClock::try_new(TEST_NOW).unwrap().now();
+    request
+        .sign_intent_v2(
+            &fixture.agent_key,
+            "postgres-test-gateway",
+            now,
+            now + Duration::minutes(1),
+            policy.digest().unwrap(),
+        )
+        .unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *request.agent.id.as_uuid(),
+        request_id: request.request_id,
+    };
+
+    let url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+    let down = Arc::new(AtomicBool::new(false));
+    let journal = {
+        let down = down.clone();
+        PostgresExecutionJournal::from_connection_factory(move || {
+            if down.load(Ordering::SeqCst) {
+                // Any refused connection: the database is unreachable.
+                return Client::connect(
+                    "host=127.0.0.1 port=1 user=praetore connect_timeout=1",
+                    NoTls,
+                );
+            }
+            let mut client = Client::connect(&url, NoTls)?;
+            client.batch_execute(
+                "SET application_name = 'praetore-g7-journal-down'; SET ROLE praetore_replay_test",
+            )?;
+            Ok(client)
+        })
+        .unwrap()
+    };
+    down.store(true, Ordering::SeqCst);
+    let terminated: i64 = connect_client()
+        .query_one(
+            "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = 'praetore-g7-journal-down') AS terminated",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(terminated, 1, "the journal connection was terminated");
+
+    let gateway = Gateway::new(
+        create_test_engine(
+            policy,
+            fixture.issuer_public_key.clone(),
+            fixture.attester.clone(),
+        ),
+        Arc::new(journal),
+        fixture.adapter.clone(),
+        execution_attester(),
+    )
+    .unwrap();
+    let app = praetore_gateway::http_api::router(
+        Arc::new(gateway),
+        praetore_gateway::http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let post = |body: Value| {
+        let app = app.clone();
+        runtime.block_on(async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let started = std::time::Instant::now();
+            let response = app.oneshot(request).await.unwrap();
+            let elapsed = started.elapsed();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 65_536).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            (status, body, elapsed)
+        })
+    };
+
+    let mut safety = serde_json::to_value(&request).unwrap();
+    safety["action"]["action_type"] = json!("safety:halt");
+    let (status, body, elapsed) = post(safety);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "safety_action_not_governed");
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "{elapsed:?}"
+    );
+    assert_eq!(praetore_core::probe::engine_calls(policy_id), 0);
+    assert_eq!(database_replay_claim_count(key), 0);
+    assert_eq!(database_journal_count(key), 0);
+    assert_eq!(fixture.adapter.invocation_count(), 0);
+
+    // Control: the mission request reaches the engine and fails closed.
+    let (status, body, _) = post(serde_json::to_value(&request).unwrap());
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(praetore_core::probe::engine_calls(policy_id), 1);
+    assert_eq!(database_replay_claim_count(key), 0);
+    assert_eq!(database_journal_count(key), 0);
+    assert_eq!(fixture.adapter.invocation_count(), 0);
+}
+
+/// G7: an undeclared action type is refused with a signed DENY that the
+/// PostgreSQL journal commits atomically with its replay claim, like a
+/// policy DENY; nothing is dispatched.
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_g7_unclassified_action_commits_a_signed_deny() {
+    let fixture = create_postgres_gateway(Uuid::new_v4());
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[72; 32]);
+    let agent = fixture.agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "gateway-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(test_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+    let action = Action::new(
+        "local:delete_all",
+        Some("persistent-state".into()),
+        json!({}),
+    )
+    .unwrap()
+    .with_capability("local:write");
+    let mut request = AuthorizationRequest::new_unclassified(
+        agent,
+        authority,
+        fixture.policy.unclassified(action).unwrap(),
+    )
+    .unwrap();
+    let now = FixedClock::try_new(TEST_NOW).unwrap().now();
+    request
+        .sign_intent_v2(
+            &fixture.agent_key,
+            "postgres-test-gateway",
+            now,
+            now + Duration::minutes(1),
+            fixture.policy.digest().unwrap(),
+        )
+        .unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *request.agent.id.as_uuid(),
+        request_id: request.request_id,
+    };
+
+    let receipt = fixture
+        .gateway
+        .refuse_unclassified(request.clone())
+        .unwrap();
+
+    assert_eq!(receipt.evidence.decision.outcome, DecisionOutcome::Deny);
+    assert_eq!(
+        receipt.evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
+    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(database_journal_count(key), 1);
+    assert_eq!(database_replay_claim_count(key), 1);
+    assert_eq!(fixture.adapter.invocation_count(), 0);
+    let persisted = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(
+        persisted.evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
+    // The same request again is a replay.
+    assert!(fixture.gateway.refuse_unclassified(request).is_err());
+    assert_eq!(database_journal_count(key), 1);
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

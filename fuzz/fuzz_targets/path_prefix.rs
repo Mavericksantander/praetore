@@ -21,8 +21,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use praetore_core::{
-    Action, AgentId, AgentIdentity, AgentKeyPair, Authority, DecisionOutcome, Policy,
-    PolicyCondition, PolicyEffect, PolicyRule,
+    Action, AgentId, AgentIdentity, AgentKeyPair, Authority, DecisionOutcome, MissionAction,
+    Policy, PolicyCondition, PolicyEffect, PolicyRule,
 };
 use serde_json::json;
 use std::sync::OnceLock;
@@ -89,6 +89,7 @@ fn policy(semantics: u8, rules: Vec<PolicyRule>) -> Policy {
     } else {
         Policy::new("fuzz-path-prefix", 1, rules)
     }
+    .with_mission_actions(["modify_file"])
 }
 
 fn check_allowed_path(prefix: &str, path: &str) {
@@ -110,7 +111,13 @@ fn check_allowed_path(prefix: &str, path: &str) {
     );
 }
 
-fn check(agent: &AgentIdentity, authority: &Authority, action: &Action, prefix: &str, path: &str) {
+fn check(
+    agent: &AgentIdentity,
+    authority: &Authority,
+    action: &MissionAction,
+    prefix: &str,
+    path: &str,
+) {
     let canonical_prefix = canonical(prefix);
     // `None`: unsafe path. `Some(inside)`: safe path, inside the prefix or not.
     let expected = canonical(path).map(|path| canonical_prefix.is_some_and(|p| inside(p, path)));
@@ -213,6 +220,12 @@ fuzz_target!(|input: &[u8]| {
         (agent, authority)
     });
     let Ok(action) = Action::new("modify_file", None, json!({ "path": path })) else {
+        return;
+    };
+    let Ok(action) = policy(2, vec![])
+        .classify(action)
+        .and_then(|action| action.into_mission())
+    else {
         return;
     };
 

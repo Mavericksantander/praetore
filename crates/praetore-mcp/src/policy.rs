@@ -147,6 +147,11 @@ pub fn add_rule(policy: &Policy, rule: PolicyRule) -> Result<String, String> {
         return Err(format!("a rule with id {:?} already exists", rule.id));
     }
     let mut updated = policy.clone();
+    // Generated rules always use the MCP action type, a mission action (G7).
+    updated
+        .action_classes
+        .entry(ACTION_TYPE.to_owned())
+        .or_insert(praetore_core::ActionClass::Mission);
     updated.rules.push(rule);
     bump(&mut updated)?;
     render_validated(&updated)

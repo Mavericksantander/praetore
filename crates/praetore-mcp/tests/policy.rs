@@ -199,7 +199,8 @@ fn check_reports_hand_written_mistakes() {
     // `value` instead of `expected`, missing fields: invalid, exit 1.
     fs::write(
         &policy,
-        r#"{"id":"p","version":1,"canonical_version":1,"semantics_version":2,"rules":[
+        r#"{"format_version":2,"id":"p","version":1,"canonical_version":1,"semantics_version":2,
+          "action_classes":{"mcp.tools/call":"Mission"},"rules":[
           {"id":"d","action_type":"mcp.tools/call","effect":"Deny",
            "parameter_conditions":[{"key":"tool","operator":"Exact","value":"x"}]}]}"#,
     )
@@ -214,10 +215,27 @@ fn check_reports_hand_written_mistakes() {
     ));
     assert!(!out.status.success());
 
+    // A policy format 1 document (no action_classes, written before G7) is
+    // invalid for evaluation, with a migration hint.
+    fs::write(
+        &policy,
+        r#"{"id":"p","version":1,"canonical_version":1,"semantics_version":2,"rules":[]}"#,
+    )
+    .unwrap();
+    let v1 = run(&with_dir(&["policy", "check"], dir));
+    assert_eq!(v1.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&v1.stdout);
+    assert!(
+        text.contains("unsupported policy format version 1"),
+        "{text}"
+    );
+    assert!(text.contains("praetore policy classify --policy"), "{text}");
+
     // Valid JSON, but approval without capability: warned.
     fs::write(
         &policy,
-        r#"{"id":"p","version":1,"canonical_version":1,"semantics_version":2,"rules":[
+        r#"{"format_version":2,"id":"p","version":1,"canonical_version":1,"semantics_version":2,
+          "action_classes":{"mcp.tools/call":"Mission"},"rules":[
           {"id":"allow","action_type":"mcp.tools/call","effect":"Allow","required_capability":"mcp:tools/call",
            "target":null,"parameter_conditions":[],"context_conditions":[]},
           {"id":"ra","action_type":"mcp.tools/call","effect":"RequireApproval","required_capability":null,
@@ -325,5 +343,21 @@ fn adding_a_rule_with_a_symlinked_path_prefix_warns() {
     assert!(
         !String::from_utf8_lossy(&out.stdout).contains("warning"),
         "{out:?}"
+    );
+}
+
+/// G7: `init` writes a format 2 policy that declares `mcp.tools/call` as
+/// Mission, so new homes classify every MCP call (observe refuses
+/// unclassified calls).
+#[test]
+fn init_declares_the_mcp_action_type_as_mission() {
+    let (_temp, home) = init();
+    let policy =
+        praetore_core::Policy::from_json(&fs::read_to_string(home.join("policy.json")).unwrap())
+            .unwrap();
+    assert_eq!(policy.format_version, 2);
+    assert_eq!(
+        policy.action_classes.get("mcp.tools/call"),
+        Some(&praetore_core::ActionClass::Mission)
     );
 }

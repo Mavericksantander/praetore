@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod journal_export;
+mod policy_classify;
 
 const POLICY_FILE: &str = "policy.json";
 const ISSUER_PIN_FILE: &str = "issuer-pin.json";
@@ -287,6 +288,11 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             dispatch_approved(Path::new(&directory), &execution_id, agent.as_deref())
         }
         "journal-export" => journal_export::run(journal_export::parse(args)?),
+        "policy" => match args.next().as_deref() {
+            Some("classify") => policy_classify::run(&policy_classify::parse(args)?),
+            Some(other) => Err(format!("unknown policy subcommand: {other}").into()),
+            None => Err("policy needs a subcommand: classify".into()),
+        },
         "help" | "--help" | "-h" => {
             print_usage();
             Ok(())
@@ -330,6 +336,7 @@ fn print_usage() {
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
            praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> --output <new file>\n\
+           praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
@@ -449,6 +456,8 @@ fn demo_policy() -> Policy {
                 .with_target("demo-state"),
         ],
     )
+    // G7: policy format 2 declares every action type explicitly.
+    .with_mission_actions(["demo:set_value"])
 }
 
 fn random_secret() -> Result<[u8; 32], io::Error> {
@@ -1172,7 +1181,7 @@ fn submit_demo_request(
         Err(_) => println!("{body}"),
     }
     if !status.is_success() {
-        return Err(format!("gateway returned HTTP {status}; review the receipt above").into());
+        return Err(format!("gateway returned HTTP {status}; review the response above (a DENY receipt, with its reason, is in the execution journal)").into());
     }
     if let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&body)
         && receipt["authorization"] == "requires_approval"
@@ -1251,6 +1260,9 @@ fn build_signed_request(
                 not_after: Some(timestamp(now + Duration::hours(1))?),
             });
     authority.sign_for_agent(&issuer_key, &agent)?;
+    // G7: only a Mission action of the policy can be submitted; a `safety:*`
+    // action returns SafetyActionNotGoverned here.
+    let action = policy.classify(action)?.into_mission()?;
     let mut request = AuthorizationRequest::new(agent, authority, action)?;
     request.sign_intent_v2(
         agent_key,
@@ -1695,7 +1707,7 @@ mod tests {
                 policy_digest: policy_digest.clone(),
                 expires_at: "2026-06-01T12:00:00Z".into(),
             },
-            action: request.action,
+            action: request.action.into_action(),
         };
         (view, policy_digest)
     }
@@ -1831,13 +1843,14 @@ mod tests {
         .unwrap()
         .with_capability("demo:write");
 
-        assert_eq!(
-            policy
-                .evaluate(&agent, &authority, &action)
-                .unwrap()
-                .outcome,
-            praetore_core::DecisionOutcome::Deny
-        );
+        let _ = (agent, authority);
+        // G7: an action type the policy does not declare is refused before
+        // any rule is evaluated.
+        assert!(matches!(
+            policy.classify(action),
+            Err(praetore_core::PraetoreError::UnclassifiedAction { action_type })
+                if action_type == "demo:delete_all"
+        ));
     }
 
     #[test]
@@ -2331,6 +2344,12 @@ mod tests {
                     .with_target("sandbox"),
             ],
         )
+        .with_mission_actions([
+            "fs:write_file",
+            "fs:delete_file",
+            "shell:exec",
+            "fs:chmod_file",
+        ])
     }
 
     struct SandboxFixture {

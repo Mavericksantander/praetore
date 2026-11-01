@@ -11,7 +11,7 @@
 //! inherited and passes straight through.
 
 use crate::{
-    gate::{Evaluator, Gate, Mode, Verdict},
+    gate::{Evaluator, Gate, GateError, Mode, Verdict},
     proxy::handle_client_line,
     store::Home,
 };
@@ -39,10 +39,12 @@ pub struct WrapOptions {
 struct GateOrError(Result<Gate, String>);
 
 impl Evaluator for GateOrError {
-    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String> {
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         match &mut self.0 {
             Ok(gate) => gate.evaluate(server, params),
-            Err(error) => Err(format!("praetore-mcp is not ready: {error}")),
+            Err(error) => Err(GateError::Failed(format!(
+                "praetore-mcp is not ready: {error}"
+            ))),
         }
     }
 }

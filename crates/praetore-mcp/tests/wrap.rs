@@ -63,7 +63,7 @@ fn write_policy(home: &Home, extra: Vec<PolicyRule>) {
             .with_capability(CAPABILITY),
     ];
     rules.extend(extra);
-    let policy = Policy::new_v2("test-policy", 1, rules);
+    let policy = mission_policy(Policy::new_v2("test-policy", 1, rules));
     fs::write(
         home.policy(),
         serde_json::to_string_pretty(&policy).unwrap(),
@@ -233,8 +233,13 @@ fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
     let denied = by_id(&responses, &json!(5));
     assert_eq!(denied["result"]["isError"], true);
     let text = denied["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("Denied by PRÆTORE"), "{text}");
-    assert!(text.contains("deny-delete-file"), "{text}");
+    assert!(
+        text.starts_with("Denied by PRÆTORE. Evidence id: "),
+        "{text}"
+    );
+    // The rule is reported on stderr, not to the client (G7).
+    assert!(!text.contains("deny-delete-file"), "{text}");
+    assert!(stderr.contains("deny-delete-file"), "{stderr}");
 
     assert_eq!(by_id(&responses, &json!("e"))["result"]["isError"], false);
 
@@ -463,11 +468,12 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
     assert!(out.status.success(), "{stderr}");
     let denied = by_id(&responses, &json!(10))["result"].clone();
     assert_eq!(denied["isError"], true);
+    assert!(stderr.contains("deny-delete"), "{stderr}");
     assert!(
         denied["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("deny-delete")
+            .starts_with("Denied by PRÆTORE")
     );
     assert_eq!(by_id(&responses, &json!(11))["result"]["isError"], false);
     let held = by_id(&responses, &json!(12))["result"].clone();
@@ -539,7 +545,7 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
 }
 
 fn write_rules(home: &Home, rules: Vec<PolicyRule>) {
-    let policy = Policy::new_v2("test-policy", 1, rules);
+    let policy = mission_policy(Policy::new_v2("test-policy", 1, rules));
     fs::write(
         home.policy(),
         serde_json::to_string_pretty(&policy).unwrap(),
@@ -671,7 +677,8 @@ fn deny_path_prefix_catches_symlinks_into_it_and_unresolvable_paths() {
         assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
         if refused {
             let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains("deny-outside"), "id {id}: {text}");
+            assert!(text.starts_with("Denied by PRÆTORE"), "id {id}: {text}");
+            assert!(stderr.contains("deny-outside"), "id {id}: {stderr}");
         }
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
@@ -1074,4 +1081,209 @@ fn deny_path_prefix_catches_hfs_ignorable_aliases_of_a_missing_name() {
     );
     fs::remove_file(hfs.join("notes.txt")).unwrap();
     assert!(verify_cli(&home).status.success());
+}
+
+/// G7: the default policy plus `safety:halt` declared Safety.
+fn write_policy_with_safety(home: &Home) {
+    let policy = store::default_policy()
+        .with_action_class("safety:halt", praetore_core::ActionClass::Safety);
+    fs::write(
+        home.policy(),
+        serde_json::to_string_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+}
+
+/// G7: a `safety:*` tool that the policy declares Safety is
+/// forwarded to the wrapped server without a receipt, in enforce and in
+/// observe. Every evaluation in praetore-mcp writes a receipt, so "no
+/// receipt for the safety call" means the engine was not called for it; the
+/// mission call in the same session shows the journal works.
+#[test]
+fn g7_declared_safety_call_is_forwarded_without_a_receipt_in_both_modes() {
+    for mode in ["enforce", "observe"] {
+        let (_temp, home) = init_home();
+        write_policy_with_safety(&home);
+        let (responses, stderr, out) = wrap(
+            &home,
+            mode,
+            &session(vec![
+                json!({"jsonrpc":"2.0","id":"s","method":"tools/call","params":{"name":"safety:halt","arguments":{}}}),
+                json!({"jsonrpc":"2.0","id":"m","method":"tools/call","params":{"name":"echo","arguments":{}}}),
+            ]),
+        );
+        assert!(out.status.success(), "{mode}: {stderr}");
+        let safety = by_id(&responses, &json!("s"));
+        assert_eq!(safety["result"]["isError"], false, "{mode}: {safety}");
+        assert!(stderr.contains("EXECUTED safety:halt"), "{mode}: {stderr}");
+        assert!(
+            stderr.contains("SAFETY_ACTION_NOT_GOVERNED"),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains("forwarded WITHOUT a receipt"),
+            "{mode}: {stderr}"
+        );
+        let evidence = journal(&home);
+        assert_eq!(
+            evidence.len(),
+            1,
+            "{mode}: only the mission call has a receipt"
+        );
+        assert_eq!(evidence[0].action.parameters["tool"], "echo");
+        assert!(
+            evidence
+                .iter()
+                .all(|e| !e.action.action_type.starts_with("safety:"))
+        );
+    }
+}
+
+/// G7: a `safety:*` tool that the policy does not declare is refused in both
+/// modes, nothing reaches the server, and the engine leaves a signed DENY
+/// receipt (reason `unclassified`) that `praetore-mcp verify` accepts. The
+/// client sees the same text as for any DENY.
+#[test]
+fn g7_undeclared_safety_call_is_refused_in_both_modes() {
+    for mode in ["enforce", "observe"] {
+        let (_temp, home) = init_home();
+        write_policy_with_safety(&home);
+        let (responses, stderr, out) = wrap(
+            &home,
+            mode,
+            &session(vec![
+                json!({"jsonrpc":"2.0","id":"u","method":"tools/call","params":{"name":"safety:hold","arguments":{}}}),
+            ]),
+        );
+        assert!(out.status.success(), "{mode}: {stderr}");
+        let refused = by_id(&responses, &json!("u"));
+        assert_eq!(refused["result"]["isError"], true, "{mode}: {refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Denied by PRÆTORE. Evidence id: "),
+            "{mode}: {text}"
+        );
+        assert!(!stderr.contains("EXECUTED safety:hold"), "{mode}: {stderr}");
+        let evidence = journal(&home);
+        assert_eq!(evidence.len(), 1, "{mode}");
+        assert_eq!(evidence[0].action.action_type, "safety:hold");
+        assert_eq!(evidence[0].decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            evidence[0].decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
+        assert!(text.contains(&evidence[0].evidence_id.to_string()));
+        let verify = verify_cli(&home);
+        let report = String::from_utf8_lossy(&verify.stdout);
+        assert!(verify.status.success(), "{mode}: {report}");
+        assert!(report.contains("1 verified, 0 failed"), "{mode}: {report}");
+    }
+}
+
+/// G7: a tool name that starts with `safety` (any ASCII case) and is not
+/// exactly a declared Safety action is refused in both modes and never
+/// forwarded, including names that would fail validation (trailing space or
+/// tab) and an ambiguous line (bare carriage return).
+#[test]
+fn g7_safety_named_calls_that_are_not_declared_are_never_forwarded() {
+    let calls = [
+        ("space", json!({"jsonrpc":"2.0","id":"space","method":"tools/call","params":{"name":"safety:halt ","arguments":{}}}).to_string()),
+        ("tab", json!({"jsonrpc":"2.0","id":"tab","method":"tools/call","params":{"name":"safety:halt\t","arguments":{}}}).to_string()),
+        ("upper", json!({"jsonrpc":"2.0","id":"upper","method":"tools/call","params":{"name":"SAFETY:halt","arguments":{}}}).to_string()),
+        ("cr", "{\"a\":1,\"x\":\r{\"jsonrpc\":\"2.0\",\"id\":\"cr\",\"method\":\"tools/call\",\"params\":{\"name\":\"safety:hold\"}}\r}".to_string()),
+    ];
+    for mode in ["enforce", "observe"] {
+        for (id, call) in &calls {
+            let (_temp, home) = init_home();
+            write_policy_with_safety(&home);
+            let mut input: String = session(vec![]).iter().map(|l| format!("{l}\n")).collect();
+            input.push_str(call);
+            input.push('\n');
+            let (responses, stderr, out) = wrap_raw(&home, mode, &input);
+            assert!(out.status.success(), "{mode}/{id}: {stderr}");
+            assert!(
+                !stderr.contains("EXECUTED"),
+                "{mode}/{id}: forwarded: {stderr}"
+            );
+            let refused = responses
+                .iter()
+                .find(|r| r["id"] == json!(id) || (r["id"].is_null() && r.get("error").is_some()))
+                .unwrap_or_else(|| panic!("{mode}/{id}: no refusal in {responses:?}"));
+            let text = refused.to_string();
+            assert!(
+                text.contains("Denied by PRÆTORE") || text.contains("not forwarded"),
+                "{mode}/{id}: {text}"
+            );
+            // Any receipt is the engine's signed unclassified DENY.
+            assert!(
+                journal(&home)
+                    .iter()
+                    .all(|e| e.decision.reason == praetore_core::UNCLASSIFIED_DENY_REASON),
+                "{mode}/{id}"
+            );
+        }
+    }
+}
+
+/// G7 limit: without a readable policy nothing can be classified, so every
+/// tool is refused, `safety:*` included, in both modes (fail closed).
+#[test]
+fn g7_unreadable_policy_refuses_safety_calls_in_both_modes() {
+    for broken in ["not json", "directory"] {
+        let (_temp, home) = init_home();
+        write_policy_with_safety(&home);
+        if broken == "directory" {
+            fs::remove_file(home.policy()).unwrap();
+            fs::create_dir(home.policy()).unwrap();
+        } else {
+            fs::write(home.policy(), "{not a policy").unwrap();
+        }
+        for mode in ["enforce", "observe"] {
+            let (responses, stderr, _) = wrap(
+                &home,
+                mode,
+                &session(vec![
+                    json!({"jsonrpc":"2.0","id":"s","method":"tools/call","params":{"name":"safety:halt","arguments":{}}}),
+                ]),
+            );
+            let refused = by_id(&responses, &json!("s"));
+            assert_eq!(
+                refused["result"]["isError"], true,
+                "{broken}/{mode}: {refused}"
+            );
+            assert!(
+                refused["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not ready"),
+                "{broken}/{mode}: {refused}"
+            );
+            assert!(!stderr.contains("EXECUTED"), "{broken}/{mode}: {stderr}");
+        }
+        assert!(receipts::read_journal(&home).unwrap().is_empty());
+    }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

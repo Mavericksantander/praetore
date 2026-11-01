@@ -40,6 +40,26 @@ praetore run ./praetore-deny
 A `requires_approval` action stays held until it is resolved with
 `praetore approve` / `praetore reject` (see Human approval below).
 
+All three are policy format 2: they declare `demo:set_value` as `Mission` in
+`action_classes` (see
+[docs/policy-language.md](../../docs/policy-language.md#action-classes-policy-format-2)).
+A format 1 policy (no `format_version`) no longer loads.
+
+### Migrating a policy to format 2
+
+```sh
+praetore policy classify --policy ./old/policy.json
+```
+
+prints a proposed `{"format_version": 2, "action_classes": {...}}` on stdout
+(types starting with `safety:` as `Safety`, the rest as `Mission`) and, on
+stderr, the document's current format and digest and anything that prevents
+it from loading as format 2 (a rule on a `safety:` action, a name that
+contains `safety` without the prefix); it then exits 1. It only reads the
+file and never writes or rewrites it. Add the two fields yourself, review
+every `Mission` entry, and keep the old document: receipts that recorded its
+digest verify only against it (`praetore-verify --policy`).
+
 ### Human approval
 
 `init` also creates a local human approver key (`approver.key`, owner-only)

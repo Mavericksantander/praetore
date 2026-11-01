@@ -21,7 +21,9 @@ fn decision(policy: &Policy, capabilities: &[&str], action: &Action) -> Decision
         "issuer",
         capabilities.iter().map(|c| c.to_string()).collect(),
     );
-    policy.evaluate(&agent, &authority, action).unwrap()
+    policy
+        .evaluate(&agent, &authority, &mission((action).clone()))
+        .unwrap()
 }
 
 fn outcome(policy: &Policy, capabilities: &[&str], action: &Action) -> DecisionOutcome {
@@ -30,8 +32,8 @@ fn outcome(policy: &Policy, capabilities: &[&str], action: &Action) -> DecisionO
 
 fn versions(rules: Vec<PolicyRule>) -> [Policy; 2] {
     [
-        Policy::new("scope", 1, rules.clone()),
-        Policy::new_v2("scope", 1, rules),
+        mission_policy(Policy::new("scope", 1, rules.clone())),
+        mission_policy(Policy::new_v2("scope", 1, rules)),
     ]
 }
 
@@ -239,4 +241,28 @@ fn unbound_restrictive_match_records_unbound_rule_as_decider() {
             }
         }
     }
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

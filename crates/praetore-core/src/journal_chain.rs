@@ -9,7 +9,7 @@
 //! when it was anchored somewhere the producer does not control and the
 //! verifier compares against it (`expected_head`).
 
-use crate::{Evidence, Policy, PraetoreError, StorageRecord, VerifiedPublicKey};
+use crate::{Evidence, PraetoreError, RecordedPolicy, StorageRecord, VerifiedPublicKey};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
@@ -257,7 +257,7 @@ enum Kind {
 /// Shared state of producer and verifier: position, last link, seen ids.
 struct ChainState<'k> {
     attester: &'k VerifiedPublicKey,
-    policy: Option<&'k Policy>,
+    policy: Option<&'k RecordedPolicy>,
     seq: u64,
     prev: ChainLink,
     seen: HashSet<Uuid>,
@@ -268,7 +268,7 @@ struct ChainState<'k> {
 }
 
 impl<'k> ChainState<'k> {
-    fn new(attester: &'k VerifiedPublicKey, policy: Option<&'k Policy>) -> Self {
+    fn new(attester: &'k VerifiedPublicKey, policy: Option<&'k RecordedPolicy>) -> Self {
         Self {
             attester,
             policy,
@@ -342,7 +342,7 @@ impl<'k> ChainState<'k> {
             });
         }
         if let Some(policy) = self.policy
-            && evidence.verify_policy(policy).is_err()
+            && evidence.verify_recorded_policy(policy).is_err()
         {
             return Err(ChainError::PolicyMismatch { line });
         }
@@ -478,7 +478,7 @@ struct DatabaseHeadField<'a> {
 pub fn verify_chain(
     text: &str,
     attester: &VerifiedPublicKey,
-    policy: Option<&Policy>,
+    policy: Option<&RecordedPolicy>,
     expected_head: Option<&ChainLink>,
 ) -> Result<ChainHead, ChainError> {
     verify_journal(text, attester, policy, expected_head, None).map(|summary| summary.head)
@@ -490,7 +490,7 @@ pub fn verify_chain(
 pub fn verify_journal(
     text: &str,
     attester: &VerifiedPublicKey,
-    policy: Option<&Policy>,
+    policy: Option<&RecordedPolicy>,
     expected_head: Option<&ChainLink>,
     expected_database_head: Option<&ExpectedDatabaseHead>,
 ) -> Result<JournalSummary, ChainError> {

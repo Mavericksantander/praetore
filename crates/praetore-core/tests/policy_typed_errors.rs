@@ -10,7 +10,7 @@ use praetore_core::{
 use serde_json::{Value, json};
 
 fn policy_with(expected: Value) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "p",
         1,
         vec![
@@ -18,7 +18,7 @@ fn policy_with(expected: Value) -> Policy {
                 PolicyCondition::new("k", MatchOperator::Exact, expected),
             ),
         ],
-    )
+    ))
 }
 
 /// The JSON document of `policy_with(expected)`, without validating it.
@@ -59,7 +59,7 @@ fn oversized_decoded_value_is_a_canonical_bytes_limit() {
         .map(|i| format!(r#"{{"key":"k{i:02}","operator":"Exact","expected":[{values}]}}"#))
         .collect();
     let text = format!(
-        r#"{{"id":"p","version":1,"canonical_version":1,"rules":[{{"id":"r","action_type":"a","effect":"Allow","required_capability":null,"target":null,"parameter_conditions":[{}],"context_conditions":[]}}]}}"#,
+        r#"{{"format_version":2,"id":"p","version":1,"canonical_version":1,"action_classes":{{"a":"Mission"}},"rules":[{{"id":"r","action_type":"a","effect":"Allow","required_capability":null,"target":null,"parameter_conditions":[{}],"context_conditions":[]}}]}}"#,
         conditions.join(",")
     );
     assert!(text.len() <= MAX_JSON_VALUE_BYTES);
@@ -243,7 +243,7 @@ fn nested_arrays_share_one_total_cap_at_every_depth() {
 
     // A flat `In` set keeps its previous bound.
     let flat = |n| {
-        Policy::new(
+        mission_policy(Policy::new(
             "p",
             1,
             vec![
@@ -251,7 +251,7 @@ fn nested_arrays_share_one_total_cap_at_every_depth() {
                     PolicyCondition::one_of("k", (0..n).map(|i| json!(i)).collect()),
                 ),
             ],
-        )
+        ))
     };
     flat(MAX_CONDITION_SET_VALUES).validate().unwrap();
     assert!(is_set_limit(flat(MAX_CONDITION_SET_VALUES + 1).validate()));
@@ -283,4 +283,28 @@ fn condition_set_values_error_states_the_cap() {
         message.contains("total across all nested arrays"),
         "{message}"
     );
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

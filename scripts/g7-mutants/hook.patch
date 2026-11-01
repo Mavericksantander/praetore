@@ -1,0 +1,61 @@
+diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
+index fb4f619..3aced84 100644
+--- a/crates/praetore-core/src/action.rs
++++ b/crates/praetore-core/src/action.rs
+@@ -300,6 +300,12 @@ impl MissionAction {
+     pub fn into_action(self) -> Action {
+         self.0
+     }
++
++    /// G7 MUTANT (scripts/g7-mutation-test.sh only): wraps any action
++    /// without classifying it, as the code did before G7.
++    pub fn mutant_unclassified(action: Action) -> Self {
++        Self(action)
++    }
+ }
+ 
+ impl SafetyAction {
+diff --git a/examples/claude-code-hook/src/main.rs b/examples/claude-code-hook/src/main.rs
+index ea658cf..b3f39d4 100644
+--- a/examples/claude-code-hook/src/main.rs
++++ b/examples/claude-code-hook/src/main.rs
+@@ -700,28 +700,8 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+     // a receipt is appended. A safety action gets no decision from PRÆTORE,
+     // so a PRÆTORE failure after this point cannot hold it.
+     let policy = load_policy(directory)?;
+-    let action_type = action_type_of(&input.tool_name);
+-    let unclassified = match policy.classify(Action::new(action_type, None, json!({}))?) {
+-        Ok(ClassifiedAction::Mission(_)) => false,
+-        Ok(ClassifiedAction::Safety(action)) => {
+-            return Ok(Verdict {
+-                outcome: DecisionOutcome::Deny,
+-                rule: None,
+-                reason: format!(
+-                    "{}: {}",
+-                    action.not_governed().code(),
+-                    action.not_governed()
+-                ),
+-                not_governed: true,
+-                evidence_id: None,
+-            });
+-        }
+-        // Not declared: the engine refuses it with a signed DENY (engine
+-        // guard `unclassified_action`) after verifying the request like a
+-        // mission request; no policy rule is evaluated.
+-        Err(PraetoreError::UnclassifiedAction { .. }) => true,
+-        Err(error) => return Err(error.into()),
+-    };
++    // G7 MUTANT: the classify call is removed.
++    let unclassified = false;
+     // Only the absence of `agent_type` is the main session. An explicit
+     // `main` (a subagent defined with `name: main`) or `unregistered` is a
+     // reserved name and is evaluated as `unregistered`.
+@@ -820,7 +800,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+         request.sign_intent(&key)?;
+         engine.refuse_unclassified(request)?
+     } else {
+-        let action = engine.policy().classify(action)?.into_mission()?;
++        let action = praetore_core::MissionAction::mutant_unclassified(action);
+         let mut request = context.apply(AuthorizationRequest::new(identity, authority, action)?);
+         request.sign_intent(&key)?;
+         engine.evaluate(request)?

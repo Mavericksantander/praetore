@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use crate::{
-    action::Action,
+    action::{Action, ClassifiedAction, MissionAction, SafetyAction, UnclassifiedAction},
     authority::Authority,
     canonical::{
         JsonError, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_JSON_VALUE_BYTES, canonical_json,
@@ -38,6 +38,132 @@ pub const MAX_CONDITION_STRING_BYTES: usize = 1024;
 pub const MAX_CONDITION_SET_VALUES: usize = 256;
 /// Maximum nesting depth of a condition's expected value (a scalar is 1).
 pub const MAX_CONDITION_VALUE_DEPTH: usize = 8;
+/// Maximum number of entries in a policy's `action_classes` table.
+pub const MAX_ACTION_CLASSES: usize = 512;
+
+/// Policy document format evaluated by this release. Format 2 adds the
+/// required `action_classes` table (G7). Format 1 documents carry no
+/// `format_version` field; they are rejected for evaluation and are only
+/// digested for historical verification (see [`RecordedPolicy`]).
+pub const POLICY_FORMAT_VERSION: u8 = 2;
+/// The prefix every safety action type carries, and only safety action
+/// types carry.
+pub const SAFETY_ACTION_PREFIX: &str = "safety:";
+
+/// G7: how a policy classifies an exact `action_type`.
+///
+/// * `Mission`: an action PRÆTORE decides. Every mission action needs a
+///   synchronously signed decision before it runs (fail closed).
+/// * `Safety`: an action the executor of an AI-enabled system runs without
+///   waiting for PRÆTORE (for example `safety:halt`, `safety:hold`,
+///   `safety:stop_all`). PRÆTORE makes no decision about
+///   it, and no policy rule may target it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ActionClass {
+    Mission,
+    Safety,
+}
+
+/// Why a policy's `action_classes` table, or a rule's use of it, was
+/// rejected. Raised as [`PraetoreError::PolicyActionClassInvalid`] when the
+/// policy is loaded or validated (fail closed, the policy is never partially
+/// applied).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ActionClassError {
+    /// A format 2 document has no `action_classes` field.
+    #[error("policy format 2 requires an `action_classes` table")]
+    MissingTable,
+    /// An `action_classes` key is empty or has surrounding whitespace.
+    #[error("action_classes key '{action_type}' is not a canonical action type")]
+    InvalidActionType { action_type: String },
+    /// An `action_classes` key has a character outside printable ASCII
+    /// (`!` to `~`): whitespace, a control or format character such as a
+    /// zero-width space, or any non-ASCII character such as a homoglyph or
+    /// a full-width letter. Keeps names that read alike from classifying
+    /// differently.
+    #[error("action_classes key {action_type:?} must be printable ASCII without whitespace")]
+    NotPrintableAscii { action_type: String },
+    /// A rule names an action type the table does not declare.
+    #[error(
+        "rule '{rule_id}' uses action type '{action_type}', which action_classes does not declare"
+    )]
+    UndeclaredActionType {
+        rule_id: String,
+        action_type: String,
+    },
+    /// An action type starting with `safety:` is not declared `Safety`.
+    #[error("action type '{action_type}' starts with `safety:` and must be declared Safety")]
+    SafetyPrefixNotSafety { action_type: String },
+    /// A `Safety` entry does not start with `safety:` followed by a name
+    /// that starts with an ASCII letter or digit.
+    #[error("Safety action type '{action_type}' must be `safety:` followed by a name")]
+    SafetyWithoutPrefix { action_type: String },
+    /// An action type without the `safety:` prefix contains "safety" (ASCII
+    /// case-insensitive), so it could be mistaken for a safety action.
+    #[error("action type '{action_type}' contains \"safety\" without the `safety:` prefix")]
+    AmbiguousSafetyName { action_type: String },
+    /// A rule targets a `Safety` action. PRÆTORE decides nothing about safety
+    /// actions, so no rule may name one.
+    #[error(
+        "rule '{rule_id}' targets safety action '{action_type}'; rules may only target Mission actions"
+    )]
+    RuleTargetsSafetyAction {
+        rule_id: String,
+        action_type: String,
+    },
+}
+
+fn class_error(error: ActionClassError) -> PraetoreError {
+    PraetoreError::PolicyActionClassInvalid(error)
+}
+
+/// Checks one `action_classes` entry: prefix and class must agree, and an
+/// unprefixed name may not contain "safety".
+fn validate_action_class_entry(action_type: &str, class: ActionClass) -> Result<()> {
+    if action_type.trim().is_empty() || action_type != action_type.trim() {
+        return Err(class_error(ActionClassError::InvalidActionType {
+            action_type: action_type.to_owned(),
+        }));
+    }
+    check_limit(
+        PolicyLimit::ActionTypeBytes,
+        action_type.len(),
+        MAX_POLICY_TEXT_BYTES,
+    )?;
+    if !action_type.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(class_error(ActionClassError::NotPrintableAscii {
+            action_type: action_type.to_owned(),
+        }));
+    }
+    let owned = || action_type.to_owned();
+    match (action_type.strip_prefix(SAFETY_ACTION_PREFIX), class) {
+        (Some(name), ActionClass::Safety)
+            if name
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric()) =>
+        {
+            Ok(())
+        }
+        (Some(_), ActionClass::Safety) => Err(class_error(ActionClassError::SafetyWithoutPrefix {
+            action_type: owned(),
+        })),
+        (Some(_), ActionClass::Mission) => {
+            Err(class_error(ActionClassError::SafetyPrefixNotSafety {
+                action_type: owned(),
+            }))
+        }
+        (None, ActionClass::Safety) => Err(class_error(ActionClassError::SafetyWithoutPrefix {
+            action_type: owned(),
+        })),
+        (None, ActionClass::Mission) if action_type.to_ascii_lowercase().contains("safety") => {
+            Err(class_error(ActionClassError::AmbiguousSafetyName {
+                action_type: owned(),
+            }))
+        }
+        (None, ActionClass::Mission) => Ok(()),
+    }
+}
 
 /// Which policy limit was exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +180,8 @@ pub enum PolicyLimit {
     ConditionSetValues,
     ConditionValueDepth,
     CanonicalBytes,
+    /// Entries in `action_classes` (`MAX_ACTION_CLASSES`).
+    ActionClasses,
     /// Raw policy text passed to `Policy::from_json`, before parsing.
     InputBytes,
     /// JSON nesting depth of the whole document (`MAX_JSON_DEPTH`).
@@ -79,6 +207,7 @@ impl std::fmt::Display for PolicyLimit {
             }
             Self::ConditionValueDepth => "condition value nesting depth",
             Self::CanonicalBytes => "canonical policy bytes",
+            Self::ActionClasses => "action_classes entries",
             Self::InputBytes => "policy input bytes",
             Self::JsonDepth => "policy JSON nesting depth",
             Self::JsonNodes => "policy JSON nodes",
@@ -245,13 +374,16 @@ fn check_condition_value(value: &Value, depth: usize, array_values: &mut usize) 
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-/// A versioned set of declarative authorization rules.
+/// A versioned set of declarative authorization rules (policy format 2).
 ///
 /// No matching rule produces a DENY decision. Matching effects are combined
 /// using DENY > REQUIRE_APPROVAL > ALLOW.
 ///
+/// Every action type a rule names must be declared in `action_classes`, and
+/// no rule may name a `Safety` action (G7).
+///
 /// ```
-/// use praetore_core::{Policy, PolicyCondition, PolicyEffect, PolicyRule};
+/// use praetore_core::{ActionClass, Policy, PolicyCondition, PolicyEffect, PolicyRule};
 /// use serde_json::json;
 ///
 /// let policy = Policy::new(
@@ -259,11 +391,15 @@ fn check_condition_value(value: &Value, depth: usize, array_values: &mut usize) 
 ///     1,
 ///     vec![PolicyRule::new("allow-public", "read_data", PolicyEffect::Allow)
 ///         .with_parameter_condition(PolicyCondition::exact("classification", json!("public")))],
-/// );
+/// )
+/// .with_mission_actions(["read_data"])
+/// .with_action_class("safety:halt", ActionClass::Safety);
 /// policy.validate().expect("valid policy");
 /// assert_eq!(policy.digest().expect("canonical digest").len(), 64);
 /// ```
 pub struct Policy {
+    /// Policy document format; must be [`POLICY_FORMAT_VERSION`] (2).
+    pub format_version: u8,
     pub id: String,
     pub version: u32,
     pub canonical_version: u8,
@@ -272,6 +408,9 @@ pub struct Policy {
         skip_serializing_if = "is_legacy_policy_semantics_version"
     )]
     pub semantics_version: u8,
+    /// G7: the class of every action type this policy knows, by exact
+    /// `action_type`. Required in format 2.
+    pub action_classes: BTreeMap<String, ActionClass>,
     pub rules: Vec<PolicyRule>,
     /// SAF-10: upper bound for a human-approval window, in milliseconds.
     /// A RequireApproval request whose signed intent window is longer is
@@ -289,15 +428,141 @@ fn is_legacy_policy_semantics_version(version: &u8) -> bool {
 }
 
 impl Policy {
+    /// Creates a format 2 policy with semantics version 1 and an empty
+    /// `action_classes` table. Declare every action type its rules use with
+    /// [`Self::with_action_class`] or [`Self::with_mission_actions`];
+    /// [`Self::validate`] rejects an undeclared one.
     pub fn new(id: impl Into<String>, version: u32, rules: Vec<PolicyRule>) -> Self {
         Self {
+            format_version: POLICY_FORMAT_VERSION,
             id: id.into(),
             version,
             canonical_version: crate::canonical::CANONICAL_VERSION,
             semantics_version: 1,
+            action_classes: BTreeMap::new(),
             rules,
             max_approval_ms: None,
         }
+    }
+
+    /// Declares the class of one exact action type.
+    pub fn with_action_class(mut self, action_type: impl Into<String>, class: ActionClass) -> Self {
+        self.action_classes.insert(action_type.into(), class);
+        self
+    }
+
+    /// Declares each of `action_types` as [`ActionClass::Mission`].
+    pub fn with_mission_actions<I, S>(mut self, action_types: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        for action_type in action_types {
+            self.action_classes
+                .insert(action_type.into(), ActionClass::Mission);
+        }
+        self
+    }
+
+    /// Classifies `action` by its exact `action_type`.
+    ///
+    /// Returns [`PraetoreError::UnclassifiedAction`] when `action_classes`
+    /// does not declare it, and a typed policy error when this policy is not
+    /// format 2 or the entry itself is invalid (prefix and class disagree).
+    /// This is the only way to obtain a [`MissionAction`] or a
+    /// [`SafetyAction`]. It reads only the table: it evaluates no rule and
+    /// performs no I/O.
+    ///
+    /// ```
+    /// use praetore_core::{Action, ActionClass, ClassifiedAction, Policy, PraetoreError};
+    /// use serde_json::json;
+    ///
+    /// let policy = Policy::new_v2("p", 1, vec![])
+    ///     .with_mission_actions(["fs:write_file"])
+    ///     .with_action_class("safety:halt", ActionClass::Safety);
+    /// let halt = Action::new("safety:halt", None, json!({})).unwrap();
+    /// assert!(matches!(policy.classify(halt), Ok(ClassifiedAction::Safety(_))));
+    /// let unknown = Action::new("fs:delete", None, json!({})).unwrap();
+    /// assert!(matches!(
+    ///     policy.classify(unknown),
+    ///     Err(PraetoreError::UnclassifiedAction { .. })
+    /// ));
+    /// ```
+    pub fn classify(&self, action: Action) -> Result<ClassifiedAction> {
+        self.check_format()?;
+        action.validate()?;
+        let Some(class) = self.action_classes.get(&action.action_type).copied() else {
+            return Err(PraetoreError::UnclassifiedAction {
+                action_type: action.action_type,
+            });
+        };
+        validate_action_class_entry(&action.action_type, class)?;
+        Ok(match class {
+            ActionClass::Mission => ClassifiedAction::Mission(MissionAction::classified(action)),
+            ActionClass::Safety => ClassifiedAction::Safety(SafetyAction::classified(action)),
+        })
+    }
+
+    /// Wraps `action` as an [`UnclassifiedAction`]: an action whose type
+    /// `action_classes` does not declare. Fails when the type is declared
+    /// (`Mission` or `Safety`), when the action is invalid, and when this
+    /// policy is not format 2. The result can only be refused, with a signed
+    /// DENY, by
+    /// [`AuthorizationEngine::refuse_unclassified`](crate::engine::AuthorizationEngine::refuse_unclassified).
+    pub fn unclassified(&self, action: Action) -> Result<UnclassifiedAction> {
+        self.check_format()?;
+        action.validate()?;
+        match self.action_classes.get(&action.action_type) {
+            None => Ok(UnclassifiedAction::unclassified(action)),
+            Some(ActionClass::Safety) => Err(PraetoreError::SafetyActionNotGoverned {
+                action_type: action.action_type,
+            }),
+            Some(ActionClass::Mission) => Err(PraetoreError::InvalidRequest(format!(
+                "action type '{}' is declared Mission; it is not unclassified",
+                action.action_type
+            ))),
+        }
+    }
+
+    /// Re-checks, at refusal time, that `action` is still not declared by
+    /// this policy (it may have been wrapped against another policy).
+    pub(crate) fn require_unclassified(&self, action: &UnclassifiedAction) -> Result<()> {
+        self.check_format()?;
+        match self.action_classes.get(&action.action_type) {
+            None => Ok(()),
+            Some(ActionClass::Safety) => Err(PraetoreError::SafetyActionNotGoverned {
+                action_type: action.action_type.clone(),
+            }),
+            Some(ActionClass::Mission) => Err(PraetoreError::InvalidRequest(format!(
+                "action type '{}' is declared Mission; it is not unclassified",
+                action.action_type
+            ))),
+        }
+    }
+
+    /// Re-checks, at evaluation time, that `action` is still a declared
+    /// Mission action of this policy (it may have been classified by another
+    /// policy).
+    pub(crate) fn require_mission(&self, action: &MissionAction) -> Result<()> {
+        self.check_format()?;
+        match self.action_classes.get(&action.action_type).copied() {
+            Some(class @ ActionClass::Mission) => {
+                validate_action_class_entry(&action.action_type, class)
+            }
+            Some(ActionClass::Safety) => Err(PraetoreError::SafetyActionNotGoverned {
+                action_type: action.action_type.clone(),
+            }),
+            None => Err(PraetoreError::UnclassifiedAction {
+                action_type: action.action_type.clone(),
+            }),
+        }
+    }
+
+    fn check_format(&self) -> Result<()> {
+        if self.format_version != POLICY_FORMAT_VERSION {
+            return Err(unsupported_format(self.format_version));
+        }
+        Ok(())
     }
 
     /// Creates a policy using conservative unknown-condition semantics.
@@ -316,7 +581,7 @@ impl Policy {
         &self,
         agent: &AgentIdentity,
         authority: &Authority,
-        action: &Action,
+        action: &MissionAction,
     ) -> Result<Decision> {
         self.evaluate_with_context(agent, authority, action, &BTreeMap::new())
     }
@@ -325,10 +590,14 @@ impl Policy {
         &self,
         agent: &AgentIdentity,
         authority: &Authority,
-        action: &Action,
+        action: &MissionAction,
         context: &BTreeMap<String, Value>,
     ) -> Result<Decision> {
+        #[cfg(feature = "test-probe")]
+        crate::probe::record_policy_evaluation(&self.id);
         self.validate()?;
+        self.require_mission(action)?;
+        let action = action.action();
 
         let mut decision: Option<Decision> = None;
 
@@ -434,8 +703,21 @@ impl Policy {
     /// and unsafe integers as `PolicyDocumentInvalid`. Other schema errors
     /// (wrong types, missing fields, unknown enum values) remain
     /// `PolicyEvaluationFailed`.
+    ///
+    /// A document without `format_version` is policy format 1 and is
+    /// rejected with [`PraetoreError::PolicyFormatUnsupported`]; to check
+    /// historical evidence against one, use [`RecordedPolicy::from_json`].
+    /// A format 2 document without `action_classes` is rejected with
+    /// [`ActionClassError::MissingTable`].
     pub fn from_json(json: &str) -> Result<Self> {
         let value = parse_json_strict(json).map_err(policy_json_error)?;
+        match document_format(&value) {
+            Ok(POLICY_FORMAT_VERSION) => {}
+            Ok(found) | Err(found) => return Err(unsupported_format(found)),
+        }
+        if value.get("action_classes").is_none() {
+            return Err(class_error(ActionClassError::MissingTable));
+        }
         check_policy_fields(&value)?;
         let policy: Self = serde_json::from_value(value)
             .map_err(|error| PraetoreError::PolicyEvaluationFailed(error.to_string()))?;
@@ -444,6 +726,52 @@ impl Policy {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.check_format()?;
+        self.validate_body()?;
+        self.validate_action_classes()?;
+        let canonical = canonical_json(self).map_err(policy_json_error)?;
+        check_limit(
+            PolicyLimit::CanonicalBytes,
+            canonical.len(),
+            MAX_JSON_VALUE_BYTES,
+        )?;
+        Ok(())
+    }
+
+    /// G7 load-time checks of `action_classes` and of the rules against it.
+    fn validate_action_classes(&self) -> Result<()> {
+        check_limit(
+            PolicyLimit::ActionClasses,
+            self.action_classes.len(),
+            MAX_ACTION_CLASSES,
+        )?;
+        for (action_type, class) in &self.action_classes {
+            validate_action_class_entry(action_type, *class)?;
+        }
+        for rule in &self.rules {
+            match self.action_classes.get(&rule.action_type) {
+                Some(ActionClass::Mission) => {}
+                Some(ActionClass::Safety) => {
+                    return Err(class_error(ActionClassError::RuleTargetsSafetyAction {
+                        rule_id: rule.id.clone(),
+                        action_type: rule.action_type.clone(),
+                    }));
+                }
+                None => {
+                    return Err(class_error(ActionClassError::UndeclaredActionType {
+                        rule_id: rule.id.clone(),
+                        action_type: rule.action_type.clone(),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks shared by format 1 and format 2 documents: identifiers, rules,
+    /// approval loops and duplicate rule ids. Not the canonical size, which
+    /// depends on the format.
+    fn validate_body(&self) -> Result<()> {
         if self.canonical_version != crate::canonical::CANONICAL_VERSION {
             return Err(PraetoreError::PolicyEvaluationFailed(
                 "unsupported policy canonical version".into(),
@@ -491,14 +819,219 @@ impl Policy {
             }
         }
 
-        let canonical = canonical_json(self).map_err(policy_json_error)?;
+        Ok(())
+    }
+}
+
+/// The format a document declares: `Ok(1)` when `format_version` is absent
+/// (format 1 never wrote the field), `Ok(n)` for a declared `n >= 2`, and
+/// `Err(found)` otherwise: an explicit `1` (no format 1 document has it) or
+/// a value that is not a small integer (reported as 0).
+fn document_format(document: &Value) -> std::result::Result<u8, u8> {
+    match document.get("format_version") {
+        None => Ok(1),
+        Some(value) => match value.as_u64().and_then(|v| u8::try_from(v).ok()) {
+            Some(version) if version >= 2 => Ok(version),
+            Some(version) => Err(version),
+            None => Err(0),
+        },
+    }
+}
+
+fn unsupported_format(found: u8) -> PraetoreError {
+    PraetoreError::PolicyFormatUnsupported {
+        found,
+        supported: POLICY_FORMAT_VERSION,
+    }
+}
+
+/// The format 1 policy document, exactly as releases before G7 serialized
+/// it. Used only to recompute historical digests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyDocumentV1 {
+    id: String,
+    version: u32,
+    canonical_version: u8,
+    #[serde(
+        default = "legacy_policy_semantics_version",
+        skip_serializing_if = "is_legacy_policy_semantics_version"
+    )]
+    semantics_version: u8,
+    rules: Vec<PolicyRule>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_approval_ms: Option<u64>,
+}
+
+/// A policy document as historical evidence recorded it: format 1 or 2.
+///
+/// It exists to answer one question: does this document have the digest a
+/// receipt recorded? It has no `evaluate` and does not convert into a
+/// [`Policy`], so a format 1 document can be digested and compared but never
+/// used to decide anything. Format 1 documents are validated as they were
+/// before G7 (identifiers, rules, limits); they have no `action_classes`.
+///
+/// ```
+/// use praetore_core::RecordedPolicy;
+///
+/// let v1 = include_str!("../../../docs/golden/canonical-policy-v1.json");
+/// let recorded = RecordedPolicy::from_json(v1).unwrap();
+/// assert_eq!(recorded.format_version(), 1);
+/// assert_eq!(
+///     recorded.digest(),
+///     "5d45f213fc1f9fcfa17bf0a462169ea9e14efa028d873b79841924eae90ddd1f"
+/// );
+/// // The same document cannot be loaded for evaluation.
+/// assert!(praetore_core::Policy::from_json(v1).is_err());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedPolicy {
+    format_version: u8,
+    id: String,
+    version: u32,
+    digest: String,
+    rules: Vec<PolicyRule>,
+    action_classes: Option<BTreeMap<String, ActionClass>>,
+}
+
+/// A proposed `action_classes` table for a policy, from
+/// [`RecordedPolicy::propose_action_classes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionClassProposal {
+    /// One entry per action type the rules name, plus any entry the document
+    /// already declares.
+    pub action_classes: BTreeMap<String, ActionClass>,
+    /// What prevents the document from loading as format 2 with this table
+    /// (a rule on a `safety:` action, an ambiguous name). Empty when adding
+    /// the table and `"format_version": 2` is enough.
+    pub problems: Vec<ActionClassError>,
+}
+
+impl RecordedPolicy {
+    /// Parses and validates a format 1 or format 2 policy document and
+    /// computes its digest. Format 2 documents get the full
+    /// [`Policy::from_json`] validation.
+    pub fn from_json(json: &str) -> Result<Self> {
+        let value = parse_json_strict(json).map_err(policy_json_error)?;
+        match document_format(&value) {
+            Ok(1) => Self::from_v1(value),
+            Ok(POLICY_FORMAT_VERSION) => Self::from_policy(&Policy::from_json(json)?),
+            Ok(found) | Err(found) => Err(unsupported_format(found)),
+        }
+    }
+
+    /// The record of a format 2 policy.
+    pub fn from_policy(policy: &Policy) -> Result<Self> {
+        Ok(Self {
+            format_version: policy.format_version,
+            id: policy.id.clone(),
+            version: policy.version,
+            digest: policy.digest()?,
+            rules: policy.rules.clone(),
+            action_classes: Some(policy.action_classes.clone()),
+        })
+    }
+
+    fn from_v1(value: Value) -> Result<Self> {
+        check_known_fields::<PolicyDocumentV1>(&value)?;
+        let rules = value.get("rules").and_then(Value::as_array);
+        for rule in rules.into_iter().flatten() {
+            check_known_fields::<PolicyRule>(rule)?;
+            for scope in ["parameter_conditions", "context_conditions"] {
+                let conditions = rule.get(scope).and_then(Value::as_array);
+                for condition in conditions.into_iter().flatten() {
+                    check_known_fields::<PolicyCondition>(condition)?;
+                }
+            }
+        }
+        let document: PolicyDocumentV1 = serde_json::from_value(value)
+            .map_err(|error| PraetoreError::PolicyEvaluationFailed(error.to_string()))?;
+        // The shared checks run on a format 2 view of the same fields; the
+        // view is never returned and never evaluated.
+        Policy {
+            format_version: POLICY_FORMAT_VERSION,
+            id: document.id.clone(),
+            version: document.version,
+            canonical_version: document.canonical_version,
+            semantics_version: document.semantics_version,
+            action_classes: BTreeMap::new(),
+            rules: document.rules.clone(),
+            max_approval_ms: document.max_approval_ms,
+        }
+        .validate_body()?;
+        let canonical = canonical_json(&document).map_err(policy_json_error)?;
         check_limit(
             PolicyLimit::CanonicalBytes,
             canonical.len(),
             MAX_JSON_VALUE_BYTES,
         )?;
+        Ok(Self {
+            format_version: 1,
+            id: document.id,
+            version: document.version,
+            digest: hex::encode(Sha256::digest(canonical)),
+            rules: document.rules,
+            action_classes: None,
+        })
+    }
 
-        Ok(())
+    /// 1 or 2.
+    pub fn format_version(&self) -> u8 {
+        self.format_version
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// SHA-256 of the document's canonical JSON, lowercase hex: the value a
+    /// receipt records as `policy_digest`.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Proposes an `action_classes` table for migrating this document to
+    /// format 2. Action types starting with `safety:` are proposed as
+    /// `Safety` (and every rule on one is reported, since format 2 rejects
+    /// it); other action types are proposed as `Mission`, except a name that
+    /// contains "safety" without the prefix, which is reported and left out.
+    /// It reads only this document and changes nothing.
+    pub fn propose_action_classes(&self) -> ActionClassProposal {
+        let mut action_classes = self.action_classes.clone().unwrap_or_default();
+        let mut problems = Vec::new();
+        for rule in &self.rules {
+            let action_type = &rule.action_type;
+            let class = action_classes.get(action_type).copied().unwrap_or(
+                if action_type.starts_with(SAFETY_ACTION_PREFIX) {
+                    ActionClass::Safety
+                } else {
+                    ActionClass::Mission
+                },
+            );
+            if let Err(PraetoreError::PolicyActionClassInvalid(problem)) =
+                validate_action_class_entry(action_type, class)
+            {
+                if !problems.contains(&problem) {
+                    problems.push(problem);
+                }
+                continue;
+            }
+            if class == ActionClass::Safety {
+                problems.push(ActionClassError::RuleTargetsSafetyAction {
+                    rule_id: rule.id.clone(),
+                    action_type: action_type.clone(),
+                });
+            }
+            action_classes.insert(action_type.clone(), class);
+        }
+        ActionClassProposal {
+            action_classes,
+            problems,
+        }
     }
 }
 
@@ -1286,13 +1819,15 @@ mod tests {
         AgentIdentity::new(id, b"test-public-key".to_vec(), "ed25519").unwrap()
     }
 
-    fn test_action() -> Action {
-        Action::new(
-            "read_data",
-            Some("database".into()),
-            json!({"table": "users"}),
+    fn test_action() -> MissionAction {
+        crate::test_support::mission(
+            Action::new(
+                "read_data",
+                Some("database".into()),
+                json!({"table": "users"}),
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     #[test]
@@ -1300,7 +1835,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![PolicyRule::new(
@@ -1308,7 +1843,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::Allow,
             )],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1331,14 +1866,14 @@ mod tests {
     fn policy_import_rejects_unknown_fields_and_versions() {
         assert!(matches!(
             Policy::from_json(
-                r#"{"id":"p","version":1,"canonical_version":1,"rules":[],"future":true}"#
+                r#"{"format_version":2,"id":"p","version":1,"canonical_version":1,"action_classes":{},"rules":[],"future":true}"#
             ),
             Err(PraetoreError::PolicyDocumentInvalid(
                 PolicyDocumentError::UnknownField { field }
             )) if field == "future"
         ));
         assert!(
-            Policy::from_json(r#"{"id":"p","version":1,"canonical_version":2,"rules":[]}"#)
+            Policy::from_json(r#"{"format_version":2,"id":"p","version":1,"canonical_version":2,"action_classes":{},"rules":[]}"#)
                 .is_err()
         );
     }
@@ -1348,7 +1883,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![PolicyRule::new(
@@ -1356,7 +1891,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::Deny,
             )],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1370,7 +1905,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![PolicyRule::new(
@@ -1378,7 +1913,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::RequireApproval,
             )],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1392,7 +1927,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![PolicyRule::new(
@@ -1400,7 +1935,8 @@ mod tests {
                 "write_data",
                 PolicyEffect::Allow,
             )],
-        );
+        ))
+        .with_mission_actions(["read_data"]);
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1417,14 +1953,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
                     .with_capability("admin:data"),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1437,14 +1973,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("deny-database", "read_data", PolicyEffect::Deny)
                     .with_target("database"),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1457,14 +1993,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow),
                 PolicyRule::new("deny-read", "read_data", PolicyEffect::Deny),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1477,14 +2013,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow),
                 PolicyRule::new("approval-read", "read_data", PolicyEffect::RequireApproval),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1497,14 +2033,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("approval-read", "read_data", PolicyEffect::RequireApproval),
                 PolicyRule::new("deny-read", "read_data", PolicyEffect::Deny),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1517,23 +2053,23 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let first = Policy::new(
+        let first = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow),
                 PolicyRule::new("deny-read", "read_data", PolicyEffect::Deny),
             ],
-        );
+        ));
 
-        let second = Policy::new(
+        let second = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("deny-read", "read_data", PolicyEffect::Deny),
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow),
             ],
-        );
+        ));
 
         let first_decision = first.evaluate(&agent, &authority, &test_action()).unwrap();
         let second_decision = second.evaluate(&agent, &authority, &test_action()).unwrap();
@@ -1547,7 +2083,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![PolicyRule::new(
@@ -1555,7 +2091,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::Allow,
             )],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1570,14 +2106,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("allow-read-1", "read_data", PolicyEffect::Allow),
                 PolicyRule::new("allow-read-2", "read_data", PolicyEffect::Allow),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1590,14 +2126,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("deny-read-1", "read_data", PolicyEffect::Deny),
                 PolicyRule::new("deny-read-2", "read_data", PolicyEffect::Deny),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1607,14 +2143,14 @@ mod tests {
 
     #[test]
     fn policy_rejects_empty_id() {
-        let policy = Policy::new("", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new("", 1, vec![]));
 
         assert!(policy.validate().is_err());
     }
 
     #[test]
     fn policy_rejects_zero_version() {
-        let policy = Policy::new("production", 0, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new("production", 0, vec![]));
 
         assert!(policy.validate().is_err());
     }
@@ -1624,7 +2160,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "",
             1,
             vec![PolicyRule::new(
@@ -1632,7 +2168,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::Allow,
             )],
-        );
+        ));
 
         let result = policy.evaluate(&agent, &authority, &test_action());
 
@@ -1647,14 +2183,14 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("allow-read-1", "read_data", PolicyEffect::Allow),
                 PolicyRule::new("allow-read-2", "read_data", PolicyEffect::Allow),
             ],
-        );
+        ));
 
         let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1672,7 +2208,7 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             0,
             vec![PolicyRule::new(
@@ -1680,7 +2216,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::Allow,
             )],
-        );
+        ));
 
         let result = policy.evaluate(&agent, &authority, &test_action());
 
@@ -1721,14 +2257,14 @@ mod tests {
 
         for (left_index, left_effect) in effects.iter().enumerate() {
             for (right_index, right_effect) in effects.iter().enumerate() {
-                let policy = Policy::new(
+                let policy = crate::test_support::mission_policy(Policy::new(
                     "precedence-test",
                     1,
                     vec![
                         PolicyRule::new("rule-left", "read_data", left_effect.clone()),
                         PolicyRule::new("rule-right", "read_data", right_effect.clone()),
                     ],
-                );
+                ));
 
                 let decision = policy.evaluate(&agent, &authority, &test_action()).unwrap();
 
@@ -1745,14 +2281,14 @@ mod tests {
 
     #[test]
     fn policy_rejects_duplicate_rule_ids() {
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "production",
             1,
             vec![
                 PolicyRule::new("read-rule", "read_data", PolicyEffect::Allow),
                 PolicyRule::new("read-rule", "read_data", PolicyEffect::Deny),
             ],
-        );
+        ));
 
         let result = policy.validate();
 
@@ -1777,7 +2313,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "typed-matches",
             1,
             vec![
@@ -1793,9 +2329,15 @@ mod tests {
                         json!(10),
                     )),
             ],
-        );
+        ));
 
-        let decision = policy.evaluate(&agent, &authority, &action).unwrap();
+        let decision = policy
+            .evaluate(
+                &agent,
+                &authority,
+                &crate::test_support::mission(action.clone()),
+            )
+            .unwrap();
 
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
     }
@@ -1804,7 +2346,7 @@ mod tests {
     fn restrictive_conditions_fail_closed_when_values_are_missing_or_mistyped() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["data:read".into()]);
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "restrictive-unknowns",
             1,
             vec![
@@ -1815,7 +2357,7 @@ mod tests {
                         json!(1000),
                     )),
             ],
-        );
+        ));
 
         for parameters in [
             json!({}),
@@ -1825,7 +2367,11 @@ mod tests {
         ] {
             let action = Action::new("read_data", None, parameters).unwrap();
             let decision = policy
-                .evaluate(&agent, &authority, &action)
+                .evaluate(
+                    &agent,
+                    &authority,
+                    &crate::test_support::mission(action.clone()),
+                )
                 .expect("policy is valid");
             assert_eq!(
                 decision.outcome,
@@ -1847,7 +2393,7 @@ mod tests {
     fn restrictive_conditions_do_not_match_when_another_condition_is_false() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["data:read".into()]);
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "restrictive-false-condition",
             1,
             vec![
@@ -1863,10 +2409,16 @@ mod tests {
                     json!(1000),
                 )),
             ],
-        );
+        ));
         let action = Action::new("read_data", Some("development".into()), json!({})).unwrap();
 
-        let decision = policy.evaluate(&agent, &authority, &action).unwrap();
+        let decision = policy
+            .evaluate(
+                &agent,
+                &authority,
+                &crate::test_support::mission(action.clone()),
+            )
+            .unwrap();
         assert_eq!(decision.outcome, DecisionOutcome::Allow);
     }
 
@@ -1880,7 +2432,7 @@ mod tests {
             json!({"record_count": "12", "region": "south"}),
         )
         .unwrap();
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "typed-matches",
             1,
             vec![
@@ -1891,9 +2443,15 @@ mod tests {
                     ))
                     .with_parameter_condition(PolicyCondition::exact("missing", json!(true))),
             ],
-        );
+        ));
 
-        let decision = policy.evaluate(&agent, &authority, &action).unwrap();
+        let decision = policy
+            .evaluate(
+                &agent,
+                &authority,
+                &crate::test_support::mission(action.clone()),
+            )
+            .unwrap();
 
         assert_eq!(decision.outcome, DecisionOutcome::Deny);
         assert!(decision.contributions.is_empty());
@@ -1905,7 +2463,7 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
         let mut context = BTreeMap::new();
         context.insert("risk_level".into(), json!(2));
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "context-policy",
             1,
             vec![
@@ -1916,7 +2474,7 @@ mod tests {
                         json!(3),
                     )),
             ],
-        );
+        ));
 
         let decision = policy
             .evaluate_with_context(&agent, &authority, &test_action(), &context)
@@ -1927,7 +2485,7 @@ mod tests {
 
     #[test]
     fn policy_validation_rejects_contradictory_conditions() {
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "invalid-policy",
             1,
             vec![
@@ -1935,7 +2493,7 @@ mod tests {
                     .with_parameter_condition(PolicyCondition::exact("region", json!("north")))
                     .with_parameter_condition(PolicyCondition::exact("region", json!("south"))),
             ],
-        );
+        ));
 
         assert!(matches!(
             policy.validate(),
@@ -1945,16 +2503,16 @@ mod tests {
 
     #[test]
     fn policy_digest_is_stable_and_sensitive_to_policy_changes() {
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "digest-test",
             1,
             vec![
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
                     .with_parameter_condition(PolicyCondition::exact("enabled", json!(true))),
             ],
-        );
+        ));
         let same_policy = policy.clone();
-        let changed_policy = Policy::new(
+        let changed_policy = crate::test_support::mission_policy(Policy::new(
             "digest-test",
             1,
             vec![PolicyRule::new(
@@ -1962,7 +2520,7 @@ mod tests {
                 "read_data",
                 PolicyEffect::Deny,
             )],
-        );
+        ));
 
         assert_eq!(policy.digest().unwrap(), same_policy.digest().unwrap());
         assert_ne!(policy.digest().unwrap(), changed_policy.digest().unwrap());
@@ -1975,8 +2533,9 @@ mod tests {
             "read_data",
             PolicyEffect::Allow,
         )];
-        let v1 = Policy::new("versioned-policy", 1, rules.clone());
-        let v2 = Policy::new_v2("versioned-policy", 1, rules);
+        let v1 =
+            crate::test_support::mission_policy(Policy::new("versioned-policy", 1, rules.clone()));
+        let v2 = crate::test_support::mission_policy(Policy::new_v2("versioned-policy", 1, rules));
 
         assert_eq!(v1.semantics_version, 1);
         assert_eq!(v2.semantics_version, 2);
@@ -2058,9 +2617,8 @@ mod tests {
         assert_eq!(compare_integer_float(0, f64::NAN), None);
     }
 
-    #[test]
-    fn policy_digest_matches_canonical_golden_value() {
-        let policy = Policy::new(
+    fn golden_v2_policy() -> Policy {
+        Policy::new(
             "golden",
             1,
             vec![PolicyRule::new(
@@ -2068,30 +2626,53 @@ mod tests {
                 "read_data",
                 PolicyEffect::Allow,
             )],
-        );
-
-        assert_eq!(
-            policy.digest().unwrap(),
-            "5d45f213fc1f9fcfa17bf0a462169ea9e14efa028d873b79841924eae90ddd1f"
-        );
+        )
+        .with_mission_actions(["read_data"])
+        .with_action_class("safety:halt", ActionClass::Safety)
     }
 
     #[test]
-    fn policy_canonical_bytes_match_committed_golden_vector() {
-        let policy = Policy::new(
-            "golden",
-            1,
-            vec![PolicyRule::new(
-                "allow-read",
-                "read_data",
-                PolicyEffect::Allow,
-            )],
+    fn format_1_golden_vector_keeps_its_historical_digest() {
+        let v1 = include_str!("../../../docs/golden/canonical-policy-v1.json").trim();
+        let recorded = RecordedPolicy::from_json(v1).unwrap();
+        assert_eq!(recorded.format_version(), 1);
+        assert_eq!(
+            recorded.digest(),
+            "5d45f213fc1f9fcfa17bf0a462169ea9e14efa028d873b79841924eae90ddd1f"
         );
-        let expected = include_str!("../../../docs/golden/canonical-policy-v1.json").trim();
+        assert_eq!(
+            recorded.digest(),
+            hex::encode(Sha256::digest(v1.as_bytes()))
+        );
+        // Loading it for evaluation is refused, in every mode.
+        assert!(matches!(
+            Policy::from_json(v1),
+            Err(PraetoreError::PolicyFormatUnsupported {
+                found: 1,
+                supported: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn policy_canonical_bytes_match_committed_golden_v2_vector() {
+        let policy = golden_v2_policy();
+        let expected = include_str!("../../../docs/golden/canonical-policy-v2.json").trim();
         let canonical = canonical_json(&policy).unwrap();
         let expected_digest = hex::encode(Sha256::digest(expected.as_bytes()));
 
-        assert_eq!(canonical, expected.as_bytes());
+        assert_eq!(String::from_utf8(canonical).unwrap(), expected);
         assert_eq!(policy.digest().unwrap(), expected_digest);
+        // Pinned, so a regenerated vector cannot follow a canonicalization
+        // change unnoticed.
+        assert_eq!(
+            policy.digest().unwrap(),
+            "77821c2735152448004f6780288dbb793bc1a78c204c5d0e460e859e89753cd0"
+        );
+        assert_eq!(
+            RecordedPolicy::from_json(expected).unwrap().digest(),
+            expected_digest
+        );
+        assert_eq!(Policy::from_json(expected).unwrap(), policy);
     }
 }

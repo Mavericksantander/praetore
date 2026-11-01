@@ -44,8 +44,15 @@ fn evaluate(policy: &Policy, action: &Action, context: &[(&str, Value)]) -> Deci
         .iter()
         .map(|(k, v)| ((*k).to_owned(), v.clone()))
         .collect();
+    // The action's type is a declared Mission action of the policy; whether
+    // a rule matches it is what each test checks.
+    let mut policy = policy.clone();
     policy
-        .evaluate_with_context(&agent, &authority, action, &context)
+        .action_classes
+        .entry(action.action_type.clone())
+        .or_insert(praetore_core::ActionClass::Mission);
+    policy
+        .evaluate_with_context(&agent, &authority, &mission((action).clone()), &context)
         .unwrap()
 }
 
@@ -73,14 +80,14 @@ fn assert_rule(decision: &Decision, outcome: DecisionOutcome, rule_id: &str) {
 // substring heuristics, so the rule matches a declared parameter exactly.
 #[test]
 fn explicit_deny_rule_denies_matching_action() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![
             PolicyRule::new("deny-wipe", "execute_shell", PolicyEffect::Deny)
                 .with_parameter_condition(PolicyCondition::exact("program", json!("rm"))),
         ],
-    );
+    ));
     let decision = evaluate(
         &policy,
         &action(
@@ -95,7 +102,7 @@ fn explicit_deny_rule_denies_matching_action() {
 // Origin: tests/test_authorize_action.py::test_require_approval.
 #[test]
 fn require_approval_rule_holds_action() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![PolicyRule::new(
@@ -103,7 +110,7 @@ fn require_approval_rule_holds_action() {
             "call_external_api",
             PolicyEffect::RequireApproval,
         )],
-    );
+    ));
     let decision = evaluate(
         &policy,
         &action("call_external_api", json!({"url": "https://example.com"})),
@@ -117,7 +124,7 @@ fn require_approval_rule_holds_action() {
 // PRAETORE: production → DENY by the rule, staging → default deny.
 #[test]
 fn context_and_parameter_conditions_must_all_hold() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![
@@ -125,7 +132,7 @@ fn context_and_parameter_conditions_must_all_hold() {
                 .with_context_condition(PolicyCondition::exact("env", json!("production")))
                 .with_parameter_condition(PolicyCondition::exact("program", json!("rm"))),
         ],
-    );
+    ));
     let shell = action("execute_shell", json!({"program": "rm"}));
     assert_rule(
         &evaluate(&policy, &shell, &[("env", json!("production"))]),
@@ -137,14 +144,14 @@ fn context_and_parameter_conditions_must_all_hold() {
 }
 
 fn safe_path_policy() -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![
             PolicyRule::new("safe-paths", "modify_file", PolicyEffect::Allow)
                 .with_parameter_condition(PolicyCondition::prefix("path", "/srv/agent/")),
         ],
-    )
+    ))
 }
 
 // Origin: tests/test_authorize_action.py::test_safe_paths.
@@ -202,7 +209,7 @@ fn all_matching_rules_are_evaluated_and_deny_wins() {
         vec![block.clone(), review.clone()],
     ] {
         let decision = evaluate(
-            &Policy::new("canopy-port", 1, rules),
+            &mission_policy(Policy::new("canopy-port", 1, rules)),
             &action("custom_action", json!({})),
             &[],
         );
@@ -222,7 +229,7 @@ fn all_matching_rules_are_evaluated_and_deny_wins() {
 // that denies everything by default (fail closed either way).
 #[test]
 fn empty_policy_denies_everything() {
-    let policy = Policy::new("canopy-port", 1, vec![]);
+    let policy = mission_policy(Policy::new("canopy-port", 1, vec![]));
     assert!(policy.validate().is_ok());
     assert_default_deny(&evaluate(&policy, &action("execute_shell", json!({})), &[]));
 }
@@ -233,7 +240,8 @@ fn empty_policy_denies_everything() {
 #[test]
 fn unknown_policy_fields_or_operators_are_rejected() {
     let base = json!({
-        "id": "canopy-port", "version": 1, "canonical_version": 1,
+        "format_version": 2, "id": "canopy-port", "version": 1, "canonical_version": 1,
+        "action_classes": {"execute_shell": "Mission"},
         "rules": [{
             "id": "r", "action_type": "execute_shell", "effect": "Deny",
             "required_capability": null, "target": null,
@@ -257,7 +265,7 @@ fn unknown_policy_fields_or_operators_are_rejected() {
 // ambiguity and are rejected.
 #[test]
 fn policy_documents_parse_and_reject_duplicate_keys() {
-    let ok = r#"{"id":"p","version":1,"canonical_version":1,"rules":[{"id":"r","action_type":"execute_shell","effect":"Deny","required_capability":null,"target":null,"parameter_conditions":[],"context_conditions":[]}]}"#;
+    let ok = r#"{"format_version":2,"id":"p","version":1,"canonical_version":1,"action_classes":{"execute_shell":"Mission"},"rules":[{"id":"r","action_type":"execute_shell","effect":"Deny","required_capability":null,"target":null,"parameter_conditions":[],"context_conditions":[]}]}"#;
     assert_eq!(
         Policy::from_json(ok).unwrap().rules[0].action_type,
         "execute_shell"
@@ -270,11 +278,11 @@ fn policy_documents_parse_and_reject_duplicate_keys() {
 // Empty condition lists are valid and mean "no extra condition".
 #[test]
 fn empty_condition_lists_are_valid() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![PolicyRule::new("r", "x", PolicyEffect::Deny)],
-    );
+    ));
     assert!(policy.rules[0].parameter_conditions.is_empty());
     assert_rule(
         &evaluate(&policy, &action("x", json!({})), &[]),
@@ -288,7 +296,7 @@ fn empty_condition_lists_are_valid() {
 // PRAETORE has no regex; an oversized rule value is rejected (fail closed).
 #[test]
 fn oversized_policy_text_is_rejected_not_ignored() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![
@@ -296,7 +304,7 @@ fn oversized_policy_text_is_rejected_not_ignored() {
                 .with_parameter_condition(PolicyCondition::prefix("p", "x"))
                 .with_target("a".repeat(2048)),
         ],
-    );
+    ));
     assert!(policy.validate().is_err());
     let agent = agent();
     assert!(
@@ -304,7 +312,7 @@ fn oversized_policy_text_is_rejected_not_ignored() {
             .evaluate(
                 &agent,
                 &authority(&agent, &[]),
-                &action("execute_shell", json!({}))
+                &mission((action("execute_shell", json!({}))).clone())
             )
             .is_err()
     );
@@ -321,7 +329,7 @@ fn agent_identity_requires_a_public_key() {
 // types exactly; a differently-cased action matches no rule and is denied.
 #[test]
 fn action_type_match_is_exact_and_fails_closed() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![PolicyRule::new(
@@ -329,7 +337,7 @@ fn action_type_match_is_exact_and_fails_closed() {
             "read_file",
             PolicyEffect::Allow,
         )],
-    );
+    ));
     assert_default_deny(&evaluate(&policy, &action("READ_FILE", json!({})), &[]));
     assert_rule(
         &evaluate(&policy, &action("read_file", json!({})), &[]),
@@ -349,7 +357,7 @@ fn spend_over_limit_requires_approval_and_missing_amount_fails_closed() {
         PolicyRule::new("large-spend", "spend", PolicyEffect::RequireApproval)
             .with_parameter_condition(PolicyCondition::greater_than("amount", json!(10))),
     ];
-    let policy = Policy::new_v2("canopy-port", 1, rules);
+    let policy = mission_policy(Policy::new_v2("canopy-port", 1, rules));
     assert_rule(
         &evaluate(&policy, &action("spend", json!({"amount": 5})), &[]),
         DecisionOutcome::Allow,
@@ -376,19 +384,23 @@ fn spend_over_limit_requires_approval_and_missing_amount_fails_closed() {
 // granted in the (signed) authority.
 #[test]
 fn capability_gated_rule_needs_the_capability() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![PolicyRule::new("mine", "mine_crypto", PolicyEffect::Allow).with_capability("mining")],
-    );
+    ));
     let agent = agent();
     let act = action("mine_crypto", json!({}));
     let without = policy
-        .evaluate(&agent, &authority(&agent, &[]), &act)
+        .evaluate(&agent, &authority(&agent, &[]), &mission((act).clone()))
         .unwrap();
     assert_default_deny(&without);
     let with = policy
-        .evaluate(&agent, &authority(&agent, &["mining"]), &act)
+        .evaluate(
+            &agent,
+            &authority(&agent, &["mining"]),
+            &mission((act).clone()),
+        )
         .unwrap();
     assert_rule(&with, DecisionOutcome::Allow, "mine");
 }
@@ -398,18 +410,18 @@ fn capability_gated_rule_needs_the_capability() {
 // agent id and refuses a request whose authority names another subject.
 #[test]
 fn authority_for_another_agent_is_rejected() {
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "canopy-port",
         1,
         vec![
             PolicyRule::new("read", "read_data", PolicyEffect::Allow).with_capability("data:read"),
         ],
-    );
+    ));
     let agent = agent();
     let other = AgentKeyPair::from_secret_bytes(&[10; 32]).identity(AgentId::new());
     let foreign = authority(&other, &["data:read"]);
     let act = action("read_data", json!({})).with_capability("data:read");
-    let result = AuthorizationRequest::new(agent, foreign, act)
+    let result = AuthorizationRequest::new(agent, foreign, mission(act))
         .and_then(|request| AuthorizationEngine::development(policy).evaluate(request));
     assert!(result.is_err(), "{result:?}");
 }
@@ -421,10 +433,36 @@ fn engine_with_no_rules_denies_valid_request() {
     let agent = agent();
     let auth = authority(&agent, &["data:read"]);
     let act = action("read_data", json!({})).with_capability("data:read");
-    let request = AuthorizationRequest::new(agent, auth, act).unwrap();
-    let evidence = AuthorizationEngine::development(Policy::new("canopy-port", 1, vec![]))
-        .evaluate(request)
-        .unwrap();
+    let request = AuthorizationRequest::new(agent, auth, mission(act)).unwrap();
+    let evidence = AuthorizationEngine::development(
+        Policy::new("canopy-port", 1, vec![]).with_mission_actions(["read_data"]),
+    )
+    .evaluate(request)
+    .unwrap();
     assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
     assert!(evidence.verify_integrity());
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

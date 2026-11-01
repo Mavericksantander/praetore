@@ -3,10 +3,10 @@
 
 use crate::store::{self, ACTION_TYPE, AUDIENCE, CAPABILITY, Home, LoadedHome};
 use praetore_core::{
-    Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, DecisionOutcome,
-    Evidence, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
-    MatchOperator, Policy, ReplayGuard, ReplayGuardError, authority::AuthorityId,
-    engine::AuthorizationEngine, identity::AgentKeyFingerprint,
+    Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, ClassifiedAction,
+    DecisionOutcome, Evidence, FreshnessError, FreshnessLease, FreshnessProvider,
+    HighAssuranceConfig, MatchOperator, Policy, PraetoreError, ReplayGuard, ReplayGuardError,
+    authority::AuthorityId, engine::AuthorizationEngine, identity::AgentKeyFingerprint,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -67,6 +67,10 @@ impl Mode {
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub outcome: DecisionOutcome,
+    /// G7: the engine refused the call because the policy does not declare
+    /// its action type (signed DENY, engine guard `unclassified_action`).
+    /// Refused in both modes.
+    pub unclassified: bool,
     pub evidence_id: Uuid,
     pub rule_ids: Vec<String>,
     pub reason: String,
@@ -74,10 +78,73 @@ pub struct Verdict {
     pub journaled: Result<PathBuf, String>,
 }
 
+/// Why a `tools/call` got no verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateError {
+    /// G7: the call names a safety action (a tool whose name starts with
+    /// `safety:` and that the policy declares `Safety`). PRÆTORE makes no
+    /// decision about it: nothing was evaluated, signed, claimed or
+    /// journaled.
+    SafetyActionNotGoverned { action_type: String },
+    /// G7: the call's action type is not declared in the policy's
+    /// `action_classes`; refused before evaluation.
+    UnclassifiedAction { action_type: String },
+    /// Anything else that prevented a verdict (keys, signing, engine).
+    Failed(String),
+}
+
+impl std::fmt::Display for GateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SafetyActionNotGoverned { action_type } => write!(
+                f,
+                "SAFETY_ACTION_NOT_GOVERNED: safety action {action_type:?} is not governed by PRÆTORE; it was not evaluated, signed or recorded"
+            ),
+            Self::UnclassifiedAction { action_type } => write!(
+                f,
+                "UNCLASSIFIED_ACTION: action type {action_type:?} is not declared in the policy's action_classes"
+            ),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for GateError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// Whether a tool name starts with `safety`, ASCII case-insensitive, read
+/// before any validation (G7). Such a call is either exactly a declared
+/// Safety action or refused; it is never treated as a mission call.
+pub fn is_safety_named(params: &Value) -> bool {
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            name.as_bytes()
+                .get(..6)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"safety"))
+        })
+}
+
+/// The action type of a `tools/call` (G7). A tool whose name starts with
+/// `safety:` is that safety action type; every other call is
+/// [`ACTION_TYPE`], a mission action.
+pub fn action_type_of(params: &Value) -> String {
+    match params.get("name").and_then(Value::as_str) {
+        Some(name) if name.starts_with(praetore_core::policy::SAFETY_ACTION_PREFIX) => {
+            name.to_owned()
+        }
+        _ => ACTION_TYPE.to_owned(),
+    }
+}
+
 /// Anything that can evaluate a `tools/call`. The proxy logic is generic over
 /// this so it can be unit-tested without keys.
 pub trait Evaluator {
-    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String>;
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError>;
 }
 
 /// Builds the action parameters for a `tools/call`.
@@ -976,31 +1043,115 @@ impl Gate {
         !self.path_keys.is_empty()
     }
 
+    /// G7: classifies the call against the policy's `action_classes` before
+    /// anything else: before path resolution, signing, the engine or the
+    /// journal. A safety action or an undeclared action type is refused here.
+    pub fn classify_call(&self, server: &str, params: &Value) -> Result<(), GateError> {
+        // A name that starts with `safety` (any ASCII case) must be exactly a
+        // declared Safety action; anything else with that start (`SAFETY:x`,
+        // `safety:x ` with a trailing space or tab, `safety_x`, an
+        // undeclared `safety:x`) is refused here, before `Action::new`, so it
+        // is refused in observe mode too and never forwarded.
+        if is_safety_named(params) {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if self.engine.policy().action_classes.get(name)
+                != Some(&praetore_core::ActionClass::Safety)
+            {
+                return Err(GateError::UnclassifiedAction {
+                    action_type: name.to_owned(),
+                });
+            }
+        }
+        let action_type = action_type_of(params);
+        let action = Action::new(action_type.clone(), Some(server.to_owned()), json!({}))
+            .map_err(|e| GateError::Failed(format!("{}: {e}", e.code())))?;
+        match self.engine.policy().classify(action) {
+            Ok(ClassifiedAction::Mission(_)) => Ok(()),
+            Ok(ClassifiedAction::Safety(_)) => {
+                Err(GateError::SafetyActionNotGoverned { action_type })
+            }
+            Err(PraetoreError::UnclassifiedAction { .. }) => {
+                Err(GateError::UnclassifiedAction { action_type })
+            }
+            Err(e) => Err(GateError::Failed(format!("{}: {e}", e.code()))),
+        }
+    }
+
     /// Evaluates and returns the attested evidence without journaling it.
-    pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, String> {
+    pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, GateError> {
+        // G7: classify first. A declared Safety call stops here with no
+        // evaluation and no receipt; an unclassified one is refused by the
+        // engine with a signed DENY, without evaluating any rule.
+        let unclassified = match self.classify_call(server, params) {
+            Ok(()) => false,
+            Err(GateError::UnclassifiedAction { .. }) => true,
+            Err(error) => return Err(error),
+        };
+        let action_type = if unclassified {
+            unclassified_action_type(server, params)
+        } else {
+            action_type_of(params)
+        };
         let target = Some(server.to_owned());
         let mut path_check = None;
         let mut inline = build_parameters(server, params, false);
-        if !self.path_keys.is_empty() {
+        // Path arguments are resolved only for calls a rule can match.
+        if !unclassified && !self.path_keys.is_empty() {
             path_check = check_paths(&mut inline, &self.path_keys, &self.path_prefixes);
         }
-        let action = Action::new(ACTION_TYPE, target.clone(), inline)
+        let action = Action::new(action_type.clone(), target.clone(), inline)
             .or_else(|_| {
                 // The digest form has no `arguments.<key>` copies, so no path
                 // is checked; conditions on them are unknown (fail closed).
                 path_check = None;
-                Action::new(ACTION_TYPE, target, build_parameters(server, params, true))
+                Action::new(action_type, target, build_parameters(server, params, true))
             })
             .map_err(|e| format!("{}: {e}", e.code()))?
             .with_capability(CAPABILITY);
-        let mut request =
+        let failed =
+            |e: praetore_core::PraetoreError| GateError::Failed(format!("{}: {e}", e.code()));
+        if unclassified {
+            let action = self.engine.policy().unclassified(action).map_err(failed)?;
+            let request = self.signed(
+                AuthorizationRequest::new_unclassified(
+                    self.agent.clone(),
+                    self.authority.clone(),
+                    action,
+                )
+                .map_err(failed)?,
+                None,
+            )?;
+            return self.engine.refuse_unclassified(request).map_err(failed);
+        }
+        let action = self
+            .engine
+            .policy()
+            .classify(action)
+            .and_then(ClassifiedAction::into_mission)
+            .map_err(failed)?;
+        let request = self.signed(
             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
-                .map_err(|e| format!("{}: {e}", e.code()))?
-                .with_context(MODE_CONTEXT_KEY, Value::String(self.mode.as_str().into()))
-                .with_context(
-                    PROXY_CONTEXT_KEY,
-                    Value::String(concat!("praetore-mcp/", env!("CARGO_PKG_VERSION")).into()),
-                );
+                .map_err(failed)?,
+            path_check,
+        )?;
+        self.engine.evaluate(request).map_err(failed)
+    }
+
+    /// Adds the proxy context and signs the v2 intent with the agent key.
+    fn signed<A: praetore_core::RequestAction>(
+        &self,
+        request: AuthorizationRequest<A>,
+        path_check: Option<Value>,
+    ) -> Result<AuthorizationRequest<A>, GateError> {
+        let mut request = request
+            .with_context(MODE_CONTEXT_KEY, Value::String(self.mode.as_str().into()))
+            .with_context(
+                PROXY_CONTEXT_KEY,
+                Value::String(concat!("praetore-mcp/", env!("CARGO_PKG_VERSION")).into()),
+            );
         if let Some(record) = path_check {
             request = request.with_context(PATH_CHECK_CONTEXT_KEY, record);
         }
@@ -1014,14 +1165,36 @@ impl Gate {
                 self.policy_digest.clone(),
             )
             .map_err(|e| format!("{}: {e}", e.code()))?;
-        self.engine
-            .evaluate(request)
-            .map_err(|e| format!("{}: {e}", e.code()))
+        Ok(request)
     }
 }
 
+/// Action type recorded for an unclassified call (G7). A `safety*` tool name
+/// that is a valid action type is recorded as itself; one that is not (a
+/// trailing space or tab, for example) as [`UNCLASSIFIED_TOOL_ACTION_TYPE`],
+/// with the raw name in the `tool` parameter. Any other call is
+/// [`ACTION_TYPE`] (a policy that does not declare it).
+fn unclassified_action_type(server: &str, params: &Value) -> String {
+    if !is_safety_named(params) {
+        return ACTION_TYPE.to_owned();
+    }
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match Action::new(name, Some(server.to_owned()), json!({})) {
+        Ok(_) => name.to_owned(),
+        Err(_) => UNCLASSIFIED_TOOL_ACTION_TYPE.to_owned(),
+    }
+}
+
+/// Recorded action type for a `safety*` tool name that is not a valid action
+/// type. Its inner spaces make it impossible to declare in `action_classes`
+/// (printable ASCII only), so it is always unclassified.
+pub const UNCLASSIFIED_TOOL_ACTION_TYPE: &str = "praetore-mcp unclassified tool name";
+
 impl Evaluator for Gate {
-    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String> {
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
         let journaled = self.journal.append(&evidence);
         Ok(verdict_from(&evidence, journaled))
@@ -1031,6 +1204,11 @@ impl Evaluator for Gate {
 pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> Verdict {
     let outcome = evidence.decision.outcome;
     Verdict {
+        unclassified: outcome == DecisionOutcome::Deny
+            && evidence.decision.decided_by()
+                == Some(&praetore_core::DecidedBy::engine_guard(
+                    praetore_core::UNCLASSIFIED_ACTION_GUARD,
+                )),
         outcome,
         evidence_id: evidence.evidence_id,
         rule_ids: evidence
@@ -1067,6 +1245,8 @@ impl Journal {
     }
 
     pub fn append(&self, evidence: &Evidence) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        tests::JOURNAL_APPENDS.with(|appends| appends.set(appends.get() + 1));
         let mut line = evidence
             .to_json()
             .map_err(|e| format!("cannot serialize evidence: {e}"))?;
@@ -1103,6 +1283,187 @@ fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Receipt appends on this thread (G7 runtime tests).
+        pub(super) static JOURNAL_APPENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// G7: an initialized home whose policy has its own id (the probe
+    /// counters are per policy id) and declares `safety:halt` Safety, with
+    /// the receipts journal made unavailable: `receipts` is a regular file,
+    /// so no receipt can be written.
+    fn g7_home(policy_id: &str) -> (tempfile::TempDir, Home, Vec<u8>) {
+        use praetore_core::ActionClass;
+        let (temp, root) = canonical_tempdir();
+        let home = Home::new(root.join("home"));
+        store::init(&home).unwrap();
+        let mut policy = store::default_policy()
+            .with_action_class("safety:halt", ActionClass::Safety)
+            .with_action_class("safety:stop_all", ActionClass::Safety);
+        policy.id = policy_id.to_owned();
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let receipts = home.receipts_dir();
+        let _ = fs::remove_dir_all(&receipts);
+        let marker = b"not a directory: the receipts journal is down\n".to_vec();
+        fs::write(&receipts, &marker).unwrap();
+        (temp, home, marker)
+    }
+
+    fn assert_journal_untouched(home: &Home, marker: &[u8]) {
+        assert_eq!(JOURNAL_APPENDS.with(|appends| appends.get()), 0);
+        assert!(home.receipts_dir().is_file());
+        assert_eq!(fs::read(home.receipts_dir()).unwrap(), marker);
+    }
+
+    const G7_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[test]
+    fn g7_safety_call_is_refused_before_the_engine_with_the_journal_down() {
+        for (name, mode) in [
+            ("safety:halt", Mode::Enforce),
+            ("safety:stop_all", Mode::Observe),
+        ] {
+            let policy_id = format!("g7-mcp-safety-{name}-{}", mode.as_str());
+            let (_temp, home, marker) = g7_home(&policy_id);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            JOURNAL_APPENDS.with(|appends| appends.set(0));
+
+            let started = std::time::Instant::now();
+            let result =
+                Evaluator::evaluate(&mut gate, "tools", &json!({"name": name, "arguments": {}}));
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                result.err(),
+                Some(GateError::SafetyActionNotGoverned {
+                    action_type: name.to_owned()
+                })
+            );
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 0);
+            assert_eq!(praetore_core::probe::policy_evaluations(&policy_id), 0);
+            assert_journal_untouched(&home, &marker);
+            assert!(elapsed < G7_BOUND, "answered in {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn g7_proxy_forwards_a_declared_safety_call_without_a_receipt() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let policy_id = format!("g7-mcp-proxy-safety-{}", mode.as_str());
+            let (_temp, home, marker) = g7_home(&policy_id);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            JOURNAL_APPENDS.with(|appends| appends.set(0));
+            let line = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"safety:halt","arguments":{}}}
+"#;
+            let started = std::time::Instant::now();
+            let out = crate::proxy::handle_client_line(line, mode, "tools", &mut gate);
+            let elapsed = started.elapsed();
+            assert_eq!(
+                out.to_server.as_deref(),
+                Some(&line[..]),
+                "forwarded unchanged"
+            );
+            assert!(out.to_client.is_none());
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("SAFETY_ACTION_NOT_GOVERNED")),
+                "{:?}",
+                out.warnings
+            );
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 0);
+            assert_journal_untouched(&home, &marker);
+            assert!(elapsed < G7_BOUND, "answered in {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn g7_proxy_refuses_an_undeclared_safety_call_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let policy_id = format!("g7-mcp-proxy-unclassified-{}", mode.as_str());
+            let (_temp, home, marker) = g7_home(&policy_id);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            JOURNAL_APPENDS.with(|appends| appends.set(0));
+            let line = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"safety:hold","arguments":{}}}
+"#;
+            let out = crate::proxy::handle_client_line(line, mode, "tools", &mut gate);
+            assert!(out.to_server.is_none(), "{}: not forwarded", mode.as_str());
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(!reply.to_string().contains("UNCLASSIFIED"), "{reply}");
+            // The engine signs a DENY without evaluating any rule; the
+            // journal is down here, so the append fails (and is refused).
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 1);
+            assert_eq!(praetore_core::probe::policy_evaluations(&policy_id), 0);
+            assert_eq!(JOURNAL_APPENDS.with(|appends| appends.get()), 1);
+            assert_eq!(fs::read(home.receipts_dir()).unwrap(), marker);
+        }
+    }
+
+    /// G7: an undeclared `safety:*` call gets a signed DENY from the engine,
+    /// reason `unclassified`, engine guard `unclassified_action`, without any
+    /// policy rule being evaluated.
+    #[test]
+    fn g7_undeclared_safety_call_gets_a_signed_unclassified_deny() {
+        let policy_id = "g7-mcp-unclassified";
+        let (_temp, home, _marker) = g7_home(policy_id);
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        let evidence = gate
+            .evaluate_evidence("tools", &json!({"name": "safety:hold"}))
+            .unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            evidence.decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
+        assert_eq!(
+            evidence.decision.decided_by(),
+            Some(&praetore_core::DecidedBy::engine_guard(
+                praetore_core::UNCLASSIFIED_ACTION_GUARD
+            ))
+        );
+        assert_eq!(evidence.action.action_type, "safety:hold");
+        evidence.verify_agent_intent().unwrap();
+        assert!(evidence.attester_signature.is_some());
+        let verdict =
+            Evaluator::evaluate(&mut gate, "tools", &json!({"name": "safety:hold"})).unwrap();
+        assert!(verdict.unclassified);
+        assert_eq!(praetore_core::probe::engine_calls(policy_id), 2);
+        assert_eq!(praetore_core::probe::policy_evaluations(policy_id), 0);
+        // A name that is not a valid action type is recorded under the
+        // fixed unclassified type, with the raw name in `tool`.
+        let evidence = gate
+            .evaluate_evidence("tools", &json!({"name": "safety:halt "}))
+            .unwrap();
+        assert_eq!(evidence.action.action_type, UNCLASSIFIED_TOOL_ACTION_TYPE);
+        assert_eq!(evidence.action.parameters["tool"], "safety:halt ");
+        assert_eq!(
+            evidence.decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
+    }
+
+    /// Control: a mission call in the same setup reaches the engine, and the
+    /// journal really is down (no receipt written, so enforce refuses it).
+    #[test]
+    fn g7_mission_call_reaches_the_engine_and_the_journal_is_down() {
+        let policy_id = "g7-mcp-mission-control";
+        let (_temp, home, marker) = g7_home(policy_id);
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        JOURNAL_APPENDS.with(|appends| appends.set(0));
+        let verdict = Evaluator::evaluate(
+            &mut gate,
+            "fs",
+            &json!({"name": "read_file", "arguments": {}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+        assert!(verdict.journaled.is_err(), "the journal is down");
+        assert_eq!(praetore_core::probe::engine_calls(policy_id), 1);
+        assert_eq!(JOURNAL_APPENDS.with(|appends| appends.get()), 1);
+        assert_eq!(fs::read(home.receipts_dir()).unwrap(), marker);
+    }
 
     /// A canonical temporary root (macOS `/var` is a symlink to `/private/var`).
     fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {

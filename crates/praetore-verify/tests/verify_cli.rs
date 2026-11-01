@@ -55,7 +55,8 @@ impl TestFiles {
         let action = Action::new("read_data", Some("db".into()), json!({"table": "users"}))
             .unwrap()
             .with_capability("data:read");
-        let mut request = AuthorizationRequest::new(agent, authority.clone(), action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority.clone(), mission(action)).unwrap();
         request.sign_intent(&agent_key).unwrap();
         let mut evidence = request
             .attest(Decision::allow(
@@ -69,7 +70,7 @@ impl TestFiles {
         let mut tampered = evidence.clone();
         tampered.decision.reason.push_str(" altered");
 
-        let policy = Policy::new("fixture-policy", 1, vec![]);
+        let policy = mission_policy(Policy::new("fixture-policy", 1, vec![]));
         let issuer_pin = TrustedAuthorityIssuer::new("test-issuer", issuer_key.public_key())
             .unwrap()
             .export_pin_json()
@@ -341,14 +342,14 @@ fn expired_high_assurance_receipt_is_historical_only_and_cannot_authorize_new_ac
     let action = Action::new("read_data", Some("db".into()), json!({"table": "users"}))
         .unwrap()
         .with_capability("data:read");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "historical-verification-test",
         1,
         vec![
             PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
                 .with_capability("data:read"),
         ],
-    );
+    ));
     let issuer_pin = TrustedAuthorityIssuer::new("test-issuer", issuer_key.public_key())
         .unwrap()
         .with_validity(Validity {
@@ -368,7 +369,8 @@ fn expired_high_assurance_receipt_is_historical_only_and_cannot_authorize_new_ac
         .unwrap();
     let policy_digest = policy.digest().unwrap();
     let mut old_request =
-        AuthorizationRequest::new(agent.clone(), authority.clone(), action.clone()).unwrap();
+        AuthorizationRequest::new(agent.clone(), authority.clone(), mission(action.clone()))
+            .unwrap();
     old_request
         .sign_intent_v2(
             &agent_key,
@@ -450,7 +452,7 @@ fn expired_high_assurance_receipt_is_historical_only_and_cannot_authorize_new_ac
     ));
 
     let now = OffsetDateTime::now_utc();
-    let mut fresh_request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut fresh_request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     fresh_request
         .sign_intent_v2(
             &agent_key,
@@ -699,4 +701,28 @@ fn receipt_command_verifies_v1_and_rejects_a_tampered_copy() {
     let _ = fs::remove_file(&path);
     assert!(!output.status.success());
     assert_eq!(json_output(&output)["ok"], false);
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

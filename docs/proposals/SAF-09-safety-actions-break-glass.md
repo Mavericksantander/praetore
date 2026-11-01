@@ -2,10 +2,59 @@
 
 Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at ed05347.
 
-**Scope:** an optional, opt-in extension that lives outside the core. It does
-not change `praetore-core`, the gateway crates, their APIs or their semantics,
-and it is not part of the roadmap. There is no committed timeline. If it is
-never built, nothing in PRÆTORE changes.
+> **G7 update (separation of mission and safety actions).** G7 changes two premises of this document, which are now marked
+> **PROPUESTA** (superseded proposal text, kept for history):
+>
+> 1. "The extension lives outside the core": G7 puts the classification in
+>    the core. Policy format 2 requires an `action_classes` table (`Mission`
+>    or `Safety` per exact `action_type`), and `praetore-core` has the types
+>    `MissionAction` and `SafetyAction`. Only `Policy::classify` builds them,
+>    and `AuthorizationRequest.action` is a `MissionAction`, so the engine
+>    cannot receive a safety action.
+> 2. "Safety actions go through the normal path": with G7 they do not. A
+>    `safety:*` action declared `Safety` is answered at the entry point
+>    (gateway HTTP API, `praetore-mcp` gate, the Claude Code hook) with a
+>    typed `SAFETY_ACTION_NOT_GOVERNED` answer, before any evaluation,
+>    replay claim, journal write or signature. PRÆTORE makes no decision about
+>    it. The gateway does not dispatch it; `praetore-mcp` forwards it to the
+>    wrapped server without a receipt (enforce and observe);
+>    the hook adds no permission decision. An undeclared `safety:*` action is
+>    refused everywhere.
+>
+> The external lint of §1 is replaced by a load-time error in
+> `Policy::validate`: a rule that targets a `Safety` action makes the whole
+> policy invalid. See [G7 requirements](#g7-requirements) and
+> [docs/policy-language.md](../policy-language.md#action-classes-policy-format-2).
+
+**Scope (PROPUESTA, superseded by G7 for the classification):** an optional,
+opt-in extension that lives outside the core. It does not change
+`praetore-core`, the gateway crates, their APIs or their semantics, and it is
+not part of the roadmap. There is no committed timeline. If it is never built,
+nothing in PRÆTORE changes. Break-glass (§2) is still only this proposal.
+
+## G7 requirements
+
+- **SAF-09.3 (implemented by G7).** Every mission action requires a
+  synchronously signed decision before it runs. Fail closed: no decision
+  means no execution.
+- **SAF-09.5 (pending a separate change, not implemented).** Safety-action
+  ingestion is isolated from the decision path, with its own process,
+  credentials and key. An ingestion failure does not affect the executor.
+  Until it exists, PRÆTORE keeps no record of safety actions: the G7 entry
+  points refuse them with `SAFETY_ACTION_NOT_GOVERNED` and write nothing.
+
+What G7 does not do: it does not decide or record safety actions (only
+`praetore-mcp`, as a transparent proxy, passes a declared one through to the
+wrapped server), it does not decide whether an executor should run one, and
+it does not change how a mission action is decided. Classification needs a
+readable policy: if `policy.json` cannot be read, the hook and the gate
+refuse every tool call, `safety:*` included. A safety failsafe must not
+depend on PRÆTORE (see `docs/threat-model.md`). A deployment that wants
+PRÆTORE to stay out of a safety action's path must not route that action
+through PRÆTORE in the first place. If it does, and the policy is loaded,
+the entry point answers before evaluation and without depending on the
+journal; if the policy cannot be loaded, the action is refused like every
+other.
 
 ## Problem
 
@@ -30,7 +79,11 @@ Everything below is built only on the existing public API. If something cannot
 be built that way, it stays out of this extension; it is not a reason to change
 the core.
 
-### 1. Pre-authorized safety actions
+### 1. Pre-authorized safety actions (PROPUESTA, superseded by G7)
+
+The premises of this section are superseded by G7: safety actions are
+declared `Safety` in `action_classes`, no rule may target them, and they do
+not go through the normal path. The text below is the original proposal.
 
 - The deployment that opts in defines its own protective `action_type`s (for
   example `safety:halt_agent`, `safety:revoke_lease`). They are ordinary policy
@@ -41,9 +94,12 @@ the core.
   avoid self-blocking, the extension ships a **lint**, an external tool run
   over the policy JSON before it is deployed. It warns if any Deny or
   RequireApproval rule targets a safety action. The core validator does not
-  change.
+  change. **PROPUESTA, replaced by G7:** `Policy::validate` rejects any rule
+  that targets a `Safety` action (`ActionClassError::RuleTargetsSafetyAction`).
 - These actions go through the normal path, including evidence signing
-  (`engine.rs:1016`) and the journal. Nothing is skipped.
+  (`engine.rs:1016`) and the journal. Nothing is skipped. **PROPUESTA,
+  replaced by G7:** safety actions do not reach the engine, the signer or the
+  journal.
 
 ### 2. Audited break-glass
 
@@ -62,7 +118,8 @@ the core.
 ## Non-goals
 
 - Changing `praetore-core`, the gateway crates, the precedence or the
-  HighAssurance configuration.
+  HighAssurance configuration. (**PROPUESTA**, superseded by G7 for the
+  classification of actions; break-glass still changes none of them.)
 - Bypassing a policy Deny or skipping evidence or the journal.
 - Getting on the roadmap or committing to dates.
 
@@ -74,7 +131,9 @@ the core.
 
 ## Possible tests (only if the extension is ever built)
 
-- The lint warns on a policy with Deny on `safety:halt_agent`.
+- ~~The lint warns on a policy with Deny on `safety:halt_agent`.~~ Replaced
+  by G7: such a policy fails to load
+  (`crates/praetore-core/tests/action_classes.rs`).
 - A break-glass authority without the incident id in the action → Deny (the
   current behavior of `engine.rs:1228-1233`).
 - The report lists every break-glass use present in the journal.

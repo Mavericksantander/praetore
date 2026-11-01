@@ -2,6 +2,156 @@
 
 ## Unreleased
 
+- **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
+  `praetore-core` separates mission actions, which PRÆTORE decides, from
+  safety actions, which the executor of an AI-enabled system runs without
+  waiting for PRÆTORE (for example `safety:halt`, `safety:stop_all`). The new
+  types `MissionAction` and `SafetyAction` are built only by
+  `Policy::classify(action) -> Result<ClassifiedAction>`, and
+  `AuthorizationRequest::new` takes a `MissionAction`, so a safety action
+  cannot be put in a request (compile error E0308, checked by a
+  `compile_fail` doc test). `AuthorizationEngine::evaluate` keeps its
+  signature and re-checks the class against its own policy.
+  `Policy::evaluate` / `evaluate_with_context` take a `&MissionAction`.
+  `AuthorizationRequest` no longer implements `Deserialize`:
+  `AuthorizationRequest::from_json(json, &policy)` classifies the action
+  first and returns `SafetyActionNotGoverned` or `UnclassifiedAction`.
+  New typed errors: `PraetoreError::SafetyActionNotGoverned`
+  (`SAFETY_ACTION_NOT_GOVERNED`), `UnclassifiedAction`
+  (`UNCLASSIFIED_ACTION`), `PolicyFormatUnsupported` and
+  `PolicyActionClassInvalid(ActionClassError)`.
+  `verify_journal` takes an `Option<&RecordedPolicy>`.
+- **Breaking (policy format 2, G7).** A policy needs `"format_version": 2`
+  and an `action_classes` table (`"Mission"` or `"Safety"` per exact
+  `action_type`). `Policy::validate` rejects, with typed errors: a rule on an
+  undeclared action type, a `safety:` type not declared `Safety` (and a
+  `Safety` entry without the prefix), an unprefixed name that contains
+  `safety` (ASCII, any case), and any rule that targets a `Safety` action
+  (this replaces the external lint proposed in SAF-09). Mission action types
+  need no prefix. A format 1 document (no `format_version`) is rejected for
+  evaluation in every mode (`PolicyFormatUnsupported { found: 1 }`).
+  Digests of migrated policies change; the receipt format does not.
+- **Historical verification keeps working.** `RecordedPolicy::from_json`
+  reads format 1 and 2 documents and computes the digest they had; it
+  cannot be evaluated. `praetore-verify evidence|journal --policy` and
+  `policy-digest` (which now also prints `policy_format_version`) use it,
+  as does the hook's `verify`. The committed evidence sets (hook `bundle/`,
+  sets 03, 04 and 05, `examples/verify/`,
+  `examples/third-party-verification/bundle/`) are unchanged and verify
+  against their recorded format 1 documents; `docs/golden/canonical-policy-v1.json`
+  keeps its digest and `canonical-policy-v2.json` is added.
+- **Entry points classify first (G7).** A declared `Safety` action gets no
+  decision: the gateway HTTP API answers 422 `safety_action_not_governed`,
+  the `praetore-mcp` gate forwards it to the wrapped server without a
+  receipt (enforce and observe), and the Claude Code hook adds no decision;
+  nothing is evaluated, signed, claimed or journaled. An action type the
+  policy does not declare is refused at every entry point with a **signed
+  DENY receipt**: the new `AuthorizationEngine::refuse_unclassified` (and
+  `refuse_unclassified_with_atomic_commit`) takes an
+  `AuthorizationRequest<UnclassifiedAction>` (built only from
+  `Policy::unclassified`), verifies it exactly like a mission request
+  (identity, authority, issuer pin, intent signature and, in HighAssurance,
+  intent window, freshness and replay claim), never evaluates policy rules,
+  and records `Deny` with reason `unclassified` and
+  `decided_by: {"kind": "engine_guard", "guard": "unclassified_action"}` (an
+  existing `decided_by` kind; verifiers that read engine guards accept it).
+  It is journaled and claimed like a policy DENY. A forged or
+  unauthenticated request gets no receipt. `praetore-mcp` refuses it in both
+  modes; the hook appends it to `receipts.jsonl`. An unreadable `policy.json` still refuses every tool call,
+  `safety:*` included (documented in `docs/threat-model.md`).
+- **Breaking (gateway API behaviour change).** Every DENY from
+  `POST /v1/execute` now returns 403 with one body,
+  `{"code": "authorization_denied", "authorization": "denied", "execution":
+  "not_dispatched", "evidence_id": ..., "request_id": ...}`, instead of the
+  signed receipt, whatever decided it (a rule, an engine guard or an
+  undeclared action type), so a DENY response does not reveal what the
+  policy declares or which rule matched (REQUIRE_APPROVAL responses still
+  carry the receipt and the rule). The receipt, with its reason, is in the
+  execution journal (`praetore journal-export`). The 422
+  `unclassified_action` response is removed. Likewise, `praetore-mcp`
+  answers every DENY with `Denied by PRÆTORE. Evidence id: ...` (the rule
+  and reason go to stderr) and the hook answers every DENY that has a
+  receipt with `PRÆTORE denied this tool call (evidence ...)` (details on
+  stderr). Response timing is not made uniform.
+- **Gateway: the reserved `safety:` prefix decides before classification.**
+  `POST /v1/execute` answers every action type that starts with `safety:`
+  with the same 422 `safety_action_not_governed` (same body, headers and
+  code path), declared Safety or not, before any verification, engine,
+  journal or signing work. An undeclared `safety:*` gets no receipt at the
+  gateway. Every request at this gate writes the same unsigned WARN line
+  (claimed agent id and action type, bounded and escaped, and
+  `declared=true|false`), so the answer cannot be used to enumerate the
+  table; the remaining timing difference is a documented limit. `SAFETY:x`
+  (not the exact prefix) goes through the unclassified path and gets a
+  signed DENY when the request is authenticated. `praetore-mcp` and the hook keep the signed `unclassified`
+  DENY for it.
+- Human-facing text escapes characters that render invisibly or reorder text
+  (zero-width, bidi, control) as `\u{XXXX}`: `praetore-verify --format text`
+  (which now also reports `receipt_action_type`, `receipt_tool`,
+  `receipt_decision` and `receipt_decided_by`), `praetore-mcp` tables and
+  stderr, the hook's stderr, and the gateway's WARN line (`praetore_core::display`). JSON
+  output and receipts stay exact. `UNCLASSIFIED_DENY_REASON` and
+  `UNCLASSIFIED_ACTION_GUARD` are public constants in `praetore-core`.
+- **Breaking (behaviour change, praetore-mcp observe mode).** A call whose
+  action type the policy does not declare (`UNCLASSIFIED_ACTION`) is now
+  refused in observe mode too, not forwarded: an undeclared `safety:*`, any
+  tool name that starts with `safety` in any ASCII case and is not exactly a
+  declared Safety action (including names with a trailing space or tab, and
+  ambiguous lines), and also every mission call when the policy does not
+  declare `mcp.tools/call`. `praetore-mcp init` declares `mcp.tools/call`,
+  so new homes are not affected. A JSON-RPC batch stays all or nothing in
+  enforce, so a declared Safety call in a batch with a blocked call is not
+  forwarded; send safety calls on their own. Runtime tests per entry point
+  check zero engine calls and zero journal writes, with the journal down,
+  in under 100 ms (`crates/praetore-gateway/tests/safety_actions.rs`, the
+  `g7_` tests in `crates/praetore-mcp/src/gate.rs`,
+  `examples/claude-code-hook/src/tests_g7.rs`, and the PostgreSQL test
+  `postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down`).
+  `scripts/g7-mutation-test.sh` shows they fail when `classify` is removed.
+  Mission actions take the unchanged path: synchronous signing, fail closed.
+  Recording safety actions (SAF-09.5, isolated ingestion) is not
+  implemented.
+- `praetore policy classify --policy <path>` proposes an `action_classes`
+  table for a policy and lists what prevents loading it as format 2. It
+  never writes files. `praetore-core` gains a `test-probe` feature (off by
+  default, enabled only from dev-dependencies) that counts engine calls for
+  tests.
+- Shipped policies are format 2: `praetore-mcp init`, the hook's `init`,
+  `praetore init` and `crates/praetore-cli/examples/policies/*.json`.
+
+  Migration guide. **Migrate the policy to format 2 before upgrading the
+  binary.** After the upgrade a format 1 policy no longer loads, so hook or
+  `praetore-mcp` state written before G7 refuses every tool call (fail
+  closed, `safety:*` included) until its policy is migrated; the gateway
+  service does not start.
+
+  ```text
+  # before (format 1)
+  {"id":"p","version":3,"canonical_version":1,"semantics_version":2,"rules":[
+    {"id":"w","action_type":"fs:write_file","effect":"Allow", ...}]}
+
+  # after (format 2)
+  {"format_version":2,"id":"p","version":3,"canonical_version":1,"semantics_version":2,
+   "action_classes":{"fs:write_file":"Mission","safety:halt":"Safety"},
+   "rules":[{"id":"w","action_type":"fs:write_file","effect":"Allow", ...}]}
+  ```
+
+  1. Before upgrading, run `praetore policy classify --policy policy.json`
+     (or add the fields by hand) and add the printed
+     `format_version` and `action_classes` to the document.
+  2. Rename any action the executor runs without waiting for PRÆTORE to
+     `safety:<name>`, declare it `Safety` and remove every rule on it.
+  3. Rust callers: `let action = policy.classify(action)?.into_mission()?;`
+     before `AuthorizationRequest::new`, `AuthorizationRequest::from_json(json,
+     &policy)`, `Policy::new(..).with_mission_actions([..])` /
+     `.with_action_class(..)`.
+  4. praetore-mcp homes: make sure `action_classes` declares
+     `"mcp.tools/call": "Mission"`, otherwise every call is refused, in
+     observe too.
+  5. Pin the new digest (HighAssurance `policy_digest`). Keep the format 1
+     document: receipts that recorded its digest verify only against it
+     (`praetore-verify --policy old-policy.json`).
+
 ## 0.3.1 - 2026-11-01
 
 This release also includes every change listed under 0.3.1-rc.1 below.

@@ -23,4 +23,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]
+# G7: the HTTP entry point test drives the gateway router and counts engine
+# calls with the test-only probe.
+axum = { version = "0.8", default-features = false }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+praetore-core = { path = "../praetore-core", features = ["test-probe"] }
+tower = { version = "0.5", features = ["util"] }

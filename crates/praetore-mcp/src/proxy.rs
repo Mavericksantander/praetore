@@ -4,7 +4,7 @@
 //! This module is pure (no I/O) apart from the `Evaluator` it is handed.
 
 use crate::{
-    gate::{Evaluator, Mode, Verdict},
+    gate::{Evaluator, GateError, Mode, Verdict},
     json::JsonValue,
 };
 use praetore_core::DecisionOutcome;
@@ -327,6 +327,29 @@ fn decide(
         .and_then(Value::as_str)
         .map_or_else(|| "?".to_owned(), display_safe);
     match evaluator.evaluate(server, &call.params) {
+        // G7: a safety action that the policy declares Safety is
+        // not governed by PRÆTORE. It was not evaluated, signed or recorded,
+        // and it is forwarded to the wrapped server without a receipt in both
+        // modes; its record is left to a separate ingestion path.
+        Err(error @ GateError::SafetyActionNotGoverned { .. }) => {
+            warnings.push(format!(
+                "praetore-mcp: {server}/{tool}: {error}; forwarded WITHOUT a receipt ({})",
+                mode.as_str()
+            ));
+            CallDecision::Forward
+        }
+        // An action type the policy does not declare (for example an
+        // undeclared `safety:*` tool) is refused in both modes: it cannot be
+        // classified, so it is neither decided nor passed through.
+        Err(error @ GateError::UnclassifiedAction { .. }) => {
+            warnings.push(format!(
+                "praetore-mcp: {server}/{tool}: {error}; call REFUSED ({})",
+                mode.as_str()
+            ));
+            CallDecision::Block(format!(
+                "PRÆTORE refused this tool call because the policy does not classify it: {error}"
+            ))
+        }
         Err(error) => match mode {
             Mode::Enforce => {
                 warnings.push(format!(
@@ -376,6 +399,20 @@ fn decide_verdict(
     } else {
         verdict.rule_ids.join(", ")
     };
+    // Every DENY gets the same client-facing text, whatever decided it, so
+    // the client cannot tell from it what the policy declares or which rule
+    // matched. The details go to stderr and to the signed receipt.
+    let denied = || format!("Denied by PRÆTORE. Evidence id: {}", verdict.evidence_id);
+    if verdict.unclassified {
+        // G7: an action type the policy does not declare is refused in both
+        // modes, with its signed DENY receipt.
+        warnings.push(format!(
+            "praetore-mcp: {server}/{tool}: action type not declared in the policy; signed DENY (evidence {}); call REFUSED ({})",
+            verdict.evidence_id,
+            mode.as_str()
+        ));
+        return CallDecision::Block(denied());
+    }
     match (mode, verdict.outcome) {
         (_, DecisionOutcome::Allow) => CallDecision::Forward,
         (Mode::Observe, outcome) => {
@@ -386,10 +423,14 @@ fn decide_verdict(
             ));
             CallDecision::Forward
         }
-        (Mode::Enforce, DecisionOutcome::Deny) => CallDecision::Block(format!(
-            "Denied by PRÆTORE policy. Rule: {rules}. Reason: {}. Evidence id: {}",
-            verdict.reason, verdict.evidence_id
-        )),
+        (Mode::Enforce, DecisionOutcome::Deny) => {
+            warnings.push(format!(
+                "praetore-mcp: {server}/{tool} DENIED by rule {rules}: {} (evidence {})",
+                display_safe(&verdict.reason),
+                verdict.evidence_id
+            ));
+            CallDecision::Block(denied())
+        }
         (Mode::Enforce, DecisionOutcome::RequireApproval) => CallDecision::Block(format!(
             "This tool call requires human approval (not supported by praetore-mcp yet), so it was not executed. Rule: {rules}. Evidence id: {}",
             verdict.evidence_id
@@ -400,15 +441,9 @@ fn decide_verdict(
 /// Replaces control characters (terminal escapes) in untrusted text and
 /// bounds its length before it is printed.
 pub fn display_safe(value: &str) -> String {
-    let mut out: String = value
-        .chars()
-        .take(200)
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if value.chars().count() > 200 {
-        out.push('…');
-    }
-    out
+    // Control, zero-width and bidi characters are written as `\u{XXXX}`
+    // (G7), so a tool name cannot pass for another in a table or log line.
+    praetore_core::display::escape_bounded(value, 200)
 }
 
 pub fn outcome_label(outcome: DecisionOutcome) -> &'static str {
@@ -496,11 +531,32 @@ pub fn handle_client_line(
                     "praetore-mcp: WARNING ambiguous client line ({reason}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
                     candidates.len()
                 ));
+                let mut refused = None;
                 for call in &candidates {
-                    // Observe always forwards; this only records receipts.
-                    let _ = decide(mode, server, call, evaluator, &mut out.warnings);
+                    // Observe forwards and only records receipts, except a
+                    // reading named `safety*` that is not a declared Safety
+                    // action (G7): then the line is refused.
+                    let decision = decide(mode, server, call, evaluator, &mut out.warnings);
+                    if let CallDecision::Block(text) = decision
+                        && crate::gate::is_safety_named(&call.params)
+                    {
+                        refused.get_or_insert((call.id.clone(), text));
+                    }
                 }
-                out.to_server = Some(forward_unchanged(raw));
+                match refused {
+                    None => out.to_server = Some(forward_unchanged(raw)),
+                    Some((id, text)) => {
+                        out.warnings.push(
+                            "praetore-mcp: ambiguous line with an unclassified safety* tool call REFUSED (observe)".into(),
+                        );
+                        out.to_client = Some(match id {
+                            Some(id) => line(&blocked_response(&id, &text)),
+                            None => line(&parse_error_response(
+                                "praetore-mcp: an ambiguous message naming a safety* tool was not forwarded",
+                            )),
+                        });
+                    }
+                }
             }
         },
         Classified::ToolCall(call) => {
@@ -577,10 +633,11 @@ mod tests {
     }
 
     impl Evaluator for Fixed {
-        fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String> {
+        fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
             self.calls.push((server.into(), params.clone()));
             let outcome = self.result.clone()?;
             Ok(Verdict {
+                unclassified: false,
                 outcome,
                 evidence_id: Uuid::nil(),
                 rule_ids: vec!["rule-x".into()],
@@ -649,7 +706,12 @@ mod tests {
 
     #[test]
     fn display_safe_strips_escapes() {
-        assert_eq!(display_safe("rm\u{1b}[2J\n"), "rm?[2J?");
+        assert_eq!(display_safe("rm\u{1b}[2J\n"), "rm\\u{1b}[2J\\u{a}");
+        assert_eq!(
+            display_safe("local:set_value\u{200b}"),
+            "local:set_value\\u{200b}"
+        );
+        assert_eq!(display_safe("a\u{202e}b"), "a\\u{202e}b");
     }
 
     #[test]
@@ -681,8 +743,13 @@ mod tests {
         assert_eq!(reply["id"], 7);
         assert_eq!(reply["result"]["isError"], true);
         let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("rule-x"));
-        assert!(text.contains(&Uuid::nil().to_string()));
+        // The client-facing text is the same for every DENY (G7); the rule
+        // is reported on stderr only.
+        assert_eq!(
+            text,
+            format!("Denied by PRÆTORE. Evidence id: {}", Uuid::nil())
+        );
+        assert!(out.warnings.iter().any(|w| w.contains("rule-x")));
     }
 
     #[test]
@@ -747,13 +814,8 @@ mod tests {
         let raw = br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"x"}}"#;
         let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
-        assert_eq!(
-            out,
-            Outcome {
-                warnings: vec![],
-                ..Outcome::default()
-            }
-        );
+        assert!(out.to_server.is_none());
+        assert!(out.to_client.is_none());
     }
 
     #[test]

@@ -51,16 +51,16 @@ fn outcome(prefix: &str, path: &str) -> DecisionOutcome {
     let agent = AgentKeyPair::from_secret_bytes(&[9; 32]).identity(AgentId::new());
     let authority = Authority::new(agent.id.clone(), "path-issuer", vec![]);
     let action = Action::new("modify_file", None, json!({ "path": path })).unwrap();
-    let policy = Policy::new(
+    let policy = mission_policy(Policy::new(
         "path-policy",
         1,
         vec![
             PolicyRule::new("safe", "modify_file", PolicyEffect::Allow)
                 .with_parameter_condition(PolicyCondition::path_prefix("path", prefix)),
         ],
-    );
+    ));
     policy
-        .evaluate(&agent, &authority, &action)
+        .evaluate(&agent, &authority, &mission((action).clone()))
         .unwrap()
         .outcome
 }
@@ -86,4 +86,28 @@ fn path_prefix_allow_rejects_symlink_that_leaves_the_prefix() {
         "symlink {lexical} resolves to {} and must not match an allow PathPrefix",
         resolved.display()
     );
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

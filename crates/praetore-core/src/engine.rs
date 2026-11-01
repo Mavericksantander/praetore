@@ -1,7 +1,8 @@
 use crate::{
     PraetoreError, Result,
+    action::RequestAction,
     authority::Validity,
-    authorization::AuthorizationRequest,
+    authorization::{AuthorizationRequest, UnclassifiedRequest},
     canonical::{decode_lower_hex, parse_json_rejecting_duplicates},
     decision::{DecidedBy, Decision, RecordedDecision},
     evidence::{Evidence, EvidenceAttesterKey},
@@ -98,6 +99,12 @@ impl ClockSource {
         }
     }
 }
+
+/// Reason of the DENY that [`AuthorizationEngine::refuse_unclassified`]
+/// records for an action type the policy does not declare (G7).
+pub const UNCLASSIFIED_DENY_REASON: &str = "unclassified";
+/// Engine guard named in that DENY's `decided_by`.
+pub const UNCLASSIFIED_ACTION_GUARD: &str = "unclassified_action";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvaluationMode {
@@ -818,7 +825,10 @@ impl AuthorizationEngine {
             request_id: evidence.request_id,
             agent: evidence.agent.clone(),
             authority: evidence.authority.clone(),
-            action: evidence.action.clone(),
+            action: self
+                .policy
+                .classify(evidence.action.clone())?
+                .into_mission()?,
             trace_id: evidence.trace_id.clone(),
             context: evidence.context.clone(),
             agent_signature: evidence.agent_signature.clone(),
@@ -919,28 +929,66 @@ impl AuthorizationEngine {
     }
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
-        self.evaluate_inner(request, None)
-            .map_err(|error| match error {
-                AtomicEvaluationError::Evaluation(error) => error,
-                AtomicEvaluationError::Commit(AuthorizationCommitError::AlreadyCommitted)
-                | AtomicEvaluationError::Commit(AuthorizationCommitError::OrphanedReplayClaim) => {
-                    PraetoreError::ReplayDetected
-                }
-                AtomicEvaluationError::Commit(AuthorizationCommitError::ConflictingRequest) => {
-                    PraetoreError::InvalidRequest(
-                        "authorization identity conflicts with persisted content".into(),
-                    )
-                }
-                AtomicEvaluationError::Commit(AuthorizationCommitError::Unavailable)
-                | AtomicEvaluationError::Commit(AuthorizationCommitError::NotFound) => {
-                    PraetoreError::ReplayGuardUnavailable
-                }
-                AtomicEvaluationError::Commit(AuthorizationCommitError::InvalidRecord) => {
-                    PraetoreError::EvidenceError("persisted authorization record is invalid".into())
-                }
-            })
+        self.evaluate_inner(request, None).map_err(standalone_error)
     }
 
+    /// Refuses a request for an action whose type the policy does not declare
+    /// (G7), with a signed DENY decided by the engine guard
+    /// `unclassified_action` and the reason `unclassified`.
+    ///
+    /// The request is verified exactly as [`Self::evaluate`] verifies a
+    /// mission request before anything is signed: identity, authority,
+    /// issuer pin, intent signature and validity, and in HighAssurance the
+    /// intent window, freshness and the replay claim. A request that fails
+    /// verification returns the same error as on the mission path and no
+    /// evidence. The action is never evaluated against policy rules.
+    pub fn refuse_unclassified(&self, request: UnclassifiedRequest) -> Result<Evidence> {
+        self.evaluate_inner(request, None).map_err(standalone_error)
+    }
+
+    /// Like [`Self::refuse_unclassified`], committing the signed DENY
+    /// atomically with the replay claim, as
+    /// [`Self::evaluate_with_atomic_commit`] does for a mission request.
+    pub fn refuse_unclassified_with_atomic_commit(
+        &self,
+        request: UnclassifiedRequest,
+        commit: &dyn AtomicAuthorizationCommit,
+    ) -> std::result::Result<Evidence, AtomicEvaluationError> {
+        if self.mode != EvaluationMode::HighAssurance {
+            return Err(PraetoreError::InvalidRequest(
+                "atomic authorization commit requires HighAssurance mode".into(),
+            )
+            .into());
+        }
+        self.evaluate_inner(request, Some(commit))
+    }
+}
+
+fn standalone_error(error: AtomicEvaluationError) -> PraetoreError {
+    {
+        match error {
+            AtomicEvaluationError::Evaluation(error) => error,
+            AtomicEvaluationError::Commit(AuthorizationCommitError::AlreadyCommitted)
+            | AtomicEvaluationError::Commit(AuthorizationCommitError::OrphanedReplayClaim) => {
+                PraetoreError::ReplayDetected
+            }
+            AtomicEvaluationError::Commit(AuthorizationCommitError::ConflictingRequest) => {
+                PraetoreError::InvalidRequest(
+                    "authorization identity conflicts with persisted content".into(),
+                )
+            }
+            AtomicEvaluationError::Commit(AuthorizationCommitError::Unavailable)
+            | AtomicEvaluationError::Commit(AuthorizationCommitError::NotFound) => {
+                PraetoreError::ReplayGuardUnavailable
+            }
+            AtomicEvaluationError::Commit(AuthorizationCommitError::InvalidRecord) => {
+                PraetoreError::EvidenceError("persisted authorization record is invalid".into())
+            }
+        }
+    }
+}
+
+impl AuthorizationEngine {
     /// Evaluates a new request and atomically commits its signed HighAssurance
     /// evidence with the replay claim. Unlike [`Self::evaluate`], this path
     /// never uses the configured standalone replay guard.
@@ -958,11 +1006,18 @@ impl AuthorizationEngine {
         self.evaluate_inner(request, Some(commit))
     }
 
-    fn evaluate_inner(
+    fn evaluate_inner<A: RequestAction>(
         &self,
-        request: AuthorizationRequest,
+        request: AuthorizationRequest<A>,
         atomic_commit: Option<&dyn AtomicAuthorizationCommit>,
     ) -> std::result::Result<Evidence, AtomicEvaluationError> {
+        #[cfg(feature = "test-probe")]
+        crate::probe::record_engine_call(&self.policy.id);
+        // G7: a mission action must be a declared Mission action of this
+        // engine's policy, and an unclassified one must still be undeclared
+        // (either may have been built against another policy). Checked
+        // before the clock, the replay guard or any signature.
+        request.action.check_class(&self.policy)?;
         let now = self.clock.now()?;
         if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
             return Err(PraetoreError::InvalidRequest(
@@ -1117,9 +1172,9 @@ impl AuthorizationEngine {
         Ok(())
     }
 
-    fn validate_high_assurance_request(
+    fn validate_high_assurance_request<A: RequestAction>(
         &self,
-        request: &AuthorizationRequest,
+        request: &AuthorizationRequest<A>,
         now: OffsetDateTime,
     ) -> Result<(
         Option<crate::authorization::AuthorizationIntentV2>,
@@ -1184,14 +1239,15 @@ impl AuthorizationEngine {
         ))
     }
 
-    fn evaluate_request(
+    fn evaluate_request<A: RequestAction>(
         &self,
-        request: &AuthorizationRequest,
+        request: &AuthorizationRequest<A>,
         now: OffsetDateTime,
     ) -> Result<Decision> {
+        request.action.check_class(&self.policy)?;
         request.agent.validate()?;
         request.authority.validate()?;
-        request.action.validate()?;
+        request.action.action().validate()?;
 
         if request.agent.id != request.authority.subject {
             return Err(PraetoreError::InvalidRequest(
@@ -1218,7 +1274,7 @@ impl AuthorizationEngine {
                 }
             }
 
-            if request.action.capability.is_none() {
+            if request.action.action().capability.is_none() {
                 return Err(PraetoreError::InvalidRequest(
                     "strict evaluation requires an explicit action capability".into(),
                 ));
@@ -1260,16 +1316,24 @@ impl AuthorizationEngine {
             return Err(PraetoreError::AuthorityExpired);
         }
 
+        // G7: everything above verifies the request; what follows decides.
+        // An unclassified action is never evaluated against policy rules.
+        let Some(action) = request.action.as_mission() else {
+            return Ok(Decision::deny(
+                UNCLASSIFIED_DENY_REASON,
+                DecidedBy::engine_guard(UNCLASSIFIED_ACTION_GUARD),
+            ));
+        };
+
         for constraint in &request.authority.constraints {
             // The gateway consumes this issuer-signed routing claim separately.
             if constraint.key == "tenant_id" {
                 continue;
             }
             let satisfied = if constraint.key == "target" {
-                request.action.target.as_deref() == Some(constraint.value.as_str())
+                action.target.as_deref() == Some(constraint.value.as_str())
             } else {
-                request
-                    .action
+                action
                     .parameters
                     .get(&constraint.key)
                     .and_then(|v| v.as_str())
@@ -1289,7 +1353,7 @@ impl AuthorizationEngine {
 
         // Fail closed: an action without an explicit capability is never
         // mapped onto its action_type (or any other) grant.
-        let Some(capability) = request.action.capability.as_deref() else {
+        let Some(capability) = action.capability.as_deref() else {
             return Ok(Decision::deny(
                 "action does not declare a required capability",
                 DecidedBy::engine_guard("missing_capability"),
@@ -1305,7 +1369,7 @@ impl AuthorizationEngine {
         let decision = self.policy.evaluate_with_context(
             &request.agent,
             &request.authority,
-            &request.action,
+            action,
             &request.context,
         )?;
 
@@ -1503,7 +1567,12 @@ mod tests {
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
         let policy_digest = policy.digest().unwrap();
         let now = FixedClock::new("2026-06-01T12:00:00Z").now();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -1632,7 +1701,7 @@ mod tests {
 
     #[test]
     fn high_assurance_denies_allow_rule_without_required_capability() {
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "unbound-capability",
             1,
             vec![PolicyRule::new(
@@ -1640,7 +1709,7 @@ mod tests {
                 "delete_data",
                 crate::policy::PolicyEffect::Allow,
             )],
-        );
+        ));
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let issuer_key = AgentKeyPair::generate();
@@ -1657,7 +1726,9 @@ mod tests {
         .with_capability("read_data");
         let policy_digest = policy.digest().unwrap();
         let now = FixedClock::new("2026-06-01T12:00:00Z").now();
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -1730,7 +1801,7 @@ mod tests {
     }
 
     fn allow_policy() -> Policy {
-        Policy::new_v2(
+        crate::test_support::mission_policy(Policy::new_v2(
             "test-policy",
             1,
             vec![
@@ -1741,12 +1812,12 @@ mod tests {
                 )
                 .with_capability("read_data"),
             ],
-        )
+        ))
     }
 
     fn decided_by_policy() -> Policy {
         use crate::policy::PolicyEffect;
-        Policy::new_v2(
+        crate::test_support::mission_policy(Policy::new_v2(
             "decided-by-policy",
             1,
             vec![
@@ -1757,7 +1828,8 @@ mod tests {
                 PolicyRule::new("approve-write", "write_data", PolicyEffect::RequireApproval)
                     .with_capability("write_data"),
             ],
-        )
+        ))
+        .with_mission_actions(["export_data"])
     }
 
     fn signed_evidence_for(action_type: &str) -> (Evidence, crate::EvidenceAttesterKey) {
@@ -1775,7 +1847,9 @@ mod tests {
         let action = Action::new(action_type, Some("database".into()), json!({}))
             .unwrap()
             .with_capability(action_type);
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         let mut evidence = AuthorizationEngine::development(decided_by_policy())
             .evaluate(request)
             .unwrap();
@@ -1840,7 +1914,7 @@ mod tests {
     #[test]
     fn deny_rule_beats_allow_rule_and_is_recorded_as_decider() {
         use crate::policy::PolicyEffect;
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "overlap",
             1,
             vec![
@@ -1849,10 +1923,15 @@ mod tests {
                 PolicyRule::new("deny-read", "read_data", PolicyEffect::Deny)
                     .with_capability("read_data"),
             ],
-        );
+        ));
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         let evidence = AuthorizationEngine::development(policy)
             .evaluate(request)
             .unwrap();
@@ -1867,7 +1946,12 @@ mod tests {
     fn engine_guard_denial_records_guard_as_decider() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["other".into()]);
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         let evidence = AuthorizationEngine::development(allow_policy())
             .evaluate(request)
             .unwrap();
@@ -1931,7 +2015,9 @@ mod tests {
         if let Some((key, value)) = constraint {
             authority = authority.with_constraint(key, value);
         }
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         let mut evidence = AuthorizationEngine::development(policy)
             .evaluate(request)
             .unwrap();
@@ -1959,7 +2045,7 @@ mod tests {
     fn every_new_receipt_exports_decided_by_in_json() {
         use crate::policy::PolicyEffect;
         let all = ["read_data", "delete_data", "write_data", "export_data"];
-        let unbound_policy = Policy::new_v2(
+        let unbound_policy = crate::test_support::mission_policy(Policy::new_v2(
             "unbound",
             1,
             vec![PolicyRule::new(
@@ -1967,9 +2053,10 @@ mod tests {
                 "read_data",
                 PolicyEffect::Allow,
             )],
-        );
+        ))
+        .with_mission_actions(all);
         let scoped_policy = || {
-            Policy::new_v2(
+            crate::test_support::mission_policy(Policy::new_v2(
                 "scoped",
                 1,
                 vec![
@@ -1989,7 +2076,7 @@ mod tests {
                     PolicyRule::new("allow-halt", "halt", PolicyEffect::Allow)
                         .with_capability("halt:write"),
                 ],
-            )
+            ))
         };
         let cases: Vec<(&str, serde_json::Value, DecisionOutcome, serde_json::Value)> = vec![
             (
@@ -2242,7 +2329,12 @@ mod tests {
 
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
@@ -2261,7 +2353,12 @@ mod tests {
                 not_after: Some("2026-12-31T23:59:59Z".into()),
             });
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development_with_clock(
             allow_policy(),
@@ -2278,7 +2375,12 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
             .with_constraint("target", "database");
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
 
@@ -2297,7 +2399,12 @@ mod tests {
         let engine = AuthorizationEngine::development_with_clock(allow_policy(), clock);
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         engine.evaluate(request).unwrap();
 
@@ -2311,7 +2418,12 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
             .with_constraint("environment", "production");
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
 
@@ -2326,7 +2438,9 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
             .with_constraint("record_count", "12");
         let action = Action::new("read_data", None, json!({"record_count": 12})).unwrap();
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
@@ -2341,7 +2455,12 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
             .with_constraint("environment", "staging");
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
 
@@ -2357,7 +2476,12 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
             .with_constraint("target", "other-database");
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
@@ -2372,7 +2496,12 @@ mod tests {
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
             .with_constraint("region", "santiago");
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
@@ -2388,7 +2517,12 @@ mod tests {
             .with_constraint("target", "database")
             .with_constraint("environment", "staging");
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
@@ -2402,9 +2536,14 @@ mod tests {
 
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
-        let policy = Policy::new(
+        let policy = crate::test_support::mission_policy(Policy::new(
             "test-policy",
             1,
             vec![
@@ -2419,7 +2558,7 @@ mod tests {
                     crate::policy::PolicyEffect::Deny,
                 ),
             ],
-        );
+        ));
 
         let engine = AuthorizationEngine::development(policy);
         let evidence = engine.evaluate(request).unwrap();
@@ -2438,7 +2577,11 @@ mod tests {
 
         authority.issuer = String::new();
 
-        let result = AuthorizationRequest::new(agent, authority, test_action());
+        let result = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        );
 
         assert!(matches!(result, Err(PraetoreError::InvalidRequest(_))));
     }
@@ -2450,7 +2593,12 @@ mod tests {
         let authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["write_data".into()]);
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development(allow_policy());
         let evidence = engine.evaluate(request).unwrap();
@@ -2469,7 +2617,7 @@ mod tests {
         )
         .unwrap()
         .with_capability("read_data");
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "unbound-capability",
             1,
             vec![PolicyRule::new(
@@ -2477,8 +2625,10 @@ mod tests {
                 "delete_data",
                 crate::policy::PolicyEffect::Allow,
             )],
-        );
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        ));
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         AuthorizationEngine::development(policy)
             .evaluate(request)
             .unwrap()
@@ -2511,7 +2661,9 @@ mod tests {
             "praetore-root",
             capabilities.iter().map(|c| (*c).to_string()).collect(),
         );
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         AuthorizationEngine::development(allow_policy())
             .evaluate(request)
             .unwrap()
@@ -2598,7 +2750,9 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read:data".into()]);
         let action = test_action().with_capability("write:data");
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         let engine = AuthorizationEngine::development(allow_policy());
 
         let evidence = engine.evaluate(request).unwrap();
@@ -2615,7 +2769,9 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         let action = test_action().with_capability("write:data");
-        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         let evidence = engine.evaluate(request).unwrap();
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
         assert!(evidence.decision.reason.contains("write:data"));
@@ -2625,10 +2781,14 @@ mod tests {
     fn request_context_is_available_to_policy_and_bound_in_evidence() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
-        let request = AuthorizationRequest::new(agent, authority, test_action())
-            .unwrap()
-            .with_context("region", json!("south"));
-        let policy = Policy::new(
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap()
+        .with_context("region", json!("south"));
+        let policy = crate::test_support::mission_policy(Policy::new(
             "context-policy",
             1,
             vec![
@@ -2643,7 +2803,7 @@ mod tests {
                     json!("south"),
                 )),
             ],
-        );
+        ));
         let engine = AuthorizationEngine::development(policy);
 
         let mut evidence = engine.evaluate(request).unwrap();
@@ -2664,7 +2824,12 @@ mod tests {
                 not_after: None,
             });
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development_with_clock(
             allow_policy(),
@@ -2687,7 +2852,12 @@ mod tests {
                 not_after: Some("2026-05-01T00:00:00Z".into()),
             });
 
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         let engine = AuthorizationEngine::development_with_clock(
             allow_policy(),
@@ -2706,7 +2876,12 @@ mod tests {
 
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
 
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         request.agent.public_key.clear();
 
@@ -2724,9 +2899,16 @@ mod tests {
 
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
 
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
-        request.action.parameters = json!("invalid");
+        let mut tampered = request.action.action().clone();
+        tampered.parameters = json!("invalid");
+        request.action = crate::test_support::mission(tampered);
 
         let engine = AuthorizationEngine::development(allow_policy());
 
@@ -2741,7 +2923,12 @@ mod tests {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         let issuer_key = AgentKeyPair::generate();
         let trusted_issuer =
             TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
@@ -2761,7 +2948,12 @@ mod tests {
         let mut authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request.sign_intent(&agent_key).unwrap();
         let trusted_issuer =
             TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
@@ -2793,9 +2985,11 @@ mod tests {
         )
         .unwrap()
         .with_capability("read_data");
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         request.sign_intent(&agent_key).unwrap();
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "unbound-capability",
             1,
             vec![PolicyRule::new(
@@ -2803,7 +2997,7 @@ mod tests {
                 "delete_data",
                 crate::policy::PolicyEffect::Allow,
             )],
-        );
+        ));
         let trusted_issuer =
             TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
         let engine = AuthorizationEngine::strict(policy, vec![trusted_issuer]).unwrap();
@@ -2823,7 +3017,12 @@ mod tests {
         let mut authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         authority.sign_for_agent(&new_issuer, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request.sign_intent(&agent_key).unwrap();
 
         let engine = AuthorizationEngine::strict(
@@ -2849,7 +3048,12 @@ mod tests {
         let mut authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         let trusted_issuer =
             TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
         let engine = AuthorizationEngine::strict(allow_policy(), vec![trusted_issuer]).unwrap();
@@ -2872,7 +3076,12 @@ mod tests {
                     not_after: Some("2026-05-01T00:00:00Z".into()),
                 });
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request.sign_intent(&agent_key).unwrap();
         let trusted_issuer =
             TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
@@ -2898,7 +3107,12 @@ mod tests {
         let mut authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         authority.sign_for_agent(&actual_issuer, &agent).unwrap();
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         let trusted_issuer =
             TrustedAuthorityIssuer::new("praetore-root", untrusted_issuer.public_key()).unwrap();
         let engine = AuthorizationEngine::strict(allow_policy(), vec![trusted_issuer]).unwrap();
@@ -2945,7 +3159,12 @@ mod tests {
         let mut authority =
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         let trusted_issuer =
             TrustedAuthorityIssuer::new("other-root", issuer_key.public_key()).unwrap();
         let engine = AuthorizationEngine::strict(allow_policy(), vec![trusted_issuer]).unwrap();
@@ -2966,8 +3185,12 @@ mod tests {
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
 
         let substituted_agent = AgentKeyPair::generate().identity(agent.id.clone());
-        let mut request =
-            AuthorizationRequest::new(substituted_agent.clone(), authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            substituted_agent.clone(),
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request.sign_intent(&AgentKeyPair::generate()).unwrap_err();
 
         let trusted_issuer =
@@ -3006,7 +3229,7 @@ mod tests {
             Authority::new(agent.id.clone(), "praetore-root", vec!["data:read".into()])
                 .with_validity(high_assurance_validity());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let policy = Policy::new_v2(
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
             "production-read",
             1,
             vec![
@@ -3017,11 +3240,14 @@ mod tests {
                 )
                 .with_capability("data:read"),
             ],
-        );
+        ));
         let now = FixedClock::new("2026-06-01T12:00:00Z").now();
-        let mut request =
-            AuthorizationRequest::new(agent, authority, test_action().with_capability("data:read"))
-                .unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action().with_capability("data:read")),
+        )
+        .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -3097,8 +3323,10 @@ mod tests {
     fn production_profile_rejects_policy_pin_mismatch() {
         let issuer_key = AgentKeyPair::generate();
         let attester = EvidenceAttesterKey::generate();
-        let expected_policy = Policy::new_v2("expected", 1, vec![]);
-        let actual_policy = Policy::new_v2("substituted", 1, vec![]);
+        let expected_policy =
+            crate::test_support::mission_policy(Policy::new_v2("expected", 1, vec![]));
+        let actual_policy =
+            crate::test_support::mission_policy(Policy::new_v2("substituted", 1, vec![]));
         let config = HighAssuranceConfig::new(
             expected_policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
@@ -3121,7 +3349,7 @@ mod tests {
     #[test]
     fn production_profile_rejects_legacy_policy_semantics() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new("legacy-policy", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new("legacy-policy", 1, vec![]));
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
@@ -3144,7 +3372,7 @@ mod tests {
     #[test]
     fn production_profile_rejects_expired_issuer_pin() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new_v2("production", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new_v2("production", 1, vec![]));
         let pin = production_test_pin(
             &issuer_key,
             Validity {
@@ -3174,7 +3402,7 @@ mod tests {
     #[test]
     fn production_profile_requires_replay_guard() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new_v2("production", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new_v2("production", 1, vec![]));
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
@@ -3195,7 +3423,7 @@ mod tests {
     #[test]
     fn production_profile_rejects_noncanonical_audience_and_nonpositive_lifetimes() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new_v2("production", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new_v2("production", 1, vec![]));
         let build_config = || {
             HighAssuranceConfig::new(
                 policy.digest().unwrap(),
@@ -3240,7 +3468,7 @@ mod tests {
     fn production_profile_rejects_invalid_tenant_issuer_bindings() {
         let issuer_key = AgentKeyPair::generate();
         let second_issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new_v2("production", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new_v2("production", 1, vec![]));
         let issuer_pin = production_test_pin(&issuer_key, high_assurance_validity());
         let second_issuer_pin = production_test_pin(&second_issuer_key, high_assurance_validity());
         let issuer_key_id = issuer_pin.key_id().to_owned();
@@ -3307,7 +3535,12 @@ mod tests {
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
         let policy = allow_policy();
         let now = FixedClock::new("2026-06-01T12:00:00Z").now();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -3407,7 +3640,12 @@ mod tests {
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
                 .with_validity(high_assurance_validity());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -3455,7 +3693,12 @@ mod tests {
             Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
                 .with_validity(high_assurance_validity());
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -3504,7 +3747,7 @@ mod tests {
             .validate_allow_evidence_for_dispatch(&evidence)
             .unwrap();
 
-        let approval_policy = Policy::new_v2(
+        let approval_policy = crate::test_support::mission_policy(Policy::new_v2(
             "test-policy",
             1,
             vec![
@@ -3515,7 +3758,7 @@ mod tests {
                 )
                 .with_capability("read_data"),
             ],
-        );
+        ));
         let (engine, request) =
             production_engine_with_policy(approval_policy, test_freshness_provider(), None);
         let evidence = engine.evaluate(request).unwrap();
@@ -3533,7 +3776,7 @@ mod tests {
     /// other decision field matches, and still rejects any other difference.
     #[test]
     fn dispatch_revalidation_accepts_legacy_pending_approval_evidence() {
-        let approval_policy = Policy::new_v2(
+        let approval_policy = crate::test_support::mission_policy(Policy::new_v2(
             "test-policy",
             1,
             vec![
@@ -3544,7 +3787,7 @@ mod tests {
                 )
                 .with_capability("read_data"),
             ],
-        );
+        ));
         let (engine, request) =
             production_engine_with_policy(approval_policy, test_freshness_provider(), None);
         let evidence = engine.evaluate(request).unwrap();
@@ -3631,7 +3874,12 @@ mod tests {
                 Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()])
                     .with_validity(high_assurance_validity());
             authority.sign_for_agent(&issuer_key, &agent).unwrap();
-            let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+            let mut request = AuthorizationRequest::new(
+                agent,
+                authority,
+                crate::test_support::mission(test_action()),
+            )
+            .unwrap();
             request
                 .sign_intent_v2(
                     &agent_key,
@@ -3719,7 +3967,7 @@ mod tests {
     #[test]
     fn production_profile_requires_freshness_provider() {
         let issuer_key = AgentKeyPair::generate();
-        let policy = Policy::new_v2("production", 1, vec![]);
+        let policy = crate::test_support::mission_policy(Policy::new_v2("production", 1, vec![]));
         let config = HighAssuranceConfig::new(
             policy.digest().unwrap(),
             vec![production_test_pin(&issuer_key, high_assurance_validity())],
@@ -3771,7 +4019,9 @@ mod tests {
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
         let mut action = test_action();
         action.capability = None;
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         request.sign_intent(&agent_key).unwrap();
         let pin = TrustedAuthorityIssuer::new("praetore-root", issuer_key.public_key()).unwrap();
         let engine = AuthorizationEngine::strict(allow_policy(), vec![pin]).unwrap();
@@ -3795,7 +4045,12 @@ mod tests {
                 let authority = authority.clone();
                 let action = action.clone();
                 std::thread::spawn(move || {
-                    let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+                    let request = AuthorizationRequest::new(
+                        agent,
+                        authority,
+                        crate::test_support::mission(action),
+                    )
+                    .unwrap();
                     engine.evaluate(request).unwrap().decision.outcome
                 })
             })
@@ -3811,7 +4066,12 @@ mod tests {
         let agent_key = AgentKeyPair::generate();
         let agent = agent_key.identity(AgentId::new());
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
         request.sign_intent(&agent_key).unwrap();
         request.agent_signature = Some("00".repeat(64));
         let engine = AuthorizationEngine::development(allow_policy());
@@ -3827,7 +4087,12 @@ mod tests {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
 
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
 
         request.agent.id = AgentId::new();
 
@@ -3861,7 +4126,11 @@ mod tests {
         if let Some(capability) = required_capability {
             rule = rule.with_capability(capability);
         }
-        let policy = Policy::new_v2("unbound-capability", 1, vec![rule]);
+        let policy = crate::test_support::mission_policy(Policy::new_v2(
+            "unbound-capability",
+            1,
+            vec![rule],
+        ));
         let action = Action::new(
             "delete_data",
             Some("database".into()),
@@ -3873,7 +4142,9 @@ mod tests {
         if mode == EvaluationMode::Development {
             let agent = test_agent();
             let authority = Authority::new(agent.id.clone(), "praetore-root", grants);
-            let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+            let request =
+                AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                    .unwrap();
             return Ok(AuthorizationEngine::development(policy)
                 .evaluate(request)?
                 .decision
@@ -3888,7 +4159,9 @@ mod tests {
             authority = authority.with_validity(high_assurance_validity());
         }
         authority.sign_for_agent(&issuer_key, &agent).unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
 
         let engine = if mode == EvaluationMode::Strict {
             request.sign_intent(&agent_key).unwrap();
@@ -4026,7 +4299,9 @@ mod tests {
         let policy = allow_policy();
         let policy_digest = policy.digest().unwrap();
         let now = FixedClock::new("2026-06-01T12:00:00Z").now();
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request =
+            AuthorizationRequest::new(agent, authority, crate::test_support::mission(action))
+                .unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -4062,8 +4337,15 @@ mod tests {
     fn blank_capability_does_not_fall_back_to_action_type() {
         let agent = test_agent();
         let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
-        let mut request = AuthorizationRequest::new(agent, authority, test_action()).unwrap();
-        request.action.capability = Some(String::new());
+        let mut request = AuthorizationRequest::new(
+            agent,
+            authority,
+            crate::test_support::mission(test_action()),
+        )
+        .unwrap();
+        let mut tampered = request.action.action().clone();
+        tampered.capability = Some(String::new());
+        request.action = crate::test_support::mission(tampered);
         let engine = AuthorizationEngine::development(allow_policy());
 
         assert!(matches!(

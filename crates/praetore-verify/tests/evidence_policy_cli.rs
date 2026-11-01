@@ -47,11 +47,11 @@ impl Drop for Dir {
 }
 
 fn policy(effect: PolicyEffect) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "receipt-policy",
         1,
         vec![PolicyRule::new("read", "read_data", effect)],
-    )
+    ))
 }
 
 fn attester() -> EvidenceAttesterKey {
@@ -71,7 +71,7 @@ fn receipt(policy: &Policy) -> Evidence {
     let action = Action::new("read_data", Some("db".into()), json!({}))
         .unwrap()
         .with_capability("data:read");
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request.sign_intent(&agent_key).unwrap();
     let mut evidence = request
         .attest(Decision::allow(
@@ -225,4 +225,72 @@ fn oversized_or_missing_policy_file_fails_without_success() {
     let output = verify(&evidence, &pin_file, Some(&missing));
     assert!(!output.status.success());
     assert_eq!(summary(&output)["ok"], false);
+}
+
+/// G7: evidence that bound a policy format 1 digest (committed before G7)
+/// still verifies against its recorded format 1 document. The migrated
+/// format 2 document has another digest, so it does not match that evidence.
+#[test]
+fn historical_format_1_evidence_verifies_against_its_recorded_document() {
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/verify");
+    let path = |name: &str| fixtures.join(name).to_string_lossy().into_owned();
+    let recorded = fs::read_to_string(fixtures.join("policy.json")).unwrap();
+    assert!(!recorded.contains("format_version"), "fixture is format 1");
+
+    let output = verify(
+        &path("evidence.json"),
+        &path("attester-public-key.hex"),
+        Some(&path("policy.json")),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(summary(&output)["details"]["policy_verified"], true);
+
+    let digest = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args(["policy-digest", "--policy", &path("policy.json")])
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert!(digest.status.success());
+    assert_eq!(summary(&digest)["details"]["policy_format_version"], 1);
+
+    // The same rules migrated to format 2 (with action_classes).
+    let mut migrated: Value = serde_json::from_str(&recorded).unwrap();
+    migrated["format_version"] = json!(2);
+    migrated["action_classes"] = json!({"read_data": "Mission"});
+    let dir = Dir::new();
+    let migrated = dir.write("migrated.json", migrated.to_string());
+    let output = verify(
+        &path("evidence.json"),
+        &path("attester-public-key.hex"),
+        Some(&migrated),
+    );
+    assert_fails(&output, "POLICY_MISMATCH");
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

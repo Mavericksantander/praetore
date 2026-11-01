@@ -7,8 +7,12 @@ and the result is written as a signed evidence receipt that a third party can
 check offline with `praetore-verify`. It needs no PostgreSQL, no server and no
 Rust code.
 
-* **observe** (default): every call is forwarded. The decision is only
-  recorded. If the home cannot be loaded at startup (not initialized, or
+* **observe** (default): every call that the policy classifies is
+  forwarded; the decision is only recorded. A call whose action type the
+  policy does not declare (a signed `unclassified` DENY, for example an undeclared
+  `mcp.tools/call` or a `safety*` tool that is not exactly a declared Safety
+  action) is refused in observe too, and a declared Safety call is forwarded
+  without a receipt (G7). If the home cannot be loaded at startup (not initialized, or
   invalid keys, pins or policy), no receipt can be written, so every
   `tools/call` is refused in observe as well (see Limitations).
 * **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
@@ -240,9 +244,34 @@ time is only as trustworthy as the attester key that signed it.
 
 ## Writing policy
 
-`DIR/policy.json` is a PRÆTORE v2 policy (see
+`DIR/policy.json` is a PRÆTORE policy, format 2 with semantics v2 (see
 [`docs/policy-language.md`](../../docs/policy-language.md)). The default policy
-has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`.
+has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`,
+and declares the action type `mcp.tools/call` as `Mission` in
+`action_classes`. A home created before G7 has a format 1 policy, which no
+longer loads, so **migrate it before upgrading the binary**: after the
+upgrade every call is refused, `safety:*` included, until the policy is
+migrated. Add `"format_version": 2` and
+`"action_classes": {"mcp.tools/call": "Mission"}` (`policy check` prints this
+hint). Receipts written before keep verifying against the old document with
+`praetore-verify --policy`.
+
+**Safety actions (G7).** A `tools/call` whose tool name starts with `safety:`
+has that name as its action type. If the policy declares it `Safety`, the
+gate answers `SAFETY_ACTION_NOT_GOVERNED` before path resolution, signing,
+the engine or the receipts journal, and the proxy forwards the call to the
+wrapped server unchanged and without a receipt, in enforce and in observe
+mode: PRÆTORE decides and signs nothing about it. An undeclared `safety:*`
+tool is refused in both modes and is not forwarded; the engine leaves a
+signed DENY receipt for it (reason `unclassified`, engine guard
+`unclassified_action`), and the client sees the same text as for any DENY.
+Declaring a tool `Safety` takes it out of governance entirely, and that trust
+rests with the policy author. The name is not bound to a server: a tool
+called `safety:halt` on any wrapped server matches the entry. The stderr
+line written for such a call is a diagnostic, not evidence.
+If `policy.json` cannot be read, every call is refused, `safety:*` included
+(see `docs/threat-model.md`).
+
 Manage rules with `praetore-mcp policy` instead of editing JSON by hand:
 
 ```sh
@@ -452,8 +481,11 @@ Things to know:
   Allowed calls in a refused batch still have ALLOW receipts, because a
   receipt records the decision, not execution. A batch with nothing blocked is
   forwarded byte-for-byte; elements are never re-serialized. Nested arrays
-  inside a batch are treated as ambiguous (see below).
-* Blocked reply: `{"jsonrpc":"2.0","id":ID,"result":{"content":[{"type":"text","text":"Denied by PRÆTORE policy. Rule: ... Evidence id: ..."}],"isError":true}}`.
+  inside a batch are treated as ambiguous (see below). This also applies to
+  a declared Safety call (G7): in a batch with a blocked call it is not
+  forwarded either. Do not batch safety calls; send each one on its own
+  line.
+* Blocked reply: `{"jsonrpc":"2.0","id":ID,"result":{"content":[{"type":"text","text":"Denied by PRÆTORE. Evidence id: ..."}],"isError":true}}`. The text is the same for every DENY, whatever decided it (a rule, an engine guard, or an action type the policy does not declare); the rule and reason are written to stderr and to the signed receipt.
 * Client lines are parsed strictly. **Duplicate object keys** (for example two
   `method` members), invalid UTF-8 and invalid JSON are unparseable. Such a
   line could hide a `tools/call` from the proxy while the server still reads
@@ -490,7 +522,11 @@ Things to know:
   (`praetore-mcp init`, `praetore-mcp policy check`) and restart the client.
 * Errors while evaluating one call after a successful start (clock, replay
   guard): **enforce refuses the call (fail closed); observe forwards it with
-  a loud stderr warning and no receipt.** If a receipt cannot be written,
+  a loud stderr warning and no receipt.** Exceptions (G7): an unclassified
+  action type and any `safety*` tool name that is not exactly a declared
+  Safety action are refused in observe as well, even when the name would
+  fail validation or the line is ambiguous. Unparseable lines are still
+  forwarded unchanged in observe. If a receipt cannot be written,
   enforce refuses the call; observe forwards it and warns.
 
 ## Trust model

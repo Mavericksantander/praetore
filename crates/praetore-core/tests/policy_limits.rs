@@ -18,7 +18,7 @@ fn rule() -> PolicyRule {
 }
 
 fn one(rule: PolicyRule) -> Policy {
-    Policy::new("p", 1, vec![rule])
+    mission_policy(Policy::new("p", 1, vec![rule]))
 }
 
 fn assert_ok(policy: &Policy) {
@@ -50,7 +50,11 @@ fn assert_limit(policy: &Policy, expected: PolicyLimit) {
     let agent = AgentKeyPair::from_secret_bytes(&[5; 32]).identity(AgentId::new());
     let authority = Authority::new(agent.id.clone(), "i", vec![]);
     let action = Action::new("a", None, json!({})).unwrap();
-    assert!(policy.evaluate(&agent, &authority, &action).is_err());
+    assert!(
+        policy
+            .evaluate(&agent, &authority, &mission((action).clone()))
+            .is_err()
+    );
 }
 
 fn edge(build: impl Fn(usize) -> Policy, max: usize, limit: PolicyLimit) {
@@ -61,24 +65,25 @@ fn edge(build: impl Fn(usize) -> Policy, max: usize, limit: PolicyLimit) {
 #[test]
 fn policy_id_bytes() {
     edge(
-        |n| Policy::new("p".repeat(n), 1, vec![rule()]),
+        |n| mission_policy(Policy::new("p".repeat(n), 1, vec![rule()])),
         MAX_POLICY_TEXT_BYTES,
         PolicyLimit::PolicyIdBytes,
     );
 }
 
 fn minimal_rules(n: usize) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "p",
         1,
         (0..n)
             .map(|i| PolicyRule::new(format!("r{i}"), "a", PolicyEffect::Allow))
             .collect(),
-    )
+    ))
 }
 
 /// Largest number of minimal rules (ids `r0`, `r1`, ...) that fits in
-/// 64 KiB of canonical JSON: 468 (65 464 bytes; 469 rules need 65 604).
+/// 64 KiB of canonical JSON: 468 (65 516 bytes in policy format 2, with
+/// `format_version` and a one-entry `action_classes`; 469 rules need 65 656).
 const MAX_MINIMAL_RULES_THAT_FIT: usize = 468;
 
 #[test]
@@ -88,7 +93,7 @@ fn rules_per_policy() {
         serde_json::to_string(&minimal_rules(MAX_MINIMAL_RULES_THAT_FIT))
             .unwrap()
             .len(),
-        65_464
+        65_516
     );
     assert_ok(&minimal_rules(MAX_MINIMAL_RULES_THAT_FIT));
     for n in [MAX_MINIMAL_RULES_THAT_FIT + 1, MAX_POLICY_RULES] {
@@ -294,9 +299,37 @@ fn canonical_policy_bytes() {
 
 #[test]
 fn limit_errors_keep_the_stable_policy_code() {
-    let error = Policy::new("p".repeat(MAX_POLICY_TEXT_BYTES + 1), 1, vec![rule()])
-        .validate()
-        .unwrap_err();
+    let error = mission_policy(Policy::new(
+        "p".repeat(MAX_POLICY_TEXT_BYTES + 1),
+        1,
+        vec![rule()],
+    ))
+    .validate()
+    .unwrap_err();
     assert_eq!(error.code(), "POLICY_EVALUATION_FAIL");
     assert!(error.to_string().contains("policy id bytes"));
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

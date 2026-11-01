@@ -25,6 +25,32 @@ agente haga por otro camino queda fuera (ver Límites).
 - `Deny` → la tool call se bloquea. `RequireApproval` → Claude Code le
   pregunta al usuario. `Allow` → el hook no decide y siguen aplicando los
   permisos propios de Claude Code.
+- G7: antes de leer claves o perfiles, firmar o evaluar, el hook clasifica
+  la tool call con `action_classes` de la policy (formato 2). Una tool cuyo
+  nombre empieza con `safety:` y que la policy declara `Safety` no recibe
+  decisión de PRÆTORE (siguen aplicando los permisos propios de Claude Code),
+  no se firma nada y no se agrega nada a `receipts.jsonl`; el hook escribe
+  `SAFETY_ACTION_NOT_GOVERNED` en stderr. Así, un fallo de PRÆTORE después de
+  cargar la policy (por ejemplo, `receipts.jsonl` sin escritura) no la
+  retiene. Una tool `safety:*` no declarada se niega con un DENY firmado
+  (motivo `unclassified`, guard `unclassified_action`) que se agrega a
+  `receipts.jsonl`; el motor verifica la solicitud igual que una de misión y
+  no evalúa reglas. Todo DENY con recibo se muestra con el mismo texto,
+  `PRÆTORE denied this tool call (evidence ...)`; la regla y el motivo van a
+  stderr y al recibo firmado. La policy por defecto declara `Mission`
+  los tipos `claude:*` y ninguna acción `Safety`.
+- **Migrar la policy antes de actualizar el binario.** Un estado creado
+  antes de G7 tiene una policy de formato 1; con el binario nuevo esa policy
+  no carga y el hook niega todas las tool calls, incluidas las `safety:*`,
+  hasta migrarla (`praetore policy classify --policy <estado>/policy.json`
+  propone la tabla) o hacer un `init` nuevo. El mensaje de error del hook
+  indica ese paso.
+- Declarar una tool `Safety` la saca por completo del gobierno de PRÆTORE;
+  esa confianza recae en quien escribe la policy.
+- Los recibos ya escritos con una policy de formato 1 (estado creado antes
+  de G7) siguen verificando contra esa policy: `verify` y `praetore-verify
+  --policy` la leen como `RecordedPolicy`, que solo calcula el digest. Para
+  evaluar hace falta un `init` nuevo (policy de formato 2).
 
 | Perfil | Capacidades |
 | --- | --- |

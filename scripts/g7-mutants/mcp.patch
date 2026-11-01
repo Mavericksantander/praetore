@@ -1,0 +1,49 @@
+diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
+index fb4f619..3aced84 100644
+--- a/crates/praetore-core/src/action.rs
++++ b/crates/praetore-core/src/action.rs
+@@ -300,6 +300,12 @@ impl MissionAction {
+     pub fn into_action(self) -> Action {
+         self.0
+     }
++
++    /// G7 MUTANT (scripts/g7-mutation-test.sh only): wraps any action
++    /// without classifying it, as the code did before G7.
++    pub fn mutant_unclassified(action: Action) -> Self {
++        Self(action)
++    }
+ }
+ 
+ impl SafetyAction {
+diff --git a/crates/praetore-mcp/src/gate.rs b/crates/praetore-mcp/src/gate.rs
+index 4027642..98ac5d0 100644
+--- a/crates/praetore-mcp/src/gate.rs
++++ b/crates/praetore-mcp/src/gate.rs
+@@ -1085,11 +1085,8 @@ impl Gate {
+         // G7: classify first. A declared Safety call stops here with no
+         // evaluation and no receipt; an unclassified one is refused by the
+         // engine with a signed DENY, without evaluating any rule.
+-        let unclassified = match self.classify_call(server, params) {
+-            Ok(()) => false,
+-            Err(GateError::UnclassifiedAction { .. }) => true,
+-            Err(error) => return Err(error),
+-        };
++        // G7 MUTANT: the classify call is removed.
++        let unclassified = false;
+         let action_type = if unclassified {
+             unclassified_action_type(server, params)
+         } else {
+@@ -1126,12 +1123,7 @@ impl Gate {
+             )?;
+             return self.engine.refuse_unclassified(request).map_err(failed);
+         }
+-        let action = self
+-            .engine
+-            .policy()
+-            .classify(action)
+-            .and_then(ClassifiedAction::into_mission)
+-            .map_err(failed)?;
++        let action = praetore_core::MissionAction::mutant_unclassified(action);
+         let request = self.signed(
+             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
+                 .map_err(failed)?,

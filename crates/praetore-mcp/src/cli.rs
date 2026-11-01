@@ -638,6 +638,16 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             match praetore_core::Policy::from_json(&text).and_then(|p| p.digest().map(|d| (p, d))) {
                 Err(error) => {
                     println!("INVALID {}: {error}", path.display());
+                    if matches!(
+                        error,
+                        praetore_core::PraetoreError::PolicyFormatUnsupported { found: 1, .. }
+                    ) {
+                        println!(
+                            "hint: policy format 1 was written before G7, and until it is migrated every tool call is refused. Add \"format_version\": 2 and \"action_classes\": {{\"{}\": \"Mission\"}}, or run `praetore policy classify --policy {}` to propose the table (see docs/policy-language.md); the digest changes, so receipts already written keep verifying only against the old document.",
+                            crate::store::ACTION_TYPE,
+                            path.display()
+                        );
+                    }
                     1
                 }
                 Ok((parsed_policy, digest)) => {

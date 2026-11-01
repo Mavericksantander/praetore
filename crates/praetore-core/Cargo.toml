@@ -25,6 +25,15 @@ thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 
+[features]
+# Test-only counters of engine and policy evaluations (G7 runtime tests).
+# Off by default; workspace crates enable it only from [dev-dependencies],
+# so it is absent from release builds. It counts calls and changes nothing.
+# Note: one cargo invocation that builds binaries and tests together (for
+# example `cargo build --workspace --all-targets`) unifies dev-dependency
+# features into those binaries; build release binaries on their own
+# (`cargo build --release -p <package>`).
+test-probe = []
 
 [dev-dependencies]
 proptest = "1"

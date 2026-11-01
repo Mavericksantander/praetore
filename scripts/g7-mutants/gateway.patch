@@ -1,0 +1,60 @@
+diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
+index fb4f619..3aced84 100644
+--- a/crates/praetore-core/src/action.rs
++++ b/crates/praetore-core/src/action.rs
+@@ -300,6 +300,12 @@ impl MissionAction {
+     pub fn into_action(self) -> Action {
+         self.0
+     }
++
++    /// G7 MUTANT (scripts/g7-mutation-test.sh only): wraps any action
++    /// without classifying it, as the code did before G7.
++    pub fn mutant_unclassified(action: Action) -> Self {
++        Self(action)
++    }
+ }
+ 
+ impl SafetyAction {
+diff --git a/crates/praetore-core/src/authorization.rs b/crates/praetore-core/src/authorization.rs
+index 20cf4d7..4c0cac6 100644
+--- a/crates/praetore-core/src/authorization.rs
++++ b/crates/praetore-core/src/authorization.rs
+@@ -170,19 +170,11 @@ impl AuthorizationRequest {
+     /// so the caller can have the engine refuse it with a signed DENY. A
+     /// `Safety` action still returns `SafetyActionNotGoverned`.
+     pub fn classify_json(json: &str, policy: &Policy) -> Result<ClassifiedRequest> {
++        // G7 MUTANT: the classify call is removed.
++        let _ = policy;
+         let document = parse_document(json)?;
+-        match policy.classify(document.action.clone()) {
+-            Ok(classified) => Ok(ClassifiedRequest::Mission(
+-                document.into_request(classified.into_mission()?)?,
+-            )),
+-            Err(crate::PraetoreError::UnclassifiedAction { .. }) => {
+-                let action = policy.unclassified(document.action.clone())?;
+-                Ok(ClassifiedRequest::Unclassified(
+-                    document.into_request(action)?,
+-                ))
+-            }
+-            Err(error) => Err(error),
+-        }
++        let action = MissionAction::mutant_unclassified(document.action.clone());
++        Ok(ClassifiedRequest::Mission(document.into_request(action)?))
+     }
+ }
+ 
+diff --git a/crates/praetore-gateway/src/http_api.rs b/crates/praetore-gateway/src/http_api.rs
+index d4f0a90..7754684 100644
+--- a/crates/praetore-gateway/src/http_api.rs
++++ b/crates/praetore-gateway/src/http_api.rs
+@@ -518,7 +518,9 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
+     // Every such action type gets the same 422, declared Safety or not, with
+     // no engine, journal or signing work, so the answer depends only on the
+     // public prefix rule and cannot be used to enumerate `action_classes`.
+-    if let Some(claimed) = reserved_safety_action(json) {
++    // G7 MUTANT: the reserved-prefix check is removed.
++    let _ = reserved_safety_action;
++    if let Some(claimed) = None::<ReservedSafetyAction> {
+         let declared = state
+             .gateway
+             .policy()

@@ -882,10 +882,11 @@ fn fixture_with_replay(
             ]
         })
         .unwrap_or_default();
-    let policy = Policy::new_v2("local-gateway-test", 1, rules);
+    let policy = mission_policy(Policy::new_v2("local-gateway-test", 1, rules))
+        .with_mission_actions(["local:set_value"]);
     let clock = FixedClock::try_new(NOW).unwrap();
     let now = clock.now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     let (issued_at, expires_at) = if expired {
         (now - Duration::minutes(2), now - Duration::seconds(1))
     } else {
@@ -1076,7 +1077,7 @@ fn approval_fixture_full(
     )
     .unwrap()
     .with_capability("local:write");
-    let mut policy = Policy::new_v2(
+    let mut policy = mission_policy(Policy::new_v2(
         "human-approval-test",
         1,
         vec![
@@ -1087,13 +1088,13 @@ fn approval_fixture_full(
             )
             .with_capability("local:write"),
         ],
-    );
+    ));
     edit(&mut policy);
     // Fixed base inside long_validity(); never host time.
     let now = FixedClock::try_new(NOW).unwrap().now();
     let clock = Arc::new(Mutex::new(now));
     let policy_digest = policy.digest().unwrap();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request
         .sign_intent_v2(
             &agent_key,
@@ -1575,16 +1576,16 @@ async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
     )
     .unwrap()
     .with_capability("demo:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "local-demo",
         1,
         vec![
             PolicyRule::new("allow-demo-write", "demo:set_value", PolicyEffect::Allow)
                 .with_capability("demo:write"),
         ],
-    );
+    ));
     let now = FixedClock::try_new(NOW).unwrap().now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request
         .sign_intent_v2(
             &agent_key,
@@ -1785,17 +1786,17 @@ fn gateway_does_not_dispatch_when_freshness_expires_after_journal_claim() {
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "dispatch-freshness-test",
         1,
         vec![
             PolicyRule::new("allow-local-set", "local:set_value", PolicyEffect::Allow)
                 .with_capability("local:write"),
         ],
-    );
+    ));
     let initial_time = FixedClock::try_new(NOW).unwrap().now();
     let clock = Arc::new(Mutex::new(initial_time));
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request
         .sign_intent_v2(
             &agent_key,
@@ -1858,7 +1859,9 @@ fn gateway_does_not_dispatch_when_freshness_expires_after_journal_claim() {
 fn changing_signed_action_parameters_before_authorization_fails_closed() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     let mut modified = fixture.request;
-    modified.action.parameters["value"] = json!("privileged");
+    let mut action = modified.action.action().clone();
+    action.parameters["value"] = json!("privileged");
+    modified.action = mission(action);
 
     assert!(matches!(
         fixture.gateway.execute(modified),
@@ -1881,7 +1884,11 @@ fn gateway_uses_atomic_commit_instead_of_standalone_replay_guard() {
 
 #[test]
 fn development_engine_cannot_construct_gateway() {
-    let engine = AuthorizationEngine::development(Policy::new_v2("development-only", 1, vec![]));
+    let engine = AuthorizationEngine::development(mission_policy(Policy::new_v2(
+        "development-only",
+        1,
+        vec![],
+    )));
     assert_eq!(engine.mode(), EvaluationMode::Development);
     assert!(matches!(
         Gateway::new(
@@ -3799,7 +3806,9 @@ fn execution_key_of(receipt_agent: &Uuid, request_id: Uuid) -> ExecutionKey {
 fn second_pending_request(template: &AuthorizationRequest, value: &str) -> AuthorizationRequest {
     let mut request = template.clone();
     request.request_id = Uuid::new_v4();
-    request.action.parameters = json!({"key": "mode", "value": value});
+    let mut action = request.action.action().clone();
+    action.parameters = json!({"key": "mode", "value": value});
+    request.action = mission(action);
     let intent = request
         .intent_v2
         .clone()
@@ -4501,4 +4510,287 @@ fn transient_refusal_at_claim_keeps_the_approval_pending_dispatch() {
     let receipt = gateway.dispatch_approved(key).unwrap();
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     assert_eq!(tool.invocations(), 1);
+}
+
+/// G7: a gateway whose policy (own id, for the per-policy probe counters)
+/// denies `local:set_value`, declares `safety:halt` Safety and nothing else.
+struct G7Fixture {
+    gateway: Arc<Gateway>,
+    journal: Arc<MemoryJournal>,
+    tool: Arc<LocalSetTool>,
+    policy: Policy,
+    issuer_key: AgentKeyPair,
+    attester: EvidenceAttesterKey,
+}
+
+fn g7_fixture(policy_id: &str) -> G7Fixture {
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[12; 32]);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[13; 32]);
+    let mut policy = Policy::new_v2(
+        policy_id,
+        1,
+        vec![PolicyRule::new(
+            "deny-set",
+            "local:set_value",
+            PolicyEffect::Deny,
+        )],
+    )
+    .with_mission_actions(["local:set_value"])
+    .with_action_class("safety:halt", praetore_core::ActionClass::Safety);
+    policy.id = policy_id.into();
+    let engine = production_engine(
+        policy.clone(),
+        issuer_key.public_key(),
+        attester.clone(),
+        Arc::new(MemoryReplayGuard::default()),
+    );
+    let journal = Arc::new(MemoryJournal::default());
+    let tool = Arc::new(LocalSetTool::default());
+    let gateway =
+        Gateway::new(engine, journal.clone(), tool.clone(), execution_attester()).unwrap();
+    G7Fixture {
+        gateway: Arc::new(gateway),
+        journal,
+        tool,
+        policy,
+        issuer_key,
+        attester,
+    }
+}
+
+/// A signed v2 request for `action_type`, classified as the gateway would:
+/// mission or unclassified. Returns its JSON body and its execution key.
+fn g7_request(fixture: &G7Fixture, action_type: &str) -> (Value, ExecutionKey) {
+    let agent_key = AgentKeyPair::from_secret_bytes(&[11; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "local-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    authority
+        .sign_for_agent(&fixture.issuer_key, &agent)
+        .unwrap();
+    let action = Action::new(
+        action_type,
+        Some("local-state".into()),
+        json!({"key": "mode", "value": "x"}),
+    )
+    .unwrap()
+    .with_capability("local:write");
+    let now = FixedClock::try_new(NOW).unwrap().now();
+    let window = (now - Duration::seconds(1), now + Duration::minutes(1));
+    let digest = fixture.policy.digest().unwrap();
+    let body = match fixture.policy.classify(action.clone()) {
+        Ok(classified) => {
+            let mut request =
+                AuthorizationRequest::new(agent, authority, classified.into_mission().unwrap())
+                    .unwrap();
+            request
+                .sign_intent_v2(&agent_key, "local-test-gateway", window.0, window.1, digest)
+                .unwrap();
+            serde_json::to_value(&request).unwrap()
+        }
+        Err(PraetoreError::UnclassifiedAction { .. }) => {
+            let mut request = AuthorizationRequest::new_unclassified(
+                agent,
+                authority,
+                fixture.policy.unclassified(action).unwrap(),
+            )
+            .unwrap();
+            request
+                .sign_intent_v2(&agent_key, "local-test-gateway", window.0, window.1, digest)
+                .unwrap();
+            serde_json::to_value(&request).unwrap()
+        }
+        Err(error) => panic!("{error}"),
+    };
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: serde_json::from_value(body["agent"]["id"].clone()).unwrap(),
+        request_id: serde_json::from_value(body["request_id"].clone()).unwrap(),
+    };
+    (body, key)
+}
+
+async fn g7_post(fixture: &G7Fixture, body: &Value) -> (StatusCode, Value) {
+    let app = http_api::router(
+        fixture.gateway.clone(),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
+    let response = app.oneshot(http_request(body.to_string())).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), 65_536).await.unwrap();
+    (status, serde_json::from_slice(&bytes).unwrap())
+}
+
+/// G7: an undeclared action type leaves a signed DENY in the journal, with
+/// the reason `unclassified` and the engine guard `unclassified_action`,
+/// committed with its replay claim like a policy DENY. Policy rules are not
+/// evaluated (probe), nothing is dispatched, and a resubmission is a replay.
+#[tokio::test]
+async fn g7_undeclared_action_leaves_a_signed_unclassified_deny() {
+    let policy_id = "g7-enforcement-unclassified";
+    let fixture = g7_fixture(policy_id);
+    let (body, key) = g7_request(&fixture, "local:delete_all");
+
+    let (status, response) = g7_post(&fixture, &body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(response["code"], "authorization_denied");
+    assert_eq!(praetore_core::probe::policy_evaluations(policy_id), 0);
+    assert_eq!(praetore_core::probe::engine_calls(policy_id), 1);
+    let entry = fixture.journal.entry(key).expect("the DENY is journaled");
+    assert_eq!(entry.authorization, AuthorizationStatus::Denied);
+    assert_eq!(entry.execution, ExecutionStatus::NotDispatched);
+    let evidence = entry.evidence;
+    assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+    assert_eq!(
+        evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
+    assert_eq!(
+        evidence.decision.decided_by(),
+        Some(&praetore_core::DecidedBy::engine_guard(
+            praetore_core::UNCLASSIFIED_ACTION_GUARD
+        ))
+    );
+    assert!(evidence.decision.contributions.is_empty());
+    assert_eq!(evidence.action.action_type, "local:delete_all");
+    evidence
+        .verify_attester_signature(&fixture.attester.public_key().unwrap())
+        .unwrap();
+    evidence.verify_agent_intent().unwrap();
+    assert!(
+        entry.execution_attestation.is_some(),
+        "not_dispatched attestation"
+    );
+    assert_eq!(fixture.tool.invocations(), 0);
+
+    // The same signed request again is a replay, as for any decision.
+    let (status, response) = g7_post(&fixture, &body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+}
+
+/// G7: the client cannot tell an undeclared action from a policy DENY: same
+/// status and byte-identical body apart from the ids.
+#[tokio::test]
+async fn g7_unclassified_and_policy_denied_responses_are_identical() {
+    let fixture = g7_fixture("g7-enforcement-uniform");
+    let (undeclared, _) = g7_request(&fixture, "local:delete_all");
+    let (denied, _) = g7_request(&fixture, "local:set_value");
+
+    let (undeclared_status, mut undeclared_body) = g7_post(&fixture, &undeclared).await;
+    let (denied_status, mut denied_body) = g7_post(&fixture, &denied).await;
+
+    assert_eq!(undeclared_status, denied_status);
+    assert_eq!(undeclared_status, StatusCode::FORBIDDEN);
+    for body in [&mut undeclared_body, &mut denied_body] {
+        let object = body.as_object_mut().unwrap();
+        assert!(object.remove("evidence_id").is_some());
+        assert!(object.remove("request_id").is_some());
+    }
+    assert_eq!(
+        serde_json::to_vec(&undeclared_body).unwrap(),
+        serde_json::to_vec(&denied_body).unwrap()
+    );
+    assert_eq!(undeclared_body["code"], "authorization_denied");
+    // The receipts keep the real reasons.
+    assert_eq!(fixture.journal.entries.lock().unwrap().len(), 2);
+}
+
+/// G7: a forged or unauthenticated unclassified request leaves no signed
+/// receipt: it fails the same verification as a mission request.
+#[tokio::test]
+async fn g7_forged_or_unauthenticated_unclassified_request_leaves_no_receipt() {
+    let policy_id = "g7-enforcement-forged";
+    let fixture = g7_fixture(policy_id);
+
+    // The intent signature no longer covers the context.
+    let (mut forged, key) = g7_request(&fixture, "local:delete_all");
+    forged["context"]["injected"] = json!(true);
+    let (status, _) = g7_post(&fixture, &forged).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(fixture.journal.entry(key).is_none());
+
+    // An authority signed by an issuer the gateway does not pin, for a
+    // request signed by the agent itself.
+    let rogue = AgentKeyPair::from_secret_bytes(&[99; 32]);
+    let agent_key = AgentKeyPair::from_secret_bytes(&[11; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "local-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    authority.sign_for_agent(&rogue, &agent).unwrap();
+    let action = fixture
+        .policy
+        .unclassified(
+            Action::new("local:delete_all", Some("local-state".into()), json!({}))
+                .unwrap()
+                .with_capability("local:write"),
+        )
+        .unwrap();
+    let mut request = AuthorizationRequest::new_unclassified(agent, authority, action).unwrap();
+    let now = FixedClock::try_new(NOW).unwrap().now();
+    request
+        .sign_intent_v2(
+            &agent_key,
+            "local-test-gateway",
+            now - Duration::seconds(1),
+            now + Duration::minutes(1),
+            fixture.policy.digest().unwrap(),
+        )
+        .unwrap();
+    let (status, _) = g7_post(&fixture, &serde_json::to_value(&request).unwrap()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    assert!(
+        fixture.journal.entries.lock().unwrap().is_empty(),
+        "no receipt"
+    );
+    assert_eq!(praetore_core::probe::policy_evaluations(policy_id), 0);
+}
+
+/// G7: a declared Safety action still leaves nothing: no receipt, no engine.
+#[tokio::test]
+async fn g7_declared_safety_action_still_leaves_no_receipt() {
+    let policy_id = "g7-enforcement-safety";
+    let fixture = g7_fixture(policy_id);
+    let (mut body, key) = g7_request(&fixture, "local:delete_all");
+    body["action"]["action_type"] = json!("safety:halt");
+    let (status, response) = g7_post(&fixture, &body).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(response["code"], "safety_action_not_governed");
+    assert!(fixture.journal.entry(key).is_none());
+    assert_eq!(praetore_core::probe::engine_calls(policy_id), 0);
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

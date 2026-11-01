@@ -1267,6 +1267,7 @@ dependencies = [
 name = "praetore-replay-postgres"
 version = "0.3.1"
 dependencies = [
+ "axum",
  "ed25519-dalek",
  "hex",
  "postgres",
@@ -1278,6 +1279,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tower",
  "uuid",
 ]
 

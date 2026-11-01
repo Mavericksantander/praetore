@@ -103,6 +103,87 @@ Trust boundaries are explicit:
 | Policy binding | HighAssurance rejects a policy or signed intent whose v2 canonical digest differs from the configured pin | Pin provisioning and anti-rollback storage remain outside the library |
 | Tool enforcement | No guarantee from the library; the caller must place an unavoidable gateway before each protected side effect | Bypass prevention, action-to-effect fidelity, and crash reconciliation belong to the deployment |
 
+### Mission and safety actions (G7): limits
+
+* Classification needs a readable, valid policy. If `policy.json` cannot be
+  read or parsed (missing, not a regular file, invalid JSON, format 1), the
+  Claude Code hook and the `praetore-mcp` gate cannot classify any tool call
+  and refuse all of them, `safety:*` included (fail closed). `praetore-mcp`
+  does the same when the rest of its home cannot be loaded: missing or
+  mismatched agent or attester keys, issuer pins or authority. This is
+  intentional and is not changed by G7.
+* In `praetore-mcp` a JSON-RPC batch is all or nothing in enforce: a
+  declared Safety call in a batch with a blocked call is not forwarded.
+  Safety calls should not be batched.
+* A safety failsafe of an AI-enabled system therefore must not depend on
+  PRÆTORE. It runs outside PRÆTORE's decision loop and must not rely on the
+  hook, the gate or the gateway being available. Routing a safety action
+  through PRÆTORE gives an immediate `SAFETY_ACTION_NOT_GOVERNED` answer only
+  while the policy is loaded; it is not a substitute for the executor's own
+  path.
+* With a loaded policy, a declared `Safety` action is answered before any
+  evaluation, replay claim, journal write or signature, so an unavailable
+  journal does not hold it. `praetore-mcp` forwards it to the wrapped server
+  without a receipt in both modes. PRÆTORE keeps no record of safety actions
+  until a separate ingestion path exists (SAF-09.5).
+* An undeclared `safety:*` action is refused at every entry point.
+* Upgrades: a release with G7 does not load a policy format 1 document.
+  State written before G7 refuses every tool call after the upgrade until
+  its policy is migrated to format 2, so the policy must be migrated before
+  the binary is upgraded.
+* Declaring an action `Safety` takes it out of governance entirely, and the
+  trust rests with the policy author: PRÆTORE does not check what the action
+  does. A `safety:` name is not bound to an executor; in `praetore-mcp` a
+  tool with that name on any wrapped server is forwarded without a receipt.
+* Before classification, the entry points can still refuse or delay a call
+  for reasons unrelated to the decision path: the hook denies input it
+  cannot read or parse (for example more than 32 MiB or invalid JSON) and
+  parses the whole policy on every call; `praetore-mcp` handles client lines
+  one at a time, so a `safety:*` call waits behind a mission call that is
+  being evaluated, signed and journaled; the gateway authenticates and
+  parses the request first.
+* The diagnostics that the hook and `praetore-mcp` write to stderr for a
+  safety action (`SAFETY_ACTION_NOT_GOVERNED ...`) are not evidence: they
+  are unsigned, and hosts may keep them in their own logs.
+* An undeclared action is refused with a signed DENY (engine guard
+  `unclassified_action`), after the same verification as a mission request,
+  so a forged or unauthenticated request gets no receipt. Every DENY gets
+  the same client-facing answer at the gateway, in `praetore-mcp` and in the
+  hook, so a DENY does not reveal whether an action type is declared or
+  which rule matched. This applies to DENY only: a REQUIRE_APPROVAL answer
+  still carries the receipt (gateway) or names the rule (`praetore-mcp`).
+* Gateway exception for the reserved prefix: `POST /v1/execute` answers
+  every action type that starts with `safety:` with the same 422
+  `safety_action_not_governed`, before any verification, engine, journal or
+  signing work, whether the policy declares it `Safety` or not. An
+  undeclared `safety:*` therefore gets no receipt at the gateway. Every
+  request at this gate, declared or not, writes the same unsigned WARN log
+  line (claimed agent id and action type, bounded and escaped, and
+  `declared=true|false`), so both branches do the same work and operators
+  still see attempts on undeclared names. Only the exact lowercase prefix
+  `safety:` takes this path: `SAFETY:x` or `safety：x` (full-width colon)
+  cannot be declared and go through the unclassified path, which, for an
+  authenticated and verified request, leaves a signed `unclassified` DENY. The reason is that the answer then depends only on the public prefix
+  rule, so an authenticated agent cannot use it to enumerate the Safety part
+  of `action_classes`. `praetore-mcp` and the hook keep the signed
+  `unclassified` DENY for an undeclared `safety:*`; there the Safety part of
+  the table is observable by design (a declared one is forwarded or gets no
+  decision).
+* Known limits: response timing is not uniform. An undeclared action skips
+  rule evaluation. On the reserved-prefix path both branches now log the
+  same line, which reduces the timing difference between a declared and an
+  undeclared `safety:*` but does not eliminate it (the table lookup and the
+  `declared` value still differ). In `praetore-mcp` observe mode a policy
+  DENY is forwarded while an undeclared action is refused.
+* Text meant for people escapes characters that render invisibly or reorder
+  text (zero-width, bidi, control) as `\u{XXXX}`: `praetore-verify
+  --format text`, `praetore-mcp` tables and stderr lines, the hook's stderr
+  lines, and the gateway's WARN line. Receipts, JSONL exports and JSON output keep the exact bytes.
+  `praetore journal-export` writes JSONL and a JSON summary only, so it has
+  no text rendering of action types. Audits should select unclassified
+  refusals by `decided_by` (`engine_guard` / `unclassified_action`), not by
+  the action type.
+
 ## Invariants and traceability
 
 | Invariant / requirement | Enforcing code | Test coverage | Threat |

@@ -119,9 +119,10 @@ def main():
           json.dumps(responses.get(2)))
     denied = responses.get(3, {}).get("result", {})
     denied_text = json.dumps(denied.get("content", []), ensure_ascii=False)
-    check("write_file is refused with the rule",
-          denied.get("isError") is True and "Denied by PRÆTORE policy" in denied_text
-          and "deny-write" in denied_text, json.dumps(responses.get(3)))
+    # The client text is the same for every DENY; the rule is in the receipt.
+    check("write_file is refused",
+          denied.get("isError") is True and "Denied by PRÆTORE" in denied_text
+          and "deny-write" not in denied_text, json.dumps(responses.get(3)))
     check("b.txt was not created", not os.path.exists(os.path.join(root, "b.txt")))
 
     receipts = run(binary, "receipts", "--dir", home)

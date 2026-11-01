@@ -35,6 +35,8 @@ zeroize = "1"
 libc = "0.2.189"
 
 [dev-dependencies]
+# G7 runtime tests count engine calls with the test-only probe.
+praetore-core = { path = "../praetore-core", features = ["test-probe"] }
 tempfile = "3"
 
 [[example]]

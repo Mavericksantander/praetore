@@ -118,14 +118,14 @@ impl Fixture {
         let action = Action::new("read_data", Some("db".into()), json!({"table": "users"}))
             .unwrap()
             .with_capability("data:read");
-        let policy = Policy::new_v2(
+        let policy = mission_policy(Policy::new_v2(
             "decision-time-test",
             1,
             vec![
                 PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
                     .with_capability("data:read"),
             ],
-        );
+        ));
         let issuer_pin = TrustedAuthorityIssuer::new("test-issuer", issuer_key.public_key())
             .unwrap()
             .with_validity(Validity {
@@ -134,7 +134,7 @@ impl Fixture {
             })
             .unwrap();
         let policy_digest = policy.digest().unwrap();
-        let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
         request
             .sign_intent_v2(
                 &agent_key,
@@ -344,4 +344,28 @@ fn high_assurance_receipt_passes_with_require_decision_time() {
         "{text}"
     );
     assert_eq!(text.matches("authority_checked_at_source=").count(), 1);
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

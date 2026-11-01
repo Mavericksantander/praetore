@@ -197,7 +197,8 @@ pub fn init(home: &Home) -> Result<InitOutcome, String> {
     Ok(InitOutcome::Created)
 }
 
-/// The default v2 policy: one ALLOW rule for every `tools/call`, gated on the
+/// The default policy (format 2, semantics v2): one ALLOW rule for every
+/// `tools/call`, with `mcp.tools/call` declared Mission, gated on the
 /// explicit `mcp:tools/call` capability. Users add DENY / REQUIRE_APPROVAL
 /// rules keyed on `server`, `tool`, `arguments` and `arguments.<key>`.
 pub fn default_policy() -> Policy {
@@ -209,6 +210,9 @@ pub fn default_policy() -> Policy {
                 .with_capability(CAPABILITY),
         ],
     )
+    // G7: every MCP `tools/call` is a mission action. A tool named
+    // `safety:...` is a safety action only if the policy declares it Safety.
+    .with_mission_actions([ACTION_TYPE])
 }
 
 fn to_pretty<T: Serialize>(value: &T) -> Result<String, String> {
@@ -379,8 +383,16 @@ pub fn read_issuer_pins(path: &Path) -> Result<Vec<TrustedAuthorityIssuer>, Stri
 }
 
 pub fn load_policy(home: &Home) -> Result<Policy, String> {
-    Policy::from_json(&read(&home.policy())?)
-        .map_err(|e| format!("{}: invalid policy: {e}", home.policy().display()))
+    Policy::from_json(&read(&home.policy())?).map_err(|e| {
+        let hint = match e {
+            praetore_core::PraetoreError::PolicyFormatUnsupported { found: 1, .. } => format!(
+                " (policy format 1, written before G7: add \"format_version\": 2 and \"action_classes\": {{\"{ACTION_TYPE}\": \"Mission\"}}, or run `praetore policy classify --policy {}` to propose the table)",
+                home.policy().display()
+            ),
+            _ => String::new(),
+        };
+        format!("{}: invalid policy: {e}{hint}", home.policy().display())
+    })
 }
 
 pub fn load(home: &Home) -> Result<LoadedHome, String> {
