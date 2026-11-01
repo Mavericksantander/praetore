@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- Policy loading reports size, depth, node, integer, duplicate-key,
+  malformed-JSON and unknown-field rejections with typed errors
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)); wrong
+  types, missing fields and unknown enum variants are still
+  `PolicyEvaluationFailed(String)`. The error
+  code of all of them stays `POLICY_EVALUATION_FAIL`, so `praetore-verify`,
+  the CLI, the gateway and `praetore-mcp` report the same codes as before.
+  Receipts and policy digests are unchanged.
+  - New `praetore_core::canonical::JsonError` and `parse_json_strict`: the
+    strict parser, `validate_json_value` and the canonical encoder return
+    a typed reason (input size, malformed with line and column, duplicate
+    key, value size, depth, node count, unsafe integer, canonical size).
+    `parse_json_rejecting_duplicates` keeps its `String` error and messages.
+    `MAX_JSON_NODES` is now public.
+  - `Policy::validate` maps canonical-size errors to
+    `PolicyLimitExceeded { CanonicalBytes }` from the typed error, without
+    matching the `"exceeds maximum size"` message.
+  - Breaking: new `PolicyLimit` variants `InputBytes` (raw text passed to
+    `Policy::from_json` over 64 KiB), `JsonDepth` and `JsonNodes`. A
+    decoded value over 64 KiB is `CanonicalBytes`. These used to be
+    `PolicyEvaluationFailed(String)`.
+  - Breaking: new `PraetoreError::PolicyDocumentInvalid(PolicyDocumentError)`
+    with `Malformed { line, column }`, `DuplicateKey`,
+    `UnknownField { field }` and `UnsafeInteger`, for policy documents that
+    used to fail with `PolicyEvaluationFailed(String)`. Wrong types, missing
+    fields and unknown enum values are still `PolicyEvaluationFailed`.
+  - Breaking: `MAX_CONDITION_SET_VALUES` (256) now caps the total number of
+    array elements in a condition's expected value, across every array at
+    every depth, not only the top-level `In` set. A flat `In` set of 256
+    values is still accepted; a policy whose expected value holds more than
+    256 array elements in total is now rejected with
+    `PolicyLimitExceeded { limit: ConditionSetValues, max: 256 }`, shown as
+    "policy limit exceeded: array elements in a condition's expected value
+    (total across all nested arrays) (maximum 256)".
+  - **Limit:** at most 256 array elements per condition, counted as one total
+    over every array in its expected value (the `expected` array itself and
+    arrays nested in arrays or objects, at any depth). Elements are counted,
+    not leaves: `[[]]` counts 1, `[[0]]` counts 2; object keys do not count;
+    the cap is per condition, so two conditions of 256 in one rule are
+    accepted. Only `Exact` and `In` can hold such values. No policy in this
+    repository is affected.
+  - Messages for integral floats outside the safe range now say "JSON
+    integer exceeds interoperable safe range".
+
 - A combined decision's signed `reason` now names the same rule as its
   `decided_by`. When a DENY rule matched before a RECOVER rule
   (`[deny d, recover r]`), `decided_by` and the recovery obligation named `r`
