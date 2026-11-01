@@ -230,7 +230,8 @@ jobs:
             "--bin praetore journal_export::tests::postgres_export_reads_only_the_tenant_rows_in_insert_order" \
             "--bin praetore journal_export::tests::postgres_export_as_runtime_role_is_confined_by_row_level_security" \
             "--bin praetore journal_export::tests::postgres_export_orders_by_created_at_then_request_id_then_agent_id" \
-            "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end"; do
+            "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end" \
+            "--bin praetore tests::postgres_find_pending_agent_ignores_hostile_search_path"; do
             read -r flag target name <<<"$test"
             echo "::group::$name"
             output="$(cargo test -p praetore-cli --locked "$flag" "$target" -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
@@ -293,6 +294,7 @@ jobs:
             postgres_migrations_baseline_catalog_flags_fail_closed \
             postgres_migrations_baseline_round2_lows_fail_closed \
             postgres_migrations_unknown_version_refuses_to_start \
+            postgres_runtime_role_accepts_a_harmless_search_path_setting \
             postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered \
             postgres_apd_sigkill_between_approve_and_claim \
             postgres_apd_concurrent_claims_dispatch_exactly_once \

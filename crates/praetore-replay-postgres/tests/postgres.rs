@@ -3616,7 +3616,7 @@ fn postgres_runtime_tenant_context_ignores_hostile_search_path() {
         .expect_err("a runtime session with a hostile search_path must be refused");
     let message = error.to_string();
     assert!(
-        message.contains("search_path=public, pg_catalog"),
+        message.contains("puts public before pg_catalog"),
         "{message}"
     );
     eprintln!("refused as expected: {message}");
@@ -3642,6 +3642,27 @@ fn postgres_runtime_tenant_context_ignores_hostile_search_path() {
         .unwrap()
         .get(0);
     assert_eq!(stored, tenant);
+}
+
+/// A harmless database or role search_path (pg_catalog still searched first)
+/// does not stop the runtime: runtime transactions pin search_path anyway.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_accepts_a_harmless_search_path_setting() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = migrated_with_runtime(&runtime);
+    scratch
+        .connect()
+        .batch_execute(&format!(
+            "ALTER DATABASE {db} SET search_path = \"$user\", public, extensions; \
+             ALTER ROLE {role} IN DATABASE {db} SET search_path = pg_catalog, public",
+            db = scratch.name,
+            role = runtime.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("a search_path with pg_catalog first is accepted");
 }
 
 const OWNER_BACKDOOR: &str = "CREATE FUNCTION public.maintenance(sql text) RETURNS void \

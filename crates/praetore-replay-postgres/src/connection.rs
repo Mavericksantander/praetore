@@ -117,6 +117,16 @@ impl DatabaseConnector {
             }
             other => return Err(DatabaseUrlError::UnsupportedSslMode(other.to_owned())),
         };
+        // Defence in depth: every session starts with the runtime search
+        // path, whatever the database, role or ALTER SYSTEM set. Runtime
+        // transactions also pin it with SET LOCAL (`set_tenant_context`).
+        let options = match config.get_options() {
+            Some(existing) if !existing.trim().is_empty() => {
+                format!("{existing} -c search_path=pg_catalog,pg_temp")
+            }
+            _ => "-c search_path=pg_catalog,pg_temp".to_owned(),
+        };
+        config.options(&options);
         Ok(Self { config, tls })
     }
 
@@ -364,11 +374,10 @@ pub enum RuntimeRoleError {
     /// table, e.g. a leftover `GRANT ALL` or membership in `pg_write_all_data`.
     ExcessTablePrivilege(String),
     /// The session does not fire triggers or enforce foreign keys:
-    /// `session_replication_role` (here the value) is not `origin`, for
-    /// example through `ALTER DATABASE ... SET session_replication_role`.
+    /// `session_replication_role` (here the value) is not `origin`.
     TriggersDisabled(String),
-    /// A setting or parameter grant that disables triggers or row-level
-    /// security, or changes name resolution, for this role or database.
+    /// A setting or parameter grant that could disable triggers or row-level
+    /// security, or a search_path that puts a schema before `pg_catalog`.
     UnsafeSetting(String),
     /// The role may execute a SECURITY DEFINER function that runs with the
     /// rights of the `praetore` schema owner.
@@ -395,6 +404,11 @@ impl fmt::Display for RuntimeRoleError {
                     "runtime database role {role} has CREATE on schema praetore"
                 )
             }
+            Self::TriggersDisabled(value) => write!(
+                f,
+                "runtime session has session_replication_role = {value}; the append-only \
+                 triggers and foreign keys would not fire (it must be origin)"
+            ),
             Self::UnsafeSetting(setting) => write!(
                 f,
                 "runtime database session is exposed to {setting}; the append-only triggers, \
@@ -403,12 +417,7 @@ impl fmt::Display for RuntimeRoleError {
             Self::OwnerFunctionExecutable(function) => write!(
                 f,
                 "runtime database role may execute SECURITY DEFINER function(s) {function} \
-                 owned with the rights of the praetore schema owner"
-            ),
-            Self::TriggersDisabled(value) => write!(
-                f,
-                "runtime session has session_replication_role = {value}; the append-only \
-                 triggers and foreign keys would not fire (it must be origin)"
+                 that run with the rights of the praetore schema owner"
             ),
             Self::ExcessTablePrivilege(role) => write!(
                 f,
@@ -433,12 +442,37 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// relation or function in it (directly or through membership), holder of
 /// CREATE on the schema, CREATEROLE, or holder of a table privilege beyond
 /// `praetore_runtime`'s grants (DELETE, TRUNCATE, table-wide UPDATE, TRIGGER,
-/// REFERENCES) on any `praetore` table; and a session whose
-/// `session_replication_role` is not `origin` (triggers would not fire).
+/// REFERENCES) on any `praetore` table. Also refuses a session in which
+/// triggers do not fire or row-level security could be switched off
+/// (`session_replication_role`, `row_security`: the current value, a
+/// per-database or per-role setting, a non-default session-start value such
+/// as one from `ALTER SYSTEM`, or a parameter grant), and a session
+/// search_path that puts another schema before `pg_catalog`.
+///
+/// The checks run in a read-only transaction under `RUNTIME_SEARCH_PATH`, so
+/// they cannot be shadowed themselves. They run once, when the caller starts
+/// (the gateway and the CLI do this at startup); reconnections of a
+/// connection factory are not checked again. Every runtime transaction pins
+/// its search_path (`set_tenant_context`) regardless.
 pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> {
-    // Read-only and rolled back; `SET LOCAL` pins name resolution so the
-    // checks themselves cannot be shadowed through search_path.
     let mut transaction = client.build_transaction().read_only(true).start()?;
+    // The session's own search_path, before it is pinned below. A harmless
+    // value (pg_catalog implicitly or explicitly first, e.g. "$user", public)
+    // is accepted: runtime transactions pin search_path anyway.
+    let schemas: Vec<String> = transaction
+        .query_one(
+            "SELECT pg_catalog.current_schemas(true)::pg_catalog.text[]",
+            &[],
+        )?
+        .get(0);
+    if let Some(first) = schemas.iter().find(|schema| !schema.starts_with("pg_temp"))
+        && first != "pg_catalog"
+    {
+        return Err(RuntimeRoleError::UnsafeSetting(format!(
+            "search_path that puts {first} before pg_catalog ({})",
+            schemas.join(", ")
+        )));
+    }
     transaction.batch_execute(&format!(
         "SET LOCAL search_path = {}",
         crate::RUNTIME_SEARCH_PATH
@@ -491,7 +525,8 @@ fn verify_runtime_role_in(
                            FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), false), \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
                          JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
-                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' AND c.relkind IN ('r', 'p') \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                           AND (c.relkind OPERATOR(pg_catalog.=) 'r' OR c.relkind OPERATOR(pg_catalog.=) 'p') \
                            AND pg_catalog.has_table_privilege($1, c.oid, \
                                'DELETE, TRUNCATE, UPDATE, TRIGGER, REFERENCES'))",
             &[&role],
@@ -516,8 +551,7 @@ fn verify_runtime_role_in(
 }
 
 /// Settings that would disable the append-only triggers or row-level
-/// security, or change how the runtime's SQL resolves names, for this
-/// session: a `search_path`, `row_security` or `session_replication_role`
+/// security for this session: a `row_security` or `session_replication_role`
 /// set for this database or all databases and for this login role or all
 /// roles (`pg_db_role_setting`); a session-start value of `row_security` or
 /// `session_replication_role` that is not the built-in default (for example
@@ -543,8 +577,7 @@ fn unsafe_runtime_setting(
                     OR rs.setrole OPERATOR(pg_catalog.=) \
                        (SELECT r.oid FROM pg_catalog.pg_roles r \
                         WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)) \
-               AND (pg_catalog.starts_with(s.setting, 'search_path=') \
-                    OR pg_catalog.starts_with(s.setting, 'row_security=') \
+               AND (pg_catalog.starts_with(s.setting, 'row_security=') \
                     OR pg_catalog.starts_with(s.setting, 'session_replication_role='))), \
              ( \
              SELECT pg_catalog.string_agg( \
@@ -572,8 +605,7 @@ fn unsafe_runtime_setting(
                           ELSE pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text END), ', ') \
                  FROM pg_catalog.pg_parameter_acl pa \
                  CROSS JOIN LATERAL pg_catalog.aclexplode(pa.paracl) a \
-                 WHERE (pa.parname OPERATOR(pg_catalog.=) 'search_path' \
-                        OR pa.parname OPERATOR(pg_catalog.=) 'row_security' \
+                 WHERE (pa.parname OPERATOR(pg_catalog.=) 'row_security' \
                         OR pa.parname OPERATOR(pg_catalog.=) 'session_replication_role') \
                    AND (a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
                         OR pg_catalog.pg_has_role(SESSION_USER, a.grantee, 'MEMBER') \

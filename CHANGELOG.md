@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Runtime database sessions no longer depend on search_path. Every runtime
+  transaction (`praetore_replay_postgres::set_tenant_context`, now public
+  and also used by `praetore journal-export` and by `find_pending_agent`
+  behind `praetore approve`/`dispatch`) starts with
+  `SET LOCAL search_path = pg_catalog, pg_temp` and sets the tenant with
+  `pg_catalog.set_config`, so a `public.set_config` or `public.=` picked up
+  through a database, role, `ALTER SYSTEM` or session search_path cannot
+  change the tenant the RLS policies filter by. `DatabaseConnector` also
+  starts every session with `-c search_path=pg_catalog,pg_temp`.
+  `verify_runtime_role` runs its checks in a read-only transaction under
+  that search_path and also refuses: a session search_path that puts
+  another schema before `pg_catalog` (a harmless one such as
+  `"$user", public` is accepted); `session_replication_role` other than
+  `origin` (`RuntimeRoleError::TriggersDisabled`); and
+  (`RuntimeRoleError::UnsafeSetting`) `row_security` or
+  `session_replication_role` set for the database or the login role, a
+  non-default session-start value of either (for example from
+  `ALTER SYSTEM`), or a `GRANT SET`/`ALTER SYSTEM ON PARAMETER` on either to
+  PUBLIC or to a role it belongs to. These checks run once at startup;
+  `praetore-observe` now runs them too and refuses to start on failure.
+  New ignored PostgreSQL tests in CI with `--exact`.
 - The 0009 baseline check in `praetore-replay-postgres` (a `praetore`
   schema without migration records, recorded as 0001-0009 without running
   them) now compares the live schema with 0001-0009 applied by the same
@@ -27,27 +48,14 @@
   catalog names qualified, so a `public.pg_proc` view or a `public.=`
   operator cannot shadow the catalog. It refuses a session with
   `session_replication_role` other than `origin`
-  (`MigrationError::UnsafeSession`), fresh database or not, and
-  `verify_runtime_role` refuses such a runtime session
-  (`RuntimeRoleError::TriggersDisabled`).
+  (`MigrationError::UnsafeSession`), fresh database or not.
 - `crates/praetore-replay-postgres/migrations/.gitattributes` keeps the
   migrations LF (`*.sql text eol=lf`): their bytes are checksummed and
   compared.
-- Runtime connections no longer depend on search_path: every runtime
-  transaction (`set_tenant_context`, now public and also used by
-  `praetore journal-export`) starts with
-  `SET LOCAL search_path = pg_catalog, pg_temp` and sets the tenant with
-  `pg_catalog.set_config`, so a `public.set_config` cannot swap the tenant
-  the RLS policies filter by. `verify_runtime_role` runs its checks under
-  the same search_path and also refuses (`RuntimeRoleError::UnsafeSetting`)
-  a `search_path`, `row_security` or `session_replication_role` set for the
-  database or the login role, a non-default session-start value of
-  `row_security` or `session_replication_role` (for example from
-  `ALTER SYSTEM`), and a `GRANT SET`/`ALTER SYSTEM ON PARAMETER` on those
-  parameters to PUBLIC or to a role it belongs to; and
-  (`RuntimeRoleError::OwnerFunctionExecutable`) any SECURITY DEFINER
-  function outside `pg_catalog`/`information_schema` that runs with the
-  praetore owner's rights and that the runtime role may execute.
+- `verify_runtime_role` also refuses
+  (`RuntimeRoleError::OwnerFunctionExecutable`) a SECURITY DEFINER function
+  outside `pg_catalog`/`information_schema` that runs with the praetore
+  owner's rights and that the runtime role may execute.
 - The baseline check also refuses SECURITY DEFINER functions outside
   `praetore` that run with the owner's rights; any role that can act as the
   owner other than the migrating role and NOLOGIN groups it belongs to (the

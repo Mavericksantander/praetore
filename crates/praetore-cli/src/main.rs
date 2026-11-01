@@ -681,7 +681,7 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for table in REQUIRED_DATABASE_TABLES {
                     let exists: bool = client
-                        .query_one("SELECT to_regclass($1)::text IS NOT NULL", &[&table])?
+                        .query_one("SELECT pg_catalog.to_regclass($1) IS NOT NULL", &[&table])?
                         .get(0);
                     if exists {
                         println!("[ok] database table {table}");
@@ -1272,10 +1272,8 @@ fn find_pending_agent(
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
     let mut client = connect_local_database(database_url)?;
     let mut transaction = client.build_transaction().read_only(true).start()?;
-    transaction.query_one(
-        "SELECT set_config('praetore.tenant_id', $1, true)",
-        &[&tenant_id.to_string()],
-    )?;
+    // Pins search_path for the transaction: `=` below resolves in pg_catalog.
+    praetore_replay_postgres::set_tenant_context(&mut transaction, tenant_id)?;
     let rows = transaction.query(
         "SELECT agent_id FROM praetore.execution_journal \
          WHERE tenant_id = $1 AND request_id = $2 LIMIT 2",
@@ -1803,6 +1801,74 @@ mod tests {
         .unwrap();
         assert!(load_approver_pin(&directory).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// B2: `find_pending_agent` must not return another tenant's row when the
+    /// database search_path makes a `public.=(uuid, uuid)` that is always
+    /// true win over `pg_catalog.=`.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_find_pending_agent_ignores_hostile_search_path() {
+        let base_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        let name = format!("praetore_b2_{}", Uuid::new_v4().simple());
+        let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let (prefix, _) = base_url.rsplit_once('/').unwrap();
+        let url = format!("{prefix}/{name}");
+        let result = std::panic::catch_unwind(|| {
+            apply_migrations(&url).unwrap();
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let other_tenant = Uuid::new_v4();
+            let agent = Uuid::new_v4();
+            let request = Uuid::new_v4();
+            let mut tx = client.transaction().unwrap();
+            tx.query_one(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&other_tenant.to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3)",
+                &[&other_tenant, &agent, &request],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json) \
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'not_dispatched', '{}')",
+                &[&other_tenant, &agent, &request, &"ab".repeat(32)],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            client
+                .batch_execute(&format!(
+                    "CREATE FUNCTION public.uuid_eq_any(uuid, uuid) RETURNS boolean \
+                       LANGUAGE sql IMMUTABLE AS 'SELECT true'; \
+                     CREATE OPERATOR public.= (LEFTARG = uuid, RIGHTARG = uuid, \
+                       PROCEDURE = public.uuid_eq_any); \
+                     ALTER DATABASE {name} SET search_path = public, pg_catalog"
+                ))
+                .unwrap();
+            let my_tenant = Uuid::new_v4();
+            let found = find_pending_agent(&url, my_tenant, request);
+            assert!(
+                found.is_err(),
+                "another tenant's agent was returned: {:?}",
+                found.ok()
+            );
+            eprintln!(
+                "not found for this tenant, as expected: {}",
+                found.unwrap_err()
+            );
+        });
+        let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// Real PostgreSQL end-to-end test of the approval flow through the same
