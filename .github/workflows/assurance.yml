@@ -270,7 +270,7 @@ jobs:
             postgres_migrations_baseline_partial_schema_fails_closed \
             postgres_migrations_unknown_version_refuses_to_start \
             postgres_runtime_tenant_context_ignores_hostile_search_path \
-            postgres_runtime_role_accepts_a_harmless_search_path_setting \
+            postgres_runtime_role_refuses_a_search_path_setting_unless_allowed \
             postgres_runtime_role_refuses_session_replication_role_replica \
             postgres_runtime_role_refuses_parameter_grants \
             postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered \

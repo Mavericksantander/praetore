@@ -9,7 +9,8 @@ mod migrations;
 mod observability;
 
 pub use connection::{
-    DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RustlsConnect, verify_runtime_role,
+    DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RuntimeRoleOptions, RustlsConnect,
+    verify_runtime_role, verify_runtime_role_with,
 };
 pub use execution::PostgresExecutionJournal;
 pub use migrations::{MIGRATIONS, MigrationError, apply_migrations, verify_schema_current};
