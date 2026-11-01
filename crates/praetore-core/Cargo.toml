@@ -28,3 +28,12 @@ uuid = { version = "1.18", features = ["v4", "serde"] }
 
 [dev-dependencies]
 proptest = "1"
+
+# Black-box decision-layer tests live at the repository root (`tests/core/`).
+# The workspace root is virtual, so the file is compiled as a test target of
+# this crate. Releases ship as GitHub Release assets, not via crates.io; if the
+# crate is ever packaged, `cargo package` warns that the file is outside the
+# package and drops this test target from the packaged manifest.
+[[test]]
+name = "decision"
+path = "../../tests/core/decision.rs"

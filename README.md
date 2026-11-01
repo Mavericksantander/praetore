@@ -427,10 +427,13 @@ code or test that backs it. None of it is a security or production guarantee.
 - **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
   A policy that exceeds any limit is rejected when it loads with the typed
   error `PolicyLimitExceeded`; nothing is skipped or treated as allow.
-  Raw policy JSON over 64 KiB, or deeper than the parser limit
-  (`MAX_JSON_DEPTH` = 32), fails closed in `Policy::from_json` with an
-  untyped `PolicyEvaluationFailed` (see
-  [#23](https://github.com/Mavericksantander/praetore/issues/23)). The
+  `Policy::from_json` also reports raw input over 64 KiB
+  (`PolicyLimit::InputBytes`), JSON deeper than `MAX_JSON_DEPTH` = 32
+  (`JsonDepth`) and more than `MAX_JSON_NODES` = 16,384 nodes (`JsonNodes`)
+  as `PolicyLimitExceeded`. Malformed JSON, duplicate keys, unknown fields
+  and integers outside ±(2^53−1) are the typed
+  `PolicyDocumentInvalid(PolicyDocumentError)`
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)). The
   public constants in
   [`crates/praetore-core/src/policy.rs`](crates/praetore-core/src/policy.rs)
   (tests in [`crates/praetore-core/tests/policy_limits.rs`](crates/praetore-core/tests/policy_limits.rs)):
@@ -442,7 +445,9 @@ code or test that backs it. None of it is a security or production guarantee.
     action type, capability, target or condition key.
   - `MAX_CONDITION_STRING_BYTES` = 1024 UTF-8 bytes for any string inside a
     condition's expected value, including a `Prefix` / `PathPrefix` prefix.
-  - `MAX_CONDITION_SET_VALUES` = 256 values in an `In` condition.
+  - `MAX_CONDITION_SET_VALUES` = 256 array values in one condition's
+    expected value, counted across every array at every depth (a flat `In`
+    set of 256 values still fits).
   - `MAX_CONDITION_VALUE_DEPTH` = 8 levels of nesting in an expected value
     (a scalar is 1).
   - The engine has no regex operator, so there is no regex limit.
@@ -729,6 +734,7 @@ praetore/
 ├── docs/
 ├── examples/
 ├── scripts/
+├── tests/core/          # black-box decision tests (praetore-core `decision` target)
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE
@@ -915,8 +921,11 @@ target/release/praetore-verify authority \
 
 Regenerating the fixtures changes `evidence.json` and
 `evidence-tampered.json`, because `evidence_id` is random. The fixture authority is valid from 2026-01-01 to 2036-01-01. The `evidence`
-command checks it against the current time, so regenerate the fixtures after
-that date.
+command checks an authority at the receipt's signed decision time
+(`decided_at`, recorded by HighAssurance receipts), which proves it was valid
+then, not that it is valid now. This fixture records no decision time, so it is
+checked against the current time: regenerate the fixtures after that date. See
+[docs/operations.md](docs/operations.md).
 
 The optional `--agent` enables explicit subject-key binding verification for
 standalone authority documents. When omitted, the verifier checks the issuer

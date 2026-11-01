@@ -337,7 +337,43 @@ target/release/praetore-verify evidence \
 
 `--issuer-pins` on evidence verification additionally validates the authority
 signature, pin validity, and authority subject-key binding against the
-evidence agent. `--require-intent` requires `--issuer-pins`, preventing an
+evidence agent. The issuer pin and authority validity windows are checked at
+the receipt's decision time, not at the verifier's clock: for HighAssurance
+receipts this is `decided_at`, the engine's trusted clock when it evaluated
+the request and checked the authority, which the context hash and attester
+signature cover. A decision time before `not_before` or after `not_after`
+fails (`TRUST_STORE_FAIL` for the pin, `AUTHORITY_EXPIRED` for the
+authority). Receipts that record no decision time (v1, and v3/v4 without
+HighAssurance metadata) carry no signed time, so they are checked at the
+verifier's current time, as before, and stop verifying once their authority
+or pin expires. JSON output reports the instant used as
+`authority_checked_at` and its origin as `authority_checked_at_source`
+(`receipt_decided_at` or `verifier_clock`); text output prints
+`authority_checked_at_source` first, right after the result code. Success
+shows that the authority was valid at that instant, not that it is valid now.
+
+`--require-decision-time` (off by default) makes the evidence command fail
+closed: a receipt that records no signed `decided_at` fails with
+`DECISION_TIME_MISSING`, with or without `--issuer-pins`, and nothing falls
+back to the verifier's clock. Use it when only HighAssurance receipts are
+acceptable. The `journal` command does not check authorities and does not
+accept the flag.
+
+Known limit of the decision-time check: it is only as trustworthy as the
+attester key. Anyone holding that key can sign a receipt with a back-dated
+`decided_at`, and that receipt passes even after the issuer pin has expired,
+because the issuer pin is also checked at `decided_at`. The attester pin is a
+bare public key with no validity window, so the verifier cannot limit an
+attester key to decisions made before a given date. An OK therefore proves
+that the authority was valid at the signed decision time only as far as the
+attester key is trusted; if an attester key is retired after compromise,
+treat every receipt it signed as unverified.
+
+Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
+receipts (required before 2027-01-29, when their authorities and issuer pins
+expire): `--require-decision-time` becomes the default, with an explicit
+`--allow-verifier-clock` to keep the verifier-clock fallback, and the
+attester pin gets a validity window that `decided_at` must fall inside. `--require-intent` requires `--issuer-pins`, preventing an
 intent signature from being accepted under only a self-asserted embedded
 agent key. For standalone authority documents, `--agent agent.json` is
 optional; without it, the CLI verifies the signed subject-key hash is present

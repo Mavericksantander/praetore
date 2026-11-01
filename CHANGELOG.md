@@ -52,6 +52,90 @@
   with the hook instead of copying `bundle/`, since copies of one receipt
   are now an invalid bundle.
 
+- Policy loading reports size, depth, node, integer, duplicate-key,
+  malformed-JSON and unknown-field rejections with typed errors
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)); wrong
+  types, missing fields and unknown enum variants are still
+  `PolicyEvaluationFailed(String)`. The error
+  code of all of them stays `POLICY_EVALUATION_FAIL`, so `praetore-verify`,
+  the CLI, the gateway and `praetore-mcp` report the same codes as before.
+  Receipts and policy digests are unchanged.
+  - New `praetore_core::canonical::JsonError` and `parse_json_strict`: the
+    strict parser, `validate_json_value` and the canonical encoder return
+    a typed reason (input size, malformed with line and column, duplicate
+    key, value size, depth, node count, unsafe integer, canonical size).
+    `parse_json_rejecting_duplicates` keeps its `String` error and messages.
+    `MAX_JSON_NODES` is now public.
+  - `Policy::validate` maps canonical-size errors to
+    `PolicyLimitExceeded { CanonicalBytes }` from the typed error, without
+    matching the `"exceeds maximum size"` message.
+  - Breaking: new `PolicyLimit` variants `InputBytes` (raw text passed to
+    `Policy::from_json` over 64 KiB), `JsonDepth` and `JsonNodes`. A
+    decoded value over 64 KiB is `CanonicalBytes`. These used to be
+    `PolicyEvaluationFailed(String)`.
+  - Breaking: new `PraetoreError::PolicyDocumentInvalid(PolicyDocumentError)`
+    with `Malformed { line, column }`, `DuplicateKey`,
+    `UnknownField { field }` and `UnsafeInteger`, for policy documents that
+    used to fail with `PolicyEvaluationFailed(String)`. Wrong types, missing
+    fields and unknown enum values are still `PolicyEvaluationFailed`.
+  - Breaking: `MAX_CONDITION_SET_VALUES` (256) now caps the total number of
+    array elements in a condition's expected value, across every array at
+    every depth, not only the top-level `In` set. A flat `In` set of 256
+    values is still accepted; a policy whose expected value holds more than
+    256 array elements in total is now rejected with
+    `PolicyLimitExceeded { limit: ConditionSetValues, max: 256 }`, shown as
+    "policy limit exceeded: array elements in a condition's expected value
+    (total across all nested arrays) (maximum 256)".
+  - **Limit:** at most 256 array elements per condition, counted as one total
+    over every array in its expected value (the `expected` array itself and
+    arrays nested in arrays or objects, at any depth). Elements are counted,
+    not leaves: `[[]]` counts 1, `[[0]]` counts 2; object keys do not count;
+    the cap is per condition, so two conditions of 256 in one rule are
+    accepted. Only `Exact` and `In` can hold such values. No policy in this
+    repository is affected.
+  - Messages for integral floats outside the safe range now say "JSON
+    integer exceeds interoperable safe range".
+
+- A combined decision's signed `reason` now names the same rule as its
+  `decided_by`. When a DENY rule matched before a RECOVER rule
+  (`[deny d, recover r]`), `decided_by` and the recovery obligation named `r`
+  but `reason` named `d`; the reason now follows the rule with the higher
+  effective severity (RECOVER > DENY > REQUIRE_APPROVAL > ALLOW, earlier rule
+  on a tie), so it no longer depends on rule order. Only the `reason` text of
+  that combination changes. The receipt format is unchanged and receipts
+  signed with the old reason still verify (integrity, attester signature and
+  policy digest; see
+  `receipt_with_the_previous_deny_then_recover_reason_still_verifies` in
+  `tests/core/decision.rs`). Dispatch revalidation (`RecordedDecision::records`)
+  only handles ALLOW/REQUIRE_APPROVAL receipts, which never carry a recovery
+  obligation, so it is not affected. New black-box decision tests live in
+  `tests/core/decision.rs` (the `decision` test target of `praetore-core`);
+  the empty `tests/{core,integration,python,security}` placeholders are gone.
+- **Breaking (`praetore-verify evidence --issuer-pins`):** the embedded
+  authority and its issuer pin are now checked at the receipt's signed
+  decision time instead of the verifier's clock. For HighAssurance receipts
+  that is `decided_at`, the engine clock at evaluation, covered by the context
+  hash and the attester signature. A HighAssurance receipt whose authority has
+  since expired now verifies; one whose `decided_at` falls before the
+  authority's `not_before` or after its `not_after` now fails, whatever the
+  current time. Receipts without HighAssurance metadata (v1, v3/v4 without
+  it) record no signed time and are still checked at the current time; this
+  includes the committed hook evidence sets 03, 04 and 05 and both bundles,
+  so sets 04 and 05 still stop verifying on 2027-01-29. JSON and text output
+  add `authority_checked_at` (RFC 3339) and `authority_checked_at_source`
+  (`receipt_decided_at` or `verifier_clock`). A pass shows the authority was
+  valid at that instant, not that it is valid now; anyone holding the
+  attester key can sign a back-dated `decided_at`, and it passes even after
+  the issuer pin expires, since the pin is also checked at `decided_at` and
+  the attester pin has no validity window. Text output prints
+  `authority_checked_at_source` right after the result code. New optional
+  `--require-decision-time` (off by default): a receipt without a signed
+  `decided_at` fails with `DECISION_TIME_MISSING` instead of falling back to
+  the verifier clock (`journal` does not check authorities and rejects the
+  flag). The `authority` subcommand and its `--now` are unchanged. Planned
+  when sets 04 and 05 are re-recorded with HighAssurance receipts (before
+  2027-01-29): `--require-decision-time` becomes the default with an explicit
+  `--allow-verifier-clock`, and the attester pin gets a validity window.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed
@@ -64,6 +148,38 @@
   `examples/claude-code-hook/test-verify.sh` (in CI): 1000 receipts exit 0
   (141 before the fix), one altered receipt among them exits 1 and is named.
   `scripts/record-hook-demo.sh` had the same `ls | head` and is fixed too.
+- **T-013B:** new crate `praetore-sandbox-fs` (Unix, `#![forbid(unsafe_code)]`,
+  built on `rustix`, which was already in `Cargo.lock`): file effects beneath
+  a sandbox root made through directory descriptors, never through a joined
+  path. On Linux the parent directory is opened with one `openat2(...,
+  RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+  RESOLVE_NO_XDEV)`; on `ENOSYS` and on macOS, one
+  `openat(O_NOFOLLOW | O_DIRECTORY)` per component. The final component is
+  created with `O_CREAT | O_EXCL | O_NOFOLLOW`, replaced with `renameat`,
+  removed with `unlinkat` relative to the parent descriptor, and opened with
+  `O_NOFOLLOW | O_NONBLOCK` plus an `fstat` check. Existing hard links
+  (`st_nlink > 1`), symlinks, FIFOs, sockets and devices are refused.
+  `praetore_gateway::sandbox::SandboxDispatcher` now performs its effects
+  through it (refusal codes and receipt format unchanged; it already walked
+  by descriptor, the new part is `openat2` and `RESOLVE_NO_XDEV`, which also
+  refuses bind mounts). New race tests swap an intermediate directory for a
+  symlink to an outside directory while writes and deletes run; they fail
+  against a deliberately path-based reference
+  (`PRAETORE_SANDBOX_FS_RACE_IMPL=path-based`). Not prevented: a directory
+  moved out of the root while an operation is in flight, and hard links
+  created after the check, both by a process that can also write outside
+  the root. The ignored supervisor test `sandbox_dispatch_rejects_symlink_escape`
+  is removed: it tested a layer that cannot see the Job's filesystem (#61);
+  the case is covered in `praetore-sandbox-fs`.
+  After independent review: the `ENOSYS` fallback is logged once and shown
+  by `SandboxDispatcher::path_resolution()` (startup log and `praetore
+  doctor`); `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` makes the gateway refuse to
+  start without `openat2` and never fall back; `EPERM` from `openat2`
+  (seccomp/LSM) is the permanent refusal `openat2_denied`, not a transient
+  error. The crate refuses `TEMP_PREFIX` components itself (ASCII
+  case-insensitive). New final-component race tests swap `t` with a
+  symlink, a hard link or a directory during writes and deletes; the
+  dispatcher race test now checks the refusal reasons.
 ## 0.3.1-rc.1 - 2026-10-31
 
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,

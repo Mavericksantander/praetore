@@ -406,27 +406,23 @@ impl Decision {
     /// discarded: the left one is kept if both carry one, and any obligation
     /// forces `Deny`.
     ///
-    /// `decided_by` comes from the decision with the higher [`Severity`]
-    /// (`Recover > Deny > RequireApproval > Allow`); on a tie the left-hand
-    /// (earlier) decision keeps it. This agrees with the kept obligation: a
-    /// combined Recover decision is always decided by the obligation's rule.
+    /// `decided_by` and `reason` come from the decision with the higher
+    /// [`Severity`] (`Recover > Deny > RequireApproval > Allow`); on a tie the
+    /// left-hand (earlier) decision keeps them. This agrees with the kept
+    /// obligation: a combined Recover decision is always decided by, and
+    /// carries the reason of, the obligation's rule.
     pub fn strongest(self, other: Self) -> Self {
-        let decided_by = if self.severity() >= other.severity() {
-            self.decided_by
+        let keep_left = self.severity() >= other.severity();
+        let (decided_by, reason) = if keep_left {
+            (self.decided_by, self.reason)
         } else {
-            other.decided_by
+            (other.decided_by, other.reason)
         };
         let recovery = self.recovery.or(other.recovery);
         let outcome = if recovery.is_some() {
             DecisionOutcome::Deny
         } else {
             self.outcome.strongest(other.outcome)
-        };
-
-        let reason = if self.outcome == outcome {
-            self.reason
-        } else {
-            other.reason
         };
 
         let mut contributions = self.contributions;
