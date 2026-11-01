@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Breaking (engine, Development mode): no `action_type` fallback for rule
+  capabilities.** In Development, a matching `Allow` or `RequireApproval`
+  rule without `required_capability` was still applied when the authority
+  also granted the action's `action_type`. It is now denied in every mode,
+  as Strict and HighAssurance already did: the decision is `Deny` with
+  reason `policy rule '<id>' must declare required_capability` and
+  `decided_by` engine guard `unbound_rule_capability`. Actions without a
+  capability stay denied in Development (engine guard `missing_capability`)
+  and rejected with `INVALID_REQUEST` in Strict and HighAssurance. Deny
+  rules without `required_capability` are unaffected. The receipt format is
+  unchanged; no golden file or signed fixture changed.
+
+  Migration (Development only; Strict and HighAssurance behave as before):
+
+  ```rust
+  // Before: allowed in Development when the authority granted "read_data".
+  PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+  // After: the rule names the capability it requires.
+  PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+      .with_capability("read_data")
+  ```
+
+  In policy JSON, set `"required_capability"` on every `Allow` and
+  `RequireApproval` rule. Every action still needs
+  `Action::with_capability(...)`.
+- Engine construction has no default mode. This was already the case since
+  0.2.0 (`new` and `with_clock` were removed in #6) and is now pinned by
+  `compile_fail` doc tests: `AuthorizationEngine::new(..)` and
+  `AuthorizationEngine::default()` do not compile. Choose the profile by
+  name: `AuthorizationEngine::development(policy)` /
+  `development_with_clock(policy, clock)` (explicit, unsigned, local only),
+  `strict(policy, pins)`, or `production(policy, HighAssuranceConfig)`.
+- Docs: README, `docs/crypto-and-policy.md`, `docs/policy-language.md`,
+  ADR-002, ADR-005 and the threat model no longer describe deprecated
+  `new` / `with_clock` compatibility constructors (they no longer exist) and
+  document that the rule-capability requirement applies in every mode.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed

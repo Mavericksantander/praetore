@@ -756,9 +756,13 @@ There are three evaluation modes; choose deliberately:
 Use `AuthorizationEngine::production` for HighAssurance. When the deployment
 requires a fail-closed clock-health check, implement `TrustedClock` and use
 `production_with_trusted_clock`; `production` and `production_with_clock` do
-not independently establish that the host time source is trustworthy. The deprecated
-`new` and `with_clock` constructors remain Development-mode compatibility
-APIs. The crate runs offline and in-process; it does not supply PKI, revocation
+not independently establish that the host time source is trustworthy. There is
+no default mode: `AuthorizationEngine` has no `new` and no `Default`, and
+Development is reached only through the explicitly named `development` /
+`development_with_clock` constructors. In every mode an action must declare
+its capability with `Action::with_capability`, and every matching `Allow` or
+`RequireApproval` rule must declare `required_capability`; a grant of the
+action's `action_type` never stands in for either. The crate runs offline and in-process; it does not supply PKI, revocation
 storage, a secure clock, deployment integrity, host isolation, or atomic action
 execution.
 
