@@ -131,6 +131,55 @@ The [assurance matrix](assurance-matrix.md) maps shipped requirements to code,
 tests, and CI jobs. Fuzz smoke, SBOM generation, and audit reduce risk but do
 not constitute exhaustive proof, certification, or a clean-room build.
 
+## Threat model / Modelo de amenaza: PostgreSQL journal schema
+
+This section covers the checks `praetore-replay-postgres` runs on the
+database that holds the execution journal (`apply_migrations`,
+`verify_schema_current`, `verify_runtime_role`). Advisory:
+GHSA-67vm-x598-vhg3.
+
+**Best effort.** These checks inspect a database from inside it, through
+catalogs that the same database maintains. They are best effort: they detect
+mistakes and drift and raise the bar for misuse, but a result computed from
+inside an untrusted database cannot prove that database trustworthy.
+
+**Inside the trust perimeter.** For the privileges on the `praetore` schema,
+the **owner of the `praetore` schema and its objects, the owner of the
+database, and every superuser are trusted**. They can change any object,
+row, grant or catalog entry after the checks run, or edit the system
+catalogs directly. The checks do not defend against a malicious owner or
+superuser.
+
+**What the checks cover** (and refuse, fail closed):
+
+- Runtime sessions pin `search_path = pg_catalog, pg_temp`; settings that
+  disable triggers or row-level security for the runtime role; parameter
+  grants on them; runtime roles that are superusers, owners, `BYPASSRLS`,
+  `CREATEROLE`, or hold write or schema privileges beyond the migrations.
+- Grants on `praetore` objects beyond what the migrations make and the
+  documented `praetore_observe` shape, including `WITH GRANT OPTION`;
+  objects in `praetore` not owned by the schema owner; other members of
+  the owner role (unless listed explicitly); non-superuser members of
+  `pg_read_all_data` or `pg_write_all_data`; objects outside `praetore`
+  that depend on `praetore` objects; `praetore` objects that depend on
+  functions, operators, types or collations outside `pg_catalog` and
+  `praetore`; SECURITY DEFINER functions with the owner's rights that a
+  role other than their owner may execute (unless listed explicitly).
+  Whoever can execute an allowlisted function acts with its owner's
+  privileges.
+- On every `apply_migrations`: the environment (event triggers, default
+  privileges, owner memberships, settings) and the structure of `praetore`
+  compared with a scratch apply of the recorded migrations; adopting a
+  schema without migration records only with an explicit opt-in.
+
+**Out of scope:** changes made by a trusted owner or superuser after the
+checks ran; direct edits of the system catalogs; the contents of rows that
+already exist (the checks are structural); anything outside the database
+the journal uses; and other databases on the same cluster. The checks run
+when the binaries start and when migrating, not continuously. The adoption
+record in `praetore.schema_migrations` is informative and not
+tamper-evident.
+
 ## Operational response
 
 Rotation, compromise response, policy rollback, secure clock sourcing, and

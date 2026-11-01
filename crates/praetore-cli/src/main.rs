@@ -685,7 +685,8 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         healthy = false;
                     }
                 }
-                match praetore_replay_postgres::verify_runtime_role(&mut client) {
+                let options = runtime_role_options()?;
+                match praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
                     Ok(()) => println!("[ok] least-privilege runtime database role"),
                     Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
                 }
@@ -693,6 +694,39 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(Some(adoption)) => println!("[info] {adoption}"),
                     Ok(None) => {}
                     Err(error) => println!("[warn] legacy baseline record unreadable: {error}"),
+                }
+                match praetore_replay_postgres::migration_record_inconsistency(&mut client) {
+                    Ok(Some(problem)) => println!("[warn] migration record: {problem}"),
+                    Ok(None) => {}
+                    Err(error) => println!("[warn] migration record unreadable: {error}"),
+                }
+                match praetore_replay_postgres::describe_trusted_security_definer(
+                    &mut client,
+                    &options,
+                ) {
+                    Ok(functions) => {
+                        for function in functions {
+                            println!(
+                                "[{}] trusted SECURITY DEFINER function {} (owner {})",
+                                if function.owner_is_superuser {
+                                    "warn"
+                                } else {
+                                    "info"
+                                },
+                                function.resolved,
+                                function.owner
+                            );
+                        }
+                    }
+                    Err(error) => println!("[failed] {error}"),
+                }
+                match praetore_replay_postgres::runtime_role_members(&mut client) {
+                    Ok(members) if members.is_empty() => {}
+                    Ok(members) => println!(
+                        "[info] other login members of praetore_runtime: {}",
+                        members.join(", ")
+                    ),
+                    Err(error) => println!("[warn] praetore_runtime members unreadable: {error}"),
                 }
                 for table in REQUIRED_DATABASE_TABLES {
                     let exists: bool = client
@@ -759,6 +793,14 @@ fn local_database(database_url: &str) -> Result<DatabaseConnector, Box<dyn std::
         );
     }
     Ok(connector)
+}
+
+/// Runtime role options from the same variables the gateway reads.
+fn runtime_role_options()
+-> Result<praetore_replay_postgres::RuntimeRoleOptions, Box<dyn std::error::Error>> {
+    Ok(praetore_replay_postgres::RuntimeRoleOptions::from_config(
+        |name| env::var(name).ok(),
+    )?)
 }
 
 fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
@@ -936,11 +978,19 @@ fn run_gateway(
         &migration_url,
         &praetore_replay_postgres::MigrationOptions {
             adopt_legacy_baseline,
-            ..Default::default()
+            trusted_security_definer:
+                praetore_replay_postgres::MigrationOptions::parse_trusted_security_definer(
+                    &env::var(
+                        praetore_replay_postgres::MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV,
+                    )
+                    .unwrap_or_default(),
+                ),
         },
     )?;
-    let runtime_role =
-        praetore_replay_postgres::verify_runtime_role(&mut connect_local_database(&database_url)?);
+    let runtime_role = praetore_replay_postgres::verify_runtime_role_with(
+        &mut connect_local_database(&database_url)?,
+        &runtime_role_options()?,
+    );
     let api_auth = local_api_auth(directory, &config)?;
     let gateway = Arc::new(build_gateway(directory, &config, &database_url)?);
 

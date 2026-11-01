@@ -23,6 +23,11 @@
 //! pair before executing and refuses any other transaction control, so a
 //! crash can never leave a migration applied but unrecorded.
 //!
+//! A control table is not taken as proof that the schema came from these
+//! migrations: on every run the live structure is compared with a scratch
+//! apply of the recorded migrations (`structural_check`), and owners and the
+//! environment are checked (`environment_problems`).
+//!
 //! The baseline check is best effort: it inspects an untrusted database from
 //! inside it. It does not validate stored rows, and it cannot defend against
 //! a superuser who edits the system catalogs directly.
@@ -123,6 +128,12 @@ pub enum MigrationError {
     /// An existing `praetore` schema has no migration records and adopting
     /// it as a legacy 0001-0009 baseline was not requested.
     LegacyBaselineNotAdopted,
+    /// The live `praetore` schema differs from what its recorded migrations
+    /// create (compared on every run against a scratch apply).
+    SchemaDrift(String),
+    /// An option could not be applied, for example a trusted SECURITY
+    /// DEFINER function that does not resolve.
+    InvalidConfiguration(String),
 }
 
 impl std::fmt::Display for MigrationError {
@@ -159,6 +170,14 @@ impl std::fmt::Display for MigrationError {
             ),
             Self::UnsafeSession(reason) => write!(f, "refusing to migrate: {reason}"),
             Self::UnsafeDatabase(problems) => write!(f, "refusing to migrate: {problems}"),
+            Self::SchemaDrift(differences) => write!(
+                f,
+                "praetore schema differs from what its recorded migrations create \
+                 ({differences}); refusing to migrate"
+            ),
+            Self::InvalidConfiguration(reason) => {
+                write!(f, "invalid migration configuration: {reason}")
+            }
             Self::LegacyBaselineNotAdopted => write!(
                 f,
                 "existing praetore schema has no migration records; refusing to migrate. To \
@@ -188,8 +207,11 @@ pub struct MigrationOptions {
     /// adopted legacy baseline). Off by default: such a schema is refused.
     pub adopt_legacy_baseline: bool,
     /// SECURITY DEFINER functions outside `praetore` that run with the
-    /// owner's rights and that the operator trusts, as rendered by
-    /// `regprocedure` (for example `public.helper(integer)`).
+    /// owner's rights and that the operator trusts: schema-qualified names
+    /// with their full signature (for example `public.helper(integer)`),
+    /// resolved with `to_regprocedure` and compared by OID. An entry that
+    /// does not resolve is a configuration error. Whoever can execute a
+    /// trusted function acts with its owner's privileges.
     pub trusted_security_definer: Vec<String>,
 }
 
@@ -294,6 +316,42 @@ fn verify_schema_current_inner(client: &mut Client) -> Result<(), MigrationError
     Ok(())
 }
 
+/// The control table the runner creates (not a migration file). Adoption
+/// columns are set only for 0001-0009 adopted from a legacy baseline.
+/// `baseline_structure_sha256` identifies the 0001-0009 structure as the
+/// server rendered it; it is the same for every database on a server
+/// version and is not evidence about one database.
+const CONTROL_TABLE_DDL: &str = "CREATE TABLE praetore.schema_migrations (\
+     version TEXT PRIMARY KEY, \
+     checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
+     applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), \
+     adopted_legacy_baseline BOOLEAN NOT NULL DEFAULT false, \
+     adopted_by TEXT, \
+     baseline_structure_sha256 CHAR(64) \
+         CHECK (baseline_structure_sha256 ~ '^[0-9a-f]{64}$'), \
+     CHECK (adopted_legacy_baseline \
+            = (adopted_by IS NOT NULL AND baseline_structure_sha256 IS NOT NULL)))";
+
+/// `SET LOCAL ROLE` to the praetore schema owner when it is not the
+/// migrating role (a NOLOGIN owner group the migrating role belongs to), so
+/// that objects created by migrations get the same owner as the schema.
+fn owner_role_statement(
+    client: &mut impl postgres::GenericClient,
+) -> Result<Option<String>, MigrationError> {
+    let row = client.query_opt(
+        "SELECT pg_catalog.quote_ident(pg_catalog.pg_get_userbyid(n.nspowner)), \
+                n.nspowner OPERATOR(pg_catalog.=) \
+                    (SELECT r.oid FROM pg_catalog.pg_roles r \
+                     WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER) \
+         FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'",
+        &[],
+    )?;
+    Ok(row.and_then(|row| {
+        let (owner, is_current): (String, bool) = (row.get(0), row.get(1));
+        (!is_current).then(|| format!("SET LOCAL ROLE {owner}"))
+    }))
+}
+
 /// Last migration that existed before the control table was introduced.
 const BASELINE_VERSION: &str = "0009_human_approval_expirations";
 
@@ -337,26 +395,26 @@ fn apply_locked(
         } else {
             None
         };
-        transaction.batch_execute(
-            "CREATE SCHEMA IF NOT EXISTS praetore; \
-             CREATE TABLE praetore.schema_migrations (\
-                 version TEXT PRIMARY KEY, \
-                 checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
-                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), \
-                 adopted_legacy_baseline BOOLEAN NOT NULL DEFAULT false, \
-                 adopted_by TEXT, \
-                 baseline_dump_sha256 CHAR(64) \
-                     CHECK (baseline_dump_sha256 ~ '^[0-9a-f]{64}$'), \
-                 CHECK (adopted_legacy_baseline \
-                        = (adopted_by IS NOT NULL AND baseline_dump_sha256 IS NOT NULL)))",
-        )?;
+        if let Some(statement) = owner_role_statement(&mut transaction)? {
+            transaction.batch_execute(&statement)?;
+        }
+        if has_schema {
+            // CREATE SCHEMA IF NOT EXISTS would still need CREATE on the
+            // database, which a NOLOGIN owner group may not have.
+            transaction.batch_execute(CONTROL_TABLE_DDL)?;
+        } else {
+            transaction.batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS praetore; {CONTROL_TABLE_DDL}"
+            ))?;
+        }
         if let Some(expected) = &baseline {
             let dump_sha256 = dump_checksum(expected);
             for (version, sql) in MIGRATIONS {
                 transaction.execute(
                     "INSERT INTO praetore.schema_migrations \
-                     (version, checksum, adopted_legacy_baseline, adopted_by, baseline_dump_sha256) \
-                     VALUES ($1, $2, true, CURRENT_USER, $3)",
+                     (version, checksum, adopted_legacy_baseline, adopted_by, \
+                      baseline_structure_sha256) \
+                     VALUES ($1, $2, true, SESSION_USER, $3)",
                     &[&version, &checksum(sql), &dump_sha256],
                 )?;
                 if version == BASELINE_VERSION {
@@ -382,12 +440,24 @@ fn apply_locked(
     }
 
     let recorded = client.query("SELECT version FROM praetore.schema_migrations", &[])?;
-    for row in recorded {
+    for row in &recorded {
         let version: String = row.get(0);
         if !MIGRATIONS.iter().any(|(known, _)| *known == version) {
             return Err(MigrationError::UnknownVersion(version));
         }
     }
+    // A control table that existed before this run is not proof that the
+    // schema came from these migrations: compare the structure with a
+    // scratch apply of the recorded ones before migrating further.
+    if has_control {
+        let versions: Vec<&'static str> = MIGRATIONS
+            .iter()
+            .map(|(version, _)| *version)
+            .filter(|version| recorded.iter().any(|row| row.get::<_, &str>(0) == *version))
+            .collect();
+        structural_check(client, &versions)?;
+    }
+    let owner_role = owner_role_statement(client)?;
 
     let mut applied = Vec::new();
     for (version, sql) in MIGRATIONS {
@@ -404,6 +474,9 @@ fn apply_locked(
         }
         let body = transactional_body(version, sql)?;
         let mut transaction = client.transaction()?;
+        if let Some(statement) = &owner_role {
+            transaction.batch_execute(statement)?;
+        }
         transaction.batch_execute(body)?;
         transaction.execute(
             "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
@@ -412,7 +485,65 @@ fn apply_locked(
         transaction.commit()?;
         applied.push(version);
     }
+    if !has_control || !applied.is_empty() {
+        let versions: Vec<&'static str> = MIGRATIONS.iter().map(|(version, _)| *version).collect();
+        structural_check(client, &versions)?;
+    }
     Ok(applied)
+}
+
+/// Compares the live `praetore` schema with a scratch schema in which
+/// `versions` are applied, in a transaction that is always rolled back:
+/// the same canonical dump as the baseline check, without the control
+/// table (whose columns depend on the runner version that created it). Runs
+/// on every `apply_migrations`: before migrating forward a schema that has
+/// a control table, and after applying migrations. Needs CREATE on the
+/// database, like migrating does.
+fn structural_check(client: &mut Client, versions: &[&'static str]) -> Result<(), MigrationError> {
+    let mut transaction = client.transaction()?;
+    transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
+    let scratch = format!("praetore_check_{}", uuid::Uuid::new_v4().simple());
+    let mut savepoint = transaction.savepoint("praetore_structure_scratch")?;
+    let scratch_error = |what: &str, error: postgres::Error| {
+        MigrationError::SchemaDrift(format!(
+            "could not apply {what} to a scratch schema to compare with: {}",
+            database_cause(&error)
+        ))
+    };
+    savepoint
+        .batch_execute(&rewrite_schema(
+            &format!("CREATE SCHEMA praetore; {CONTROL_TABLE_DDL}"),
+            &scratch,
+        ))
+        .map_err(|error| scratch_error("the control table", error))?;
+    for (version, sql) in MIGRATIONS {
+        if !versions.contains(&version) {
+            continue;
+        }
+        let body = transactional_body(version, sql)?;
+        savepoint
+            .batch_execute(&rewrite_schema(body, &scratch))
+            .map_err(|error| scratch_error(version, error))?;
+    }
+    let mut live = schema_dump(&mut savepoint, "praetore", "praetore")?;
+    let mut expected = schema_dump(&mut savepoint, &scratch, &scratch)?;
+    savepoint.rollback()?;
+    transaction.rollback()?;
+    // ACLs are not compared here: documented grants (praetore_observe) and
+    // operator grants differ per installation, and `verify_runtime_role`
+    // checks every praetore ACL against what the migrations intend.
+    for dump in [&mut live, &mut expected] {
+        dump.retain(|key, _| !is_control_table_key(key));
+        for fields in dump.values_mut() {
+            fields.remove("acl");
+        }
+    }
+    let differences = dump_differences(&live, &expected);
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        Err(MigrationError::SchemaDrift(differences.join("; ")))
+    }
 }
 
 /// Returns the part of `sql` that the runner executes inside its own
@@ -691,8 +822,8 @@ fn database_cause(error: &postgres::Error) -> String {
 
 /// `sql` with every reference to the `praetore` schema (`praetore.x`,
 /// `CREATE SCHEMA ... praetore`, `search_path = ..., praetore, ...`) replaced
-/// by `schema`. The `praetore.tenant_id` setting name is not a schema
-/// reference and is kept.
+/// by `schema`. The `praetore.tenant_id` and `praetore.dispatch_observed_at`
+/// setting names are not schema references and are kept.
 fn rewrite_schema(sql: &str, schema: &str) -> String {
     const NAME: &str = "praetore";
     let is_identifier = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
@@ -704,7 +835,8 @@ fn rewrite_schema(sql: &str, schema: &str) -> String {
         let boundary_before = !before.chars().next_back().is_some_and(is_identifier);
         let boundary_after = !after.chars().next().is_some_and(is_identifier);
         out.push_str(before);
-        if boundary_before && boundary_after && !after.starts_with(".tenant_id") {
+        let setting = after.starts_with(".tenant_id") || after.starts_with(".dispatch_observed_at");
+        if boundary_before && boundary_after && !setting {
             out.push_str(schema);
         } else {
             out.push_str(NAME);
@@ -1054,16 +1186,19 @@ pub struct LegacyBaselineAdoption {
     pub adopted_at: String,
     /// The migrating role that compared and adopted the schema.
     pub adopted_by: String,
-    /// SHA-256 of the canonical dump that matched 0001-0009.
-    pub dump_sha256: String,
+    /// SHA-256 of the canonical 0001-0009 structure as the server rendered
+    /// it. The same for every database on a server version: it identifies
+    /// what was compared, not the database.
+    pub structure_sha256: String,
 }
 
 impl std::fmt::Display for LegacyBaselineAdoption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "0001-0009 adopted from a legacy baseline at {} by {} (schema dump sha256 {})",
-            self.adopted_at, self.adopted_by, self.dump_sha256
+            "0001-0009 adopted from a legacy baseline at {} by {} (structure sha256 {}; \
+             this record is not tamper-evident)",
+            self.adopted_at, self.adopted_by, self.structure_sha256
         )
     }
 }
@@ -1089,7 +1224,7 @@ pub fn legacy_baseline_adoption(
             return Ok(None);
         }
         let row = client.query_opt(
-            "SELECT applied_at::pg_catalog.text, adopted_by, baseline_dump_sha256::pg_catalog.text \
+            "SELECT applied_at::pg_catalog.text, adopted_by, baseline_structure_sha256::pg_catalog.text \
              FROM praetore.schema_migrations \
              WHERE version OPERATOR(pg_catalog.=) $1 AND adopted_legacy_baseline",
             &[&BASELINE_VERSION],
@@ -1097,8 +1232,53 @@ pub fn legacy_baseline_adoption(
         Ok(row.map(|row| LegacyBaselineAdoption {
             adopted_at: row.get(0),
             adopted_by: row.get(1),
-            dump_sha256: row.get(2),
+            structure_sha256: row.get(2),
         }))
+    })
+}
+
+/// A hint that the migration record does not match how it was written:
+/// 0001-0009 written (or last updated) in one transaction, which is what an
+/// adoption does, but not marked as adopted. The record is not
+/// tamper-evident: the schema owner can rewrite it; this only flags the
+/// most direct inconsistency.
+pub fn migration_record_inconsistency(
+    client: &mut Client,
+) -> Result<Option<String>, MigrationError> {
+    with_safe_search_path(client, |client| {
+        let has_column: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid OPERATOR(pg_catalog.=) \
+                       pg_catalog.to_regclass('praetore.schema_migrations') \
+                   AND a.attname OPERATOR(pg_catalog.=) 'adopted_legacy_baseline' \
+                   AND NOT a.attisdropped)",
+                &[],
+            )?
+            .get(0);
+        let adopted = if has_column {
+            "pg_catalog.bool_or(adopted_legacy_baseline)"
+        } else {
+            "false"
+        };
+        let row = client.query_one(
+            &format!(
+                "SELECT pg_catalog.count(*), \
+                        pg_catalog.count(DISTINCT xmin::pg_catalog.text), {adopted} \
+                 FROM praetore.schema_migrations \
+                 WHERE version OPERATOR(pg_catalog.<=) $1"
+            ),
+            &[&BASELINE_VERSION],
+        )?;
+        let (rows, transactions, adopted): (i64, i64, Option<bool>) =
+            (row.get(0), row.get(1), row.get(2));
+        Ok(
+            (rows == 9 && transactions == 1 && adopted != Some(true)).then(|| {
+                "0001-0009 were recorded in a single transaction, as an adoption is, but are not \
+             marked as adopted"
+                    .to_owned()
+            }),
+        )
     })
 }
 
@@ -1168,11 +1348,10 @@ const OWNER_SQL: &str = "(SELECT COALESCE(\
 
 /// A function owner `p.proowner` that has the rights of `owner_role.oid`
 /// (superusers included, since they have every role's rights). Functions
-/// the operator trusts are excluded by name (`$1`,
+/// the operator trusts are excluded by OID (`$1`, resolved from
 /// `MigrationOptions::trusted_security_definer`).
 const OWNER_RIGHTS_SQL: &str = "pg_catalog.pg_has_role(p.proowner, owner_role.oid, 'USAGE') \
-     AND NOT (p.oid::pg_catalog.regprocedure::pg_catalog.text \
-              OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[]))";
+     AND NOT (p.oid OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.oid[]))";
 
 /// Whether a `search_path` value lets another schema shadow `pg_catalog`
 /// (`pg_catalog` listed after another schema). `"$user", public` does not:
@@ -1223,6 +1402,14 @@ fn environment_problems(
 ) -> Result<Vec<String>, MigrationError> {
     const OWNER: &str = OWNER_SQL;
     const OWNER_RIGHTS: &str = OWNER_RIGHTS_SQL;
+    let trusted: Vec<u32> = crate::connection::resolve_trusted_security_definer(
+        transaction,
+        &options.trusted_security_definer,
+    )
+    .map_err(MigrationError::InvalidConfiguration)?
+    .iter()
+    .map(|function| function.oid)
+    .collect();
     let mut problems = Vec::new();
     for row in transaction.query(
         "SELECT e.evtname::pg_catalog.text FROM pg_catalog.pg_event_trigger e ORDER BY 1",
@@ -1295,7 +1482,7 @@ fn environment_problems(
                AND {OWNER_RIGHTS} \
              ORDER BY 1"
         ),
-        &[&options.trusted_security_definer],
+        &[&trusted],
     )? {
         let function: String = row.get(0);
         problems.push(format!(
@@ -1333,10 +1520,10 @@ fn environment_problems(
         let (role, can_login, on_migrator_path, is_owner): (String, bool, bool, bool) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
         if is_owner && !on_migrator_path {
-            // The owner itself, when the caller is not the migrating role (a
-            // runtime role re-checking a current schema). Adopting a
-            // baseline additionally requires the migrating role to belong to
-            // the owner (`baseline_only_problems`).
+            problems.push(format!(
+                "schema praetore is owned by {role}, and the migrating role is neither that role \
+                 nor a member of it"
+            ));
             continue;
         }
         if !on_migrator_path {
@@ -1354,36 +1541,12 @@ fn environment_problems(
     Ok(problems)
 }
 
-/// Checks only for adopting a legacy baseline: the existing schema owner
-/// must be the migrating role or one of its groups, and no publication may
-/// replicate the praetore tables.
+/// Checks only for adopting a legacy baseline: no publication may replicate
+/// the praetore tables. (Owners are checked on every run.)
 fn baseline_only_problems(
     transaction: &mut postgres::Transaction<'_>,
 ) -> Result<Vec<String>, MigrationError> {
     let mut problems = Vec::new();
-    let owner = transaction.query_one(
-        "WITH RECURSIVE member_of(role) AS ( \
-             SELECT r.oid FROM pg_catalog.pg_roles r \
-             WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER \
-             UNION \
-             SELECT m.roleid FROM pg_catalog.pg_auth_members m \
-             JOIN member_of ON m.member OPERATOR(pg_catalog.=) member_of.role) \
-         SELECT pg_catalog.pg_get_userbyid(n.nspowner)::pg_catalog.text, \
-                CURRENT_USER::pg_catalog.text, \
-                EXISTS (SELECT 1 FROM member_of \
-                        WHERE member_of.role OPERATOR(pg_catalog.=) n.nspowner) \
-         FROM pg_catalog.pg_namespace n \
-         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'",
-        &[],
-    )?;
-    let (schema_owner, migrator, is_member): (String, String, bool) =
-        (owner.get(0), owner.get(1), owner.get(2));
-    if !is_member {
-        problems.push(format!(
-            "schema praetore is owned by {schema_owner}, and the migrating role {migrator} \
-             is neither that role nor a member of it"
-        ));
-    }
     for row in transaction.query(
         "SELECT p.pubname::pg_catalog.text FROM pg_catalog.pg_publication p \
          WHERE p.puballtables ORDER BY 1",

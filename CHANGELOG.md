@@ -26,10 +26,33 @@
   `praetore run <directory> --adopt-legacy-baseline` (or the same variable)
   for the CLI, `apply_migrations_with` and `MigrationOptions` in the
   library. An adoption is recorded in `praetore.schema_migrations`
-  (`adopted_legacy_baseline`, `adopted_by`, `baseline_dump_sha256`, with
-  `applied_at`), returned by `legacy_baseline_adoption`, logged by the
-  gateway service and printed by `praetore doctor`. Fresh databases and
-  databases with migration records are unaffected.
+  (`adopted_legacy_baseline`, `adopted_by`, `baseline_structure_sha256`,
+  with `applied_at`), returned by `legacy_baseline_adoption`, logged by the
+  gateway service and printed by `praetore doctor`. The record is
+  informative and not tamper-evident; `baseline_structure_sha256` identifies
+  the compared 0001-0009 structure for the server version, not the
+  database. `praetore doctor` flags the most direct inconsistency
+  (`migration_record_inconsistency`). Fresh databases and databases with
+  migration records are unaffected.
+- `apply_migrations` compares the `praetore` structure with a scratch apply
+  of the recorded migrations on every run (before migrating forward and
+  after applying), checks owners on every run, and runs migrations as the
+  schema owner when it is a NOLOGIN group of the migrating role
+  (`MigrationError::SchemaDrift`, `MigrationError::InvalidConfiguration`).
+- `verify_runtime_role` also checks ownership of every `praetore` object,
+  members of the schema owner (allowed only through
+  `PRAETORE_SCHEMA_OWNER_MEMBERS`), non-superuser members of
+  `pg_read_all_data`/`pg_write_all_data`, objects elsewhere that depend on
+  `praetore`, `WITH GRANT OPTION`, the exact documented `praetore_observe`
+  columns, and SECURITY DEFINER functions with the owner's rights that any
+  other role may execute. Other login members of `praetore_runtime` are
+  reported at startup and by `praetore doctor`, and refused when
+  `PRAETORE_RUNTIME_LOGINS` lists the allowed ones.
+- `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS` entries must be
+  schema-qualified with their signature; they are resolved by OID, an
+  entry that does not resolve is a configuration error, superuser-owned
+  ones are logged with a warning, and `praetore run` reads the variable.
+- `docs/threat-model.md` describes the trust perimeter of these checks.
 - `apply_migrations` checks the database environment on every run, fresh,
   adopted or current (`MigrationError::UnsafeDatabase`).
   `verify_runtime_role` checks schema ACLs (`RuntimeRoleError::UnexpectedGrant`):

@@ -1,3 +1,10 @@
+//! PostgreSQL replay guard, execution journal and migration runner.
+//!
+//! The schema and runtime-role checks are best effort and treat the schema
+//! owner, the database owner and superusers as trusted; see
+//! `docs/threat-model.md`, section "Threat model / Modelo de amenaza:
+//! PostgreSQL journal schema".
+
 use postgres::{Client, Transaction};
 use praetore_core::replay::{ReplayGuard, ReplayGuardError};
 use std::sync::Mutex;
@@ -10,12 +17,14 @@ mod observability;
 
 pub use connection::{
     DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RuntimeRoleOptions, RustlsConnect,
+    TrustedSecurityDefiner, describe_trusted_security_definer, runtime_role_members,
     verify_runtime_role, verify_runtime_role_with,
 };
 pub use execution::PostgresExecutionJournal;
 pub use migrations::{
     LegacyBaselineAdoption, MIGRATIONS, MigrationError, MigrationOptions, apply_migrations,
-    apply_migrations_with, legacy_baseline_adoption, verify_schema_current,
+    apply_migrations_with, legacy_baseline_adoption, migration_record_inconsistency,
+    verify_schema_current,
 };
 pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,

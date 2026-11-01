@@ -301,6 +301,12 @@ jobs:
             postgres_runtime_role_refuses_unexpected_grants \
             postgres_superuser_security_definer_function_is_accepted_only_when_trusted \
             postgres_migrations_baseline_concurrent_function_replacement_fails_closed \
+            postgres_migrations_structure_is_compared_on_every_run \
+            postgres_migrations_refuse_a_schema_owned_by_another_role \
+            postgres_runtime_role_refuses_access_paths_outside_praetore_acls \
+            postgres_runtime_role_checks_owner_and_runtime_memberships \
+            postgres_trusted_security_definer_entries_resolve_by_oid_and_fail_closed \
+            postgres_migration_record_inconsistency_is_flagged \
             postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered \
             postgres_apd_sigkill_between_approve_and_claim \
             postgres_apd_concurrent_claims_dispatch_exactly_once \

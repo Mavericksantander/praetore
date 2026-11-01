@@ -109,22 +109,23 @@ fn initialize_test_database() {
         );
         client
             .batch_execute(
-                "CREATE TABLE IF NOT EXISTS praetore.gateway_test_effects (\
+                "CREATE SCHEMA IF NOT EXISTS praetore_test_adapter; \
+                 CREATE TABLE IF NOT EXISTS praetore_test_adapter.gateway_test_effects (\
                      tenant_id UUID NOT NULL, agent_id UUID NOT NULL, request_id UUID NOT NULL, \
                      action_digest CHAR(64) NOT NULL, output_json TEXT NOT NULL, \
                      PRIMARY KEY (tenant_id, agent_id, request_id)); \
-                 CREATE TABLE IF NOT EXISTS praetore.gateway_test_invocations (\
+                 CREATE TABLE IF NOT EXISTS praetore_test_adapter.gateway_test_invocations (\
                      invocation_id BIGSERIAL PRIMARY KEY, tenant_id UUID NOT NULL, \
                      agent_id UUID NOT NULL, request_id UUID NOT NULL); \
-                 ALTER TABLE praetore.gateway_test_effects \
+                 ALTER TABLE praetore_test_adapter.gateway_test_effects \
                      ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL \
                      DEFAULT '00000000-0000-0000-0000-000000000000'; \
-                 ALTER TABLE praetore.gateway_test_effects \
+                 ALTER TABLE praetore_test_adapter.gateway_test_effects \
                      DROP CONSTRAINT IF EXISTS gateway_test_effects_pkey; \
-                 ALTER TABLE praetore.gateway_test_effects \
+                 ALTER TABLE praetore_test_adapter.gateway_test_effects \
                      ADD CONSTRAINT gateway_test_effects_pkey \
                      PRIMARY KEY (tenant_id, agent_id, request_id); \
-                 ALTER TABLE praetore.gateway_test_invocations \
+                 ALTER TABLE praetore_test_adapter.gateway_test_invocations \
                      ADD COLUMN IF NOT EXISTS tenant_id UUID NOT NULL \
                      DEFAULT '00000000-0000-0000-0000-000000000000';",
             )
@@ -416,7 +417,7 @@ impl PostgresTestAdapter {
         let mut client = connect_client();
         let row = client
             .query_opt(
-                "SELECT action_digest, output_json FROM praetore.gateway_test_effects \
+                "SELECT action_digest, output_json FROM praetore_test_adapter.gateway_test_effects \
                  WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
@@ -448,14 +449,14 @@ impl ActionDispatcher for PostgresTestAdapter {
         let mut transaction = client.transaction().map_err(|_| DispatchError)?;
         transaction
             .execute(
-                "INSERT INTO praetore.gateway_test_invocations \
+                "INSERT INTO praetore_test_adapter.gateway_test_invocations \
                  (tenant_id, agent_id, request_id) VALUES ($1, $2, $3)",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
             .map_err(|_| DispatchError)?;
         let inserted = transaction
             .execute(
-                "INSERT INTO praetore.gateway_test_effects \
+                "INSERT INTO praetore_test_adapter.gateway_test_effects \
                  (tenant_id, agent_id, request_id, action_digest, output_json) \
                  VALUES ($1, $2, $3, $4, $5) \
                  ON CONFLICT (tenant_id, agent_id, request_id) DO NOTHING",
@@ -471,7 +472,7 @@ impl ActionDispatcher for PostgresTestAdapter {
         if inserted == 0 {
             let existing: String = transaction
                 .query_one(
-                    "SELECT action_digest FROM praetore.gateway_test_effects \
+                    "SELECT action_digest FROM praetore_test_adapter.gateway_test_effects \
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                     &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
@@ -879,7 +880,7 @@ fn evaluate_and_commit(
 fn database_invocation_count(key: ExecutionKey) -> i64 {
     connect_client()
         .query_one(
-            "SELECT count(*) FROM praetore.gateway_test_invocations \
+            "SELECT count(*) FROM praetore_test_adapter.gateway_test_invocations \
              WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
             &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
@@ -890,7 +891,7 @@ fn database_invocation_count(key: ExecutionKey) -> i64 {
 fn database_effect_count(key: ExecutionKey) -> i64 {
     connect_client()
         .query_one(
-            "SELECT count(*) FROM praetore.gateway_test_effects \
+            "SELECT count(*) FROM praetore_test_adapter.gateway_test_effects \
              WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
             &[&key.tenant_id, &key.agent_id, &key.request_id],
         )
@@ -957,8 +958,8 @@ fn clear_journal_restart_fixtures(request_ids: &[Uuid]) {
         .unwrap();
     for request_id in request_ids {
         for table in [
-            "praetore.gateway_test_invocations",
-            "praetore.gateway_test_effects",
+            "praetore_test_adapter.gateway_test_invocations",
+            "praetore_test_adapter.gateway_test_effects",
             "praetore.execution_attestations",
             "praetore.human_approvals",
             "praetore.execution_journal_events",
@@ -3934,7 +3935,7 @@ fn postgres_migrations_legacy_baseline_requires_opt_in_and_is_recorded() {
         .get(0);
     let rows = client
         .query(
-            "SELECT version, adopted_legacy_baseline, adopted_by, baseline_dump_sha256 \
+            "SELECT version, adopted_legacy_baseline, adopted_by, baseline_structure_sha256 \
              FROM praetore.schema_migrations ORDER BY version",
             &[],
         )
@@ -3961,7 +3962,7 @@ fn postgres_migrations_legacy_baseline_requires_opt_in_and_is_recorded() {
         .unwrap()
         .expect("the adoption is reported");
     assert_eq!(adoption.adopted_by, migrator);
-    assert_eq!(Some(&adoption.dump_sha256), digests.iter().next());
+    assert_eq!(Some(&adoption.structure_sha256), digests.iter().next());
     eprintln!("recorded: {adoption}");
 
     // A fresh database is migrated without the opt-in and records no adoption.
@@ -4110,15 +4111,37 @@ fn postgres_runtime_role_refuses_unexpected_grants() {
     admin
         .batch_execute(
             "GRANT USAGE ON SCHEMA praetore TO praetore_observe; \
-             GRANT SELECT (agent_id, request_id, request_digest, action_digest, \
+             GRANT SELECT (tenant_id, agent_id, request_id, request_digest, action_digest, \
                authorization_status, execution_status, evidence_json, created_at, updated_at) \
                ON praetore.execution_journal TO praetore_observe; \
-             GRANT SELECT (event_id, agent_id, request_id, from_status, to_status, occurred_at) \
-               ON praetore.execution_journal_events TO praetore_observe;",
+             GRANT SELECT (event_id, tenant_id, agent_id, request_id, from_status, to_status, \
+               occurred_at) ON praetore.execution_journal_events TO praetore_observe;",
         )
         .unwrap();
     praetore_replay_postgres::verify_runtime_role(&mut client)
         .expect("the documented observe grants are accepted");
+    // Only that exact shape: one more column is refused.
+    admin
+        .batch_execute(
+            "GRANT SELECT (not_dispatched_reason) ON praetore.execution_journal TO praetore_observe",
+        )
+        .unwrap();
+    let result = praetore_replay_postgres::verify_runtime_role(&mut client);
+    admin
+        .batch_execute(
+            "REVOKE SELECT (not_dispatched_reason) ON praetore.execution_journal \
+             FROM praetore_observe",
+        )
+        .unwrap();
+    let message = result
+        .expect_err("a column beyond the documented shape")
+        .to_string();
+    assert!(
+        message.contains(
+            "column praetore.execution_journal.not_dispatched_reason: SELECT to praetore_observe"
+        ),
+        "{message}"
+    );
 }
 
 /// Round 3, B3: a superuser's SECURITY DEFINER function is refused by
@@ -4224,6 +4247,309 @@ fn postgres_migrations_baseline_concurrent_function_replacement_fails_closed() {
         .unwrap()
         .get(0);
     assert!(!control, "nothing may be recorded");
+}
+
+/// Round 4, A4-1 (GHSA-67vm-x598-vhg3): a control table is not proof that
+/// the schema came from the migrations. Records written by hand over a
+/// changed legacy schema, and a change made after migrating, are both
+/// refused by the structural comparison that runs on every apply.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_structure_is_compared_on_every_run() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    client
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION praetore.reject_human_approval_mutation() \
+               RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$; \
+             CREATE TABLE praetore.schema_migrations (version TEXT PRIMARY KEY, \
+               checksum CHAR(64) NOT NULL, \
+               applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp());",
+        )
+        .unwrap();
+    for (version, sql) in &praetore_replay_postgres::MIGRATIONS[..9] {
+        client
+            .execute(
+                "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
+                &[version, &migration_checksum(sql)],
+            )
+            .unwrap();
+    }
+    let error = praetore_replay_postgres::apply_migrations(&mut client)
+        .expect_err("records written by hand over a changed schema must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("function praetore.reject_human_approval_mutation() differs"),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+    let recorded: i64 = client
+        .query_one("SELECT count(*) FROM praetore.schema_migrations", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(recorded, 9, "nothing more may be applied or recorded");
+
+    let current = ScratchDatabase::create();
+    let mut client = current.connect();
+    praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    client
+        .batch_execute(
+            "ALTER TABLE praetore.replay_claims DROP CONSTRAINT replay_claims_pkey CASCADE",
+        )
+        .unwrap();
+    let error = praetore_replay_postgres::apply_migrations(&mut client)
+        .expect_err("a change after migrating must be refused on the next run");
+    let message = error.to_string();
+    assert!(
+        message.contains("constraint praetore.replay_claims.replay_claims_pkey is missing"),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+}
+
+/// Round 4, A4-1: a schema migrated by another role (here one given CREATE
+/// on the database) is refused when the migrating role runs, owners being
+/// checked on every run.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_refuse_a_schema_owned_by_another_role() {
+    let other = TestRole::create("LOGIN");
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    admin
+        .batch_execute(&format!(
+            "GRANT CREATE ON DATABASE {} TO {}",
+            scratch.name, other.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &other.name);
+    praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    client
+        .batch_execute(
+            "ALTER TABLE praetore.replay_claims DROP CONSTRAINT replay_claims_pkey CASCADE",
+        )
+        .unwrap();
+    let error = praetore_replay_postgres::apply_migrations(&mut admin)
+        .expect_err("a schema owned by another role must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("schema praetore is owned by {}", other.name)),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+}
+
+/// Round 4, M4-1: access paths outside the praetore ACLs.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_refuses_access_paths_outside_praetore_acls() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let attacker = TestRole::create("LOGIN");
+    let a = &attacker.name;
+    for (setup, expected) in [
+        (
+            format!(
+                "CREATE VIEW public.claims_proxy AS SELECT * FROM praetore.replay_claims; \
+                 GRANT SELECT ON public.claims_proxy TO {a};"
+            ),
+            "on public.claims_proxy".to_owned(),
+        ),
+        (
+            "GRANT SELECT ON praetore.replay_claims TO praetore_runtime WITH GRANT OPTION"
+                .to_owned(),
+            "relation praetore.replay_claims: SELECT WITH GRANT OPTION to praetore_runtime"
+                .to_owned(),
+        ),
+        (
+            format!("GRANT pg_read_all_data TO {a}"),
+            format!("role {a} is a member of pg_read_all_data"),
+        ),
+        (
+            format!(
+                "CREATE FUNCTION public.maintenance(sql text) RETURNS void \
+                   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog \
+                   AS $$ BEGIN EXECUTE sql; END $$; \
+                 REVOKE EXECUTE ON FUNCTION public.maintenance(text) FROM PUBLIC; \
+                 GRANT EXECUTE ON FUNCTION public.maintenance(text) TO {a};"
+            ),
+            "public.maintenance(text)".to_owned(),
+        ),
+        (
+            format!("ALTER TABLE praetore.human_approvals OWNER TO {a}"),
+            format!("relation praetore.human_approvals ({a})"),
+        ),
+    ] {
+        let scratch = migrated_with_runtime(&runtime);
+        let mut client = connect_scratch_as(&scratch, &runtime.name);
+        praetore_replay_postgres::verify_runtime_role(&mut client)
+            .expect("a clean installation is accepted");
+        scratch.connect().batch_execute(&setup).unwrap();
+        let message = praetore_replay_postgres::verify_runtime_role(&mut client)
+            .expect_err(&setup)
+            .to_string();
+        assert!(message.contains(&expected), "{setup}: {message}");
+        eprintln!("refused as expected: {message}");
+        if setup.contains("pg_read_all_data") {
+            connect_client()
+                .batch_execute(&format!("REVOKE pg_read_all_data FROM {a}"))
+                .unwrap();
+        }
+    }
+}
+
+/// Round 4, M4-1: members of the owner role are refused unless listed;
+/// other login members of praetore_runtime are refused only when the
+/// operator configures the allowed logins.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_checks_owner_and_runtime_memberships() {
+    use praetore_replay_postgres::RuntimeRoleOptions;
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let other_runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let owner = TestRole::create("NOLOGIN");
+    let member = TestRole::create("LOGIN");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut admin = scratch.connect();
+    admin
+        .batch_execute(&format!(
+            "{} GRANT {owner} TO {member}; GRANT praetore_runtime TO {other};",
+            transfer_praetore_ownership(&owner.name),
+            owner = owner.name,
+            member = member.name,
+            other = other_runtime.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let message = praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect_err("a member of the owner role must be refused")
+        .to_string();
+    assert!(
+        message.contains(&format!(
+            "role {} is a member of the praetore owner",
+            member.name
+        )),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+    let allowed = RuntimeRoleOptions::default().with_schema_owner_members(&member.name);
+    praetore_replay_postgres::verify_runtime_role_with(&mut client, &allowed)
+        .expect("accepted when the member is listed");
+    let members = praetore_replay_postgres::runtime_role_members(&mut client).unwrap();
+    assert!(members.contains(&other_runtime.name), "{members:?}");
+    let strict = allowed.clone().with_runtime_logins(&runtime.name);
+    let message = praetore_replay_postgres::verify_runtime_role_with(&mut client, &strict)
+        .expect_err("another login member of praetore_runtime when logins are configured")
+        .to_string();
+    assert!(message.contains(&other_runtime.name), "{message}");
+    assert!(!message.contains(&runtime.name), "{message}");
+    // Other tests may add login members concurrently, so only this login is
+    // checked: once listed, it is no longer reported.
+    let both = allowed.with_runtime_logins(&format!("{},{}", runtime.name, other_runtime.name));
+    let reported = praetore_replay_postgres::verify_runtime_role_with(&mut client, &both)
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(!reported.contains(&other_runtime.name), "{reported}");
+}
+
+/// Round 4, B4-1: trusted SECURITY DEFINER entries resolve by OID (aliases
+/// alike), must be qualified with a signature, and an entry that does not
+/// resolve is a configuration error.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_trusted_security_definer_entries_resolve_by_oid_and_fail_closed() {
+    use praetore_replay_postgres::{MigrationOptions, RuntimeRoleOptions};
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let superuser = TestRole::create("SUPERUSER NOLOGIN");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut admin = scratch.connect();
+    admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION public.su_helper(integer) RETURNS int LANGUAGE sql \
+               SECURITY DEFINER SET search_path = pg_catalog AS 'SELECT $1'; \
+             ALTER FUNCTION public.su_helper(integer) OWNER TO {};",
+            superuser.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let alias =
+        RuntimeRoleOptions::default().with_trusted_security_definer("public.su_helper(int4)");
+    praetore_replay_postgres::verify_runtime_role_with(&mut client, &alias)
+        .expect("an alias resolves to the same function");
+    let described =
+        praetore_replay_postgres::describe_trusted_security_definer(&mut client, &alias).unwrap();
+    assert_eq!(described.len(), 1);
+    assert_eq!(described[0].resolved, "public.su_helper(integer)");
+    assert!(described[0].owner_is_superuser);
+    for entry in [
+        "public.nonexistent()",
+        "su_helper(integer)",
+        "public.su_helper",
+    ] {
+        let options = RuntimeRoleOptions::default().with_trusted_security_definer(entry);
+        let error = praetore_replay_postgres::verify_runtime_role_with(&mut client, &options)
+            .expect_err(entry);
+        assert!(
+            matches!(
+                error,
+                praetore_replay_postgres::RuntimeRoleError::InvalidConfiguration(_)
+            ),
+            "{entry}: {error}"
+        );
+        let error = praetore_replay_postgres::apply_migrations_with(
+            &mut admin,
+            &MigrationOptions {
+                trusted_security_definer: vec![entry.to_owned()],
+                ..Default::default()
+            },
+        )
+        .expect_err(entry);
+        assert!(
+            matches!(
+                error,
+                praetore_replay_postgres::MigrationError::InvalidConfiguration(_)
+            ),
+            "{entry}: {error}"
+        );
+        eprintln!("refused as expected ({entry}): {error}");
+    }
+}
+
+/// Round 4, B4-2: the record is not tamper-evident; an erased adoption mark
+/// is at least flagged by its single-transaction write.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migration_record_inconsistency_is_flagged() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    adopt_legacy_baseline(&mut client).unwrap();
+    assert!(
+        praetore_replay_postgres::migration_record_inconsistency(&mut client)
+            .unwrap()
+            .is_none(),
+        "a marked adoption is consistent"
+    );
+    client
+        .batch_execute(
+            "UPDATE praetore.schema_migrations SET adopted_legacy_baseline = false, \
+               adopted_by = NULL, baseline_structure_sha256 = NULL",
+        )
+        .unwrap();
+    let problem = praetore_replay_postgres::migration_record_inconsistency(&mut client)
+        .unwrap()
+        .expect("an erased adoption mark is flagged");
+    eprintln!("flagged as expected: {problem}");
+    let fresh = ScratchDatabase::create();
+    let mut client = fresh.connect();
+    praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    assert!(
+        praetore_replay_postgres::migration_record_inconsistency(&mut client)
+            .unwrap()
+            .is_none(),
+        "a database migrated by the runner is consistent"
+    );
 }
 
 #[test]
@@ -4958,7 +5284,8 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
             "DROP TABLE praetore.owner_probe; \
              REVOKE CREATE ON SCHEMA praetore FROM praetore_storage_creator; \
              REVOKE USAGE ON SCHEMA praetore FROM praetore_storage_owner; \
-             REVOKE ALL ON ALL TABLES IN SCHEMA praetore FROM praetore_storage_grant_all",
+             REVOKE ALL ON ALL TABLES IN SCHEMA praetore FROM praetore_storage_grant_all; \
+             REVOKE pg_write_all_data FROM praetore_storage_writer",
         )
         .unwrap();
 
@@ -4966,8 +5293,15 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
     // runtime needs: schema check and a replay claim.
     verify_runtime_role(&mut runtime).unwrap();
     praetore_replay_postgres::verify_schema_current(&mut runtime).unwrap();
+    // The runtime role is not the schema owner, so it may not migrate.
     let rerun = praetore_replay_postgres::apply_migrations(&mut runtime);
-    assert!(rerun.as_ref().is_ok_and(|v| v.is_empty()), "{rerun:?}");
+    assert!(
+        matches!(
+            rerun,
+            Err(praetore_replay_postgres::MigrationError::UnsafeDatabase(_))
+        ),
+        "{rerun:?}"
+    );
     let guard = PostgresReplayGuard::from_client(runtime);
     let (agent, request) = (Uuid::new_v4(), Uuid::new_v4());
     guard.claim_once(TEST_TENANT_ID, agent, request).unwrap();
