@@ -232,9 +232,11 @@ praetore-verify evidence \
 praetore-verify policy-digest --policy "$D"/policy.json   # compare with the receipt's policy_digest
 ```
 
-`praetore-verify` checks the authority against the current time.
-`praetore-mcp verify` checks it at the receipt's `decided_at`, so historical
-receipts still verify after the local authority expires.
+Both `praetore-verify evidence --issuer-pins` and `praetore-mcp verify` check
+the authority at the receipt's signed `decided_at`, so historical receipts
+still verify after the local authority expires. This shows the authority was
+valid when the decision was recorded, not that it is valid now; the decision
+time is only as trustworthy as the attester key that signed it.
 
 ## Writing policy
 
