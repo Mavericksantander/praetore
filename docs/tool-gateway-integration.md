@@ -142,10 +142,12 @@ gateway must also ensure it is acting on the exact request it constructed.
 engine whose mode is not `HighAssurance`, and invokes the core engine for each
 call. An `AuthorizationRequest` carries a `MissionAction`, which only
 `Policy::classify` builds (G7), so a safety action cannot reach `execute`.
-`POST /v1/execute` classifies the action against `Gateway::policy()` before
-anything else: a `Safety` action gets 422 `safety_action_not_governed`, with
-no evaluation, replay claim, journal write, signature or dispatch, also when
-the journal is unavailable. An undeclared one goes to
+`POST /v1/execute` first answers every action type with the reserved
+`safety:` prefix with 422 `safety_action_not_governed`, declared Safety or
+not, with no evaluation, replay claim, journal write, signature or dispatch,
+also when the journal is unavailable (an undeclared one is only logged, so
+the answer cannot be used to enumerate the table). Other actions are then
+classified against `Gateway::policy()`. An undeclared one goes to
 `Gateway::refuse_unclassified`: the engine verifies it like a mission
 request and commits a signed DENY (engine guard `unclassified_action`) with
 its replay claim; nothing is dispatched. Every DENY is answered with the

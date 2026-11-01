@@ -27,45 +27,63 @@ revert() {
 }
 trap revert EXIT
 
+# One test command per line. A mutant counts as killed only when every
+# listed command fails on it.
 tests_for() {
   case "$1" in
     gateway) echo "cargo test --locked -p praetore-gateway --test safety_actions" ;;
     mcp) echo "cargo test --locked -p praetore-mcp --lib g7_" ;;
     hook) echo "cargo test --locked --manifest-path examples/claude-code-hook/Cargo.toml tests_g7" ;;
     engine) echo "cargo test --locked -p praetore-core --test action_classes" ;;
-    unclassified) echo "cargo test --locked -p praetore-core --test action_classes" ;;
+    unclassified)
+      echo "cargo test --locked -p praetore-core --test action_classes"
+      echo "cargo test --locked -p praetore-gateway --test enforcement g7_forged_or_unauthenticated_unclassified_request_leaves_no_receipt"
+      ;;
   esac
 }
 
 survivors=0
 for mutant in gateway mcp hook engine unclassified; do
-  command="$(tests_for "$mutant")"
-  printf '\n== %s: baseline (%s)\n' "$mutant" "$command"
-  $command 2>&1 | grep -E '^test |test result' || true
-  if ! $command > /dev/null 2>&1; then
-    echo "FAIL: the $mutant G7 tests do not pass on the unmodified tree"
-    exit 1
-  fi
+  commands=()
+  while IFS= read -r line; do commands+=("$line"); done < <(tests_for "$mutant")
+  for command in "${commands[@]}"; do
+    printf '\n== %s: baseline (%s)\n' "$mutant" "$command"
+    $command 2>&1 | grep -E '^test |test result' || true
+    if ! $command > /dev/null 2>&1; then
+      echo "FAIL: the $mutant G7 tests do not pass on the unmodified tree"
+      exit 1
+    fi
+  done
 
   printf '\n== %s: mutant applied (scripts/g7-mutants/%s.patch)\n' "$mutant" "$mutant"
   git apply --check "scripts/g7-mutants/$mutant.patch"
   git apply "scripts/g7-mutants/$mutant.patch"
   applied="$mutant"
-  if ! $command --no-run > /dev/null 2>&1; then
-    echo "FAIL: the $mutant mutant does not compile; update scripts/g7-mutants/$mutant.patch"
-    exit 1
-  fi
-  set +e
-  output="$($command 2>&1)"
-  status=$?
-  set -e
-  grep -E '^test |test result|panicked at|assertion|left:|right:' <<<"$output" | head -40 || true
+  passing=0
+  for command in "${commands[@]}"; do
+    if ! $command --no-run > /dev/null 2>&1; then
+      echo "FAIL: the $mutant mutant does not compile; update scripts/g7-mutants/$mutant.patch"
+      exit 1
+    fi
+    set +e
+    output="$($command 2>&1)"
+    status=$?
+    set -e
+    printf -- '-- %s\n' "$command"
+    grep -E '^test |test result|panicked at|assertion|left:|right:' <<<"$output" | head -40 || true
+    if [ "$status" -eq 0 ]; then
+      echo "still passes: $command"
+      passing=$((passing + 1))
+    else
+      echo "fails on the mutant (exit $status): $command"
+    fi
+  done
   revert
-  if [ "$status" -eq 0 ]; then
-    echo "SURVIVED: the $mutant tests still pass with the mutant"
+  if [ "$passing" -ne 0 ]; then
+    echo "SURVIVED: $passing of the $mutant test commands still pass with the mutant"
     survivors=$((survivors + 1))
   else
-    echo "KILLED: the $mutant tests fail on the mutant (exit $status)"
+    echo "KILLED: the $mutant tests fail on the mutant"
   fi
 done
 

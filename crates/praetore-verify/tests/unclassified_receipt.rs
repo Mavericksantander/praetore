@@ -43,7 +43,10 @@ fn an_unclassified_deny_receipt_verifies_with_praetore_verify() {
     request.sign_intent(&agent_key).unwrap();
     let mut evidence = engine.refuse_unclassified(request).unwrap();
     evidence.sign(&attester).unwrap();
-    assert_eq!(evidence.decision.reason, "unclassified");
+    assert_eq!(
+        evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
 
     let dir = std::env::temp_dir().join(format!(
         "praetore-verify-unclassified-{}",
@@ -92,4 +95,88 @@ fn an_unclassified_deny_receipt_verifies_with_praetore_verify() {
     assert_eq!(summary["ok"], true);
     assert_eq!(summary["details"]["policy_verified"], true);
     assert_eq!(summary["details"]["intent_verified"], true);
+}
+
+/// G7: `--format text` escapes characters that render invisibly or reorder
+/// text in the action type and the tool name; JSON output stays exact.
+#[test]
+fn text_output_escapes_invisible_characters_and_json_stays_exact() {
+    let issuer = AgentKeyPair::from_secret_bytes(&[51; 32]);
+    let agent_key = AgentKeyPair::from_secret_bytes(&[52; 32]);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[53; 32]);
+    let pin = TrustedAuthorityIssuer::new("g7-issuer", issuer.public_key()).unwrap();
+    let policy =
+        Policy::new_v2("g7-verify-escape", 1, vec![]).with_mission_actions(["local:set_value"]);
+    let engine = AuthorizationEngine::strict(policy.clone(), vec![pin]).unwrap();
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(agent.id.clone(), "g7-issuer", vec!["local:write".into()]);
+    authority.sign_for_agent(&issuer, &agent).unwrap();
+    let action_type = "local:set_value\u{200b}";
+    let tool = "rm\u{202e}txt.exe";
+    let action = Action::new(action_type, None, json!({"tool": tool}))
+        .unwrap()
+        .with_capability("local:write");
+    let mut request = AuthorizationRequest::new_unclassified(
+        agent,
+        authority,
+        policy.unclassified(action).unwrap(),
+    )
+    .unwrap();
+    request.sign_intent(&agent_key).unwrap();
+    let mut evidence = engine.refuse_unclassified(request).unwrap();
+    evidence.sign(&attester).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("praetore-verify-escape-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let evidence_file = dir.join("evidence.json");
+    fs::write(&evidence_file, evidence.to_json().unwrap()).unwrap();
+    let pin_file = dir.join("attester.hex");
+    fs::write(
+        &pin_file,
+        format!(
+            "{}\n",
+            hex::encode(attester.public_key().unwrap().as_bytes())
+        ),
+    )
+    .unwrap();
+    let run = |format: &str| {
+        Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+            .arg("evidence")
+            .arg("--evidence")
+            .arg(&evidence_file)
+            .arg("--attester-pin")
+            .arg(&pin_file)
+            .args(["--format", format])
+            .output()
+            .unwrap()
+    };
+    let text_output = run("text");
+    let json_output = run("json");
+    let _ = fs::remove_dir_all(&dir);
+
+    let text = String::from_utf8(text_output.stdout).unwrap();
+    assert!(text_output.status.success(), "{text}");
+    println!("{text}");
+    assert!(
+        text.contains(r#"receipt_action_type="local:set_value\u{200b}""#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"receipt_tool="rm\u{202e}txt.exe""#),
+        "{text}"
+    );
+    assert!(
+        !text.contains('\u{200b}') && !text.contains('\u{202e}'),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            r#"receipt_decided_by={"guard":"unclassified_action","kind":"engine_guard"}"#
+        ),
+        "{text}"
+    );
+
+    let summary: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(summary["details"]["receipt_action_type"], action_type);
+    assert_eq!(summary["details"]["receipt_tool"], tool);
 }

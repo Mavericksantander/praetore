@@ -1,21 +1,21 @@
 diff --git a/crates/praetore-core/src/engine.rs b/crates/praetore-core/src/engine.rs
-index f9b1d37..5f302a7 100644
+index cfea8bc..9bbfb99 100644
 --- a/crates/praetore-core/src/engine.rs
 +++ b/crates/praetore-core/src/engine.rs
-@@ -1239,6 +1239,12 @@ impl AuthorizationEngine {
+@@ -1245,6 +1245,12 @@ impl AuthorizationEngine {
          now: OffsetDateTime,
      ) -> Result<Decision> {
          request.action.check_class(&self.policy)?;
 +        if request.action.as_mission().is_none() {
 +            return Ok(Decision::deny(
-+                "unclassified",
-+                DecidedBy::engine_guard("unclassified_action"),
++                UNCLASSIFIED_DENY_REASON,
++                DecidedBy::engine_guard(UNCLASSIFIED_ACTION_GUARD),
 +            ));
 +        }
          request.agent.validate()?;
          request.authority.validate()?;
          request.action.action().validate()?;
-@@ -1310,14 +1316,9 @@ impl AuthorizationEngine {
+@@ -1316,14 +1322,9 @@ impl AuthorizationEngine {
              return Err(PraetoreError::AuthorityExpired);
          }
  
@@ -23,8 +23,8 @@ index f9b1d37..5f302a7 100644
 -        // An unclassified action is never evaluated against policy rules.
 -        let Some(action) = request.action.as_mission() else {
 -            return Ok(Decision::deny(
--                "unclassified",
--                DecidedBy::engine_guard("unclassified_action"),
+-                UNCLASSIFIED_DENY_REASON,
+-                DecidedBy::engine_guard(UNCLASSIFIED_ACTION_GUARD),
 -            ));
 -        };
 +        // G7 MUTANT: the unclassified refusal is decided above, before the

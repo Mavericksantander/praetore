@@ -490,11 +490,14 @@ fn an_unclassified_action_is_refused_with_an_engine_guard_deny() {
             evidence.decision.outcome,
             praetore_core::DecisionOutcome::Deny
         );
-        assert_eq!(evidence.decision.reason, "unclassified");
+        assert_eq!(
+            evidence.decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
         assert_eq!(
             evidence.decision.decided_by(),
             Some(&praetore_core::DecidedBy::engine_guard(
-                "unclassified_action"
+                praetore_core::UNCLASSIFIED_ACTION_GUARD
             ))
         );
         assert!(evidence.decision.contributions.is_empty());
@@ -560,4 +563,14 @@ fn only_undeclared_action_types_are_unclassified() {
         fixture.engine.refuse_unclassified(request),
         Err(PraetoreError::InvalidRequest(_))
     ));
+}
+
+/// The unclassified DENY's wire values are part of the receipt format.
+#[test]
+fn the_unclassified_deny_constants_are_stable() {
+    assert_eq!(praetore_core::UNCLASSIFIED_DENY_REASON, "unclassified");
+    assert_eq!(
+        praetore_core::UNCLASSIFIED_ACTION_GUARD,
+        "unclassified_action"
+    );
 }

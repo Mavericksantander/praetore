@@ -39,12 +39,12 @@ jobs:
           # compile_fail,E0308: an AuthorizationRequest cannot hold a SafetyAction.
           run "authorization::AuthorizationRequest \(line [0-9]+\) - compile fail \.\.\. ok" \
             cargo test --locked -p praetore-core --doc authorization::AuthorizationRequest
-          run "test result: ok\. 17 passed" cargo test --locked -p praetore-core --test action_classes
-          run "test result: ok\. 4 passed" \
+          run "test result: ok\. 18 passed" cargo test --locked -p praetore-core --test action_classes
+          run "test result: ok\. 5 passed" \
             cargo test --locked -p praetore-gateway --test safety_actions -- --nocapture
           run "test result: ok\. 5 passed" cargo test --locked -p praetore-mcp --lib g7_ -- --nocapture
           run "test result: ok\. 4 passed" cargo test --locked -p praetore-gateway --test enforcement g7_
-          run "test result: ok\. 1 passed" cargo test --locked -p praetore-verify --test unclassified_receipt
+          run "test result: ok\. 2 passed" cargo test --locked -p praetore-verify --test unclassified_receipt
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"

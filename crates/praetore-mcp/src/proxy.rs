@@ -441,15 +441,9 @@ fn decide_verdict(
 /// Replaces control characters (terminal escapes) in untrusted text and
 /// bounds its length before it is printed.
 pub fn display_safe(value: &str) -> String {
-    let mut out: String = value
-        .chars()
-        .take(200)
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if value.chars().count() > 200 {
-        out.push('…');
-    }
-    out
+    // Control, zero-width and bidi characters are written as `\u{XXXX}`
+    // (G7), so a tool name cannot pass for another in a table or log line.
+    praetore_core::display::escape_bounded(value, 200)
 }
 
 pub fn outcome_label(outcome: DecisionOutcome) -> &'static str {
@@ -712,7 +706,12 @@ mod tests {
 
     #[test]
     fn display_safe_strips_escapes() {
-        assert_eq!(display_safe("rm\u{1b}[2J\n"), "rm?[2J?");
+        assert_eq!(display_safe("rm\u{1b}[2J\n"), "rm\\u{1b}[2J\\u{a}");
+        assert_eq!(
+            display_safe("local:set_value\u{200b}"),
+            "local:set_value\\u{200b}"
+        );
+        assert_eq!(display_safe("a\u{202e}b"), "a\\u{202e}b");
     }
 
     #[test]

@@ -4647,11 +4647,14 @@ async fn g7_undeclared_action_leaves_a_signed_unclassified_deny() {
     assert_eq!(entry.execution, ExecutionStatus::NotDispatched);
     let evidence = entry.evidence;
     assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
-    assert_eq!(evidence.decision.reason, "unclassified");
+    assert_eq!(
+        evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
     assert_eq!(
         evidence.decision.decided_by(),
         Some(&praetore_core::DecidedBy::engine_guard(
-            "unclassified_action"
+            praetore_core::UNCLASSIFIED_ACTION_GUARD
         ))
     );
     assert!(evidence.decision.contributions.is_empty());

@@ -393,13 +393,13 @@ async fn safety_action_is_refused_before_the_engine_with_the_journal_down() {
     }
 }
 
-/// G7: an undeclared action type (including an undeclared `safety:` one) is
+/// G7: an undeclared action type without the reserved prefix is
 /// verified by the engine and refused with a signed DENY that must be
 /// committed like any decision; it is never evaluated against policy rules.
 /// With the journal down, the commit fails and the gateway fails closed.
 #[tokio::test]
 async fn unclassified_action_is_not_evaluated_and_fails_closed_with_the_journal_down() {
-    for action_type in ["demo:delete", "safety:hold"] {
+    for action_type in ["demo:delete", "SAFETY:hold"] {
         let policy_id = format!("g7-gateway-unclassified-{action_type}");
         let (gateway, probes, body) = setup_with(&policy_id, action_type);
 
@@ -456,4 +456,103 @@ async fn mission_action_reaches_the_engine_and_fails_closed_with_the_journal_dow
         "the commit reached the journal"
     );
     assert_eq!(probes.dispatcher.0.get(), 0, "nothing was dispatched");
+}
+
+/// Captures WARN events (message and fields) on the current thread.
+#[derive(Default, Clone)]
+struct WarnCapture(Arc<std::sync::Mutex<Vec<String>>>);
+
+struct FieldText<'a>(&'a mut String);
+
+impl tracing::field::Visit for FieldText<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+impl tracing::Subscriber for WarnCapture {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut line = String::new();
+            event.record(&mut FieldText(&mut line));
+            self.0.lock().unwrap().push(line);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+async fn post_raw(gateway: Gateway, body: &Value) -> (StatusCode, Vec<(String, Vec<u8>)>, Vec<u8>) {
+    let app = http_api::router(
+        Arc::new(gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/execute")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
+        .collect();
+    let bytes = to_bytes(response.into_body(), 65_536)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, headers, bytes)
+}
+
+/// G7 (gateway): every action type with the reserved `safety:` prefix gets
+/// the same answer, declared Safety or not: byte-identical status, headers
+/// and body, no engine call and no journal row. Only the undeclared one is
+/// logged (WARN, unsigned), with the claimed agent id and the escaped type.
+#[tokio::test]
+async fn reserved_safety_prefix_answers_the_same_declared_or_not() {
+    let capture = WarnCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    let declared_id = "g7-gateway-prefix-declared";
+    let undeclared_id = "g7-gateway-prefix-undeclared";
+    let (declared_gateway, declared_probes, mut declared) = setup(declared_id);
+    declared["action"]["action_type"] = json!("safety:halt");
+    let (undeclared_gateway, undeclared_probes, mut undeclared) = setup(undeclared_id);
+    undeclared["action"]["action_type"] = json!("safety:hold\u{200b}");
+
+    let declared_response = post_raw(declared_gateway, &declared).await;
+    let warnings_after_declared = capture.0.lock().unwrap().len();
+    let undeclared_response = post_raw(undeclared_gateway, &undeclared).await;
+
+    assert_eq!(declared_response.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(declared_response, undeclared_response, "byte-identical");
+    let body: Value = serde_json::from_slice(&declared_response.2).unwrap();
+    assert_eq!(body["code"], "safety_action_not_governed");
+    declared_probes.assert_untouched();
+    undeclared_probes.assert_untouched();
+
+    let warnings = capture.0.lock().unwrap().clone();
+    assert_eq!(
+        warnings_after_declared, 0,
+        "a declared Safety action is not logged"
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let warning = &warnings[0];
+    assert!(warning.contains("undeclared safety action"), "{warning}");
+    assert!(
+        warning.contains("safety:hold\\u{200b}"),
+        "escaped: {warning}"
+    );
+    let agent_id = undeclared["agent"]["id"].as_str().unwrap();
+    assert!(warning.contains(agent_id), "{warning}");
 }

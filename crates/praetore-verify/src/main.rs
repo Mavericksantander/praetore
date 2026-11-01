@@ -138,20 +138,23 @@ fn main() {
             // whether the check used the receipt's signed decision time or
             // the verifier's clock.
             let source = summary.details.get("authority_checked_at_source");
+            // Text is for people: values are JSON-encoded, then characters
+            // that render invisibly or reorder text (zero-width, bidi,
+            // control) are written as `\u{XXXX}` so an action type or tool
+            // name cannot pass for another. JSON output stays exact.
+            let text = |value: &serde_json::Value| {
+                praetore_core::display::escape_invisible(
+                    &serde_json::to_string(value).unwrap_or_else(|_| "null".into()),
+                )
+            };
             if let Some(source) = source {
-                print!(
-                    " authority_checked_at_source={}",
-                    serde_json::to_string(source).unwrap_or_else(|_| "null".into())
-                );
+                print!(" authority_checked_at_source={}", text(source));
             }
             for (key, value) in &summary.details {
                 if source.is_some() && key == "authority_checked_at_source" {
                     continue;
                 }
-                print!(
-                    " {key}={}",
-                    serde_json::to_string(value).unwrap_or_else(|_| "null".into())
-                );
+                print!(" {key}={}", text(value));
             }
             println!();
         }
@@ -340,6 +343,30 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             evidence
                 .verify_attester_signature(&attester)
                 .map_err(CliError::from_core)?;
+            // What the receipt is about, exactly as signed (JSON output is
+            // exact; `--format text` escapes invisible characters).
+            details.insert(
+                "receipt_action_type".into(),
+                serde_json::Value::String(evidence.action.action_type.clone()),
+            );
+            if let Some(tool) = evidence
+                .action
+                .parameters
+                .get("tool")
+                .filter(|t| t.is_string())
+            {
+                details.insert("receipt_tool".into(), tool.clone());
+            }
+            details.insert(
+                "receipt_decision".into(),
+                serde_json::to_value(evidence.decision.outcome).unwrap_or(serde_json::Value::Null),
+            );
+            if let Some(decided_by) = evidence.decision.decided_by() {
+                details.insert(
+                    "receipt_decided_by".into(),
+                    serde_json::to_value(decided_by).unwrap_or(serde_json::Value::Null),
+                );
+            }
             if require_decision_time && !evidence.is_high_assurance_shape() {
                 return Err(CliError {
                     code: "DECISION_TIME_MISSING",

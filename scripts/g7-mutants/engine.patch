@@ -1,8 +1,8 @@
 diff --git a/crates/praetore-core/src/engine.rs b/crates/praetore-core/src/engine.rs
-index f9b1d37..b2c7df0 100644
+index cfea8bc..83f571f 100644
 --- a/crates/praetore-core/src/engine.rs
 +++ b/crates/praetore-core/src/engine.rs
-@@ -1011,7 +1011,7 @@ impl AuthorizationEngine {
+@@ -1017,7 +1017,7 @@ impl AuthorizationEngine {
          // engine's policy, and an unclassified one must still be undeclared
          // (either may have been built against another policy). Checked
          // before the clock, the replay guard or any signature.
@@ -11,7 +11,7 @@ index f9b1d37..b2c7df0 100644
          let now = self.clock.now()?;
          if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
              return Err(PraetoreError::InvalidRequest(
-@@ -1238,7 +1238,7 @@ impl AuthorizationEngine {
+@@ -1244,7 +1244,7 @@ impl AuthorizationEngine {
          request: &AuthorizationRequest<A>,
          now: OffsetDateTime,
      ) -> Result<Decision> {

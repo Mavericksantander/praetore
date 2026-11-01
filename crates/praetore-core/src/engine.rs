@@ -100,6 +100,12 @@ impl ClockSource {
     }
 }
 
+/// Reason of the DENY that [`AuthorizationEngine::refuse_unclassified`]
+/// records for an action type the policy does not declare (G7).
+pub const UNCLASSIFIED_DENY_REASON: &str = "unclassified";
+/// Engine guard named in that DENY's `decided_by`.
+pub const UNCLASSIFIED_ACTION_GUARD: &str = "unclassified_action";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvaluationMode {
     Development,
@@ -1314,8 +1320,8 @@ impl AuthorizationEngine {
         // An unclassified action is never evaluated against policy rules.
         let Some(action) = request.action.as_mission() else {
             return Ok(Decision::deny(
-                "unclassified",
-                DecidedBy::engine_guard("unclassified_action"),
+                UNCLASSIFIED_DENY_REASON,
+                DecidedBy::engine_guard(UNCLASSIFIED_ACTION_GUARD),
             ));
         };
 

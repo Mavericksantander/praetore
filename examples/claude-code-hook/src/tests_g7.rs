@@ -133,7 +133,7 @@ fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
     let verdict = authorize(&s.state, &s.input("safety:hold", json!({}))).unwrap();
     assert!(!verdict.not_governed);
     assert_eq!(verdict.outcome, DecisionOutcome::Deny);
-    assert_eq!(verdict.reason, "unclassified");
+    assert_eq!(verdict.reason, praetore_core::UNCLASSIFIED_DENY_REASON);
     assert_eq!(probe::engine_calls(&s.policy_id), 1);
     assert_eq!(
         probe::policy_evaluations(&s.policy_id),
@@ -150,12 +150,10 @@ fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
     .unwrap();
     let evidence = Evidence::from_json(&line["evidence"].to_string()).unwrap();
     assert_eq!(evidence.action.action_type, "safety:hold");
-    assert_eq!(evidence.decision.reason, "unclassified");
+    assert_eq!(evidence.decision.reason, praetore_core::UNCLASSIFIED_DENY_REASON);
     assert_eq!(
         evidence.decision.decided_by(),
-        Some(&praetore_core::DecidedBy::engine_guard(
-            "unclassified_action"
-        ))
+        Some(&praetore_core::DecidedBy::engine_guard(praetore_core::UNCLASSIFIED_ACTION_GUARD))
     );
     verify_receipts(&s.state).unwrap();
 

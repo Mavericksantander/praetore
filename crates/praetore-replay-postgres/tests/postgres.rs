@@ -6450,13 +6450,19 @@ fn postgres_g7_unclassified_action_commits_a_signed_deny() {
         .unwrap();
 
     assert_eq!(receipt.evidence.decision.outcome, DecisionOutcome::Deny);
-    assert_eq!(receipt.evidence.decision.reason, "unclassified");
+    assert_eq!(
+        receipt.evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
     assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
     assert_eq!(database_journal_count(key), 1);
     assert_eq!(database_replay_claim_count(key), 1);
     assert_eq!(fixture.adapter.invocation_count(), 0);
     let persisted = connect_journal().get(key).unwrap().unwrap();
-    assert_eq!(persisted.evidence.decision.reason, "unclassified");
+    assert_eq!(
+        persisted.evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
     // The same request again is a replay.
     assert!(fixture.gateway.refuse_unclassified(request).is_err());
     assert_eq!(database_journal_count(key), 1);

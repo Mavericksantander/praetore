@@ -441,12 +441,14 @@ struct ApprovalErrorContext {
 /// `{"code": "authorization_denied", "authorization": "denied", "execution":
 /// "not_dispatched", "evidence_id": ..., "request_id": ...}`, whatever
 /// decided it; the signed receipt, with the reason, is persisted in the
-/// execution journal. The action is classified against the engine policy's
-/// `action_classes` first (G7): a `Safety` action gets 422
-/// `safety_action_not_governed` with no evaluation, replay claim, journal
-/// write, signature or dispatch; an undeclared one is verified like a
-/// mission request and refused with a signed DENY (engine guard
-/// `unclassified_action`), answered like any other DENY. Request bodies are size
+/// execution journal. Before anything else (G7), an action type with the
+/// reserved `safety:` prefix gets 422 `safety_action_not_governed`, declared
+/// Safety or not, with no evaluation, replay claim, journal write, signature
+/// or dispatch (an undeclared one is only logged; see docs/threat-model.md).
+/// Any other action type is classified against the engine policy's
+/// `action_classes`: an undeclared one is verified like a mission request and
+/// refused with a signed DENY (engine guard `unclassified_action`), answered
+/// like any other DENY. Request bodies are size
 /// limited and parsed through PRÆTORE's duplicate-key rejecting parser.
 pub fn router(gateway: Arc<Gateway>, auth: ApiAuth) -> Router {
     router_with_options(gateway, auth, HttpOptions::default())
@@ -505,15 +507,38 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     if let Err(denied) = state.authenticate_role(&headers, ApiRole::Agent) {
         return denied.into_response();
     }
-    // G7: the action is classified against the engine's policy first. A
-    // safety action is answered here, before any replay claim, journal write,
-    // signature or dispatch: PRÆTORE makes no decision about it.
-    let parsed = match std::str::from_utf8(&body) {
-        Ok(json) => AuthorizationRequest::classify_json(json, state.gateway.policy()),
+    let json = match std::str::from_utf8(&body) {
+        Ok(json) => json,
         Err(_) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid_authorization_request");
         }
     };
+    // G7: the reserved `safety:` prefix decides here, not the policy table.
+    // Every such action type gets the same 422, declared Safety or not, with
+    // no engine, journal or signing work, so the answer depends only on the
+    // public prefix rule and cannot be used to enumerate `action_classes`.
+    if let Some(claimed) = reserved_safety_action(json) {
+        if state
+            .gateway
+            .policy()
+            .action_classes
+            .get(&claimed.action_type)
+            != Some(&praetore_core::ActionClass::Safety)
+        {
+            // Not declared: no receipt (see docs/threat-model.md), only this
+            // unsigned trace. The agent id is the request's claim, unverified.
+            tracing::warn!(
+                claimed_agent_id = %claimed.agent_id,
+                action_type = %claimed.action_type_display,
+                "undeclared safety action refused as not governed; no receipt"
+            );
+        }
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "safety_action_not_governed",
+        );
+    }
+    let parsed = AuthorizationRequest::classify_json(json, state.gateway.policy());
     let request = match parsed {
         Ok(request) => request,
         Err(PraetoreError::SafetyActionNotGoverned { .. }) => {
@@ -586,6 +611,36 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
         return with_executed_by(options, execution, (status, Json(body)).into_response());
     }
     with_executed_by(options, execution, (status, Json(receipt)).into_response())
+}
+
+/// A request whose `action.action_type` starts with the reserved `safety:`
+/// prefix, read from strict JSON before any verification.
+struct ReservedSafetyAction {
+    action_type: String,
+    /// Bounded and escaped for the log line.
+    action_type_display: String,
+    agent_id: String,
+}
+
+fn reserved_safety_action(json: &str) -> Option<ReservedSafetyAction> {
+    let document = parse_json_rejecting_duplicates(json).ok()?;
+    let action_type = document.get("action")?.get("action_type")?.as_str()?;
+    if !action_type.starts_with(praetore_core::policy::SAFETY_ACTION_PREFIX) {
+        return None;
+    }
+    let agent_id = document
+        .get("agent")
+        .and_then(|agent| agent.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || "-".to_owned(),
+            |id| praetore_core::display::escape_bounded(id, 64),
+        );
+    Some(ReservedSafetyAction {
+        action_type: action_type.to_owned(),
+        action_type_display: praetore_core::display::escape_bounded(action_type, 128),
+        agent_id,
+    })
 }
 
 /// The response to every DENY decision of `POST /v1/execute` (G7).

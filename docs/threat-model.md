@@ -149,12 +149,33 @@ Trust boundaries are explicit:
   `unclassified_action`), after the same verification as a mission request,
   so a forged or unauthenticated request gets no receipt. Every DENY gets
   the same client-facing answer at the gateway, in `praetore-mcp` and in the
-  hook, so the answer does not reveal whether an action type is declared or
-  which rule matched. Known limits: response timing is not uniform (an
-  undeclared action skips rule evaluation), the 422
-  `safety_action_not_governed` answer tells an authenticated client that an
-  action type is declared `Safety`, and in `praetore-mcp` observe mode a
-  policy DENY is forwarded while an undeclared action is refused.
+  hook, so a DENY does not reveal whether an action type is declared or
+  which rule matched. This applies to DENY only: a REQUIRE_APPROVAL answer
+  still carries the receipt (gateway) or names the rule (`praetore-mcp`).
+* Gateway exception for the reserved prefix: `POST /v1/execute` answers
+  every action type that starts with `safety:` with the same 422
+  `safety_action_not_governed`, before any verification, engine, journal or
+  signing work, whether the policy declares it `Safety` or not. An
+  undeclared `safety:*` therefore gets no receipt at the gateway, only an
+  unsigned WARN log line with the claimed agent id and the escaped action
+  type. The reason is that the answer then depends only on the public prefix
+  rule, so an authenticated agent cannot use it to enumerate the Safety part
+  of `action_classes`. `praetore-mcp` and the hook keep the signed
+  `unclassified` DENY for an undeclared `safety:*`; there the Safety part of
+  the table is observable by design (a declared one is forwarded or gets no
+  decision).
+* Known limits: response timing is not uniform (an undeclared action skips
+  rule evaluation; on the reserved-prefix path the WARN line is written only
+  for an undeclared type), and in `praetore-mcp` observe mode a policy DENY
+  is forwarded while an undeclared action is refused.
+* Text meant for people escapes characters that render invisibly or reorder
+  text (zero-width, bidi, control) as `\u{XXXX}`: `praetore-verify
+  --format text`, `praetore-mcp` tables and stderr lines, and the gateway's
+  WARN line. Receipts, JSONL exports and JSON output keep the exact bytes.
+  `praetore journal-export` writes JSONL and a JSON summary only, so it has
+  no text rendering of action types. Audits should select unclassified
+  refusals by `decided_by` (`engine_guard` / `unclassified_action`), not by
+  the action type.
 
 ## Invariants and traceability
 

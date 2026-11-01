@@ -194,11 +194,12 @@ The entry points that accept JSON classify first. A `Safety` action is
 answered with `SAFETY_ACTION_NOT_GOVERNED` before any replay claim, journal
 write or signature. An undeclared one leaves a signed DENY receipt, recorded
 like a policy DENY on that path, and the client sees the same answer as for
-any DENY:
+any DENY (this uniformity covers DENY only; REQUIRE_APPROVAL still returns
+the receipt or names the rule):
 
 | Entry point | Safety action | Undeclared action |
 | --- | --- | --- |
-| Gateway HTTP API (`POST /v1/execute`) | 422 `safety_action_not_governed` | signed DENY committed to the journal; 403 `authorization_denied`, the same body as every DENY |
+| Gateway HTTP API (`POST /v1/execute`) | 422 `safety_action_not_governed` | signed DENY committed to the journal; 403 `authorization_denied`, the same body as every DENY. Exception: an undeclared type with the reserved `safety:` prefix gets the same 422 as a declared one, with no receipt (a WARN log line only), so the answer depends only on the prefix |
 | `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe (except inside a JSON-RPC batch with a blocked call, which enforce refuses as a whole) | signed DENY receipt in the journal; refused in enforce and observe with the same text as every DENY, nothing forwarded; this covers every tool name that starts with `safety` in any ASCII case and is not exactly a declared Safety action (a name that is not a valid action type is recorded as `praetore-mcp unclassified tool name`, with the raw name in `tool`), and an undeclared `mcp.tools/call` |
 | Claude Code hook (a tool named `safety:*`) | no permission decision from PRÆTORE (the host's own rules apply), nothing signed or appended | signed DENY appended to `receipts.jsonl`; denied with the same text as every DENY |
 

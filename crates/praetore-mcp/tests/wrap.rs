@@ -1168,7 +1168,10 @@ fn g7_undeclared_safety_call_is_refused_in_both_modes() {
         assert_eq!(evidence.len(), 1, "{mode}");
         assert_eq!(evidence[0].action.action_type, "safety:hold");
         assert_eq!(evidence[0].decision.outcome, DecisionOutcome::Deny);
-        assert_eq!(evidence[0].decision.reason, "unclassified");
+        assert_eq!(
+            evidence[0].decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
         assert!(text.contains(&evidence[0].evidence_id.to_string()));
         let verify = verify_cli(&home);
         let report = String::from_utf8_lossy(&verify.stdout);
@@ -1215,7 +1218,7 @@ fn g7_safety_named_calls_that_are_not_declared_are_never_forwarded() {
             assert!(
                 journal(&home)
                     .iter()
-                    .all(|e| e.decision.reason == "unclassified"),
+                    .all(|e| e.decision.reason == praetore_core::UNCLASSIFIED_DENY_REASON),
                 "{mode}/{id}"
             );
         }

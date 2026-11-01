@@ -1207,7 +1207,7 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
         unclassified: outcome == DecisionOutcome::Deny
             && evidence.decision.decided_by()
                 == Some(&praetore_core::DecidedBy::engine_guard(
-                    "unclassified_action",
+                    praetore_core::UNCLASSIFIED_ACTION_GUARD,
                 )),
         outcome,
         evidence_id: evidence.evidence_id,
@@ -1413,11 +1413,14 @@ mod tests {
             .evaluate_evidence("tools", &json!({"name": "safety:hold"}))
             .unwrap();
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
-        assert_eq!(evidence.decision.reason, "unclassified");
+        assert_eq!(
+            evidence.decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
         assert_eq!(
             evidence.decision.decided_by(),
             Some(&praetore_core::DecidedBy::engine_guard(
-                "unclassified_action"
+                praetore_core::UNCLASSIFIED_ACTION_GUARD
             ))
         );
         assert_eq!(evidence.action.action_type, "safety:hold");
@@ -1435,7 +1438,10 @@ mod tests {
             .unwrap();
         assert_eq!(evidence.action.action_type, UNCLASSIFIED_TOOL_ACTION_TYPE);
         assert_eq!(evidence.action.parameters["tool"], "safety:halt ");
-        assert_eq!(evidence.decision.reason, "unclassified");
+        assert_eq!(
+            evidence.decision.reason,
+            praetore_core::UNCLASSIFIED_DENY_REASON
+        );
     }
 
     /// Control: a mission call in the same setup reaches the engine, and the

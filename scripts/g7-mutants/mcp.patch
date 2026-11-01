@@ -16,7 +16,7 @@ index fb4f619..3aced84 100644
  
  impl SafetyAction {
 diff --git a/crates/praetore-mcp/src/gate.rs b/crates/praetore-mcp/src/gate.rs
-index c80804e..cfab6ff 100644
+index 4027642..98ac5d0 100644
 --- a/crates/praetore-mcp/src/gate.rs
 +++ b/crates/praetore-mcp/src/gate.rs
 @@ -1085,11 +1085,8 @@ impl Gate {

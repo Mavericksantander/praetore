@@ -3,6 +3,7 @@ pub mod authority;
 pub mod authorization;
 pub mod canonical;
 pub mod decision;
+pub mod display;
 pub mod engine;
 pub mod error;
 pub mod evidence;
@@ -26,7 +27,7 @@ pub use decision::{
 };
 pub use engine::{
     AtomicEvaluationError, EvaluationMode, HighAssuranceConfig, TrustedAuthorityIssuer,
-    TrustedClock, TrustedClockError,
+    TrustedClock, TrustedClockError, UNCLASSIFIED_ACTION_GUARD, UNCLASSIFIED_DENY_REASON,
 };
 pub use error::{ErrorKind, PraetoreError, Result};
 pub use evidence::{Evidence, EvidenceAttesterKey};

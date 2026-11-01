@@ -64,14 +64,31 @@
   `{"code": "authorization_denied", "authorization": "denied", "execution":
   "not_dispatched", "evidence_id": ..., "request_id": ...}`, instead of the
   signed receipt, whatever decided it (a rule, an engine guard or an
-  undeclared action type), so the response does not reveal what the policy
-  declares or which rule matched. The receipt, with its reason, is in the
+  undeclared action type), so a DENY response does not reveal what the
+  policy declares or which rule matched (REQUIRE_APPROVAL responses still
+  carry the receipt and the rule). The receipt, with its reason, is in the
   execution journal (`praetore journal-export`). The 422
   `unclassified_action` response is removed. Likewise, `praetore-mcp`
   answers every DENY with `Denied by PRÆTORE. Evidence id: ...` (the rule
   and reason go to stderr) and the hook answers every DENY that has a
   receipt with `PRÆTORE denied this tool call (evidence ...)` (details on
   stderr). Response timing is not made uniform.
+- **Gateway: the reserved `safety:` prefix decides before classification.**
+  `POST /v1/execute` answers every action type that starts with `safety:`
+  with the same 422 `safety_action_not_governed` (same body, headers and
+  code path), declared Safety or not, before any verification, engine,
+  journal or signing work. An undeclared `safety:*` gets no receipt at the
+  gateway, only an unsigned WARN log line with the claimed agent id and the
+  escaped, bounded action type, so the answer cannot be used to enumerate
+  the table. `praetore-mcp` and the hook keep the signed `unclassified`
+  DENY for it.
+- Human-facing text escapes characters that render invisibly or reorder text
+  (zero-width, bidi, control) as `\u{XXXX}`: `praetore-verify --format text`
+  (which now also reports `receipt_action_type`, `receipt_tool`,
+  `receipt_decision` and `receipt_decided_by`), `praetore-mcp` tables and
+  stderr, and the gateway's WARN line (`praetore_core::display`). JSON
+  output and receipts stay exact. `UNCLASSIFIED_DENY_REASON` and
+  `UNCLASSIFIED_ACTION_GUARD` are public constants in `praetore-core`.
 - **Breaking (behaviour change, praetore-mcp observe mode).** A call whose
   action type the policy does not declare (`UNCLASSIFIED_ACTION`) is now
   refused in observe mode too, not forwarded: an undeclared `safety:*`, any
