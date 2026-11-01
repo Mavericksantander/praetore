@@ -3655,25 +3655,44 @@ fn postgres_runtime_tenant_context_ignores_hostile_search_path() {
     assert_eq!(stored, tenant);
 }
 
-/// A harmless database or role search_path (pg_catalog still searched first)
-/// does not stop the runtime: runtime transactions pin search_path anyway.
+/// A database or role search_path setting is refused by default, even a
+/// harmless one, and accepted only when the operator allows it explicitly
+/// (PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path).
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
-fn postgres_runtime_role_accepts_a_harmless_search_path_setting() {
+fn postgres_runtime_role_refuses_a_search_path_setting_unless_allowed() {
     let runtime = TestRole::create("LOGIN NOBYPASSRLS");
     let scratch = migrated_with_runtime(&runtime);
     scratch
         .connect()
         .batch_execute(&format!(
-            "ALTER DATABASE {db} SET search_path = \"$user\", public, extensions; \
-             ALTER ROLE {role} IN DATABASE {db} SET search_path = pg_catalog, public",
-            db = scratch.name,
-            role = runtime.name
+            "ALTER DATABASE {db} SET search_path = \"$user\", public, extensions",
+            db = scratch.name
         ))
         .unwrap();
     let mut client = connect_scratch_as(&scratch, &runtime.name);
-    praetore_replay_postgres::verify_runtime_role(&mut client)
-        .expect("a search_path with pg_catalog first is accepted");
+    let error = praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect_err("a search_path setting is refused by default");
+    let message = error.to_string();
+    assert!(message.contains("search_path="), "{message}");
+    eprintln!("refused as expected: {message}");
+    let allowed =
+        praetore_replay_postgres::RuntimeRoleOptions::from_allow_settings("search_path").unwrap();
+    praetore_replay_postgres::verify_runtime_role_with(&mut client, &allowed)
+        .expect("accepted when search_path is explicitly allowed");
+    // The allowlist relaxes only search_path.
+    scratch
+        .connect()
+        .batch_execute(&format!(
+            "ALTER ROLE {role} IN DATABASE {db} SET row_security = off",
+            role = runtime.name,
+            db = scratch.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let error = praetore_replay_postgres::verify_runtime_role_with(&mut client, &allowed)
+        .expect_err("row_security stays refused");
+    assert!(error.to_string().contains("row_security=off"), "{error}");
 }
 
 const OWNER_BACKDOOR: &str = "CREATE FUNCTION public.maintenance(sql text) RETURNS void \

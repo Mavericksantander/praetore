@@ -453,8 +453,10 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// triggers do not fire or row-level security could be switched off
 /// (`session_replication_role`, `row_security`: the current value, a
 /// per-database or per-role setting, a non-default session-start value such
-/// as one from `ALTER SYSTEM`, or a parameter grant), and a session
-/// search_path that puts another schema before `pg_catalog`.
+/// as one from `ALTER SYSTEM`, or a parameter grant), a per-database or
+/// per-role `search_path` setting, and a session search_path that puts
+/// another schema before `pg_catalog`. The `search_path` refusals can be
+/// relaxed only explicitly, with `RuntimeRoleOptions`.
 ///
 /// The checks run in a read-only transaction under `RUNTIME_SEARCH_PATH`, so
 /// they cannot be shadowed themselves. They run once, when the caller starts
@@ -462,17 +464,99 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// connection factory are not checked again. Every runtime transaction pins
 /// its search_path (`set_tenant_context`) regardless.
 pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> {
+    verify_runtime_role_with(client, &RuntimeRoleOptions::default())
+}
+
+/// Refusals of `verify_runtime_role` that an operator may relax explicitly.
+/// Everything is refused by default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeRoleOptions {
+    allow_search_path: bool,
+    trusted_security_definer: Vec<String>,
+}
+
+impl RuntimeRoleOptions {
+    /// Environment variable the gateway and praetore-observe read (exact
+    /// names, comma-separated).
+    pub const ALLOW_SETTINGS_ENV: &'static str = "PRAETORE_RUNTIME_ALLOW_SETTINGS";
+
+    /// Parses the value of `PRAETORE_RUNTIME_ALLOW_SETTINGS`: exact,
+    /// comma-separated names. The only relaxable setting is `search_path`
+    /// (a per-database or per-role `search_path`, or a session search_path
+    /// that puts another schema before `pg_catalog`). Any other name, for
+    /// example `row_security` or `session_replication_role`, is an error.
+    pub fn from_allow_settings(value: &str) -> Result<Self, String> {
+        let mut options = Self::default();
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name {
+                "search_path" => options.allow_search_path = true,
+                other => {
+                    return Err(format!(
+                        "{}: unknown or non-relaxable setting {other:?} (allowed: search_path)",
+                        Self::ALLOW_SETTINGS_ENV
+                    ));
+                }
+            }
+        }
+        Ok(options)
+    }
+
+    /// Environment variable the gateway and praetore-observe read for
+    /// trusted SECURITY DEFINER functions (semicolon-separated
+    /// `regprocedure` names, for example `public.helper(integer)`).
+    pub const TRUSTED_SECURITY_DEFINER_ENV: &'static str =
+        "PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS";
+
+    /// Trusts the SECURITY DEFINER functions named in `value`
+    /// (semicolon-separated `regprocedure` names): they are not reported by
+    /// the owner-rights check. Nothing is trusted by default.
+    pub fn with_trusted_security_definer(mut self, value: &str) -> Self {
+        self.trusted_security_definer = value
+            .split(';')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect();
+        self
+    }
+
+    /// The trusted SECURITY DEFINER functions, for the startup log.
+    pub fn trusted_security_definer(&self) -> &[String] {
+        &self.trusted_security_definer
+    }
+
+    /// The relaxed refusals, for the startup log.
+    pub fn relaxed(&self) -> Vec<&'static str> {
+        let mut relaxed = Vec::new();
+        if self.allow_search_path {
+            relaxed.push("search_path");
+        }
+        if !self.trusted_security_definer.is_empty() {
+            relaxed.push("trusted SECURITY DEFINER functions");
+        }
+        relaxed
+    }
+}
+
+/// `verify_runtime_role` with explicitly relaxed refusals.
+pub fn verify_runtime_role_with(
+    client: &mut Client,
+    options: &RuntimeRoleOptions,
+) -> Result<(), RuntimeRoleError> {
     let mut transaction = client.build_transaction().read_only(true).start()?;
-    // The session's own search_path, before it is pinned below. A harmless
-    // value (pg_catalog implicitly or explicitly first, e.g. "$user", public)
-    // is accepted: runtime transactions pin search_path anyway.
+    // The session's own search_path, before it is pinned below.
     let schemas: Vec<String> = transaction
         .query_one(
             "SELECT pg_catalog.current_schemas(true)::pg_catalog.text[]",
             &[],
         )?
         .get(0);
-    if let Some(first) = schemas.iter().find(|schema| !schema.starts_with("pg_temp"))
+    if !options.allow_search_path
+        && let Some(first) = schemas.iter().find(|schema| !schema.starts_with("pg_temp"))
         && first != "pg_catalog"
     {
         return Err(RuntimeRoleError::UnsafeSetting(format!(
@@ -484,13 +568,14 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
         "SET LOCAL search_path = {}",
         crate::RUNTIME_SEARCH_PATH
     ))?;
-    let result = verify_runtime_role_in(&mut transaction);
+    let result = verify_runtime_role_in(&mut transaction, options);
     transaction.rollback()?;
     result
 }
 
 fn verify_runtime_role_in(
     transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
 ) -> Result<(), RuntimeRoleError> {
     let replication_role: String = transaction
         .query_one(
@@ -501,7 +586,7 @@ fn verify_runtime_role_in(
     if replication_role != "origin" {
         return Err(RuntimeRoleError::TriggersDisabled(replication_role));
     }
-    if let Some(setting) = unsafe_runtime_setting(transaction)? {
+    if let Some(setting) = unsafe_runtime_setting(transaction, options)? {
         return Err(RuntimeRoleError::UnsafeSetting(setting));
     }
     let row = transaction.query_one(
@@ -551,7 +636,7 @@ fn verify_runtime_role_in(
             return Err(RuntimeRoleError::ExcessTablePrivilege(role));
         }
     }
-    if let Some(function) = owner_function_executable(transaction)? {
+    if let Some(function) = owner_function_executable(transaction, options)? {
         return Err(RuntimeRoleError::OwnerFunctionExecutable(function));
     }
     if let Some(grants) = unexpected_grants(transaction)? {
@@ -561,7 +646,8 @@ fn verify_runtime_role_in(
 }
 
 /// Settings that would disable the append-only triggers or row-level
-/// security for this session: a `row_security` or `session_replication_role`
+/// security, or change name resolution, for this session: a `search_path`
+/// (unless explicitly allowed), `row_security` or `session_replication_role`
 /// set for this database or all databases and for this login role or all
 /// roles (`pg_db_role_setting`); a session-start value of `row_security` or
 /// `session_replication_role` that is not the built-in default (for example
@@ -570,6 +656,7 @@ fn verify_runtime_role_in(
 /// belongs to (`pg_parameter_acl`, PostgreSQL 15 and later).
 fn unsafe_runtime_setting(
     transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
 ) -> Result<Option<String>, RuntimeRoleError> {
     let row = transaction.query_one(
         "SELECT ( \
@@ -588,7 +675,8 @@ fn unsafe_runtime_setting(
                        (SELECT r.oid FROM pg_catalog.pg_roles r \
                         WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)) \
                AND (pg_catalog.starts_with(s.setting, 'row_security=') \
-                    OR pg_catalog.starts_with(s.setting, 'session_replication_role='))), \
+                    OR pg_catalog.starts_with(s.setting, 'session_replication_role=') \
+                    OR (NOT $1 AND pg_catalog.starts_with(s.setting, 'search_path=')))), \
              ( \
              SELECT pg_catalog.string_agg( \
                         pg_catalog.concat(p.name, '=', p.reset_val, ' (', p.source, ')'), ', ' \
@@ -598,7 +686,7 @@ fn unsafe_runtime_setting(
                     OR p.name OPERATOR(pg_catalog.=) 'session_replication_role') \
                AND p.reset_val OPERATOR(pg_catalog.<>) p.boot_val), \
              pg_catalog.to_regclass('pg_catalog.pg_parameter_acl') IS NOT NULL",
-        &[],
+        &[&options.allow_search_path],
     )?;
     if let Some(settings) = row.get::<_, Option<String>>(0) {
         return Ok(Some(format!("{settings} (ALTER DATABASE/ROLE ... SET)")));
@@ -728,13 +816,14 @@ fn unexpected_grants(
 
 /// A SECURITY DEFINER function, in any schema but `pg_catalog` and
 /// `information_schema`, that runs with the rights of the `praetore` schema
-/// owner (its owner is that owner, or a non-superuser with its privileges)
-/// and that the session or current role may execute: calling it would act
-/// as the owner. Functions of other superusers are not counted: whatever a
-/// superuser plants is out of scope, and managed services ship such
-/// functions executable by PUBLIC.
+/// owner (its owner has that owner's privileges, superusers included) and
+/// that the session or current role may execute: calling it would act as
+/// the owner. Functions the operator trusts explicitly
+/// (`RuntimeRoleOptions::with_trusted_security_definer`) are not reported;
+/// nothing is trusted by default.
 fn owner_function_executable(
     transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
 ) -> Result<Option<String>, RuntimeRoleError> {
     let row = transaction.query_one(
         "SELECT pg_catalog.string_agg(p.oid::pg_catalog.regprocedure::pg_catalog.text, ', ' \
@@ -747,12 +836,11 @@ fn owner_function_executable(
            AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
            AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
            AND pg_catalog.pg_has_role(p.proowner, owner_ns.nspowner, 'USAGE') \
-           AND (p.proowner OPERATOR(pg_catalog.=) owner_ns.nspowner \
-                OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles su \
-                               WHERE su.oid OPERATOR(pg_catalog.=) p.proowner AND su.rolsuper)) \
+           AND NOT (p.oid::pg_catalog.regprocedure::pg_catalog.text \
+                    OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[])) \
            AND (pg_catalog.has_function_privilege(SESSION_USER, p.oid, 'EXECUTE') \
                 OR pg_catalog.has_function_privilege(CURRENT_USER, p.oid, 'EXECUTE'))",
-        &[],
+        &[&options.trusted_security_definer],
     )?;
     Ok(row.get(0))
 }
@@ -773,6 +861,29 @@ mod tests {
 
     // Self-signed test CA (not used for any real service).
     const TEST_ROOT_PEM: &str = include_str!("../tests/fixtures/test-root-ca.pem");
+
+    #[test]
+    fn runtime_role_options_accept_only_exact_relaxable_names() {
+        assert_eq!(
+            RuntimeRoleOptions::from_allow_settings("").unwrap(),
+            RuntimeRoleOptions::default()
+        );
+        assert!(RuntimeRoleOptions::default().relaxed().is_empty());
+        let relaxed = RuntimeRoleOptions::from_allow_settings(" search_path ").unwrap();
+        assert_eq!(relaxed.relaxed(), vec!["search_path"]);
+        for refused in [
+            "row_security",
+            "session_replication_role",
+            "SEARCH_PATH",
+            "search-path",
+        ] {
+            assert!(
+                RuntimeRoleOptions::from_allow_settings(refused).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(RuntimeRoleOptions::from_allow_settings("search_path,row_security").is_err());
+    }
 
     #[test]
     fn loopback_and_unix_hosts_may_connect_without_tls() {
