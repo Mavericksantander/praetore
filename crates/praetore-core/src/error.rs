@@ -60,6 +60,12 @@ pub enum PraetoreError {
         max: usize,
     },
 
+    /// A policy document is not well-formed strict JSON for the policy
+    /// schema (malformed, duplicate key, unknown field, unsafe integer).
+    /// Raised when the policy is loaded or validated, never during matching.
+    #[error("invalid policy document: {0}")]
+    PolicyDocumentInvalid(crate::policy::PolicyDocumentError),
+
     #[error("policy integrity verification failed")]
     PolicyIntegrityFailed,
 
@@ -92,9 +98,9 @@ impl PraetoreError {
             Self::AuthorizationDenied(_) => ErrorKind::PolicyDenied,
             Self::InvalidRequest(_) => ErrorKind::InvalidRequest,
             Self::PolicyIntegrityFailed => ErrorKind::PolicyIntegrityFailure,
-            Self::PolicyEvaluationFailed(_) | Self::PolicyLimitExceeded { .. } => {
-                ErrorKind::PolicyEvaluationFailure
-            }
+            Self::PolicyEvaluationFailed(_)
+            | Self::PolicyLimitExceeded { .. }
+            | Self::PolicyDocumentInvalid(_) => ErrorKind::PolicyEvaluationFailure,
             Self::EvidenceError(_) => ErrorKind::EvidenceFailure,
             Self::ReplayDetected => ErrorKind::ReplayDetected,
             Self::ReplayGuardUnavailable => ErrorKind::ReplayGuardFailure,

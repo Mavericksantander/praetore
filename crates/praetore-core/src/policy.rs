@@ -7,7 +7,8 @@ use crate::{
     action::Action,
     authority::Authority,
     canonical::{
-        MAX_JSON_VALUE_BYTES, canonical_json, parse_json_rejecting_duplicates, validate_json_value,
+        JsonError, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_JSON_VALUE_BYTES, canonical_json,
+        parse_json_strict, validate_json_value,
     },
     decision::{DecidedBy, Decision, DecisionContribution, RecoveryObligation},
     error::{PraetoreError, Result},
@@ -31,7 +32,9 @@ pub const MAX_CONDITIONS_PER_RULE: usize = 128;
 pub const MAX_POLICY_TEXT_BYTES: usize = 1024;
 /// Maximum UTF-8 bytes of any string inside a condition's expected value.
 pub const MAX_CONDITION_STRING_BYTES: usize = 1024;
-/// Maximum number of values in an `In` condition.
+/// Maximum number of array elements in one condition's expected value,
+/// counted across every array at every depth (the top-level `In` set
+/// included). A flat `In` set may therefore hold up to this many values.
 pub const MAX_CONDITION_SET_VALUES: usize = 256;
 /// Maximum nesting depth of a condition's expected value (a scalar is 1).
 pub const MAX_CONDITION_VALUE_DEPTH: usize = 8;
@@ -51,6 +54,12 @@ pub enum PolicyLimit {
     ConditionSetValues,
     ConditionValueDepth,
     CanonicalBytes,
+    /// Raw policy text passed to `Policy::from_json`, before parsing.
+    InputBytes,
+    /// JSON nesting depth of the whole document (`MAX_JSON_DEPTH`).
+    JsonDepth,
+    /// JSON node count of the whole document (`MAX_JSON_NODES`).
+    JsonNodes,
 }
 
 impl std::fmt::Display for PolicyLimit {
@@ -65,11 +74,128 @@ impl std::fmt::Display for PolicyLimit {
             Self::ConditionsPerRule => "conditions per rule scope",
             Self::ConditionKeyBytes => "condition key bytes",
             Self::ConditionStringBytes => "condition string bytes",
-            Self::ConditionSetValues => "values in an In condition",
+            Self::ConditionSetValues => {
+                "array elements in a condition's expected value (total across all nested arrays)"
+            }
             Self::ConditionValueDepth => "condition value nesting depth",
             Self::CanonicalBytes => "canonical policy bytes",
+            Self::InputBytes => "policy input bytes",
+            Self::JsonDepth => "policy JSON nesting depth",
+            Self::JsonNodes => "policy JSON nodes",
         })
     }
+}
+
+/// Why a policy document was rejected before any rule was considered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PolicyDocumentError {
+    /// Not a single well-formed JSON value.
+    #[error("malformed JSON at line {line} column {column}")]
+    Malformed { line: usize, column: usize },
+    /// An object, at any depth, repeats a key.
+    #[error("duplicate JSON object key")]
+    DuplicateKey,
+    /// A policy, rule or condition object has a field the schema does not
+    /// define. `field` is the offending key.
+    #[error("unknown field `{field}`")]
+    UnknownField { field: String },
+    /// An integer, or integral float, outside +/-2^53-1.
+    #[error("integer exceeds interoperable safe range")]
+    UnsafeInteger,
+}
+
+/// Maps a strict-JSON rejection to the policy error a caller can match on.
+fn policy_json_error(error: JsonError) -> PraetoreError {
+    let limit = |limit, max| PraetoreError::PolicyLimitExceeded { limit, max };
+    match error {
+        JsonError::InputTooLarge => limit(PolicyLimit::InputBytes, MAX_JSON_VALUE_BYTES),
+        JsonError::ValueTooLarge | JsonError::CanonicalTooLarge => {
+            limit(PolicyLimit::CanonicalBytes, MAX_JSON_VALUE_BYTES)
+        }
+        JsonError::TooDeep => limit(PolicyLimit::JsonDepth, MAX_JSON_DEPTH),
+        JsonError::TooManyNodes => limit(PolicyLimit::JsonNodes, MAX_JSON_NODES),
+        JsonError::Malformed { line, column } => {
+            PraetoreError::PolicyDocumentInvalid(PolicyDocumentError::Malformed { line, column })
+        }
+        JsonError::DuplicateKey => {
+            PraetoreError::PolicyDocumentInvalid(PolicyDocumentError::DuplicateKey)
+        }
+        JsonError::UnsafeInteger => {
+            PraetoreError::PolicyDocumentInvalid(PolicyDocumentError::UnsafeInteger)
+        }
+        JsonError::Unrepresentable => {
+            PraetoreError::PolicyEvaluationFailed(format!("policy is not valid JSON: {error}"))
+        }
+    }
+}
+
+/// The field names serde accepts for struct `T`, read from its derived
+/// `Deserialize` impl so they cannot drift from the struct definition.
+fn struct_fields<'de, T: Deserialize<'de>>() -> &'static [&'static str] {
+    use serde::de::{Error as _, Visitor, value::Error};
+
+    struct Introspect<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> serde::Deserializer<'de> for Introspect<'_> {
+        type Error = Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> std::result::Result<V::Value, Error> {
+            Err(Error::custom("not a struct"))
+        }
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> std::result::Result<V::Value, Error> {
+            *self.0 = fields;
+            Err(Error::custom("introspection only"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    let mut fields: &'static [&'static str] = &[];
+    let _ = T::deserialize(Introspect(&mut fields));
+    fields
+}
+
+/// Rejects the first key of `object` that `T` does not define.
+fn check_known_fields<'de, T: Deserialize<'de>>(object: &Value) -> Result<()> {
+    let Some(object) = object.as_object() else {
+        return Ok(());
+    };
+    let fields = struct_fields::<T>();
+    match object.keys().find(|key| !fields.contains(&key.as_str())) {
+        Some(field) => Err(PraetoreError::PolicyDocumentInvalid(
+            PolicyDocumentError::UnknownField {
+                field: field.clone(),
+            },
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Reports unknown fields on the policy, its rules and their conditions as a
+/// typed error. Values of the wrong shape are left for serde to reject.
+fn check_policy_fields(document: &Value) -> Result<()> {
+    check_known_fields::<Policy>(document)?;
+    let rules = document.get("rules").and_then(Value::as_array);
+    for rule in rules.into_iter().flatten() {
+        check_known_fields::<PolicyRule>(rule)?;
+        for scope in ["parameter_conditions", "context_conditions"] {
+            let conditions = rule.get(scope).and_then(Value::as_array);
+            for condition in conditions.into_iter().flatten() {
+                check_known_fields::<PolicyCondition>(condition)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_limit(limit: PolicyLimit, actual: usize, max: usize) -> Result<()> {
@@ -79,8 +205,10 @@ fn check_limit(limit: PolicyLimit, actual: usize, max: usize) -> Result<()> {
     Ok(())
 }
 
-/// Checks string length, `In` cardinality and nesting depth of a value.
-fn check_condition_value(value: &Value, depth: usize) -> Result<()> {
+/// Checks string length, nesting depth and the total number of array
+/// elements of a condition value. `array_values` accumulates the elements
+/// of every array seen so far in the same condition.
+fn check_condition_value(value: &Value, depth: usize, array_values: &mut usize) -> Result<()> {
     check_limit(
         PolicyLimit::ConditionValueDepth,
         depth,
@@ -92,16 +220,24 @@ fn check_condition_value(value: &Value, depth: usize) -> Result<()> {
             text.len(),
             MAX_CONDITION_STRING_BYTES,
         ),
-        Value::Array(values) => values
-            .iter()
-            .try_for_each(|value| check_condition_value(value, depth + 1)),
+        Value::Array(values) => {
+            *array_values = array_values.saturating_add(values.len());
+            check_limit(
+                PolicyLimit::ConditionSetValues,
+                *array_values,
+                MAX_CONDITION_SET_VALUES,
+            )?;
+            values
+                .iter()
+                .try_for_each(|value| check_condition_value(value, depth + 1, array_values))
+        }
         Value::Object(values) => values.iter().try_for_each(|(key, value)| {
             check_limit(
                 PolicyLimit::ConditionStringBytes,
                 key.len(),
                 MAX_CONDITION_STRING_BYTES,
             )?;
-            check_condition_value(value, depth + 1)
+            check_condition_value(value, depth + 1, array_values)
         }),
         _ => Ok(()),
     }
@@ -291,9 +427,16 @@ impl Policy {
         Ok(hex::encode(Sha256::digest(canonical)))
     }
 
+    /// Parses and validates a policy document.
+    ///
+    /// Oversized input and JSON structure limits are reported as
+    /// `PolicyLimitExceeded`; malformed JSON, duplicate keys, unknown fields
+    /// and unsafe integers as `PolicyDocumentInvalid`. Other schema errors
+    /// (wrong types, missing fields, unknown enum values) remain
+    /// `PolicyEvaluationFailed`.
     pub fn from_json(json: &str) -> Result<Self> {
-        let value =
-            parse_json_rejecting_duplicates(json).map_err(PraetoreError::PolicyEvaluationFailed)?;
+        let value = parse_json_strict(json).map_err(policy_json_error)?;
+        check_policy_fields(&value)?;
         let policy: Self = serde_json::from_value(value)
             .map_err(|error| PraetoreError::PolicyEvaluationFailed(error.to_string()))?;
         policy.validate()?;
@@ -348,19 +491,7 @@ impl Policy {
             }
         }
 
-        let canonical = canonical_json(self).map_err(|error| {
-            let message = error.to_string();
-            if message.contains("exceeds maximum size") {
-                PraetoreError::PolicyLimitExceeded {
-                    limit: PolicyLimit::CanonicalBytes,
-                    max: MAX_JSON_VALUE_BYTES,
-                }
-            } else {
-                PraetoreError::PolicyEvaluationFailed(format!(
-                    "policy exceeds canonical input limits: {message}"
-                ))
-            }
-        })?;
+        let canonical = canonical_json(self).map_err(policy_json_error)?;
         check_limit(
             PolicyLimit::CanonicalBytes,
             canonical.len(),
@@ -796,25 +927,14 @@ impl PolicyCondition {
             self.key.len(),
             MAX_POLICY_TEXT_BYTES,
         )?;
-        if let Some(values) = self.expected.as_array() {
-            check_limit(
-                PolicyLimit::ConditionSetValues,
-                values.len(),
-                MAX_CONDITION_SET_VALUES,
-            )?;
-        }
-        check_condition_value(&self.expected, 1)?;
+        check_condition_value(&self.expected, 1, &mut 0)?;
         if self.key.trim().is_empty() || self.key != self.key.trim() {
             return Err(PraetoreError::PolicyEvaluationFailed(format!(
                 "policy rule '{rule_id}' has invalid {scope} condition key"
             )));
         }
 
-        validate_json_value(&self.expected).map_err(|message| {
-            PraetoreError::PolicyEvaluationFailed(format!(
-                "policy rule '{rule_id}' has invalid {scope} condition value: {message}"
-            ))
-        })?;
+        validate_json_value(&self.expected).map_err(policy_json_error)?;
 
         match self.operator {
             MatchOperator::Prefix
@@ -1199,17 +1319,24 @@ mod tests {
 
     #[test]
     fn policy_import_rejects_duplicate_json_fields() {
-        assert!(Policy::from_json(r#"{"policy_id":"a","policy_id":"b"}"#).is_err());
+        assert!(matches!(
+            Policy::from_json(r#"{"policy_id":"a","policy_id":"b"}"#),
+            Err(PraetoreError::PolicyDocumentInvalid(
+                PolicyDocumentError::DuplicateKey
+            ))
+        ));
     }
 
     #[test]
     fn policy_import_rejects_unknown_fields_and_versions() {
-        assert!(
+        assert!(matches!(
             Policy::from_json(
                 r#"{"id":"p","version":1,"canonical_version":1,"rules":[],"future":true}"#
-            )
-            .is_err()
-        );
+            ),
+            Err(PraetoreError::PolicyDocumentInvalid(
+                PolicyDocumentError::UnknownField { field }
+            )) if field == "future"
+        ));
         assert!(
             Policy::from_json(r#"{"id":"p","version":1,"canonical_version":2,"rules":[]}"#)
                 .is_err()

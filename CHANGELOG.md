@@ -27,6 +27,100 @@
   backslash. The documented `praetore_observe` grant now includes
   `tenant_id`, which the reader's queries need. `docs/operations.md`
   documents the runtime refusals.
+- SAF-14 (proposal, `docs/proposals/SAF-14-identidad-por-agente.md`):
+  per-agent identity. It records what the agent signature identifies today
+  (one key per home in `praetore-mcp`, one key per profile in the Claude
+  Code hook, no agent keys in the gateway) and proposes per-profile keys,
+  per-client agents for `praetore-mcp`, and instance/session ids as signed
+  claims. It gives attribution between cooperative agents, not isolation:
+  every key is readable by the same OS user.
+- `examples/claude-code-hook`: a receipt can no longer be re-attributed to
+  another agent by editing an unsigned field. `verify` counted receipts by
+  the unsigned `agent` field of `receipts.jsonl` and `export` copied it into
+  `index.json`, which `verify.sh` only summarized; editing either changed who
+  a receipt was attributed to with exit 0. Now `verify` and `export` read
+  the agent and profile from the signed receipt and fail when the unsigned
+  copy disagrees, `verify` checks the signing identity against
+  `agents/<profile>.json`, and `verify.sh` runs `check-attribution.py`
+  (fails on a mismatch, a missing index entry, or more than one identity per
+  profile) and rejects a re-attributed copy of `index.json`. `init` adds an
+  issuer-signed `praetore.agent_profile` constraint to each authority and
+  the hook sends the same action parameter, so the engine refuses an
+  authority issued for another profile (a profile file copied over another
+  now fails closed instead of signing as the other agent). Claude Code's
+  `agent_id` and `session_id`, when present, are recorded in the signed
+  context (over 128 bytes: deny). `index.json` gains `agent_id`. The receipt
+  format does not change; the committed evidence sets still verify. New
+  `test-attribution.sh` (in CI).
+- `examples/claude-code-hook`, fixes from the independent review of #79:
+  `verify.sh` and `check-attribution.py` accept in `evidence/` only regular,
+  non-hidden `*.json` files and fail on anything else. Before, a hidden
+  `evidence/.X.json` with broken signatures skipped `praetore-verify` (the
+  bash glob ignores dotfiles) but was counted in the attribution (exit 0).
+  An explicit `agent_type: "main"` (a subagent named `main`) no longer gets
+  the main session's profile; explicit `main` and `unregistered` are
+  evaluated as `unregistered` (Deny, signed receipt), and the default
+  policy's context conditions match the signing `profile` instead of the raw
+  `agent`. State created before the `praetore.agent_profile` constraint now
+  fails closed with a message to re-run `init`. A numeric `agent_id` or
+  `session_id` is recorded as its canonical text; one that is not a string
+  or number, or over 128 bytes, is denied under `unregistered` with a signed
+  receipt that records the reason in `praetore.claim_rejected`, not the
+  value. Summaries show unregistered `agent_type` values escaped to ASCII.
+- `examples/claude-code-hook`, second review of #79: `verify.sh` copies the
+  bundle to a temporary directory first and runs every step on that copy,
+  so it verifies and attributes the same bytes (a receipt replaced in the
+  original between steps 3 and 5 used to be counted unverified, exit 0).
+  `check-attribution.py` and the hook's `verify` fail on a repeated receipt
+  (same `evidence_id`, or same agent id and `request_id`), which counted one
+  decision several times. `test-verify.sh` now signs 1000 distinct receipts
+  with the hook instead of copying `bundle/`, since copies of one receipt
+  are now an invalid bundle.
+
+- Policy loading reports size, depth, node, integer, duplicate-key,
+  malformed-JSON and unknown-field rejections with typed errors
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)); wrong
+  types, missing fields and unknown enum variants are still
+  `PolicyEvaluationFailed(String)`. The error
+  code of all of them stays `POLICY_EVALUATION_FAIL`, so `praetore-verify`,
+  the CLI, the gateway and `praetore-mcp` report the same codes as before.
+  Receipts and policy digests are unchanged.
+  - New `praetore_core::canonical::JsonError` and `parse_json_strict`: the
+    strict parser, `validate_json_value` and the canonical encoder return
+    a typed reason (input size, malformed with line and column, duplicate
+    key, value size, depth, node count, unsafe integer, canonical size).
+    `parse_json_rejecting_duplicates` keeps its `String` error and messages.
+    `MAX_JSON_NODES` is now public.
+  - `Policy::validate` maps canonical-size errors to
+    `PolicyLimitExceeded { CanonicalBytes }` from the typed error, without
+    matching the `"exceeds maximum size"` message.
+  - Breaking: new `PolicyLimit` variants `InputBytes` (raw text passed to
+    `Policy::from_json` over 64 KiB), `JsonDepth` and `JsonNodes`. A
+    decoded value over 64 KiB is `CanonicalBytes`. These used to be
+    `PolicyEvaluationFailed(String)`.
+  - Breaking: new `PraetoreError::PolicyDocumentInvalid(PolicyDocumentError)`
+    with `Malformed { line, column }`, `DuplicateKey`,
+    `UnknownField { field }` and `UnsafeInteger`, for policy documents that
+    used to fail with `PolicyEvaluationFailed(String)`. Wrong types, missing
+    fields and unknown enum values are still `PolicyEvaluationFailed`.
+  - Breaking: `MAX_CONDITION_SET_VALUES` (256) now caps the total number of
+    array elements in a condition's expected value, across every array at
+    every depth, not only the top-level `In` set. A flat `In` set of 256
+    values is still accepted; a policy whose expected value holds more than
+    256 array elements in total is now rejected with
+    `PolicyLimitExceeded { limit: ConditionSetValues, max: 256 }`, shown as
+    "policy limit exceeded: array elements in a condition's expected value
+    (total across all nested arrays) (maximum 256)".
+  - **Limit:** at most 256 array elements per condition, counted as one total
+    over every array in its expected value (the `expected` array itself and
+    arrays nested in arrays or objects, at any depth). Elements are counted,
+    not leaves: `[[]]` counts 1, `[[0]]` counts 2; object keys do not count;
+    the cap is per condition, so two conditions of 256 in one rule are
+    accepted. Only `Exact` and `In` can hold such values. No policy in this
+    repository is affected.
+  - Messages for integral floats outside the safe range now say "JSON
+    integer exceeds interoperable safe range".
+
 - A combined decision's signed `reason` now names the same rule as its
   `decided_by`. When a DENY rule matched before a RECOVER rule
   (`[deny d, recover r]`), `decided_by` and the recovery obligation named `r`
@@ -79,6 +173,38 @@
   `examples/claude-code-hook/test-verify.sh` (in CI): 1000 receipts exit 0
   (141 before the fix), one altered receipt among them exits 1 and is named.
   `scripts/record-hook-demo.sh` had the same `ls | head` and is fixed too.
+- **T-013B:** new crate `praetore-sandbox-fs` (Unix, `#![forbid(unsafe_code)]`,
+  built on `rustix`, which was already in `Cargo.lock`): file effects beneath
+  a sandbox root made through directory descriptors, never through a joined
+  path. On Linux the parent directory is opened with one `openat2(...,
+  RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+  RESOLVE_NO_XDEV)`; on `ENOSYS` and on macOS, one
+  `openat(O_NOFOLLOW | O_DIRECTORY)` per component. The final component is
+  created with `O_CREAT | O_EXCL | O_NOFOLLOW`, replaced with `renameat`,
+  removed with `unlinkat` relative to the parent descriptor, and opened with
+  `O_NOFOLLOW | O_NONBLOCK` plus an `fstat` check. Existing hard links
+  (`st_nlink > 1`), symlinks, FIFOs, sockets and devices are refused.
+  `praetore_gateway::sandbox::SandboxDispatcher` now performs its effects
+  through it (refusal codes and receipt format unchanged; it already walked
+  by descriptor, the new part is `openat2` and `RESOLVE_NO_XDEV`, which also
+  refuses bind mounts). New race tests swap an intermediate directory for a
+  symlink to an outside directory while writes and deletes run; they fail
+  against a deliberately path-based reference
+  (`PRAETORE_SANDBOX_FS_RACE_IMPL=path-based`). Not prevented: a directory
+  moved out of the root while an operation is in flight, and hard links
+  created after the check, both by a process that can also write outside
+  the root. The ignored supervisor test `sandbox_dispatch_rejects_symlink_escape`
+  is removed: it tested a layer that cannot see the Job's filesystem (#61);
+  the case is covered in `praetore-sandbox-fs`.
+  After independent review: the `ENOSYS` fallback is logged once and shown
+  by `SandboxDispatcher::path_resolution()` (startup log and `praetore
+  doctor`); `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` makes the gateway refuse to
+  start without `openat2` and never fall back; `EPERM` from `openat2`
+  (seccomp/LSM) is the permanent refusal `openat2_denied`, not a transient
+  error. The crate refuses `TEMP_PREFIX` components itself (ASCII
+  case-insensitive). New final-component race tests swap `t` with a
+  symlink, a hard link or a directory during writes and deletes; the
+  dispatcher race test now checks the refusal reasons.
 ## 0.3.1-rc.1 - 2026-10-31
 
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,

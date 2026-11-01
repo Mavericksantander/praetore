@@ -21,6 +21,9 @@ Limits:
   them.
 - The agent signature identifies the agent **profile**, not which process
   used it; the profile keys lived in the same user account as the agents.
+  These sets predate SAF-14: the profile name is signed by the agent key and
+  the attester (`context.profile`), not by the issuer. `verify.sh` checks
+  that `index.json` names the same agent as each signed receipt.
 - Only tool calls that went through the hook are covered.
 - Session 04 left 33 denials without a receipt (see its README).
 - Paths under `/Users/...` are kept as recorded: they are part of the signed
