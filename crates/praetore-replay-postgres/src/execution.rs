@@ -435,7 +435,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::InvalidRecord)?;
         transaction
             .query_one(
-                "SELECT set_config('praetore.dispatch_observed_at', $1, true)",
+                "SELECT pg_catalog.set_config('praetore.dispatch_observed_at', $1, true)",
                 &[&observed_at],
             )
             .map_err(|_| JournalError::Unavailable)?;

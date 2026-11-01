@@ -160,7 +160,7 @@ impl Evidence {
     ) -> crate::Result<Self> {
         decision
             .validate()
-            .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+            .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))?;
         // Every new decision records `decided_by`, which only v4 may carry.
         let evidence_schema_version = 4;
         let mut evidence = Self {
@@ -553,7 +553,7 @@ impl Evidence {
         for (key, value) in &self.context {
             context_size += key.len();
             context_size += validate_json_value(value)
-                .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+                .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))?;
             if context_size > MAX_JSON_VALUE_BYTES {
                 return Err(crate::PraetoreError::EvidenceError(
                     "evidence context exceeds maximum size".into(),

@@ -45,7 +45,7 @@ to PostgreSQL from the browser.
 
 Apply migrations in numeric order through
 `0008_tenant_row_level_security.sql`.
-Grant the service role schema usage and SELECT only on the journal identity,
+Grant the service role schema usage and SELECT only on the tenant, journal identity,
 digest, status, evidence, and timestamp columns, plus event identity/status/
 timestamp/sequence columns. Do not grant it access to `output_json`; output availability
 is derived from the journal's enforced state/output constraint. The reader
@@ -67,11 +67,11 @@ management out of band):
 CREATE ROLE praetore_observe LOGIN;
 GRANT USAGE ON SCHEMA praetore TO praetore_observe;
 GRANT SELECT (
-    agent_id, request_id, request_digest, action_digest, authorization_status,
-    execution_status, evidence_json, created_at, updated_at
+    tenant_id, agent_id, request_id, request_digest, action_digest,
+    authorization_status, execution_status, evidence_json, created_at, updated_at
 ) ON praetore.execution_journal TO praetore_observe;
 GRANT SELECT (
-    event_id, agent_id, request_id, from_status, to_status, occurred_at
+    event_id, tenant_id, agent_id, request_id, from_status, to_status, occurred_at
 ) ON praetore.execution_journal_events TO praetore_observe;
 ```
 

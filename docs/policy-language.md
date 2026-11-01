@@ -137,8 +137,11 @@ grants capabilities; it does not grant policy permission by itself.
 Set the capability required by the action explicitly with
 `Action::with_capability`. Strict and HighAssurance evaluation reject actions
 without an explicit capability, and Development denies them: the action type
-is never used as an implicit capability. In Development, a rule without
-`with_capability` also requires the authority to grant the action type. A policy rule's
+is never used as an implicit capability. In every mode, `AuthorizationEngine`
+denies a matching `Allow` or `RequireApproval` rule without `with_capability`;
+an authority that grants the action type itself does not satisfy it. The
+lower-level `Policy::evaluate` only folds rule effects and does not apply this
+check; use the engine to authorize. A policy rule's
 `with_capability` is an additional rule match condition, not a grant: the
 authority must contain that capability, and the action's own required
 capability must also be granted by the engine.
@@ -172,6 +175,14 @@ The fold is independent of rule order: a matching DENY dominates an approval
 or allow, and a matching approval dominates an allow. Matching contributions
 are retained in the decision for explanation and audit. Do not use rule order
 to express priority or to weaken a restrictive result.
+
+The decision's `decided_by` and `reason` name the same rule: the one with the
+highest effective severity (RECOVER > DENY > REQUIRE_APPROVAL > ALLOW, where
+RECOVER is a DENY that carries a recovery obligation). For a RECOVER decision
+that is the rule that produced the obligation, even when a plain DENY rule
+also matched. Between rules of equal severity the earlier-matching rule is
+kept, so the outcome is order-independent but the named rule on a tie is
+not.
 
 If no rule matches, the policy returns DENY. An ALLOW rule is therefore
 required for every allowed case; the engine never treats a missing policy

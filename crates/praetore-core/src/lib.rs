@@ -30,7 +30,8 @@ pub use freshness::{FreshnessError, FreshnessLease, FreshnessProvider};
 pub use identity::{AgentId, AgentIdentity, AgentKeyFingerprint, AgentKeyPair, VerifiedPublicKey};
 pub use key_rotation::KeyRotationProof;
 pub use policy::{
-    ControlLoop, MatchOperator, Policy, PolicyCondition, PolicyEffect, PolicyLimit, PolicyRule,
+    ControlLoop, MatchOperator, Policy, PolicyCondition, PolicyDocumentError, PolicyEffect,
+    PolicyLimit, PolicyRule,
 };
 pub use replay::{
     AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,

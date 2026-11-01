@@ -9,7 +9,8 @@ use praetore_core::{
 use praetore_gateway::{
     ActionDispatcher, ApprovalChallenge, ApprovalChallengeView, ExecutionAttestationError,
     ExecutionAttestationSigner, Gateway, HumanApprovalDecision, HumanApprovalOutcome,
-    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher, sandbox::SandboxDispatcher,
+    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher, sandbox,
+    sandbox::SandboxDispatcher,
 };
 use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use rand_core::{OsRng, RngCore};
@@ -648,9 +649,10 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|config| config.sandbox_root.as_ref())
     {
         match open_sandbox(directory, root) {
-            Ok(_) => println!(
-                "[ok] sandbox root {} (gateway-executed fs actions)",
-                root.display()
+            Ok(dispatcher) => println!(
+                "[ok] sandbox root {} (gateway-executed fs actions; path resolution: {})",
+                root.display(),
+                dispatcher.path_resolution()
             ),
             Err(error) => {
                 println!("[failed] sandbox root: {error}");
@@ -935,13 +937,22 @@ fn build_gateway(
 
 /// Opens the configured sandbox root fail-closed. The root must be an
 /// existing absolute canonical directory that neither contains nor lies inside
-/// the gateway directory holding the keys.
+/// the gateway directory holding the keys. With
+/// `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` the gateway also refuses to start
+/// unless the kernel resolves sandbox paths with `openat2`.
 fn open_sandbox(
     directory: &Path,
     root: &Path,
 ) -> Result<SandboxDispatcher, Box<dyn std::error::Error>> {
-    let dispatcher = SandboxDispatcher::open(root)
+    let require_openat2 =
+        sandbox::require_openat2_from_env(env::var(sandbox::REQUIRE_OPENAT2_ENV).ok().as_deref())?;
+    let mut dispatcher = SandboxDispatcher::open(root)
         .map_err(|error| format!("invalid sandbox_root {}: {error}", root.display()))?;
+    if require_openat2 {
+        dispatcher = dispatcher
+            .require_openat2()
+            .map_err(|error| format!("sandbox_root {}: {error}", root.display()))?;
+    }
     let gateway_directory = match fs::canonicalize(directory) {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

@@ -23,6 +23,12 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
+      - name: T-013B confinement race tests (Linux, openat2 required, output shown)
+        env:
+          PRAETORE_REQUIRE_OPENAT2: "1"
+        run: |
+          cargo test --locked -p praetore-sandbox-fs -- --nocapture
+          cargo test --locked -p praetore-gateway --lib -- --nocapture sandbox::tests::race sandbox::tests::require_openat2
       - run: cargo run --locked --package praetore-core --example high_assurance
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
@@ -92,6 +98,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --locked
       - run: cargo test -p praetore-python --locked
+      - name: T-013B confinement tests (macOS portable walk)
+        run: cargo test --locked -p praetore-sandbox-fs -- --nocapture
 
   verifier-features:
     name: Offline verifiers build without receipt signing
@@ -195,6 +203,10 @@ jobs:
         run: |
           ./examples/claude-code-hook/demo.sh "$RUNNER_TEMP/claude-code-hook-bundle"
           ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+      # SAF-14: two agents sign with different issued identities, and no
+      # edit of index.json or of the receipt re-attributes a receipt.
+      - name: Per-agent attribution end to end
+        run: ./examples/claude-code-hook/test-attribution.sh
 
   replay-postgres:
     name: PostgreSQL replay guard integration
@@ -312,6 +324,8 @@ jobs:
             postgres_migrations_adoption_without_signer_is_refused \
             postgres_migrations_trusted_event_triggers_allowlist \
             postgres_migrations_trusted_default_privileges_allowlist \
+            postgres_runtime_role_refuses_foreign_dependencies \
+            postgres_documented_observe_grant_supports_list \
             postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered \
             postgres_apd_sigkill_between_approve_and_claim \
             postgres_apd_concurrent_claims_dispatch_exactly_once \

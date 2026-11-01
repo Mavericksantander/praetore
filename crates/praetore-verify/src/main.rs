@@ -58,6 +58,7 @@ enum Command {
         attester_pin: PathBuf,
         issuer_pins: Option<PathBuf>,
         require_intent: bool,
+        require_decision_time: bool,
         policy: Option<PathBuf>,
     },
     Journal {
@@ -89,12 +90,12 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
     let (summary, format) = match parse_command(&result) {
-        Ok((command, format)) => match execute(command) {
+        Ok((command, format)) => match execute(command, OffsetDateTime::now_utc()) {
             Ok(summary) => (summary, format),
             Err(error) => (
                 Summary {
@@ -133,7 +134,20 @@ fn main() {
                 summary.command,
                 summary.code
             );
+            // The authority time source comes first so a reader cannot miss
+            // whether the check used the receipt's signed decision time or
+            // the verifier's clock.
+            let source = summary.details.get("authority_checked_at_source");
+            if let Some(source) = source {
+                print!(
+                    " authority_checked_at_source={}",
+                    serde_json::to_string(source).unwrap_or_else(|_| "null".into())
+                );
+            }
             for (key, value) in &summary.details {
+                if source.is_some() && key == "authority_checked_at_source" {
+                    continue;
+                }
                 print!(
                     " {key}={}",
                     serde_json::to_string(value).unwrap_or_else(|_| "null".into())
@@ -168,7 +182,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 Some("text") => OutputFormat::Text,
                 _ => return Err(CliError::usage()),
             };
-        } else if flag == "--require-intent" {
+        } else if flag == "--require-intent" || flag == "--require-decision-time" {
             if values.insert(flag.clone(), None).is_some() {
                 return Err(CliError::usage());
             }
@@ -207,6 +221,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                         | "--attester-pin"
                         | "--issuer-pins"
                         | "--require-intent"
+                        | "--require-decision-time"
                         | "--policy"
                 )
             }) {
@@ -217,6 +232,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 attester_pin: path("--attester-pin")?,
                 issuer_pins: optional_path("--issuer-pins"),
                 require_intent: values.contains_key("--require-intent"),
+                require_decision_time: values.contains_key("--require-decision-time"),
                 policy: optional_path("--policy"),
             }
         }
@@ -302,7 +318,11 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
     Ok((command, format))
 }
 
-fn execute(command: Command) -> Result<Summary, CliError> {
+/// `verifier_now` is the verifier's clock. The evidence command uses it for
+/// the authority check only when the receipt records no signed decision time
+/// (see [`authority_check_time`]); the authority command uses it when `--now`
+/// is absent. Tests pass a fixed instant.
+fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, CliError> {
     let mut details = BTreeMap::new();
     let command_name = match command {
         Command::Evidence {
@@ -310,6 +330,7 @@ fn execute(command: Command) -> Result<Summary, CliError> {
             attester_pin,
             issuer_pins,
             require_intent,
+            require_decision_time,
             policy,
         } => {
             let policy = policy.as_deref().map(read_policy).transpose()?;
@@ -319,14 +340,27 @@ fn execute(command: Command) -> Result<Summary, CliError> {
             evidence
                 .verify_attester_signature(&attester)
                 .map_err(CliError::from_core)?;
+            if require_decision_time && !evidence.is_high_assurance_shape() {
+                return Err(CliError {
+                    code: "DECISION_TIME_MISSING",
+                });
+            }
             if let Some(policy) = &policy {
                 verify_receipt_policy(&evidence, policy)?;
                 details.insert("policy_verified".into(), serde_json::Value::Bool(true));
             }
             if let Some(pin_path) = issuer_pins {
-                let now = OffsetDateTime::now_utc();
-                verify_evidence_authority(&evidence, &read_issuer_pins(&pin_path)?, now)?;
+                let (checked_at, source) = authority_check_time(&evidence, verifier_now)?;
+                verify_evidence_authority(&evidence, &read_issuer_pins(&pin_path)?, checked_at)?;
                 details.insert("authority_verified".into(), serde_json::Value::Bool(true));
+                details.insert(
+                    "authority_checked_at".into(),
+                    serde_json::Value::String(format_rfc3339(checked_at)?),
+                );
+                details.insert(
+                    "authority_checked_at_source".into(),
+                    serde_json::Value::String(source.into()),
+                );
             } else if require_intent {
                 return Err(CliError {
                     code: "TRUST_STORE_FAIL",
@@ -525,7 +559,7 @@ fn execute(command: Command) -> Result<Summary, CliError> {
         } => {
             let authority =
                 Authority::from_json(&read_limited(&authority)?).map_err(CliError::from_core)?;
-            let now = parse_now(now.as_deref())?;
+            let now = parse_now(now.as_deref(), verifier_now)?;
             let pins = read_issuer_pins(&issuer_pins)?;
             verify_authority(&authority, &pins, now)?;
             let subject_identity_verified = if let Some(agent_path) = agent {
@@ -656,13 +690,55 @@ fn verify_authority(
         .map_err(CliError::from_core)
 }
 
-fn parse_now(value: Option<&str>) -> Result<OffsetDateTime, CliError> {
+fn parse_now(
+    value: Option<&str>,
+    verifier_now: OffsetDateTime,
+) -> Result<OffsetDateTime, CliError> {
     match value {
         Some(value) => OffsetDateTime::parse(value, &Rfc3339).map_err(|_| CliError {
             code: "INVALID_REQUEST",
         }),
-        None => Ok(OffsetDateTime::now_utc()),
+        None => Ok(verifier_now),
     }
+}
+
+/// The instant at which the evidence command checks the receipt's embedded
+/// authority (issuer pin validity, authority signature, `not_before` and
+/// `not_after`), and where it came from.
+///
+/// HighAssurance receipts record `decided_at`: the engine's trusted clock at
+/// evaluation, the instant it checked the authority. It is covered by the
+/// context hash and the attester signature (verified before this is called),
+/// and `Evidence::from_json` requires it to be canonical RFC 3339 inside the
+/// agent-signed intent window. It is only as trustworthy as the attester
+/// key: whoever holds that key can sign any `decided_at`.
+///
+/// Receipts without HighAssurance metadata (v1, and v3/v4 without it) record
+/// no signed time, so the check falls back to the verifier's clock, as before,
+/// unless `--require-decision-time` rejected them earlier with
+/// `DECISION_TIME_MISSING`.
+fn authority_check_time(
+    evidence: &Evidence,
+    verifier_now: OffsetDateTime,
+) -> Result<(OffsetDateTime, &'static str), CliError> {
+    if !evidence.is_high_assurance_shape() {
+        return Ok((verifier_now, "verifier_clock"));
+    }
+    evidence
+        .decided_at
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .map(|decided_at| (decided_at, "receipt_decided_at"))
+        .ok_or(CliError {
+            code: "EVIDENCE_FAIL",
+        })
+}
+
+fn format_rfc3339(value: OffsetDateTime) -> Result<String, CliError> {
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(&Rfc3339)
+        .map_err(|_| CliError { code: "INTERNAL" })
 }
 
 fn command_name(args: &[String]) -> &'static str {
@@ -720,5 +796,103 @@ mod tests {
             "json".into(),
         ];
         assert_eq!(parse_command(&args).unwrap().1, OutputFormat::Json);
+    }
+
+    /// Verifies the first receipt of a committed Claude Code hook evidence
+    /// set as `verify.sh` does, with the verifier clock fixed at `now`.
+    fn verify_committed_set(set: &str, now: &str) -> Result<Summary, CliError> {
+        verify_committed_set_with(set, now, false)
+    }
+
+    fn verify_committed_set_with(
+        set: &str,
+        now: &str,
+        require_decision_time: bool,
+    ) -> Result<Summary, CliError> {
+        let set = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/claude-code-hook/evidence")
+            .join(set);
+        let mut receipts = fs::read_dir(set.join("evidence"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        receipts.sort();
+        execute(
+            Command::Evidence {
+                evidence: receipts[0].clone(),
+                attester_pin: set.join("attester-public-key.hex"),
+                issuer_pins: Some(set.join("issuer-pins.jsonl")),
+                require_intent: true,
+                require_decision_time,
+                policy: Some(set.join("policy.json")),
+            },
+            OffsetDateTime::parse(now, &Rfc3339).unwrap(),
+        )
+    }
+
+    #[test]
+    fn committed_sets_record_no_decision_time_and_use_the_verifier_clock() {
+        // 03 (authority until 2036) verifies on 2027-02-01.
+        let summary =
+            verify_committed_set("03-bundle-demo-reproducible", "2027-02-01T00:00:00Z").unwrap();
+        assert_eq!(
+            summary.details["authority_checked_at"],
+            "2027-02-01T00:00:00Z"
+        );
+        assert_eq!(
+            summary.details["authority_checked_at_source"],
+            "verifier_clock"
+        );
+
+        // 04 and 05 are v1 receipts without `decided_at`: no signed time to
+        // check against, so they keep the verifier-clock behaviour and stop
+        // verifying on 2027-01-29, when their issuer pin and authority
+        // expire. The pin is checked first, hence TRUST_STORE_FAIL.
+        for set in ["04-sesion-real-bloqueada-web-fetch", "05-sesion-real-final"] {
+            let summary = verify_committed_set(set, "2027-01-29T00:00:00Z").unwrap();
+            assert_eq!(
+                summary.details["authority_checked_at_source"],
+                "verifier_clock"
+            );
+            assert_eq!(
+                verify_committed_set(set, "2027-02-01T00:00:00Z")
+                    .unwrap_err()
+                    .code,
+                "TRUST_STORE_FAIL"
+            );
+        }
+    }
+
+    #[test]
+    fn require_decision_time_rejects_committed_sets_without_decided_at() {
+        // 03 holds v4 receipts without HighAssurance metadata, 04 and 05 v1
+        // receipts. None records a signed decision time.
+        for set in [
+            "03-bundle-demo-reproducible",
+            "04-sesion-real-bloqueada-web-fetch",
+            "05-sesion-real-final",
+        ] {
+            assert_eq!(
+                verify_committed_set_with(set, "2026-11-01T00:00:00Z", true)
+                    .unwrap_err()
+                    .code,
+                "DECISION_TIME_MISSING"
+            );
+            // Without the flag the result is unchanged.
+            assert!(verify_committed_set_with(set, "2026-11-01T00:00:00Z", false).is_ok());
+        }
+    }
+
+    #[test]
+    fn require_decision_time_is_only_accepted_by_the_evidence_command() {
+        let journal = vec![
+            "journal".into(),
+            "--journal".into(),
+            "chain.jsonl".into(),
+            "--attester-pin".into(),
+            "pin.hex".into(),
+            "--require-decision-time".into(),
+        ];
+        assert_eq!(parse_command(&journal).unwrap_err().code, "USAGE");
     }
 }
