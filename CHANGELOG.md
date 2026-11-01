@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Policy loading reports every rejection with a typed error
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)). The error
+  code of all of them stays `POLICY_EVALUATION_FAIL`, so `praetore-verify`,
+  the CLI, the gateway and `praetore-mcp` report the same codes as before.
+  Receipts and policy digests are unchanged.
+  - New `praetore_core::canonical::JsonError` and `parse_json_strict`: the
+    strict parser, `validate_json_value` and the canonical encoder return
+    a typed reason (input size, malformed with line and column, duplicate
+    key, value size, depth, node count, unsafe integer, canonical size).
+    `parse_json_rejecting_duplicates` keeps its `String` error and messages.
+    `MAX_JSON_NODES` is now public.
+  - `Policy::validate` maps canonical-size errors to
+    `PolicyLimitExceeded { CanonicalBytes }` from the typed error, without
+    matching the `"exceeds maximum size"` message.
+  - Breaking: new `PolicyLimit` variants `InputBytes` (raw text passed to
+    `Policy::from_json` over 64 KiB), `JsonDepth` and `JsonNodes`. A
+    decoded value over 64 KiB is `CanonicalBytes`. These used to be
+    `PolicyEvaluationFailed(String)`.
+  - Breaking: new `PraetoreError::PolicyDocumentInvalid(PolicyDocumentError)`
+    with `Malformed { line, column }`, `DuplicateKey`,
+    `UnknownField { field }` and `UnsafeInteger`, for policy documents that
+    used to fail with `PolicyEvaluationFailed(String)`. Wrong types, missing
+    fields and unknown enum values are still `PolicyEvaluationFailed`.
+  - Breaking: `MAX_CONDITION_SET_VALUES` (256) now caps the total number of
+    array elements in a condition's expected value, across every array at
+    every depth, not only the top-level `In` set. A flat `In` set of 256
+    values is still accepted; a policy whose expected value holds more than
+    256 array elements in total is now rejected with
+    `PolicyLimitExceeded { ConditionSetValues }`.
+  - The `Display` text of `PolicyLimit::ConditionSetValues` is now
+    "array values in a condition". Messages for integral floats outside the
+    safe range now say "JSON integer exceeds interoperable safe range".
+
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed
