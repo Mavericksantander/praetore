@@ -100,7 +100,7 @@ fn a_name_containing_safety_without_the_prefix_is_rejected() {
     for action_type in [
         "safety_halt",
         "Safety:halt",
-        "SAFETY:land",
+        "SAFETY:halt",
         "ops:override-safety",
         "unsafety",
         "mcp.SafetyCheck",

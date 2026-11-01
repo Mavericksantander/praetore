@@ -345,3 +345,19 @@ fn adding_a_rule_with_a_symlinked_path_prefix_warns() {
         "{out:?}"
     );
 }
+
+/// G7: `init` writes a format 2 policy that declares `mcp.tools/call` as
+/// Mission, so new homes classify every MCP call (observe refuses
+/// unclassified calls).
+#[test]
+fn init_declares_the_mcp_action_type_as_mission() {
+    let (_temp, home) = init();
+    let policy =
+        praetore_core::Policy::from_json(&fs::read_to_string(home.join("policy.json")).unwrap())
+            .unwrap();
+    assert_eq!(policy.format_version, 2);
+    assert_eq!(
+        policy.action_classes.get("mcp.tools/call"),
+        Some(&praetore_core::ActionClass::Mission)
+    );
+}

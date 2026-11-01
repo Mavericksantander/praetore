@@ -48,7 +48,17 @@
   modes; the Claude Code hook adds no decision for a Safety call and denies
   an undeclared one. In every case nothing is evaluated, signed, claimed or
   journaled. An unreadable `policy.json` still refuses every tool call,
-  `safety:*` included (documented in `docs/threat-model.md`). Runtime tests per entry point
+  `safety:*` included (documented in `docs/threat-model.md`).
+- **Breaking (behaviour change, praetore-mcp observe mode).** A call whose
+  action type the policy does not declare (`UNCLASSIFIED_ACTION`) is now
+  refused in observe mode too, not forwarded: an undeclared `safety:*`, any
+  tool name that starts with `safety` in any ASCII case and is not exactly a
+  declared Safety action (including names with a trailing space or tab, and
+  ambiguous lines), and also every mission call when the policy does not
+  declare `mcp.tools/call`. `praetore-mcp init` declares `mcp.tools/call`,
+  so new homes are not affected. A JSON-RPC batch stays all or nothing in
+  enforce, so a declared Safety call in a batch with a blocked call is not
+  forwarded; send safety calls on their own. Runtime tests per entry point
   check zero engine calls and zero journal writes, with the journal down,
   in under 100 ms (`crates/praetore-gateway/tests/safety_actions.rs`, the
   `g7_` tests in `crates/praetore-mcp/src/gate.rs`,
@@ -92,7 +102,10 @@
      before `AuthorizationRequest::new`, `AuthorizationRequest::from_json(json,
      &policy)`, `Policy::new(..).with_mission_actions([..])` /
      `.with_action_class(..)`.
-  4. Pin the new digest (HighAssurance `policy_digest`). Keep the format 1
+  4. praetore-mcp homes: make sure `action_classes` declares
+     `"mcp.tools/call": "Mission"`, otherwise every call is refused, in
+     observe too.
+  5. Pin the new digest (HighAssurance `policy_digest`). Keep the format 1
      document: receipts that recorded its digest verify only against it
      (`praetore-verify --policy old-policy.json`).
 

@@ -191,7 +191,7 @@ write or signature, and an undeclared one with `UNCLASSIFIED_ACTION`:
 | Entry point | Safety action | Undeclared action |
 | --- | --- | --- |
 | Gateway HTTP API (`POST /v1/execute`) | 422 `safety_action_not_governed` | 422 `unclassified_action` |
-| `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe | refused in enforce and observe, nothing forwarded |
+| `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe (except inside a JSON-RPC batch with a blocked call, which enforce refuses as a whole) | refused in enforce and observe, nothing forwarded; this covers every tool name that starts with `safety` in any ASCII case and is not exactly a declared Safety action, and an undeclared `mcp.tools/call` |
 | Claude Code hook (a tool named `safety:*`) | no permission decision from PRÆTORE (the host's own rules apply), nothing signed or appended | denied, without a receipt |
 
 **Trust model.** Declaring an action type `Safety` takes it out of
@@ -209,7 +209,8 @@ record of them.
 
 Classification needs the policy. If `policy.json` cannot be read or parsed,
 the hook and the `praetore-mcp` gate refuse every tool call, `safety:*`
-included. A safety failsafe must therefore not depend on PRÆTORE; see
+included. `praetore-mcp` also refuses every call when the rest of its home
+cannot be loaded (missing or mismatched keys, pins or authority). A safety failsafe must therefore not depend on PRÆTORE; see
 [the threat model](threat-model.md#mission-and-safety-actions-g7-limits).
 
 ### Format 1 documents and historical evidence
@@ -232,6 +233,10 @@ to decide. `praetore-verify --policy` and `policy-digest` use it, and so does
 format 1 policy, so state written before G7 (a hook directory, a
 `praetore-mcp` home, a gateway service configuration) refuses every tool call
 after the upgrade, `safety:*` included, until its policy is migrated.
+
+For a `praetore-mcp` home, the migrated policy must declare
+`"mcp.tools/call": "Mission"`; without it every call is refused, in observe
+mode too.
 
 To migrate, run `praetore policy classify --policy <path>`. It prints a
 proposed `{"format_version": 2, "action_classes": {...}}` (action types

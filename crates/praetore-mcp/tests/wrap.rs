@@ -1161,6 +1161,45 @@ fn g7_undeclared_safety_call_is_refused_in_both_modes() {
     }
 }
 
+/// G7: a tool name that starts with `safety` (any ASCII case) and is not
+/// exactly a declared Safety action is refused in both modes and never
+/// forwarded, including names that would fail validation (trailing space or
+/// tab) and an ambiguous line (bare carriage return).
+#[test]
+fn g7_safety_named_calls_that_are_not_declared_are_never_forwarded() {
+    let calls = [
+        ("space", json!({"jsonrpc":"2.0","id":"space","method":"tools/call","params":{"name":"safety:halt ","arguments":{}}}).to_string()),
+        ("tab", json!({"jsonrpc":"2.0","id":"tab","method":"tools/call","params":{"name":"safety:halt\t","arguments":{}}}).to_string()),
+        ("upper", json!({"jsonrpc":"2.0","id":"upper","method":"tools/call","params":{"name":"SAFETY:halt","arguments":{}}}).to_string()),
+        ("cr", "{\"a\":1,\"x\":\r{\"jsonrpc\":\"2.0\",\"id\":\"cr\",\"method\":\"tools/call\",\"params\":{\"name\":\"safety:hold\"}}\r}".to_string()),
+    ];
+    for mode in ["enforce", "observe"] {
+        for (id, call) in &calls {
+            let (_temp, home) = init_home();
+            write_policy_with_safety(&home);
+            let mut input: String = session(vec![]).iter().map(|l| format!("{l}\n")).collect();
+            input.push_str(call);
+            input.push('\n');
+            let (responses, stderr, out) = wrap_raw(&home, mode, &input);
+            assert!(out.status.success(), "{mode}/{id}: {stderr}");
+            assert!(
+                !stderr.contains("EXECUTED"),
+                "{mode}/{id}: forwarded: {stderr}"
+            );
+            let refused = responses
+                .iter()
+                .find(|r| r["id"] == json!(id) || (r["id"].is_null() && r.get("error").is_some()))
+                .unwrap_or_else(|| panic!("{mode}/{id}: no refusal in {responses:?}"));
+            let text = refused.to_string();
+            assert!(
+                text.contains("UNCLASSIFIED_ACTION") || text.contains("not forwarded"),
+                "{mode}/{id}: {text}"
+            );
+            assert!(journal(&home).is_empty(), "{mode}/{id}");
+        }
+    }
+}
+
 /// G7 limit: without a readable policy nothing can be classified, so every
 /// tool is refused, `safety:*` included, in both modes (fail closed).
 #[test]

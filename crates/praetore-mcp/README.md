@@ -7,8 +7,12 @@ and the result is written as a signed evidence receipt that a third party can
 check offline with `praetore-verify`. It needs no PostgreSQL, no server and no
 Rust code.
 
-* **observe** (default): every call is forwarded. The decision is only
-  recorded. If the home cannot be loaded at startup (not initialized, or
+* **observe** (default): every call that the policy classifies is
+  forwarded; the decision is only recorded. A call whose action type the
+  policy does not declare (`UNCLASSIFIED_ACTION`, for example an undeclared
+  `mcp.tools/call` or a `safety*` tool that is not exactly a declared Safety
+  action) is refused in observe too, and a declared Safety call is forwarded
+  without a receipt (G7). If the home cannot be loaded at startup (not initialized, or
   invalid keys, pins or policy), no receipt can be written, so every
   `tools/call` is refused in observe as well (see Limitations).
 * **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
@@ -475,7 +479,10 @@ Things to know:
   Allowed calls in a refused batch still have ALLOW receipts, because a
   receipt records the decision, not execution. A batch with nothing blocked is
   forwarded byte-for-byte; elements are never re-serialized. Nested arrays
-  inside a batch are treated as ambiguous (see below).
+  inside a batch are treated as ambiguous (see below). This also applies to
+  a declared Safety call (G7): in a batch with a blocked call it is not
+  forwarded either. Do not batch safety calls; send each one on its own
+  line.
 * Blocked reply: `{"jsonrpc":"2.0","id":ID,"result":{"content":[{"type":"text","text":"Denied by PRÆTORE policy. Rule: ... Evidence id: ..."}],"isError":true}}`.
 * Client lines are parsed strictly. **Duplicate object keys** (for example two
   `method` members), invalid UTF-8 and invalid JSON are unparseable. Such a
@@ -513,7 +520,11 @@ Things to know:
   (`praetore-mcp init`, `praetore-mcp policy check`) and restart the client.
 * Errors while evaluating one call after a successful start (clock, replay
   guard): **enforce refuses the call (fail closed); observe forwards it with
-  a loud stderr warning and no receipt.** If a receipt cannot be written,
+  a loud stderr warning and no receipt.** Exceptions (G7): an unclassified
+  action type and any `safety*` tool name that is not exactly a declared
+  Safety action are refused in observe as well, even when the name would
+  fail validation or the line is ambiguous. Unparseable lines are still
+  forwarded unchanged in observe. If a receipt cannot be written,
   enforce refuses the call; observe forwards it and warns.
 
 ## Trust model

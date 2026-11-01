@@ -519,11 +519,32 @@ pub fn handle_client_line(
                     "praetore-mcp: WARNING ambiguous client line ({reason}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
                     candidates.len()
                 ));
+                let mut refused = None;
                 for call in &candidates {
-                    // Observe always forwards; this only records receipts.
-                    let _ = decide(mode, server, call, evaluator, &mut out.warnings);
+                    // Observe forwards and only records receipts, except a
+                    // reading named `safety*` that is not a declared Safety
+                    // action (G7): then the line is refused.
+                    let decision = decide(mode, server, call, evaluator, &mut out.warnings);
+                    if let CallDecision::Block(text) = decision
+                        && crate::gate::is_safety_named(&call.params)
+                    {
+                        refused.get_or_insert((call.id.clone(), text));
+                    }
                 }
-                out.to_server = Some(forward_unchanged(raw));
+                match refused {
+                    None => out.to_server = Some(forward_unchanged(raw)),
+                    Some((id, text)) => {
+                        out.warnings.push(
+                            "praetore-mcp: ambiguous line with an unclassified safety* tool call REFUSED (observe)".into(),
+                        );
+                        out.to_client = Some(match id {
+                            Some(id) => line(&blocked_response(&id, &text)),
+                            None => line(&parse_error_response(
+                                "praetore-mcp: an ambiguous message naming a safety* tool was not forwarded",
+                            )),
+                        });
+                    }
+                }
             }
         },
         Classified::ToolCall(call) => {

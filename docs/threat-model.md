@@ -108,8 +108,13 @@ Trust boundaries are explicit:
 * Classification needs a readable, valid policy. If `policy.json` cannot be
   read or parsed (missing, not a regular file, invalid JSON, format 1), the
   Claude Code hook and the `praetore-mcp` gate cannot classify any tool call
-  and refuse all of them, `safety:*` included (fail closed). This is
+  and refuse all of them, `safety:*` included (fail closed). `praetore-mcp`
+  does the same when the rest of its home cannot be loaded: missing or
+  mismatched agent or attester keys, issuer pins or authority. This is
   intentional and is not changed by G7.
+* In `praetore-mcp` a JSON-RPC batch is all or nothing in enforce: a
+  declared Safety call in a batch with a blocked call is not forwarded.
+  Safety calls should not be batched.
 * A safety failsafe of an AI-enabled system therefore must not depend on
   PRÆTORE. It runs outside PRÆTORE's decision loop and must not rely on the
   hook, the gate or the gateway being available. Routing a safety action

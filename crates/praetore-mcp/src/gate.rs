@@ -111,6 +111,20 @@ impl From<String> for GateError {
     }
 }
 
+/// Whether a tool name starts with `safety`, ASCII case-insensitive, read
+/// before any validation (G7). Such a call is either exactly a declared
+/// Safety action or refused; it is never treated as a mission call.
+pub fn is_safety_named(params: &Value) -> bool {
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|name| {
+            name.as_bytes()
+                .get(..6)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"safety"))
+        })
+}
+
 /// The action type of a `tools/call` (G7). A tool whose name starts with
 /// `safety:` is that safety action type; every other call is
 /// [`ACTION_TYPE`], a mission action.
@@ -1029,6 +1043,24 @@ impl Gate {
     /// anything else: before path resolution, signing, the engine or the
     /// journal. A safety action or an undeclared action type is refused here.
     pub fn classify_call(&self, server: &str, params: &Value) -> Result<(), GateError> {
+        // A name that starts with `safety` (any ASCII case) must be exactly a
+        // declared Safety action; anything else with that start (`SAFETY:x`,
+        // `safety:x ` with a trailing space or tab, `safety_x`, an
+        // undeclared `safety:x`) is refused here, before `Action::new`, so it
+        // is refused in observe mode too and never forwarded.
+        if is_safety_named(params) {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if self.engine.policy().action_classes.get(name)
+                != Some(&praetore_core::ActionClass::Safety)
+            {
+                return Err(GateError::UnclassifiedAction {
+                    action_type: name.to_owned(),
+                });
+            }
+        }
         let action_type = action_type_of(params);
         let action = Action::new(action_type.clone(), Some(server.to_owned()), json!({}))
             .map_err(|e| GateError::Failed(format!("{}: {e}", e.code())))?;
