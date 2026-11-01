@@ -27,6 +27,13 @@ fingerprint golden vectors are checked by core unit tests in the workspace
 test command above. Treat `docs/golden/*-v1.json` as compatibility fixtures;
 codec changes require a deliberate versioned migration.
 
+Black-box tests of the decision layer live in `tests/core/decision.rs` at the
+repository root. The workspace root has no package, so the file is compiled as
+the `decision` test target of `praetore-core` (`[[test]]` in
+`crates/praetore-core/Cargo.toml`) and runs with `cargo test --workspace`; run
+it alone with `cargo test -p praetore-core --test decision --locked`. Other
+crate tests live in each crate's own `tests/` directory.
+
 The PostgreSQL replay adapter's integration tests need a disposable database.
 The CI job provides one and runs duplicate-client, concurrent-claim, and
 connection-loss/recovery tests:

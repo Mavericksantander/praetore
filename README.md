@@ -729,6 +729,7 @@ praetore/
 ├── docs/
 ├── examples/
 ├── scripts/
+├── tests/core/          # black-box decision tests (praetore-core `decision` target)
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE
@@ -915,8 +916,11 @@ target/release/praetore-verify authority \
 
 Regenerating the fixtures changes `evidence.json` and
 `evidence-tampered.json`, because `evidence_id` is random. The fixture authority is valid from 2026-01-01 to 2036-01-01. The `evidence`
-command checks it against the current time, so regenerate the fixtures after
-that date.
+command checks an authority at the receipt's signed decision time
+(`decided_at`, recorded by HighAssurance receipts), which proves it was valid
+then, not that it is valid now. This fixture records no decision time, so it is
+checked against the current time: regenerate the fixtures after that date. See
+[docs/operations.md](docs/operations.md).
 
 The optional `--agent` enables explicit subject-key binding verification for
 standalone authority documents. When omitted, the verifier checks the issuer
