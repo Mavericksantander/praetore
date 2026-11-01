@@ -24,7 +24,7 @@ make_bundle() {
   local out="$1" i=0 n
   mkdir -p "$out/evidence"
   cp "$SOURCE/attester-public-key.hex" "$SOURCE/issuer-pins.jsonl" \
-    "$SOURCE/policy.json" "$SOURCE/index.json" "$out/"
+    "$SOURCE/policy.json" "$out/"
   shopt -s nullglob
   local signed=("$SOURCE"/evidence/*.json)
   shopt -u nullglob
@@ -34,6 +34,19 @@ make_bundle() {
     cp "${signed[$((i % n))]}" "$(printf '%s/evidence/r%04d-%s' "$out" "$i" "$(basename "${signed[$((i % n))]}")")"
     i=$((i + 1))
   done
+  # index.json con una entrada por copia, la del recibo original: verify.sh
+  # exige que index.json cubra cada recibo y lo atribuya a quien lo firmó.
+  python3 -I - "$SOURCE/index.json" "$out" <<'PY'
+import json, os, sys
+source, out = sys.argv[1], sys.argv[2]
+by_file = {os.path.basename(e["file"]): e for e in json.load(open(source))}
+index = []
+for name in sorted(os.listdir(os.path.join(out, "evidence"))):
+    entry = dict(by_file[name.split("-", 1)[1]])
+    entry["file"] = "evidence/" + name
+    index.append(entry)
+json.dump(index, open(os.path.join(out, "index.json"), "w"), indent=2)
+PY
 }
 
 run_verify() {

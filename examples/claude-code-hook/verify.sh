@@ -6,7 +6,9 @@
 #   ./examples/claude-code-hook/verify.sh [bundle]
 # Por defecto verifica examples/claude-code-hook/bundle.
 # Sale con 0 solo si praetore-verify acepta todos los recibos (con la policy
-# publicada) y rechaza la copia alterada; con 1 en cualquier otro caso.
+# publicada) y rechaza la copia alterada, e index.json atribuye cada recibo al
+# agente que lo firmó y una copia re-atribuida se rechaza; con 1 en cualquier
+# otro caso.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -72,17 +74,29 @@ set -e
 [ "$TAMPER_RC" -ne 0 ] || fail "la copia alterada verificó (no debería)"
 echo "OK: la copia alterada fue rechazada (exit $TAMPER_RC)"
 
-step "5. Resumen por agente y decisión (de index.json, solo informativo)"
-# No cambia el código de salida: index.json no está firmado y el resultado ya
-# lo dieron los pasos 3 y 4.
-python3 - "$BUNDLE/index.json" <<'PY' || echo "aviso: no se pudo resumir index.json"
-import collections, json, sys
+step "5. Atribución: index.json debe decir lo mismo que los recibos firmados"
+# index.json y los nombres de archivo no están firmados. check-attribution.py
+# lee los recibos que el paso 3 verificó y exige que index.json nombre el
+# mismo agente, perfil y agent id; una identidad por perfil.
+python3 -I "$HERE/check-attribution.py" "$BUNDLE" ||
+  fail "index.json no coincide con los recibos firmados"
+echo "OK: cada recibo queda atribuido a la identidad que lo firmó"
+
+step "6. Re-atribuir UN recibo en una copia de index.json y comprobar que falla"
+python3 -I - "$BUNDLE/index.json" "$WORK/index-reattributed.json" <<'PY'
+import json, sys
 index = json.load(open(sys.argv[1]))
-tally = collections.Counter((e["agent"], e["outcome"]) for e in index)
-for (agent, outcome), n in sorted(tally.items()):
-    print(f"{agent:<9} {outcome:<16} {n}")
-totals = collections.Counter(e["outcome"] for e in index)
-print("total:", ", ".join(f"{k} {v}" for k, v in sorted(totals.items())))
+first = index[0]["agent"]
+other = next((e["agent"] for e in index if e["agent"] != first), first + "-otro")
+index[0]["agent"] = other
+if index[0].get("profile") is not None:
+    index[0]["profile"] = other
+json.dump(index, open(sys.argv[2], "w"))
+print(f"{index[0]['file']}: agent {first} -> {other}")
 PY
+if python3 -I "$HERE/check-attribution.py" "$BUNDLE" "$WORK/index-reattributed.json"; then
+  fail "la copia re-atribuida de index.json fue aceptada (no debería)"
+fi
+echo "OK: la re-atribución fue rechazada"
 
 step "RESULTADO: todas las verificaciones dieron lo esperado"

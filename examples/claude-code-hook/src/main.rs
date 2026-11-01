@@ -14,6 +14,9 @@
 
 mod shell;
 
+#[cfg(test)]
+mod attribution_tests;
+
 use std::{
     collections::BTreeMap,
     fs,
@@ -46,7 +49,14 @@ const UNREGISTERED: &str = "unregistered";
 const SUBAGENTS: [&str; 3] = ["planner", "coder", "explorer"];
 const MAX_HOOK_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// Longest `agent_id` or `session_id` recorded in a receipt.
+const MAX_CLAIM_BYTES: usize = 128;
 const AUTHORITY_LIFETIME_DAYS: i64 = 90;
+/// Authority constraint naming the profile an agent key was issued for.
+/// The issuer signs it, so a verifier that pins only the issuer can tell
+/// which profile an agent id belongs to. The engine enforces it: the
+/// request must carry the same value as an action parameter.
+const PROFILE_CONSTRAINT: &str = "praetore.agent_profile";
 
 /// Capabilities granted to each agent's authority at `init`.
 const PROFILES: [(&str, &[&str]); 6] = [
@@ -86,6 +96,12 @@ struct HookInput {
     tool_use_id: Option<String>,
     #[serde(default)]
     agent_type: Option<String>,
+    /// Claude Code's id for the subagent instance the hook fires in. It is
+    /// recorded in the signed context; it does not select a key.
+    #[serde(default)]
+    agent_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
 }
@@ -194,6 +210,7 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
             ISSUER,
             capabilities.iter().map(|c| (*c).to_string()).collect(),
         )
+        .with_constraint(PROFILE_CONSTRAINT, name)
         .with_validity(validity.clone());
         authority.sign_for_agent(&issuer_key, &identity)?;
         let profile = AgentProfile {
@@ -556,6 +573,17 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     if key.public_key() != identity.verified_public_key()? {
         return Err(format!("key for profile '{profile_name}' does not match its identity").into());
     }
+    // A profile file copied over another (say `coder.*` saved as
+    // `explorer.*`) would sign as the wrong agent; the issuer-signed profile
+    // name catches it. State created before this constraint has none.
+    if let Some(issued_for) = profile_constraint(&authority)
+        && issued_for != profile_name
+    {
+        return Err(format!(
+            "authority in profile '{profile_name}' was issued for profile '{issued_for}'"
+        )
+        .into());
+    }
 
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
         &directory.join(ISSUER_PIN_FILE),
@@ -565,8 +593,14 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     )?)?)?;
     let engine = AuthorizationEngine::strict(policy, vec![pin])?;
 
-    let (action_type, capability, parameters, path_check) =
+    let (action_type, capability, mut parameters, path_check) =
         classify(&input.tool_name, &input.tool_input, input.cwd.as_deref());
+    // The engine requires every authority constraint to appear among the
+    // action parameters, so an authority issued for one profile cannot be
+    // used in a request made as another.
+    if let Some(parameters) = parameters.as_object_mut() {
+        parameters.insert(PROFILE_CONSTRAINT.into(), json!(profile_name));
+    }
     let action = Action::new(action_type, None, parameters)?.with_capability(capability);
     let mut request = AuthorizationRequest::new(identity, authority, action)?
         .with_context("agent", json!(agent))
@@ -574,6 +608,22 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         .with_context("tool", json!(input.tool_name));
     if let Some(check) = path_check {
         request = request.with_context("praetore.path_check", check);
+    }
+    // Instance and session ids as Claude Code reports them: signed claims
+    // made with the profile key, not separate keys (see SAF-14).
+    for (key, value) in [
+        ("claude.agent_id", &input.agent_id),
+        ("claude.session_id", &input.session_id),
+    ] {
+        match value.as_deref() {
+            Some(value) if value.len() > MAX_CLAIM_BYTES => {
+                return Ok(denied(format!("{key} longer than {MAX_CLAIM_BYTES} bytes")));
+            }
+            Some(value) if !value.is_empty() => {
+                request = request.with_context(key, json!(value));
+            }
+            _ => {}
+        }
     }
     request.sign_intent(&key)?;
     let mut evidence = engine.evaluate(request)?;
@@ -637,9 +687,86 @@ fn append_receipt(
     Ok(())
 }
 
+/// The issuer-signed profile name of an authority, if it carries one.
+fn profile_constraint(authority: &Authority) -> Option<&str> {
+    authority
+        .constraints
+        .iter()
+        .find(|c| c.key == PROFILE_CONSTRAINT)
+        .map(|c| c.value.as_str())
+}
+
+/// Who a receipt attributes the request to, read only from signed fields.
+struct Attribution {
+    /// `context.agent`: the `agent_type` Claude Code sent (or `main`).
+    agent: String,
+    /// `context.profile`: the profile whose key signed the intent.
+    profile: String,
+    /// The profile is also named in the issuer-signed authority.
+    issuer_bound: bool,
+}
+
+/// Reads the attribution from the signed request context and checks it
+/// against the issuer-signed authority. Call it only on evidence whose
+/// signatures were verified; unsigned copies of these names (the
+/// `receipts.jsonl` wrapper, `index.json`) are checked against it.
+fn signed_attribution(evidence: &Evidence) -> Result<Attribution, BoxError> {
+    let agent = evidence
+        .context
+        .get("agent")
+        .and_then(Value::as_str)
+        .ok_or("receipt does not sign an agent name")?;
+    // Receipts from before the `profile` context key (set 04) name only the
+    // agent, which was then also the profile.
+    let profile = match evidence.context.get("profile") {
+        Some(profile) => profile.as_str().ok_or("signed profile is not a string")?,
+        None => agent,
+    };
+    if profile != UNREGISTERED && profile != agent {
+        return Err(
+            format!("signed agent '{agent}' does not match signed profile '{profile}'").into(),
+        );
+    }
+    let issued_for = profile_constraint(&evidence.authority);
+    if let Some(issued_for) = issued_for {
+        let requested_as = evidence
+            .action
+            .parameters
+            .get(PROFILE_CONSTRAINT)
+            .and_then(Value::as_str);
+        if issued_for != profile || requested_as != Some(profile) {
+            return Err(format!(
+                "authority was issued for profile '{issued_for}', receipt names '{profile}' (action parameter {requested_as:?})"
+            )
+            .into());
+        }
+    }
+    Ok(Attribution {
+        agent: agent.to_string(),
+        profile: profile.to_string(),
+        issuer_bound: issued_for.is_some(),
+    })
+}
+
+/// Fails if an unsigned copy of a name disagrees with the signed one.
+fn check_unsigned(record: &Value, field: &str, signed: &str) -> Result<(), BoxError> {
+    match record.get(field) {
+        None | Some(Value::Null) => Ok(()),
+        Some(value) if value.as_str() == Some(signed) => Ok(()),
+        Some(value) => Err(format!(
+            "unsigned field {field}={value} disagrees with the signed receipt ({signed:?})"
+        )
+        .into()),
+    }
+}
+
 /// Re-verifies every receipt offline: evidence integrity, the attester
 /// signature, the intent signed with the agent profile's key, the
-/// issuer-signed authority, and the policy digest.
+/// issuer-signed authority, and the policy digest. It also checks who the
+/// receipt is attributed to: the signed agent and profile names, the
+/// profile named in the authority, that the signing identity is the one in
+/// `agents/<profile>.json`, and that the unsigned `agent`/`profile` fields
+/// of the line agree. The tally is built from the signed names only.
 fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
         &directory.join(ISSUER_PIN_FILE),
@@ -652,9 +779,11 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     let receipts = fs::read_to_string(directory.join(RECEIPTS_FILE))?;
     let now = OffsetDateTime::now_utc();
     let mut tally: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut identities: BTreeMap<String, String> = BTreeMap::new();
+    let mut issuer_bound = 0usize;
     let mut failures = 0usize;
     for (index, line) in receipts.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let check = || -> Result<(String, DecisionOutcome), BoxError> {
+        let check = || -> Result<(Attribution, String, DecisionOutcome), BoxError> {
             let record: Value = serde_json::from_str(line)?;
             let evidence = Evidence::from_json(&record["evidence"].to_string())?;
             if !evidence.verify_integrity() {
@@ -669,12 +798,30 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
             if evidence.policy_digest.as_deref() != Some(policy_digest.as_str()) {
                 return Err("evaluated under a different policy".into());
             }
-            let agent = record["agent"].as_str().unwrap_or("?").to_string();
-            Ok((agent, evidence.decision.outcome))
+            let attribution = signed_attribution(&evidence)?;
+            check_unsigned(&record, "agent", &attribution.agent)?;
+            check_unsigned(&record, "profile", &attribution.profile)?;
+            let profile_path = directory
+                .join(AGENTS_DIR)
+                .join(format!("{}.json", attribution.profile));
+            let profile: AgentProfile = serde_json::from_slice(&read_bounded(&profile_path)?)?;
+            if AgentIdentity::from_json(&profile.identity.to_string())? != evidence.agent {
+                return Err(format!(
+                    "signed by an identity that is not the one of profile '{}'",
+                    attribution.profile
+                )
+                .into());
+            }
+            let agent_id = evidence.agent.id.as_uuid().to_string();
+            Ok((attribution, agent_id, evidence.decision.outcome))
         };
         match check() {
-            Ok((agent, outcome)) => {
-                *tally.entry((agent, format!("{outcome:?}"))).or_default() += 1;
+            Ok((attribution, agent_id, outcome)) => {
+                issuer_bound += usize::from(attribution.issuer_bound);
+                identities.insert(attribution.profile, agent_id);
+                *tally
+                    .entry((attribution.agent, format!("{outcome:?}")))
+                    .or_default() += 1;
             }
             Err(error) => {
                 failures += 1;
@@ -685,8 +832,13 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     for ((agent, outcome), count) in &tally {
         println!("{agent:<9} {outcome:<16} {count}");
     }
+    for (profile, agent_id) in &identities {
+        println!("profile {profile:<12} agent id {agent_id}");
+    }
     let verified: usize = tally.values().sum();
-    println!("{verified} receipts verified, {failures} failed");
+    println!(
+        "{verified} receipts verified, {failures} failed; {issuer_bound} name their profile in the issuer-signed authority"
+    );
     if failures > 0 {
         return Err(format!("{failures} receipts failed verification").into());
     }
@@ -713,7 +865,14 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
     for (number, line) in receipts.lines().filter(|l| !l.is_empty()).enumerate() {
         let record: Value = serde_json::from_str(line)?;
         let evidence = Evidence::from_json(&record["evidence"].to_string())?;
-        let agent = record["agent"].as_str().unwrap_or("unknown");
+        // The index is unsigned: its names come from the signed receipt, and
+        // a line whose wrapper disagrees is not exported.
+        let attribution = signed_attribution(&evidence)
+            .map_err(|error| format!("receipt {}: {error}", number + 1))?;
+        check_unsigned(&record, "agent", &attribution.agent)
+            .and_then(|()| check_unsigned(&record, "profile", &attribution.profile))
+            .map_err(|error| format!("receipt {}: {error}", number + 1))?;
+        let agent = attribution.agent.as_str();
         let tool = record["tool_name"].as_str().unwrap_or("unknown");
         let outcome = evidence.decision.outcome;
         let file = format!(
@@ -726,8 +885,9 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
         index.push(json!({
             "file": file,
             "agent": agent,
+            "agent_id": evidence.agent.id.as_uuid().to_string(),
             "tool_name": tool,
-            "profile": record["profile"],
+            "profile": attribution.profile,
             "tool_use_id": record["tool_use_id"],
             "outcome": outcome,
             "rule": deciding_rules(&evidence),
@@ -862,6 +1022,8 @@ mod tests {
                 tool_input: input,
                 tool_use_id: Some("toolu_test".into()),
                 agent_type: agent.map(str::to_string),
+                agent_id: None,
+                session_id: None,
                 cwd: Some(self.root.display().to_string()),
             };
             authorize(&self.state, &input).unwrap()
@@ -1094,6 +1256,37 @@ mod tests {
         assert!(records.iter().all(|r| r["profile"] == UNREGISTERED));
         assert_eq!(records[1]["agent"], "../main");
         verify_receipts(&f.state).unwrap();
+    }
+
+    #[test]
+    fn committed_receipts_keep_their_signed_attribution() {
+        // Sets 04 and 05 predate the issuer-signed profile name; set 04 also
+        // predates the `profile` context key. Both still read back.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("evidence");
+        for (file, agent, profile) in [
+            (
+                "04-sesion-real-bloqueada-web-fetch/evidence/0001-main-Glob-Allow.json",
+                "main",
+                "main",
+            ),
+            (
+                "05-sesion-real-final/evidence/0093-coder-Bash-RequireApproval.json",
+                "coder",
+                "coder",
+            ),
+            (
+                "03-bundle-demo-reproducible/evidence/0020-general-purpose-Read-Deny.json",
+                "general-purpose",
+                UNREGISTERED,
+            ),
+        ] {
+            let evidence =
+                Evidence::from_json(&fs::read_to_string(dir.join(file)).unwrap()).unwrap();
+            let attribution = signed_attribution(&evidence).unwrap();
+            assert_eq!(attribution.agent, agent, "{file}");
+            assert_eq!(attribution.profile, profile, "{file}");
+            assert!(!attribution.issuer_bound, "{file}");
+        }
     }
 
     #[test]

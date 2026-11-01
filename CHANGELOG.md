@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- SAF-14 (proposal, `docs/proposals/SAF-14-identidad-por-agente.md`):
+  per-agent identity. It records what the agent signature identifies today
+  (one key per home in `praetore-mcp`, one key per profile in the Claude
+  Code hook, no agent keys in the gateway) and proposes per-profile keys,
+  per-client agents for `praetore-mcp`, and instance/session ids as signed
+  claims. It gives attribution between cooperative agents, not isolation:
+  every key is readable by the same OS user.
+- `examples/claude-code-hook`: a receipt can no longer be re-attributed to
+  another agent by editing an unsigned field. `verify` counted receipts by
+  the unsigned `agent` field of `receipts.jsonl` and `export` copied it into
+  `index.json`, which `verify.sh` only summarized; editing either changed who
+  a receipt was attributed to with exit 0. Now `verify` and `export` read
+  the agent and profile from the signed receipt and fail when the unsigned
+  copy disagrees, `verify` checks the signing identity against
+  `agents/<profile>.json`, and `verify.sh` runs `check-attribution.py`
+  (fails on a mismatch, a missing index entry, or more than one identity per
+  profile) and rejects a re-attributed copy of `index.json`. `init` adds an
+  issuer-signed `praetore.agent_profile` constraint to each authority and
+  the hook sends the same action parameter, so the engine refuses an
+  authority issued for another profile (a profile file copied over another
+  now fails closed instead of signing as the other agent). Claude Code's
+  `agent_id` and `session_id`, when present, are recorded in the signed
+  context (over 128 bytes: deny). `index.json` gains `agent_id`. The receipt
+  format does not change; existing state and the committed evidence sets
+  still verify. New `test-attribution.sh` (in CI).
+
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed

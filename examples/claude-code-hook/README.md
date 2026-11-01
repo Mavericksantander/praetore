@@ -11,11 +11,15 @@ agente haga por otro camino queda fuera (ver Límites).
 ## Qué hace
 
 - `init` crea una clave Ed25519 por perfil de agente y una autoridad firmada
-  por un emisor local que da solo las capacidades de ese perfil. La clave del
+  por un emisor local que da solo las capacidades de ese perfil y nombra el
+  perfil (constraint `praetore.agent_profile`, SAF-14). La clave del
   emisor se descarta después de firmar; queda solo su pin público. También
   crea una clave de atestador para firmar los recibos.
 - Por cada tool call, el hook arma un `AuthorizationRequest` firmado con la
-  clave del perfil, lo evalúa con un motor `strict` contra una policy v2 que
+  clave del perfil (con `praetore.agent_profile` en los parámetros, que el
+  motor exige contra la autoridad, y `agent_id`/`session_id` de Claude Code
+  en el contexto firmado si llegan), lo evalúa con un motor `strict` contra
+  una policy v2 que
   por defecto niega, firma la evidencia con el atestador y la agrega a
   `receipts.jsonl`.
 - `Deny` → la tool call se bloquea. `RequireApproval` → Claude Code le
@@ -107,11 +111,20 @@ Desde la raíz de un clon:
    Con `--policy`, praetore-verify exige además que el `policy_digest` de cada
    recibo sea el de la `policy.json` publicada.
 3. Altera un byte de una copia y comprueba que la verificación falla.
-4. Resume las decisiones por agente (de `index.json`, solo informativo).
+4. Con `check-attribution.py`, exige que `index.json` (sin firmar) nombre el
+   mismo agente, perfil y agent id que cada recibo firmado, que cada recibo
+   tenga una entrada y que haya una identidad por perfil. Imprime el agent
+   id de cada perfil.
+5. Re-atribuye un recibo en una copia de `index.json` y comprueba que el
+   paso 4 la rechaza.
 
 Sale con 0 solo si praetore-verify acepta todos los recibos y rechaza la copia
-alterada; con 1 en cualquier otro caso. `test-verify.sh` lo comprueba con un
-bundle de 1000 recibos y con uno que tiene un recibo alterado.
+alterada, e `index.json` coincide con lo firmado; con 1 en cualquier otro
+caso. `test-verify.sh` lo comprueba con un bundle de 1000 recibos y con uno
+que tiene un recibo alterado. `test-attribution.sh` regenera un bundle y
+comprueba que coder y explorer firman con identidades distintas y que tres
+re-atribuciones (en `index.json`, en el contexto firmado y cambiando
+identidad y autoridad) se rechazan.
 
 No usa el binario del hook ni ninguna clave privada. Las claves privadas del
 demo existen solo mientras corre `demo.sh` y se borran al terminar. Las
@@ -153,9 +166,15 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
   la intención la firmó la clave de ese **perfil de agente**, que la
   autoridad la emitió el emisor pineado para esa clave, y bajo qué policy se
   decidió.
-- **No prueba qué agente fue.** Las claves de todos los perfiles y la del
-  atestador viven en la misma cuenta de usuario que los agentes, así que la
-  firma identifica el perfil, no aísla un agente de otro.
+- **Atribuye al perfil, no aísla.** La firma dice qué perfil (`agent_type`)
+  pidió la acción, y con SAF-14 el emisor firma para qué perfil emitió cada
+  identidad. Pero las claves de todos los perfiles y la del atestador viven
+  en la misma cuenta de usuario que los agentes: un agente que lee archivos
+  puede firmar como otro. Es atribución entre agentes cooperativos, no
+  contención. Dos instancias del mismo perfil comparten clave; el
+  `agent_id` de Claude Code, si llega, queda como dato firmado, no como
+  clave propia. Ver
+  [SAF-14](../../docs/proposals/SAF-14-identidad-por-agente.md).
 - **No prueba que la acción se ejecutó**, ni que no hubo acciones fuera del
   hook.
 
