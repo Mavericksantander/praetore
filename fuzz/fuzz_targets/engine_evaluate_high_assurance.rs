@@ -88,7 +88,8 @@ fn fixture() -> &'static Fixture {
                 "fuzz_action",
                 PolicyEffect::Allow,
             )],
-        );
+        )
+        .with_mission_actions(["fuzz_action"]);
         let issuer_pin = TrustedAuthorityIssuer::new("fuzz-issuer", issuer_key.public_key())
             .unwrap()
             .with_validity(validity)
@@ -134,6 +135,14 @@ fuzz_target!(|data: &[u8]| {
     let fixture = fixture();
     let Ok(action) = Action::new("fuzz_action", None, parameters)
         .map(|action| action.with_capability("fuzz:execute"))
+    else {
+        return;
+    };
+    let Ok(action) = fixture
+        .engine
+        .policy()
+        .classify(action)
+        .and_then(|action| action.into_mission())
     else {
         return;
     };
