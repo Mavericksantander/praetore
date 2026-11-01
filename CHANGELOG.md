@@ -2,8 +2,11 @@
 
 ## Unreleased
 
-- Policy loading reports every rejection with a typed error
-  ([#23](https://github.com/Mavericksantander/praetore/issues/23)). The error
+- Policy loading reports size, depth, node, integer, duplicate-key,
+  malformed-JSON and unknown-field rejections with typed errors
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)); wrong
+  types, missing fields and unknown enum variants are still
+  `PolicyEvaluationFailed(String)`. The error
   code of all of them stays `POLICY_EVALUATION_FAIL`, so `praetore-verify`,
   the CLI, the gateway and `praetore-mcp` report the same codes as before.
   Receipts and policy digests are unchanged.
