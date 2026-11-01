@@ -1,0 +1,14 @@
+diff --git a/crates/praetore-gateway/src/http_api.rs b/crates/praetore-gateway/src/http_api.rs
+index d4f0a90..75ffc2c 100644
+--- a/crates/praetore-gateway/src/http_api.rs
++++ b/crates/praetore-gateway/src/http_api.rs
+@@ -518,7 +518,8 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
+     // Every such action type gets the same 422, declared Safety or not, with
+     // no engine, journal or signing work, so the answer depends only on the
+     // public prefix rule and cannot be used to enumerate `action_classes`.
+-    if let Some(claimed) = reserved_safety_action(json) {
++    // G7 MUTANT: only the reserved-prefix gate is removed.
++    if let Some(claimed) = reserved_safety_action(json).filter(|_| false) {
+         let declared = state
+             .gateway
+             .policy()

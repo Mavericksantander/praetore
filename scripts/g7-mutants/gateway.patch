@@ -44,10 +44,10 @@ index 20cf4d7..4c0cac6 100644
  }
  
 diff --git a/crates/praetore-gateway/src/http_api.rs b/crates/praetore-gateway/src/http_api.rs
-index a88b58d..3624b43 100644
+index d4f0a90..7754684 100644
 --- a/crates/praetore-gateway/src/http_api.rs
 +++ b/crates/praetore-gateway/src/http_api.rs
-@@ -517,7 +517,9 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
+@@ -518,7 +518,9 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
      // Every such action type gets the same 422, declared Safety or not, with
      // no engine, journal or signing work, so the answer depends only on the
      // public prefix rule and cannot be used to enumerate `action_classes`.
@@ -55,6 +55,6 @@ index a88b58d..3624b43 100644
 +    // G7 MUTANT: the reserved-prefix check is removed.
 +    let _ = reserved_safety_action;
 +    if let Some(claimed) = None::<ReservedSafetyAction> {
-         if state
+         let declared = state
              .gateway
              .policy()

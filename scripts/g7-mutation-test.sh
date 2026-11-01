@@ -3,8 +3,9 @@
 # depend on the `classify` call at each entry point.
 #
 # For each entry point (gateway HTTP API, praetore-mcp gate, Claude Code
-# hook), for the engine's own class re-check, and for the unclassified
-# refusal deciding before the request is verified, it:
+# hook), for the gateway's reserved-prefix gate alone, for the engine's own
+# class re-check, and for the unclassified refusal deciding before the
+# request is verified, it:
 #   1. runs the G7 runtime tests on the unmodified tree (they must pass);
 #   2. applies scripts/g7-mutants/<entry>.patch, which removes the classify
 #      call and wraps the action unclassified, as the code did before G7
@@ -34,6 +35,7 @@ tests_for() {
     gateway) echo "cargo test --locked -p praetore-gateway --test safety_actions" ;;
     mcp) echo "cargo test --locked -p praetore-mcp --lib g7_" ;;
     hook) echo "cargo test --locked --manifest-path examples/claude-code-hook/Cargo.toml tests_g7" ;;
+    gateway-prefix) echo "cargo test --locked -p praetore-gateway --test safety_actions reserved_safety_prefix_answers_the_same_declared_or_not" ;;
     engine) echo "cargo test --locked -p praetore-core --test action_classes" ;;
     unclassified)
       echo "cargo test --locked -p praetore-core --test action_classes"
@@ -43,7 +45,7 @@ tests_for() {
 }
 
 survivors=0
-for mutant in gateway mcp hook engine unclassified; do
+for mutant in gateway gateway-prefix mcp hook engine unclassified; do
   commands=()
   while IFS= read -r line; do commands+=("$line"); done < <(tests_for "$mutant")
   for command in "${commands[@]}"; do
