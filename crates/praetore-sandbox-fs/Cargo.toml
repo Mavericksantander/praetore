@@ -1,0 +1,17 @@
+[package]
+name = "praetore-sandbox-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "Descriptor-based file effects confined beneath a sandbox root directory (openat2 on Linux, O_NOFOLLOW walk elsewhere)."
+
+[dependencies]
+thiserror = "2.0"
+uuid = { version = "1.18", features = ["v4"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["std", "fs"] }

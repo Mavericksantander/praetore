@@ -14,6 +14,29 @@
   `examples/claude-code-hook/test-verify.sh` (in CI): 1000 receipts exit 0
   (141 before the fix), one altered receipt among them exits 1 and is named.
   `scripts/record-hook-demo.sh` had the same `ls | head` and is fixed too.
+- **T-013B:** new crate `praetore-sandbox-fs` (Unix, `#![forbid(unsafe_code)]`,
+  built on `rustix`, which was already in `Cargo.lock`): file effects beneath
+  a sandbox root made through directory descriptors, never through a joined
+  path. On Linux the parent directory is opened with one `openat2(...,
+  RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+  RESOLVE_NO_XDEV)`; on `ENOSYS` and on macOS, one
+  `openat(O_NOFOLLOW | O_DIRECTORY)` per component. The final component is
+  created with `O_CREAT | O_EXCL | O_NOFOLLOW`, replaced with `renameat`,
+  removed with `unlinkat` relative to the parent descriptor, and opened with
+  `O_NOFOLLOW | O_NONBLOCK` plus an `fstat` check. Existing hard links
+  (`st_nlink > 1`), symlinks, FIFOs, sockets and devices are refused.
+  `praetore_gateway::sandbox::SandboxDispatcher` now performs its effects
+  through it (refusal codes and receipt format unchanged; it already walked
+  by descriptor, the new part is `openat2` and `RESOLVE_NO_XDEV`, which also
+  refuses bind mounts). New race tests swap an intermediate directory for a
+  symlink to an outside directory while writes and deletes run; they fail
+  against a deliberately path-based reference
+  (`PRAETORE_SANDBOX_FS_RACE_IMPL=path-based`). Not prevented: a directory
+  moved out of the root while an operation is in flight, and hard links
+  created after the check, both by a process that can also write outside
+  the root. The ignored supervisor test `sandbox_dispatch_rejects_symlink_escape`
+  is removed: it tested a layer that cannot see the Job's filesystem (#61);
+  the case is covered in `praetore-sandbox-fs`.
 ## 0.3.1-rc.1 - 2026-10-31
 
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,

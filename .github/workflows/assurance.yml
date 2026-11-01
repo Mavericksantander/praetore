@@ -23,6 +23,12 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
+      - name: T-013B confinement race tests (Linux, openat2 required, output shown)
+        env:
+          PRAETORE_REQUIRE_OPENAT2: "1"
+        run: |
+          cargo test --locked -p praetore-sandbox-fs -- --nocapture
+          cargo test --locked -p praetore-gateway --lib sandbox::tests::race -- --nocapture
       - run: cargo run --locked --package praetore-core --example high_assurance
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
@@ -92,6 +98,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace --locked
       - run: cargo test -p praetore-python --locked
+      - name: T-013B confinement tests (macOS portable walk)
+        run: cargo test --locked -p praetore-sandbox-fs -- --nocapture
 
   verifier-features:
     name: Offline verifiers build without receipt signing
