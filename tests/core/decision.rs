@@ -5,7 +5,10 @@
 //! `[[test]]` entry in `crates/praetore-core/Cargo.toml`), so it runs under
 //! `cargo test --workspace`. It uses only the public API.
 //!
-//! The behaviour asserted here is the documented one:
+//! Two kinds of assertion live here.
+//!
+//! Documented contract (outcome, `decided_by`, the set of contributions,
+//! recovery obligations), from:
 //! * `docs/policy-language.md`, "Effects and precedence": the outcome is the
 //!   strongest matching effect under DENY > REQUIRE_APPROVAL > ALLOW, the fold
 //!   is independent of rule order, and no matching rule means DENY;
@@ -13,6 +16,14 @@
 //!   combination (higher severity, ties keep the earlier-matching rule), and
 //!   `decided_by` covered by the integrity hash and the attester signature;
 //! * `docs/golden/trust-chain-v1.json`: the frozen legacy decision encoding.
+//!
+//! Current behaviour, pinned but NOT documented as a contract: the exact
+//! `reason` strings (rule, default deny, unbound rule, engine guards) and the
+//! document order of `contributions`. Both are part of the signed receipt
+//! bytes, so a change must be deliberate, but `docs/` does not define them.
+//! The one reason property that is documented is that a combined decision's
+//! `reason` follows its decider (`docs/policy-language.md`, "Effects and
+//! precedence"); `combined_reason_follows_the_decider_in_every_order` tests it.
 //!
 //! Unit tests in `src/decision.rs` and `src/engine.rs` already cover
 //! `strongest` on hand-built decisions, `decided_by` consistency rules and
@@ -82,12 +93,16 @@ fn approve(id: &str) -> PolicyRule {
 }
 
 fn recover(id: &str) -> PolicyRule {
+    recover_to(id, "safe-hold", 250)
+}
+
+fn recover_to(id: &str, recovery_id: &str, deadline_ms: u64) -> PolicyRule {
     PolicyRule::new(
         id,
         "read_data",
         PolicyEffect::Recover {
-            recovery_id: "safe-hold".into(),
-            deadline_ms: 250,
+            recovery_id: recovery_id.into(),
+            deadline_ms,
         },
     )
     .with_capability("read_data")
@@ -317,6 +332,42 @@ fn unbound_restrictive_rule_denies_and_is_recorded_as_unbound() {
     );
 }
 
+#[test]
+fn unbound_deny_rule_applies_its_effect_and_is_an_ordinary_rule() {
+    // docs/policy-language.md: "an unbound DENY rule applied its declared
+    // effect and is an ordinary `rule`". The authority lacks the rule's
+    // capability, the rule still applies and is recorded as `rule`.
+    for rules in [
+        vec![
+            allow("allow-read"),
+            PolicyRule::new("deny-x", "read_data", PolicyEffect::Deny)
+                .with_capability("read_data:x"),
+        ],
+        vec![
+            PolicyRule::new("deny-x", "read_data", PolicyEffect::Deny)
+                .with_capability("read_data:x"),
+            allow("allow-read"),
+        ],
+        // Unbound through a missing action target.
+        vec![allow("allow-read"), deny("deny-x").with_target("secrets")],
+    ] {
+        let target = if rules.iter().any(|r| r.target.is_some()) {
+            None
+        } else {
+            Some("db")
+        };
+        let evidence = evaluate(
+            Policy::new_v2("unbound-deny", 1, rules),
+            &["read_data"],
+            action("read_data", target, json!({})),
+        );
+        assert_eq!(evidence.outcome(), DecisionOutcome::Deny);
+        assert_eq!(decider(&evidence), DecidedBy::rule("deny-x"));
+        assert_eq!(evidence.decision.reason, matched("deny-x"));
+        assert!(contributed_rules(&evidence).contains(&("deny-x".into(), DecisionOutcome::Deny)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Precedence
 // ---------------------------------------------------------------------------
@@ -381,10 +432,7 @@ fn recover_outranks_deny_in_either_order() {
             Some("r"),
             "{ids:?}"
         );
-        // Note: `decision.reason` is not asserted here. When a DENY rule
-        // precedes the RECOVER rule the reason names the DENY rule while
-        // `decided_by` names the RECOVER rule; the docs do not define the
-        // reason for this case (reported in the PR).
+        assert_eq!(evidence.decision.reason, matched("r"), "{ids:?}");
         assert!(evidence.verify());
     }
 }
@@ -402,6 +450,123 @@ fn equal_outcomes_are_decided_by_the_earliest_matching_rule() {
         assert_eq!(decider(&evidence), DecidedBy::rule(first));
         assert_eq!(evidence.decision.reason, matched(first));
     }
+}
+
+#[test]
+fn combined_reason_follows_the_decider_in_every_order() {
+    // The signed reason names the same rule as `decided_by` (and, for a
+    // Recover decision, the recovery obligation), whatever the rule order.
+    let rule_sets = [
+        vec![deny("d"), recover("r")],
+        vec![deny("d"), recover("r"), allow("a")],
+        vec![allow("a"), approve("p"), deny("d")],
+        vec![allow("a"), approve("p")],
+        vec![deny("d1"), deny("d2")],
+    ];
+    for rules in rule_sets {
+        for order in permutations(&rules) {
+            let ids: Vec<String> = order.iter().map(|r| r.id.clone()).collect();
+            let evidence = evaluate_read(order);
+            let decision = &evidence.decision;
+            let DecidedBy::Rule { rule_id } = decider(&evidence) else {
+                panic!("expected a rule decider for {ids:?}");
+            };
+            assert_eq!(decision.reason, matched(&rule_id), "{ids:?}");
+            let contribution = decision
+                .contributions
+                .iter()
+                .find(|c| c.rule_id == rule_id)
+                .expect("decider contributed");
+            assert_eq!(decision.reason, contribution.reason, "{ids:?}");
+            if let Some(recovery) = &decision.recovery {
+                assert_eq!(recovery.rule_id, rule_id, "{ids:?}");
+                assert_eq!(decision.reason, recovery.reason, "{ids:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn tie_between_recover_rules_keeps_the_first_obligation() {
+    for (first, second) in [("r1", "r2"), ("r2", "r1")] {
+        let safe = |id: &str| format!("safe-{id}");
+        let deadline = |id: &str| if id == "r1" { 100 } else { 900 };
+        let evidence = evaluate_read(vec![
+            recover_to(first, &safe(first), deadline(first)),
+            recover_to(second, &safe(second), deadline(second)),
+        ]);
+        let decision = &evidence.decision;
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(decision.severity(), Severity::Recover);
+        assert_eq!(decider(&evidence), DecidedBy::rule(first));
+        assert_eq!(decision.reason, matched(first));
+        let recovery = decision.recovery.as_ref().expect("recovery obligation");
+        assert_eq!(recovery.rule_id, first);
+        assert_eq!(recovery.recovery_id, safe(first));
+        assert_eq!(recovery.deadline_ms, deadline(first));
+        assert_eq!(
+            contributed_rules(&evidence),
+            vec![
+                (first.to_string(), DecisionOutcome::Deny),
+                (second.to_string(), DecisionOutcome::Deny),
+            ]
+        );
+        assert!(evidence.verify());
+    }
+}
+
+#[test]
+fn receipt_with_the_previous_deny_then_recover_reason_still_verifies() {
+    // Before the fix, `[deny d, recover r]` produced a decision whose reason
+    // named `d` while `decided_by` and the obligation named `r`. The receipt
+    // format did not change, so such a receipt (rebuilt here field by field)
+    // still passes integrity, signature and import checks.
+    let recovery = praetore_core::RecoveryObligation {
+        recovery_id: "safe-hold".into(),
+        rule_id: "r".into(),
+        reason: matched("r"),
+        deadline_ms: 250,
+    };
+    let old = Decision::recover(matched("d"), recovery)
+        .with_contribution(DecisionContribution::new(
+            "d",
+            DecisionOutcome::Deny,
+            matched("d"),
+        ))
+        .with_contribution(DecisionContribution::new(
+            "r",
+            DecisionOutcome::Deny,
+            matched("r"),
+        ));
+    old.validate().unwrap();
+    let agent = new_agent();
+    let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+    let mut evidence = Evidence::new(
+        uuid::Uuid::new_v4(),
+        agent,
+        authority,
+        action("read_data", Some("db"), json!({})),
+        old,
+        None,
+    )
+    .unwrap();
+    assert_eq!(evidence.evidence_schema_version, 4);
+    let policy = Policy::new_v2("decision-tests", 3, vec![deny("d"), recover("r")]);
+    evidence
+        .bind_policy_digest(policy.digest().unwrap())
+        .unwrap();
+    let attester = signed(&mut evidence);
+    let key = attester.public_key().unwrap();
+    let imported = Evidence::from_json(&evidence.to_json().unwrap()).unwrap();
+    assert!(imported.verify());
+    imported.verify_attester_signature(&key).unwrap();
+    imported.verify_policy(&policy).unwrap();
+    assert_eq!(imported.decision.reason, matched("d"));
+    assert_eq!(imported.decision.decided_by(), Some(&DecidedBy::rule("r")));
+
+    // A fresh evaluation of the same rules now records the decider's reason.
+    let fresh = evaluate_read(vec![deny("d"), recover("r")]);
+    assert_eq!(fresh.decision.reason, matched("r"));
 }
 
 #[test]
