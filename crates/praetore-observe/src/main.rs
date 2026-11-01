@@ -32,9 +32,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VerifiedPublicKey::from_bytes(&bytes).map_err(|error| error.to_string())
         })
         .transpose()?;
-    let reader = Arc::new(PostgresObservabilityReader::from_client(
-        database.connect()?,
-    )?);
+    let mut client = database.connect()?;
+    // The same startup check as the gateway runtime: refuse an owner,
+    // superuser, BYPASSRLS or write-capable role, and a session in which
+    // triggers or row-level security could be switched off. It runs once,
+    // at startup; queries pin their search_path per transaction regardless.
+    praetore_replay_postgres::verify_runtime_role(&mut client)?;
+    let reader = Arc::new(PostgresObservabilityReader::from_client(client)?);
     let state = ObserveState::new(reader, tenant_token_hashes, trusted_attester)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

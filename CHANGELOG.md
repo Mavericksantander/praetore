@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Runtime database sessions no longer depend on search_path. Every runtime
+  transaction (`praetore_replay_postgres::set_tenant_context`, now public
+  and also used by `praetore journal-export` and by `find_pending_agent`
+  behind `praetore approve`/`dispatch`) starts with
+  `SET LOCAL search_path = pg_catalog, pg_temp` and sets the tenant with
+  `pg_catalog.set_config`, so a `public.set_config` or `public.=` picked up
+  through a database, role, `ALTER SYSTEM` or session search_path cannot
+  change the tenant the RLS policies filter by. `DatabaseConnector` also
+  starts every session with `-c search_path=pg_catalog,pg_temp`.
+  `verify_runtime_role` runs its checks in a read-only transaction under
+  that search_path and also refuses: a session search_path that puts
+  another schema before `pg_catalog` (a harmless one such as
+  `"$user", public` is accepted); `session_replication_role` other than
+  `origin` (`RuntimeRoleError::TriggersDisabled`); and
+  (`RuntimeRoleError::UnsafeSetting`) `row_security` or
+  `session_replication_role` set for the database or the login role, a
+  non-default session-start value of either (for example from
+  `ALTER SYSTEM`), or a `GRANT SET`/`ALTER SYSTEM ON PARAMETER` on either to
+  PUBLIC or to a role it belongs to. These checks run once at startup;
+  `praetore-observe` now runs them too and refuses to start on failure.
+  New ignored PostgreSQL tests in CI with `--exact`.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed

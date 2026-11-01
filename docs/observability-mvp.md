@@ -54,6 +54,11 @@ uses explicit read-only repeatable-read transactions for list/detail queries.
 The service code contains no mutation SQL. PostgreSQL ownership and superuser
 roles can override database controls, so the process must not use an owner,
 superuser, or role with write grants.
+At startup the service runs `verify_runtime_role` on its connection and
+refuses to start if the role is an owner, superuser, `BYPASSRLS`, can
+CREATE in `praetore`, holds DELETE/TRUNCATE/UPDATE/TRIGGER/REFERENCES, or
+if triggers or row-level security could be switched off for the session.
+The check runs once, at startup.
 
 Minimal role grant shape (run as the schema owner; choose login and password
 management out of band):

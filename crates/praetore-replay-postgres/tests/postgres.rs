@@ -3005,6 +3005,207 @@ fn postgres_migrations_baseline_partial_schema_fails_closed() {
     assert!(!control, "a refused baseline must not record anything");
 }
 
+/// A cluster-wide role for one test, dropped (after the scratch databases
+/// that reference it) when the guard goes out of scope.
+struct TestRole {
+    name: String,
+}
+
+impl TestRole {
+    fn create(options: &str) -> Self {
+        let name = format!("t015_{}", Uuid::new_v4().simple());
+        connect_client()
+            .batch_execute(&format!(
+                "CREATE ROLE {name} {options} PASSWORD '{TEST_ROLE_PASSWORD}'"
+            ))
+            .expect("create test role");
+        Self { name }
+    }
+}
+
+impl Drop for TestRole {
+    fn drop(&mut self) {
+        // DROP OWNED also revokes grants on shared objects such as
+        // configuration parameters (GRANT SET ON PARAMETER).
+        let _ = connect_client().batch_execute(&format!(
+            "DROP OWNED BY {name}; DROP ROLE IF EXISTS {name}",
+            name = self.name
+        ));
+    }
+}
+
+/// A migrated scratch database and a LOGIN member of praetore_runtime.
+/// `runtime` must outlive the returned database.
+fn migrated_with_runtime(runtime: &TestRole) -> ScratchDatabase {
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    admin
+        .batch_execute(&format!("GRANT praetore_runtime TO {}", runtime.name))
+        .unwrap();
+    scratch
+}
+
+/// H2: a `public.set_config` that swaps the tenant, picked up through a
+/// database-level search_path that puts public before pg_catalog. The
+/// runtime check refuses to start, and the tenant context still binds the
+/// requested tenant.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_tenant_context_ignores_hostile_search_path() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    admin
+        .batch_execute(
+            "CREATE FUNCTION public.set_config(name text, value text, is_local boolean) \
+               RETURNS text LANGUAGE sql AS $$ SELECT pg_catalog.set_config(name, \
+                 CASE WHEN name = 'praetore.tenant_id' \
+                      THEN '22222222-2222-2222-2222-222222222222' ELSE value END, is_local) $$;",
+        )
+        .unwrap();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    admin
+        .batch_execute(&format!(
+            "GRANT praetore_runtime TO {runtime}; \
+             ALTER DATABASE {db} SET search_path = public, pg_catalog",
+            runtime = runtime.name,
+            db = scratch.name
+        ))
+        .unwrap();
+
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let error = praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect_err("a runtime session with a hostile search_path must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("puts public before pg_catalog"),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+
+    // Even when started anyway, and with the session's own search_path
+    // hostile too (as ALTER SYSTEM would leave it), the claim is written
+    // under the requested tenant.
+    let tenant = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let request_id = Uuid::new_v4();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    client
+        .batch_execute("SET search_path = public, pg_catalog")
+        .unwrap();
+    let guard = PostgresReplayGuard::from_client(client);
+    guard
+        .claim_once(tenant, Uuid::new_v4(), request_id)
+        .expect("claim under the requested tenant");
+    let stored: Uuid = admin
+        .query_one(
+            "SELECT tenant_id FROM praetore.replay_claims WHERE request_id = $1",
+            &[&request_id],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, tenant);
+}
+
+/// A harmless database or role search_path (pg_catalog still searched first)
+/// does not stop the runtime: runtime transactions pin search_path anyway.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_accepts_a_harmless_search_path_setting() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = migrated_with_runtime(&runtime);
+    scratch
+        .connect()
+        .batch_execute(&format!(
+            "ALTER DATABASE {db} SET search_path = \"$user\", public, extensions; \
+             ALTER ROLE {role} IN DATABASE {db} SET search_path = pg_catalog, public",
+            db = scratch.name,
+            role = runtime.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("a search_path with pg_catalog first is accepted");
+}
+
+/// A runtime session in which the append-only triggers and foreign keys do
+/// not fire is refused.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_refuses_session_replication_role_replica() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("least-privilege runtime role is accepted");
+    drop(client);
+    scratch
+        .connect()
+        .batch_execute(&format!(
+            "ALTER ROLE {} IN DATABASE {} SET session_replication_role = replica",
+            runtime.name, scratch.name
+        ))
+        .unwrap();
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let error = praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect_err("runtime session without triggers must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("session_replication_role = replica"),
+        "{message}"
+    );
+    eprintln!("refused as expected: {message}");
+}
+
+/// M3: a parameter grant that lets the runtime turn triggers off after the
+/// check.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_refuses_parameter_grants() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    let group = TestRole::create("NOLOGIN");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("least-privilege runtime role is accepted");
+    let mut admin = scratch.connect();
+    for (grant, revoke) in [
+        (
+            format!(
+                "GRANT SET ON PARAMETER session_replication_role TO {}",
+                runtime.name
+            ),
+            format!(
+                "REVOKE SET ON PARAMETER session_replication_role FROM {}",
+                runtime.name
+            ),
+        ),
+        (
+            format!(
+                "GRANT {group} TO {runtime}; \
+                 GRANT SET ON PARAMETER session_replication_role TO {group}",
+                group = group.name,
+                runtime = runtime.name
+            ),
+            format!(
+                "REVOKE SET ON PARAMETER session_replication_role FROM {}",
+                group.name
+            ),
+        ),
+    ] {
+        admin.batch_execute(&grant).unwrap();
+        let result = praetore_replay_postgres::verify_runtime_role(&mut client);
+        admin.batch_execute(&revoke).unwrap();
+        let error = result.expect_err("a SET grant on session_replication_role must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("GRANT SET ON PARAMETER session_replication_role"),
+            "{message}"
+        );
+        eprintln!("refused as expected: {message}");
+    }
+}
+
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_migrations_unknown_version_refuses_to_start() {
