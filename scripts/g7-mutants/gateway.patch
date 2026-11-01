@@ -1,0 +1,32 @@
+diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
+index e822f0a..6b2c3ce 100644
+--- a/crates/praetore-core/src/action.rs
++++ b/crates/praetore-core/src/action.rs
+@@ -213,6 +213,12 @@ impl MissionAction {
+     pub fn into_action(self) -> Action {
+         self.0
+     }
++
++    /// G7 MUTANT (scripts/g7-mutation-test.sh only): wraps any action
++    /// without classifying it, as the code did before G7.
++    pub fn mutant_unclassified(action: Action) -> Self {
++        Self(action)
++    }
+ }
+ 
+ impl SafetyAction {
+diff --git a/crates/praetore-core/src/authorization.rs b/crates/praetore-core/src/authorization.rs
+index 0d3d85d..abe821f 100644
+--- a/crates/praetore-core/src/authorization.rs
++++ b/crates/praetore-core/src/authorization.rs
+@@ -136,7 +136,9 @@ impl AuthorizationRequest {
+             .map_err(crate::PraetoreError::InvalidRequest)?;
+         let document: AuthorizationRequestDocument = serde_json::from_value(value)
+             .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
+-        let action = policy.classify(document.action)?.into_mission()?;
++        // G7 MUTANT: the classify call is removed.
++        let _ = policy;
++        let action = MissionAction::mutant_unclassified(document.action);
+         let request = Self {
+             request_id: document.request_id,
+             agent: document.agent,
