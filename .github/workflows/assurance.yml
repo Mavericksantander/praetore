@@ -203,6 +203,10 @@ jobs:
         run: |
           ./examples/claude-code-hook/demo.sh "$RUNNER_TEMP/claude-code-hook-bundle"
           ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+      # SAF-14: two agents sign with different issued identities, and no
+      # edit of index.json or of the receipt re-attributes a receipt.
+      - name: Per-agent attribution end to end
+        run: ./examples/claude-code-hook/test-attribution.sh
 
   replay-postgres:
     name: PostgreSQL replay guard integration

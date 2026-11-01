@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- SAF-14 (proposal, `docs/proposals/SAF-14-identidad-por-agente.md`):
+  per-agent identity. It records what the agent signature identifies today
+  (one key per home in `praetore-mcp`, one key per profile in the Claude
+  Code hook, no agent keys in the gateway) and proposes per-profile keys,
+  per-client agents for `praetore-mcp`, and instance/session ids as signed
+  claims. It gives attribution between cooperative agents, not isolation:
+  every key is readable by the same OS user.
+- `examples/claude-code-hook`: a receipt can no longer be re-attributed to
+  another agent by editing an unsigned field. `verify` counted receipts by
+  the unsigned `agent` field of `receipts.jsonl` and `export` copied it into
+  `index.json`, which `verify.sh` only summarized; editing either changed who
+  a receipt was attributed to with exit 0. Now `verify` and `export` read
+  the agent and profile from the signed receipt and fail when the unsigned
+  copy disagrees, `verify` checks the signing identity against
+  `agents/<profile>.json`, and `verify.sh` runs `check-attribution.py`
+  (fails on a mismatch, a missing index entry, or more than one identity per
+  profile) and rejects a re-attributed copy of `index.json`. `init` adds an
+  issuer-signed `praetore.agent_profile` constraint to each authority and
+  the hook sends the same action parameter, so the engine refuses an
+  authority issued for another profile (a profile file copied over another
+  now fails closed instead of signing as the other agent). Claude Code's
+  `agent_id` and `session_id`, when present, are recorded in the signed
+  context (over 128 bytes: deny). `index.json` gains `agent_id`. The receipt
+  format does not change; the committed evidence sets still verify. New
+  `test-attribution.sh` (in CI).
+- `examples/claude-code-hook`, fixes from the independent review of #79:
+  `verify.sh` and `check-attribution.py` accept in `evidence/` only regular,
+  non-hidden `*.json` files and fail on anything else. Before, a hidden
+  `evidence/.X.json` with broken signatures skipped `praetore-verify` (the
+  bash glob ignores dotfiles) but was counted in the attribution (exit 0).
+  An explicit `agent_type: "main"` (a subagent named `main`) no longer gets
+  the main session's profile; explicit `main` and `unregistered` are
+  evaluated as `unregistered` (Deny, signed receipt), and the default
+  policy's context conditions match the signing `profile` instead of the raw
+  `agent`. State created before the `praetore.agent_profile` constraint now
+  fails closed with a message to re-run `init`. A numeric `agent_id` or
+  `session_id` is recorded as its canonical text; one that is not a string
+  or number, or over 128 bytes, is denied under `unregistered` with a signed
+  receipt that records the reason in `praetore.claim_rejected`, not the
+  value. Summaries show unregistered `agent_type` values escaped to ASCII.
+- `examples/claude-code-hook`, second review of #79: `verify.sh` copies the
+  bundle to a temporary directory first and runs every step on that copy,
+  so it verifies and attributes the same bytes (a receipt replaced in the
+  original between steps 3 and 5 used to be counted unverified, exit 0).
+  `check-attribution.py` and the hook's `verify` fail on a repeated receipt
+  (same `evidence_id`, or same agent id and `request_id`), which counted one
+  decision several times. `test-verify.sh` now signs 1000 distinct receipts
+  with the hook instead of copying `bundle/`, since copies of one receipt
+  are now an invalid bundle.
+
 - Policy loading reports size, depth, node, integer, duplicate-key,
   malformed-JSON and unknown-field rejections with typed errors
   ([#23](https://github.com/Mavericksantander/praetore/issues/23)); wrong
