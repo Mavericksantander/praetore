@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Runtime connections now pin search_path. Every runtime transaction
+  (`praetore_replay_postgres::set_tenant_context`, now public; also used by
+  `praetore journal-export`, `praetore approve` and `praetore dispatch`)
+  sets `search_path = pg_catalog, pg_temp` for the transaction and calls
+  `pg_catalog.set_config`; `DatabaseConnector` starts sessions with the same
+  search_path. `verify_runtime_role` runs its checks under that search_path
+  and also refuses a per-database or per-role `search_path`, `row_security`
+  or `session_replication_role` setting, a non-default session-start value
+  of `row_security` or `session_replication_role`, parameter grants on
+  them, a session search_path that does not start with `pg_catalog`, and a
+  session with `session_replication_role` other than `origin`
+  (`RuntimeRoleError::TriggersDisabled`, `RuntimeRoleError::UnsafeSetting`).
+  It also refuses praetore objects that depend on functions, operators,
+  types or collations outside `pg_catalog` and `praetore`
+  (`RuntimeRoleError::ForeignDependency`).
+  The checks run once at startup; `praetore-observe` now runs them too,
+  and `praetore doctor` reports the effective relaxations.
+  Only the `search_path` refusals can be relaxed, explicitly, with
+  `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; anything else
+  is a configuration error; the effective setting is logged at startup), or
+  `verify_runtime_role_with` and `RuntimeRoleOptions` in the library.
+  `DatabaseConnector` refuses URL `options` that end with an unescaped
+  backslash. The documented `praetore_observe` grant now includes
+  `tenant_id`, which the reader's queries need. `docs/operations.md`
+  documents the runtime refusals.
 - SAF-14 (proposal, `docs/proposals/SAF-14-identidad-por-agente.md`):
   per-agent identity. It records what the agent signature identifies today
   (one key per home in `praetore-mcp`, one key per profile in the Claude

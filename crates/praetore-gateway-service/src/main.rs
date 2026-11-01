@@ -190,8 +190,9 @@ fn prepare_database(
         (None, false) => apply_migrations(&runtime)?,
         (None, true) => {}
     }
+    let options = runtime_role_options()?;
     let mut client = runtime.connect()?;
-    if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
+    if let Err(error) = praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
         if production {
             return Err(error.into());
         }
@@ -199,6 +200,22 @@ fn prepare_database(
     }
     praetore_replay_postgres::verify_schema_current(&mut client)?;
     Ok(runtime)
+}
+
+/// Explicit relaxations of the runtime role check
+/// (PRAETORE_RUNTIME_ALLOW_SETTINGS; none by default), logged at startup.
+fn runtime_role_options()
+-> Result<praetore_replay_postgres::RuntimeRoleOptions, Box<dyn std::error::Error>> {
+    let name = praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV;
+    let value = std::env::var(name).unwrap_or_default();
+    let options = praetore_replay_postgres::RuntimeRoleOptions::from_allow_settings(&value)?;
+    let relaxed = options.relaxed();
+    if relaxed.is_empty() {
+        tracing::info!("runtime role check: no refusal relaxed");
+    } else {
+        tracing::warn!(?relaxed, "runtime role check relaxed by {name}");
+    }
+    Ok(options)
 }
 
 /// `praetore-gateway-demo migrate`: applies migrations with

@@ -117,6 +117,24 @@ impl DatabaseConnector {
             }
             other => return Err(DatabaseUrlError::UnsupportedSslMode(other.to_owned())),
         };
+        // Defence in depth: every session starts with the runtime search
+        // path, whatever the database, role or ALTER SYSTEM set. Runtime
+        // transactions also pin it with SET LOCAL (`set_tenant_context`).
+        let options = match config.get_options() {
+            Some(existing) if !existing.trim().is_empty() => {
+                // A trailing unescaped backslash would join the pin to the
+                // last option; such an URL is refused.
+                let trailing = existing.chars().rev().take_while(|c| *c == '\\').count();
+                if trailing % 2 == 1 {
+                    return Err(DatabaseUrlError::Invalid(
+                        "options must not end with an unescaped backslash".into(),
+                    ));
+                }
+                format!("{existing} -c search_path=pg_catalog,pg_temp")
+            }
+            _ => "-c search_path=pg_catalog,pg_temp".to_owned(),
+        };
+        config.options(&options);
         Ok(Self { config, tls })
     }
 
@@ -363,6 +381,17 @@ pub enum RuntimeRoleError {
     /// TRUNCATE, table-wide UPDATE, TRIGGER or REFERENCES) on a `praetore`
     /// table, e.g. a leftover `GRANT ALL` or membership in `pg_write_all_data`.
     ExcessTablePrivilege(String),
+    /// The session does not fire triggers or enforce foreign keys:
+    /// `session_replication_role` (here the value) is not `origin`.
+    TriggersDisabled(String),
+    /// A setting or parameter grant that could disable triggers or row-level
+    /// security, or a search_path that puts a schema before `pg_catalog`.
+    UnsafeSetting(String),
+    /// An object in `praetore` (policy, constraint, default, trigger,
+    /// function, view or rule) depends on a function, operator, type or
+    /// collation outside `pg_catalog` and `praetore`, so its behaviour is
+    /// defined by whoever owns that schema.
+    ForeignDependency(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -385,6 +414,20 @@ impl fmt::Display for RuntimeRoleError {
                     "runtime database role {role} has CREATE on schema praetore"
                 )
             }
+            Self::TriggersDisabled(value) => write!(
+                f,
+                "runtime session has session_replication_role = {value}; the append-only \
+                 triggers and foreign keys would not fire (it must be origin)"
+            ),
+            Self::ForeignDependency(dependencies) => write!(
+                f,
+                "praetore objects depend on objects outside pg_catalog and praetore: {dependencies}"
+            ),
+            Self::UnsafeSetting(setting) => write!(
+                f,
+                "runtime database session is exposed to {setting}; the append-only triggers, \
+                 row-level security or name resolution could be changed"
+            ),
             Self::ExcessTablePrivilege(role) => write!(
                 f,
                 "runtime database role {role} holds DELETE, TRUNCATE, table-wide UPDATE, TRIGGER or \
@@ -408,34 +451,151 @@ impl From<postgres::Error> for RuntimeRoleError {
 /// relation or function in it (directly or through membership), holder of
 /// CREATE on the schema, CREATEROLE, or holder of a table privilege beyond
 /// `praetore_runtime`'s grants (DELETE, TRUNCATE, table-wide UPDATE, TRIGGER,
-/// REFERENCES) on any `praetore` table.
+/// REFERENCES) on any `praetore` table. Also refuses a session in which
+/// triggers do not fire or row-level security could be switched off
+/// (`session_replication_role`, `row_security`: the current value, a
+/// per-database or per-role setting, a non-default session-start value such
+/// as one from `ALTER SYSTEM`, or a parameter grant), a per-database or
+/// per-role `search_path` setting, and a session search_path that puts
+/// another schema before `pg_catalog`. The `search_path` refusals can be
+/// relaxed only explicitly, with `RuntimeRoleOptions`.
+///
+/// The checks run in a read-only transaction under `RUNTIME_SEARCH_PATH`, so
+/// they cannot be shadowed themselves. They run once, when the caller starts
+/// (the gateway and the CLI do this at startup); reconnections of a
+/// connection factory are not checked again. Every runtime transaction pins
+/// its search_path (`set_tenant_context`) regardless.
 pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> {
-    let row = client.query_one("SELECT session_user::text, current_user::text", &[])?;
+    verify_runtime_role_with(client, &RuntimeRoleOptions::default())
+}
+
+/// Refusals of `verify_runtime_role` that an operator may relax explicitly.
+/// Everything is refused by default.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeRoleOptions {
+    allow_search_path: bool,
+}
+
+impl RuntimeRoleOptions {
+    /// Environment variable the gateway and praetore-observe read (exact
+    /// names, comma-separated).
+    pub const ALLOW_SETTINGS_ENV: &'static str = "PRAETORE_RUNTIME_ALLOW_SETTINGS";
+
+    /// Parses the value of `PRAETORE_RUNTIME_ALLOW_SETTINGS`: exact,
+    /// comma-separated names. The only relaxable setting is `search_path`
+    /// (a per-database or per-role `search_path`, or a session search_path
+    /// that puts another schema before `pg_catalog`). Any other name, for
+    /// example `row_security` or `session_replication_role`, is an error.
+    pub fn from_allow_settings(value: &str) -> Result<Self, String> {
+        let mut options = Self::default();
+        for name in value
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            match name {
+                "search_path" => options.allow_search_path = true,
+                other => {
+                    return Err(format!(
+                        "{}: unknown or non-relaxable setting {other:?} (allowed: search_path)",
+                        Self::ALLOW_SETTINGS_ENV
+                    ));
+                }
+            }
+        }
+        Ok(options)
+    }
+
+    /// The relaxed refusals, for the startup log.
+    pub fn relaxed(&self) -> Vec<&'static str> {
+        let mut relaxed = Vec::new();
+        if self.allow_search_path {
+            relaxed.push("search_path");
+        }
+        relaxed
+    }
+}
+
+/// `verify_runtime_role` with explicitly relaxed refusals.
+pub fn verify_runtime_role_with(
+    client: &mut Client,
+    options: &RuntimeRoleOptions,
+) -> Result<(), RuntimeRoleError> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    // The session's own search_path, before it is pinned below.
+    let schemas: Vec<String> = transaction
+        .query_one(
+            "SELECT pg_catalog.current_schemas(true)::pg_catalog.text[]",
+            &[],
+        )?
+        .get(0);
+    if !options.allow_search_path
+        && let Some(first) = schemas.iter().find(|schema| !schema.starts_with("pg_temp"))
+        && first != "pg_catalog"
+    {
+        return Err(RuntimeRoleError::UnsafeSetting(format!(
+            "search_path that puts {first} before pg_catalog ({})",
+            schemas.join(", ")
+        )));
+    }
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let result = verify_runtime_role_in(&mut transaction, options);
+    transaction.rollback()?;
+    result
+}
+
+fn verify_runtime_role_in(
+    transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
+) -> Result<(), RuntimeRoleError> {
+    let replication_role: String = transaction
+        .query_one(
+            "SELECT pg_catalog.current_setting('session_replication_role')",
+            &[],
+        )?
+        .get(0);
+    if replication_role != "origin" {
+        return Err(RuntimeRoleError::TriggersDisabled(replication_role));
+    }
+    if let Some(setting) = unsafe_runtime_setting(transaction, options)? {
+        return Err(RuntimeRoleError::UnsafeSetting(setting));
+    }
+    if let Some(dependencies) = foreign_dependencies(transaction)? {
+        return Err(RuntimeRoleError::ForeignDependency(dependencies));
+    }
+    let row = transaction.query_one(
+        "SELECT session_user::pg_catalog.text, current_user::pg_catalog.text",
+        &[],
+    )?;
     let mut roles: Vec<String> = vec![row.get(0), row.get(1)];
     roles.dedup();
     for role in roles {
-        let row = client.query_one(
+        let row = transaction.query_one(
             "SELECT \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_roles privileged \
                          WHERE (privileged.rolsuper OR privileged.rolbypassrls \
                                 OR privileged.rolcreaterole) \
                            AND pg_catalog.pg_has_role($1, privileged.oid, 'MEMBER')), \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n \
-                         WHERE n.nspname = 'praetore' \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
                            AND pg_catalog.pg_has_role($1, n.nspowner, 'MEMBER')) \
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE n.nspname = 'praetore' \
+                         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
                            AND pg_catalog.pg_has_role($1, c.relowner, 'MEMBER')) \
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-                         WHERE n.nspname = 'praetore' \
+                         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
                            AND pg_catalog.pg_has_role($1, p.proowner, 'MEMBER')), \
                  COALESCE((SELECT pg_catalog.has_schema_privilege($1, n.oid, 'CREATE') \
-                           FROM pg_catalog.pg_namespace n WHERE n.nspname = 'praetore'), false), \
+                           FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), false), \
                  EXISTS (SELECT 1 FROM pg_catalog.pg_class c \
-                         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                         WHERE n.nspname = 'praetore' AND c.relkind IN ('r', 'p') \
+                         JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                         WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                           AND (c.relkind OPERATOR(pg_catalog.=) 'r' OR c.relkind OPERATOR(pg_catalog.=) 'p') \
                            AND pg_catalog.has_table_privilege($1, c.oid, \
                                'DELETE, TRUNCATE, UPDATE, TRIGGER, REFERENCES'))",
             &[&role],
@@ -456,6 +616,160 @@ pub fn verify_runtime_role(client: &mut Client) -> Result<(), RuntimeRoleError> 
     Ok(())
 }
 
+/// Objects in `praetore` that depend (`pg_depend`) on a function, operator,
+/// type or collation in a schema other than `pg_catalog` and `praetore`.
+/// Expressions in policies, constraints, defaults and trigger conditions
+/// bind such objects when they are created, so a later search_path change
+/// does not undo it. Up to ten entries.
+fn foreign_dependencies(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH ns AS (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         dependent AS ( \
+             SELECT d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid, d.refobjsubid, \
+                    CASE \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_class c \
+                                  WHERE c.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                            THEN (SELECT p.pronamespace FROM pg_catalog.pg_proc p \
+                                  WHERE p.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                            THEN (SELECT t.typnamespace FROM pg_catalog.pg_type t \
+                                  WHERE t.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                            THEN (SELECT con.connamespace FROM pg_catalog.pg_constraint con \
+                                  WHERE con.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_policy'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_policy pol \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pol.polrelid \
+                                  WHERE pol.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_trigger'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_trigger g \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) g.tgrelid \
+                                  WHERE g.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_attrdef ad \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) ad.adrelid \
+                                  WHERE ad.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_rewrite rw \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) rw.ev_class \
+                                  WHERE rw.oid OPERATOR(pg_catalog.=) d.objid) \
+                    END AS dependent_namespace, \
+                    CASE \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                            THEN (SELECT p.pronamespace FROM pg_catalog.pg_proc p \
+                                  WHERE p.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_operator'::pg_catalog.regclass \
+                            THEN (SELECT o.oprnamespace FROM pg_catalog.pg_operator o \
+                                  WHERE o.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                            THEN (SELECT t.typnamespace FROM pg_catalog.pg_type t \
+                                  WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_collation'::pg_catalog.regclass \
+                            THEN (SELECT co.collnamespace FROM pg_catalog.pg_collation co \
+                                  WHERE co.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                    END AS referenced_namespace \
+             FROM pg_catalog.pg_depend d \
+             WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                OR d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_operator'::pg_catalog.regclass \
+                OR d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                OR d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_collation'::pg_catalog.regclass), \
+         foreign_refs AS ( \
+             SELECT pg_catalog.concat(o.type, ' ', o.identity, ' -> ', r.type, ' ', r.identity) \
+                        AS entry \
+             FROM dependent dep CROSS JOIN ns \
+             CROSS JOIN LATERAL pg_catalog.pg_identify_object(dep.classid, dep.objid, dep.objsubid) o \
+             CROSS JOIN LATERAL \
+                 pg_catalog.pg_identify_object(dep.refclassid, dep.refobjid, dep.refobjsubid) r \
+             WHERE dep.dependent_namespace OPERATOR(pg_catalog.=) ns.oid \
+               AND dep.referenced_namespace IS NOT NULL \
+               AND dep.referenced_namespace OPERATOR(pg_catalog.<>) ns.oid \
+               AND dep.referenced_namespace OPERATOR(pg_catalog.<>) \
+                   'pg_catalog'::pg_catalog.regnamespace::pg_catalog.oid) \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT DISTINCT entry FROM foreign_refs ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
+/// Settings that would disable the append-only triggers or row-level
+/// security, or change name resolution, for this session: a `search_path`
+/// (unless explicitly allowed), `row_security` or `session_replication_role`
+/// set for this database or all databases and for this login role or all
+/// roles (`pg_db_role_setting`); a session-start value of `row_security` or
+/// `session_replication_role` that is not the built-in default (for example
+/// from `ALTER SYSTEM`); and a `GRANT SET` or `GRANT ALTER SYSTEM` on one of
+/// those parameters to PUBLIC or to a role the session or current role
+/// belongs to (`pg_parameter_acl`, PostgreSQL 15 and later).
+fn unsafe_runtime_setting(
+    transaction: &mut postgres::Transaction<'_>,
+    options: &RuntimeRoleOptions,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "SELECT ( \
+             SELECT pg_catalog.string_agg(s.setting, ', ' ORDER BY s.setting) \
+             FROM pg_catalog.pg_db_role_setting rs \
+             CROSS JOIN LATERAL pg_catalog.unnest(rs.setconfig) s(setting) \
+             WHERE (rs.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                    OR rs.setdatabase OPERATOR(pg_catalog.=) \
+                       (SELECT d.oid FROM pg_catalog.pg_database d \
+                        WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database())) \
+               AND (rs.setrole OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                    OR rs.setrole OPERATOR(pg_catalog.=) \
+                       (SELECT r.oid FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER) \
+                    OR rs.setrole OPERATOR(pg_catalog.=) \
+                       (SELECT r.oid FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)) \
+               AND (pg_catalog.starts_with(s.setting, 'row_security=') \
+                    OR pg_catalog.starts_with(s.setting, 'session_replication_role=') \
+                    OR (NOT $1 AND pg_catalog.starts_with(s.setting, 'search_path=')))), \
+             ( \
+             SELECT pg_catalog.string_agg( \
+                        pg_catalog.concat(p.name, '=', p.reset_val, ' (', p.source, ')'), ', ' \
+                        ORDER BY p.name) \
+             FROM pg_catalog.pg_settings p \
+             WHERE (p.name OPERATOR(pg_catalog.=) 'row_security' \
+                    OR p.name OPERATOR(pg_catalog.=) 'session_replication_role') \
+               AND p.reset_val OPERATOR(pg_catalog.<>) p.boot_val), \
+             pg_catalog.to_regclass('pg_catalog.pg_parameter_acl') IS NOT NULL",
+        &[&options.allow_search_path],
+    )?;
+    if let Some(settings) = row.get::<_, Option<String>>(0) {
+        return Ok(Some(format!("{settings} (ALTER DATABASE/ROLE ... SET)")));
+    }
+    if let Some(settings) = row.get::<_, Option<String>>(1) {
+        return Ok(Some(settings));
+    }
+    if row.get::<_, bool>(2) {
+        let granted: Option<String> = transaction
+            .query_one(
+                "SELECT pg_catalog.string_agg(DISTINCT pg_catalog.concat( \
+                     'GRANT ', a.privilege_type, ' ON PARAMETER ', pa.parname, ' TO ', \
+                     CASE WHEN a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' \
+                          ELSE pg_catalog.pg_get_userbyid(a.grantee)::pg_catalog.text END), ', ') \
+                 FROM pg_catalog.pg_parameter_acl pa \
+                 CROSS JOIN LATERAL pg_catalog.aclexplode(pa.paracl) a \
+                 WHERE (pa.parname OPERATOR(pg_catalog.=) 'row_security' \
+                        OR pa.parname OPERATOR(pg_catalog.=) 'session_replication_role') \
+                   AND (a.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                        OR pg_catalog.pg_has_role(SESSION_USER, a.grantee, 'MEMBER') \
+                        OR pg_catalog.pg_has_role(CURRENT_USER, a.grantee, 'MEMBER'))",
+                &[],
+            )?
+            .get(0);
+        if let Some(granted) = granted {
+            return Ok(Some(granted));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +786,46 @@ mod tests {
 
     // Self-signed test CA (not used for any real service).
     const TEST_ROOT_PEM: &str = include_str!("../tests/fixtures/test-root-ca.pem");
+
+    #[test]
+    fn pinned_options_refuse_a_trailing_unescaped_backslash() {
+        let url =
+            |options: &str| format!("postgres://gateway@127.0.0.1/praetore?options={options}");
+        assert!(DatabaseConnector::from_url(&url("-c%20application_name%3Dx")).is_ok());
+        assert!(DatabaseConnector::from_url(&url("-c%20application_name%3Dx%5C%5C")).is_ok());
+        assert!(matches!(
+            DatabaseConnector::from_url(&url("-c%20application_name%3Dx%5C")),
+            Err(DatabaseUrlError::Invalid(_))
+        ));
+        let connector = DatabaseConnector::from_url(&url("-c%20application_name%3Dx")).unwrap();
+        assert_eq!(
+            connector.config.get_options(),
+            Some("-c application_name=x -c search_path=pg_catalog,pg_temp")
+        );
+    }
+
+    #[test]
+    fn runtime_role_options_accept_only_exact_relaxable_names() {
+        assert_eq!(
+            RuntimeRoleOptions::from_allow_settings("").unwrap(),
+            RuntimeRoleOptions::default()
+        );
+        assert!(RuntimeRoleOptions::default().relaxed().is_empty());
+        let relaxed = RuntimeRoleOptions::from_allow_settings(" search_path ").unwrap();
+        assert_eq!(relaxed.relaxed(), vec!["search_path"]);
+        for refused in [
+            "row_security",
+            "session_replication_role",
+            "SEARCH_PATH",
+            "search-path",
+        ] {
+            assert!(
+                RuntimeRoleOptions::from_allow_settings(refused).is_err(),
+                "{refused}"
+            );
+        }
+        assert!(RuntimeRoleOptions::from_allow_settings("search_path,row_security").is_err());
+    }
 
     #[test]
     fn loopback_and_unix_hosts_may_connect_without_tls() {
