@@ -14,11 +14,19 @@
   them, a session search_path that does not start with `pg_catalog`, and a
   session with `session_replication_role` other than `origin`
   (`RuntimeRoleError::TriggersDisabled`, `RuntimeRoleError::UnsafeSetting`).
-  The checks run once at startup; `praetore-observe` now runs them too.
+  It also refuses praetore objects that depend on functions, operators,
+  types or collations outside `pg_catalog` and `praetore`
+  (`RuntimeRoleError::ForeignDependency`).
+  The checks run once at startup; `praetore-observe` now runs them too,
+  and `praetore doctor` reports the effective relaxations.
   Only the `search_path` refusals can be relaxed, explicitly, with
   `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; anything else
   is a configuration error; the effective setting is logged at startup), or
   `verify_runtime_role_with` and `RuntimeRoleOptions` in the library.
+  `DatabaseConnector` refuses URL `options` that end with an unescaped
+  backslash. The documented `praetore_observe` grant now includes
+  `tenant_id`, which the reader's queries need. `docs/operations.md`
+  documents the runtime refusals.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed

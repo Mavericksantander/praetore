@@ -196,6 +196,24 @@ Use two database roles:
   `GRANT ALL` from an install where the gateway owned the tables.
   `verify_runtime_role` refuses each of these at startup in `http` and
   `sandbox` modes.
+- The runtime session must also be one in which the append-only triggers
+  and row-level security cannot be switched off and names resolve in
+  `pg_catalog`. `verify_runtime_role` refuses: `session_replication_role`
+  other than `origin` (`TriggersDisabled`); `row_security` or
+  `session_replication_role` set for the database or the login role, a
+  non-default session-start value of either (for example from
+  `ALTER SYSTEM`), or a `GRANT SET`/`ALTER SYSTEM ON PARAMETER` on either
+  (`UnsafeSetting`); a `search_path` set for the database or the login role,
+  or a session search_path that does not start with `pg_catalog`
+  (`UnsafeSetting`); and objects in `praetore` that depend on functions,
+  operators, types or collations outside `pg_catalog` and `praetore`
+  (`ForeignDependency`). Runtime transactions pin
+  `search_path = pg_catalog, pg_temp` regardless, and `DatabaseConnector`
+  starts sessions with it. The check runs once, at startup.
+- Only the `search_path` refusals can be relaxed, explicitly:
+  `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; any other
+  value is a configuration error). The gateway and `praetore-observe` log
+  the effective setting at startup, and `praetore doctor` reports it.
 - `praetore_runtime` is a cluster-wide role, so a login member of it can
   connect to every database on the cluster that ran migration 0011. Use one
   PostgreSQL cluster per environment (staging and production never share a

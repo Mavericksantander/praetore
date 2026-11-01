@@ -3225,6 +3225,83 @@ fn postgres_runtime_role_refuses_parameter_grants() {
     }
 }
 
+/// M1 (GHSA-67vm-x598-vhg3): an installation in which a praetore object is
+/// bound to a function or operator outside pg_catalog and praetore is
+/// refused at runtime start, whatever the session search_path.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_runtime_role_refuses_foreign_dependencies() {
+    let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+    for (contaminate, expected) in [
+        (
+            "CREATE FUNCTION public.uuid_eq_any(uuid, uuid) RETURNS boolean \
+               LANGUAGE sql IMMUTABLE AS 'SELECT true'; \
+             CREATE OPERATOR public.= (LEFTARG = uuid, RIGHTARG = uuid, \
+               PROCEDURE = public.uuid_eq_any); \
+             ALTER POLICY tenant_isolation ON praetore.replay_claims \
+               USING (tenant_id OPERATOR(public.=) \
+                      NULLIF(pg_catalog.current_setting('praetore.tenant_id', true), '')::uuid);",
+            "-> operator public.=(pg_catalog.uuid,pg_catalog.uuid)",
+        ),
+        (
+            "CREATE FUNCTION public.fake_now() RETURNS timestamptz LANGUAGE sql \
+               AS 'SELECT pg_catalog.now()'; \
+             ALTER TABLE praetore.replay_claims ALTER COLUMN claimed_at \
+               SET DEFAULT public.fake_now();",
+            "-> function public.fake_now()",
+        ),
+    ] {
+        let scratch = migrated_with_runtime(&runtime);
+        let mut client = connect_scratch_as(&scratch, &runtime.name);
+        praetore_replay_postgres::verify_runtime_role(&mut client)
+            .expect("a clean installation is accepted");
+        scratch.connect().batch_execute(contaminate).unwrap();
+        let error = praetore_replay_postgres::verify_runtime_role(&mut client)
+            .expect_err("a foreign dependency must be refused");
+        let message = error.to_string();
+        assert!(message.contains(expected), "{message}");
+        eprintln!("refused as expected: {message}");
+    }
+}
+
+/// The praetore_observe grant documented in docs/observability-mvp.md is
+/// enough for the reader's list(), and passes the runtime role check.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_documented_observe_grant_supports_list() {
+    const DOC: &str = include_str!("../../../docs/observability-mvp.md");
+    let start = DOC
+        .find("CREATE ROLE praetore_observe LOGIN;")
+        .expect("documented grant");
+    let block = &DOC[start..];
+    let grant = &block[..block.find("```").expect("end of the SQL block")];
+    let observer = TestRole::create("LOGIN NOBYPASSRLS");
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    let statements = grant
+        .replace("CREATE ROLE praetore_observe LOGIN;", "")
+        .replace("praetore_observe", &observer.name);
+    admin.batch_execute(&statements).unwrap();
+    let mut client = connect_scratch_as(&scratch, &observer.name);
+    praetore_replay_postgres::verify_runtime_role(&mut client)
+        .expect("the documented observe role passes the runtime role check");
+    let reader =
+        praetore_replay_postgres::PostgresObservabilityReader::from_client(client).expect("reader");
+    let filters = praetore_replay_postgres::ExecutionFilters {
+        tenant_id: Some(TEST_TENANT_ID),
+        limit: 10,
+        ..Default::default()
+    };
+    let page = reader
+        .list(&filters)
+        .expect("list() works with the documented grant");
+    eprintln!(
+        "list() with the documented grant: {} executions",
+        page.total
+    );
+}
+
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_migrations_unknown_version_refuses_to_start() {

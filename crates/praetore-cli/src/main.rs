@@ -675,7 +675,16 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         healthy = false;
                     }
                 }
-                match praetore_replay_postgres::verify_runtime_role(&mut client) {
+                let options = runtime_role_options()?;
+                match options.relaxed().as_slice() {
+                    [] => println!("[ok] runtime role check: no refusal relaxed"),
+                    relaxed => println!(
+                        "[warn] runtime role check relaxed by {}: {}",
+                        praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV,
+                        relaxed.join(", ")
+                    ),
+                }
+                match praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
                     Ok(()) => println!("[ok] least-privilege runtime database role"),
                     Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
                 }
@@ -744,6 +753,15 @@ fn local_database(database_url: &str) -> Result<DatabaseConnector, Box<dyn std::
         );
     }
     Ok(connector)
+}
+
+/// Explicit relaxations of the runtime role check, as the gateway reads them
+/// (PRAETORE_RUNTIME_ALLOW_SETTINGS; none by default).
+fn runtime_role_options()
+-> Result<praetore_replay_postgres::RuntimeRoleOptions, Box<dyn std::error::Error>> {
+    let value = env::var(praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV)
+        .unwrap_or_default();
+    Ok(praetore_replay_postgres::RuntimeRoleOptions::from_allow_settings(&value)?)
 }
 
 fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
@@ -904,8 +922,10 @@ fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")
         .unwrap_or_else(|_| database_url.clone());
     apply_migrations(&migration_url)?;
-    let runtime_role =
-        praetore_replay_postgres::verify_runtime_role(&mut connect_local_database(&database_url)?);
+    let runtime_role = praetore_replay_postgres::verify_runtime_role_with(
+        &mut connect_local_database(&database_url)?,
+        &runtime_role_options()?,
+    );
     let api_auth = local_api_auth(directory, &config)?;
     let gateway = Arc::new(build_gateway(directory, &config, &database_url)?);
 

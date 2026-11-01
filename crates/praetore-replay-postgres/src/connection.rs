@@ -122,6 +122,14 @@ impl DatabaseConnector {
         // transactions also pin it with SET LOCAL (`set_tenant_context`).
         let options = match config.get_options() {
             Some(existing) if !existing.trim().is_empty() => {
+                // A trailing unescaped backslash would join the pin to the
+                // last option; such an URL is refused.
+                let trailing = existing.chars().rev().take_while(|c| *c == '\\').count();
+                if trailing % 2 == 1 {
+                    return Err(DatabaseUrlError::Invalid(
+                        "options must not end with an unescaped backslash".into(),
+                    ));
+                }
                 format!("{existing} -c search_path=pg_catalog,pg_temp")
             }
             _ => "-c search_path=pg_catalog,pg_temp".to_owned(),
@@ -379,6 +387,11 @@ pub enum RuntimeRoleError {
     /// A setting or parameter grant that could disable triggers or row-level
     /// security, or a search_path that puts a schema before `pg_catalog`.
     UnsafeSetting(String),
+    /// An object in `praetore` (policy, constraint, default, trigger,
+    /// function, view or rule) depends on a function, operator, type or
+    /// collation outside `pg_catalog` and `praetore`, so its behaviour is
+    /// defined by whoever owns that schema.
+    ForeignDependency(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -405,6 +418,10 @@ impl fmt::Display for RuntimeRoleError {
                 f,
                 "runtime session has session_replication_role = {value}; the append-only \
                  triggers and foreign keys would not fire (it must be origin)"
+            ),
+            Self::ForeignDependency(dependencies) => write!(
+                f,
+                "praetore objects depend on objects outside pg_catalog and praetore: {dependencies}"
             ),
             Self::UnsafeSetting(setting) => write!(
                 f,
@@ -546,6 +563,9 @@ fn verify_runtime_role_in(
     if let Some(setting) = unsafe_runtime_setting(transaction, options)? {
         return Err(RuntimeRoleError::UnsafeSetting(setting));
     }
+    if let Some(dependencies) = foreign_dependencies(transaction)? {
+        return Err(RuntimeRoleError::ForeignDependency(dependencies));
+    }
     let row = transaction.query_one(
         "SELECT session_user::pg_catalog.text, current_user::pg_catalog.text",
         &[],
@@ -594,6 +614,87 @@ fn verify_runtime_role_in(
         }
     }
     Ok(())
+}
+
+/// Objects in `praetore` that depend (`pg_depend`) on a function, operator,
+/// type or collation in a schema other than `pg_catalog` and `praetore`.
+/// Expressions in policies, constraints, defaults and trigger conditions
+/// bind such objects when they are created, so a later search_path change
+/// does not undo it. Up to ten entries.
+fn foreign_dependencies(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH ns AS (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         dependent AS ( \
+             SELECT d.classid, d.objid, d.objsubid, d.refclassid, d.refobjid, d.refobjsubid, \
+                    CASE \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_class c \
+                                  WHERE c.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                            THEN (SELECT p.pronamespace FROM pg_catalog.pg_proc p \
+                                  WHERE p.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                            THEN (SELECT t.typnamespace FROM pg_catalog.pg_type t \
+                                  WHERE t.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_constraint'::pg_catalog.regclass \
+                            THEN (SELECT con.connamespace FROM pg_catalog.pg_constraint con \
+                                  WHERE con.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_policy'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_policy pol \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) pol.polrelid \
+                                  WHERE pol.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_trigger'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_trigger g \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) g.tgrelid \
+                                  WHERE g.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_attrdef'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_attrdef ad \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) ad.adrelid \
+                                  WHERE ad.oid OPERATOR(pg_catalog.=) d.objid) \
+                        WHEN d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_rewrite'::pg_catalog.regclass \
+                            THEN (SELECT c.relnamespace FROM pg_catalog.pg_rewrite rw \
+                                  JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) rw.ev_class \
+                                  WHERE rw.oid OPERATOR(pg_catalog.=) d.objid) \
+                    END AS dependent_namespace, \
+                    CASE \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                            THEN (SELECT p.pronamespace FROM pg_catalog.pg_proc p \
+                                  WHERE p.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_operator'::pg_catalog.regclass \
+                            THEN (SELECT o.oprnamespace FROM pg_catalog.pg_operator o \
+                                  WHERE o.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                            THEN (SELECT t.typnamespace FROM pg_catalog.pg_type t \
+                                  WHERE t.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                        WHEN d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_collation'::pg_catalog.regclass \
+                            THEN (SELECT co.collnamespace FROM pg_catalog.pg_collation co \
+                                  WHERE co.oid OPERATOR(pg_catalog.=) d.refobjid) \
+                    END AS referenced_namespace \
+             FROM pg_catalog.pg_depend d \
+             WHERE d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+                OR d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_operator'::pg_catalog.regclass \
+                OR d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_type'::pg_catalog.regclass \
+                OR d.refclassid OPERATOR(pg_catalog.=) 'pg_catalog.pg_collation'::pg_catalog.regclass), \
+         foreign_refs AS ( \
+             SELECT pg_catalog.concat(o.type, ' ', o.identity, ' -> ', r.type, ' ', r.identity) \
+                        AS entry \
+             FROM dependent dep CROSS JOIN ns \
+             CROSS JOIN LATERAL pg_catalog.pg_identify_object(dep.classid, dep.objid, dep.objsubid) o \
+             CROSS JOIN LATERAL \
+                 pg_catalog.pg_identify_object(dep.refclassid, dep.refobjid, dep.refobjsubid) r \
+             WHERE dep.dependent_namespace OPERATOR(pg_catalog.=) ns.oid \
+               AND dep.referenced_namespace IS NOT NULL \
+               AND dep.referenced_namespace OPERATOR(pg_catalog.<>) ns.oid \
+               AND dep.referenced_namespace OPERATOR(pg_catalog.<>) \
+                   'pg_catalog'::pg_catalog.regnamespace::pg_catalog.oid) \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT DISTINCT entry FROM foreign_refs ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
 }
 
 /// Settings that would disable the append-only triggers or row-level
@@ -685,6 +786,23 @@ mod tests {
 
     // Self-signed test CA (not used for any real service).
     const TEST_ROOT_PEM: &str = include_str!("../tests/fixtures/test-root-ca.pem");
+
+    #[test]
+    fn pinned_options_refuse_a_trailing_unescaped_backslash() {
+        let url =
+            |options: &str| format!("postgres://gateway@127.0.0.1/praetore?options={options}");
+        assert!(DatabaseConnector::from_url(&url("-c%20application_name%3Dx")).is_ok());
+        assert!(DatabaseConnector::from_url(&url("-c%20application_name%3Dx%5C%5C")).is_ok());
+        assert!(matches!(
+            DatabaseConnector::from_url(&url("-c%20application_name%3Dx%5C")),
+            Err(DatabaseUrlError::Invalid(_))
+        ));
+        let connector = DatabaseConnector::from_url(&url("-c%20application_name%3Dx")).unwrap();
+        assert_eq!(
+            connector.config.get_options(),
+            Some("-c application_name=x -c search_path=pg_catalog,pg_temp")
+        );
+    }
 
     #[test]
     fn runtime_role_options_accept_only_exact_relaxable_names() {
