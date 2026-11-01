@@ -56,7 +56,7 @@ agente haga por otro camino queda fuera (ver Límites).
 | --- | --- |
 | `main` (sesión principal, sin `agent_type`) | `fs:read`, `fs:write`, `process:execute`, `network:invoke`, `agent:delegate`, `tool:invoke` |
 | `planner`, `explorer` | `fs:read` |
-| `coder` | `fs:read`, `fs:write`, `process:execute` |
+| `coder` | `fs:read`, `fs:write` |
 | `web-fetch` (lector web incorporado de Claude Code) | `network:invoke` |
 | `unregistered` | ninguna |
 
@@ -70,6 +70,10 @@ tiene capacidades, así que toda solicitud se niega, pero con un recibo
 firmado que conserva el `agent_type` pedido. Así ninguna negación queda sin
 registrar.
 
+Ningún subagente recibe `process:execute` (ver
+[`Bash` y `process:execute`](#bash-y-processexecute)). Solo la sesión
+principal, que es la del usuario, puede ejecutar comandos.
+
 Darle red a `web-fetch` es una decisión de policy: en algunas instalaciones
 de Claude Code es la única vía para leer páginas web. Sácalo de `PROFILES`
 si no la quieres.
@@ -81,6 +85,11 @@ Reglas de la policy por defecto:
 - Nadie escribe en `<raíz>/.git`.
 - `git push` requiere aprobación (ver abajo cómo se detecta).
 - Un comando que no se puede analizar requiere aprobación.
+- Un comando analizable requiere aprobación si alguna de sus palabras nombra
+  `<raíz>/.claude` o `<raíz>/.git` (`approval-command-touches-protected-path`),
+  una ruta fuera de la raíz (`approval-command-leaves-root`) o una
+  herramienta de red común (`approval-command-uses-network`). Es defensa en
+  profundidad, no un límite (ver abajo).
 - Los subagentes leen y escriben solo dentro de la raíz del proyecto, con la
   ruta ya resuelta (un symlink que sale de la raíz no cuenta como dentro). La
   sesión principal además lee en cualquier lugar y escribe en
@@ -123,6 +132,93 @@ no analizable y la policy pide aprobación: sustitución de comandos (`$(...)`,
 backticks), sustitución de procesos, heredocs, `eval`, `sh -c` / `bash -c`,
 una variable en posición de comando o junto a `push`, o un alias inline
 (`git -c alias.x=push x`). Acepta falsos positivos como `echo git push`.
+
+### `Bash` y `process:execute`
+
+**Conceder `Bash` (`process:execute`) equivale a conceder todas las demás
+capacidades.** El hook ve el texto del comando, no lo que el comando hace al
+correr: un comando permitido puede escribir en cualquier archivo que el
+usuario pueda escribir (incluidos `.claude/` y `.git/`), leer fuera de la
+raíz del proyecto y usar la red sin `network:invoke`. Las reglas de rutas y
+de red de este README se aplican a las herramientas que nombran una ruta o
+una URL (Read, Write, Edit, Grep, Glob, NotebookEdit, WebFetch, WebSearch),
+no a lo que hace un comando.
+
+Por eso (GHSA-wg33-3h8v-xvqw) ningún perfil de subagente recibe
+`process:execute` por defecto: `coder` edita archivos y la sesión principal
+corre los comandos. La definición de ejemplo
+[`agents/coder.md`](agents/coder.md) ya no incluye `Bash` en `tools:`.
+
+**Estados existentes.** Un estado creado antes de este cambio conserva lo
+que `init` emitió: `coder` sigue teniendo `process:execute` y la policy no
+trae las reglas `approval-command-*`. Para quitarlo, emitir un estado nuevo
+y dejar el anterior para verificar sus recibos:
+
+```sh
+mv <proyecto>/.claude/praetore <proyecto>/.claude/praetore.anterior
+<proyecto>/.claude/bin/praetore-claude-hook init <proyecto>/.claude/praetore --root <proyecto>
+<proyecto>/.claude/bin/praetore-claude-hook verify <proyecto>/.claude/praetore.anterior
+```
+
+**Defensa en profundidad en el escáner, no un límite.** Para un comando
+analizable, [`src/shell.rs`](src/shell.rs) toma cada palabra (argumentos,
+valores de opciones tras `=`, destinos de redirecciones) como posible ruta y
+el hook la resuelve contra la raíz dada en `init` (archivo `project-root` del
+estado; un estado anterior usa el `cwd` de la tool call): de forma léxica
+(quitando `.` y `..`) y siguiendo symlinks. Marca `protected_path` si alguna
+cae bajo `<raíz>/.claude` o `<raíz>/.git`, `leaves_root` si alguna cae fuera
+de la raíz (o es `~...` o `$VAR`, cuyo valor no conoce; `/dev/null` y
+similares no cuentan, ni el programa nombrado por ruta, como
+`/usr/bin/git`), y `network` si alguna palabra es `curl`, `wget`, `nc`,
+`ssh`, `scp`, `rsync`, `ftp`, `telnet` o `socat`. La policy pide aprobación
+en cada caso con su propia regla.
+
+Se eligió `RequireApproval` y no `Deny` porque el escaneo es léxico y tiene
+falsos positivos (`cat .git/HEAD`, `ls /`), y porque por defecto el único
+perfil con `process:execute` es la sesión del usuario, que ya pide
+aprobación para escribir en `.claude/` y para `git push`. Un subagente no
+llega a estas reglas: se le niega `Bash` por falta de capacidad.
+
+Este escaneo **se puede evadir** y no es un límite de seguridad: un script o
+un `Makefile`, un alias o una función de shell definidos en otro lado, un
+glob, una ruta armada en tiempo de ejecución, un comando codificado que otro
+programa permitido decodifica, o cualquier programa que abra archivos o
+conexiones por su cuenta hacen lo que el texto del comando no dice.
+
+**Ejecutar `Bash` confinado.** Claude Code tiene un sandbox para `Bash`
+([documentación](https://code.claude.com/docs/en/sandboxing), y las claves en
+[settings](https://code.claude.com/docs/en/settings-reference#sandbox-filesystem)),
+en macOS, Linux y WSL2. Según esa documentación, los comandos confinados
+escriben solo en el directorio de trabajo, en el temporal del usuario y en
+los directorios agregados; dentro de ellos ya deniega escribir en los
+archivos de configuración de `.claude` (`settings*.json`, `agents/`,
+`hooks/`, `skills/`, `commands/`) y en `.git/hooks` y `.git/config`; y la
+red pasa por un proxy con dominios permitidos, que empiezan vacíos. Para
+dejar además `.claude/` y `.git/` completos de solo lectura para `Bash`, en
+`<proyecto>/.claude/settings.json` (las rutas `./` se resuelven contra la
+raíz del proyecto):
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": { "denyWrite": ["./.claude", "./.git"] }
+  }
+}
+```
+
+`allowUnsandboxedCommands: false` quita el reintento fuera del sandbox y
+`failIfUnavailable: true` evita que corra sin sandbox si no puede iniciarlo.
+Con `./.git` de solo lectura, `git commit` y similares fallan dentro del
+sandbox. El sandbox no cubre las herramientas de archivos ni los hooks (el
+hook de PRÆTORE sigue corriendo con acceso completo), y un comando en
+`excludedCommands` corre sin confinar. Revisar esa documentación para la
+versión de Claude Code en uso. La dirección a más largo plazo es que un
+ejecutor confinado como el de T-013 B (`praetore-sandbox-fs`,
+[#61](https://github.com/Mavericksantander/praetore/pull/61)) sea el que
+abra archivos y ejecute, en vez de la herramienta de Claude Code.
 
 ## Probarlo
 
@@ -191,7 +287,8 @@ estado. Para exportar los recibos de una sesión real y verificarlos:
 ```
 
 Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
-`coder` (sonnet) y `explorer` (haiku, solo lectura).
+`coder` (sonnet, edita archivos pero no ejecuta comandos) y `explorer`
+(haiku, solo lectura).
 
 ## Qué prueba un recibo y qué no
 
@@ -221,7 +318,11 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
 
 - **Cooperativo.** Solo cubre las tool calls que pasan por el hook, y solo
   mientras el hook esté configurado. Por eso los subagentes no pueden
-  escribir en `.claude/`, y la sesión principal necesita aprobación.
+  escribir en `.claude/` con Write, Edit, MultiEdit o NotebookEdit, y la
+  sesión principal necesita aprobación. Eso no vale para `Bash`: un perfil
+  con `process:execute` puede cambiar `.claude/` (y con ello el registro del
+  hook para las sesiones siguientes) desde un comando; ver
+  [`Bash` y `process:execute`](#bash-y-processexecute).
 - **Lo que corre dentro de un comando permitido no se ve.** Un script
   (`./deploy.sh`), un `Makefile` o un alias de git definido en la
   configuración pueden hacer push sin que el comando lo diga.

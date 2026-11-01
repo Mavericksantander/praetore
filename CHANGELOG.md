@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **Claude Code hook example: no subagent profile gets `process:execute` by
+  default** (GHSA-wg33-3h8v-xvqw). The hook sees a command's text, not what
+  it does when it runs, so `Bash` under `process:execute` is equivalent to
+  every other capability; the README now says so, and that the `.claude/`
+  write rule for subagents holds for Write/Edit only. `coder` loses
+  `process:execute` in `PROFILES` (the main session keeps it) and
+  `agents/coder.md` no longer lists `Bash`. State written by an earlier
+  `init` keeps what it was issued; the README documents re-running `init`
+  into a new directory. As defense in depth, not a boundary, the `Bash` scan
+  now also flags an analyzable command whose words name `<root>/.claude` or
+  `<root>/.git`, a path outside the project root, or a common network tool,
+  and the default policy holds each for approval
+  (`approval-command-touches-protected-path`, `approval-command-leaves-root`,
+  `approval-command-uses-network`). `init` writes the root to
+  `project-root` in the state directory. The README documents running
+  `Bash` under Claude Code's sandbox. Receipt format unchanged; committed
+  evidence not regenerated.
+
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without

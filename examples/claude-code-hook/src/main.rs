@@ -17,6 +17,8 @@ mod shell;
 #[cfg(test)]
 mod attribution_tests;
 #[cfg(test)]
+mod tests_bash;
+#[cfg(test)]
 mod tests_g7;
 
 use std::{
@@ -45,6 +47,14 @@ const ATTESTER_KEY_FILE: &str = "attester.key";
 const ATTESTER_PIN_FILE: &str = "attester-public-key.hex";
 const AGENTS_DIR: &str = "agents";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
+/// The canonical project root given to `init`. The `Bash` scan resolves the
+/// paths a command names against it. State written before this file existed
+/// falls back to the hook input's `cwd`.
+const PROJECT_ROOT_FILE: &str = "project-root";
+/// Paths a command may name without counting as leaving the project root.
+const SHELL_DEVICES: [&str; 4] = ["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
+/// More words than this that may name a path count as leaving the root.
+const MAX_COMMAND_PATHS: usize = 512;
 const MAIN_AGENT: &str = "main";
 /// Profile for any agent without an authority of its own: it holds no
 /// capability, so every request is denied, but with a signed receipt.
@@ -62,6 +72,12 @@ const AUTHORITY_LIFETIME_DAYS: i64 = 90;
 const PROFILE_CONSTRAINT: &str = "praetore.agent_profile";
 
 /// Capabilities granted to each agent's authority at `init`.
+///
+/// No subagent gets `process:execute`: the hook cannot see what a command
+/// does once it runs, so a profile that may run `Bash` can in practice do
+/// what every other capability allows (write anywhere the user can, read
+/// outside the project, use the network). Only the main session, the user's
+/// own, gets it.
 const PROFILES: [(&str, &[&str]); 6] = [
     (
         MAIN_AGENT,
@@ -76,7 +92,7 @@ const PROFILES: [(&str, &[&str]); 6] = [
     ),
     ("planner", &["fs:read"]),
     ("explorer", &["fs:read"]),
-    ("coder", &["fs:read", "fs:write", "process:execute"]),
+    ("coder", &["fs:read", "fs:write"]),
     // Claude Code's built-in web reader: network only, no file access.
     ("web-fetch", &["network:invoke"]),
     (UNREGISTERED, &[]),
@@ -237,6 +253,7 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
         )?;
     }
 
+    write_private_file(&directory.join(PROJECT_ROOT_FILE), root.as_bytes())?;
     let policy = default_policy(root, &home);
     policy.validate()?;
     write_private_file(
@@ -309,6 +326,39 @@ fn default_policy(root: &str, home: &str) -> Policy {
             )
             .with_capability("process:execute")
             .with_parameter_condition(PolicyCondition::exact("analyzable", json!(false))),
+            // Defense in depth, not a boundary (see `shell`): an analyzable
+            // command whose words name `<root>/.claude` or `<root>/.git`, a
+            // path outside the root, or a network tool is held for approval.
+            // Approval rather than DENY: the scan is lexical and has false
+            // positives (`cat .git/HEAD`, `ls /`), and the only profile with
+            // `process:execute` by default is the user's own session, which
+            // already gets approval for governance writes and `git push`.
+            // `analyzable` keeps an unanalyzable command (no such keys) from
+            // matching these rules as unknown; the rule above holds it.
+            PolicyRule::new(
+                "approval-command-touches-protected-path",
+                "claude:exec",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("process:execute")
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
+            .with_parameter_condition(PolicyCondition::exact("protected_path", json!(true))),
+            PolicyRule::new(
+                "approval-command-leaves-root",
+                "claude:exec",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("process:execute")
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
+            .with_parameter_condition(PolicyCondition::exact("leaves_root", json!(true))),
+            PolicyRule::new(
+                "approval-command-uses-network",
+                "claude:exec",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("process:execute")
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
+            .with_parameter_condition(PolicyCondition::exact("network", json!(true))),
             PolicyRule::new("allow-read-project", "claude:read", PolicyEffect::Allow)
                 .with_capability("fs:read")
                 .with_parameter_condition(PolicyCondition::path_prefix("path", root)),
@@ -370,6 +420,7 @@ fn classify(
     tool_name: &str,
     input: &Value,
     cwd: Option<&str>,
+    root: Option<&str>,
 ) -> (String, &'static str, Value, Option<Value>) {
     let field = |key: &str| input.get(key).and_then(Value::as_str);
     let path_param = |path: Option<&str>| match path.or(cwd) {
@@ -400,8 +451,16 @@ fn classify(
         "Bash" => {
             let command = field("command").unwrap_or_default();
             let parameters = match shell::scan(command) {
-                shell::Scan::Analyzed { git_push } => {
-                    json!({ "command": command, "analyzable": true, "git_push": git_push })
+                shell::Scan::Analyzed(analysis) => {
+                    let paths = command_paths(&analysis.paths, cwd, root);
+                    json!({
+                        "command": command,
+                        "analyzable": true,
+                        "git_push": analysis.git_push,
+                        "protected_path": paths.protected,
+                        "leaves_root": paths.leaves_root,
+                        "network": analysis.network,
+                    })
                 }
                 shell::Scan::Unanalyzable(reason) => json!({
                     "command": command,
@@ -438,6 +497,92 @@ fn classify(
             None,
         ),
     }
+}
+
+/// What the words of an analyzable command name, resolved against the root.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CommandPaths {
+    /// A word names `<root>/.claude` or `<root>/.git`, or something under it.
+    protected: bool,
+    /// A word names a path outside the root, its value is unknown (a `$`
+    /// expansion, a leading `~`), or the command runs outside the root.
+    leaves_root: bool,
+}
+
+/// Best effort, not a boundary: every word is taken as a possible path,
+/// joined onto `cwd` and checked lexically (after removing `.` and `..`) and
+/// after resolving symlinks, both for the word as written and normalized.
+/// A program named by path (`/usr/bin/git`) does not count as leaving the
+/// root; it still counts when it names a protected path. Without a root
+/// nothing can be checked, so the command counts as leaving it.
+fn command_paths(words: &[shell::PathWord], cwd: Option<&str>, root: Option<&str>) -> CommandPaths {
+    let Some(root) = root else {
+        return CommandPaths {
+            protected: false,
+            leaves_root: true,
+        };
+    };
+    let protected_dirs = [format!("{root}/.claude"), format!("{root}/.git")];
+    let base = cwd.unwrap_or(root);
+    let base = match resolve_path(&normalize(base)) {
+        (_, Some(resolved)) => resolved,
+        _ => normalize(base),
+    };
+    let mut found = CommandPaths {
+        protected: false,
+        leaves_root: !within(&base, root) || words.len() > MAX_COMMAND_PATHS,
+    };
+    for word in words.iter().take(MAX_COMMAND_PATHS) {
+        if word.dynamic || word.text.starts_with('~') {
+            found.leaves_root |= !word.program;
+            continue;
+        }
+        if SHELL_DEVICES.contains(&word.text.as_str()) {
+            continue;
+        }
+        let raw = absolute(&word.text, Some(&base));
+        let lexical = normalize(&raw);
+        let mut seen = vec![lexical.clone()];
+        for candidate in [&raw, &lexical] {
+            if let (_, Some(resolved)) = resolve_path(candidate) {
+                seen.push(normalize(&resolved));
+            }
+        }
+        for path in &seen {
+            found.protected |= protected_dirs.iter().any(|dir| within(path, dir));
+            found.leaves_root |= !word.program && !within(path, root);
+        }
+    }
+    found
+}
+
+/// Removes `.` and `..` segments and repeated slashes from an absolute path,
+/// lexically. A relative path is returned unchanged.
+fn normalize(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// `path` is `dir` or under it, by whole segments.
+fn within(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    dir.is_empty()
+        || path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// What the policy sees in place of a path that does not resolve to itself.
@@ -796,8 +941,22 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     )?)?)?;
     let engine = AuthorizationEngine::strict(policy, vec![pin])?;
 
-    let (action_type, capability, mut parameters, path_check) =
-        classify(&input.tool_name, &input.tool_input, input.cwd.as_deref());
+    let root_file = directory.join(PROJECT_ROOT_FILE);
+    let root = if root_file.exists() {
+        Some(
+            String::from_utf8(read_bounded(&root_file)?)?
+                .trim()
+                .to_string(),
+        )
+    } else {
+        input.cwd.clone()
+    };
+    let (action_type, capability, mut parameters, path_check) = classify(
+        &input.tool_name,
+        &input.tool_input,
+        input.cwd.as_deref(),
+        root.as_deref(),
+    );
     // The engine requires every authority constraint to appear among the
     // action parameters, so an authority issued for one profile cannot be
     // used in a request made as another.
@@ -1350,8 +1509,11 @@ mod tests {
             let verdict = f.decide(Some(agent), "Write", write.clone());
             assert_eq!(verdict.outcome, DecisionOutcome::Deny);
             assert!(verdict.reason.contains("fs:write"), "{}", verdict.reason);
+        }
+        // No subagent runs commands (see `tests_bash`).
+        for agent in ["planner", "explorer", "coder"] {
             let verdict = f.decide(Some(agent), "Bash", json!({ "command": "ls" }));
-            assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+            assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{agent}");
         }
         let verdict = f.decide(
             Some("coder"),
@@ -1395,17 +1557,13 @@ mod tests {
     #[test]
     fn git_push_requires_approval() {
         let f = Fixture::new("push");
-        let verdict = f.decide(
-            Some("coder"),
-            "Bash",
-            json!({ "command": "git push origin main" }),
-        );
+        let verdict = f.decide(None, "Bash", json!({ "command": "git push origin main" }));
         assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
         assert_eq!(
             hook_output(&verdict).unwrap()["hookSpecificOutput"]["permissionDecision"],
             "ask"
         );
-        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": "cargo test" }));
+        let verdict = f.decide(None, "Bash", json!({ "command": "cargo test" }));
         assert_eq!(verdict.outcome, DecisionOutcome::Allow);
         assert!(hook_output(&verdict).is_none());
 
@@ -1415,7 +1573,7 @@ mod tests {
             ("$(echo git) push", "approval-unanalyzable-command"),
             ("bash -c 'git push'", "approval-unanalyzable-command"),
         ] {
-            let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
+            let verdict = f.decide(None, "Bash", json!({ "command": command }));
             assert_eq!(
                 verdict.outcome,
                 DecisionOutcome::RequireApproval,
@@ -1435,7 +1593,7 @@ mod tests {
         // with no `git push`, held only because it cannot be analyzed.
         let f = Fixture::new("heredoc");
         let command = "cd docs && python3 - <<'E'\nprint('hola')\nE\ngrep -n x 01.md";
-        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
+        let verdict = f.decide(None, "Bash", json!({ "command": command }));
         assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
         assert_eq!(
             verdict.rule.as_deref(),
@@ -1443,7 +1601,7 @@ mod tests {
         );
 
         // An analyzable push still names approval-git-push.
-        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": "git push" }));
+        let verdict = f.decide(None, "Bash", json!({ "command": "git push" }));
         assert_eq!(verdict.rule.as_deref(), Some("approval-git-push"));
     }
 
