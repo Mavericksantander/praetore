@@ -3005,6 +3005,188 @@ fn postgres_migrations_baseline_partial_schema_fails_closed() {
     assert!(!control, "a refused baseline must not record anything");
 }
 
+/// Builds a 0009 database without migration records, applies `tamper`, and
+/// asserts that the runner refuses it, names `object`, and records nothing.
+fn assert_tampered_baseline_refused(tamper: &str, object: &str) {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    client
+        .batch_execute(tamper)
+        .expect("tamper with the baseline");
+    let error = praetore_replay_postgres::apply_migrations(&mut client)
+        .expect_err(&format!("tampered baseline must be refused: {tamper}"));
+    assert!(
+        matches!(
+            error,
+            praetore_replay_postgres::MigrationError::UnrecognizedSchema(_)
+        ),
+        "{error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(object),
+        "error must name {object}: {message}"
+    );
+    eprintln!("refused as expected: {message}");
+    let control: bool = client
+        .query_one(
+            "SELECT to_regclass('praetore.schema_migrations') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!control, "a refused baseline must not record anything");
+    let not_dispatched_reason =
+        column_exists(&mut client, "execution_journal", "not_dispatched_reason");
+    assert!(
+        !not_dispatched_reason,
+        "a refused baseline must not run 0010"
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_changed_function_body_fails_closed() {
+    // A body that no longer rejects mutation.
+    assert_tampered_baseline_refused(
+        "CREATE OR REPLACE FUNCTION praetore.reject_human_approval_mutation() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$\nBEGIN\n    RETURN NEW;\nEND;\n$$;",
+        "praetore.reject_human_approval_mutation()",
+    );
+    // The same body with one extra trailing space: no normalization.
+    assert_tampered_baseline_refused(
+        "CREATE OR REPLACE FUNCTION praetore.reject_execution_attestation_mutation() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$\nBEGIN\n    \
+         RAISE EXCEPTION 'execution attestations are append-only';\nEND;\n $$;",
+        "praetore.reject_execution_attestation_mutation()",
+    );
+    // A missing function (CASCADE also drops its triggers).
+    assert_tampered_baseline_refused(
+        "DROP FUNCTION praetore.reject_human_approval_expiration_mutation() CASCADE;",
+        "function praetore.reject_human_approval_expiration_mutation() is missing",
+    );
+    // A different language attribute (volatility) with the same body.
+    assert_tampered_baseline_refused(
+        "ALTER FUNCTION praetore.enforce_approval_resolution_exclusive() STABLE;",
+        "praetore.enforce_approval_resolution_exclusive()",
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_changed_security_definer_fails_closed() {
+    assert_tampered_baseline_refused(
+        "ALTER FUNCTION praetore.record_execution_journal_transition() SECURITY INVOKER;",
+        "praetore.record_execution_journal_transition()",
+    );
+    assert_tampered_baseline_refused(
+        "ALTER FUNCTION praetore.enforce_approval_resolution_exclusive() SECURITY DEFINER;",
+        "praetore.enforce_approval_resolution_exclusive()",
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_changed_search_path_fails_closed() {
+    assert_tampered_baseline_refused(
+        "ALTER FUNCTION praetore.record_execution_journal_transition() \
+         SET search_path = public, pg_catalog, praetore, pg_temp;",
+        "praetore.record_execution_journal_transition()",
+    );
+    assert_tampered_baseline_refused(
+        "ALTER FUNCTION praetore.record_execution_journal_transition() RESET search_path;",
+        "praetore.record_execution_journal_transition()",
+    );
+    assert_tampered_baseline_refused(
+        "ALTER FUNCTION praetore.validate_execution_journal_transition() \
+         SET search_path = public;",
+        "praetore.validate_execution_journal_transition()",
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_added_overload_fails_closed() {
+    assert_tampered_baseline_refused(
+        "CREATE FUNCTION praetore.reject_human_approval_mutation(reason TEXT) \
+         RETURNS TEXT LANGUAGE sql AS $$ SELECT reason $$;",
+        "praetore.reject_human_approval_mutation(reason text)",
+    );
+    assert_tampered_baseline_refused(
+        "CREATE FUNCTION praetore.unexpected_helper() RETURNS INTEGER \
+         LANGUAGE sql AS $$ SELECT 1 $$;",
+        "praetore.unexpected_helper()",
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_changed_trigger_fails_closed() {
+    // Same name, no longer fires on DELETE.
+    assert_tampered_baseline_refused(
+        "DROP TRIGGER human_approvals_immutable ON praetore.human_approvals; \
+         CREATE TRIGGER human_approvals_immutable BEFORE UPDATE ON praetore.human_approvals \
+         FOR EACH ROW EXECUTE FUNCTION praetore.reject_human_approval_mutation();",
+        "human_approvals_immutable",
+    );
+    // Same events, a different (baseline) function.
+    assert_tampered_baseline_refused(
+        "DROP TRIGGER execution_journal_transition ON praetore.execution_journal; \
+         CREATE TRIGGER execution_journal_transition BEFORE UPDATE ON praetore.execution_journal \
+         FOR EACH ROW EXECUTE FUNCTION praetore.reject_human_approval_mutation();",
+        "trigger execution_journal_transition on praetore.execution_journal differs from 0009 in: function",
+    );
+    // A missing trigger.
+    assert_tampered_baseline_refused(
+        "DROP TRIGGER human_approvals_exclusive ON praetore.human_approvals;",
+        "trigger human_approvals_exclusive on praetore.human_approvals is missing",
+    );
+    // A WHEN clause that skips the check.
+    assert_tampered_baseline_refused(
+        "DROP TRIGGER execution_journal_transition ON praetore.execution_journal; \
+         CREATE TRIGGER execution_journal_transition BEFORE UPDATE ON praetore.execution_journal \
+         FOR EACH ROW WHEN (false) \
+         EXECUTE FUNCTION praetore.validate_execution_journal_transition();",
+        "execution_journal_transition",
+    );
+    // Disabled.
+    assert_tampered_baseline_refused(
+        "ALTER TABLE praetore.execution_journal_events \
+         DISABLE TRIGGER execution_journal_events_immutable;",
+        "execution_journal_events_immutable",
+    );
+    // An extra trigger.
+    assert_tampered_baseline_refused(
+        "CREATE TRIGGER extra_trigger AFTER INSERT ON praetore.replay_claims \
+         FOR EACH ROW EXECUTE FUNCTION praetore.reject_human_approval_mutation();",
+        "extra_trigger",
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_baseline_changed_policy_fails_closed() {
+    assert_tampered_baseline_refused(
+        "ALTER POLICY tenant_isolation ON praetore.human_approvals USING (true);",
+        "human_approvals.tenant_isolation",
+    );
+    assert_tampered_baseline_refused(
+        "ALTER POLICY tenant_isolation ON praetore.execution_journal \
+         WITH CHECK (tenant_id IS NOT NULL);",
+        "execution_journal.tenant_isolation",
+    );
+    // An extra permissive policy widens access even when the original stays.
+    assert_tampered_baseline_refused(
+        "CREATE POLICY open_read ON praetore.replay_claims FOR SELECT USING (true);",
+        "replay_claims.open_read",
+    );
+    assert_tampered_baseline_refused(
+        "ALTER POLICY tenant_isolation ON praetore.execution_attestations TO pg_monitor;",
+        "execution_attestations.tenant_isolation",
+    );
+}
+
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_migrations_unknown_version_refuses_to_start() {

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- The 0009 baseline check in `praetore-replay-postgres` (a `praetore`
+  schema without migration records, recorded as 0001-0009 without running
+  them) now compares definitions, not only names. Every function in
+  `praetore` must be one of the eight trigger functions 0001-0009 create,
+  with no arguments (an added overload is refused), the same `prosrc` byte
+  for byte as the last `CREATE OR REPLACE FUNCTION` in the bundled
+  0001-0009 text, and the same SECURITY DEFINER, `SET search_path`,
+  language, return type, volatility, STRICT, LEAKPROOF and parallel
+  setting. Every non-internal trigger on a `praetore` table must be one of
+  the thirteen 0001-0009 create, with the same timing, events, level,
+  function, `UPDATE OF` columns, enabled state, and no arguments, WHEN
+  clause or transition tables. The RLS policies must be exactly the six
+  `tenant_isolation` policies (PERMISSIVE, FOR ALL, TO PUBLIC) whose USING
+  and WITH CHECK equal the server's own rendering of the 0008/0009
+  expression on a temporary table in a rolled-back transaction; an extra
+  policy is refused (this needs the TEMP privilege on the database, which
+  PostgreSQL grants to PUBLIC by default). Forced RLS on `human_approval_expirations` is now
+  checked too. Any difference refuses the migration and names the object.
+  `MigrationError::UnrecognizedSchema` now carries a `String`. Six new
+  ignored PostgreSQL tests, run in CI with `--exact`.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed

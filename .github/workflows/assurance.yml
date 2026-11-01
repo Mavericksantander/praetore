@@ -267,6 +267,12 @@ jobs:
             postgres_migrations_baseline_empty_database_applies_everything_once \
             postgres_migrations_baseline_0009_database_records_without_reexecuting \
             postgres_migrations_baseline_partial_schema_fails_closed \
+            postgres_migrations_baseline_changed_function_body_fails_closed \
+            postgres_migrations_baseline_changed_security_definer_fails_closed \
+            postgres_migrations_baseline_changed_search_path_fails_closed \
+            postgres_migrations_baseline_added_overload_fails_closed \
+            postgres_migrations_baseline_changed_trigger_fails_closed \
+            postgres_migrations_baseline_changed_policy_fails_closed \
             postgres_migrations_unknown_version_refuses_to_start \
             postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered \
             postgres_apd_sigkill_between_approve_and_claim \
