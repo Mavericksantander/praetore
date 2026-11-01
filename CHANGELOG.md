@@ -19,6 +19,24 @@
   `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; anything else
   is a configuration error; the effective setting is logged at startup), or
   `verify_runtime_role_with` and `RuntimeRoleOptions` in the library.
+- **Breaking:** an existing `praetore` schema without migration records is
+  no longer adopted silently. `apply_migrations` refuses it
+  (`MigrationError::LegacyBaselineNotAdopted`). Adoption is explicit:
+  `PRAETORE_ADOPT_LEGACY_BASELINE=1` for the gateway service,
+  `praetore run <directory> --adopt-legacy-baseline` (or the same variable)
+  for the CLI, `apply_migrations_with` and `MigrationOptions` in the
+  library. An adoption is recorded in `praetore.schema_migrations`
+  (`adopted_legacy_baseline`, `adopted_by`, `baseline_dump_sha256`, with
+  `applied_at`), returned by `legacy_baseline_adoption`, logged by the
+  gateway service and printed by `praetore doctor`. Fresh databases and
+  databases with migration records are unaffected.
+- `apply_migrations` checks the database environment on every run, fresh,
+  adopted or current (`MigrationError::UnsafeDatabase`).
+  `verify_runtime_role` checks schema ACLs (`RuntimeRoleError::UnexpectedGrant`):
+  only the grants the migrations make and the documented `praetore_observe`
+  shape are accepted. SECURITY DEFINER functions with the owner's rights are
+  refused unless listed in `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`
+  (semicolon-separated; logged at startup).
 - The 0009 baseline check in `praetore-replay-postgres` (a `praetore`
   schema without migration records, recorded as 0001-0009 without running
   them) now compares the live schema with 0001-0009 applied by the same
@@ -41,8 +59,7 @@
   (`MigrationError::UnrecognizedSchema` now carries a `String`).
 - The migration runner sends every statement with
   `search_path = pg_catalog, pg_temp` (the caller's value is restored) and
-  catalog names qualified, so a `public.pg_proc` view or a `public.=`
-  operator cannot shadow the catalog. It refuses a session with
+  catalog names qualified. It refuses a session with
   `session_replication_role` other than `origin`
   (`MigrationError::UnsafeSession`), fresh database or not.
 - `crates/praetore-replay-postgres/migrations/.gitattributes` keeps the

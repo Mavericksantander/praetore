@@ -135,7 +135,7 @@ fn initialize_test_database() {
                      CREATE ROLE praetore_replay_test NOLOGIN; \
                  EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
                 DO $$ BEGIN \
-                    CREATE ROLE praetore_observe_test NOLOGIN; \
+                    CREATE ROLE praetore_observe NOLOGIN; \
                 EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
                  REVOKE ALL ON SCHEMA praetore FROM PUBLIC; \
                  REVOKE ALL ON TABLE praetore.replay_claims FROM PUBLIC; \
@@ -155,16 +155,16 @@ fn initialize_test_database() {
                      FROM praetore_replay_test; \
                  REVOKE ALL ON SCHEMA praetore FROM praetore_replay_test; \
                  GRANT praetore_runtime TO praetore_replay_test; \
-                 GRANT USAGE ON SCHEMA praetore TO praetore_observe_test; \
+                 GRANT USAGE ON SCHEMA praetore TO praetore_observe; \
                  REVOKE ALL ON TABLE praetore.execution_journal \
-                     FROM praetore_observe_test; \
+                     FROM praetore_observe; \
                  REVOKE ALL ON TABLE praetore.execution_journal_events \
-                     FROM praetore_observe_test; \
+                     FROM praetore_observe; \
                  GRANT SELECT (tenant_id, agent_id, request_id, request_digest, action_digest, \
                      authorization_status, execution_status, evidence_json, created_at, updated_at) \
-                     ON praetore.execution_journal TO praetore_observe_test; \
+                     ON praetore.execution_journal TO praetore_observe; \
                  GRANT SELECT (event_id, tenant_id, agent_id, request_id, from_status, to_status, occurred_at) \
-                     ON praetore.execution_journal_events TO praetore_observe_test",
+                     ON praetore.execution_journal_events TO praetore_observe",
             )
             .expect("configure least-privilege test role");
     });
@@ -194,7 +194,7 @@ fn connect_observability_reader() -> praetore_replay_postgres::PostgresObservabi
     initialize_test_database();
     let mut client = connect_client();
     client
-        .batch_execute("SET ROLE praetore_observe_test")
+        .batch_execute("SET ROLE praetore_observe")
         .expect("assume read-only observability role");
     praetore_replay_postgres::PostgresObservabilityReader::from_client(client).unwrap()
 }
@@ -1656,7 +1656,7 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
 
     let mut read_only_client = connect_client();
     read_only_client
-        .batch_execute("SET ROLE praetore_observe_test")
+        .batch_execute("SET ROLE praetore_observe")
         .unwrap();
     assert!(
         read_only_client
@@ -1709,7 +1709,7 @@ fn postgres_observability_lists_filters_and_reads_real_transition_history() {
 
     let mut rls_client = connect_client();
     rls_client
-        .batch_execute("SET ROLE praetore_observe_test")
+        .batch_execute("SET ROLE praetore_observe")
         .unwrap();
     let mut rls_transaction = rls_client.transaction().unwrap();
     rls_transaction
@@ -4086,12 +4086,16 @@ fn postgres_runtime_role_refuses_unexpected_grants() {
                 .to_owned(),
             "REVOKE EXECUTE ON FUNCTION praetore.record_execution_journal_transition() FROM PUBLIC"
                 .to_owned(),
-            "function praetore.record_execution_journal_transition(): EXECUTE to PUBLIC".to_owned(),
+            // Reported first as an executable owner SECURITY DEFINER function.
+            "praetore.record_execution_journal_transition()".to_owned(),
         ),
         (
-            "GRANT DELETE ON praetore.replay_claims TO praetore_runtime".to_owned(),
-            "REVOKE DELETE ON praetore.replay_claims FROM praetore_runtime".to_owned(),
-            "relation praetore.replay_claims: DELETE to praetore_runtime".to_owned(),
+            "GRANT SELECT ON praetore.execution_journal_events_event_id_seq TO praetore_runtime"
+                .to_owned(),
+            "REVOKE SELECT ON praetore.execution_journal_events_event_id_seq FROM praetore_runtime"
+                .to_owned(),
+            "relation praetore.execution_journal_events_event_id_seq: SELECT to praetore_runtime"
+                .to_owned(),
         ),
     ] {
         admin.batch_execute(&grant).unwrap();
@@ -4962,7 +4966,8 @@ fn postgres_runtime_role_must_not_own_or_bypass_the_schema() {
     // runtime needs: schema check and a replay claim.
     verify_runtime_role(&mut runtime).unwrap();
     praetore_replay_postgres::verify_schema_current(&mut runtime).unwrap();
-    assert!(praetore_replay_postgres::apply_migrations(&mut runtime).is_ok_and(|v| v.is_empty()));
+    let rerun = praetore_replay_postgres::apply_migrations(&mut runtime);
+    assert!(rerun.as_ref().is_ok_and(|v| v.is_empty()), "{rerun:?}");
     let guard = PostgresReplayGuard::from_client(runtime);
     let (agent, request) = (Uuid::new_v4(), Uuid::new_v4());
     guard.claim_once(TEST_TENANT_ID, agent, request).unwrap();

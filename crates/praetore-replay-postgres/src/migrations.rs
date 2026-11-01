@@ -1191,17 +1191,21 @@ fn search_path_shadows_catalog(value: &str) -> bool {
     }
 }
 
-/// Keys of the control table, created in the recording transaction.
+/// Keys of the control table, created in the recording transaction: the
+/// first object named after `praetore.` is `schema_migrations`, its primary
+/// key index or its array type.
 fn is_control_table_key(key: &str) -> bool {
-    key == "relation praetore.schema_migrations"
-        || key == "relation praetore.schema_migrations_pkey"
-        || key == "type praetore.schema_migrations"
-        || key == "type praetore._schema_migrations"
-        || key == "internal triggers on praetore.schema_migrations"
-        || key.starts_with("column praetore.schema_migrations.")
-        || key.starts_with("column praetore.schema_migrations_pkey.")
-        || key.starts_with("constraint praetore.schema_migrations.")
-        || (key.starts_with("dependent ") && key.contains("praetore.schema_migrations"))
+    let Some((_, rest)) = key.split_once("praetore.") else {
+        return false;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    matches!(
+        name.as_str(),
+        "schema_migrations" | "schema_migrations_pkey" | "_schema_migrations"
+    )
 }
 
 /// State checked on every `apply_migrations`, fresh database, baseline or
@@ -1317,7 +1321,8 @@ fn environment_problems(
                  JOIN migrator_groups g ON m.member OPERATOR(pg_catalog.=) g.role) \
          SELECT r.rolname::pg_catalog.text, r.rolcanlogin, \
                 EXISTS (SELECT 1 FROM migrator_groups g \
-                        WHERE g.role OPERATOR(pg_catalog.=) a.role) \
+                        WHERE g.role OPERATOR(pg_catalog.=) a.role), \
+                a.role OPERATOR(pg_catalog.=) (SELECT oid FROM owner_role) \
          FROM acting a JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.role \
          WHERE NOT EXISTS (SELECT 1 FROM migrator \
                            WHERE migrator.oid OPERATOR(pg_catalog.=) a.role) \
@@ -1325,8 +1330,15 @@ fn environment_problems(
         ),
         &[],
     )? {
-        let (role, can_login, on_migrator_path): (String, bool, bool) =
-            (row.get(0), row.get(1), row.get(2));
+        let (role, can_login, on_migrator_path, is_owner): (String, bool, bool, bool) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        if is_owner && !on_migrator_path {
+            // The owner itself, when the caller is not the migrating role (a
+            // runtime role re-checking a current schema). Adopting a
+            // baseline additionally requires the migrating role to belong to
+            // the owner (`baseline_only_problems`).
+            continue;
+        }
         if !on_migrator_path {
             problems.push(format!(
                 "role {role} can act as the praetore owner (it is, or is a member of, the \
@@ -1491,6 +1503,29 @@ mod tests {
             "x,pg_catalog",
         ] {
             assert!(search_path_shadows_catalog(hostile), "{hostile}");
+        }
+    }
+
+    #[test]
+    fn control_table_keys_are_exactly_the_control_table() {
+        for key in [
+            "relation praetore.schema_migrations",
+            "relation praetore.schema_migrations_pkey",
+            "internal triggers on praetore.schema_migrations_pkey",
+            "column praetore.schema_migrations.version",
+            "constraint praetore.schema_migrations.schema_migrations_check",
+            "type praetore._schema_migrations",
+            "dependent for praetore.schema_migrations.applied_at (default value)",
+        ] {
+            assert!(is_control_table_key(key), "{key}");
+        }
+        for key in [
+            "relation praetore.schema_migrations_extra",
+            "relation praetore.replay_claims",
+            "function praetore.schema_migrations_helper()",
+            "schema praetore",
+        ] {
+            assert!(!is_control_table_key(key), "{key}");
         }
     }
 
