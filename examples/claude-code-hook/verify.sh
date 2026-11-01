@@ -6,17 +6,39 @@
 #   ./examples/claude-code-hook/verify.sh [bundle]
 # Por defecto verifica examples/claude-code-hook/bundle.
 # Sale con 0 solo si praetore-verify acepta todos los recibos (con la policy
-# publicada) y rechaza la copia alterada; con 1 en cualquier otro caso.
+# publicada) y rechaza la copia alterada, e index.json atribuye cada recibo al
+# agente que lo firmó y una copia re-atribuida se rechaza; con 1 en cualquier
+# otro caso. Verifica y atribuye una copia del bundle tomada al empezar (paso
+# 0): lo que cambie en el original después no entra en el resultado.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-BUNDLE="$(cd "${1:-$HERE/bundle}" && pwd)"
+SOURCE="$(cd "${1:-$HERE/bundle}" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 step() { printf '\n== %s\n' "$*"; }
 fail() { printf 'FALLO: %s\n' "$*" >&2; exit 1; }
+
+step "0. Copiar el bundle a un directorio temporal"
+# Los pasos 3 y 5 leen los mismos bytes: los de esta copia. Antes cada paso
+# abría el original por su cuenta, y un archivo cambiado entre el paso 3 y el
+# 5 se atribuía sin verificar. `evidence/.` copia el contenido del directorio;
+# con -R, un symlink o un archivo especial dentro se copia como tal y la
+# regla de nombres del paso 3 lo rechaza.
+mkdir "$WORK/bundle" "$WORK/bundle/evidence"
+for file in index.json attester-public-key.hex issuer-pins.jsonl policy.json; do
+  [ -f "$SOURCE/$file" ] || fail "falta $file en el bundle"
+  cp "$SOURCE/$file" "$WORK/bundle/$file"
+done
+[ -d "$SOURCE/evidence" ] || fail "el bundle no tiene evidence/"
+cp -R "$SOURCE/evidence/." "$WORK/bundle/evidence/"
+echo "copia de $SOURCE en $WORK/bundle"
+# Desde aquí solo se lee la copia. Con `set -u`, cualquier uso posterior de
+# SOURCE hace fallar el script.
+readonly BUNDLE="$WORK/bundle"
+unset SOURCE
 
 step "1. Compilar praetore-verify (cargo build --release --locked)"
 cargo build --quiet --release --locked --manifest-path "$ROOT/Cargo.toml" --package praetore-verify
@@ -31,9 +53,19 @@ step "3. Verificar cada recibo: integridad, firma del atestador, autoridad pinea
 # Glob a un array, sin `ls | head`: con cientos de recibos, `head` cerraba el
 # pipe, `ls` recibía SIGPIPE y pipefail hacía salir el script con 141 aunque
 # todo hubiera verificado.
-shopt -s nullglob
-receipts=("$BUNDLE"/evidence/*.json)
-shopt -u nullglob
+# Con dotglob el glob incluye los archivos ocultos. Cualquier entrada que no
+# sea un archivo regular *.json no oculto hace fallar: así este paso y
+# check-attribution.py (paso 5, misma regla) leen exactamente los mismos
+# archivos y ninguno queda sin verificar.
+shopt -s nullglob dotglob
+receipts=("$BUNDLE"/evidence/*)
+shopt -u nullglob dotglob
+for entry in "${receipts[@]}"; do
+  name="${entry##*/}"
+  if [[ "$name" == .* || "$name" != *.json || -L "$entry" || ! -f "$entry" ]]; then
+    fail "evidence/$name: entrada no permitida (solo archivos regulares *.json no ocultos)"
+  fi
+done
 [ "${#receipts[@]}" -gt 0 ] || fail "el bundle no tiene recibos"
 for evidence in "${receipts[@]}"; do
   # --policy: praetore-verify exige que el recibo registre el digest de la
@@ -72,17 +104,29 @@ set -e
 [ "$TAMPER_RC" -ne 0 ] || fail "la copia alterada verificó (no debería)"
 echo "OK: la copia alterada fue rechazada (exit $TAMPER_RC)"
 
-step "5. Resumen por agente y decisión (de index.json, solo informativo)"
-# No cambia el código de salida: index.json no está firmado y el resultado ya
-# lo dieron los pasos 3 y 4.
-python3 - "$BUNDLE/index.json" <<'PY' || echo "aviso: no se pudo resumir index.json"
-import collections, json, sys
+step "5. Atribución: index.json debe decir lo mismo que los recibos firmados"
+# index.json y los nombres de archivo no están firmados. check-attribution.py
+# lee los recibos que el paso 3 verificó y exige que index.json nombre el
+# mismo agente, perfil y agent id; una identidad por perfil.
+python3 -I "$HERE/check-attribution.py" "$BUNDLE" ||
+  fail "index.json no coincide con los recibos firmados"
+echo "OK: cada recibo queda atribuido a la identidad que lo firmó"
+
+step "6. Re-atribuir UN recibo en una copia de index.json y comprobar que falla"
+python3 -I - "$BUNDLE/index.json" "$WORK/index-reattributed.json" <<'PY'
+import json, sys
 index = json.load(open(sys.argv[1]))
-tally = collections.Counter((e["agent"], e["outcome"]) for e in index)
-for (agent, outcome), n in sorted(tally.items()):
-    print(f"{agent:<9} {outcome:<16} {n}")
-totals = collections.Counter(e["outcome"] for e in index)
-print("total:", ", ".join(f"{k} {v}" for k, v in sorted(totals.items())))
+first = index[0]["agent"]
+other = next((e["agent"] for e in index if e["agent"] != first), first + "-otro")
+index[0]["agent"] = other
+if index[0].get("profile") is not None:
+    index[0]["profile"] = other
+json.dump(index, open(sys.argv[2], "w"))
+print(f"{index[0]['file']}: agent {first} -> {other}")
 PY
+if python3 -I "$HERE/check-attribution.py" "$BUNDLE" "$WORK/index-reattributed.json"; then
+  fail "la copia re-atribuida de index.json fue aceptada (no debería)"
+fi
+echo "OK: la re-atribución fue rechazada"
 
 step "RESULTADO: todas las verificaciones dieron lo esperado"

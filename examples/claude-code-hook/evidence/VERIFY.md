@@ -130,9 +130,20 @@ Real output:
 
 ```text
 OK policy-digest OK digest="60388a9ccfa887b9e712dd4f029f0a2aaa0e0f4df62d648c64629b3dae6f0f68" policy_id="claude-code-agents" policy_version=1
-OK evidence OK authority_verified=true current_authorization=false evidence_id="2d619485-e1d3-48a5-88ff-97fae15cc038" intent_verified=true verification_scope="historical_receipt_integrity_and_attestation"
+OK evidence OK authority_checked_at_source="verifier_clock" authority_checked_at="2026-11-01T05:15:09.795087Z" authority_verified=true current_authorization=false evidence_id="2d619485-e1d3-48a5-88ff-97fae15cc038" intent_verified=true verification_scope="historical_receipt_integrity_and_attestation"
 exit 0
 ```
+
+`praetore-verify evidence` checks the authority and issuer pin at the
+receipt's signed decision time (`decided_at`) when the receipt records one.
+The receipts in sets 03, 04 and 05 are v1/v4 receipts without HighAssurance
+metadata: they record no signed decision time, so the check uses the
+verifier's current time (`authority_checked_at_source="verifier_clock"`). The
+authorities and issuer pins of sets 04 and 05 expire on 2027-01-29; from that
+day these commands and `verify.sh` (also in CI) fail for 04 and 05 with
+`TRUST_STORE_FAIL` until the sets are re-recorded. Set 03 is valid until
+2036-10-28. With `--require-decision-time` every receipt in sets 03, 04 and
+05 fails with `DECISION_TIME_MISSING`.
 
 Sets 03 and 04 use the same flags with their own folder. Policy digests:
 03 `03f5e97499562eb2abc4ad1a4a2b1cc728a4907089d9d369a36d6a6b3ea102c3`,

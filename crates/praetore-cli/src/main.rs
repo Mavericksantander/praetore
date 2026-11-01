@@ -9,7 +9,8 @@ use praetore_core::{
 use praetore_gateway::{
     ActionDispatcher, ApprovalChallenge, ApprovalChallengeView, ExecutionAttestationError,
     ExecutionAttestationSigner, Gateway, HumanApprovalDecision, HumanApprovalOutcome,
-    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher, sandbox::SandboxDispatcher,
+    HumanApprovalVerifier, http_api, local_demo::LocalDemoDispatcher, sandbox,
+    sandbox::SandboxDispatcher,
 };
 use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
 use rand_core::{OsRng, RngCore};
@@ -638,9 +639,10 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|config| config.sandbox_root.as_ref())
     {
         match open_sandbox(directory, root) {
-            Ok(_) => println!(
-                "[ok] sandbox root {} (gateway-executed fs actions)",
-                root.display()
+            Ok(dispatcher) => println!(
+                "[ok] sandbox root {} (gateway-executed fs actions; path resolution: {})",
+                root.display(),
+                dispatcher.path_resolution()
             ),
             Err(error) => {
                 println!("[failed] sandbox root: {error}");
@@ -675,13 +677,22 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         healthy = false;
                     }
                 }
-                match praetore_replay_postgres::verify_runtime_role(&mut client) {
+                let options = runtime_role_options()?;
+                match options.relaxed().as_slice() {
+                    [] => println!("[ok] runtime role check: no refusal relaxed"),
+                    relaxed => println!(
+                        "[warn] runtime role check relaxed by {}: {}",
+                        praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV,
+                        relaxed.join(", ")
+                    ),
+                }
+                match praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
                     Ok(()) => println!("[ok] least-privilege runtime database role"),
                     Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
                 }
                 for table in REQUIRED_DATABASE_TABLES {
                     let exists: bool = client
-                        .query_one("SELECT to_regclass($1)::text IS NOT NULL", &[&table])?
+                        .query_one("SELECT pg_catalog.to_regclass($1) IS NOT NULL", &[&table])?
                         .get(0);
                     if exists {
                         println!("[ok] database table {table}");
@@ -746,6 +757,15 @@ fn local_database(database_url: &str) -> Result<DatabaseConnector, Box<dyn std::
     Ok(connector)
 }
 
+/// Explicit relaxations of the runtime role check, as the gateway reads them
+/// (PRAETORE_RUNTIME_ALLOW_SETTINGS; none by default).
+fn runtime_role_options()
+-> Result<praetore_replay_postgres::RuntimeRoleOptions, Box<dyn std::error::Error>> {
+    let value = env::var(praetore_replay_postgres::RuntimeRoleOptions::ALLOW_SETTINGS_ENV)
+        .unwrap_or_default();
+    Ok(praetore_replay_postgres::RuntimeRoleOptions::from_allow_settings(&value)?)
+}
+
 fn connect_local_database(database_url: &str) -> Result<Client, Box<dyn std::error::Error>> {
     Ok(local_database(database_url)?.connect()?)
 }
@@ -806,13 +826,22 @@ fn build_gateway(
 
 /// Opens the configured sandbox root fail-closed. The root must be an
 /// existing absolute canonical directory that neither contains nor lies inside
-/// the gateway directory holding the keys.
+/// the gateway directory holding the keys. With
+/// `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` the gateway also refuses to start
+/// unless the kernel resolves sandbox paths with `openat2`.
 fn open_sandbox(
     directory: &Path,
     root: &Path,
 ) -> Result<SandboxDispatcher, Box<dyn std::error::Error>> {
-    let dispatcher = SandboxDispatcher::open(root)
+    let require_openat2 =
+        sandbox::require_openat2_from_env(env::var(sandbox::REQUIRE_OPENAT2_ENV).ok().as_deref())?;
+    let mut dispatcher = SandboxDispatcher::open(root)
         .map_err(|error| format!("invalid sandbox_root {}: {error}", root.display()))?;
+    if require_openat2 {
+        dispatcher = dispatcher
+            .require_openat2()
+            .map_err(|error| format!("sandbox_root {}: {error}", root.display()))?;
+    }
     let gateway_directory = match fs::canonicalize(directory) {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -904,8 +933,10 @@ fn run_gateway(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")
         .unwrap_or_else(|_| database_url.clone());
     apply_migrations(&migration_url)?;
-    let runtime_role =
-        praetore_replay_postgres::verify_runtime_role(&mut connect_local_database(&database_url)?);
+    let runtime_role = praetore_replay_postgres::verify_runtime_role_with(
+        &mut connect_local_database(&database_url)?,
+        &runtime_role_options()?,
+    );
     let api_auth = local_api_auth(directory, &config)?;
     let gateway = Arc::new(build_gateway(directory, &config, &database_url)?);
 
@@ -1272,10 +1303,8 @@ fn find_pending_agent(
 ) -> Result<Uuid, Box<dyn std::error::Error>> {
     let mut client = connect_local_database(database_url)?;
     let mut transaction = client.build_transaction().read_only(true).start()?;
-    transaction.query_one(
-        "SELECT set_config('praetore.tenant_id', $1, true)",
-        &[&tenant_id.to_string()],
-    )?;
+    // Pins search_path for the transaction: `=` below resolves in pg_catalog.
+    praetore_replay_postgres::set_tenant_context(&mut transaction, tenant_id)?;
     let rows = transaction.query(
         "SELECT agent_id FROM praetore.execution_journal \
          WHERE tenant_id = $1 AND request_id = $2 LIMIT 2",
@@ -1803,6 +1832,74 @@ mod tests {
         .unwrap();
         assert!(load_approver_pin(&directory).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// B2: `find_pending_agent` must not return another tenant's row when the
+    /// database search_path makes a `public.=(uuid, uuid)` that is always
+    /// true win over `pg_catalog.=`.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_find_pending_agent_ignores_hostile_search_path() {
+        let base_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        let name = format!("praetore_b2_{}", Uuid::new_v4().simple());
+        let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let (prefix, _) = base_url.rsplit_once('/').unwrap();
+        let url = format!("{prefix}/{name}");
+        let result = std::panic::catch_unwind(|| {
+            apply_migrations(&url).unwrap();
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            let other_tenant = Uuid::new_v4();
+            let agent = Uuid::new_v4();
+            let request = Uuid::new_v4();
+            let mut tx = client.transaction().unwrap();
+            tx.query_one(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&other_tenant.to_string()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3)",
+                &[&other_tenant, &agent, &request],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json) \
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'not_dispatched', '{}')",
+                &[&other_tenant, &agent, &request, &"ab".repeat(32)],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            client
+                .batch_execute(&format!(
+                    "CREATE FUNCTION public.uuid_eq_any(uuid, uuid) RETURNS boolean \
+                       LANGUAGE sql IMMUTABLE AS 'SELECT true'; \
+                     CREATE OPERATOR public.= (LEFTARG = uuid, RIGHTARG = uuid, \
+                       PROCEDURE = public.uuid_eq_any); \
+                     ALTER DATABASE {name} SET search_path = public, pg_catalog"
+                ))
+                .unwrap();
+            let my_tenant = Uuid::new_v4();
+            let found = find_pending_agent(&url, my_tenant, request);
+            assert!(
+                found.is_err(),
+                "another tenant's agent was returned: {:?}",
+                found.ok()
+            );
+            eprintln!(
+                "not found for this tenant, as expected: {}",
+                found.unwrap_err()
+            );
+        });
+        let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// Real PostgreSQL end-to-end test of the approval flow through the same

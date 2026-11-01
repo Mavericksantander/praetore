@@ -38,7 +38,13 @@ fn assert_limit(policy: &Policy, expected: PolicyLimit) {
             Err(PraetoreError::PolicyLimitExceeded { limit, .. }) if limit == expected
         ));
     } else {
-        assert!(Policy::from_json(&json).is_err());
+        assert!(matches!(
+            Policy::from_json(&json),
+            Err(PraetoreError::PolicyLimitExceeded {
+                limit: PolicyLimit::InputBytes,
+                ..
+            })
+        ));
     }
     // Fail closed at evaluation time too: an error, never a decision.
     let agent = AgentKeyPair::from_secret_bytes(&[5; 32]).identity(AgentId::new());
@@ -275,7 +281,15 @@ fn canonical_policy_bytes() {
             max: MAX_JSON_VALUE_BYTES
         })
     ));
-    assert!(Policy::from_json(&serde_json::to_string(&over).unwrap()).is_err());
+    // Its compact JSON is also over 64 KiB, so loading it stops at the raw
+    // input bound before parsing.
+    assert!(matches!(
+        Policy::from_json(&serde_json::to_string(&over).unwrap()),
+        Err(PraetoreError::PolicyLimitExceeded {
+            limit: PolicyLimit::InputBytes,
+            max: MAX_JSON_VALUE_BYTES
+        })
+    ));
 }
 
 #[test]

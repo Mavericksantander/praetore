@@ -176,6 +176,14 @@ or allow, and a matching approval dominates an allow. Matching contributions
 are retained in the decision for explanation and audit. Do not use rule order
 to express priority or to weaken a restrictive result.
 
+The decision's `decided_by` and `reason` name the same rule: the one with the
+highest effective severity (RECOVER > DENY > REQUIRE_APPROVAL > ALLOW, where
+RECOVER is a DENY that carries a recovery obligation). For a RECOVER decision
+that is the rule that produced the obligation, even when a plain DENY rule
+also matched. Between rules of equal severity the earlier-matching rule is
+kept, so the outcome is order-independent but the named rule on a tie is
+not.
+
 If no rule matches, the policy returns DENY. An ALLOW rule is therefore
 required for every allowed case; the engine never treats a missing policy
 match as permission.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Test de verify.sh con un bundle grande. Arma, a partir de bundle/, uno con
-# 1000 recibos (copias de los recibos firmados con otros nombres) y comprueba:
+# Test de verify.sh con un bundle grande. Firma con el hook, en un estado
+# temporal, 1000 recibos distintos, los exporta y comprueba:
 #   1. verify.sh sale con 0. Antes, `ls | head` recibía SIGPIPE y salía con 141.
 #   2. con UN recibo alterado entre los 1000, sale distinto de 0 y nombra ese
 #      recibo.
@@ -10,7 +10,6 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERIFY_SH="${1:-$HERE/verify.sh}"
-SOURCE="$HERE/bundle"
 COUNT=1000
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -19,21 +18,29 @@ failures=0
 pass() { printf 'PASS: %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*"; failures=$((failures + 1)); }
 
-# Copia los metadatos del bundle y $COUNT recibos, recorriendo los firmados.
+# $COUNT recibos distintos, firmados por el hook en un estado temporal. No
+# sirven copias de bundle/: verify.sh rechaza un recibo repetido (mismo
+# evidence_id o mismo agent id y request_id), porque contaría una decisión
+# varias veces.
+cargo build --quiet --release --locked --manifest-path "$HERE/Cargo.toml"
+BIN="$HERE/target/release/praetore-claude-hook"
+mkdir -p "$WORK/proyecto" "$WORK/home"
+PROJECT="$(cd "$WORK/proyecto" && pwd -P)"
+STATE="$WORK/state"
+HOME="$WORK/home" "$BIN" init "$STATE" --root "$PROJECT" --valid-days 30 >/dev/null
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+  printf '{"hook_event_name":"PreToolUse","tool_name":"Read","agent_type":"explorer","tool_use_id":"t%04d","cwd":"%s","tool_input":{"file_path":"%s/f%04d.txt"}}' \
+    "$i" "$PROJECT" "$PROJECT" "$i" | "$BIN" hook "$STATE" >/dev/null
+  i=$((i + 1))
+done
+# Un directorio de nombre largo: el listado de nombres debe pasar de 64 KiB,
+# el buffer de un pipe, para que `ls | head` hubiera recibido SIGPIPE.
+SIGNED="$WORK/bundle-firmado-con-mil-recibos-distintos-y-nombres-largos"
+"$BIN" export "$STATE" "$SIGNED" >/dev/null
+
 make_bundle() {
-  local out="$1" i=0 n
-  mkdir -p "$out/evidence"
-  cp "$SOURCE/attester-public-key.hex" "$SOURCE/issuer-pins.jsonl" \
-    "$SOURCE/policy.json" "$SOURCE/index.json" "$out/"
-  shopt -s nullglob
-  local signed=("$SOURCE"/evidence/*.json)
-  shopt -u nullglob
-  n=${#signed[@]}
-  [ "$n" -gt 0 ] || { echo "no hay recibos en $SOURCE/evidence" >&2; exit 2; }
-  while [ "$i" -lt "$COUNT" ]; do
-    cp "${signed[$((i % n))]}" "$(printf '%s/evidence/r%04d-%s' "$out" "$i" "$(basename "${signed[$((i % n))]}")")"
-    i=$((i + 1))
-  done
+  cp -R "$SIGNED" "$1"
 }
 
 run_verify() {
@@ -45,11 +52,13 @@ run_verify() {
   echo "$rc"
 }
 
-make_bundle "$WORK/good"
-listing=$(printf '%s\n' "$WORK/good"/evidence/*.json | wc -c | tr -d ' ')
+GOOD="$WORK/good-bundle-de-mil-recibos-distintos-con-nombres-largos"
+make_bundle "$GOOD"
+listing=$(printf '%s\n' "$GOOD"/evidence/*.json | wc -c | tr -d ' ')
 echo "bundle con $COUNT recibos ($listing bytes de nombres; el buffer de un pipe es 64 KiB)"
+[ "$listing" -gt 65536 ] || fail "el listado tiene $listing bytes: no pasa de 64 KiB"
 
-rc=$(run_verify "$WORK/good" "$WORK/good.log")
+rc=$(run_verify "$GOOD" "$WORK/good.log")
 if [ "$rc" -eq 0 ] && grep -q "OK: $COUNT recibos verificados" "$WORK/good.log"; then
   pass "$COUNT recibos válidos: exit 0"
 else
@@ -58,7 +67,7 @@ else
 fi
 
 make_bundle "$WORK/tampered"
-victim="$(printf '%s/evidence/r%04d-' "$WORK/tampered" 737)"
+victim="$(printf '%s/evidence/%04d-' "$WORK/tampered" 737)"
 victim=$(echo "$victim"*)
 python3 - "$victim" <<'PY'
 import sys

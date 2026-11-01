@@ -6,6 +6,7 @@ members = [
     "crates/praetore-verify",
     "crates/praetore-python",
     "crates/praetore-replay-postgres",
+    "crates/praetore-sandbox-fs",
     "crates/praetore-gateway",
     "crates/praetore-gateway-service",
     "crates/praetore-cli",

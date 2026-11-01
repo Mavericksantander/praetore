@@ -149,7 +149,7 @@ impl Action {
         }
 
         let parameter_bytes = validate_json_value(&self.parameters)
-            .map_err(|message| PraetoreError::InvalidRequest(message.into()))?;
+            .map_err(|error| PraetoreError::InvalidRequest(error.to_string()))?;
         if parameter_bytes > MAX_JSON_VALUE_BYTES {
             return Err(PraetoreError::InvalidRequest(
                 "action parameters exceed maximum size".into(),

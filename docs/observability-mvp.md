@@ -45,7 +45,7 @@ to PostgreSQL from the browser.
 
 Apply migrations in numeric order through
 `0008_tenant_row_level_security.sql`.
-Grant the service role schema usage and SELECT only on the journal identity,
+Grant the service role schema usage and SELECT only on the tenant, journal identity,
 digest, status, evidence, and timestamp columns, plus event identity/status/
 timestamp/sequence columns. Do not grant it access to `output_json`; output availability
 is derived from the journal's enforced state/output constraint. The reader
@@ -54,6 +54,11 @@ uses explicit read-only repeatable-read transactions for list/detail queries.
 The service code contains no mutation SQL. PostgreSQL ownership and superuser
 roles can override database controls, so the process must not use an owner,
 superuser, or role with write grants.
+At startup the service runs `verify_runtime_role` on its connection and
+refuses to start if the role is an owner, superuser, `BYPASSRLS`, can
+CREATE in `praetore`, holds DELETE/TRUNCATE/UPDATE/TRIGGER/REFERENCES, or
+if triggers or row-level security could be switched off for the session.
+The check runs once, at startup.
 
 Minimal role grant shape (run as the schema owner; choose login and password
 management out of band):
@@ -62,11 +67,11 @@ management out of band):
 CREATE ROLE praetore_observe LOGIN;
 GRANT USAGE ON SCHEMA praetore TO praetore_observe;
 GRANT SELECT (
-    agent_id, request_id, request_digest, action_digest, authorization_status,
-    execution_status, evidence_json, created_at, updated_at
+    tenant_id, agent_id, request_id, request_digest, action_digest,
+    authorization_status, execution_status, evidence_json, created_at, updated_at
 ) ON praetore.execution_journal TO praetore_observe;
 GRANT SELECT (
-    event_id, agent_id, request_id, from_status, to_status, occurred_at
+    event_id, tenant_id, agent_id, request_id, from_status, to_status, occurred_at
 ) ON praetore.execution_journal_events TO praetore_observe;
 ```
 

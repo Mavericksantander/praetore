@@ -224,7 +224,7 @@ or `unbound_rule` decider, when contributions are present, is one of them
 with the final outcome, which is the strongest contributed one; a
 `default_deny` has no contributions). On combination the decider of the
 higher effective severity (`Recover > Deny > RequireApproval > Allow`) is
-kept; on a tie the earlier-matching rule's.
+kept, together with its `reason`; on a tie the earlier-matching rule's.
 
 These checks catch internally inconsistent receipts only. A `rule` decider on
 a decision with no contributions, or any fully consistent rewrite of outcome,
