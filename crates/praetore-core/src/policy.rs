@@ -74,7 +74,9 @@ impl std::fmt::Display for PolicyLimit {
             Self::ConditionsPerRule => "conditions per rule scope",
             Self::ConditionKeyBytes => "condition key bytes",
             Self::ConditionStringBytes => "condition string bytes",
-            Self::ConditionSetValues => "array values in a condition",
+            Self::ConditionSetValues => {
+                "array elements in a condition's expected value (total across all nested arrays)"
+            }
             Self::ConditionValueDepth => "condition value nesting depth",
             Self::CanonicalBytes => "canonical policy bytes",
             Self::InputBytes => "policy input bytes",

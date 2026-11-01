@@ -268,3 +268,19 @@ fn typed_policy_errors_keep_the_policy_evaluation_code() {
         assert_eq!(error.code(), "POLICY_EVALUATION_FAIL", "{error:?}");
     }
 }
+
+/// The typed error names the cap, and its message states it.
+#[test]
+fn condition_set_values_error_states_the_cap() {
+    assert_eq!(MAX_CONDITION_SET_VALUES, 256);
+    let error = PraetoreError::PolicyLimitExceeded {
+        limit: PolicyLimit::ConditionSetValues,
+        max: MAX_CONDITION_SET_VALUES,
+    };
+    let message = error.to_string();
+    assert!(message.contains("(maximum 256)"), "{message}");
+    assert!(
+        message.contains("total across all nested arrays"),
+        "{message}"
+    );
+}

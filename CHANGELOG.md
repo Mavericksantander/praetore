@@ -33,10 +33,18 @@
     every depth, not only the top-level `In` set. A flat `In` set of 256
     values is still accepted; a policy whose expected value holds more than
     256 array elements in total is now rejected with
-    `PolicyLimitExceeded { ConditionSetValues }`.
-  - The `Display` text of `PolicyLimit::ConditionSetValues` is now
-    "array values in a condition". Messages for integral floats outside the
-    safe range now say "JSON integer exceeds interoperable safe range".
+    `PolicyLimitExceeded { limit: ConditionSetValues, max: 256 }`, shown as
+    "policy limit exceeded: array elements in a condition's expected value
+    (total across all nested arrays) (maximum 256)".
+  - **Limit:** at most 256 array elements per condition, counted as one total
+    over every array in its expected value (the `expected` array itself and
+    arrays nested in arrays or objects, at any depth). Elements are counted,
+    not leaves: `[[]]` counts 1, `[[0]]` counts 2; object keys do not count;
+    the cap is per condition, so two conditions of 256 in one rule are
+    accepted. Only `Exact` and `In` can hold such values. No policy in this
+    repository is affected.
+  - Messages for integral floats outside the safe range now say "JSON
+    integer exceeds interoperable safe range".
 
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
