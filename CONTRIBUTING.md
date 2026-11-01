@@ -77,6 +77,18 @@ PRAETORE_TEST_JOURNAL_RESTART_PHASE=before cargo test -p praetore-replay-postgre
 PRAETORE_TEST_JOURNAL_RESTART_PHASE=after cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_journal_survives_server_restart_without_automatic_dispatch
 ```
 
+The bulk run can use the default parallel test threads. Tests share one
+cluster: a test that changes the shared database's `praetore` schema runs
+itself in a child process against its own scratch database
+(`in_own_scratch_database`), and a test that grants a cluster-wide role
+(`pg_read_all_data`, `pg_write_all_data`) holds `CLUSTER_WIDE_GRANTS`
+exclusively until it revokes it, while every runtime-role check takes it
+shared. Keep new tests to that rule: per-test roles (`TestRole`) and
+databases (`ScratchDatabase`), and cleanup on drop. Also skip
+`postgres_apd_and_migrations_survive_restart` (a staged restart test) and
+`postgres_runtime_role_must_not_own_or_bypass_the_schema`, which must log in
+as `postgres` (see the CI job).
+
 To refresh the standalone fuzzer lockfile when its manifest changes, run
 `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`, then audit and fuzz
 the resulting locked dependency graph.

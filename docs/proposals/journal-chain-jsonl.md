@@ -73,6 +73,26 @@ trigger), signed with the evidence attester key that the binary passes in
   against the attester pin, `record_id` unique). With `--database-journal
   JSONL` (verified too) or `--expected-database-head HEX`, a tenant chain
   must carry a matching reference (`JOURNAL_HEAD_MISMATCH` otherwise).
+- **Attester key rotation.** Records and receipts keep the signature of the
+  key that was current when they were written; nothing is re-signed (the
+  table is append-only). `praetore journal-export` and `praetore-verify
+  journal` accept `--attester-pin` more than once (up to 16 keys). Each
+  line is checked against the pinned key whose key id it names (`key_id` of
+  a record, `attester_key_id` of a receipt); a line signed by a key outside
+  the set fails, naming that key. After a rotation, pass the retired key's
+  pin together with the current one: with only the current pin, every
+  export of a database adopted before the rotation fails
+  (`journal-export --tenant` reads the database chain to reference its
+  head), and so does `praetore-verify` on the database chain or with
+  `--database-journal`. A tenant chain file checked alone needs only the
+  keys that signed its receipts: its reference line is not signed and
+  proves nothing without the database chain. The head of a chain does not
+  depend on which pins were given. Pinning a retired key keeps accepting
+  everything it signed, including after a compromise; see
+  `docs/operations.md`.
+- **`--policy`** applies to receipts. With a database chain, which has no
+  policy digest to compare, `praetore-verify journal --policy` fails with
+  `INVALID_REQUEST` instead of reporting `policy_verified: true`.
 - **Compatibility.** Chains without storage records or references are
   unchanged and verify as before. Verifiers older than this extension refuse
   chains that contain `record` or `database_head` lines (`INVALID_REQUEST`):

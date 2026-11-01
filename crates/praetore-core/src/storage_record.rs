@@ -198,7 +198,10 @@ impl StorageRecord {
         let payload = self.payload();
         payload.validate()?;
         if self.key_id != attester_key_id(attester) {
-            return Err(record_error("signed by another key"));
+            return Err(PraetoreError::EvidenceError(format!(
+                "storage record: signed by attester key {}, not by a pinned key",
+                self.key_id
+            )));
         }
         let bytes = payload.canonical_bytes()?;
         if !is_lower_hex(&self.record_hash, 64)

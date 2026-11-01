@@ -238,6 +238,11 @@ pub struct MigrationOptions {
     /// Default-privilege entries the operator trusts, as
     /// `role:*:objtype` (`PRAETORE_TRUSTED_DEFAULT_PRIVILEGES`).
     pub trusted_default_privileges: Vec<String>,
+    /// The role that must own the `praetore` schema, by exact name
+    /// (`PRAETORE_SCHEMA_OWNER`). When set, migrating refuses a schema owned
+    /// by another role and, when there is no schema yet, a migrating role
+    /// with another name (the schema it would create would be its own).
+    pub schema_owner: Option<String>,
 }
 
 impl std::fmt::Debug for MigrationOptions {
@@ -254,6 +259,7 @@ impl std::fmt::Debug for MigrationOptions {
                 "trusted_default_privileges",
                 &self.trusted_default_privileges,
             )
+            .field("schema_owner", &self.schema_owner)
             .finish()
     }
 }
@@ -285,6 +291,17 @@ impl MigrationOptions {
     /// Environment variable for `trusted_default_privileges`
     /// (semicolon-separated `role:*:objtype`).
     pub const TRUSTED_DEFAULT_PRIVILEGES_ENV: &'static str = "PRAETORE_TRUSTED_DEFAULT_PRIVILEGES";
+
+    /// Environment variable for `schema_owner` (one exact role name).
+    pub const SCHEMA_OWNER_ENV: &'static str = crate::RuntimeRoleOptions::SCHEMA_OWNER_ENV;
+
+    /// `PRAETORE_SCHEMA_OWNER`: trimmed; unset or empty is `None`.
+    pub fn parse_schema_owner(value: Option<&str>) -> Option<String> {
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
 
     /// Semicolon-separated entries, trimmed; empty entries are ignored.
     pub fn parse_list(value: &str) -> Vec<String> {
@@ -1707,6 +1724,33 @@ fn environment_problems(
     .map(|function| function.oid)
     .collect();
     let mut problems = Vec::new();
+    if let Some(expected) = &options.schema_owner {
+        match crate::connection::praetore_schema_owner(transaction)? {
+            Some(actual) if actual != *expected => problems.push(format!(
+                "schema praetore is owned by {actual}, but {} is {expected}",
+                MigrationOptions::SCHEMA_OWNER_ENV
+            )),
+            Some(_) => {}
+            None => {
+                let migrator: String = transaction
+                    .query_one("SELECT CURRENT_USER::pg_catalog.text", &[])?
+                    .get(0);
+                if migrator != *expected {
+                    problems.push(format!(
+                        "schema praetore does not exist and would be created owned by the \
+                         migrating role {migrator}, but {} is {expected}",
+                        MigrationOptions::SCHEMA_OWNER_ENV
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(objects) = crate::connection::extension_objects(transaction)? {
+        problems.push(format!(
+            "extension objects are in schema praetore, which only its migrations may \
+             populate: {objects}"
+        ));
+    }
     for status in event_trigger_statuses(transaction, &options.trusted_event_triggers)? {
         if let Some(problem) = status.problem {
             problems.push(problem);

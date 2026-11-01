@@ -281,6 +281,8 @@ jobs:
             "--bin praetore journal_export::tests::postgres_export_as_runtime_role_is_confined_by_row_level_security" \
             "--bin praetore journal_export::tests::postgres_export_orders_by_created_at_then_request_id_then_agent_id" \
             "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end" \
+            "--test journal_export_postgres postgres_cli_journal_export_after_attester_key_rotation" \
+            "--test journal_export_postgres postgres_cli_run_reports_a_port_in_use" \
             "--bin praetore journal_export::tests::postgres_database_export_and_tenant_reference" \
             "--bin praetore tests::postgres_find_pending_agent_ignores_hostile_search_path"; do
             read -r flag target name <<<"$test"
@@ -361,6 +363,8 @@ jobs:
             postgres_migrations_adoption_writes_a_signed_append_only_storage_record \
             postgres_migrations_adoption_without_signer_is_refused \
             postgres_migrations_trusted_event_triggers_allowlist \
+            postgres_extension_objects_in_praetore_are_refused \
+            postgres_schema_owner_is_pinned_by_praetore_schema_owner \
             postgres_migrations_trusted_default_privileges_allowlist \
             postgres_runtime_role_refuses_foreign_dependencies \
             postgres_documented_observe_grant_supports_list \

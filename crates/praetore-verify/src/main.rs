@@ -5,7 +5,8 @@ use praetore_core::{
     evidence::Evidence,
     identity::{AgentIdentity, VerifiedPublicKey},
     journal_chain::{
-        ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES, verify_journal,
+        ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES,
+        verify_journal_with_attesters,
     },
     policy::RecordedPolicy,
 };
@@ -63,7 +64,9 @@ enum Command {
     },
     Journal {
         journal: PathBuf,
-        attester_pin: PathBuf,
+        /// One or more pins (repeated `--attester-pin`): the retired and the
+        /// current attester key across a rotation.
+        attester_pins: Vec<PathBuf>,
         expected_head: Option<String>,
         policy: Option<PathBuf>,
         database_journal: Option<PathBuf>,
@@ -90,7 +93,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (written before G7) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (written before G7) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. --attester-pin may be repeated (up to 16 keys) for a chain that spans an attester key rotation: each entry must be signed by the pinned key its key id names, so pin the retired key as well as the current one. --policy applies to receipts; with a database journal it fails with INVALID_REQUEST. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -170,6 +173,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
     let mut values = BTreeMap::<String, Option<String>>::new();
     let mut format = OutputFormat::Text;
     let mut format_seen = false;
+    let mut journal_pins = Vec::new();
     let mut index = 1;
 
     while index < args.len() {
@@ -194,6 +198,16 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             let value = args.get(index).ok_or_else(CliError::usage)?.clone();
             if value.starts_with("--") {
                 return Err(CliError::usage());
+            }
+            // `journal` takes several attester pins (a chain that spans a
+            // key rotation); every other flag is given at most once.
+            if command_name == "journal" && flag == "--attester-pin" {
+                if journal_pins.len() == MAX_ATTESTER_PINS {
+                    return Err(CliError::usage());
+                }
+                journal_pins.push(PathBuf::from(value));
+                index += 1;
+                continue;
             }
             if values.insert(flag.clone(), Some(value)).is_some() {
                 return Err(CliError::usage());
@@ -277,7 +291,11 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             }
             Command::Journal {
                 journal: path("--journal")?,
-                attester_pin: path("--attester-pin")?,
+                attester_pins: if journal_pins.is_empty() {
+                    return Err(CliError::usage());
+                } else {
+                    journal_pins
+                },
                 expected_head: match values.get("--expected-head") {
                     None => None,
                     Some(Some(value)) => Some(value.clone()),
@@ -466,7 +484,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
         }
         Command::Journal {
             journal,
-            attester_pin,
+            attester_pins,
             expected_head,
             policy,
             database_journal,
@@ -481,15 +499,16 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 })
                 .transpose()?;
             let policy = policy.as_deref().map(read_policy).transpose()?;
-            let attester = read_attester_pin(&attester_pin)?;
+            let attesters = read_attester_pins(&attester_pins)?;
             let expected_database = match (&database_journal, &expected_database_head) {
                 (Some(path), _) => {
                     let text = read_limited_to(path, MAX_CHAIN_BYTES)?;
                     let summary =
-                        verify_journal(&text, &attester, None, None, None).map_err(|error| {
-                            eprintln!("database journal: {error}");
-                            CliError { code: error.code() }
-                        })?;
+                        verify_journal_with_attesters(&text, &attesters, None, None, None)
+                            .map_err(|error| {
+                                eprintln!("database journal: {error}");
+                                CliError { code: error.code() }
+                            })?;
                     if summary.kind != JournalKind::Database {
                         eprintln!("database journal: not a database journal");
                         return Err(CliError {
@@ -510,9 +529,9 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 (None, None) => None,
             };
             let text = read_limited_to(&journal, MAX_CHAIN_BYTES)?;
-            let summary = verify_journal(
+            let summary = verify_journal_with_attesters(
                 &text,
-                &attester,
+                &attesters,
                 policy.as_ref(),
                 expected_head.as_ref(),
                 expected_database.as_ref(),
@@ -668,6 +687,25 @@ fn read_attester_pin(path: &Path) -> Result<VerifiedPublicKey, CliError> {
     VerifiedPublicKey::from_bytes(&key).map_err(|_| CliError {
         code: "TRUST_STORE_FAIL",
     })
+}
+
+/// Most attester pins one `journal` run accepts.
+const MAX_ATTESTER_PINS: usize = 16;
+
+/// Reads every pin; the same key given twice is a trust-store error.
+fn read_attester_pins(paths: &[PathBuf]) -> Result<Vec<VerifiedPublicKey>, CliError> {
+    let mut keys: Vec<VerifiedPublicKey> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let key = read_attester_pin(path)?;
+        if keys.contains(&key) {
+            eprintln!("attester pin {} repeats a key", path.display());
+            return Err(CliError {
+                code: "TRUST_STORE_FAIL",
+            });
+        }
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 fn read_issuer_pins(path: &Path) -> Result<Vec<TrustedAuthorityIssuer>, CliError> {

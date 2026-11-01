@@ -228,6 +228,11 @@ fn migration_options()
         trusted_default_privileges: MigrationOptions::parse_list(&env(
             MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV,
         )),
+        schema_owner: MigrationOptions::parse_schema_owner(
+            std::env::var(MigrationOptions::SCHEMA_OWNER_ENV)
+                .ok()
+                .as_deref(),
+        ),
     };
     praetore_replay_postgres::parse_trusted_default_privileges(
         &options.trusted_default_privileges,
@@ -301,6 +306,13 @@ fn runtime_role_options()
             trusted_security_definer = ?options.trusted_security_definer(),
             "runtime role check relaxed explicitly"
         );
+    }
+    match options.schema_owner() {
+        Some(owner) => tracing::info!(schema_owner = owner, "praetore schema owner is pinned"),
+        None => tracing::warn!(
+            "PRAETORE_SCHEMA_OWNER is not set: the runtime accepts whichever role owns the \
+             praetore schema (set it in production)"
+        ),
     }
     Ok(options)
 }

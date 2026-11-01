@@ -151,6 +151,49 @@
   5. Pin the new digest (HighAssurance `policy_digest`). Keep the format 1
      document: receipts that recorded its digest verify only against it
      (`praetore-verify --policy old-policy.json`).
+- **Journal export across an attester key rotation (v0.3.2 follow-up
+  B5-5).** `praetore journal-export` and `praetore-verify journal` accept
+  `--attester-pin` more than once (up to 16 keys); each receipt and storage
+  record is checked against the pinned key its key id names, and nothing is
+  re-signed. A database adopted with a retired key exports and verifies
+  again with the retired and the current pin; with only the current pin the
+  export fails and names the key that signed the adoption record. New
+  library API: `ChainExporter::with_attesters` and
+  `journal_chain::verify_journal_with_attesters`; `export`,
+  `export_with_database_head` and `export_storage_records` of the CLI take
+  a slice of keys.
+- **`praetore-verify journal --policy` on a database chain fails (B5-4)**
+  with `INVALID_REQUEST` (`ChainError::PolicyNotApplicable`) instead of
+  reporting `policy_verified: true` with nothing compared. **Breaking
+  (API):** new `ChainError` variant.
+- **Extension objects in `praetore` are refused (B5-1).** The runtime check
+  (`RuntimeRoleError::ExtensionObjects`) and the migration runner
+  (`UnsafeDatabase`) refuse an extension installed in `praetore` and any
+  `praetore` object that belongs to an extension, which a role with CREATE
+  on the database can install since PostgreSQL 13. **Breaking (API):** new
+  `RuntimeRoleError` variants.
+- **`PRAETORE_SCHEMA_OWNER` (B5-2).** Optional exact role name of the
+  `praetore` schema owner. When set, the runtime check
+  (`RuntimeRoleError::UnexpectedSchemaOwner`) and migrating refuse another
+  owner (and, before the schema exists, another migrating role). Read by the
+  gateway, the CLI and `praetore-observe`; the gateway warns while it is
+  unset. Set it in production. New `RuntimeRoleOptions::with_schema_owner`
+  and `MigrationOptions::schema_owner` (a new public field).
+- **Docs (B5-3).** `docs/operations.md` now says that an allowlisted event
+  trigger runs with the privileges of the role executing the migration DDL
+  (unless its function is SECURITY DEFINER), as a test records, not with its
+  function owner's.
+- **`praetore run` reports a port in use** with exit status 1 and the bind
+  error, instead of aborting (SIGABRT) while it dropped its PostgreSQL
+  clients on the async runtime thread.
+- **Tests (B5-6 and an intermittent CI failure).** The full ignored
+  PostgreSQL suite runs in parallel: the fault-injection test runs in its own
+  scratch database, and cluster-wide grants of `pg_read_all_data` /
+  `pg_write_all_data` are serialized with every runtime-role check.
+  `postgres_cli_journal_export_tenant_end_to_end` no longer picks two ports
+  that can coincide, and waits for a gateway that accepts its own token
+  rather than any answer to `/healthz` (two gateways on one port made
+  `praetore demo` get 401 `authentication_required`).
 
 ## 0.3.1 - 2026-11-01
 

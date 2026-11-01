@@ -338,6 +338,28 @@ amenaza: PostgreSQL journal schema", and GHSA-67vm-x598-vhg3). Some managed
 platforms install such state. Each relaxation is an explicit allowlist, off
 by default, logged at startup and reported by `praetore doctor`:
 
+`PRAETORE_SCHEMA_OWNER` (one exact role name, optional) is not a relaxation
+but a pin: the role that must own the `praetore` schema. When it is set,
+`verify_runtime_role` refuses a schema owned by any other role (or no
+schema), and migrating refuses a schema owned by another role or, when there
+is no schema yet, a migrating role with another name (the schema it creates
+is its own). Without it, the runtime check trusts whichever role owns
+`praetore`, and the structure is compared with the migrations only when
+migrating: a role with CREATE on the database that creates and migrates
+`praetore` before the first legitimate migration would pass a runtime-only
+startup (the next legitimate `migrate` refuses it). **Set it in production**,
+in the gateway, the CLI and `praetore-observe`, to the owner role of the
+migration step (the gateway logs a warning while it is unset).
+
+A role with CREATE on the database can, since PostgreSQL 13, install a
+trusted extension (`hstore`, `citext`, `pgcrypto`, ...) into any schema,
+`praetore` included, without CREATE on that schema; the extension's objects
+are then owned by the bootstrap superuser. The migrations create no
+extension objects, so both the runtime check and the migration runner refuse
+an extension installed in `praetore` and any object in `praetore` that
+belongs to an extension (`pg_depend` deptype `e`), naming them. Grant CREATE
+on the database only to the roles that run migrations.
+
 - `PRAETORE_RUNTIME_LOGINS` (comma-separated login roles): the logins allowed
   to be members of `praetore_runtime`. Without it, other login members are
   only reported. **Set it in production**, so that a login added to
@@ -356,8 +378,22 @@ by default, logged at startup and reported by `praetore doctor`:
   if the trigger and its function are owned by superusers, the function is
   not in `praetore`, and neither owner is, belongs to, or has as member the
   `praetore` owner or the migrating role; otherwise migrating fails with an
-  error naming the trigger. A listed event trigger runs with its function
-  owner's privileges during every migration DDL.
+  error naming the trigger. A listed event trigger fires on every migration
+  DDL, in the migrating session. Its function runs with the privileges of
+  the role that executes that DDL (the migrating role, or the `praetore`
+  owner when the runner switches to a NOLOGIN owner group with `SET LOCAL
+  ROLE`), not with its owner's, unless it is `SECURITY DEFINER`, in which
+  case it runs with its owner's. PostgreSQL documents that a function
+  "is to be executed with the privileges of the user that calls it" unless it
+  is `SECURITY DEFINER` (`CREATE FUNCTION`), and its event-trigger chapter
+  names no other identity; the test
+  `postgres_migrations_trusted_event_triggers_allowlist` records
+  `session_user = current_user =` the migrating role for every firing of a
+  superuser-owned trigger function. The check verifies owners only, not
+  what the function calls: list only triggers whose code does not depend on
+  objects that other roles can change (functions of other owners, or
+  unqualified names resolved through a `search_path` with a writable
+  schema), because that code would run with the migrating role's rights.
 - `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES` (semicolon-separated
   `role:*:objtype`, objtype `r`, `S`, `f`, `T` or `n`): global default
   privileges of the `praetore` owner or the migrating role that only revoke
@@ -441,6 +477,19 @@ attester key to decisions made before a given date. An OK therefore proves
 that the authority was valid at the signed decision time only as far as the
 attester key is trusted; if an attester key is retired after compromise,
 treat every receipt it signed as unverified.
+
+Journal exports across an attester key rotation: storage records (such as
+the adoption record of a legacy baseline) and receipts keep the signature of
+the key that was current when they were written, and are never re-signed.
+`praetore journal-export` and `praetore-verify journal` therefore take
+`--attester-pin` more than once; pass the retired key's pin together with the
+current one. With only the current pin, exporting any chain of a database
+adopted before the rotation fails, naming the key that signed the adoption
+record. Pinning a retired key keeps accepting everything it signed. After a
+compromise, treat what that key signed as unverified and do not pin it; the
+export of a database whose adoption record it signed then fails, because
+`journal-export --tenant` verifies that record before it references the
+database head (`docs/proposals/journal-chain-jsonl.md`).
 
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins
