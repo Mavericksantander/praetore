@@ -150,10 +150,15 @@ fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
     .unwrap();
     let evidence = Evidence::from_json(&line["evidence"].to_string()).unwrap();
     assert_eq!(evidence.action.action_type, "safety:hold");
-    assert_eq!(evidence.decision.reason, praetore_core::UNCLASSIFIED_DENY_REASON);
+    assert_eq!(
+        evidence.decision.reason,
+        praetore_core::UNCLASSIFIED_DENY_REASON
+    );
     assert_eq!(
         evidence.decision.decided_by(),
-        Some(&praetore_core::DecidedBy::engine_guard(praetore_core::UNCLASSIFIED_ACTION_GUARD))
+        Some(&praetore_core::DecidedBy::engine_guard(
+            praetore_core::UNCLASSIFIED_ACTION_GUARD
+        ))
     );
     verify_receipts(&s.state).unwrap();
 
