@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.1-rc.1 - 2026-10-31
+
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,
   `aarch64-apple-darwin` and `x86_64-apple-darwin` on every run, runs
   `scripts/mcp-smoke.py` on each (a real allowed and a real denied
