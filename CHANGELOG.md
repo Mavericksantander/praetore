@@ -2,6 +2,91 @@
 
 ## Unreleased
 
+- **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
+  `praetore-core` separates mission actions, which PRÆTORE decides, from
+  safety actions, which the executor of an AI-enabled system runs without
+  waiting for PRÆTORE (for example `safety:halt`, `safety:land`). The new
+  types `MissionAction` and `SafetyAction` are built only by
+  `Policy::classify(action) -> Result<ClassifiedAction>`, and
+  `AuthorizationRequest::new` takes a `MissionAction`, so a safety action
+  cannot be put in a request (compile error E0308, checked by a
+  `compile_fail` doc test). `AuthorizationEngine::evaluate` keeps its
+  signature and re-checks the class against its own policy.
+  `Policy::evaluate` / `evaluate_with_context` take a `&MissionAction`.
+  `AuthorizationRequest` no longer implements `Deserialize`:
+  `AuthorizationRequest::from_json(json, &policy)` classifies the action
+  first and returns `SafetyActionNotGoverned` or `UnclassifiedAction`.
+  New typed errors: `PraetoreError::SafetyActionNotGoverned`
+  (`SAFETY_ACTION_NOT_GOVERNED`), `UnclassifiedAction`
+  (`UNCLASSIFIED_ACTION`), `PolicyFormatUnsupported` and
+  `PolicyActionClassInvalid(ActionClassError)`.
+  `verify_journal` takes an `Option<&RecordedPolicy>`.
+- **Breaking (policy format 2, G7).** A policy needs `"format_version": 2`
+  and an `action_classes` table (`"Mission"` or `"Safety"` per exact
+  `action_type`). `Policy::validate` rejects, with typed errors: a rule on an
+  undeclared action type, a `safety:` type not declared `Safety` (and a
+  `Safety` entry without the prefix), an unprefixed name that contains
+  `safety` (ASCII, any case), and any rule that targets a `Safety` action
+  (this replaces the external lint proposed in SAF-09). Mission action types
+  need no prefix. A format 1 document (no `format_version`) is rejected for
+  evaluation in every mode (`PolicyFormatUnsupported { found: 1 }`).
+  Digests of migrated policies change; the receipt format does not.
+- **Historical verification keeps working.** `RecordedPolicy::from_json`
+  reads format 1 and 2 documents and computes the digest they had; it
+  cannot be evaluated. `praetore-verify evidence|journal --policy` and
+  `policy-digest` (which now also prints `policy_format_version`) use it,
+  as does the hook's `verify`. The committed evidence sets (hook `bundle/`,
+  sets 03, 04 and 05, `examples/verify/`,
+  `examples/third-party-verification/bundle/`) are unchanged and verify
+  against their recorded format 1 documents; `docs/golden/canonical-policy-v1.json`
+  keeps its digest and `canonical-policy-v2.json` is added.
+- **Entry points classify first (G7).** The gateway HTTP API answers a
+  `Safety` action with 422 `safety_action_not_governed` and an undeclared one
+  with 422 `unclassified_action`; the `praetore-mcp` gate (a tool named
+  `safety:*`) and the Claude Code hook refuse them before anything is
+  evaluated, signed, claimed or journaled. Runtime tests per entry point
+  check zero engine calls and zero journal writes, with the journal down,
+  in under 100 ms (`crates/praetore-gateway/tests/safety_actions.rs`, the
+  `g7_` tests in `crates/praetore-mcp/src/gate.rs`,
+  `examples/claude-code-hook/src/tests_g7.rs`, and the PostgreSQL test
+  `postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down`).
+  `scripts/g7-mutation-test.sh` shows they fail when `classify` is removed.
+  Mission actions take the unchanged path: synchronous signing, fail closed.
+  Recording safety actions (SAF-09.5, isolated ingestion) is not
+  implemented.
+- `praetore policy classify --policy <path>` proposes an `action_classes`
+  table for a policy and lists what prevents loading it as format 2. It
+  never writes files. `praetore-core` gains a `test-probe` feature (off by
+  default, enabled only from dev-dependencies) that counts engine calls for
+  tests.
+- Shipped policies are format 2: `praetore-mcp init`, the hook's `init`,
+  `praetore init` and `crates/praetore-cli/examples/policies/*.json`.
+
+  Migration guide:
+
+  ```text
+  # before (format 1)
+  {"id":"p","version":3,"canonical_version":1,"semantics_version":2,"rules":[
+    {"id":"w","action_type":"fs:write_file","effect":"Allow", ...}]}
+
+  # after (format 2)
+  {"format_version":2,"id":"p","version":3,"canonical_version":1,"semantics_version":2,
+   "action_classes":{"fs:write_file":"Mission","safety:halt":"Safety"},
+   "rules":[{"id":"w","action_type":"fs:write_file","effect":"Allow", ...}]}
+  ```
+
+  1. Run `praetore policy classify --policy policy.json` and add the printed
+     `format_version` and `action_classes` to the document.
+  2. Rename any action the executor runs without waiting for PRÆTORE to
+     `safety:<name>`, declare it `Safety` and remove every rule on it.
+  3. Rust callers: `let action = policy.classify(action)?.into_mission()?;`
+     before `AuthorizationRequest::new`, `AuthorizationRequest::from_json(json,
+     &policy)`, `Policy::new(..).with_mission_actions([..])` /
+     `.with_action_class(..)`.
+  4. Pin the new digest (HighAssurance `policy_digest`). Keep the format 1
+     document: receipts that recorded its digest verify only against it
+     (`praetore-verify --policy old-policy.json`).
+
 - **Breaking (journal chain format):** the journal export gains signed
   storage records. Adopting a legacy baseline writes a record signed with
   the evidence attester key into `praetore.storage_records` (migration

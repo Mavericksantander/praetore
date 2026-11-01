@@ -240,9 +240,25 @@ time is only as trustworthy as the attester key that signed it.
 
 ## Writing policy
 
-`DIR/policy.json` is a PRÆTORE v2 policy (see
+`DIR/policy.json` is a PRÆTORE policy, format 2 with semantics v2 (see
 [`docs/policy-language.md`](../../docs/policy-language.md)). The default policy
-has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`.
+has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`,
+and declares the action type `mcp.tools/call` as `Mission` in
+`action_classes`. A home created before G7 has a format 1 policy, which no
+longer loads: add `"format_version": 2` and
+`"action_classes": {"mcp.tools/call": "Mission"}` (`policy check` prints this
+hint). Receipts written before keep verifying against the old document with
+`praetore-verify --policy`.
+
+**Safety actions (G7).** A `tools/call` whose tool name starts with `safety:`
+has that name as its action type. If the policy declares it `Safety`, the
+gate answers `SAFETY_ACTION_NOT_GOVERNED` before path resolution, signing,
+the engine or the receipts journal: no receipt is written. In enforce mode
+the proxy does not forward the call (running safety actions is the
+executor's job on its own path); in observe mode it forwards it, as it
+forwards every call, without a receipt. An undeclared `safety:*` tool is
+refused as `UNCLASSIFIED_ACTION`.
+
 Manage rules with `praetore-mcp policy` instead of editing JSON by hand:
 
 ```sh

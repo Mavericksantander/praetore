@@ -338,7 +338,11 @@ let policy = Policy::new_v2(
                 json!(2),
             )),
     ],
-);
+)
+// Policy format 2: every action type is declared; no rule may name a Safety
+// action.
+.with_mission_actions(["execute_shell", "call_external_api", "write_data", "deploy", "read_data"]);
+policy.validate().expect("valid policy");
 ```
 
 This example does not grant any authority by itself. The authority must also

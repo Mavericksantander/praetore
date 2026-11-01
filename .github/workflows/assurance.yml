@@ -23,6 +23,26 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
+      # G7: shown separately so the log shows each test ran. A renamed or
+      # missing test fails the step (the counts are pinned).
+      - name: G7 safety actions never reach the evaluator (output shown)
+        run: |
+          set -euo pipefail
+          run() {
+            local expected="$1"; shift
+            echo "::group::$*"
+            output="$("$@" 2>&1)" || { echo "$output"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -qE "$expected" <<<"$output" || { echo "::error::expected '$expected' from: $*"; exit 1; }
+          }
+          # compile_fail,E0308: an AuthorizationRequest cannot hold a SafetyAction.
+          run "authorization::AuthorizationRequest \(line [0-9]+\) - compile fail \.\.\. ok" \
+            cargo test --locked -p praetore-core --doc authorization::AuthorizationRequest
+          run "test result: ok\. 12 passed" cargo test --locked -p praetore-core --test action_classes
+          run "test result: ok\. 3 passed" \
+            cargo test --locked -p praetore-gateway --test safety_actions -- --nocapture
+          run "test result: ok\. 4 passed" cargo test --locked -p praetore-mcp --lib g7_ -- --nocapture
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"
@@ -207,6 +227,22 @@ jobs:
       # edit of index.json or of the receipt re-attributes a receipt.
       - name: Per-agent attribution end to end
         run: ./examples/claude-code-hook/test-attribution.sh
+      - name: G7 hook safety-action tests (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_g7 -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 5 passed" <<<"$output" || { echo "::error::the G7 hook tests did not run"; exit 1; }
+
+  g7-mutation:
+    name: G7 mutation test (classify removed from each entry point)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Applies scripts/g7-mutants/*.patch one at a time and requires the G7
+      # runtime tests to fail on every mutant; exits 1 if one survives.
+      - run: ./scripts/g7-mutation-test.sh
 
   replay-postgres:
     name: PostgreSQL replay guard integration
@@ -334,7 +370,8 @@ jobs:
             postgres_apd_illegal_transitions_are_rejected_by_sql \
             postgres_apd_failed_approval_commit_leaves_the_request_pending_and_undispatched \
             postgres_apd_lost_claim_acknowledgement_never_invokes_the_adapter \
-            postgres_apd_parse_record_rejects_forged_apd_rows; do
+            postgres_apd_parse_record_rejects_forged_apd_rows \
+            postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down; do
             echo "::group::$test"
             output="$(cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact "$test" 2>&1)" || { echo "$output"; exit 1; }
             echo "$output"
@@ -542,6 +579,7 @@ jobs:
       - fuzz-smoke
       - python-verify
       - claude-code-hook-example
+      - g7-mutation
       - replay-postgres
       - sbom
       - release-integrity

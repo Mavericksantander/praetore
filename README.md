@@ -424,6 +424,29 @@ code or test that backs it. None of it is a security or production guarantee.
   `Evidence::verify_policy(&Policy)` checks a receipt against a given policy.
   Receipts signed earlier without the field still verify, but
   `verify_policy` rejects them.
+- **Mission and safety actions (G7).** A policy (format 2) classifies every
+  `action_type` in `action_classes` as `Mission` (PRÆTORE decides it; every
+  mission action needs a synchronously signed decision before it runs, fail
+  closed) or `Safety` (the executor of an AI-enabled system runs it without
+  waiting for PRÆTORE, for example `safety:halt`). `Policy::classify` is the
+  only way to build a `MissionAction`, and `AuthorizationRequest.action` is a
+  `MissionAction`, so the engine cannot receive a safety action:
+
+  ```rust
+  let action = policy.classify(action)?.into_mission()?; // SafetyActionNotGoverned for safety:*
+  let request = AuthorizationRequest::new(agent, authority, action)?;
+  ```
+
+  No rule may target a `Safety` action, and a `safety:` name must be declared
+  `Safety` (load-time typed errors). The gateway HTTP API, the
+  `praetore-mcp` gate and the Claude Code hook classify first and answer a
+  safety action with `SAFETY_ACTION_NOT_GOVERNED` before any evaluation,
+  replay claim, journal write or signature. PRÆTORE does not record safety
+  actions yet (SAF-09.5, pending). Format 1 policies are rejected for
+  evaluation; evidence that recorded a format 1 digest still verifies against
+  its format 1 document (`praetore-verify --policy`, `RecordedPolicy`).
+  `praetore policy classify --policy <path>` proposes the table. See
+  [docs/policy-language.md](docs/policy-language.md#action-classes-policy-format-2).
 - **Policy size and complexity limits** ([#21](https://github.com/Mavericksantander/praetore/pull/21)).
   A policy that exceeds any limit is rejected when it loads with the typed
   error `PolicyLimitExceeded`; nothing is skipped or treated as allow.

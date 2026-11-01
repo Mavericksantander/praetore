@@ -65,3 +65,13 @@ pub(crate) mod test_support {
         MissionAction::classified(action)
     }
 }
+
+/// The Rust snippets of the policy documentation run as doc tests, so they
+/// stay in step with the API (G7 changed it).
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/policy-language.md")]
+pub struct PolicyLanguageDocTests;
+
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/crypto-and-policy.md")]
+pub struct CryptoAndPolicyDocTests;

@@ -140,7 +140,14 @@ gateway must also ensure it is acting on the exact request it constructed.
 
 `praetore-gateway::Gateway` accepts only `AuthorizationRequest`, rejects any
 engine whose mode is not `HighAssurance`, and invokes the core engine for each
-call. It checks the returned evidence integrity and HighAssurance metadata.
+call. An `AuthorizationRequest` carries a `MissionAction`, which only
+`Policy::classify` builds (G7), so a safety action cannot reach `execute`.
+`POST /v1/execute` classifies the action against `Gateway::policy()` before
+anything else: a `Safety` action gets 422 `safety_action_not_governed` and an
+undeclared one 422 `unclassified_action`, with no evaluation, replay claim,
+journal write, signature or dispatch, also when the journal is unavailable.
+The gateway does not run or record safety actions; see
+[SAF-09](proposals/SAF-09-safety-actions-break-glass.md#g7-requirements). It checks the returned evidence integrity and HighAssurance metadata.
 Only an evidence decision exactly equal to `ALLOW` can advance to dispatch.
 The action passed to `ActionDispatcher` is the action inside that newly
 produced evidence; the gateway does not accept a second action argument and
