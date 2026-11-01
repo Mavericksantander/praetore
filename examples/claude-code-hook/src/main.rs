@@ -520,17 +520,23 @@ fn absolute(path: &str, cwd: Option<&str>) -> String {
 fn run_hook(directory: &Path) {
     let verdict = read_hook_input()
         .and_then(|input| authorize(directory, &input))
-        .unwrap_or_else(|error| Verdict {
-            outcome: DecisionOutcome::Deny,
-            rule: None,
-            reason: format!("hook error, failing closed: {error}"),
-            not_governed: false,
-        });
+        .unwrap_or_else(fail_closed);
     if verdict.not_governed {
         eprintln!("PRÆTORE: {}", verdict.reason);
     }
     if let Some(output) = hook_output(&verdict) {
         println!("{output}");
+    }
+}
+
+/// Any error denies, including an unreadable `policy.json`: without a policy
+/// no tool call can be classified, `safety:*` included (G7 limit).
+fn fail_closed(error: BoxError) -> Verdict {
+    Verdict {
+        outcome: DecisionOutcome::Deny,
+        rule: None,
+        reason: format!("hook error, failing closed: {error}"),
+        not_governed: false,
     }
 }
 

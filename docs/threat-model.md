@@ -103,6 +103,26 @@ Trust boundaries are explicit:
 | Policy binding | HighAssurance rejects a policy or signed intent whose v2 canonical digest differs from the configured pin | Pin provisioning and anti-rollback storage remain outside the library |
 | Tool enforcement | No guarantee from the library; the caller must place an unavoidable gateway before each protected side effect | Bypass prevention, action-to-effect fidelity, and crash reconciliation belong to the deployment |
 
+### Mission and safety actions (G7): limits
+
+* Classification needs a readable, valid policy. If `policy.json` cannot be
+  read or parsed (missing, not a regular file, invalid JSON, format 1), the
+  Claude Code hook and the `praetore-mcp` gate cannot classify any tool call
+  and refuse all of them, `safety:*` included (fail closed). This is
+  intentional and is not changed by G7.
+* A safety failsafe of an AI-enabled system therefore must not depend on
+  PRÆTORE. It runs outside PRÆTORE's decision loop and must not rely on the
+  hook, the gate or the gateway being available. Routing a safety action
+  through PRÆTORE gives an immediate `SAFETY_ACTION_NOT_GOVERNED` answer only
+  while the policy is loaded; it is not a substitute for the executor's own
+  path.
+* With a loaded policy, a declared `Safety` action is answered before any
+  evaluation, replay claim, journal write or signature, so an unavailable
+  journal does not hold it. `praetore-mcp` forwards it to the wrapped server
+  without a receipt in both modes. PRÆTORE keeps no record of safety actions
+  until a separate ingestion path exists (SAF-09.5).
+* An undeclared `safety:*` action is refused at every entry point.
+
 ## Invariants and traceability
 
 | Invariant / requirement | Enforcing code | Test coverage | Threat |

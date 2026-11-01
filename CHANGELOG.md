@@ -42,9 +42,13 @@
   keeps its digest and `canonical-policy-v2.json` is added.
 - **Entry points classify first (G7).** The gateway HTTP API answers a
   `Safety` action with 422 `safety_action_not_governed` and an undeclared one
-  with 422 `unclassified_action`; the `praetore-mcp` gate (a tool named
-  `safety:*`) and the Claude Code hook refuse them before anything is
-  evaluated, signed, claimed or journaled. Runtime tests per entry point
+  with 422 `unclassified_action`. The `praetore-mcp` gate (a tool named
+  `safety:*`) forwards a declared Safety call to the wrapped server without a
+  receipt, in enforce and observe, and refuses an undeclared one in both
+  modes; the Claude Code hook adds no decision for a Safety call and denies
+  an undeclared one. In every case nothing is evaluated, signed, claimed or
+  journaled. An unreadable `policy.json` still refuses every tool call,
+  `safety:*` included (documented in `docs/threat-model.md`). Runtime tests per entry point
   check zero engine calls and zero journal writes, with the journal down,
   in under 100 ms (`crates/praetore-gateway/tests/safety_actions.rs`, the
   `g7_` tests in `crates/praetore-mcp/src/gate.rs`,

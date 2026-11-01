@@ -187,12 +187,17 @@ write or signature, and an undeclared one with `UNCLASSIFIED_ACTION`:
 | Entry point | Safety action | Undeclared action |
 | --- | --- | --- |
 | Gateway HTTP API (`POST /v1/execute`) | 422 `safety_action_not_governed` | 422 `unclassified_action` |
-| `praetore-mcp` gate (a tool named `safety:*`) | not evaluated, no receipt; enforce does not forward it, observe forwards it without a receipt | refused like an evaluation error |
+| `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe | refused in enforce and observe, nothing forwarded |
 | Claude Code hook (a tool named `safety:*`) | no permission decision from PRÆTORE (the host's own rules apply), nothing signed or appended | denied, without a receipt |
 
 Recording safety actions (SAF-09.5: isolated ingestion with its own process,
 credentials and key) is not implemented; until it is, PRÆTORE keeps no
 record of them.
+
+Classification needs the policy. If `policy.json` cannot be read or parsed,
+the hook and the `praetore-mcp` gate refuse every tool call, `safety:*`
+included. A safety failsafe must therefore not depend on PRÆTORE; see
+[the threat model](threat-model.md#mission-and-safety-actions-g7-limits).
 
 ### Format 1 documents and historical evidence
 

@@ -253,11 +253,12 @@ hint). Receipts written before keep verifying against the old document with
 **Safety actions (G7).** A `tools/call` whose tool name starts with `safety:`
 has that name as its action type. If the policy declares it `Safety`, the
 gate answers `SAFETY_ACTION_NOT_GOVERNED` before path resolution, signing,
-the engine or the receipts journal: no receipt is written. In enforce mode
-the proxy does not forward the call (running safety actions is the
-executor's job on its own path); in observe mode it forwards it, as it
-forwards every call, without a receipt. An undeclared `safety:*` tool is
-refused as `UNCLASSIFIED_ACTION`.
+the engine or the receipts journal, and the proxy forwards the call to the
+wrapped server unchanged and without a receipt, in enforce and in observe
+mode: PRÆTORE decides and signs nothing about it. An undeclared `safety:*`
+tool is refused as `UNCLASSIFIED_ACTION` in both modes and is not forwarded.
+If `policy.json` cannot be read, every call is refused, `safety:*` included
+(see `docs/threat-model.md`).
 
 Manage rules with `praetore-mcp policy` instead of editing JSON by hand:
 

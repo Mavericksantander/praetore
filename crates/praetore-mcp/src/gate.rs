@@ -1246,22 +1246,52 @@ mod tests {
     }
 
     #[test]
-    fn g7_proxy_answers_a_safety_call_without_a_receipt() {
-        let policy_id = "g7-mcp-proxy-safety";
-        let (_temp, home, marker) = g7_home(policy_id);
-        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
-        JOURNAL_APPENDS.with(|appends| appends.set(0));
-        let line = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"safety:halt","arguments":{}}}
+    fn g7_proxy_forwards_a_declared_safety_call_without_a_receipt() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let policy_id = format!("g7-mcp-proxy-safety-{}", mode.as_str());
+            let (_temp, home, marker) = g7_home(&policy_id);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            JOURNAL_APPENDS.with(|appends| appends.set(0));
+            let line = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"safety:halt","arguments":{}}}
 "#;
-        let started = std::time::Instant::now();
-        let out = crate::proxy::handle_client_line(line, Mode::Enforce, "plant", &mut gate);
-        let elapsed = started.elapsed();
-        assert!(out.to_server.is_none(), "enforce does not forward it");
-        let reply = String::from_utf8(out.to_client.unwrap()).unwrap();
-        assert!(reply.contains("SAFETY_ACTION_NOT_GOVERNED"), "{reply}");
-        assert_eq!(praetore_core::probe::engine_calls(policy_id), 0);
-        assert_journal_untouched(&home, &marker);
-        assert!(elapsed < G7_BOUND, "answered in {elapsed:?}");
+            let started = std::time::Instant::now();
+            let out = crate::proxy::handle_client_line(line, mode, "plant", &mut gate);
+            let elapsed = started.elapsed();
+            assert_eq!(
+                out.to_server.as_deref(),
+                Some(&line[..]),
+                "forwarded unchanged"
+            );
+            assert!(out.to_client.is_none());
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.contains("SAFETY_ACTION_NOT_GOVERNED")),
+                "{:?}",
+                out.warnings
+            );
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 0);
+            assert_journal_untouched(&home, &marker);
+            assert!(elapsed < G7_BOUND, "answered in {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn g7_proxy_refuses_an_undeclared_safety_call_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let policy_id = format!("g7-mcp-proxy-unclassified-{}", mode.as_str());
+            let (_temp, home, marker) = g7_home(&policy_id);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            JOURNAL_APPENDS.with(|appends| appends.set(0));
+            let line = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"safety:hold","arguments":{}}}
+"#;
+            let out = crate::proxy::handle_client_line(line, mode, "plant", &mut gate);
+            assert!(out.to_server.is_none(), "{}: not forwarded", mode.as_str());
+            let reply = String::from_utf8(out.to_client.unwrap()).unwrap();
+            assert!(reply.contains("UNCLASSIFIED_ACTION"), "{reply}");
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 0);
+            assert_journal_untouched(&home, &marker);
+        }
     }
 
     #[test]

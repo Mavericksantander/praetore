@@ -42,7 +42,7 @@ jobs:
           run "test result: ok\. 12 passed" cargo test --locked -p praetore-core --test action_classes
           run "test result: ok\. 3 passed" \
             cargo test --locked -p praetore-gateway --test safety_actions -- --nocapture
-          run "test result: ok\. 4 passed" cargo test --locked -p praetore-mcp --lib g7_ -- --nocapture
+          run "test result: ok\. 5 passed" cargo test --locked -p praetore-mcp --lib g7_ -- --nocapture
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"
@@ -232,7 +232,7 @@ jobs:
           set -euo pipefail
           output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_g7 -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
-          grep -q "test result: ok. 5 passed" <<<"$output" || { echo "::error::the G7 hook tests did not run"; exit 1; }
+          grep -q "test result: ok. 6 passed" <<<"$output" || { echo "::error::the G7 hook tests did not run"; exit 1; }
 
   g7-mutation:
     name: G7 mutation test (classify removed from each entry point)

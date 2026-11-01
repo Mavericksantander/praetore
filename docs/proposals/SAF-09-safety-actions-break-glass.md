@@ -15,9 +15,12 @@ Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at e
 > 2. "Safety actions go through the normal path": with G7 they do not. A
 >    `safety:*` action declared `Safety` is answered at the entry point
 >    (gateway HTTP API, `praetore-mcp` gate, the Claude Code hook) with a
->    typed `SAFETY_ACTION_NOT_GOVERNED` refusal, before any evaluation,
+>    typed `SAFETY_ACTION_NOT_GOVERNED` answer, before any evaluation,
 >    replay claim, journal write or signature. PRÆTORE makes no decision about
->    it.
+>    it. The gateway does not dispatch it; `praetore-mcp` forwards it to the
+>    wrapped server without a receipt (enforce and observe, CTO decision);
+>    the hook adds no permission decision. An undeclared `safety:*` action is
+>    refused everywhere.
 >
 > The external lint of §1 is replaced by a load-time error in
 > `Policy::validate`: a rule that targets a `Safety` action makes the whole
@@ -41,9 +44,13 @@ nothing in PRÆTORE changes. Break-glass (§2) is still only this proposal.
   Until it exists, PRÆTORE keeps no record of safety actions: the G7 entry
   points refuse them with `SAFETY_ACTION_NOT_GOVERNED` and write nothing.
 
-What G7 does not do: it does not run, forward or record safety actions, it
-does not decide whether an executor should run one, and it does not change
-how a mission action is decided. A deployment that wants PRÆTORE to stay out
+What G7 does not do: it does not decide or record safety actions (only
+`praetore-mcp`, as a transparent proxy, passes a declared one through to the
+wrapped server), it does not decide whether an executor should run one, and
+it does not change how a mission action is decided. Classification needs a
+readable policy: if `policy.json` cannot be read, the hook and the gate
+refuse every tool call, `safety:*` included. A safety failsafe must not
+depend on PRÆTORE (see `docs/threat-model.md`). A deployment that wants PRÆTORE to stay out
 of a safety action's path must not route that action through PRÆTORE in the
 first place; G7 makes sure that, if it does, the answer is immediate and
 does not depend on the journal.

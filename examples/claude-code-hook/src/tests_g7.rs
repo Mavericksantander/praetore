@@ -149,6 +149,32 @@ fn mission_tool_call_is_evaluated_and_fails_closed_with_the_journal_down() {
     assert_eq!(APPENDS.with(Cell::get), 1);
 }
 
+/// G7 limit: without a readable policy nothing can be classified, so the
+/// hook denies every tool call, `safety:*` included (fail closed).
+#[test]
+fn unreadable_policy_denies_a_safety_tool_call() {
+    for broken in ["not json", "directory", "missing"] {
+        let s = State::new(&format!("unreadable-{}", broken.replace(' ', "-")));
+        let policy = s.state.join(POLICY_FILE);
+        fs::remove_file(&policy).unwrap();
+        match broken {
+            "not json" => fs::write(&policy, "{not a policy").unwrap(),
+            "directory" => fs::create_dir(&policy).unwrap(),
+            _ => {}
+        }
+        let verdict =
+            authorize(&s.state, &s.input("safety:halt", json!({}))).unwrap_or_else(fail_closed);
+        assert!(!verdict.not_governed, "{broken}");
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{broken}");
+        let output = hook_output(&verdict).expect("a deny decision");
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{broken}"
+        );
+        s.assert_nothing_recorded();
+    }
+}
+
 #[test]
 fn tool_mapping_agrees_with_action_type_of() {
     for tool in [

@@ -327,26 +327,29 @@ fn decide(
         .and_then(Value::as_str)
         .map_or_else(|| "?".to_owned(), display_safe);
     match evaluator.evaluate(server, &call.params) {
-        // G7: a declared safety action is not governed by PRÆTORE. It was not
-        // evaluated, signed or recorded. praetore-mcp does not forward it in
-        // enforce mode (it is not this proxy's to run); observe mode forwards
-        // every call.
-        Err(error @ GateError::SafetyActionNotGoverned { .. }) => match mode {
-            Mode::Enforce => {
-                warnings.push(format!(
-                    "praetore-mcp: {server}/{tool}: {error}; call not forwarded (enforce)"
-                ));
-                CallDecision::Block(format!(
-                    "PRÆTORE does not govern safety actions, so this proxy did not forward it: {error}"
-                ))
-            }
-            Mode::Observe => {
-                warnings.push(format!(
-                    "praetore-mcp: observe: {server}/{tool}: {error}; forwarded WITHOUT a receipt"
-                ));
-                CallDecision::Forward
-            }
-        },
+        // G7 (CTO decision): a safety action that the policy declares Safety is
+        // not governed by PRÆTORE. It was not evaluated, signed or recorded,
+        // and it is forwarded to the wrapped server without a receipt in both
+        // modes; its record is left to a separate ingestion path.
+        Err(error @ GateError::SafetyActionNotGoverned { .. }) => {
+            warnings.push(format!(
+                "praetore-mcp: {server}/{tool}: {error}; forwarded WITHOUT a receipt ({})",
+                mode.as_str()
+            ));
+            CallDecision::Forward
+        }
+        // An action type the policy does not declare (for example an
+        // undeclared `safety:*` tool) is refused in both modes: it cannot be
+        // classified, so it is neither decided nor passed through.
+        Err(error @ GateError::UnclassifiedAction { .. }) => {
+            warnings.push(format!(
+                "praetore-mcp: {server}/{tool}: {error}; call REFUSED ({})",
+                mode.as_str()
+            ));
+            CallDecision::Block(format!(
+                "PRÆTORE refused this tool call because the policy does not classify it: {error}"
+            ))
+        }
         Err(error) => match mode {
             Mode::Enforce => {
                 warnings.push(format!(
