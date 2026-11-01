@@ -122,18 +122,80 @@ fn safety_action_gets_no_decision_and_no_receipt_with_the_journal_down() {
     }
 }
 
+/// G7: an undeclared `safety:` tool is refused by the engine with a signed
+/// DENY (reason `unclassified`) that the hook appends and `verify` accepts.
+/// No policy rule is evaluated. The model sees the same text as for any
+/// DENY with a receipt.
 #[test]
-fn undeclared_safety_tool_is_denied_before_evaluation() {
+fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
     let s = State::new("unclassified");
+    fs::remove_dir(s.state.join(RECEIPTS_FILE)).unwrap(); // journal up
     let verdict = authorize(&s.state, &s.input("safety:hold", json!({}))).unwrap();
     assert!(!verdict.not_governed);
     assert_eq!(verdict.outcome, DecisionOutcome::Deny);
-    assert!(
-        verdict.reason.starts_with("UNCLASSIFIED_ACTION"),
-        "{}",
-        verdict.reason
+    assert_eq!(verdict.reason, "unclassified");
+    assert_eq!(probe::engine_calls(&s.policy_id), 1);
+    assert_eq!(
+        probe::policy_evaluations(&s.policy_id),
+        0,
+        "no rule evaluated"
     );
-    s.assert_nothing_recorded();
+    assert_eq!(APPENDS.with(Cell::get), 1);
+
+    let line: Value = serde_json::from_str(
+        fs::read_to_string(s.state.join(RECEIPTS_FILE))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    let evidence = Evidence::from_json(&line["evidence"].to_string()).unwrap();
+    assert_eq!(evidence.action.action_type, "safety:hold");
+    assert_eq!(evidence.decision.reason, "unclassified");
+    assert_eq!(
+        evidence.decision.decided_by(),
+        Some(&praetore_core::DecidedBy::engine_guard(
+            "unclassified_action"
+        ))
+    );
+    verify_receipts(&s.state).unwrap();
+
+    // Same client text as a DENY decided by a rule (here: no capability).
+    let output = hook_output(&verdict).unwrap();
+    let text = output["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "PRÆTORE denied this tool call (evidence {})",
+            evidence.evidence_id
+        )
+    );
+    let ruled = authorize(&s.state, &s.input("Write", json!({"file_path": "/etc/x"}))).unwrap();
+    let ruled_text = hook_output(&ruled).unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(ruled.outcome, DecisionOutcome::Deny);
+    assert!(ruled_text.starts_with("PRÆTORE denied this tool call (evidence "));
+    assert!(!ruled_text.contains("rule"), "{ruled_text}");
+}
+
+/// G7: when the agent key does not match its issued identity, an undeclared
+/// tool call is refused before anything is signed: no receipt.
+#[test]
+fn mismatched_key_leaves_no_unclassified_receipt() {
+    let s = State::new("forged");
+    fs::remove_dir(s.state.join(RECEIPTS_FILE)).unwrap();
+    // The main key no longer matches the main identity.
+    fs::write(
+        s.state.join(AGENTS_DIR).join("main.key"),
+        hex::encode([5u8; 32]),
+    )
+    .unwrap();
+    assert!(authorize(&s.state, &s.input("safety:hold", json!({}))).is_err());
+    assert!(!s.state.join(RECEIPTS_FILE).exists());
+    assert_eq!(probe::engine_calls(&s.policy_id), 0);
 }
 
 /// Control: a mission tool call in the same state reaches the engine and is

@@ -383,6 +383,7 @@ jobs:
             postgres_closed_execution_and_approval_exclude_each_other \
             postgres_transition_v2_function_is_dropped \
             postgres_migrations_0013_database_applies_only_0014 \
+            postgres_g7_unclassified_action_commits_a_signed_deny \
             postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down; do
             echo "::group::$test"
             output="$(cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact "$test" 2>&1)" || { echo "$output"; exit 1; }

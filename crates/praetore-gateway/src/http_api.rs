@@ -11,7 +11,8 @@ use axum::{
     routing::{get, post},
 };
 use praetore_core::{
-    AuthorizationRequest, ErrorKind, PraetoreError, canonical::parse_json_rejecting_duplicates,
+    AuthorizationRequest, ErrorKind, PraetoreError, authorization::ClassifiedRequest,
+    canonical::parse_json_rejecting_duplicates,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -435,12 +436,17 @@ struct ApprovalErrorContext {
 /// and returns the signed receipt; it never retries.
 ///
 /// `POST /v1/execute` accepts the serialized `AuthorizationRequest`. The
-/// gateway returns its signed receipt for every completed policy decision,
-/// including denials and approval requirements. The action is classified
-/// against the engine policy's `action_classes` first (G7): a `Safety`
-/// action gets 422 `safety_action_not_governed` and an undeclared one 422
-/// `unclassified_action`, with no evaluation, replay claim, journal write,
-/// signature or dispatch. Request bodies are size
+/// gateway returns its signed receipt for an allowed decision and for an
+/// approval requirement. Every DENY returns 403 with the same body,
+/// `{"code": "authorization_denied", "authorization": "denied", "execution":
+/// "not_dispatched", "evidence_id": ..., "request_id": ...}`, whatever
+/// decided it; the signed receipt, with the reason, is persisted in the
+/// execution journal. The action is classified against the engine policy's
+/// `action_classes` first (G7): a `Safety` action gets 422
+/// `safety_action_not_governed` with no evaluation, replay claim, journal
+/// write, signature or dispatch; an undeclared one is verified like a
+/// mission request and refused with a signed DENY (engine guard
+/// `unclassified_action`), answered like any other DENY. Request bodies are size
 /// limited and parsed through PRÆTORE's duplicate-key rejecting parser.
 pub fn router(gateway: Arc<Gateway>, auth: ApiAuth) -> Router {
     router_with_options(gateway, auth, HttpOptions::default())
@@ -503,7 +509,7 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     // safety action is answered here, before any replay claim, journal write,
     // signature or dispatch: PRÆTORE makes no decision about it.
     let parsed = match std::str::from_utf8(&body) {
-        Ok(json) => AuthorizationRequest::from_json(json, state.gateway.policy()),
+        Ok(json) => AuthorizationRequest::classify_json(json, state.gateway.policy()),
         Err(_) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid_authorization_request");
         }
@@ -516,9 +522,6 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
                 "safety_action_not_governed",
             );
         }
-        Err(PraetoreError::UnclassifiedAction { .. }) => {
-            return error_response(StatusCode::UNPROCESSABLE_ENTITY, "unclassified_action");
-        }
         Err(_) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid_authorization_request");
         }
@@ -526,7 +529,11 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     // The authority is only verified by the engine; binding the caller to
     // its claimed tenant here keeps one tenant's credential from submitting
     // (and consuming) another tenant's signed request.
-    let Some(request_tenant) = crate::authority_tenant_id(&request.authority) else {
+    let authority = match &request {
+        ClassifiedRequest::Mission(request) => &request.authority,
+        ClassifiedRequest::Unclassified(request) => &request.authority,
+    };
+    let Some(request_tenant) = crate::authority_tenant_id(authority) else {
         return error_response(StatusCode::BAD_REQUEST, "tenant_identity_invalid");
     };
     if let Err(denied) = state.authorize(&headers, &[ApiRole::Agent], Some(request_tenant)) {
@@ -538,7 +545,13 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     let options = state.options;
     let gateway = state.gateway;
 
-    let result = tokio::task::spawn_blocking(move || gateway.execute(request)).await;
+    // G7: an undeclared action type is refused by the engine with a signed
+    // DENY (engine guard `unclassified_action`), committed like a policy DENY.
+    let result = tokio::task::spawn_blocking(move || match request {
+        ClassifiedRequest::Mission(request) => gateway.execute(request),
+        ClassifiedRequest::Unclassified(request) => gateway.refuse_unclassified(request),
+    })
+    .await;
     let receipt = match result {
         Ok(Ok(receipt)) => receipt,
         Ok(Err(error)) => {
@@ -557,7 +570,32 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
         AuthorizationStatus::Denied => StatusCode::FORBIDDEN,
     };
     let execution = receipt.execution;
+    if receipt.authorization == AuthorizationStatus::Denied {
+        // Every DENY gets the same body, whether a policy rule, an engine
+        // guard or an undeclared action type decided it: the client cannot
+        // tell from the response what the policy declares or which rule
+        // matched. The signed receipt, with the real reason, is in the
+        // execution journal.
+        let body = DeniedResponse {
+            code: "authorization_denied",
+            authorization: receipt.authorization,
+            execution,
+            evidence_id: receipt.evidence.evidence_id,
+            request_id: receipt.evidence.request_id,
+        };
+        return with_executed_by(options, execution, (status, Json(body)).into_response());
+    }
     with_executed_by(options, execution, (status, Json(receipt)).into_response())
+}
+
+/// The response to every DENY decision of `POST /v1/execute` (G7).
+#[derive(Serialize)]
+struct DeniedResponse {
+    code: &'static str,
+    authorization: AuthorizationStatus,
+    execution: crate::ExecutionStatus,
+    evidence_id: uuid::Uuid,
+    request_id: uuid::Uuid,
 }
 
 async fn approval_challenge(

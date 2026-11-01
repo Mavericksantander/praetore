@@ -9,7 +9,7 @@ Rust code.
 
 * **observe** (default): every call that the policy classifies is
   forwarded; the decision is only recorded. A call whose action type the
-  policy does not declare (`UNCLASSIFIED_ACTION`, for example an undeclared
+  policy does not declare (a signed `unclassified` DENY, for example an undeclared
   `mcp.tools/call` or a `safety*` tool that is not exactly a declared Safety
   action) is refused in observe too, and a declared Safety call is forwarded
   without a receipt (G7). If the home cannot be loaded at startup (not initialized, or
@@ -262,7 +262,9 @@ gate answers `SAFETY_ACTION_NOT_GOVERNED` before path resolution, signing,
 the engine or the receipts journal, and the proxy forwards the call to the
 wrapped server unchanged and without a receipt, in enforce and in observe
 mode: PRÆTORE decides and signs nothing about it. An undeclared `safety:*`
-tool is refused as `UNCLASSIFIED_ACTION` in both modes and is not forwarded.
+tool is refused in both modes and is not forwarded; the engine leaves a
+signed DENY receipt for it (reason `unclassified`, engine guard
+`unclassified_action`), and the client sees the same text as for any DENY.
 Declaring a tool `Safety` takes it out of governance entirely, and that trust
 rests with the policy author. The name is not bound to a server: a tool
 called `safety:halt` on any wrapped server matches the entry. The stderr
@@ -483,7 +485,7 @@ Things to know:
   a declared Safety call (G7): in a batch with a blocked call it is not
   forwarded either. Do not batch safety calls; send each one on its own
   line.
-* Blocked reply: `{"jsonrpc":"2.0","id":ID,"result":{"content":[{"type":"text","text":"Denied by PRÆTORE policy. Rule: ... Evidence id: ..."}],"isError":true}}`.
+* Blocked reply: `{"jsonrpc":"2.0","id":ID,"result":{"content":[{"type":"text","text":"Denied by PRÆTORE. Evidence id: ..."}],"isError":true}}`. The text is the same for every DENY, whatever decided it (a rule, an engine guard, or an action type the policy does not declare); the rule and reason are written to stderr and to the signed receipt.
 * Client lines are parsed strictly. **Duplicate object keys** (for example two
   `method` members), invalid UTF-8 and invalid JSON are unparseable. Such a
   line could hide a `tools/call` from the proxy while the server still reads

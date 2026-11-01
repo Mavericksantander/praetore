@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use crate::{
-    action::{Action, ClassifiedAction, MissionAction, SafetyAction},
+    action::{Action, ClassifiedAction, MissionAction, SafetyAction, UnclassifiedAction},
     authority::Authority,
     canonical::{
         JsonError, MAX_JSON_DEPTH, MAX_JSON_NODES, MAX_JSON_VALUE_BYTES, canonical_json,
@@ -501,6 +501,43 @@ impl Policy {
             ActionClass::Mission => ClassifiedAction::Mission(MissionAction::classified(action)),
             ActionClass::Safety => ClassifiedAction::Safety(SafetyAction::classified(action)),
         })
+    }
+
+    /// Wraps `action` as an [`UnclassifiedAction`]: an action whose type
+    /// `action_classes` does not declare. Fails when the type is declared
+    /// (`Mission` or `Safety`), when the action is invalid, and when this
+    /// policy is not format 2. The result can only be refused, with a signed
+    /// DENY, by
+    /// [`AuthorizationEngine::refuse_unclassified`](crate::engine::AuthorizationEngine::refuse_unclassified).
+    pub fn unclassified(&self, action: Action) -> Result<UnclassifiedAction> {
+        self.check_format()?;
+        action.validate()?;
+        match self.action_classes.get(&action.action_type) {
+            None => Ok(UnclassifiedAction::unclassified(action)),
+            Some(ActionClass::Safety) => Err(PraetoreError::SafetyActionNotGoverned {
+                action_type: action.action_type,
+            }),
+            Some(ActionClass::Mission) => Err(PraetoreError::InvalidRequest(format!(
+                "action type '{}' is declared Mission; it is not unclassified",
+                action.action_type
+            ))),
+        }
+    }
+
+    /// Re-checks, at refusal time, that `action` is still not declared by
+    /// this policy (it may have been wrapped against another policy).
+    pub(crate) fn require_unclassified(&self, action: &UnclassifiedAction) -> Result<()> {
+        self.check_format()?;
+        match self.action_classes.get(&action.action_type) {
+            None => Ok(()),
+            Some(ActionClass::Safety) => Err(PraetoreError::SafetyActionNotGoverned {
+                action_type: action.action_type.clone(),
+            }),
+            Some(ActionClass::Mission) => Err(PraetoreError::InvalidRequest(format!(
+                "action type '{}' is declared Mission; it is not unclassified",
+                action.action_type
+            ))),
+        }
     }
 
     /// Re-checks, at evaluation time, that `action` is still a declared

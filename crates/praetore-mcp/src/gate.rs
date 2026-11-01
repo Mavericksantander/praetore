@@ -67,6 +67,10 @@ impl Mode {
 #[derive(Debug, Clone)]
 pub struct Verdict {
     pub outcome: DecisionOutcome,
+    /// G7: the engine refused the call because the policy does not declare
+    /// its action type (signed DENY, engine guard `unclassified_action`).
+    /// Refused in both modes.
+    pub unclassified: bool,
     pub evidence_id: Uuid,
     pub rule_ids: Vec<String>,
     pub reason: String,
@@ -1078,12 +1082,24 @@ impl Gate {
 
     /// Evaluates and returns the attested evidence without journaling it.
     pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, GateError> {
-        self.classify_call(server, params)?;
-        let action_type = action_type_of(params);
+        // G7: classify first. A declared Safety call stops here with no
+        // evaluation and no receipt; an unclassified one is refused by the
+        // engine with a signed DENY, without evaluating any rule.
+        let unclassified = match self.classify_call(server, params) {
+            Ok(()) => false,
+            Err(GateError::UnclassifiedAction { .. }) => true,
+            Err(error) => return Err(error),
+        };
+        let action_type = if unclassified {
+            unclassified_action_type(server, params)
+        } else {
+            action_type_of(params)
+        };
         let target = Some(server.to_owned());
         let mut path_check = None;
         let mut inline = build_parameters(server, params, false);
-        if !self.path_keys.is_empty() {
+        // Path arguments are resolved only for calls a rule can match.
+        if !unclassified && !self.path_keys.is_empty() {
             path_check = check_paths(&mut inline, &self.path_keys, &self.path_prefixes);
         }
         let action = Action::new(action_type.clone(), target.clone(), inline)
@@ -1095,20 +1111,47 @@ impl Gate {
             })
             .map_err(|e| format!("{}: {e}", e.code()))?
             .with_capability(CAPABILITY);
+        let failed =
+            |e: praetore_core::PraetoreError| GateError::Failed(format!("{}: {e}", e.code()));
+        if unclassified {
+            let action = self.engine.policy().unclassified(action).map_err(failed)?;
+            let request = self.signed(
+                AuthorizationRequest::new_unclassified(
+                    self.agent.clone(),
+                    self.authority.clone(),
+                    action,
+                )
+                .map_err(failed)?,
+                None,
+            )?;
+            return self.engine.refuse_unclassified(request).map_err(failed);
+        }
         let action = self
             .engine
             .policy()
             .classify(action)
             .and_then(ClassifiedAction::into_mission)
-            .map_err(|e| format!("{}: {e}", e.code()))?;
-        let mut request =
+            .map_err(failed)?;
+        let request = self.signed(
             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
-                .map_err(|e| format!("{}: {e}", e.code()))?
-                .with_context(MODE_CONTEXT_KEY, Value::String(self.mode.as_str().into()))
-                .with_context(
-                    PROXY_CONTEXT_KEY,
-                    Value::String(concat!("praetore-mcp/", env!("CARGO_PKG_VERSION")).into()),
-                );
+                .map_err(failed)?,
+            path_check,
+        )?;
+        self.engine.evaluate(request).map_err(failed)
+    }
+
+    /// Adds the proxy context and signs the v2 intent with the agent key.
+    fn signed<A: praetore_core::RequestAction>(
+        &self,
+        request: AuthorizationRequest<A>,
+        path_check: Option<Value>,
+    ) -> Result<AuthorizationRequest<A>, GateError> {
+        let mut request = request
+            .with_context(MODE_CONTEXT_KEY, Value::String(self.mode.as_str().into()))
+            .with_context(
+                PROXY_CONTEXT_KEY,
+                Value::String(concat!("praetore-mcp/", env!("CARGO_PKG_VERSION")).into()),
+            );
         if let Some(record) = path_check {
             request = request.with_context(PATH_CHECK_CONTEXT_KEY, record);
         }
@@ -1122,11 +1165,33 @@ impl Gate {
                 self.policy_digest.clone(),
             )
             .map_err(|e| format!("{}: {e}", e.code()))?;
-        self.engine
-            .evaluate(request)
-            .map_err(|e| GateError::Failed(format!("{}: {e}", e.code())))
+        Ok(request)
     }
 }
+
+/// Action type recorded for an unclassified call (G7). A `safety*` tool name
+/// that is a valid action type is recorded as itself; one that is not (a
+/// trailing space or tab, for example) as [`UNCLASSIFIED_TOOL_ACTION_TYPE`],
+/// with the raw name in the `tool` parameter. Any other call is
+/// [`ACTION_TYPE`] (a policy that does not declare it).
+fn unclassified_action_type(server: &str, params: &Value) -> String {
+    if !is_safety_named(params) {
+        return ACTION_TYPE.to_owned();
+    }
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match Action::new(name, Some(server.to_owned()), json!({})) {
+        Ok(_) => name.to_owned(),
+        Err(_) => UNCLASSIFIED_TOOL_ACTION_TYPE.to_owned(),
+    }
+}
+
+/// Recorded action type for a `safety*` tool name that is not a valid action
+/// type. Its inner spaces make it impossible to declare in `action_classes`
+/// (printable ASCII only), so it is always unclassified.
+pub const UNCLASSIFIED_TOOL_ACTION_TYPE: &str = "praetore-mcp unclassified tool name";
 
 impl Evaluator for Gate {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
@@ -1139,6 +1204,11 @@ impl Evaluator for Gate {
 pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> Verdict {
     let outcome = evidence.decision.outcome;
     Verdict {
+        unclassified: outcome == DecisionOutcome::Deny
+            && evidence.decision.decided_by()
+                == Some(&praetore_core::DecidedBy::engine_guard(
+                    "unclassified_action",
+                )),
         outcome,
         evidence_id: evidence.evidence_id,
         rule_ids: evidence
@@ -1319,28 +1389,53 @@ mod tests {
 "#;
             let out = crate::proxy::handle_client_line(line, mode, "tools", &mut gate);
             assert!(out.to_server.is_none(), "{}: not forwarded", mode.as_str());
-            let reply = String::from_utf8(out.to_client.unwrap()).unwrap();
-            assert!(reply.contains("UNCLASSIFIED_ACTION"), "{reply}");
-            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 0);
-            assert_journal_untouched(&home, &marker);
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(!reply.to_string().contains("UNCLASSIFIED"), "{reply}");
+            // The engine signs a DENY without evaluating any rule; the
+            // journal is down here, so the append fails (and is refused).
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 1);
+            assert_eq!(praetore_core::probe::policy_evaluations(&policy_id), 0);
+            assert_eq!(JOURNAL_APPENDS.with(|appends| appends.get()), 1);
+            assert_eq!(fs::read(home.receipts_dir()).unwrap(), marker);
         }
     }
 
+    /// G7: an undeclared `safety:*` call gets a signed DENY from the engine,
+    /// reason `unclassified`, engine guard `unclassified_action`, without any
+    /// policy rule being evaluated.
     #[test]
-    fn g7_undeclared_safety_call_is_unclassified() {
+    fn g7_undeclared_safety_call_gets_a_signed_unclassified_deny() {
         let policy_id = "g7-mcp-unclassified";
-        let (_temp, home, marker) = g7_home(policy_id);
+        let (_temp, home, _marker) = g7_home(policy_id);
         let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
-        JOURNAL_APPENDS.with(|appends| appends.set(0));
-        let result = Evaluator::evaluate(&mut gate, "tools", &json!({"name": "safety:hold"}));
+        let evidence = gate
+            .evaluate_evidence("tools", &json!({"name": "safety:hold"}))
+            .unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(evidence.decision.reason, "unclassified");
         assert_eq!(
-            result.err(),
-            Some(GateError::UnclassifiedAction {
-                action_type: "safety:hold".to_owned()
-            })
+            evidence.decision.decided_by(),
+            Some(&praetore_core::DecidedBy::engine_guard(
+                "unclassified_action"
+            ))
         );
-        assert_eq!(praetore_core::probe::engine_calls(policy_id), 0);
-        assert_journal_untouched(&home, &marker);
+        assert_eq!(evidence.action.action_type, "safety:hold");
+        evidence.verify_agent_intent().unwrap();
+        assert!(evidence.attester_signature.is_some());
+        let verdict =
+            Evaluator::evaluate(&mut gate, "tools", &json!({"name": "safety:hold"})).unwrap();
+        assert!(verdict.unclassified);
+        assert_eq!(praetore_core::probe::engine_calls(policy_id), 2);
+        assert_eq!(praetore_core::probe::policy_evaluations(policy_id), 0);
+        // A name that is not a valid action type is recorded under the
+        // fixed unclassified type, with the raw name in `tool`.
+        let evidence = gate
+            .evaluate_evidence("tools", &json!({"name": "safety:halt "}))
+            .unwrap();
+        assert_eq!(evidence.action.action_type, UNCLASSIFIED_TOOL_ACTION_TYPE);
+        assert_eq!(evidence.action.parameters["tool"], "safety:halt ");
+        assert_eq!(evidence.decision.reason, "unclassified");
     }
 
     /// Control: a mission call in the same setup reaches the engine, and the

@@ -6398,6 +6398,70 @@ fn postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down(
     assert_eq!(fixture.adapter.invocation_count(), 0);
 }
 
+/// G7: an undeclared action type is refused with a signed DENY that the
+/// PostgreSQL journal commits atomically with its replay claim, like a
+/// policy DENY; nothing is dispatched.
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_g7_unclassified_action_commits_a_signed_deny() {
+    let fixture = create_postgres_gateway(Uuid::new_v4());
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[72; 32]);
+    let agent = fixture.agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "gateway-test-issuer",
+        vec!["local:write".into()],
+    )
+    .with_validity(test_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+    let action = Action::new(
+        "local:delete_all",
+        Some("persistent-state".into()),
+        json!({}),
+    )
+    .unwrap()
+    .with_capability("local:write");
+    let mut request = AuthorizationRequest::new_unclassified(
+        agent,
+        authority,
+        fixture.policy.unclassified(action).unwrap(),
+    )
+    .unwrap();
+    let now = FixedClock::try_new(TEST_NOW).unwrap().now();
+    request
+        .sign_intent_v2(
+            &fixture.agent_key,
+            "postgres-test-gateway",
+            now,
+            now + Duration::minutes(1),
+            fixture.policy.digest().unwrap(),
+        )
+        .unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *request.agent.id.as_uuid(),
+        request_id: request.request_id,
+    };
+
+    let receipt = fixture
+        .gateway
+        .refuse_unclassified(request.clone())
+        .unwrap();
+
+    assert_eq!(receipt.evidence.decision.outcome, DecisionOutcome::Deny);
+    assert_eq!(receipt.evidence.decision.reason, "unclassified");
+    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(database_journal_count(key), 1);
+    assert_eq!(database_replay_claim_count(key), 1);
+    assert_eq!(fixture.adapter.invocation_count(), 0);
+    let persisted = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(persisted.evidence.decision.reason, "unclassified");
+    // The same request again is a replay.
+    assert!(fixture.gateway.refuse_unclassified(request).is_err());
+    assert_eq!(database_journal_count(key), 1);
+}
+
 /// G7 test helper: declares every action type a rule names as Mission.
 #[allow(dead_code)]
 fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {

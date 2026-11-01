@@ -1,7 +1,8 @@
 use crate::{
     PraetoreError, Result,
+    action::RequestAction,
     authority::Validity,
-    authorization::AuthorizationRequest,
+    authorization::{AuthorizationRequest, UnclassifiedRequest},
     canonical::{decode_lower_hex, parse_json_rejecting_duplicates},
     decision::{DecidedBy, Decision, RecordedDecision},
     evidence::{Evidence, EvidenceAttesterKey},
@@ -922,28 +923,66 @@ impl AuthorizationEngine {
     }
 
     pub fn evaluate(&self, request: AuthorizationRequest) -> Result<Evidence> {
-        self.evaluate_inner(request, None)
-            .map_err(|error| match error {
-                AtomicEvaluationError::Evaluation(error) => error,
-                AtomicEvaluationError::Commit(AuthorizationCommitError::AlreadyCommitted)
-                | AtomicEvaluationError::Commit(AuthorizationCommitError::OrphanedReplayClaim) => {
-                    PraetoreError::ReplayDetected
-                }
-                AtomicEvaluationError::Commit(AuthorizationCommitError::ConflictingRequest) => {
-                    PraetoreError::InvalidRequest(
-                        "authorization identity conflicts with persisted content".into(),
-                    )
-                }
-                AtomicEvaluationError::Commit(AuthorizationCommitError::Unavailable)
-                | AtomicEvaluationError::Commit(AuthorizationCommitError::NotFound) => {
-                    PraetoreError::ReplayGuardUnavailable
-                }
-                AtomicEvaluationError::Commit(AuthorizationCommitError::InvalidRecord) => {
-                    PraetoreError::EvidenceError("persisted authorization record is invalid".into())
-                }
-            })
+        self.evaluate_inner(request, None).map_err(standalone_error)
     }
 
+    /// Refuses a request for an action whose type the policy does not declare
+    /// (G7), with a signed DENY decided by the engine guard
+    /// `unclassified_action` and the reason `unclassified`.
+    ///
+    /// The request is verified exactly as [`Self::evaluate`] verifies a
+    /// mission request before anything is signed: identity, authority,
+    /// issuer pin, intent signature and validity, and in HighAssurance the
+    /// intent window, freshness and the replay claim. A request that fails
+    /// verification returns the same error as on the mission path and no
+    /// evidence. The action is never evaluated against policy rules.
+    pub fn refuse_unclassified(&self, request: UnclassifiedRequest) -> Result<Evidence> {
+        self.evaluate_inner(request, None).map_err(standalone_error)
+    }
+
+    /// Like [`Self::refuse_unclassified`], committing the signed DENY
+    /// atomically with the replay claim, as
+    /// [`Self::evaluate_with_atomic_commit`] does for a mission request.
+    pub fn refuse_unclassified_with_atomic_commit(
+        &self,
+        request: UnclassifiedRequest,
+        commit: &dyn AtomicAuthorizationCommit,
+    ) -> std::result::Result<Evidence, AtomicEvaluationError> {
+        if self.mode != EvaluationMode::HighAssurance {
+            return Err(PraetoreError::InvalidRequest(
+                "atomic authorization commit requires HighAssurance mode".into(),
+            )
+            .into());
+        }
+        self.evaluate_inner(request, Some(commit))
+    }
+}
+
+fn standalone_error(error: AtomicEvaluationError) -> PraetoreError {
+    {
+        match error {
+            AtomicEvaluationError::Evaluation(error) => error,
+            AtomicEvaluationError::Commit(AuthorizationCommitError::AlreadyCommitted)
+            | AtomicEvaluationError::Commit(AuthorizationCommitError::OrphanedReplayClaim) => {
+                PraetoreError::ReplayDetected
+            }
+            AtomicEvaluationError::Commit(AuthorizationCommitError::ConflictingRequest) => {
+                PraetoreError::InvalidRequest(
+                    "authorization identity conflicts with persisted content".into(),
+                )
+            }
+            AtomicEvaluationError::Commit(AuthorizationCommitError::Unavailable)
+            | AtomicEvaluationError::Commit(AuthorizationCommitError::NotFound) => {
+                PraetoreError::ReplayGuardUnavailable
+            }
+            AtomicEvaluationError::Commit(AuthorizationCommitError::InvalidRecord) => {
+                PraetoreError::EvidenceError("persisted authorization record is invalid".into())
+            }
+        }
+    }
+}
+
+impl AuthorizationEngine {
     /// Evaluates a new request and atomically commits its signed HighAssurance
     /// evidence with the replay claim. Unlike [`Self::evaluate`], this path
     /// never uses the configured standalone replay guard.
@@ -961,17 +1000,18 @@ impl AuthorizationEngine {
         self.evaluate_inner(request, Some(commit))
     }
 
-    fn evaluate_inner(
+    fn evaluate_inner<A: RequestAction>(
         &self,
-        request: AuthorizationRequest,
+        request: AuthorizationRequest<A>,
         atomic_commit: Option<&dyn AtomicAuthorizationCommit>,
     ) -> std::result::Result<Evidence, AtomicEvaluationError> {
         #[cfg(feature = "test-probe")]
         crate::probe::record_engine_call(&self.policy.id);
-        // G7: the action must be a declared Mission action of this engine's
-        // policy (it may have been classified against another policy). Checked
+        // G7: a mission action must be a declared Mission action of this
+        // engine's policy, and an unclassified one must still be undeclared
+        // (either may have been built against another policy). Checked
         // before the clock, the replay guard or any signature.
-        self.policy.require_mission(&request.action)?;
+        request.action.check_class(&self.policy)?;
         let now = self.clock.now()?;
         if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
             return Err(PraetoreError::InvalidRequest(
@@ -1126,9 +1166,9 @@ impl AuthorizationEngine {
         Ok(())
     }
 
-    fn validate_high_assurance_request(
+    fn validate_high_assurance_request<A: RequestAction>(
         &self,
-        request: &AuthorizationRequest,
+        request: &AuthorizationRequest<A>,
         now: OffsetDateTime,
     ) -> Result<(
         Option<crate::authorization::AuthorizationIntentV2>,
@@ -1193,15 +1233,15 @@ impl AuthorizationEngine {
         ))
     }
 
-    fn evaluate_request(
+    fn evaluate_request<A: RequestAction>(
         &self,
-        request: &AuthorizationRequest,
+        request: &AuthorizationRequest<A>,
         now: OffsetDateTime,
     ) -> Result<Decision> {
-        self.policy.require_mission(&request.action)?;
+        request.action.check_class(&self.policy)?;
         request.agent.validate()?;
         request.authority.validate()?;
-        request.action.validate()?;
+        request.action.action().validate()?;
 
         if request.agent.id != request.authority.subject {
             return Err(PraetoreError::InvalidRequest(
@@ -1228,7 +1268,7 @@ impl AuthorizationEngine {
                 }
             }
 
-            if request.action.capability.is_none() {
+            if request.action.action().capability.is_none() {
                 return Err(PraetoreError::InvalidRequest(
                     "strict evaluation requires an explicit action capability".into(),
                 ));
@@ -1270,16 +1310,24 @@ impl AuthorizationEngine {
             return Err(PraetoreError::AuthorityExpired);
         }
 
+        // G7: everything above verifies the request; what follows decides.
+        // An unclassified action is never evaluated against policy rules.
+        let Some(action) = request.action.as_mission() else {
+            return Ok(Decision::deny(
+                "unclassified",
+                DecidedBy::engine_guard("unclassified_action"),
+            ));
+        };
+
         for constraint in &request.authority.constraints {
             // The gateway consumes this issuer-signed routing claim separately.
             if constraint.key == "tenant_id" {
                 continue;
             }
             let satisfied = if constraint.key == "target" {
-                request.action.target.as_deref() == Some(constraint.value.as_str())
+                action.target.as_deref() == Some(constraint.value.as_str())
             } else {
-                request
-                    .action
+                action
                     .parameters
                     .get(&constraint.key)
                     .and_then(|v| v.as_str())
@@ -1299,7 +1347,7 @@ impl AuthorizationEngine {
 
         // Fail closed: an action without an explicit capability is never
         // mapped onto its action_type (or any other) grant.
-        let Some(capability) = request.action.capability.as_deref() else {
+        let Some(capability) = action.capability.as_deref() else {
             return Ok(Decision::deny(
                 "action does not declare a required capability",
                 DecidedBy::engine_guard("missing_capability"),
@@ -1315,7 +1363,7 @@ impl AuthorizationEngine {
         let decision = self.policy.evaluate_with_context(
             &request.agent,
             &request.authority,
-            &request.action,
+            action,
             &request.context,
         )?;
 

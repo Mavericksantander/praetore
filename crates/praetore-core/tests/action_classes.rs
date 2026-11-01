@@ -441,3 +441,123 @@ fn the_documented_action_classes_example_loads() {
         Some(&ActionClass::Safety)
     );
 }
+
+struct Strict {
+    engine: AuthorizationEngine,
+    policy: Policy,
+    agent_key: AgentKeyPair,
+    issuer: AgentKeyPair,
+}
+
+fn strict(policy_id: &str) -> Strict {
+    let policy = Policy::new_v2(policy_id, 1, vec![rule("read_data")])
+        .with_mission_actions(["read_data"])
+        .with_action_class("safety:halt", ActionClass::Safety);
+    let issuer = AgentKeyPair::from_secret_bytes(&[21; 32]);
+    let pin = TrustedAuthorityIssuer::new("issuer", issuer.public_key()).unwrap();
+    Strict {
+        engine: AuthorizationEngine::strict(policy.clone(), vec![pin]).unwrap(),
+        policy,
+        agent_key: AgentKeyPair::from_secret_bytes(&[22; 32]),
+        issuer,
+    }
+}
+
+fn unclassified_request(
+    fixture: &Strict,
+    signer: &AgentKeyPair,
+    action_type: &str,
+) -> praetore_core::authorization::UnclassifiedRequest {
+    let agent = fixture.agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(agent.id.clone(), "issuer", vec!["c".into()]);
+    authority.sign_for_agent(signer, &agent).unwrap();
+    let action = fixture.policy.unclassified(action(action_type)).unwrap();
+    let mut request = AuthorizationRequest::new_unclassified(agent, authority, action).unwrap();
+    request.sign_intent(&fixture.agent_key).unwrap();
+    request
+}
+
+/// G7: an undeclared action is refused by the engine with a DENY decided by
+/// the engine guard `unclassified_action`, reason `unclassified`, no rule
+/// contribution.
+#[test]
+fn an_unclassified_action_is_refused_with_an_engine_guard_deny() {
+    let fixture = strict("g7-core-unclassified");
+    for action_type in ["fs:delete", "safety:hold"] {
+        let request = unclassified_request(&fixture, &fixture.issuer, action_type);
+        let evidence = fixture.engine.refuse_unclassified(request).unwrap();
+        assert_eq!(
+            evidence.decision.outcome,
+            praetore_core::DecisionOutcome::Deny
+        );
+        assert_eq!(evidence.decision.reason, "unclassified");
+        assert_eq!(
+            evidence.decision.decided_by(),
+            Some(&praetore_core::DecidedBy::engine_guard(
+                "unclassified_action"
+            ))
+        );
+        assert!(evidence.decision.contributions.is_empty());
+        assert_eq!(evidence.action.action_type, action_type);
+        assert_eq!(
+            evidence.policy_digest.as_deref(),
+            Some(fixture.policy.digest().unwrap().as_str())
+        );
+        evidence.verify_agent_intent().unwrap();
+    }
+}
+
+/// G7: the refusal verifies the request exactly like a mission request: a
+/// forged intent or an authority from an unpinned issuer gets no evidence.
+#[test]
+fn an_unclassified_refusal_verifies_the_request_first() {
+    let fixture = strict("g7-core-unclassified-forged");
+    let mut forged = unclassified_request(&fixture, &fixture.issuer, "fs:delete");
+    forged.context.insert("injected".into(), json!(true));
+    assert!(matches!(
+        fixture.engine.refuse_unclassified(forged),
+        Err(PraetoreError::IntentInvalid)
+    ));
+
+    let rogue = AgentKeyPair::from_secret_bytes(&[23; 32]);
+    let unpinned = unclassified_request(&fixture, &rogue, "fs:delete");
+    assert!(matches!(
+        fixture.engine.refuse_unclassified(unpinned),
+        Err(PraetoreError::AuthorityVerificationFailed | PraetoreError::TrustStoreFailure)
+    ));
+
+    let mut unsigned = unclassified_request(&fixture, &fixture.issuer, "fs:delete");
+    unsigned.agent_signature = None;
+    assert!(fixture.engine.refuse_unclassified(unsigned).is_err());
+}
+
+/// G7: only an undeclared type can be wrapped, and the engine checks again
+/// against its own policy.
+#[test]
+fn only_undeclared_action_types_are_unclassified() {
+    let fixture = strict("g7-core-unclassified-declared");
+    assert!(matches!(
+        fixture.policy.unclassified(action("read_data")),
+        Err(PraetoreError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        fixture.policy.unclassified(action("safety:halt")),
+        Err(PraetoreError::SafetyActionNotGoverned { .. })
+    ));
+    // Wrapped against another policy, declared Mission in the engine's.
+    let other = Policy::new_v2("other", 1, vec![]);
+    let agent = fixture.agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(agent.id.clone(), "issuer", vec!["c".into()]);
+    authority.sign_for_agent(&fixture.issuer, &agent).unwrap();
+    let mut request = AuthorizationRequest::new_unclassified(
+        agent,
+        authority,
+        other.unclassified(action("read_data")).unwrap(),
+    )
+    .unwrap();
+    request.sign_intent(&fixture.agent_key).unwrap();
+    assert!(matches!(
+        fixture.engine.refuse_unclassified(request),
+        Err(PraetoreError::InvalidRequest(_))
+    ));
+}

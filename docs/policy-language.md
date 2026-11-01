@@ -180,19 +180,27 @@ without `action_classes` is rejected with `ActionClassError::MissingTable`.
   `PraetoreError::SafetyActionNotGoverned` (`SAFETY_ACTION_NOT_GOVERNED`).
 * `PraetoreError::UnclassifiedAction` (`UNCLASSIFIED_ACTION`) when the table
   does not declare the action type, including an undeclared `safety:*` type.
+  `Policy::unclassified(action)` then wraps it as an `UnclassifiedAction`,
+  which only `AuthorizationEngine::refuse_unclassified` accepts (in an
+  `AuthorizationRequest<UnclassifiedAction>`): the engine verifies the
+  request exactly like a mission request, evaluates no rule, and signs a
+  `Deny` with reason `unclassified` and
+  `decided_by: {"kind": "engine_guard", "guard": "unclassified_action"}`.
 
 The engine checks again, at evaluation time, that the action is a declared
 `Mission` action of its own policy.
 
 The entry points that accept JSON classify first. A `Safety` action is
-refused with `SAFETY_ACTION_NOT_GOVERNED` before any replay claim, journal
-write or signature, and an undeclared one with `UNCLASSIFIED_ACTION`:
+answered with `SAFETY_ACTION_NOT_GOVERNED` before any replay claim, journal
+write or signature. An undeclared one leaves a signed DENY receipt, recorded
+like a policy DENY on that path, and the client sees the same answer as for
+any DENY:
 
 | Entry point | Safety action | Undeclared action |
 | --- | --- | --- |
-| Gateway HTTP API (`POST /v1/execute`) | 422 `safety_action_not_governed` | 422 `unclassified_action` |
-| `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe (except inside a JSON-RPC batch with a blocked call, which enforce refuses as a whole) | refused in enforce and observe, nothing forwarded; this covers every tool name that starts with `safety` in any ASCII case and is not exactly a declared Safety action, and an undeclared `mcp.tools/call` |
-| Claude Code hook (a tool named `safety:*`) | no permission decision from PRÆTORE (the host's own rules apply), nothing signed or appended | denied, without a receipt |
+| Gateway HTTP API (`POST /v1/execute`) | 422 `safety_action_not_governed` | signed DENY committed to the journal; 403 `authorization_denied`, the same body as every DENY |
+| `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe (except inside a JSON-RPC batch with a blocked call, which enforce refuses as a whole) | signed DENY receipt in the journal; refused in enforce and observe with the same text as every DENY, nothing forwarded; this covers every tool name that starts with `safety` in any ASCII case and is not exactly a declared Safety action (a name that is not a valid action type is recorded as `praetore-mcp unclassified tool name`, with the raw name in `tool`), and an undeclared `mcp.tools/call` |
+| Claude Code hook (a tool named `safety:*`) | no permission decision from PRÆTORE (the host's own rules apply), nothing signed or appended | signed DENY appended to `receipts.jsonl`; denied with the same text as every DENY |
 
 **Trust model.** Declaring an action type `Safety` takes it out of
 PRÆTORE's governance entirely: no rule applies, nothing is evaluated, signed

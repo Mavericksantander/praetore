@@ -233,8 +233,13 @@ fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
     let denied = by_id(&responses, &json!(5));
     assert_eq!(denied["result"]["isError"], true);
     let text = denied["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("Denied by PRÆTORE"), "{text}");
-    assert!(text.contains("deny-delete-file"), "{text}");
+    assert!(
+        text.starts_with("Denied by PRÆTORE. Evidence id: "),
+        "{text}"
+    );
+    // The rule is reported on stderr, not to the client (G7).
+    assert!(!text.contains("deny-delete-file"), "{text}");
+    assert!(stderr.contains("deny-delete-file"), "{stderr}");
 
     assert_eq!(by_id(&responses, &json!("e"))["result"]["isError"], false);
 
@@ -463,11 +468,12 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
     assert!(out.status.success(), "{stderr}");
     let denied = by_id(&responses, &json!(10))["result"].clone();
     assert_eq!(denied["isError"], true);
+    assert!(stderr.contains("deny-delete"), "{stderr}");
     assert!(
         denied["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("deny-delete")
+            .starts_with("Denied by PRÆTORE")
     );
     assert_eq!(by_id(&responses, &json!(11))["result"]["isError"], false);
     let held = by_id(&responses, &json!(12))["result"].clone();
@@ -671,7 +677,8 @@ fn deny_path_prefix_catches_symlinks_into_it_and_unresolvable_paths() {
         assert_eq!(reply["result"]["isError"], refused, "id {id}: {stderr}");
         if refused {
             let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains("deny-outside"), "id {id}: {text}");
+            assert!(text.starts_with("Denied by PRÆTORE"), "id {id}: {text}");
+            assert!(stderr.contains("deny-outside"), "id {id}: {stderr}");
         }
     }
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
@@ -1133,7 +1140,9 @@ fn g7_declared_safety_call_is_forwarded_without_a_receipt_in_both_modes() {
 }
 
 /// G7: a `safety:*` tool that the policy does not declare is refused in both
-/// modes, and nothing reaches the server.
+/// modes, nothing reaches the server, and the engine leaves a signed DENY
+/// receipt (reason `unclassified`) that `praetore-mcp verify` accepts. The
+/// client sees the same text as for any DENY.
 #[test]
 fn g7_undeclared_safety_call_is_refused_in_both_modes() {
     for mode in ["enforce", "observe"] {
@@ -1149,15 +1158,22 @@ fn g7_undeclared_safety_call_is_refused_in_both_modes() {
         assert!(out.status.success(), "{mode}: {stderr}");
         let refused = by_id(&responses, &json!("u"));
         assert_eq!(refused["result"]["isError"], true, "{mode}: {refused}");
+        let text = refused["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
-            refused["result"]["content"][0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("UNCLASSIFIED_ACTION"),
-            "{mode}: {refused}"
+            text.starts_with("Denied by PRÆTORE. Evidence id: "),
+            "{mode}: {text}"
         );
         assert!(!stderr.contains("EXECUTED safety:hold"), "{mode}: {stderr}");
-        assert!(journal(&home).is_empty(), "{mode}");
+        let evidence = journal(&home);
+        assert_eq!(evidence.len(), 1, "{mode}");
+        assert_eq!(evidence[0].action.action_type, "safety:hold");
+        assert_eq!(evidence[0].decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(evidence[0].decision.reason, "unclassified");
+        assert!(text.contains(&evidence[0].evidence_id.to_string()));
+        let verify = verify_cli(&home);
+        let report = String::from_utf8_lossy(&verify.stdout);
+        assert!(verify.status.success(), "{mode}: {report}");
+        assert!(report.contains("1 verified, 0 failed"), "{mode}: {report}");
     }
 }
 
@@ -1192,10 +1208,16 @@ fn g7_safety_named_calls_that_are_not_declared_are_never_forwarded() {
                 .unwrap_or_else(|| panic!("{mode}/{id}: no refusal in {responses:?}"));
             let text = refused.to_string();
             assert!(
-                text.contains("UNCLASSIFIED_ACTION") || text.contains("not forwarded"),
+                text.contains("Denied by PRÆTORE") || text.contains("not forwarded"),
                 "{mode}/{id}: {text}"
             );
-            assert!(journal(&home).is_empty(), "{mode}/{id}");
+            // Any receipt is the engine's signed unclassified DENY.
+            assert!(
+                journal(&home)
+                    .iter()
+                    .all(|e| e.decision.reason == "unclassified"),
+                "{mode}/{id}"
+            );
         }
     }
 }

@@ -399,6 +399,20 @@ fn decide_verdict(
     } else {
         verdict.rule_ids.join(", ")
     };
+    // Every DENY gets the same client-facing text, whatever decided it, so
+    // the client cannot tell from it what the policy declares or which rule
+    // matched. The details go to stderr and to the signed receipt.
+    let denied = || format!("Denied by PRÆTORE. Evidence id: {}", verdict.evidence_id);
+    if verdict.unclassified {
+        // G7: an action type the policy does not declare is refused in both
+        // modes, with its signed DENY receipt.
+        warnings.push(format!(
+            "praetore-mcp: {server}/{tool}: action type not declared in the policy; signed DENY (evidence {}); call REFUSED ({})",
+            verdict.evidence_id,
+            mode.as_str()
+        ));
+        return CallDecision::Block(denied());
+    }
     match (mode, verdict.outcome) {
         (_, DecisionOutcome::Allow) => CallDecision::Forward,
         (Mode::Observe, outcome) => {
@@ -409,10 +423,14 @@ fn decide_verdict(
             ));
             CallDecision::Forward
         }
-        (Mode::Enforce, DecisionOutcome::Deny) => CallDecision::Block(format!(
-            "Denied by PRÆTORE policy. Rule: {rules}. Reason: {}. Evidence id: {}",
-            verdict.reason, verdict.evidence_id
-        )),
+        (Mode::Enforce, DecisionOutcome::Deny) => {
+            warnings.push(format!(
+                "praetore-mcp: {server}/{tool} DENIED by rule {rules}: {} (evidence {})",
+                display_safe(&verdict.reason),
+                verdict.evidence_id
+            ));
+            CallDecision::Block(denied())
+        }
         (Mode::Enforce, DecisionOutcome::RequireApproval) => CallDecision::Block(format!(
             "This tool call requires human approval (not supported by praetore-mcp yet), so it was not executed. Rule: {rules}. Evidence id: {}",
             verdict.evidence_id
@@ -625,6 +643,7 @@ mod tests {
             self.calls.push((server.into(), params.clone()));
             let outcome = self.result.clone()?;
             Ok(Verdict {
+                unclassified: false,
                 outcome,
                 evidence_id: Uuid::nil(),
                 rule_ids: vec!["rule-x".into()],
@@ -725,8 +744,13 @@ mod tests {
         assert_eq!(reply["id"], 7);
         assert_eq!(reply["result"]["isError"], true);
         let text = reply["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("rule-x"));
-        assert!(text.contains(&Uuid::nil().to_string()));
+        // The client-facing text is the same for every DENY (G7); the rule
+        // is reported on stderr only.
+        assert_eq!(
+            text,
+            format!("Denied by PRÆTORE. Evidence id: {}", Uuid::nil())
+        );
+        assert!(out.warnings.iter().any(|w| w.contains("rule-x")));
     }
 
     #[test]
@@ -791,13 +815,8 @@ mod tests {
         let raw = br#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"x"}}"#;
         let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
-        assert_eq!(
-            out,
-            Outcome {
-                warnings: vec![],
-                ..Outcome::default()
-            }
-        );
+        assert!(out.to_server.is_none());
+        assert!(out.to_client.is_none());
     }
 
     #[test]

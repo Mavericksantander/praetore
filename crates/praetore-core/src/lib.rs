@@ -16,7 +16,9 @@ pub mod probe;
 pub mod replay;
 pub mod storage_record;
 
-pub use action::{Action, ClassifiedAction, MissionAction, SafetyAction};
+pub use action::{
+    Action, ClassifiedAction, MissionAction, RequestAction, SafetyAction, UnclassifiedAction,
+};
 pub use authority::{Authority, AuthorityId};
 pub use authorization::{AuthorizationIntentV2, AuthorizationRequest};
 pub use decision::{

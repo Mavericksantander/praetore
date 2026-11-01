@@ -1181,7 +1181,7 @@ fn submit_demo_request(
         Err(_) => println!("{body}"),
     }
     if !status.is_success() {
-        return Err(format!("gateway returned HTTP {status}; review the receipt above").into());
+        return Err(format!("gateway returned HTTP {status}; review the response above (a DENY receipt, with its reason, is in the execution journal)").into());
     }
     if let Ok(receipt) = serde_json::from_str::<serde_json::Value>(&body)
         && receipt["authorization"] == "requires_approval"

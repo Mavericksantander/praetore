@@ -899,6 +899,21 @@ impl DispatchPermit {
     }
 }
 
+fn map_atomic_evaluation_error(error: AtomicEvaluationError) -> GatewayError {
+    match error {
+        AtomicEvaluationError::Evaluation(error) => GatewayError::Authorization(error),
+        AtomicEvaluationError::Commit(error) => GatewayError::Journal(match error {
+            AuthorizationCommitError::AlreadyCommitted => JournalError::AlreadyRecorded,
+            AuthorizationCommitError::ConflictingRequest => JournalError::ConflictingRequest,
+            AuthorizationCommitError::OrphanedReplayClaim => JournalError::OrphanedReplayClaim,
+            AuthorizationCommitError::Unavailable | AuthorizationCommitError::NotFound => {
+                JournalError::Unavailable
+            }
+            AuthorizationCommitError::InvalidRecord => JournalError::InvalidRecord,
+        }),
+    }
+}
+
 /// A synchronous gateway that binds a current authorization result to one
 /// adapter invocation.
 #[derive(Clone)]
@@ -1547,31 +1562,35 @@ impl Gateway {
             .engine
             .evaluate_with_atomic_commit(request, self.journal.as_ref())
             .map_err(map_atomic_evaluation_error)?;
+        self.after_commit(evidence)
+    }
+
+    /// G7: refuses a request whose action type the policy does not declare.
+    /// The engine verifies it like a mission request and commits a signed
+    /// DENY (engine guard `unclassified_action`) with its replay claim; the
+    /// execution is then closed as not dispatched, exactly as for a policy
+    /// DENY. Nothing is dispatched.
+    pub fn refuse_unclassified(
+        &self,
+        request: praetore_core::authorization::UnclassifiedRequest,
+    ) -> Result<GatewayReceipt, GatewayError> {
+        let evidence = self
+            .engine
+            .refuse_unclassified_with_atomic_commit(request, self.journal.as_ref())
+            .map_err(map_atomic_evaluation_error)?;
+        if evidence.decision.outcome != DecisionOutcome::Deny {
+            return Err(GatewayError::InvalidEvidence);
+        }
+        self.after_commit(evidence)
+    }
+
+    fn after_commit(&self, evidence: Evidence) -> Result<GatewayReceipt, GatewayError> {
         if !evidence.is_high_assurance_shape()
             || evidence.evaluation_mode.as_deref() != Some("high_assurance")
             || evidence.policy_digest.is_none()
             || !evidence.verify_integrity()
         {
             return Err(GatewayError::InvalidEvidence);
-        }
-
-        fn map_atomic_evaluation_error(error: AtomicEvaluationError) -> GatewayError {
-            match error {
-                AtomicEvaluationError::Evaluation(error) => GatewayError::Authorization(error),
-                AtomicEvaluationError::Commit(error) => GatewayError::Journal(match error {
-                    AuthorizationCommitError::AlreadyCommitted => JournalError::AlreadyRecorded,
-                    AuthorizationCommitError::ConflictingRequest => {
-                        JournalError::ConflictingRequest
-                    }
-                    AuthorizationCommitError::OrphanedReplayClaim => {
-                        JournalError::OrphanedReplayClaim
-                    }
-                    AuthorizationCommitError::Unavailable | AuthorizationCommitError::NotFound => {
-                        JournalError::Unavailable
-                    }
-                    AuthorizationCommitError::InvalidRecord => JournalError::InvalidRecord,
-                }),
-            }
         }
 
         let key = ExecutionKey {

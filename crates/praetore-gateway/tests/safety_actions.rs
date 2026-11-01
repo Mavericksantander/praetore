@@ -254,6 +254,12 @@ fn validity() -> Validity {
 /// request serialized as JSON. Each test passes its own policy id so the
 /// process-wide probe counters are not shared between tests.
 fn setup(policy_id: &str) -> (Gateway, Probes, Value) {
+    setup_with(policy_id, "demo:set_value")
+}
+
+/// Like [`setup`], with a request signed for `action_type`: a mission
+/// request when the policy declares it, an unclassified one otherwise.
+fn setup_with(policy_id: &str, action_type: &str) -> (Gateway, Probes, Value) {
     let agent_key = AgentKeyPair::from_secret_bytes(&[31; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[32; 32]);
     let agent = agent_key.identity(AgentId::new());
@@ -273,29 +279,46 @@ fn setup(policy_id: &str) -> (Gateway, Probes, Value) {
     .with_mission_actions(["demo:set_value"])
     .with_action_class("safety:halt", ActionClass::Safety)
     .with_action_class("safety:stop_all", ActionClass::Safety);
-    let action = Action::new(
-        "demo:set_value",
-        Some("demo-state".into()),
-        json!({"value": 1}),
-    )
-    .unwrap()
-    .with_capability("demo:write");
-    let mut request = AuthorizationRequest::new(
-        agent,
-        authority,
-        policy.classify(action).unwrap().into_mission().unwrap(),
-    )
-    .unwrap();
+    let action = Action::new(action_type, Some("demo-state".into()), json!({"value": 1}))
+        .unwrap()
+        .with_capability("demo:write");
     let now = OffsetDateTime::parse(NOW, &Rfc3339).unwrap();
-    request
-        .sign_intent_v2(
-            &agent_key,
-            "g7-gateway",
-            now - Duration::seconds(1),
-            now + Duration::minutes(1),
-            policy.digest().unwrap(),
-        )
-        .unwrap();
+    let (issued, expires) = (now - Duration::seconds(1), now + Duration::minutes(1));
+    let body = match policy.classify(action.clone()) {
+        Ok(classified) => {
+            let mut request =
+                AuthorizationRequest::new(agent, authority, classified.into_mission().unwrap())
+                    .unwrap();
+            request
+                .sign_intent_v2(
+                    &agent_key,
+                    "g7-gateway",
+                    issued,
+                    expires,
+                    policy.digest().unwrap(),
+                )
+                .unwrap();
+            serde_json::to_value(&request).unwrap()
+        }
+        Err(_) => {
+            let mut request = AuthorizationRequest::new_unclassified(
+                agent,
+                authority,
+                policy.unclassified(action).unwrap(),
+            )
+            .unwrap();
+            request
+                .sign_intent_v2(
+                    &agent_key,
+                    "g7-gateway",
+                    issued,
+                    expires,
+                    policy.digest().unwrap(),
+                )
+                .unwrap();
+            serde_json::to_value(&request).unwrap()
+        }
+    };
 
     let probes = Probes {
         policy_id: policy_id.into(),
@@ -331,7 +354,6 @@ fn setup(policy_id: &str) -> (Gateway, Probes, Value) {
         probes.signer.clone(),
     )
     .unwrap();
-    let body = serde_json::to_value(&request).unwrap();
     (gateway, probes, body)
 }
 
@@ -371,21 +393,49 @@ async fn safety_action_is_refused_before_the_engine_with_the_journal_down() {
     }
 }
 
+/// G7: an undeclared action type (including an undeclared `safety:` one) is
+/// verified by the engine and refused with a signed DENY that must be
+/// committed like any decision; it is never evaluated against policy rules.
+/// With the journal down, the commit fails and the gateway fails closed.
 #[tokio::test]
-async fn unclassified_action_is_refused_before_the_engine() {
-    // Not declared, including an undeclared `safety:` action.
+async fn unclassified_action_is_not_evaluated_and_fails_closed_with_the_journal_down() {
     for action_type in ["demo:delete", "safety:hold"] {
         let policy_id = format!("g7-gateway-unclassified-{action_type}");
-        let (gateway, probes, mut body) = setup(&policy_id);
-        body["action"]["action_type"] = json!(action_type);
+        let (gateway, probes, body) = setup_with(&policy_id, action_type);
 
-        let (status, response, elapsed) = post(gateway, &body).await;
+        let (status, response, _) = post(gateway, &body).await;
 
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
-        assert_eq!(response["code"], "unclassified_action");
-        probes.assert_untouched();
-        assert!(elapsed < BOUND, "answered in {elapsed:?}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{response}");
+        assert_eq!(probe::engine_calls(&policy_id), 1);
+        assert_eq!(
+            probe::policy_evaluations(&policy_id),
+            0,
+            "no rule evaluated"
+        );
+        assert!(
+            probes.journal.0.get() >= 1,
+            "the DENY commit reached the journal"
+        );
+        assert_eq!(probes.dispatcher.0.get(), 0);
     }
+}
+
+/// G7: an undeclared request whose intent signature does not cover it (a
+/// mission request with its action type edited) is rejected by the
+/// engine's verification: nothing reaches the journal, nothing is signed.
+#[tokio::test]
+async fn forged_unclassified_request_reaches_no_journal() {
+    let policy_id = "g7-gateway-forged";
+    let (gateway, probes, mut body) = setup(policy_id);
+    body["action"]["action_type"] = json!("demo:delete");
+
+    let (status, response, _) = post(gateway, &body).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "{response}");
+    assert_eq!(probe::policy_evaluations(policy_id), 0);
+    assert_eq!(probes.journal.0.get(), 0, "no commit");
+    assert_eq!(probes.signer.0.get(), 0);
+    assert_eq!(probes.dispatcher.0.get(), 0);
 }
 
 /// Control: the same setup sends a mission action to the engine, and with

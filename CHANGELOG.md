@@ -40,15 +40,38 @@
   `examples/third-party-verification/bundle/`) are unchanged and verify
   against their recorded format 1 documents; `docs/golden/canonical-policy-v1.json`
   keeps its digest and `canonical-policy-v2.json` is added.
-- **Entry points classify first (G7).** The gateway HTTP API answers a
-  `Safety` action with 422 `safety_action_not_governed` and an undeclared one
-  with 422 `unclassified_action`. The `praetore-mcp` gate (a tool named
-  `safety:*`) forwards a declared Safety call to the wrapped server without a
-  receipt, in enforce and observe, and refuses an undeclared one in both
-  modes; the Claude Code hook adds no decision for a Safety call and denies
-  an undeclared one. In every case nothing is evaluated, signed, claimed or
-  journaled. An unreadable `policy.json` still refuses every tool call,
+- **Entry points classify first (G7).** A declared `Safety` action gets no
+  decision: the gateway HTTP API answers 422 `safety_action_not_governed`,
+  the `praetore-mcp` gate forwards it to the wrapped server without a
+  receipt (enforce and observe), and the Claude Code hook adds no decision;
+  nothing is evaluated, signed, claimed or journaled. An action type the
+  policy does not declare is refused at every entry point with a **signed
+  DENY receipt**: the new `AuthorizationEngine::refuse_unclassified` (and
+  `refuse_unclassified_with_atomic_commit`) takes an
+  `AuthorizationRequest<UnclassifiedAction>` (built only from
+  `Policy::unclassified`), verifies it exactly like a mission request
+  (identity, authority, issuer pin, intent signature and, in HighAssurance,
+  intent window, freshness and replay claim), never evaluates policy rules,
+  and records `Deny` with reason `unclassified` and
+  `decided_by: {"kind": "engine_guard", "guard": "unclassified_action"}` (an
+  existing `decided_by` kind; verifiers that read engine guards accept it).
+  It is journaled and claimed like a policy DENY. A forged or
+  unauthenticated request gets no receipt. `praetore-mcp` refuses it in both
+  modes; the hook appends it to `receipts.jsonl`. An unreadable `policy.json` still refuses every tool call,
   `safety:*` included (documented in `docs/threat-model.md`).
+- **Breaking (gateway API behaviour change).** Every DENY from
+  `POST /v1/execute` now returns 403 with one body,
+  `{"code": "authorization_denied", "authorization": "denied", "execution":
+  "not_dispatched", "evidence_id": ..., "request_id": ...}`, instead of the
+  signed receipt, whatever decided it (a rule, an engine guard or an
+  undeclared action type), so the response does not reveal what the policy
+  declares or which rule matched. The receipt, with its reason, is in the
+  execution journal (`praetore journal-export`). The 422
+  `unclassified_action` response is removed. Likewise, `praetore-mcp`
+  answers every DENY with `Denied by PRÆTORE. Evidence id: ...` (the rule
+  and reason go to stderr) and the hook answers every DENY that has a
+  receipt with `PRÆTORE denied this tool call (evidence ...)` (details on
+  stderr). Response timing is not made uniform.
 - **Breaking (behaviour change, praetore-mcp observe mode).** A call whose
   action type the policy does not declare (`UNCLASSIFIED_ACTION`) is now
   refused in observe mode too, not forwarded: an undeclared `safety:*`, any

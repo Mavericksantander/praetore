@@ -185,6 +185,93 @@ pub struct MissionAction(Action);
 #[serde(transparent)]
 pub struct SafetyAction(Action);
 
+/// An action whose type the policy's `action_classes` does not declare,
+/// built only by [`Policy::unclassified`](crate::Policy::unclassified).
+///
+/// It is never evaluated against policy rules. The engine accepts it only in
+/// [`AuthorizationEngine::refuse_unclassified`](crate::engine::AuthorizationEngine::refuse_unclassified),
+/// which verifies the request like a mission request (identity, authority,
+/// intent signature and, in HighAssurance, freshness and replay) and then
+/// records a signed DENY decided by the engine guard `unclassified_action`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct UnclassifiedAction(Action);
+
+impl UnclassifiedAction {
+    pub(crate) fn unclassified(action: Action) -> Self {
+        Self(action)
+    }
+
+    pub fn action(&self) -> &Action {
+        &self.0
+    }
+
+    pub fn into_action(self) -> Action {
+        self.0
+    }
+}
+
+impl std::ops::Deref for UnclassifiedAction {
+    type Target = Action;
+
+    fn deref(&self) -> &Action {
+        &self.0
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::MissionAction {}
+    impl Sealed for super::UnclassifiedAction {}
+}
+
+/// The action types an [`AuthorizationRequest`](crate::AuthorizationRequest)
+/// can carry: [`MissionAction`] (evaluated against the policy) and
+/// [`UnclassifiedAction`] (refused by the engine without evaluation). The
+/// trait is sealed; [`SafetyAction`] does not implement it.
+pub trait RequestAction:
+    sealed::Sealed + Serialize + Clone + std::fmt::Debug + Send + Sync
+{
+    /// The wrapped action.
+    fn action(&self) -> &Action;
+    /// `Some` only for a mission action: the only kind that reaches policy
+    /// rules.
+    #[doc(hidden)]
+    fn as_mission(&self) -> Option<&MissionAction>;
+    /// Checks that `policy` still gives the action this kind (declared
+    /// Mission, or not declared at all).
+    #[doc(hidden)]
+    fn check_class(&self, policy: &crate::Policy) -> Result<()>;
+}
+
+impl RequestAction for MissionAction {
+    fn action(&self) -> &Action {
+        &self.0
+    }
+
+    fn as_mission(&self) -> Option<&MissionAction> {
+        Some(self)
+    }
+
+    fn check_class(&self, policy: &crate::Policy) -> Result<()> {
+        policy.require_mission(self)
+    }
+}
+
+impl RequestAction for UnclassifiedAction {
+    fn action(&self) -> &Action {
+        &self.0
+    }
+
+    fn as_mission(&self) -> Option<&MissionAction> {
+        None
+    }
+
+    fn check_class(&self, policy: &crate::Policy) -> Result<()> {
+        policy.require_unclassified(self)
+    }
+}
+
 /// The result of [`Policy::classify`](crate::Policy::classify).
 #[derive(Debug, Clone)]
 pub enum ClassifiedAction {

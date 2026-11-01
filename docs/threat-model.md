@@ -145,10 +145,16 @@ Trust boundaries are explicit:
 * The diagnostics that the hook and `praetore-mcp` write to stderr for a
   safety action (`SAFETY_ACTION_NOT_GOVERNED ...`) are not evidence: they
   are unsigned, and hosts may keep them in their own logs.
-* An undeclared action is refused without a signed receipt; before G7 it
-  received a signed default DENY. The gateway's 422 codes let an
-  authenticated agent learn which action types the policy declares and
-  which are `Safety`.
+* An undeclared action is refused with a signed DENY (engine guard
+  `unclassified_action`), after the same verification as a mission request,
+  so a forged or unauthenticated request gets no receipt. Every DENY gets
+  the same client-facing answer at the gateway, in `praetore-mcp` and in the
+  hook, so the answer does not reveal whether an action type is declared or
+  which rule matched. Known limits: response timing is not uniform (an
+  undeclared action skips rule evaluation), the 422
+  `safety_action_not_governed` answer tells an authenticated client that an
+  action type is declared `Safety`, and in `praetore-mcp` observe mode a
+  policy DENY is forwarded while an undeclared action is refused.
 
 ## Invariants and traceability
 

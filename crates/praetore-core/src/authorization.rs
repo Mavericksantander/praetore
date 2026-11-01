@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     Result,
-    action::{Action, MissionAction},
+    action::{Action, MissionAction, RequestAction, UnclassifiedAction},
     authority::Authority,
     canonical::{MAX_JSON_VALUE_BYTES, canonical_json, decode_lower_hex, validate_json_value},
     decision::Decision,
@@ -55,11 +55,11 @@ const MAX_CONTEXT_KEY_BYTES: usize = 256;
 /// // E0308: expected `MissionAction`, found `SafetyAction`.
 /// let _ = AuthorizationRequest::new(agent, authority, halt);
 /// ```
-pub struct AuthorizationRequest {
+pub struct AuthorizationRequest<A = MissionAction> {
     pub request_id: Uuid,
     pub agent: AgentIdentity,
     pub authority: Authority,
-    pub action: MissionAction,
+    pub action: A,
     pub trace_id: Option<String>,
     pub context: BTreeMap<String, Value>,
     pub agent_signature: Option<String>,
@@ -92,8 +92,102 @@ pub struct AuthorizationIntentV2 {
     pub policy_digest: String,
 }
 
+/// A request for an [`UnclassifiedAction`]. The engine only refuses it, with
+/// a signed DENY ([`AuthorizationEngine::refuse_unclassified`](crate::engine::AuthorizationEngine::refuse_unclassified)).
+pub type UnclassifiedRequest = AuthorizationRequest<UnclassifiedAction>;
+
+/// A parsed request, by the class of its action.
+#[derive(Debug, Clone)]
+pub enum ClassifiedRequest {
+    Mission(AuthorizationRequest),
+    Unclassified(UnclassifiedRequest),
+}
+
+fn parse_document(json: &str) -> Result<AuthorizationRequestDocument> {
+    if json.len() > MAX_JSON_VALUE_BYTES {
+        return Err(crate::PraetoreError::InvalidRequest(
+            "authorization request exceeds maximum size".into(),
+        ));
+    }
+    let value = crate::canonical::parse_json_rejecting_duplicates(json)
+        .map_err(crate::PraetoreError::InvalidRequest)?;
+    serde_json::from_value(value)
+        .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))
+}
+
+impl AuthorizationRequestDocument {
+    fn into_request<A: RequestAction>(self, action: A) -> Result<AuthorizationRequest<A>> {
+        let request = AuthorizationRequest {
+            request_id: self.request_id,
+            agent: self.agent,
+            authority: self.authority,
+            action,
+            trace_id: self.trace_id,
+            context: self.context,
+            agent_signature: self.agent_signature,
+            intent_v2: self.intent_v2,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+impl AuthorizationRequest<UnclassifiedAction> {
+    /// Builds a request for an unclassified action; the engine will only
+    /// refuse it.
+    pub fn new_unclassified(
+        agent: AgentIdentity,
+        authority: Authority,
+        action: UnclassifiedAction,
+    ) -> Result<Self> {
+        Self::build(agent, authority, action)
+    }
+}
+
 impl AuthorizationRequest {
     pub fn new(agent: AgentIdentity, authority: Authority, action: MissionAction) -> Result<Self> {
+        Self::build(agent, authority, action)
+    }
+
+    /// Parses a serialized request and classifies its action against
+    /// `policy` before anything else looks at it.
+    ///
+    /// A `Safety` action returns
+    /// [`PraetoreError::SafetyActionNotGoverned`](crate::PraetoreError::SafetyActionNotGoverned)
+    /// and an undeclared one
+    /// [`PraetoreError::UnclassifiedAction`](crate::PraetoreError::UnclassifiedAction);
+    /// neither is validated further, evaluated, signed or recorded. Malformed
+    /// JSON and invalid fields return `InvalidRequest`. See
+    /// [`Self::classify_json`] to refuse undeclared actions with a receipt.
+    pub fn from_json(json: &str, policy: &Policy) -> Result<Self> {
+        let document = parse_document(json)?;
+        let action = policy.classify(document.action.clone())?.into_mission()?;
+        document.into_request(action)
+    }
+
+    /// Like [`Self::from_json`], but an action whose type the policy does not
+    /// declare yields [`ClassifiedRequest::Unclassified`] instead of an error,
+    /// so the caller can have the engine refuse it with a signed DENY. A
+    /// `Safety` action still returns `SafetyActionNotGoverned`.
+    pub fn classify_json(json: &str, policy: &Policy) -> Result<ClassifiedRequest> {
+        let document = parse_document(json)?;
+        match policy.classify(document.action.clone()) {
+            Ok(classified) => Ok(ClassifiedRequest::Mission(
+                document.into_request(classified.into_mission()?)?,
+            )),
+            Err(crate::PraetoreError::UnclassifiedAction { .. }) => {
+                let action = policy.unclassified(document.action.clone())?;
+                Ok(ClassifiedRequest::Unclassified(
+                    document.into_request(action)?,
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl<A: RequestAction> AuthorizationRequest<A> {
+    fn build(agent: AgentIdentity, authority: Authority, action: A) -> Result<Self> {
         agent.validate()?;
 
         if agent.id != authority.subject {
@@ -103,7 +197,7 @@ impl AuthorizationRequest {
         }
 
         authority.validate()?;
-        action.validate()?;
+        action.action().validate()?;
 
         Ok(Self {
             request_id: Uuid::new_v4(),
@@ -115,40 +209,6 @@ impl AuthorizationRequest {
             agent_signature: None,
             intent_v2: None,
         })
-    }
-
-    /// Parses a serialized request and classifies its action against
-    /// `policy` before anything else looks at it.
-    ///
-    /// A `Safety` action returns
-    /// [`PraetoreError::SafetyActionNotGoverned`](crate::PraetoreError::SafetyActionNotGoverned)
-    /// and an undeclared one
-    /// [`PraetoreError::UnclassifiedAction`](crate::PraetoreError::UnclassifiedAction);
-    /// neither is validated further, evaluated, signed or recorded. Malformed
-    /// JSON and invalid fields return `InvalidRequest`.
-    pub fn from_json(json: &str, policy: &Policy) -> Result<Self> {
-        if json.len() > MAX_JSON_VALUE_BYTES {
-            return Err(crate::PraetoreError::InvalidRequest(
-                "authorization request exceeds maximum size".into(),
-            ));
-        }
-        let value = crate::canonical::parse_json_rejecting_duplicates(json)
-            .map_err(crate::PraetoreError::InvalidRequest)?;
-        let document: AuthorizationRequestDocument = serde_json::from_value(value)
-            .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
-        let action = policy.classify(document.action)?.into_mission()?;
-        let request = Self {
-            request_id: document.request_id,
-            agent: document.agent,
-            authority: document.authority,
-            action,
-            trace_id: document.trace_id,
-            context: document.context,
-            agent_signature: document.agent_signature,
-            intent_v2: document.intent_v2,
-        };
-        request.validate()?;
-        Ok(request)
     }
 
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
@@ -236,7 +296,7 @@ impl AuthorizationRequest {
                 request_id: self.request_id,
                 agent: &self.agent,
                 authority: &self.authority,
-                action: self.action.action(),
+                action: RequestAction::action(&self.action),
                 trace_id: &self.trace_id,
                 context: &self.context,
                 intent_v2,
@@ -248,7 +308,7 @@ impl AuthorizationRequest {
                 request_id: self.request_id,
                 agent: &self.agent,
                 authority: &self.authority,
-                action: self.action.action(),
+                action: RequestAction::action(&self.action),
                 trace_id: &self.trace_id,
                 context: &self.context,
             })
@@ -262,10 +322,10 @@ impl AuthorizationRequest {
         Ok(payload)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.agent.validate()?;
         self.authority.validate()?;
-        self.action.validate()?;
+        RequestAction::action(&self.action).validate()?;
 
         if self.agent.id != self.authority.subject {
             return Err(crate::PraetoreError::InvalidRequest(
@@ -335,7 +395,7 @@ impl AuthorizationRequest {
             self.request_id,
             self.agent,
             self.authority,
-            self.action.into_action(),
+            RequestAction::action(&self.action).clone(),
             decision,
             self.trace_id,
             self.context,

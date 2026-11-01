@@ -143,9 +143,13 @@ engine whose mode is not `HighAssurance`, and invokes the core engine for each
 call. An `AuthorizationRequest` carries a `MissionAction`, which only
 `Policy::classify` builds (G7), so a safety action cannot reach `execute`.
 `POST /v1/execute` classifies the action against `Gateway::policy()` before
-anything else: a `Safety` action gets 422 `safety_action_not_governed` and an
-undeclared one 422 `unclassified_action`, with no evaluation, replay claim,
-journal write, signature or dispatch, also when the journal is unavailable.
+anything else: a `Safety` action gets 422 `safety_action_not_governed`, with
+no evaluation, replay claim, journal write, signature or dispatch, also when
+the journal is unavailable. An undeclared one goes to
+`Gateway::refuse_unclassified`: the engine verifies it like a mission
+request and commits a signed DENY (engine guard `unclassified_action`) with
+its replay claim; nothing is dispatched. Every DENY is answered with the
+same 403 `authorization_denied` body; the signed receipt is in the journal.
 The gateway does not run or record safety actions; see
 [SAF-09](proposals/SAF-09-safety-actions-break-glass.md#g7-requirements). It checks the returned evidence integrity and HighAssurance metadata.
 Only an evidence decision exactly equal to `ALLOW` can advance to dispatch.

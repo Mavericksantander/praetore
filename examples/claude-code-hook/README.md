@@ -32,8 +32,12 @@ agente haga por otro camino queda fuera (ver Límites).
   no se firma nada y no se agrega nada a `receipts.jsonl`; el hook escribe
   `SAFETY_ACTION_NOT_GOVERNED` en stderr. Así, un fallo de PRÆTORE después de
   cargar la policy (por ejemplo, `receipts.jsonl` sin escritura) no la
-  retiene. Una tool `safety:*` no declarada se niega como
-  `UNCLASSIFIED_ACTION`, sin recibo. La policy por defecto declara `Mission`
+  retiene. Una tool `safety:*` no declarada se niega con un DENY firmado
+  (motivo `unclassified`, guard `unclassified_action`) que se agrega a
+  `receipts.jsonl`; el motor verifica la solicitud igual que una de misión y
+  no evalúa reglas. Todo DENY con recibo se muestra con el mismo texto,
+  `PRÆTORE denied this tool call (evidence ...)`; la regla y el motivo van a
+  stderr y al recibo firmado. La policy por defecto declara `Mission`
   los tipos `claude:*` y ninguna acción `Safety`.
 - **Migrar la policy antes de actualizar el binario.** Un estado creado
   antes de G7 tiene una policy de formato 1; con el binario nuevo esa policy
