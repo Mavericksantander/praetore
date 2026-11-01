@@ -229,6 +229,7 @@ fn check_reports_hand_written_mistakes() {
         text.contains("unsupported policy format version 1"),
         "{text}"
     );
+    assert!(text.contains("praetore policy classify --policy"), "{text}");
 
     // Valid JSON, but approval without capability: warned.
     fs::write(

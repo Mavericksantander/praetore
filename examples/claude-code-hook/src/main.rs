@@ -634,9 +634,18 @@ fn action_type_of(tool_name: &str) -> String {
 }
 
 fn load_policy(directory: &Path) -> Result<Policy, BoxError> {
-    Ok(Policy::from_json(&String::from_utf8(read_bounded(
-        &directory.join(POLICY_FILE),
-    )?)?)?)
+    let path = directory.join(POLICY_FILE);
+    Policy::from_json(&String::from_utf8(read_bounded(&path)?)?).map_err(|error| {
+        let hint = match error {
+            PraetoreError::PolicyFormatUnsupported { found: 1, .. } => format!(
+                "; this state was written before G7 (policy format 1): migrate {} to format 2 (`praetore policy classify --policy {}` proposes the action_classes table) or run `praetore-claude-hook init` into a new directory",
+                path.display(),
+                path.display()
+            ),
+            _ => String::new(),
+        };
+        format!("{}: {error}{hint}", path.display()).into()
+    })
 }
 
 fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {

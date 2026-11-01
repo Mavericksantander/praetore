@@ -113,7 +113,7 @@ classes:
   means no execution (SAF-09.3).
 * `Safety`: an action that the executor of an AI-enabled system runs without
   waiting for PRÆTORE, for example `safety:halt`, `safety:hold`,
-  `safety:return_home` or `safety:land`. PRÆTORE makes no decision about
+  or `safety:stop_all`. PRÆTORE makes no decision about
   it.
 
 ```json
@@ -125,9 +125,9 @@ classes:
   "semantics_version": 2,
   "action_classes": {
     "fs:write_file": "Mission",
-    "mcp:tools/call": "Mission",
+    "mcp.tools/call": "Mission",
     "safety:halt": "Safety",
-    "safety:land": "Safety"
+    "safety:stop_all": "Safety"
   },
   "rules": [
     {
@@ -151,18 +151,22 @@ rejects the whole policy, with the typed error
   (`UndeclaredActionType`);
 * an `action_type` starting with `safety:` is not declared `Safety`
   (`SafetyPrefixNotSafety`), or a `Safety` entry is not `safety:` followed by
-  a name (`SafetyWithoutPrefix`);
+  a name that starts with an ASCII letter or digit (`SafetyWithoutPrefix`);
+* a key has a character outside printable ASCII (`!` to `~`): whitespace,
+  a control or format character such as a zero-width space, or any
+  non-ASCII character such as a homoglyph or a full-width letter
+  (`NotPrintableAscii`). Every action type used with a class is therefore
+  printable ASCII;
 * an `action_type` without the `safety:` prefix contains `safety` in any
   ASCII case, such as `safety_halt`, `Safety:halt` or `ops:skip_safety`
-  (`AmbiguousSafetyName`), so a name cannot sidestep the prefix. The check is
-  ASCII case-insensitive; it does not fold Unicode look-alikes;
+  (`AmbiguousSafetyName`), so a name cannot sidestep the prefix;
 * any rule targets a `Safety` action, whatever its effect
   (`RuleTargetsSafetyAction`);
 * a key is empty or has surrounding whitespace (`InvalidActionType`), or the
   table has more than `MAX_ACTION_CLASSES` = 512 entries.
 
 Mission action types need no prefix: existing names such as `fs:write_file`,
-`mcp:tools/call` or `read_data` stay valid once declared. A format 2 document
+`mcp.tools/call` or `read_data` stay valid once declared. A format 2 document
 without `action_classes` is rejected with `ActionClassError::MissingTable`.
 
 `Policy::classify(action)` is the only way to build the request types:
@@ -190,6 +194,15 @@ write or signature, and an undeclared one with `UNCLASSIFIED_ACTION`:
 | `praetore-mcp` gate (a tool named `safety:*`) | not evaluated; forwarded to the wrapped server without a receipt, in enforce and observe | refused in enforce and observe, nothing forwarded |
 | Claude Code hook (a tool named `safety:*`) | no permission decision from PRÆTORE (the host's own rules apply), nothing signed or appended | denied, without a receipt |
 
+**Trust model.** Declaring an action type `Safety` takes it out of
+PRÆTORE's governance entirely: no rule applies, nothing is evaluated, signed
+or recorded. PRÆTORE does not check that the action really is a safety
+action; that trust rests with the policy author. A `safety:` name is not
+bound to a particular executor: in `praetore-mcp` a tool with that name on
+any wrapped server matches the entry and is forwarded without a receipt.
+Declare only the safety actions the executor really runs, and keep the
+policy under the same review as any other policy change.
+
 Recording safety actions (SAF-09.5: isolated ingestion with its own process,
 credentials and key) is not implemented; until it is, PRÆTORE keeps no
 record of them.
@@ -214,6 +227,11 @@ digest. `RecordedPolicy` has no `evaluate` and does not convert into a
 `Policy`, so a format 1 document can be digested and compared but never used
 to decide. `praetore-verify --policy` and `policy-digest` use it, and so does
 `Evidence::verify_recorded_policy`.
+
+**Migrate before upgrading the binary.** A release with G7 does not load a
+format 1 policy, so state written before G7 (a hook directory, a
+`praetore-mcp` home, a gateway service configuration) refuses every tool call
+after the upgrade, `safety:*` included, until its policy is migrated.
 
 To migrate, run `praetore policy classify --policy <path>`. It prints a
 proposed `{"format_version": 2, "action_classes": {...}}` (action types

@@ -95,7 +95,7 @@ mod tests {
     const V1: &str = r#"{"id":"p","version":3,"canonical_version":1,"rules":[
         {"id":"w","action_type":"fs:write_file","effect":"Allow","required_capability":"fs:write",
          "target":null,"parameter_conditions":[],"context_conditions":[]},
-        {"id":"c","action_type":"mcp:tools/call","effect":"Deny","required_capability":null,
+        {"id":"c","action_type":"mcp.tools/call","effect":"Deny","required_capability":null,
          "target":null,"parameter_conditions":[],"context_conditions":[]}]}"#;
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
             proposal,
             serde_json::json!({
                 "format_version": 2,
-                "action_classes": {"fs:write_file": "Mission", "mcp:tools/call": "Mission"}
+                "action_classes": {"fs:write_file": "Mission", "mcp.tools/call": "Mission"}
             })
         );
         assert_eq!(report.problems, 0);
@@ -123,7 +123,7 @@ mod tests {
     fn reports_rules_on_safety_actions_and_ambiguous_names() {
         let text = V1
             .replace("fs:write_file", "safety:halt")
-            .replace("mcp:tools/call", "ops:skip_safety");
+            .replace("mcp.tools/call", "ops:skip_safety");
         let report = report(&text).unwrap();
         assert_eq!(report.problems, 2);
         assert!(

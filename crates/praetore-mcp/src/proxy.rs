@@ -327,7 +327,7 @@ fn decide(
         .and_then(Value::as_str)
         .map_or_else(|| "?".to_owned(), display_safe);
     match evaluator.evaluate(server, &call.params) {
-        // G7 (CTO decision): a safety action that the policy declares Safety is
+        // G7: a safety action that the policy declares Safety is
         // not governed by PRÆTORE. It was not evaluated, signed or recorded,
         // and it is forwarded to the wrapped server without a receipt in both
         // modes; its record is left to a separate ingestion path.

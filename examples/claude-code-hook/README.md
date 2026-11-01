@@ -35,6 +35,14 @@ agente haga por otro camino queda fuera (ver Límites).
   retiene. Una tool `safety:*` no declarada se niega como
   `UNCLASSIFIED_ACTION`, sin recibo. La policy por defecto declara `Mission`
   los tipos `claude:*` y ninguna acción `Safety`.
+- **Migrar la policy antes de actualizar el binario.** Un estado creado
+  antes de G7 tiene una policy de formato 1; con el binario nuevo esa policy
+  no carga y el hook niega todas las tool calls, incluidas las `safety:*`,
+  hasta migrarla (`praetore policy classify --policy <estado>/policy.json`
+  propone la tabla) o hacer un `init` nuevo. El mensaje de error del hook
+  indica ese paso.
+- Declarar una tool `Safety` la saca por completo del gobierno de PRÆTORE;
+  esa confianza recae en quien escribe la policy.
 - Los recibos ya escritos con una policy de formato 1 (estado creado antes
   de G7) siguen verificando contra esa policy: `verify` y `praetore-verify
   --policy` la leen como `RecordedPolicy`, que solo calcula el digest. Para

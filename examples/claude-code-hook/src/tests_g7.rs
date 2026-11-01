@@ -1,7 +1,7 @@
 //! G7: the hook never sends a safety action to the engine.
 //!
 //! An AI-enabled system whose executor runs safety actions (`safety:halt`,
-//! `safety:land`) without waiting for PRÆTORE must not be held by the hook,
+//! `safety:stop_all`) without waiting for PRÆTORE must not be held by the hook,
 //! even when the receipts journal is down. These tests count engine and
 //! policy evaluations (praetore-core `test-probe`, enabled only for tests),
 //! intent signatures and receipt appends.
@@ -23,7 +23,7 @@ thread_local! {
     pub(super) static APPENDS: Cell<usize> = const { Cell::new(0) };
 }
 
-/// The bound the CTO set for an answer to a safety action.
+/// Upper bound for the answer to a safety action.
 const BOUND: StdDuration = StdDuration::from_millis(100);
 
 struct State {
@@ -34,7 +34,7 @@ struct State {
 
 impl State {
     /// Initialized hook state with its own policy id (the probe counters are
-    /// per policy id), `safety:halt` and `safety:land` declared Safety, and
+    /// per policy id), `safety:halt` and `safety:stop_all` declared Safety, and
     /// the receipts journal down: `receipts.jsonl` is a directory.
     fn new(name: &str) -> Self {
         let base = std::env::temp_dir().join(format!(
@@ -50,7 +50,7 @@ impl State {
         let mut policy = load_policy(&state)
             .unwrap()
             .with_action_class("safety:halt", ActionClass::Safety)
-            .with_action_class("safety:land", ActionClass::Safety);
+            .with_action_class("safety:stop_all", ActionClass::Safety);
         policy.id = policy_id.clone();
         fs::write(
             state.join(POLICY_FILE),
@@ -100,7 +100,7 @@ impl Drop for State {
 
 #[test]
 fn safety_action_gets_no_decision_and_no_receipt_with_the_journal_down() {
-    for tool in ["safety:halt", "safety:land"] {
+    for tool in ["safety:halt", "safety:stop_all"] {
         let s = State::new(&tool.replace(':', "-"));
         // PRÆTORE's agent keys are gone too: the answer does not need them.
         fs::remove_dir_all(s.state.join(AGENTS_DIR)).unwrap();
@@ -173,6 +173,27 @@ fn unreadable_policy_denies_a_safety_tool_call() {
         );
         s.assert_nothing_recorded();
     }
+}
+
+/// State written before G7 has a format 1 policy: every call is denied and
+/// the error names the migration step.
+#[test]
+fn format_1_policy_denies_and_points_to_the_migration() {
+    let s = State::new("format-1");
+    fs::write(
+        s.state.join(POLICY_FILE),
+        r#"{"id":"claude-code-agents","version":1,"canonical_version":1,"semantics_version":2,"rules":[]}"#,
+    )
+    .unwrap();
+    let error = authorize(&s.state, &s.input("safety:halt", json!({}))).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("policy format 1"), "{message}");
+    assert!(
+        message.contains("praetore policy classify --policy"),
+        "{message}"
+    );
+    assert_eq!(fail_closed(error).outcome, DecisionOutcome::Deny);
+    s.assert_nothing_recorded();
 }
 
 #[test]

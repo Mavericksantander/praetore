@@ -122,6 +122,28 @@ Trust boundaries are explicit:
   without a receipt in both modes. PRÆTORE keeps no record of safety actions
   until a separate ingestion path exists (SAF-09.5).
 * An undeclared `safety:*` action is refused at every entry point.
+* Upgrades: a release with G7 does not load a policy format 1 document.
+  State written before G7 refuses every tool call after the upgrade until
+  its policy is migrated to format 2, so the policy must be migrated before
+  the binary is upgraded.
+* Declaring an action `Safety` takes it out of governance entirely, and the
+  trust rests with the policy author: PRÆTORE does not check what the action
+  does. A `safety:` name is not bound to an executor; in `praetore-mcp` a
+  tool with that name on any wrapped server is forwarded without a receipt.
+* Before classification, the entry points can still refuse or delay a call
+  for reasons unrelated to the decision path: the hook denies input it
+  cannot read or parse (for example more than 32 MiB or invalid JSON) and
+  parses the whole policy on every call; `praetore-mcp` handles client lines
+  one at a time, so a `safety:*` call waits behind a mission call that is
+  being evaluated, signed and journaled; the gateway authenticates and
+  parses the request first.
+* The diagnostics that the hook and `praetore-mcp` write to stderr for a
+  safety action (`SAFETY_ACTION_NOT_GOVERNED ...`) are not evidence: they
+  are unsigned, and hosts may keep them in their own logs.
+* An undeclared action is refused without a signed receipt; before G7 it
+  received a signed default DENY. The gateway's 422 codes let an
+  authenticated agent learn which action types the policy declares and
+  which are `Safety`.
 
 ## Invariants and traceability
 

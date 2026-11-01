@@ -1198,7 +1198,7 @@ mod tests {
         store::init(&home).unwrap();
         let mut policy = store::default_policy()
             .with_action_class("safety:halt", ActionClass::Safety)
-            .with_action_class("safety:land", ActionClass::Safety);
+            .with_action_class("safety:stop_all", ActionClass::Safety);
         policy.id = policy_id.to_owned();
         fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
         let receipts = home.receipts_dir();
@@ -1220,7 +1220,7 @@ mod tests {
     fn g7_safety_call_is_refused_before_the_engine_with_the_journal_down() {
         for (name, mode) in [
             ("safety:halt", Mode::Enforce),
-            ("safety:land", Mode::Observe),
+            ("safety:stop_all", Mode::Observe),
         ] {
             let policy_id = format!("g7-mcp-safety-{name}-{}", mode.as_str());
             let (_temp, home, marker) = g7_home(&policy_id);
@@ -1229,7 +1229,7 @@ mod tests {
 
             let started = std::time::Instant::now();
             let result =
-                Evaluator::evaluate(&mut gate, "plant", &json!({"name": name, "arguments": {}}));
+                Evaluator::evaluate(&mut gate, "tools", &json!({"name": name, "arguments": {}}));
             let elapsed = started.elapsed();
 
             assert_eq!(
@@ -1255,7 +1255,7 @@ mod tests {
             let line = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"safety:halt","arguments":{}}}
 "#;
             let started = std::time::Instant::now();
-            let out = crate::proxy::handle_client_line(line, mode, "plant", &mut gate);
+            let out = crate::proxy::handle_client_line(line, mode, "tools", &mut gate);
             let elapsed = started.elapsed();
             assert_eq!(
                 out.to_server.as_deref(),
@@ -1285,7 +1285,7 @@ mod tests {
             JOURNAL_APPENDS.with(|appends| appends.set(0));
             let line = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"safety:hold","arguments":{}}}
 "#;
-            let out = crate::proxy::handle_client_line(line, mode, "plant", &mut gate);
+            let out = crate::proxy::handle_client_line(line, mode, "tools", &mut gate);
             assert!(out.to_server.is_none(), "{}: not forwarded", mode.as_str());
             let reply = String::from_utf8(out.to_client.unwrap()).unwrap();
             assert!(reply.contains("UNCLASSIFIED_ACTION"), "{reply}");
@@ -1300,7 +1300,7 @@ mod tests {
         let (_temp, home, marker) = g7_home(policy_id);
         let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
         JOURNAL_APPENDS.with(|appends| appends.set(0));
-        let result = Evaluator::evaluate(&mut gate, "plant", &json!({"name": "safety:hold"}));
+        let result = Evaluator::evaluate(&mut gate, "tools", &json!({"name": "safety:hold"}));
         assert_eq!(
             result.err(),
             Some(GateError::UnclassifiedAction {

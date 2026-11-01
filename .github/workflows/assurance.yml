@@ -39,7 +39,7 @@ jobs:
           # compile_fail,E0308: an AuthorizationRequest cannot hold a SafetyAction.
           run "authorization::AuthorizationRequest \(line [0-9]+\) - compile fail \.\.\. ok" \
             cargo test --locked -p praetore-core --doc authorization::AuthorizationRequest
-          run "test result: ok\. 12 passed" cargo test --locked -p praetore-core --test action_classes
+          run "test result: ok\. 14 passed" cargo test --locked -p praetore-core --test action_classes
           run "test result: ok\. 3 passed" \
             cargo test --locked -p praetore-gateway --test safety_actions -- --nocapture
           run "test result: ok\. 5 passed" cargo test --locked -p praetore-mcp --lib g7_ -- --nocapture
@@ -232,7 +232,7 @@ jobs:
           set -euo pipefail
           output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_g7 -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
-          grep -q "test result: ok. 6 passed" <<<"$output" || { echo "::error::the G7 hook tests did not run"; exit 1; }
+          grep -q "test result: ok. 7 passed" <<<"$output" || { echo "::error::the G7 hook tests did not run"; exit 1; }
 
   g7-mutation:
     name: G7 mutation test (classify removed from each entry point)

@@ -5,7 +5,7 @@
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without
-  waiting for PRÆTORE (for example `safety:halt`, `safety:land`). The new
+  waiting for PRÆTORE (for example `safety:halt`, `safety:stop_all`). The new
   types `MissionAction` and `SafetyAction` are built only by
   `Policy::classify(action) -> Result<ClassifiedAction>`, and
   `AuthorizationRequest::new` takes a `MissionAction`, so a safety action
@@ -66,7 +66,11 @@
 - Shipped policies are format 2: `praetore-mcp init`, the hook's `init`,
   `praetore init` and `crates/praetore-cli/examples/policies/*.json`.
 
-  Migration guide:
+  Migration guide. **Migrate the policy to format 2 before upgrading the
+  binary.** After the upgrade a format 1 policy no longer loads, so hook or
+  `praetore-mcp` state written before G7 refuses every tool call (fail
+  closed, `safety:*` included) until its policy is migrated; the gateway
+  service does not start.
 
   ```text
   # before (format 1)
@@ -79,7 +83,8 @@
    "rules":[{"id":"w","action_type":"fs:write_file","effect":"Allow", ...}]}
   ```
 
-  1. Run `praetore policy classify --policy policy.json` and add the printed
+  1. Before upgrading, run `praetore policy classify --policy policy.json`
+     (or add the fields by hand) and add the printed
      `format_version` and `action_classes` to the document.
   2. Rename any action the executor runs without waiting for PRÆTORE to
      `safety:<name>`, declare it `Safety` and remove every rule on it.

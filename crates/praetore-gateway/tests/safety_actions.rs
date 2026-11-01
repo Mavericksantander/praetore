@@ -1,7 +1,7 @@
 //! G7: the gateway HTTP API never sends a safety action to the engine.
 //!
 //! An AI-enabled system whose executor runs safety actions (`safety:halt`,
-//! `safety:land`, ...) without waiting for PRÆTORE must get an immediate,
+//! `safety:stop_all`, ...) without waiting for PRÆTORE must get an immediate,
 //! typed answer even when PRÆTORE's journal is down. These tests run the
 //! real router with a journal that fails every call and counts it, and with
 //! counting replay, freshness, dispatch and signing probes. The engine and
@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 const NOW: &str = "2026-06-01T12:00:00Z";
 const TENANT: Uuid = Uuid::from_u128(7);
-/// The bound the CTO set for an answer to a safety action.
+/// Upper bound for the answer to a safety action.
 const BOUND: StdDuration = StdDuration::from_millis(100);
 
 #[derive(Default)]
@@ -272,7 +272,7 @@ fn setup(policy_id: &str) -> (Gateway, Probes, Value) {
     )
     .with_mission_actions(["demo:set_value"])
     .with_action_class("safety:halt", ActionClass::Safety)
-    .with_action_class("safety:land", ActionClass::Safety);
+    .with_action_class("safety:stop_all", ActionClass::Safety);
     let action = Action::new(
         "demo:set_value",
         Some("demo-state".into()),
@@ -356,7 +356,7 @@ async fn post(gateway: Gateway, body: &Value) -> (StatusCode, Value, StdDuration
 
 #[tokio::test]
 async fn safety_action_is_refused_before_the_engine_with_the_journal_down() {
-    for action_type in ["safety:halt", "safety:land"] {
+    for action_type in ["safety:halt", "safety:stop_all"] {
         let policy_id = format!("g7-gateway-safety-{action_type}");
         let (gateway, probes, mut body) = setup(&policy_id);
         body["action"]["action_type"] = json!(action_type);

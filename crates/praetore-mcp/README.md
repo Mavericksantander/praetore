@@ -245,7 +245,9 @@ time is only as trustworthy as the attester key that signed it.
 has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`,
 and declares the action type `mcp.tools/call` as `Mission` in
 `action_classes`. A home created before G7 has a format 1 policy, which no
-longer loads: add `"format_version": 2` and
+longer loads, so **migrate it before upgrading the binary**: after the
+upgrade every call is refused, `safety:*` included, until the policy is
+migrated. Add `"format_version": 2` and
 `"action_classes": {"mcp.tools/call": "Mission"}` (`policy check` prints this
 hint). Receipts written before keep verifying against the old document with
 `praetore-verify --policy`.
@@ -257,6 +259,10 @@ the engine or the receipts journal, and the proxy forwards the call to the
 wrapped server unchanged and without a receipt, in enforce and in observe
 mode: PRÆTORE decides and signs nothing about it. An undeclared `safety:*`
 tool is refused as `UNCLASSIFIED_ACTION` in both modes and is not forwarded.
+Declaring a tool `Safety` takes it out of governance entirely, and that trust
+rests with the policy author. The name is not bound to a server: a tool
+called `safety:halt` on any wrapped server matches the entry. The stderr
+line written for such a call is a diagnostic, not evidence.
 If `policy.json` cannot be read, every call is refused, `safety:*` included
 (see `docs/threat-model.md`).
 

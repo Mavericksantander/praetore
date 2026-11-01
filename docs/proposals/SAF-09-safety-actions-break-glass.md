@@ -2,8 +2,7 @@
 
 Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at ed05347.
 
-> **G7 update (separation of mission and safety actions, design approved by
-> the CTO).** G7 changes two premises of this document, which are now marked
+> **G7 update (separation of mission and safety actions).** G7 changes two premises of this document, which are now marked
 > **PROPUESTA** (superseded proposal text, kept for history):
 >
 > 1. "The extension lives outside the core": G7 puts the classification in
@@ -18,7 +17,7 @@ Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at e
 >    typed `SAFETY_ACTION_NOT_GOVERNED` answer, before any evaluation,
 >    replay claim, journal write or signature. PRÆTORE makes no decision about
 >    it. The gateway does not dispatch it; `praetore-mcp` forwards it to the
->    wrapped server without a receipt (enforce and observe, CTO decision);
+>    wrapped server without a receipt (enforce and observe);
 >    the hook adds no permission decision. An undeclared `safety:*` action is
 >    refused everywhere.
 >
@@ -50,10 +49,12 @@ wrapped server), it does not decide whether an executor should run one, and
 it does not change how a mission action is decided. Classification needs a
 readable policy: if `policy.json` cannot be read, the hook and the gate
 refuse every tool call, `safety:*` included. A safety failsafe must not
-depend on PRÆTORE (see `docs/threat-model.md`). A deployment that wants PRÆTORE to stay out
-of a safety action's path must not route that action through PRÆTORE in the
-first place; G7 makes sure that, if it does, the answer is immediate and
-does not depend on the journal.
+depend on PRÆTORE (see `docs/threat-model.md`). A deployment that wants
+PRÆTORE to stay out of a safety action's path must not route that action
+through PRÆTORE in the first place. If it does, and the policy is loaded,
+the entry point answers before evaluation and without depending on the
+journal; if the policy cannot be loaded, the action is refused like every
+other.
 
 ## Problem
 

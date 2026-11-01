@@ -33,7 +33,7 @@ fn action(action_type: &str) -> Action {
 
 #[test]
 fn mission_action_types_may_have_any_prefix_but_must_be_declared() {
-    for action_type in ["fs:write_file", "mcp:tools/call", "read_data", "deploy"] {
+    for action_type in ["fs:write_file", "mcp.tools/call", "read_data", "deploy"] {
         let policy = Policy::new_v2("p", 1, vec![rule(action_type)]);
         assert_eq!(
             class_error(policy.validate()),
@@ -62,7 +62,13 @@ fn safety_prefix_and_class_must_agree() {
             action_type: "safety:halt".into()
         }
     );
-    for action_type in ["halt", "emergency:stop", "safety:", "safety: land"] {
+    for action_type in [
+        "halt",
+        "emergency:stop",
+        "safety:",
+        "safety::x",
+        "safety:_x",
+    ] {
         let safety_without_prefix = Policy::new_v2("p", 1, vec![])
             .with_action_class(action_type, ActionClass::Safety)
             .validate();
@@ -77,8 +83,8 @@ fn safety_prefix_and_class_must_agree() {
     for action_type in [
         "safety:halt",
         "safety:hold",
-        "safety:return_home",
-        "safety:land",
+        "safety:stop_all",
+        "safety:pause",
     ] {
         assert!(
             Policy::new_v2("p", 1, vec![])
@@ -110,6 +116,43 @@ fn a_name_containing_safety_without_the_prefix_is_rejected() {
             "{action_type}"
         );
     }
+}
+
+/// Names that read alike must not classify differently: only printable
+/// ASCII without whitespace is accepted, in either class.
+#[test]
+fn action_classes_keys_must_be_printable_ascii() {
+    for action_type in [
+        "\u{455}afety:halt", // Cyrillic dze, a homoglyph of `s`
+        "s\u{430}fety:halt", // Cyrillic a
+        "\u{ff53}\u{ff41}\u{ff46}\u{ff45}\u{ff54}\u{ff59}:halt", // full-width letters
+        "safety:halt\u{200b}", // trailing zero-width space
+        "saf\u{200b}ety:halt", // zero-width space inside
+        "safety:\u{200b}",   // invisible name
+        "safety:\u{feff}halt", // byte order mark (format character)
+        "safety: halt",      // inner space
+        "fs:write\tfile",    // control character
+        "caf\u{e9}:order",   // any other non-ASCII character
+    ] {
+        for class in [ActionClass::Mission, ActionClass::Safety] {
+            let result = Policy::new_v2("p", 1, vec![])
+                .with_action_class(action_type, class)
+                .validate();
+            assert_eq!(
+                class_error(result),
+                ActionClassError::NotPrintableAscii {
+                    action_type: action_type.into()
+                },
+                "{action_type:?} as {class:?}"
+            );
+        }
+    }
+    // A rule cannot use such a name either: it would have to be declared.
+    let policy = Policy::new_v2("p", 1, vec![rule("s\u{430}fety:halt")]);
+    assert!(matches!(
+        class_error(policy.validate()),
+        ActionClassError::UndeclaredActionType { .. }
+    ));
 }
 
 #[test]
@@ -292,7 +335,7 @@ fn classify_separates_mission_safety_and_unclassified() {
         Err(PraetoreError::SafetyActionNotGoverned { .. })
     ));
     // Undeclared, including an undeclared `safety:` action.
-    for action_type in ["fs:delete", "safety:land"] {
+    for action_type in ["fs:delete", "safety:stop_all"] {
         assert!(matches!(
             policy.classify(action(action_type)),
             Err(PraetoreError::UnclassifiedAction { action_type: found }) if found == action_type
@@ -376,4 +419,25 @@ fn format_2_digests_cover_the_action_classes_table() {
     assert_eq!(document["format_version"], 2);
     assert_eq!(document["action_classes"]["safety:halt"], "Safety");
     assert_eq!(document["action_classes"]["read_data"], "Mission");
+}
+
+/// The policy example in docs/policy-language.md loads as written, and its
+/// MCP entry is the action type praetore-mcp uses (`mcp.tools/call`; the
+/// capability is `mcp:tools/call`).
+#[test]
+fn the_documented_action_classes_example_loads() {
+    let doc = include_str!("../../../docs/policy-language.md");
+    let section = &doc[doc.find("## Action classes (policy format 2)").unwrap()..];
+    let start = section.find("```json\n").unwrap() + "```json\n".len();
+    let example = &section[start..start + section[start..].find("```").unwrap()];
+    let policy = Policy::from_json(example).expect("documented example loads");
+    assert_eq!(
+        policy.action_classes.get("mcp.tools/call"),
+        Some(&ActionClass::Mission)
+    );
+    assert!(!policy.action_classes.contains_key("mcp:tools/call"));
+    assert_eq!(
+        policy.action_classes.get("safety:halt"),
+        Some(&ActionClass::Safety)
+    );
 }

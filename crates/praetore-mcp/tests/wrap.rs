@@ -1087,7 +1087,7 @@ fn write_policy_with_safety(home: &Home) {
     .unwrap();
 }
 
-/// G7 (CTO decision): a `safety:*` tool that the policy declares Safety is
+/// G7: a `safety:*` tool that the policy declares Safety is
 /// forwarded to the wrapped server without a receipt, in enforce and in
 /// observe. Every evaluation in praetore-mcp writes a receipt, so "no
 /// receipt for the safety call" means the engine was not called for it; the

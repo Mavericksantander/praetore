@@ -56,7 +56,7 @@ pub const SAFETY_ACTION_PREFIX: &str = "safety:";
 ///   synchronously signed decision before it runs (fail closed).
 /// * `Safety`: an action the executor of an AI-enabled system runs without
 ///   waiting for PRÆTORE (for example `safety:halt`, `safety:hold`,
-///   `safety:return_home`, `safety:land`). PRÆTORE makes no decision about
+///   `safety:stop_all`). PRÆTORE makes no decision about
 ///   it, and no policy rule may target it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ActionClass {
@@ -76,6 +76,13 @@ pub enum ActionClassError {
     /// An `action_classes` key is empty or has surrounding whitespace.
     #[error("action_classes key '{action_type}' is not a canonical action type")]
     InvalidActionType { action_type: String },
+    /// An `action_classes` key has a character outside printable ASCII
+    /// (`!` to `~`): whitespace, a control or format character such as a
+    /// zero-width space, or any non-ASCII character such as a homoglyph or
+    /// a full-width letter. Keeps names that read alike from classifying
+    /// differently.
+    #[error("action_classes key {action_type:?} must be printable ASCII without whitespace")]
+    NotPrintableAscii { action_type: String },
     /// A rule names an action type the table does not declare.
     #[error(
         "rule '{rule_id}' uses action type '{action_type}', which action_classes does not declare"
@@ -87,7 +94,8 @@ pub enum ActionClassError {
     /// An action type starting with `safety:` is not declared `Safety`.
     #[error("action type '{action_type}' starts with `safety:` and must be declared Safety")]
     SafetyPrefixNotSafety { action_type: String },
-    /// A `Safety` entry does not start with `safety:` followed by a name.
+    /// A `Safety` entry does not start with `safety:` followed by a name
+    /// that starts with an ASCII letter or digit.
     #[error("Safety action type '{action_type}' must be `safety:` followed by a name")]
     SafetyWithoutPrefix { action_type: String },
     /// An action type without the `safety:` prefix contains "safety" (ASCII
@@ -122,9 +130,19 @@ fn validate_action_class_entry(action_type: &str, class: ActionClass) -> Result<
         action_type.len(),
         MAX_POLICY_TEXT_BYTES,
     )?;
+    if !action_type.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(class_error(ActionClassError::NotPrintableAscii {
+            action_type: action_type.to_owned(),
+        }));
+    }
     let owned = || action_type.to_owned();
     match (action_type.strip_prefix(SAFETY_ACTION_PREFIX), class) {
-        (Some(name), ActionClass::Safety) if !name.trim().is_empty() && name == name.trim() => {
+        (Some(name), ActionClass::Safety)
+            if name
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric()) =>
+        {
             Ok(())
         }
         (Some(_), ActionClass::Safety) => Err(class_error(ActionClassError::SafetyWithoutPrefix {
@@ -2608,6 +2626,12 @@ mod tests {
 
         assert_eq!(String::from_utf8(canonical).unwrap(), expected);
         assert_eq!(policy.digest().unwrap(), expected_digest);
+        // Pinned, so a regenerated vector cannot follow a canonicalization
+        // change unnoticed.
+        assert_eq!(
+            policy.digest().unwrap(),
+            "77821c2735152448004f6780288dbb793bc1a78c204c5d0e460e859e89753cd0"
+        );
         assert_eq!(
             RecordedPolicy::from_json(expected).unwrap().digest(),
             expected_digest
