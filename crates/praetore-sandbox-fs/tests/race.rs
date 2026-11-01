@@ -1,8 +1,11 @@
-//! TOCTOU race: one thread keeps swapping the intermediate directory
-//! `root/d` for a symlink to a directory outside the root, and back, while
-//! another thread writes and deletes `d/...` paths. After every single
-//! operation the outside directory must be exactly as it was: nothing
-//! created, modified or deleted.
+//! TOCTOU races. Intermediate component: one thread keeps swapping the
+//! directory `root/d` for a symlink to a directory outside the root, and
+//! back, while another thread writes and deletes `d/...` paths. Final
+//! component: one thread keeps swapping the regular file `root/t` with a
+//! symlink to an outside file, a hard link to it, or a non-empty directory,
+//! while another writes and deletes `t`. After every single operation the
+//! outside directory must be exactly as it was: nothing created, modified
+//! or deleted (and the swapped directory must keep its content).
 //!
 //! The same test can be pointed at a deliberately path-based implementation
 //! (check every component with `symlink_metadata`, then `std::fs::write` /
@@ -32,6 +35,9 @@ const MAX_ITERATIONS: u64 = 20_000;
 enum Outcome {
     Ok,
     RefusedSymlink,
+    /// Refused because the final entry was a hard link or not a regular
+    /// file (the swapped-in hard link or directory).
+    RefusedSpecial,
     Missing,
     Other,
 }
@@ -49,6 +55,7 @@ fn classify(result: Result<(), ConfineError>) -> Outcome {
         Ok(()) => Outcome::Ok,
         Err(ConfineError::SymlinkOrNotDirectory | ConfineError::Symlink) => Outcome::RefusedSymlink,
         Err(ConfineError::MissingParent | ConfineError::NotFound) => Outcome::Missing,
+        Err(ConfineError::HardLinked | ConfineError::NotRegularFile) => Outcome::RefusedSpecial,
         Err(_) => Outcome::Other,
     }
 }
@@ -88,6 +95,7 @@ impl PathBasedReference {
                     return Outcome::RefusedSymlink;
                 }
                 Ok(metadata) if !last && !metadata.is_dir() => return Outcome::Other,
+                Ok(metadata) if last && metadata.is_dir() => return Outcome::RefusedSpecial,
                 Ok(_) => {}
                 Err(_) if last => {}
                 Err(_) => return Outcome::Missing,
@@ -209,6 +217,7 @@ struct Tally {
     iterations: u64,
     ok: u64,
     refused_symlink: u64,
+    refused_special: u64,
     missing: u64,
     other: u64,
     escapes: Vec<String>,
@@ -219,6 +228,7 @@ impl Tally {
         match outcome {
             Outcome::Ok => self.ok += 1,
             Outcome::RefusedSymlink => self.refused_symlink += 1,
+            Outcome::RefusedSpecial => self.refused_special += 1,
             Outcome::Missing => self.missing += 1,
             Outcome::Other => self.other += 1,
         }
@@ -348,4 +358,186 @@ fn race_intermediate_symlink_swap_never_touches_outside_linux_openat2() {
     }
     eprintln!("race[openat2]: kernel supports openat2");
     run_race("race-openat2", Resolver::Openat2);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Alternate {
+    /// Symlink to `outside/victim`.
+    Symlink,
+    /// Hard link to `outside/victim` (same filesystem).
+    HardLink,
+    /// Non-empty directory `{inner: "inner"}`.
+    Directory,
+}
+
+fn make_alternate(kind: Alternate, path: &Path, outside: &Path) {
+    match kind {
+        Alternate::Symlink => std::os::unix::fs::symlink(outside.join("victim"), path).unwrap(),
+        Alternate::HardLink => std::fs::hard_link(outside.join("victim"), path).unwrap(),
+        Alternate::Directory => {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("inner"), "inner").unwrap();
+        }
+    }
+}
+
+fn is_alternate(kind: Alternate, path: &Path, victim_ino: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => match kind {
+            Alternate::Symlink => metadata.file_type().is_symlink(),
+            Alternate::HardLink => metadata.is_file() && metadata.ino() == victim_ino,
+            Alternate::Directory => metadata.is_dir(),
+        },
+        Err(_) => false,
+    }
+}
+
+/// Swaps `root/t` with `root/t.alt` atomically until `stop`. When an effect
+/// consumed the alternate (a write renamed over it, a delete unlinked it),
+/// recreates it; when a slot is empty, puts a fresh regular file there.
+/// Returns (swaps, alternates recreated).
+fn final_swapper(
+    root: PathBuf,
+    outside: PathBuf,
+    kind: Alternate,
+    stop: Arc<AtomicBool>,
+) -> (u64, u64) {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use std::os::unix::fs::MetadataExt;
+    let target = root.join("t");
+    let alternate = root.join("t.alt");
+    let victim_ino = std::fs::metadata(outside.join("victim")).unwrap().ino();
+    let (mut swaps, mut recreated) = (0, 0);
+    while !stop.load(Ordering::Relaxed) {
+        if renameat_with(CWD, &target, CWD, &alternate, RenameFlags::EXCHANGE).is_ok() {
+            swaps += 1;
+        }
+        if !is_alternate(kind, &target, victim_ino) && !is_alternate(kind, &alternate, victim_ino) {
+            // Never a directory here: a directory cannot be consumed.
+            let _ = std::fs::remove_file(&alternate);
+            make_alternate(kind, &alternate, &outside);
+            recreated += 1;
+        }
+        for slot in [&target, &alternate] {
+            if std::fs::symlink_metadata(slot).is_err() {
+                let _ = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(slot);
+            }
+        }
+    }
+    (swaps, recreated)
+}
+
+fn run_final_race(tag: &str, kind: Alternate) {
+    let tree = Tree::new(tag);
+    std::fs::write(tree.root.join("t"), "inside").unwrap();
+    make_alternate(kind, &tree.root.join("t.alt"), &tree.outside);
+    let effects = implementation(&tree, Resolver::Auto);
+    let mut baseline = tree.snapshot_outside();
+    let stop = Arc::new(AtomicBool::new(false));
+    let budget = duration();
+    let (tally, (swaps, recreated)) = std::thread::scope(|scope| {
+        let swapper = {
+            let (root, outside, stop) = (tree.root.clone(), tree.outside.clone(), stop.clone());
+            scope.spawn(move || final_swapper(root, outside, kind, stop))
+        };
+        struct StopOnDrop(Arc<AtomicBool>);
+        impl Drop for StopOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let guard = StopOnDrop(stop.clone());
+        let started = Instant::now();
+        let mut tally = Tally::default();
+        while tally.iterations < MAX_ITERATIONS && started.elapsed() < budget {
+            let i = tally.iterations;
+            let content = format!("inside-{i}");
+            for (op, is_write) in [("write", true), ("delete", false), ("write", true)] {
+                let outcome = if is_write {
+                    effects.write("t", content.as_bytes())
+                } else {
+                    effects.remove("t")
+                };
+                tally.add(outcome);
+                let changes = Snapshot::of(&tree.outside).diff(&baseline);
+                if !changes.is_empty() {
+                    tally.escapes.push(format!(
+                        "iteration {i}: {op} \"t\" -> {outcome:?}; outside: {}",
+                        changes.join(", ")
+                    ));
+                    for entry in std::fs::read_dir(&tree.outside).unwrap() {
+                        let _ = std::fs::remove_file(entry.unwrap().path());
+                    }
+                    std::fs::write(tree.outside.join("victim"), "original").unwrap();
+                    baseline = tree.snapshot_outside();
+                    break;
+                }
+            }
+            tally.iterations += 1;
+            if tally.escapes.len() >= 20 {
+                break;
+            }
+        }
+        drop(guard);
+        (tally, swapper.join().unwrap())
+    });
+    eprintln!(
+        "race-final[{} / {kind:?}]: iterations={} swaps={swaps} alternates_recreated={recreated} ok={} refused_symlink={} refused_special={} missing={} other={} escapes={}",
+        effects.label(),
+        tally.iterations,
+        tally.ok,
+        tally.refused_symlink,
+        tally.refused_special,
+        tally.missing,
+        tally.other,
+        tally.escapes.len()
+    );
+    for escape in tally.escapes.iter().take(5) {
+        eprintln!("  ESCAPE {escape}");
+    }
+    assert!(
+        tally.escapes.is_empty(),
+        "{}: {} operation(s) changed the directory outside the root; first: {}",
+        effects.label(),
+        tally.escapes.len(),
+        tally.escapes[0]
+    );
+    if kind == Alternate::Directory {
+        let directories: Vec<_> = ["t", "t.alt"]
+            .iter()
+            .map(|name| tree.root.join(name))
+            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
+            .collect();
+        assert_eq!(directories.len(), 1, "the swapped directory disappeared");
+        assert_eq!(
+            std::fs::read_to_string(directories[0].join("inner")).unwrap(),
+            "inner",
+            "the swapped directory lost its content"
+        );
+    }
+    assert!(swaps > 0, "the swapper never swapped");
+    assert!(tally.ok > 0, "no operation ever succeeded");
+    assert!(
+        tally.refused_symlink + tally.refused_special > 0,
+        "no operation ever observed the alternate at `t`; the race was not exercised"
+    );
+}
+
+#[test]
+fn race_final_component_swapped_for_outside_symlink_never_touches_outside() {
+    run_final_race("final-symlink", Alternate::Symlink);
+}
+
+#[test]
+fn race_final_component_swapped_for_outside_hard_link_never_touches_outside() {
+    run_final_race("final-hardlink", Alternate::HardLink);
+}
+
+#[test]
+fn race_final_component_swapped_for_directory_leaves_it_intact() {
+    run_final_race("final-directory", Alternate::Directory);
 }

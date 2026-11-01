@@ -12,7 +12,8 @@
 //!
 //! A path is a relative `name(/name)*` string. It is checked structurally
 //! first (not empty, not absolute, no empty, `.` or `..` component, no NUL,
-//! components of at most [`MAX_COMPONENT_BYTES`] bytes). Then:
+//! components of at most [`MAX_COMPONENT_BYTES`] bytes, no component
+//! starting with [`TEMP_PREFIX`] compared ASCII case-insensitively). Then:
 //!
 //! - **Parent directory.** On Linux, the intermediate components are opened
 //!   in one `openat2(root_fd, "a/b", O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`
@@ -20,13 +21,16 @@
 //!   | RESOLVE_NO_XDEV`, so the kernel refuses any symlink, any escape from
 //!   the root and any mount crossing (including a bind mount of the same
 //!   filesystem) during that single resolution. When the kernel has no
-//!   `openat2` (`ENOSYS`, Linux < 5.6), and on every other Unix (macOS
-//!   included), the portable walk is used: one
-//!   `openat(dirfd, name, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)` per
-//!   component, each relative to the descriptor of the previous one. Every
-//!   other `openat2` error fails closed; it never falls back. In both cases
-//!   each opened directory is `fstat`ed and refused if it is on a different
-//!   device than the root.
+//!   `openat2` (`ENOSYS`, Linux < 5.6, or a seccomp profile that answers
+//!   `ENOSYS`), and on every other Unix (macOS included), the portable walk
+//!   is used: one `openat(dirfd, name, O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`
+//!   per component, each relative to the descriptor of the previous one.
+//!   The `ENOSYS` fallback is logged once (`tracing::warn!`) and visible
+//!   through [`openat2_status`]; [`Resolver::Openat2`] refuses it instead.
+//!   `EPERM` (seccomp or an LSM denying `openat2`) is a permanent refusal,
+//!   [`ConfineError::Openat2Denied`], never a fallback. Every other
+//!   `openat2` error fails closed. In both cases each opened directory is
+//!   `fstat`ed and refused if it is on a different device than the root.
 //! - **Final component.** It is only ever used relative to the parent
 //!   descriptor: inspected with `fstatat(AT_SYMLINK_NOFOLLOW)`, created with
 //!   `openat(O_CREAT | O_EXCL | O_NOFOLLOW)`, opened with `O_NOFOLLOW |
@@ -71,6 +75,13 @@
 //!   or a root whose own path the caller resolved wrongly, is outside the
 //!   scope of this crate: the caller decides which directory is the root.
 //!   Other processes with access to the same files are not restricted.
+//! - **Temporary file swapped before the rename.** The temporary file of
+//!   [`Root::write_file`] is visible to `readdir`. A process with write
+//!   access to the root can replace it with a symlink before `renameat`; the
+//!   target then becomes that symlink (the rename moves the link, it never
+//!   follows it) and the call returns `Written { confirmed: false }`. No
+//!   file outside the root is written; that process could have created the
+//!   same symlink directly.
 //! - **Quotas, permissions and contents.** No limit on file count or size,
 //!   no check of what is written.
 
@@ -84,19 +95,114 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use thiserror::Error;
 
 /// Longest accepted path component, in bytes.
 pub const MAX_COMPONENT_BYTES: usize = 255;
-/// Prefix of the temporary files used by [`Root::write_file`]. Callers
-/// should refuse targets whose final component starts with it.
+/// Prefix of the temporary files used by [`Root::write_file`]. Path-level
+/// operations refuse any component that starts with it (see
+/// [`is_temp_name`]), so an action can never target an in-flight write.
 pub const TEMP_PREFIX: &str = ".praetore-tmp-";
+
+/// [`TEMP_PREFIX`], compared ASCII case-insensitively: on a case-insensitive
+/// filesystem (default APFS) `.PRAETORE-TMP-x` names the same entry.
+pub fn is_temp_name(name: &[u8]) -> bool {
+    name.len() >= TEMP_PREFIX.len()
+        && name[..TEMP_PREFIX.len()].eq_ignore_ascii_case(TEMP_PREFIX.as_bytes())
+}
+
+/// What this process has learned about `openat2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Openat2Status {
+    /// Not used or probed yet.
+    Unknown,
+    Available,
+    /// `ENOSYS` (or not Linux): [`Resolver::Auto`] uses the portable walk,
+    /// [`Resolver::Openat2`] refuses.
+    Unavailable,
+    /// `EPERM` (seccomp or an LSM): every resolver except
+    /// [`Resolver::Walk`] refuses permanently.
+    Denied,
+}
+
+impl Openat2Status {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Unknown => "openat2 not probed yet",
+            Self::Available => "openat2 available",
+            Self::Unavailable => "openat2 unavailable (ENOSYS or not Linux)",
+            Self::Denied => "openat2 denied (EPERM, seccomp or LSM)",
+        }
+    }
+}
+
+/// Process-wide `openat2` status. `Unavailable` and `Denied` are sticky:
+/// once seen, the syscall is not retried.
+struct Openat2State(AtomicU8);
+
+impl Openat2State {
+    const fn new() -> Self {
+        Self(AtomicU8::new(0))
+    }
+
+    fn get(&self) -> Openat2Status {
+        match self.0.load(Ordering::Relaxed) {
+            1 => Openat2Status::Available,
+            2 => Openat2Status::Unavailable,
+            3 => Openat2Status::Denied,
+            _ => Openat2Status::Unknown,
+        }
+    }
+
+    /// Records `status`; returns `true` only for the call that first moved
+    /// the state to `Unavailable` or `Denied` (the one that logs).
+    fn record(&self, status: Openat2Status) -> bool {
+        let code = match status {
+            Openat2Status::Unknown => return false,
+            Openat2Status::Available => {
+                let _ = self
+                    .0
+                    .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+                return false;
+            }
+            Openat2Status::Unavailable => 2,
+            Openat2Status::Denied => 3,
+        };
+        let mut current = self.0.load(Ordering::Relaxed);
+        loop {
+            if current >= 2 {
+                return false;
+            }
+            match self
+                .0
+                .compare_exchange(current, code, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+static OPENAT2: Openat2State = Openat2State::new();
+
+/// What this process has learned about `openat2` so far. Always
+/// `Unavailable` off Linux.
+pub fn openat2_status() -> Openat2Status {
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        OPENAT2.get()
+    } else {
+        Openat2Status::Unavailable
+    }
+}
 
 /// How intermediate components are resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Resolver {
     /// `openat2` when the kernel has it, otherwise the portable walk (only
-    /// on `ENOSYS`; every other error fails closed).
+    /// on `ENOSYS`, logged once; `EPERM` and every other error fail
+    /// closed).
     #[default]
     Auto,
     /// Only `openat2`; fails with [`ConfineError::Openat2Unavailable`] when
@@ -110,7 +216,8 @@ pub enum Resolver {
 pub enum ConfineError {
     /// The path string is not a confined relative path. The payload is a
     /// stable reason: `empty_path`, `absolute_path`, `nul_byte`,
-    /// `empty_component`, `dot_component`, `component_too_long`.
+    /// `empty_component`, `dot_component`, `component_too_long`,
+    /// `reserved_name` (a component starting with [`TEMP_PREFIX`]).
     #[error("invalid confined path: {0}")]
     InvalidPath(&'static str),
     /// An intermediate component is a symlink (`ELOOP`) or not a directory
@@ -135,6 +242,10 @@ pub enum ConfineError {
     NotFound,
     #[error("openat2 is not available")]
     Openat2Unavailable,
+    /// `openat2` returned `EPERM` (seccomp or an LSM). Permanent: retrying
+    /// does not help.
+    #[error("openat2 is denied (EPERM)")]
+    Openat2Denied,
     #[error("the root is not a directory")]
     RootNotDirectory,
     #[error("the root is not accessible: {0}")]
@@ -224,9 +335,20 @@ impl Root {
         })
     }
 
+    /// A second handle on the same root directory with another resolver.
+    pub fn clone_with(&self, resolver: Resolver) -> Result<Self, ConfineError> {
+        let fd = rustix::io::fcntl_dupfd_cloexec(&self.fd, 0)
+            .map_err(|errno| ConfineError::RootUnavailable(errno.into()))?;
+        Ok(Self::from_fd(fd)?.with_resolver(resolver))
+    }
+
     pub fn with_resolver(mut self, resolver: Resolver) -> Self {
         self.resolver = resolver;
         self
+    }
+
+    pub fn set_resolver(&mut self, resolver: Resolver) {
+        self.resolver = resolver;
     }
 
     pub fn resolver(&self) -> Resolver {
@@ -255,46 +377,80 @@ impl Root {
     fn open_directories(&self, prefix: &str, components: &[&str]) -> Result<Dir, ConfineError> {
         match self.resolver {
             Resolver::Walk => self.walk(components),
-            Resolver::Openat2 => self.resolve_openat2(prefix),
-            Resolver::Auto => match self.resolve_openat2(prefix) {
-                Err(ConfineError::Openat2Unavailable) => self.walk(components),
-                other => other,
-            },
+            Resolver::Auto | Resolver::Openat2 => self.resolve_openat2(prefix, components),
         }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn resolve_openat2(&self, prefix: &str) -> Result<Dir, ConfineError> {
+    fn resolve_openat2(&self, prefix: &str, components: &[&str]) -> Result<Dir, ConfineError> {
         use rustix::fs::ResolveFlags;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        // Set once the kernel answered ENOSYS; later calls skip the syscall.
-        static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
-        if UNAVAILABLE.load(Ordering::Relaxed) {
-            return Err(ConfineError::Openat2Unavailable);
+        match OPENAT2.get() {
+            Openat2Status::Unavailable => return self.openat2_unavailable(components),
+            Openat2Status::Denied => return Err(ConfineError::Openat2Denied),
+            Openat2Status::Unknown | Openat2Status::Available => {}
         }
         let resolve = ResolveFlags::BENEATH
             | ResolveFlags::NO_SYMLINKS
             | ResolveFlags::NO_MAGICLINKS
             | ResolveFlags::NO_XDEV;
-        match rustix::fs::openat2(
+        let result = rustix::fs::openat2(
             &self.fd,
             prefix,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
             resolve,
-        ) {
-            Ok(fd) => self.dir_from(fd),
+        );
+        self.after_openat2(&OPENAT2, result, components)
+    }
+
+    /// Not Linux: `Auto` is the portable walk by design (nothing to log).
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn resolve_openat2(&self, _prefix: &str, components: &[&str]) -> Result<Dir, ConfineError> {
+        self.openat2_unavailable(components)
+    }
+
+    /// Classifies one `openat2` result. Platform-independent so the
+    /// fallback and refusal rules are unit-tested everywhere.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    fn after_openat2(
+        &self,
+        state: &Openat2State,
+        result: Result<OwnedFd, Errno>,
+        components: &[&str],
+    ) -> Result<Dir, ConfineError> {
+        match result {
+            Ok(fd) => {
+                state.record(Openat2Status::Available);
+                self.dir_from(fd)
+            }
             Err(errno) if errno == Errno::NOSYS => {
-                UNAVAILABLE.store(true, Ordering::Relaxed);
-                Err(ConfineError::Openat2Unavailable)
+                if state.record(Openat2Status::Unavailable) {
+                    tracing::warn!(
+                        "openat2 unavailable (ENOSYS): Resolver::Auto falls back to the portable \
+                         O_NOFOLLOW walk for the rest of this process; bind mounts of the same \
+                         filesystem are no longer detected"
+                    );
+                }
+                self.openat2_unavailable(components)
+            }
+            Err(errno) if errno == Errno::PERM => {
+                if state.record(Openat2Status::Denied) {
+                    tracing::warn!(
+                        "openat2 denied (EPERM, seccomp or LSM): confined file effects that \
+                         resolve directories fail closed for the rest of this process"
+                    );
+                }
+                Err(ConfineError::Openat2Denied)
             }
             Err(errno) => Err(directory_error(errno)),
         }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn resolve_openat2(&self, _prefix: &str) -> Result<Dir, ConfineError> {
-        Err(ConfineError::Openat2Unavailable)
+    fn openat2_unavailable(&self, components: &[&str]) -> Result<Dir, ConfineError> {
+        match self.resolver {
+            Resolver::Auto | Resolver::Walk => self.walk(components),
+            Resolver::Openat2 => Err(ConfineError::Openat2Unavailable),
+        }
     }
 
     fn walk(&self, components: &[&str]) -> Result<Dir, ConfineError> {
@@ -570,6 +726,9 @@ fn split_relative(path: &str) -> Result<(Vec<&str>, &str), ConfineError> {
     let mut components: Vec<&str> = path.split('/').collect();
     for component in &components {
         check_component(component)?;
+        if is_temp_name(component.as_bytes()) {
+            return Err(ConfineError::InvalidPath("reserved_name"));
+        }
     }
     let name = components
         .pop()
@@ -612,28 +771,41 @@ fn final_error(errno: Errno) -> ConfineError {
     }
 }
 
-/// Whether the running kernel resolves paths with `openat2` (always `false`
-/// off Linux). Probes once with a harmless `openat2(root, ".")`.
-pub fn openat2_available(root: &Root) -> bool {
+/// Probes `openat2` once with a harmless `openat2(root, ".",
+/// RESOLVE_BENEATH)` and records the answer in [`openat2_status`] (logging
+/// once if it is unavailable or denied). Always `Unavailable` off Linux.
+pub fn probe_openat2(root: &Root) -> Openat2Status {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         use rustix::fs::ResolveFlags;
-        match rustix::fs::openat2(
-            &root.fd,
-            ".",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-            ResolveFlags::BENEATH,
+        if matches!(
+            OPENAT2.get(),
+            Openat2Status::Unknown | Openat2Status::Available
         ) {
-            Ok(_) => true,
-            Err(errno) => errno != Errno::NOSYS,
+            let result = rustix::fs::openat2(
+                &root.fd,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                ResolveFlags::BENEATH,
+            );
+            let _ = root
+                .clone_with(Resolver::Openat2)
+                .and_then(|probe| probe.after_openat2(&OPENAT2, result, &[]));
         }
+        OPENAT2.get()
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = root;
-        false
+        Openat2Status::Unavailable
     }
+}
+
+/// Whether the running kernel resolves paths with `openat2` (always `false`
+/// off Linux). See [`probe_openat2`].
+pub fn openat2_available(root: &Root) -> bool {
+    probe_openat2(root) == Openat2Status::Available
 }
 
 #[cfg(test)]
@@ -664,5 +836,103 @@ mod tests {
         ));
         let (dirs, name) = split_relative("a/b/c.txt").unwrap();
         assert_eq!((dirs, name), (vec!["a", "b"], "c.txt"));
+    }
+
+    struct TempRoot(std::path::PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_root() -> TempRoot {
+        let path = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("praetore-sandbox-fs-unit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(path.join("d")).unwrap();
+        std::os::unix::fs::symlink(std::env::temp_dir(), path.join("link")).unwrap();
+        TempRoot(path)
+    }
+
+    #[test]
+    fn openat2_enosys_falls_back_only_in_auto_and_is_recorded_once() {
+        let tree = temp_root();
+        let state = Openat2State::new();
+        let auto = Root::open(&tree.0).unwrap();
+        assert_eq!(state.get(), Openat2Status::Unknown);
+        // Auto: ENOSYS -> portable walk, which still refuses symlinks.
+        let dir = auto.after_openat2(&state, Err(Errno::NOSYS), &["d"]);
+        assert!(dir.is_ok(), "{dir:?}");
+        assert!(matches!(
+            auto.after_openat2(&state, Err(Errno::NOSYS), &["link"]),
+            Err(ConfineError::SymlinkOrNotDirectory)
+        ));
+        assert_eq!(state.get(), Openat2Status::Unavailable);
+        // Logged once: only the first transition reports `true`.
+        assert!(!state.record(Openat2Status::Unavailable));
+        assert!(!state.record(Openat2Status::Denied));
+        assert_eq!(state.get(), Openat2Status::Unavailable);
+        // Openat2 required: ENOSYS is a refusal, never a walk.
+        let required = auto.clone_with(Resolver::Openat2).unwrap();
+        assert!(matches!(
+            required.after_openat2(&state, Err(Errno::NOSYS), &["d"]),
+            Err(ConfineError::Openat2Unavailable)
+        ));
+    }
+
+    #[test]
+    fn openat2_eperm_is_a_permanent_refusal_in_every_openat2_resolver() {
+        let tree = temp_root();
+        for resolver in [Resolver::Auto, Resolver::Openat2] {
+            let state = Openat2State::new();
+            let root = Root::open(&tree.0).unwrap().with_resolver(resolver);
+            let error = root
+                .after_openat2(&state, Err(Errno::PERM), &["d"])
+                .unwrap_err();
+            assert!(matches!(error, ConfineError::Openat2Denied), "{error:?}");
+            assert!(!error.is_transient());
+            assert_eq!(state.get(), Openat2Status::Denied);
+            assert!(!state.record(Openat2Status::Denied));
+        }
+        // Other errors keep their usual classification.
+        let state = Openat2State::new();
+        let root = Root::open(&tree.0).unwrap();
+        assert!(matches!(
+            root.after_openat2(&state, Err(Errno::LOOP), &["d"]),
+            Err(ConfineError::SymlinkOrNotDirectory)
+        ));
+        assert!(matches!(
+            root.after_openat2(&state, Err(Errno::XDEV), &["d"]),
+            Err(ConfineError::CrossesBoundary)
+        ));
+        assert!(
+            root.after_openat2(&state, Err(Errno::AGAIN), &["d"])
+                .unwrap_err()
+                .is_transient()
+        );
+        assert_eq!(state.get(), Openat2Status::Unknown);
+    }
+
+    #[test]
+    fn temp_prefix_is_reserved_case_insensitively() {
+        for path in [
+            ".praetore-tmp-x",
+            ".PRAETORE-TMP-x",
+            "d/.Praetore-Tmp-y",
+            ".praetore-tmp-dir/file",
+        ] {
+            assert!(
+                matches!(
+                    split_relative(path),
+                    Err(ConfineError::InvalidPath("reserved_name"))
+                ),
+                "{path:?}"
+            );
+        }
+        assert!(split_relative("d/praetore-tmp-x").is_ok());
+        assert!(split_relative("d/.praetore-tmp").is_ok());
+        assert!(is_temp_name(b".PRAETORE-tmp-"));
+        assert!(!is_temp_name(b".praetore-tm"));
     }
 }

@@ -11,6 +11,7 @@ description = "Descriptor-based file effects confined beneath a sandbox root dir
 
 [dependencies]
 thiserror = "2.0"
+tracing = "0.1"
 uuid = { version = "1.18", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]

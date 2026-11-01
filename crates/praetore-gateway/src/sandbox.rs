@@ -79,7 +79,9 @@ use crate::{
     ReconciliationReport, local_demo::LocalDemoDispatcher,
 };
 use praetore_core::{Action, Authority};
-use praetore_sandbox_fs::{ConfineError, Root};
+// `is_temp_name`: TEMP_PREFIX compared ASCII case-insensitively, shared with
+// praetore-sandbox-fs (which also refuses such paths on its own).
+use praetore_sandbox_fs::{ConfineError, Openat2Status, Resolver, Root, is_temp_name};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -111,6 +113,20 @@ pub const MAX_PATH_DEPTH: usize = 16;
 pub const TEMP_PREFIX: &str = praetore_sandbox_fs::TEMP_PREFIX;
 /// Mode of every file created or replaced by `fs:write_file`.
 pub const FILE_MODE: u32 = 0o600;
+/// Environment variable that makes [`SandboxDispatcher::require_openat2`]
+/// mandatory for the gateway (`1`/`true`). See [`require_openat2_from_env`].
+pub const REQUIRE_OPENAT2_ENV: &str = "PRAETORE_SANDBOX_REQUIRE_OPENAT2";
+
+/// Parses the value of [`REQUIRE_OPENAT2_ENV`]: unset, empty, `0` or
+/// `false` means not required; `1` or `true` means required; anything else
+/// is a configuration error (fail closed).
+pub fn require_openat2_from_env(value: Option<&str>) -> Result<bool, SandboxConfigError> {
+    match value.map(str::trim) {
+        None | Some("" | "0" | "false") => Ok(false),
+        Some("1" | "true") => Ok(true),
+        Some(other) => Err(SandboxConfigError::InvalidRequireOpenat2(other.to_owned())),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SandboxConfigError {
@@ -136,6 +152,10 @@ pub enum SandboxConfigError {
     Io(#[from] io::Error),
     #[error("sandbox content limit must be between 1 byte and 32 KiB")]
     InvalidLimit,
+    #[error("openat2 is required ({REQUIRE_OPENAT2_ENV}) but {0}")]
+    Openat2Required(&'static str),
+    #[error("{REQUIRE_OPENAT2_ENV} must be 1, true, 0, false or unset, not {0:?}")]
+    InvalidRequireOpenat2(String),
 }
 
 /// What the adapter knows about one execution key, for idempotency and
@@ -144,8 +164,9 @@ pub enum SandboxConfigError {
 struct Records {
     /// Effects performed: action digest and output.
     executions: HashMap<ExecutionKey, (String, Value)>,
-    /// Dispatches that failed before any change to the target: digest.
-    not_applied: HashMap<ExecutionKey, String>,
+    /// Dispatches that failed before any change to the target: digest and
+    /// refusal reason.
+    not_applied: HashMap<ExecutionKey, (String, &'static str)>,
 }
 
 pub struct SandboxDispatcher {
@@ -168,8 +189,9 @@ enum FsOp<'a> {
 /// A dispatch attempt that failed before anything changed at the target, so
 /// reconciliation may truthfully report `NotApplied`. Every failure after
 /// the effect point (`renameat`/`unlinkat`) is reported as success with
-/// `Executed` instead, because the effect did happen.
-struct BeforeEffect;
+/// `Executed` instead, because the effect did happen. Carries the refusal
+/// reason (kept internally; dispatch errors stay opaque).
+struct BeforeEffect(&'static str);
 
 impl SandboxDispatcher {
     /// Opens `root` fail-closed: it must exist and be an absolute, canonical,
@@ -234,7 +256,10 @@ impl SandboxDispatcher {
         // of an action; remove them (best effort, never following links).
         sweep_temp_files(root_fd.as_raw_fd(), root_dev, 0);
         let root_fd = Root::from_fd(root_fd).map_err(|_| SandboxConfigError::NotDirectory)?;
-        Ok(Self {
+        // Records (and logs once, if unavailable or denied) what this kernel
+        // offers, so the startup log below states the resolution in use.
+        praetore_sandbox_fs::probe_openat2(&root_fd);
+        let dispatcher = Self {
             root: canonical,
             c_root,
             root_fd,
@@ -244,7 +269,51 @@ impl SandboxDispatcher {
             max_content_bytes: DEFAULT_MAX_CONTENT_BYTES,
             demo: None,
             records: Mutex::new(Records::default()),
-        })
+        };
+        tracing::info!(
+            root = %dispatcher.root.display(),
+            path_resolution = dispatcher.path_resolution(),
+            "sandbox root opened"
+        );
+        Ok(dispatcher)
+    }
+
+    /// Refuses to run unless the kernel resolves paths with `openat2`
+    /// (Linux >= 5.6, not denied by seccomp): no portable-walk fallback.
+    /// Afterwards a later `ENOSYS` or `EPERM` refuses the action instead of
+    /// degrading.
+    pub fn require_openat2(mut self) -> Result<Self, SandboxConfigError> {
+        let status = praetore_sandbox_fs::probe_openat2(&self.root_fd);
+        if status != Openat2Status::Available {
+            return Err(SandboxConfigError::Openat2Required(status.reason()));
+        }
+        self.root_fd.set_resolver(Resolver::Openat2);
+        tracing::info!(
+            root = %self.root.display(),
+            path_resolution = self.path_resolution(),
+            "sandbox root requires openat2"
+        );
+        Ok(self)
+    }
+
+    /// How intermediate path components are resolved right now, for logs
+    /// and `doctor`.
+    pub fn path_resolution(&self) -> &'static str {
+        match (
+            self.root_fd.resolver(),
+            praetore_sandbox_fs::openat2_status(),
+        ) {
+            (Resolver::Openat2, _) => "openat2 (required)",
+            (Resolver::Walk, _) => "portable O_NOFOLLOW walk",
+            (Resolver::Auto, Openat2Status::Available) => "openat2",
+            (Resolver::Auto, Openat2Status::Unavailable) => {
+                "portable O_NOFOLLOW walk (openat2 unavailable: ENOSYS or not Linux)"
+            }
+            (Resolver::Auto, Openat2Status::Denied) => {
+                "nested paths refused (openat2 denied: EPERM, seccomp or LSM)"
+            }
+            (Resolver::Auto, Openat2Status::Unknown) => "openat2 when available (not probed)",
+        }
     }
 
     pub fn with_max_content_bytes(mut self, limit: usize) -> Result<Self, SandboxConfigError> {
@@ -366,13 +435,14 @@ impl SandboxDispatcher {
     /// contract matches [`BeforeEffect`]: an `Err` from `write_file` or
     /// `remove_file` means the target entry was not changed.
     fn perform(&self, op: &FsOp<'_>) -> Result<DispatchReport, BeforeEffect> {
-        self.check_root_unchanged().map_err(|_| BeforeEffect)?;
+        self.check_root_unchanged()
+            .map_err(|refused| BeforeEffect(refused.reason()))?;
         match op {
             FsOp::Write { path, content } => {
                 let written = self
                     .root_fd
                     .write_file(path, content.as_bytes(), FILE_MODE)
-                    .map_err(|_| BeforeEffect)?;
+                    .map_err(|error| BeforeEffect(refusal(error).reason()))?;
                 let output = json!({
                     "action": WRITE_ACTION,
                     "path": path,
@@ -386,7 +456,10 @@ impl SandboxDispatcher {
                 })
             }
             FsOp::Delete { path } => {
-                let removed = self.root_fd.remove_file(path).map_err(|_| BeforeEffect)?;
+                let removed = self
+                    .root_fd
+                    .remove_file(path)
+                    .map_err(|error| BeforeEffect(refusal(error).reason()))?;
                 let output = json!({"action": DELETE_ACTION, "path": path});
                 Ok(if removed.confirmed {
                     DispatchReport::Confirmed(output)
@@ -430,7 +503,7 @@ impl ActionDispatcher for SandboxDispatcher {
         }
         let result = match self.parse(action) {
             Ok(op) => self.perform(&op),
-            Err(_) => Err(BeforeEffect),
+            Err(refused) => Err(BeforeEffect(refused.reason())),
         };
         match result {
             Ok(report) => {
@@ -444,8 +517,10 @@ impl ActionDispatcher for SandboxDispatcher {
                     .insert(key, (action_digest.to_owned(), output));
                 Ok(report)
             }
-            Err(BeforeEffect) => {
-                records.not_applied.insert(key, action_digest.to_owned());
+            Err(BeforeEffect(reason)) => {
+                records
+                    .not_applied
+                    .insert(key, (action_digest.to_owned(), reason));
                 Err(DispatchError)
             }
         }
@@ -473,7 +548,7 @@ impl ActionDispatcher for SandboxDispatcher {
             }
             Some(_) => ReconciliationReport::Unknown,
             None => match records.not_applied.get(&key) {
-                Some(digest) if digest == action_digest => ReconciliationReport::NotApplied,
+                Some((digest, _)) if digest == action_digest => ReconciliationReport::NotApplied,
                 _ => ReconciliationReport::Unknown,
             },
         }
@@ -527,13 +602,6 @@ pub fn validate_relative_path(path: &str) -> Result<(), DispatchRefused> {
         return Err(DispatchRefused::terminal("path_too_deep"));
     }
     Ok(())
-}
-
-/// [`TEMP_PREFIX`], compared ASCII case-insensitively: on a case-insensitive
-/// filesystem (default APFS) `.PRAETORE-TMP-x` names the same entry.
-fn is_temp_name(name: &[u8]) -> bool {
-    name.len() >= TEMP_PREFIX.len()
-        && name[..TEMP_PREFIX.len()].eq_ignore_ascii_case(TEMP_PREFIX.as_bytes())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,9 +791,11 @@ fn refusal(error: ConfineError) -> DispatchRefused {
         ConfineError::HardLinked => DispatchRefused::terminal("hard_link_not_allowed"),
         ConfineError::NotFound => DispatchRefused::terminal("file_not_found"),
         ConfineError::AlreadyExists => DispatchRefused::terminal("file_exists"),
-        ConfineError::Openat2Unavailable
-        | ConfineError::RootNotDirectory
-        | ConfineError::RootUnavailable(_) => {
+        // Permanent: openat2 was required and is missing, or seccomp/LSM
+        // denies it. Retrying cannot succeed.
+        ConfineError::Openat2Unavailable => DispatchRefused::terminal("openat2_unavailable"),
+        ConfineError::Openat2Denied => DispatchRefused::terminal("openat2_denied"),
+        ConfineError::RootNotDirectory | ConfineError::RootUnavailable(_) => {
             DispatchRefused::transient("sandbox_root_unavailable")
         }
         ConfineError::ParentUnavailable(_) => {
@@ -1505,6 +1575,100 @@ mod tests {
         );
     }
 
+    impl SandboxDispatcher {
+        /// Reason recorded for a dispatch that failed before its effect.
+        fn not_applied_reason(&self, key: ExecutionKey) -> Option<&'static str> {
+            let records = self.records.lock().unwrap();
+            records.not_applied.get(&key).map(|(_, reason)| *reason)
+        }
+    }
+
+    #[test]
+    fn refusal_reasons_are_kept_for_dispatches_that_did_not_apply() {
+        let dirs = dirs();
+        symlink(&dirs.outside, dirs.root.join("link")).unwrap();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        assert!(run(&d, 1, &write("link/x", "x")).is_err());
+        assert_eq!(
+            d.not_applied_reason(key(1)),
+            Some("symlink_or_non_directory_in_path")
+        );
+        assert!(run(&d, 2, &delete("missing.txt")).is_err());
+        assert_eq!(d.not_applied_reason(key(2)), Some("file_not_found"));
+        assert!(run(&d, 3, &write("../x", "x")).is_err());
+        assert_eq!(d.not_applied_reason(key(3)), Some("path_traversal"));
+    }
+
+    #[test]
+    fn openat2_refusals_are_permanent() {
+        for (error, reason) in [
+            (ConfineError::Openat2Denied, "openat2_denied"),
+            (ConfineError::Openat2Unavailable, "openat2_unavailable"),
+        ] {
+            let refused = refusal(error);
+            assert_eq!(refused.reason(), reason);
+            assert!(!refused.is_transient(), "{reason} must not be retried");
+        }
+    }
+
+    #[test]
+    fn require_openat2_env_is_parsed_fail_closed() {
+        for value in [None, Some(""), Some("0"), Some("false"), Some(" 0 ")] {
+            assert!(!require_openat2_from_env(value).unwrap(), "{value:?}");
+        }
+        for value in [Some("1"), Some("true")] {
+            assert!(require_openat2_from_env(value).unwrap(), "{value:?}");
+        }
+        for value in ["yes", "2", "TRUE", "on"] {
+            assert!(
+                matches!(
+                    require_openat2_from_env(Some(value)),
+                    Err(SandboxConfigError::InvalidRequireOpenat2(_))
+                ),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// Linux with openat2 (CI): requiring it works and nested writes go
+    /// through it. Elsewhere (macOS, old kernels): requiring it fails
+    /// closed at startup and the fallback is reported.
+    #[test]
+    fn require_openat2_is_enforced_and_reported() {
+        let dirs = dirs();
+        std::fs::create_dir(dirs.root.join("sub")).unwrap();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let status = praetore_sandbox_fs::openat2_status();
+        eprintln!(
+            "openat2 status: {status:?}; path resolution: {}",
+            d.path_resolution()
+        );
+        if status == Openat2Status::Available {
+            assert_eq!(d.path_resolution(), "openat2");
+            let d = d.require_openat2().unwrap();
+            assert_eq!(d.path_resolution(), "openat2 (required)");
+            assert!(run(&d, 1, &write("sub/x.txt", "x")).is_ok());
+            symlink(&dirs.outside, dirs.root.join("link")).unwrap();
+            assert!(run(&d, 2, &write("link/x.txt", "x")).is_err());
+            assert_eq!(
+                d.not_applied_reason(key(2)),
+                Some("symlink_or_non_directory_in_path")
+            );
+        } else {
+            assert!(d.path_resolution().starts_with("portable") || status == Openat2Status::Denied);
+            match d.require_openat2() {
+                Err(SandboxConfigError::Openat2Required(reason)) => {
+                    assert_eq!(reason, status.reason());
+                }
+                other => panic!("expected Openat2Required, got {:?}", other.err()),
+            }
+        }
+        if cfg!(target_os = "macos") {
+            assert_eq!(status, Openat2Status::Unavailable);
+        }
+        assert!(outside_is_empty(&dirs));
+    }
+
     /// Name -> (inode, content) of every entry in `dir`, not following links.
     fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, (u64, Vec<u8>)> {
         use std::os::unix::fs::MetadataExt;
@@ -1552,6 +1716,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let (dir_path, link_path) = (dirs.root.join("d"), dirs.root.join("d.link"));
         let (swaps, ok, refused, iterations, escape) = std::thread::scope(|scope| {
+            let mut refused = std::collections::BTreeMap::<&'static str, u64>::new();
             // Stops the swapper even if this thread panics, so the scope
             // cannot wait forever.
             struct StopOnDrop<'a>(&'a AtomicBool);
@@ -1576,7 +1741,7 @@ mod tests {
             });
             let guard = StopOnDrop(&stop);
             let started = Instant::now();
-            let (mut ok, mut refused, mut iterations, mut n) = (0u64, 0u64, 0u64, 10_000u128);
+            let (mut ok, mut iterations, mut n) = (0u64, 0u64, 10_000u128);
             let mut escape = None;
             'race: while started.elapsed() < budget && iterations < 20_000 {
                 let fresh = format!("d/new-{}", iterations % 8);
@@ -1590,7 +1755,10 @@ mod tests {
                     n += 1;
                     match run(&d, n, &action) {
                         Ok(_) => ok += 1,
-                        Err(_) => refused += 1,
+                        Err(_) => {
+                            let reason = d.not_applied_reason(key(n)).unwrap_or("unrecorded");
+                            *refused.entry(reason).or_default() += 1;
+                        }
                     }
                     let now = snapshot(&dirs.outside);
                     if now != baseline {
@@ -1614,10 +1782,28 @@ mod tests {
             (swapper.join().unwrap(), ok, refused, iterations, escape)
         });
         eprintln!(
-            "dispatcher race: iterations={iterations} swaps_to_symlink={swaps} ok={ok} refused={refused} escape={escape:?}"
+            "dispatcher race: iterations={iterations} swaps_to_symlink={swaps} ok={ok} refused={refused:?} escape={escape:?} path_resolution={:?}",
+            d.path_resolution()
         );
         assert!(escape.is_none(), "{}", escape.unwrap_or_default());
-        assert!(swaps > 0 && ok > 0 && refused > 0, "race not exercised");
+        // Every refusal is the symlink/escape kind (or the delete that
+        // followed a refused write); nothing transient or unexpected.
+        let expected = [
+            "symlink_or_non_directory_in_path",
+            "mount_point_in_path",
+            "file_not_found",
+        ];
+        assert!(
+            refused.keys().all(|reason| expected.contains(reason)),
+            "unexpected refusal reasons: {refused:?}"
+        );
+        assert!(swaps > 0 && ok > 0, "race not exercised");
+        assert!(
+            refused
+                .get("symlink_or_non_directory_in_path")
+                .is_some_and(|count| *count > 0),
+            "no dispatch was refused for the swapped-in symlink: {refused:?}"
+        );
         assert!(
             std::fs::symlink_metadata(dirs.root.join("d"))
                 .unwrap()

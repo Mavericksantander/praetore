@@ -37,6 +37,15 @@
   the root. The ignored supervisor test `sandbox_dispatch_rejects_symlink_escape`
   is removed: it tested a layer that cannot see the Job's filesystem (#61);
   the case is covered in `praetore-sandbox-fs`.
+  After independent review: the `ENOSYS` fallback is logged once and shown
+  by `SandboxDispatcher::path_resolution()` (startup log and `praetore
+  doctor`); `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` makes the gateway refuse to
+  start without `openat2` and never fall back; `EPERM` from `openat2`
+  (seccomp/LSM) is the permanent refusal `openat2_denied`, not a transient
+  error. The crate refuses `TEMP_PREFIX` components itself (ASCII
+  case-insensitive). New final-component race tests swap `t` with a
+  symlink, a hard link or a directory during writes and deletes; the
+  dispatcher race test now checks the refusal reasons.
 ## 0.3.1-rc.1 - 2026-10-31
 
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,
