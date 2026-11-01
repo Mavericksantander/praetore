@@ -110,13 +110,13 @@ Cursor or a similar tool) do the installation. Copy the prompt below and paste
 it into your agent. The agent should explain every step and wait for your
 approval before it changes anything on your computer.
 
-PRÆTORE is pre-release software (v0.3.0). It has not been independently
+PRÆTORE is pre-release software (v0.3.1). It has not been independently
 audited and comes with no security guarantees.
 
 ### Prompt to copy
 
 ```text
-Install praetore-mcp (PRÆTORE) for me, version v0.3.0, from the official
+Install praetore-mcp (PRÆTORE) for me, version v0.3.1, from the official
 repository https://github.com/Mavericksantander/praetore. Follow these rules
 exactly.
 
@@ -132,14 +132,14 @@ Ground rules
   `praetore-mcp <command> --help` and `praetore-verify --help`. If something
   you need is not there, stop and tell me.
 - Read crates/praetore-mcp/README.md and crates/praetore-mcp/GUIDE.md in the
-  repository at tag v0.3.0 before you start.
+  repository at tag v0.3.1 before you start.
 
 Steps
 1. Check that Rust 1.88 or newer and Cargo are installed (`cargo --version`).
    If not, tell me how to install them and stop.
-2. Install both tools from the official repository, pinned to v0.3.0:
-     cargo install --git https://github.com/Mavericksantander/praetore --tag v0.3.0 --locked praetore-mcp
-     cargo install --git https://github.com/Mavericksantander/praetore --tag v0.3.0 --locked praetore-verify
+2. Install both tools from the official repository, pinned to v0.3.1:
+     cargo install --git https://github.com/Mavericksantander/praetore --tag v0.3.1 --locked praetore-mcp
+     cargo install --git https://github.com/Mavericksantander/praetore --tag v0.3.1 --locked praetore-verify
    Then run `praetore-mcp --version` and show me the output.
 3. Run `praetore-mcp init`. Show me the files it created and explain them.
 4. Find my MCP client. `praetore-mcp install` supports
@@ -221,7 +221,7 @@ language:
   symlink can change after the decision and before the server uses it.
   REQUIRE_APPROVAL has no approval flow yet; enforce mode blocks it. Policy
   changes need a client restart.
-- **Pre-release.** This is v0.3.0, pre-release software with no security
+- **Pre-release.** This is v0.3.1, pre-release software with no security
   guarantees. It has not been independently audited.
 - **You decide.** You approve each step. The agent should not continue
   without your explicit yes.
