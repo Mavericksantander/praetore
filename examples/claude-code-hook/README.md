@@ -103,11 +103,15 @@ Desde la raíz de un clon:
 
 1. Compila `praetore-verify` con `--locked`.
 2. Verifica cada recibo con
-   `praetore-verify evidence --attester-pin ... --issuer-pins ... --require-intent`.
-3. Comprueba que el `policy_digest` de cada recibo es igual al digest de la
-   `policy.json` publicada.
-4. Altera un byte de una copia y comprueba que la verificación falla.
-5. Resume las decisiones por agente.
+   `praetore-verify evidence --attester-pin ... --issuer-pins ... --require-intent --policy policy.json`.
+   Con `--policy`, praetore-verify exige además que el `policy_digest` de cada
+   recibo sea el de la `policy.json` publicada.
+3. Altera un byte de una copia y comprueba que la verificación falla.
+4. Resume las decisiones por agente (de `index.json`, solo informativo).
+
+Sale con 0 solo si praetore-verify acepta todos los recibos y rechaza la copia
+alterada; con 1 en cualquier otro caso. `test-verify.sh` lo comprueba con un
+bundle de 1000 recibos y con uno que tiene un recibo alterado.
 
 No usa el binario del hook ni ninguna clave privada. Las claves privadas del
 demo existen solo mientras corre `demo.sh` y se borran al terminar. Las
