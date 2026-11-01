@@ -96,6 +96,10 @@
      document: receipts that recorded its digest verify only against it
      (`praetore-verify --policy old-policy.json`).
 
+## 0.3.1 - 2026-11-01
+
+This release also includes every change listed under 0.3.1-rc.1 below.
+
 - **Breaking (journal chain format):** the journal export gains signed
   storage records. Adopting a legacy baseline writes a record signed with
   the evidence attester key into `praetore.storage_records` (migration
@@ -206,7 +210,7 @@
   system catalogs directly.
 - New ignored PostgreSQL tests, run in CI with `--exact`, one per case
   above.
-- **Breaking (engine, Development mode): no `action_type` fallback for rule
+- **BREAKING (engine, Development mode): no `action_type` fallback for rule
   capabilities.** In Development, a matching `Allow` or `RequireApproval`
   rule without `required_capability` was still applied when the authority
   also granted the action's `action_type`. It is now denied in every mode,
