@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 mod journal_export;
 mod policy_classify;
+mod policy_safety_manifest;
 
 const POLICY_FILE: &str = "policy.json";
 const ISSUER_PIN_FILE: &str = "issuer-pin.json";
@@ -290,8 +291,11 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
         "journal-export" => journal_export::run(journal_export::parse(args)?),
         "policy" => match args.next().as_deref() {
             Some("classify") => policy_classify::run(&policy_classify::parse(args)?),
+            Some("safety-manifest") => {
+                policy_safety_manifest::run(policy_safety_manifest::parse(args)?)
+            }
             Some(other) => Err(format!("unknown policy subcommand: {other}").into()),
-            None => Err("policy needs a subcommand: classify".into()),
+            None => Err("policy needs a subcommand: classify, safety-manifest".into()),
         },
         "help" | "--help" | "-h" => {
             print_usage();
@@ -337,6 +341,8 @@ fn print_usage() {
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
            praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> --output <new file>\n\
            praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\
+           praetore policy safety-manifest --policy <path> --key <hex file> --output <new file> [--issued-at <rfc3339>] [--format json|text]\n\
+             (signs the policy's safety namespace manifest; never overwrites)\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
