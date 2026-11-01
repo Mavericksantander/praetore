@@ -1,3 +1,10 @@
+//! PostgreSQL replay guard, execution journal and migration runner.
+//!
+//! The schema and runtime-role checks are best effort and treat the schema
+//! owner, the database owner and superusers as trusted; see
+//! `docs/threat-model.md`, section "Threat model / Modelo de amenaza:
+//! PostgreSQL journal schema".
+
 use postgres::{Client, Transaction};
 use praetore_core::replay::{ReplayGuard, ReplayGuardError};
 use std::sync::Mutex;
@@ -9,10 +16,16 @@ mod migrations;
 mod observability;
 
 pub use connection::{
-    DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RustlsConnect, verify_runtime_role,
+    DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RuntimeRoleOptions, RustlsConnect,
+    TrustedSecurityDefiner, describe_trusted_security_definer, runtime_role_members,
+    verify_runtime_role, verify_runtime_role_with,
 };
 pub use execution::PostgresExecutionJournal;
-pub use migrations::{MIGRATIONS, MigrationError, apply_migrations, verify_schema_current};
+pub use migrations::{
+    EventTriggerStatus, LegacyBaselineAdoption, MIGRATIONS, MigrationError, MigrationOptions,
+    apply_migrations, apply_migrations_with, event_trigger_report, legacy_baseline_adoption,
+    migration_record_inconsistency, parse_trusted_default_privileges, verify_schema_current,
+};
 pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,
@@ -68,12 +81,22 @@ impl ReplayGuard for PostgresReplayGuard {
     }
 }
 
-pub(crate) fn set_tenant_context(
+/// Search path for every runtime transaction. All runtime SQL names
+/// `praetore.` tables explicitly, so only `pg_catalog` needs to be visible;
+/// a `public.set_config` or `public.=` cannot be picked up, whatever
+/// search_path the database, the role, `ALTER SYSTEM` or the session set.
+pub const RUNTIME_SEARCH_PATH: &str = "pg_catalog, pg_temp";
+
+/// Starts every runtime transaction: pins `search_path` for the transaction
+/// (`SET LOCAL`) and sets `praetore.tenant_id`, which the `tenant_isolation`
+/// RLS policies read, with the schema-qualified `pg_catalog.set_config`.
+pub fn set_tenant_context(
     transaction: &mut Transaction<'_>,
     tenant_id: Uuid,
 ) -> Result<(), postgres::Error> {
+    transaction.batch_execute(&format!("SET LOCAL search_path = {RUNTIME_SEARCH_PATH}"))?;
     transaction.query_one(
-        "SELECT set_config('praetore.tenant_id', $1, true)",
+        "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
         &[&tenant_id.to_string()],
     )?;
     Ok(())

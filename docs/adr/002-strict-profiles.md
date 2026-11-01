@@ -12,8 +12,10 @@ attester key, and a durable caller-owned replay guard. It validates policy
 binding and that an issuer pin is active at construction and on each
 evaluation. No missing production setting falls back to development mode.
 
-Legacy `new` remains for source compatibility but is explicitly Development.
-Applications must not use it for production decisions.
+There is no default profile. The legacy `new` / `with_clock` constructors are
+removed and `AuthorizationEngine` has no `Default`; Development is reached only
+through the explicitly named `development` / `development_with_clock`
+constructors. Applications must not use it for production decisions.
 
 ## Consequences
 

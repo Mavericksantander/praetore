@@ -1151,7 +1151,9 @@ dependencies = [
  "libc",
  "praetore-core",
  "praetore-receipt",
+ "praetore-sandbox-fs",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1276,6 +1278,16 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "uuid",
+]
+
+[[package]]
+name = "praetore-sandbox-fs"
+version = "0.3.1-rc.1"
+dependencies = [
+ "rustix",
+ "thiserror",
+ "tracing",
  "uuid",
 ]
 

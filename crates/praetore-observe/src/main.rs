@@ -32,9 +32,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             VerifiedPublicKey::from_bytes(&bytes).map_err(|error| error.to_string())
         })
         .transpose()?;
-    let reader = Arc::new(PostgresObservabilityReader::from_client(
-        database.connect()?,
-    )?);
+    let mut client = database.connect()?;
+    // The same startup check as the gateway runtime: refuse an owner,
+    // superuser, BYPASSRLS or write-capable role, and a session in which
+    // triggers or row-level security could be switched off. It runs once,
+    // at startup; queries pin their search_path per transaction regardless.
+    let options =
+        praetore_replay_postgres::RuntimeRoleOptions::from_config(|name| env::var(name).ok())?;
+    let relaxed = options.relaxed();
+    if relaxed.is_empty() {
+        tracing::info!("runtime role check: no refusal relaxed");
+    } else {
+        tracing::warn!(
+            ?relaxed,
+            trusted_security_definer = ?options.trusted_security_definer(),
+            "runtime role check relaxed explicitly"
+        );
+    }
+    for function in
+        praetore_replay_postgres::describe_trusted_security_definer(&mut client, &options)?
+    {
+        if function.owner_is_superuser {
+            tracing::warn!(
+                function = %function.resolved,
+                owner = %function.owner,
+                "trusted SECURITY DEFINER function is owned by a superuser"
+            );
+        }
+    }
+    praetore_replay_postgres::verify_runtime_role_with(&mut client, &options)?;
+    let reader = Arc::new(PostgresObservabilityReader::from_client(client)?);
     let state = ObserveState::new(reader, tenant_token_hashes, trusted_attester)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

@@ -71,7 +71,7 @@ Trust boundaries are explicit:
 | Policy substitution or rollback | Tampering, Elevation | Canonical SHA-256 policy digest, strict expected digest, mismatch fails closed; policy pin tests | Secure policy-pin distribution and anti-rollback persistence belong to host/operator |
 | Evidence forgery/tampering | Tampering, Repudiation | SHA-256 integrity; separate attester signature and offline verification; bit-flip/wrong-key tests | Hash alone is not authenticity; trusted attester compromise permits forged evidence |
 | Clock manipulation/skew | Elevation, Denial of Service | Injected clock, exact inclusive validity bounds, expired/not-yet-valid tests | Host clock and allowable skew are operational controls; no implicit tolerance |
-| Development-mode misuse | Elevation | Explicit `development` constructor; deprecated compatibility constructors and HighAssurance configuration tests | Deprecation is a compile-time warning, not a runtime prohibition; deployment configuration must prohibit Development |
+| Development-mode misuse | Elevation | No default mode: only explicitly named `development*` constructors (no `new`, no `Default`, `compile_fail` doc tests); no capability fallback to `action_type` in any mode; HighAssurance configuration tests | Calling `development` is still possible; deployment configuration must prohibit Development |
 | Malicious host process | Information Disclosure, Tampering, Denial of Service | Core performs no implicit network or filesystem access; replay persistence is an explicit caller-owned trait; private-key wrapper redacts Debug; bounded input checks | Same-process attacker can alter memory, steal keys, patch code, falsify outputs, or bypass/roll back replay storage |
 | Authority/policy rollback | Tampering, Elevation | Signed/versioned authorities and pinned policy digest; validity checks | Monotonic version state and rollback detection across restarts require external storage |
 | Strict → Development downgrade | Tampering, Elevation | Production constructor creates a `HighAssurance` engine with no Development fallback; explicit profile constructors distinguish modes | A malicious deployer can change application code/configuration; signed deployment and process control required |
@@ -130,6 +130,55 @@ Trust boundaries are explicit:
 The [assurance matrix](assurance-matrix.md) maps shipped requirements to code,
 tests, and CI jobs. Fuzz smoke, SBOM generation, and audit reduce risk but do
 not constitute exhaustive proof, certification, or a clean-room build.
+
+## Threat model / Modelo de amenaza: PostgreSQL journal schema
+
+This section covers the checks `praetore-replay-postgres` runs on the
+database that holds the execution journal (`apply_migrations`,
+`verify_schema_current`, `verify_runtime_role`). Advisory:
+GHSA-67vm-x598-vhg3.
+
+**Best effort.** These checks inspect a database from inside it, through
+catalogs that the same database maintains. They are best effort: they detect
+mistakes and drift and raise the bar for misuse, but a result computed from
+inside an untrusted database cannot prove that database trustworthy.
+
+**Inside the trust perimeter.** For the privileges on the `praetore` schema,
+the **owner of the `praetore` schema and its objects, the owner of the
+database, and every superuser are trusted**. They can change any object,
+row, grant or catalog entry after the checks run, or edit the system
+catalogs directly. The checks do not defend against a malicious owner or
+superuser.
+
+**What the checks cover** (and refuse, fail closed):
+
+- Runtime sessions pin `search_path = pg_catalog, pg_temp`; settings that
+  disable triggers or row-level security for the runtime role; parameter
+  grants on them; runtime roles that are superusers, owners, `BYPASSRLS`,
+  `CREATEROLE`, or hold write or schema privileges beyond the migrations.
+- Grants on `praetore` objects beyond what the migrations make and the
+  documented `praetore_observe` shape, including `WITH GRANT OPTION`;
+  objects in `praetore` not owned by the schema owner; other members of
+  the owner role (unless listed explicitly); non-superuser members of
+  `pg_read_all_data` or `pg_write_all_data`; objects outside `praetore`
+  that depend on `praetore` objects; `praetore` objects that depend on
+  functions, operators, types or collations outside `pg_catalog` and
+  `praetore`; SECURITY DEFINER functions with the owner's rights that a
+  role other than their owner may execute (unless listed explicitly).
+  Whoever can execute an allowlisted function acts with its owner's
+  privileges.
+- On every `apply_migrations`: the environment (event triggers, default
+  privileges, owner memberships, settings) and the structure of `praetore`
+  compared with a scratch apply of the recorded migrations; adopting a
+  schema without migration records only with an explicit opt-in.
+
+**Out of scope:** changes made by a trusted owner or superuser after the
+checks ran; direct edits of the system catalogs; the contents of rows that
+already exist (the checks are structural); anything outside the database
+the journal uses; and other databases on the same cluster. The checks run
+when the binaries start and when migrating, not continuously. The adoption
+record in `praetore.schema_migrations` is informative and not
+tamper-evident.
 
 ## Operational response
 

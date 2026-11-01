@@ -253,7 +253,7 @@ impl AuthorizationRequest {
             }
             context_bytes += key.len();
             context_bytes += validate_json_value(value)
-                .map_err(|message| crate::PraetoreError::InvalidRequest(message.into()))?;
+                .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
             if context_bytes > MAX_JSON_VALUE_BYTES {
                 return Err(crate::PraetoreError::InvalidRequest(
                     "request context exceeds maximum size".into(),

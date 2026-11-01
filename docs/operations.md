@@ -196,6 +196,24 @@ Use two database roles:
   `GRANT ALL` from an install where the gateway owned the tables.
   `verify_runtime_role` refuses each of these at startup in `http` and
   `sandbox` modes.
+- The runtime session must also be one in which the append-only triggers
+  and row-level security cannot be switched off and names resolve in
+  `pg_catalog`. `verify_runtime_role` refuses: `session_replication_role`
+  other than `origin` (`TriggersDisabled`); `row_security` or
+  `session_replication_role` set for the database or the login role, a
+  non-default session-start value of either (for example from
+  `ALTER SYSTEM`), or a `GRANT SET`/`ALTER SYSTEM ON PARAMETER` on either
+  (`UnsafeSetting`); a `search_path` set for the database or the login role,
+  or a session search_path that does not start with `pg_catalog`
+  (`UnsafeSetting`); and objects in `praetore` that depend on functions,
+  operators, types or collations outside `pg_catalog` and `praetore`
+  (`ForeignDependency`). Runtime transactions pin
+  `search_path = pg_catalog, pg_temp` regardless, and `DatabaseConnector`
+  starts sessions with it. The check runs once, at startup.
+- Only the `search_path` refusals can be relaxed, explicitly:
+  `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; any other
+  value is a configuration error). The gateway and `praetore-observe` log
+  the effective setting at startup, and `praetore doctor` reports it.
 - `praetore_runtime` is a cluster-wide role, so a login member of it can
   connect to every database on the cluster that ran migration 0011. Use one
   PostgreSQL cluster per environment (staging and production never share a
@@ -311,6 +329,61 @@ duplicate claims through newly created clients and concurrent connections.
 That does not replace testing the target deployment's replication and
 disaster-recovery configuration.
 
+### Schema checks, allowlists and managed PostgreSQL
+
+The migration runner and `verify_runtime_role` refuse database state that
+could let another role act as the `praetore` owner or bypass the journal's
+guarantees (see `docs/threat-model.md`, section "Threat model / Modelo de
+amenaza: PostgreSQL journal schema", and GHSA-67vm-x598-vhg3). Some managed
+platforms install such state. Each relaxation is an explicit allowlist, off
+by default, logged at startup and reported by `praetore doctor`:
+
+- `PRAETORE_RUNTIME_LOGINS` (comma-separated login roles): the logins allowed
+  to be members of `praetore_runtime`. Without it, other login members are
+  only reported. **Set it in production**, so that a login added to
+  `praetore_runtime` by mistake is refused at startup.
+- `PRAETORE_SCHEMA_OWNER_MEMBERS` (comma-separated roles): members of the
+  `praetore` schema owner, for example the migrating role of a NOLOGIN owner
+  group.
+- `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS` (semicolon-separated,
+  schema-qualified with the full signature, for example
+  `public.helper(integer)`): SECURITY DEFINER functions with the owner's
+  rights that other roles may execute. An entry that does not resolve is a
+  configuration error. Whoever can execute an allowlisted function acts with
+  its owner's privileges.
+- `PRAETORE_TRUSTED_EVENT_TRIGGERS` (semicolon-separated exact names): event
+  triggers that may exist while migrating. A listed trigger is accepted only
+  if the trigger and its function are owned by superusers, the function is
+  not in `praetore`, and neither owner is, belongs to, or has as member the
+  `praetore` owner or the migrating role; otherwise migrating fails with an
+  error naming the trigger. A listed event trigger runs with its function
+  owner's privileges during every migration DDL.
+- `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES` (semicolon-separated
+  `role:*:objtype`, objtype `r`, `S`, `f`, `T` or `n`): global default
+  privileges of the `praetore` owner or the migrating role that only revoke
+  privileges (for example a hardening `REVOKE EXECUTE ON FUNCTIONS FROM
+  PUBLIC`). Default privileges in other schemas are not considered, because
+  they never apply to `praetore` objects; entries in `praetore`, and global
+  entries that grant privileges, are refused even when listed.
+
+**Supabase (verify on your instance).** Supabase's public `supabase/postgres`
+repository defines these event triggers: `issue_graphql_placeholder`,
+`issue_pg_cron_access`, `issue_pg_graphql_access`, `issue_pg_net_access`,
+`pgrst_ddl_watch` and `pgrst_drop_watch`. A configuration for such an
+instance would be:
+
+```
+PRAETORE_TRUSTED_EVENT_TRIGGERS=issue_graphql_placeholder;issue_pg_cron_access;issue_pg_graphql_access;issue_pg_net_access;pgrst_ddl_watch;pgrst_drop_watch
+```
+
+The runner then verifies each one's owners at startup and refuses to migrate
+if it cannot (for example if they are not owned by superusers unrelated to
+the `praetore` owner and the migrating role). The names, their owners, the
+platform's default privileges and its SECURITY DEFINER functions depend on
+the instance and the platform version: check them on your instance
+(`praetore doctor` lists every event trigger and why it is accepted or
+refused) before adding entries.
+
 ## Offline evidence and authority verification
 
 Build the verifier from the locked workspace:
@@ -337,7 +410,43 @@ target/release/praetore-verify evidence \
 
 `--issuer-pins` on evidence verification additionally validates the authority
 signature, pin validity, and authority subject-key binding against the
-evidence agent. `--require-intent` requires `--issuer-pins`, preventing an
+evidence agent. The issuer pin and authority validity windows are checked at
+the receipt's decision time, not at the verifier's clock: for HighAssurance
+receipts this is `decided_at`, the engine's trusted clock when it evaluated
+the request and checked the authority, which the context hash and attester
+signature cover. A decision time before `not_before` or after `not_after`
+fails (`TRUST_STORE_FAIL` for the pin, `AUTHORITY_EXPIRED` for the
+authority). Receipts that record no decision time (v1, and v3/v4 without
+HighAssurance metadata) carry no signed time, so they are checked at the
+verifier's current time, as before, and stop verifying once their authority
+or pin expires. JSON output reports the instant used as
+`authority_checked_at` and its origin as `authority_checked_at_source`
+(`receipt_decided_at` or `verifier_clock`); text output prints
+`authority_checked_at_source` first, right after the result code. Success
+shows that the authority was valid at that instant, not that it is valid now.
+
+`--require-decision-time` (off by default) makes the evidence command fail
+closed: a receipt that records no signed `decided_at` fails with
+`DECISION_TIME_MISSING`, with or without `--issuer-pins`, and nothing falls
+back to the verifier's clock. Use it when only HighAssurance receipts are
+acceptable. The `journal` command does not check authorities and does not
+accept the flag.
+
+Known limit of the decision-time check: it is only as trustworthy as the
+attester key. Anyone holding that key can sign a receipt with a back-dated
+`decided_at`, and that receipt passes even after the issuer pin has expired,
+because the issuer pin is also checked at `decided_at`. The attester pin is a
+bare public key with no validity window, so the verifier cannot limit an
+attester key to decisions made before a given date. An OK therefore proves
+that the authority was valid at the signed decision time only as far as the
+attester key is trusted; if an attester key is retired after compromise,
+treat every receipt it signed as unverified.
+
+Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
+receipts (required before 2027-01-29, when their authorities and issuer pins
+expire): `--require-decision-time` becomes the default, with an explicit
+`--allow-verifier-clock` to keep the verifier-clock fallback, and the
+attester pin gets a validity window that `decided_at` must fall inside. `--require-intent` requires `--issuer-pins`, preventing an
 intent signature from being accepted under only a self-asserted embedded
 agent key. For standalone authority documents, `--agent agent.json` is
 optional; without it, the CLI verifies the signed subject-key hash is present

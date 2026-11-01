@@ -2311,21 +2311,11 @@ mod tests {
         assert_ne!(status, StatusCode::FORBIDDEN);
     }
 
-    #[test]
-    #[ignore = "T-013 fix B (stage 2): a relative path that is a symlink leaving the sandbox root is only lexical-checked; no confined dispatcher resolves it yet. Fails today."]
-    fn sandbox_dispatch_rejects_symlink_escape() {
-        let root = std::env::temp_dir().join(format!("praetore-t013-{}", Uuid::new_v4()));
-        let sandbox = root.join("sandbox");
-        let outside = root.join("outside");
-        std::fs::create_dir_all(&sandbox).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let target = outside.join("secret");
-        std::fs::write(&target, b"secret").unwrap();
-        std::os::unix::fs::symlink(&target, sandbox.join("link")).unwrap();
-        // Relative to the sandbox root, so fix A (lexical) cannot reject it:
-        // only resolving it against the root (fix B) can.
-        let rejected = !parameters_match_schema(&path_schema(), &json!({"path": "link"}));
-        let _ = std::fs::remove_dir_all(&root);
-        assert!(rejected, "symlink path was accepted");
-    }
+    // T-013 fix B: `sandbox_dispatch_rejects_symlink_escape` used to sit here,
+    // ignored. It tested the wrong layer: the supervisor never sees the Job's
+    // filesystem (PR #61), so its schema check stays lexical by design. The
+    // case now lives where the file effect happens, with a real symlink in
+    // a real root: crates/praetore-sandbox-fs/tests/confinement.rs
+    // (`final_component_symlink_is_never_followed`,
+    // `intermediate_symlink_is_never_followed`) and tests/race.rs.
 }

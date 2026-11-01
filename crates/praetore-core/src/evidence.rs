@@ -105,6 +105,21 @@ impl EvidenceAttesterKey {
     pub fn key_id(&self) -> String {
         key_id(self.signing_key.verifying_key().as_bytes())
     }
+
+    /// Ed25519 signature over `domain || payload`. Crate-internal: only the
+    /// record types of this crate, each with its own domain, sign with it.
+    pub(crate) fn sign_with_domain(&self, domain: &[u8], payload: &[u8]) -> [u8; 64] {
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
+        message.extend_from_slice(payload);
+        self.signing_key.sign(&message).to_bytes()
+    }
+}
+
+/// The attester key id of a public key (as recorded in receipts and
+/// storage records).
+pub(crate) fn attester_key_id(public_key: &VerifiedPublicKey) -> String {
+    key_id(&public_key.as_bytes())
 }
 
 fn key_id(public_key: &[u8; 32]) -> String {
@@ -145,7 +160,7 @@ impl Evidence {
     ) -> crate::Result<Self> {
         decision
             .validate()
-            .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+            .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))?;
         // Every new decision records `decided_by`, which only v4 may carry.
         let evidence_schema_version = 4;
         let mut evidence = Self {
@@ -538,7 +553,7 @@ impl Evidence {
         for (key, value) in &self.context {
             context_size += key.len();
             context_size += validate_json_value(value)
-                .map_err(|message| crate::PraetoreError::EvidenceError(message.into()))?;
+                .map_err(|error| crate::PraetoreError::EvidenceError(error.to_string()))?;
             if context_size > MAX_JSON_VALUE_BYTES {
                 return Err(crate::PraetoreError::EvidenceError(
                     "evidence context exceeds maximum size".into(),

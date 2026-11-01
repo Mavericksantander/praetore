@@ -2,6 +2,311 @@
 
 ## Unreleased
 
+- **Breaking (journal chain format):** the journal export gains signed
+  storage records. Adopting a legacy baseline writes a record signed with
+  the evidence attester key into `praetore.storage_records` (migration
+  0015, append-only) in the adoption transaction; adoption without a signer
+  is refused (`MigrationError::AdoptionRequiresSigner`). `praetore
+  journal-export --database` exports them as a database-level chain
+  (`record` lines), and a tenant export of a database with records starts
+  with a `database_head` reference to that chain. `praetore-verify journal`
+  verifies both, and `--database-journal`/`--expected-database-head` check
+  the reference. Chains without records are unchanged; older verifiers
+  refuse chains with the new lines. See
+  `docs/proposals/journal-chain-jsonl.md`.
+- Migration checks accept event triggers and global revoke-only default
+  privileges only when listed explicitly (`PRAETORE_TRUSTED_EVENT_TRIGGERS`,
+  `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES`; off by default; listed event
+  triggers are verified at startup and refused if they cannot be). Default
+  privileges in schemas other than `praetore` are no longer considered.
+  Relaxations are logged at startup and reported by `praetore doctor`.
+  `docs/operations.md` documents them and recommends
+  `PRAETORE_RUNTIME_LOGINS` in production.
+- **Breaking:** an existing `praetore` schema without migration records is
+  no longer adopted silently. `apply_migrations` refuses it
+  (`MigrationError::LegacyBaselineNotAdopted`). Adoption is explicit:
+  `PRAETORE_ADOPT_LEGACY_BASELINE=1` for the gateway service,
+  `praetore run <directory> --adopt-legacy-baseline` (or the same variable)
+  for the CLI, `apply_migrations_with` and `MigrationOptions` in the
+  library. An adoption is recorded in `praetore.schema_migrations`
+  (`adopted_legacy_baseline`, `adopted_by`, `baseline_structure_sha256`,
+  with `applied_at`), returned by `legacy_baseline_adoption`, logged by the
+  gateway service and printed by `praetore doctor`. The record is
+  informative and not tamper-evident; `baseline_structure_sha256` identifies
+  the compared 0001-0009 structure for the server version, not the
+  database. `praetore doctor` flags the most direct inconsistency
+  (`migration_record_inconsistency`). Fresh databases and databases with
+  migration records are unaffected.
+- `apply_migrations` compares the `praetore` structure with a scratch apply
+  of the recorded migrations on every run (before migrating forward and
+  after applying), checks owners on every run, and runs migrations as the
+  schema owner when it is a NOLOGIN group of the migrating role
+  (`MigrationError::SchemaDrift`, `MigrationError::InvalidConfiguration`).
+- `verify_runtime_role` also checks ownership of every `praetore` object,
+  members of the schema owner (allowed only through
+  `PRAETORE_SCHEMA_OWNER_MEMBERS`), non-superuser members of
+  `pg_read_all_data`/`pg_write_all_data`, objects elsewhere that depend on
+  `praetore`, `WITH GRANT OPTION`, the exact documented `praetore_observe`
+  columns, and SECURITY DEFINER functions with the owner's rights that any
+  other role may execute. Other login members of `praetore_runtime` are
+  reported at startup and by `praetore doctor`, and refused when
+  `PRAETORE_RUNTIME_LOGINS` lists the allowed ones.
+- `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS` entries must be
+  schema-qualified with their signature; they are resolved by OID, an
+  entry that does not resolve is a configuration error, superuser-owned
+  ones are logged with a warning, and `praetore run` reads the variable.
+- `docs/threat-model.md` describes the trust perimeter of these checks.
+- `apply_migrations` checks the database environment on every run, fresh,
+  adopted or current (`MigrationError::UnsafeDatabase`).
+  `verify_runtime_role` checks schema ACLs (`RuntimeRoleError::UnexpectedGrant`):
+  only the grants the migrations make and the documented `praetore_observe`
+  shape are accepted. SECURITY DEFINER functions with the owner's rights are
+  refused unless listed in `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`
+  (semicolon-separated; logged at startup).
+- The 0009 baseline check in `praetore-replay-postgres` (a `praetore`
+  schema without migration records, recorded as 0001-0009 without running
+  them) now compares the live schema with 0001-0009 applied by the same
+  server, not names. In a transaction that is always rolled back, 0001-0009
+  run in a scratch schema (schema name rewritten; the `praetore.tenant_id`
+  setting is kept), and a canonical dump of both schemas must be identical:
+  relations (kind, RLS and FORCE RLS, owner, ACL, index and view
+  definitions), columns (type, NOT NULL, default, identity, collation,
+  column ACL), constraints (`pg_get_constraintdef`), functions (`prosrc`,
+  result, language, SECURITY DEFINER, `SET search_path`, volatility,
+  STRICT, LEAKPROOF, parallel, owner, ACL; overloads are separate),
+  triggers (`pg_get_triggerdef`, enabled, internal triggers), RLS policies
+  (command, roles, USING, WITH CHECK), rewrite rules, inheritance and
+  partitions, types, other objects in the schema, and objects in other
+  schemas that depend on it. The schema owner must be the migrating role
+  or one it is a member of; event triggers, default privileges for the
+  schema or owner, and per-database or per-role `search_path`,
+  `row_security` or `session_replication_role` settings are refused. Any
+  difference refuses the migration and names the objects
+  (`MigrationError::UnrecognizedSchema` now carries a `String`).
+- The migration runner sends every statement with
+  `search_path = pg_catalog, pg_temp` (the caller's value is restored) and
+  catalog names qualified. It refuses a session with
+  `session_replication_role` other than `origin`
+  (`MigrationError::UnsafeSession`), fresh database or not.
+- `crates/praetore-replay-postgres/migrations/.gitattributes` keeps the
+  migrations LF (`*.sql text eol=lf`): their bytes are checksummed and
+  compared.
+- `verify_runtime_role` also refuses
+  (`RuntimeRoleError::OwnerFunctionExecutable`) a SECURITY DEFINER function
+  outside `pg_catalog`/`information_schema` that runs with the praetore
+  owner's rights and that the runtime role may execute.
+- The baseline check also refuses SECURITY DEFINER functions outside
+  `praetore` that run with the owner's rights; any role that can act as the
+  owner other than the migrating role and NOLOGIN groups it belongs to (the
+  owner must be the migrating role or such a group); `FOR ALL TABLES` and
+  `TABLES IN SCHEMA praetore` publications. The dump adds sequence
+  parameters, index flags (`indisvalid`, `indisready`, `indislive`,
+  `indimmediate`), `relhastriggers`, `relhasrules`, replica identity, access
+  method and the column collation with its schema. The comparison and the
+  recording of 0001-0009 now run in one transaction with the praetore
+  tables locked, and a failing comparison names the server's error.
+- Limits of the baseline check: it inspects an untrusted database from
+  inside it and is best effort. It is structural only (stored rows are not
+  validated; a legitimate `VALIDATE CONSTRAINT` on the `NOT VALID` foreign
+  keys is refused), and it cannot defend against a superuser who edits the
+  system catalogs directly.
+- New ignored PostgreSQL tests, run in CI with `--exact`, one per case
+  above.
+- **Breaking (engine, Development mode): no `action_type` fallback for rule
+  capabilities.** In Development, a matching `Allow` or `RequireApproval`
+  rule without `required_capability` was still applied when the authority
+  also granted the action's `action_type`. It is now denied in every mode,
+  as Strict and HighAssurance already did: the decision is `Deny` with
+  reason `policy rule '<id>' must declare required_capability` and
+  `decided_by` engine guard `unbound_rule_capability`. Actions without a
+  capability stay denied in Development (engine guard `missing_capability`)
+  and rejected with `INVALID_REQUEST` in Strict and HighAssurance. Deny
+  rules without `required_capability` are unaffected. The receipt format is
+  unchanged; no golden file or signed fixture changed.
+
+  Migration (Development only; Strict and HighAssurance behave as before):
+
+  ```rust
+  // Before: allowed in Development when the authority granted "read_data".
+  PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+  // After: the rule names the capability it requires.
+  PolicyRule::new("allow-read", "read_data", PolicyEffect::Allow)
+      .with_capability("read_data")
+  ```
+
+  In policy JSON, set `"required_capability"` on every `Allow` and
+  `RequireApproval` rule. Every action still needs
+  `Action::with_capability(...)`.
+- Engine construction has no default mode. This was already the case since
+  0.2.0 (`new` and `with_clock` were removed in #6) and is now pinned by
+  `compile_fail` doc tests: `AuthorizationEngine::new(..)` and
+  `AuthorizationEngine::default()` do not compile. Choose the profile by
+  name: `AuthorizationEngine::development(policy)` /
+  `development_with_clock(policy, clock)` (explicit, unsigned, local only),
+  `strict(policy, pins)`, or `production(policy, HighAssuranceConfig)`.
+- Docs: README, `docs/crypto-and-policy.md`, `docs/policy-language.md`,
+  ADR-002, ADR-005 and the threat model no longer describe deprecated
+  `new` / `with_clock` compatibility constructors (they no longer exist) and
+  document that the rule-capability requirement applies in every mode.
+- Runtime connections now pin search_path. Every runtime transaction
+  (`praetore_replay_postgres::set_tenant_context`, now public; also used by
+  `praetore journal-export`, `praetore approve` and `praetore dispatch`)
+  sets `search_path = pg_catalog, pg_temp` for the transaction and calls
+  `pg_catalog.set_config`; `DatabaseConnector` starts sessions with the same
+  search_path. `verify_runtime_role` runs its checks under that search_path
+  and also refuses a per-database or per-role `search_path`, `row_security`
+  or `session_replication_role` setting, a non-default session-start value
+  of `row_security` or `session_replication_role`, parameter grants on
+  them, a session search_path that does not start with `pg_catalog`, and a
+  session with `session_replication_role` other than `origin`
+  (`RuntimeRoleError::TriggersDisabled`, `RuntimeRoleError::UnsafeSetting`).
+  It also refuses praetore objects that depend on functions, operators,
+  types or collations outside `pg_catalog` and `praetore`
+  (`RuntimeRoleError::ForeignDependency`).
+  The checks run once at startup; `praetore-observe` now runs them too,
+  and `praetore doctor` reports the effective relaxations.
+  Only the `search_path` refusals can be relaxed, explicitly, with
+  `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; anything else
+  is a configuration error; the effective setting is logged at startup), or
+  `verify_runtime_role_with` and `RuntimeRoleOptions` in the library.
+  `DatabaseConnector` refuses URL `options` that end with an unescaped
+  backslash. The documented `praetore_observe` grant now includes
+  `tenant_id`, which the reader's queries need. `docs/operations.md`
+  documents the runtime refusals.
+- SAF-14 (proposal, `docs/proposals/SAF-14-identidad-por-agente.md`):
+  per-agent identity. It records what the agent signature identifies today
+  (one key per home in `praetore-mcp`, one key per profile in the Claude
+  Code hook, no agent keys in the gateway) and proposes per-profile keys,
+  per-client agents for `praetore-mcp`, and instance/session ids as signed
+  claims. It gives attribution between cooperative agents, not isolation:
+  every key is readable by the same OS user.
+- `examples/claude-code-hook`: a receipt can no longer be re-attributed to
+  another agent by editing an unsigned field. `verify` counted receipts by
+  the unsigned `agent` field of `receipts.jsonl` and `export` copied it into
+  `index.json`, which `verify.sh` only summarized; editing either changed who
+  a receipt was attributed to with exit 0. Now `verify` and `export` read
+  the agent and profile from the signed receipt and fail when the unsigned
+  copy disagrees, `verify` checks the signing identity against
+  `agents/<profile>.json`, and `verify.sh` runs `check-attribution.py`
+  (fails on a mismatch, a missing index entry, or more than one identity per
+  profile) and rejects a re-attributed copy of `index.json`. `init` adds an
+  issuer-signed `praetore.agent_profile` constraint to each authority and
+  the hook sends the same action parameter, so the engine refuses an
+  authority issued for another profile (a profile file copied over another
+  now fails closed instead of signing as the other agent). Claude Code's
+  `agent_id` and `session_id`, when present, are recorded in the signed
+  context (over 128 bytes: deny). `index.json` gains `agent_id`. The receipt
+  format does not change; the committed evidence sets still verify. New
+  `test-attribution.sh` (in CI).
+- `examples/claude-code-hook`, fixes from the independent review of #79:
+  `verify.sh` and `check-attribution.py` accept in `evidence/` only regular,
+  non-hidden `*.json` files and fail on anything else. Before, a hidden
+  `evidence/.X.json` with broken signatures skipped `praetore-verify` (the
+  bash glob ignores dotfiles) but was counted in the attribution (exit 0).
+  An explicit `agent_type: "main"` (a subagent named `main`) no longer gets
+  the main session's profile; explicit `main` and `unregistered` are
+  evaluated as `unregistered` (Deny, signed receipt), and the default
+  policy's context conditions match the signing `profile` instead of the raw
+  `agent`. State created before the `praetore.agent_profile` constraint now
+  fails closed with a message to re-run `init`. A numeric `agent_id` or
+  `session_id` is recorded as its canonical text; one that is not a string
+  or number, or over 128 bytes, is denied under `unregistered` with a signed
+  receipt that records the reason in `praetore.claim_rejected`, not the
+  value. Summaries show unregistered `agent_type` values escaped to ASCII.
+- `examples/claude-code-hook`, second review of #79: `verify.sh` copies the
+  bundle to a temporary directory first and runs every step on that copy,
+  so it verifies and attributes the same bytes (a receipt replaced in the
+  original between steps 3 and 5 used to be counted unverified, exit 0).
+  `check-attribution.py` and the hook's `verify` fail on a repeated receipt
+  (same `evidence_id`, or same agent id and `request_id`), which counted one
+  decision several times. `test-verify.sh` now signs 1000 distinct receipts
+  with the hook instead of copying `bundle/`, since copies of one receipt
+  are now an invalid bundle.
+
+- Policy loading reports size, depth, node, integer, duplicate-key,
+  malformed-JSON and unknown-field rejections with typed errors
+  ([#23](https://github.com/Mavericksantander/praetore/issues/23)); wrong
+  types, missing fields and unknown enum variants are still
+  `PolicyEvaluationFailed(String)`. The error
+  code of all of them stays `POLICY_EVALUATION_FAIL`, so `praetore-verify`,
+  the CLI, the gateway and `praetore-mcp` report the same codes as before.
+  Receipts and policy digests are unchanged.
+  - New `praetore_core::canonical::JsonError` and `parse_json_strict`: the
+    strict parser, `validate_json_value` and the canonical encoder return
+    a typed reason (input size, malformed with line and column, duplicate
+    key, value size, depth, node count, unsafe integer, canonical size).
+    `parse_json_rejecting_duplicates` keeps its `String` error and messages.
+    `MAX_JSON_NODES` is now public.
+  - `Policy::validate` maps canonical-size errors to
+    `PolicyLimitExceeded { CanonicalBytes }` from the typed error, without
+    matching the `"exceeds maximum size"` message.
+  - Breaking: new `PolicyLimit` variants `InputBytes` (raw text passed to
+    `Policy::from_json` over 64 KiB), `JsonDepth` and `JsonNodes`. A
+    decoded value over 64 KiB is `CanonicalBytes`. These used to be
+    `PolicyEvaluationFailed(String)`.
+  - Breaking: new `PraetoreError::PolicyDocumentInvalid(PolicyDocumentError)`
+    with `Malformed { line, column }`, `DuplicateKey`,
+    `UnknownField { field }` and `UnsafeInteger`, for policy documents that
+    used to fail with `PolicyEvaluationFailed(String)`. Wrong types, missing
+    fields and unknown enum values are still `PolicyEvaluationFailed`.
+  - Breaking: `MAX_CONDITION_SET_VALUES` (256) now caps the total number of
+    array elements in a condition's expected value, across every array at
+    every depth, not only the top-level `In` set. A flat `In` set of 256
+    values is still accepted; a policy whose expected value holds more than
+    256 array elements in total is now rejected with
+    `PolicyLimitExceeded { limit: ConditionSetValues, max: 256 }`, shown as
+    "policy limit exceeded: array elements in a condition's expected value
+    (total across all nested arrays) (maximum 256)".
+  - **Limit:** at most 256 array elements per condition, counted as one total
+    over every array in its expected value (the `expected` array itself and
+    arrays nested in arrays or objects, at any depth). Elements are counted,
+    not leaves: `[[]]` counts 1, `[[0]]` counts 2; object keys do not count;
+    the cap is per condition, so two conditions of 256 in one rule are
+    accepted. Only `Exact` and `In` can hold such values. No policy in this
+    repository is affected.
+  - Messages for integral floats outside the safe range now say "JSON
+    integer exceeds interoperable safe range".
+
+- A combined decision's signed `reason` now names the same rule as its
+  `decided_by`. When a DENY rule matched before a RECOVER rule
+  (`[deny d, recover r]`), `decided_by` and the recovery obligation named `r`
+  but `reason` named `d`; the reason now follows the rule with the higher
+  effective severity (RECOVER > DENY > REQUIRE_APPROVAL > ALLOW, earlier rule
+  on a tie), so it no longer depends on rule order. Only the `reason` text of
+  that combination changes. The receipt format is unchanged and receipts
+  signed with the old reason still verify (integrity, attester signature and
+  policy digest; see
+  `receipt_with_the_previous_deny_then_recover_reason_still_verifies` in
+  `tests/core/decision.rs`). Dispatch revalidation (`RecordedDecision::records`)
+  only handles ALLOW/REQUIRE_APPROVAL receipts, which never carry a recovery
+  obligation, so it is not affected. New black-box decision tests live in
+  `tests/core/decision.rs` (the `decision` test target of `praetore-core`);
+  the empty `tests/{core,integration,python,security}` placeholders are gone.
+- **Breaking (`praetore-verify evidence --issuer-pins`):** the embedded
+  authority and its issuer pin are now checked at the receipt's signed
+  decision time instead of the verifier's clock. For HighAssurance receipts
+  that is `decided_at`, the engine clock at evaluation, covered by the context
+  hash and the attester signature. A HighAssurance receipt whose authority has
+  since expired now verifies; one whose `decided_at` falls before the
+  authority's `not_before` or after its `not_after` now fails, whatever the
+  current time. Receipts without HighAssurance metadata (v1, v3/v4 without
+  it) record no signed time and are still checked at the current time; this
+  includes the committed hook evidence sets 03, 04 and 05 and both bundles,
+  so sets 04 and 05 still stop verifying on 2027-01-29. JSON and text output
+  add `authority_checked_at` (RFC 3339) and `authority_checked_at_source`
+  (`receipt_decided_at` or `verifier_clock`). A pass shows the authority was
+  valid at that instant, not that it is valid now; anyone holding the
+  attester key can sign a back-dated `decided_at`, and it passes even after
+  the issuer pin expires, since the pin is also checked at `decided_at` and
+  the attester pin has no validity window. Text output prints
+  `authority_checked_at_source` right after the result code. New optional
+  `--require-decision-time` (off by default): a receipt without a signed
+  `decided_at` fails with `DECISION_TIME_MISSING` instead of falling back to
+  the verifier clock (`journal` does not check authorities and rejects the
+  flag). The `authority` subcommand and its `--now` are unchanged. Planned
+  when sets 04 and 05 are re-recorded with HighAssurance receipts (before
+  2027-01-29): `--require-decision-time` becomes the default with an explicit
+  `--allow-verifier-clock`, and the attester pin gets a validity window.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed
@@ -14,6 +319,38 @@
   `examples/claude-code-hook/test-verify.sh` (in CI): 1000 receipts exit 0
   (141 before the fix), one altered receipt among them exits 1 and is named.
   `scripts/record-hook-demo.sh` had the same `ls | head` and is fixed too.
+- **T-013B:** new crate `praetore-sandbox-fs` (Unix, `#![forbid(unsafe_code)]`,
+  built on `rustix`, which was already in `Cargo.lock`): file effects beneath
+  a sandbox root made through directory descriptors, never through a joined
+  path. On Linux the parent directory is opened with one `openat2(...,
+  RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+  RESOLVE_NO_XDEV)`; on `ENOSYS` and on macOS, one
+  `openat(O_NOFOLLOW | O_DIRECTORY)` per component. The final component is
+  created with `O_CREAT | O_EXCL | O_NOFOLLOW`, replaced with `renameat`,
+  removed with `unlinkat` relative to the parent descriptor, and opened with
+  `O_NOFOLLOW | O_NONBLOCK` plus an `fstat` check. Existing hard links
+  (`st_nlink > 1`), symlinks, FIFOs, sockets and devices are refused.
+  `praetore_gateway::sandbox::SandboxDispatcher` now performs its effects
+  through it (refusal codes and receipt format unchanged; it already walked
+  by descriptor, the new part is `openat2` and `RESOLVE_NO_XDEV`, which also
+  refuses bind mounts). New race tests swap an intermediate directory for a
+  symlink to an outside directory while writes and deletes run; they fail
+  against a deliberately path-based reference
+  (`PRAETORE_SANDBOX_FS_RACE_IMPL=path-based`). Not prevented: a directory
+  moved out of the root while an operation is in flight, and hard links
+  created after the check, both by a process that can also write outside
+  the root. The ignored supervisor test `sandbox_dispatch_rejects_symlink_escape`
+  is removed: it tested a layer that cannot see the Job's filesystem (#61);
+  the case is covered in `praetore-sandbox-fs`.
+  After independent review: the `ENOSYS` fallback is logged once and shown
+  by `SandboxDispatcher::path_resolution()` (startup log and `praetore
+  doctor`); `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` makes the gateway refuse to
+  start without `openat2` and never fall back; `EPERM` from `openat2`
+  (seccomp/LSM) is the permanent refusal `openat2_denied`, not a transient
+  error. The crate refuses `TEMP_PREFIX` components itself (ASCII
+  case-insensitive). New final-component race tests swap `t` with a
+  symlink, a hard link or a directory during writes and deletes; the
+  dispatcher race test now checks the refusal reasons.
 ## 0.3.1-rc.1 - 2026-10-31
 
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,

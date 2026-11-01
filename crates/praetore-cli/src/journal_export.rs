@@ -4,8 +4,8 @@
 //! uses, so producer and verifier cannot disagree on the link.
 
 use praetore_core::{
-    Evidence, VerifiedPublicKey,
-    journal_chain::{ChainExporter, ChainHead, MAX_CHAIN_ENTRIES},
+    Evidence, StorageRecord, VerifiedPublicKey,
+    journal_chain::{ChainExporter, ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
 };
 use std::{
     fs,
@@ -29,6 +29,9 @@ pub enum Source {
     /// total. Both ids are `UUID`, compared byte by byte (the same order as
     /// their lowercase hex text). Reads `PRAETORE_GATEWAY_DATABASE_URL`.
     Database { tenant_id: Uuid },
+    /// The database-level chain of signed storage records
+    /// (`praetore.storage_records`, migration 0015).
+    StorageRecords,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -43,8 +46,15 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
     let mut tenant = None;
     let mut attester_pin = None;
     let mut output = None;
+    let mut database = false;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
+        if flag == "--database" {
+            if std::mem::replace(&mut database, true) {
+                return Err("--database given twice".into());
+            }
+            continue;
+        }
         let slot = match flag.as_str() {
             "--receipts-dir" => &mut receipts_dir,
             "--tenant" => &mut tenant,
@@ -57,12 +67,13 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
             return Err(format!("{flag} given twice").into());
         }
     }
-    let source = match (receipts_dir, tenant) {
-        (Some(dir), None) => Source::ReceiptsDir(dir.into()),
-        (None, Some(tenant)) => Source::Database {
+    let source = match (receipts_dir, tenant, database) {
+        (Some(dir), None, false) => Source::ReceiptsDir(dir.into()),
+        (None, Some(tenant), false) => Source::Database {
             tenant_id: Uuid::parse_str(&tenant).map_err(|_| "--tenant must be a UUID")?,
         },
-        _ => return Err("pass exactly one of --receipts-dir or --tenant".into()),
+        (None, None, true) => Source::StorageRecords,
+        _ => return Err("pass exactly one of --receipts-dir, --tenant or --database".into()),
     };
     Ok(ExportArgs {
         source,
@@ -73,15 +84,36 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
 
 pub fn run(args: ExportArgs) -> CliResult<()> {
     let attester = read_attester_pin(&args.attester_pin)?;
-    let receipts = match &args.source {
-        Source::ReceiptsDir(dir) => read_receipts_dir(dir)?,
+    let url = || {
+        std::env::var("PRAETORE_GATEWAY_DATABASE_URL")
+            .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")
+    };
+    let (text, head, kind, database_head) = match &args.source {
+        Source::ReceiptsDir(dir) => {
+            let (text, head) = export(&read_receipts_dir(dir)?, &attester)?;
+            (text, head, "tenant", None)
+        }
         Source::Database { tenant_id } => {
-            let url = std::env::var("PRAETORE_GATEWAY_DATABASE_URL")
-                .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
-            read_journal(&url, *tenant_id)?
+            let (receipts, records) = read_tenant_export(&url()?, *tenant_id)?;
+            let database_head = if records.is_empty() {
+                None
+            } else {
+                Some(DatabaseHead::from(
+                    export_storage_records(&records, &attester)?.1,
+                ))
+            };
+            let (text, head) = export_with_database_head(&receipts, database_head, &attester)?;
+            (text, head, "tenant", database_head)
+        }
+        Source::StorageRecords => {
+            let records = read_storage_records_only(&url()?)?;
+            if records.is_empty() {
+                return Err("the database has no storage records to export".into());
+            }
+            let (text, head) = export_storage_records(&records, &attester)?;
+            (text, head, "database", None)
         }
     };
-    let (text, head) = export(&receipts, &attester)?;
     // Never overwrite: an existing file may be an anchored export.
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -95,8 +127,13 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
         serde_json::json!({
             "ok": true,
             "command": "journal-export",
+            "kind": kind,
             "entries": head.entries.get(),
             "head": head.head.to_hex(),
+            "database_head": database_head.map(|reference| serde_json::json!({
+                "entries": reference.entries.get(),
+                "head": reference.head.to_hex(),
+            })),
         })
     );
     Ok(())
@@ -106,11 +143,38 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
 /// that does not parse, lacks or fails its attester signature, or repeats an
 /// `evidence_id`.
 pub fn export(receipts: &[String], attester: &VerifiedPublicKey) -> CliResult<(String, ChainHead)> {
+    export_with_database_head(receipts, None, attester)
+}
+
+/// A tenant chain; with `database_head`, its first line references the
+/// database chain (`docs/proposals/journal-chain-jsonl.md`).
+pub fn export_with_database_head(
+    receipts: &[String],
+    database_head: Option<DatabaseHead>,
+    attester: &VerifiedPublicKey,
+) -> CliResult<(String, ChainHead)> {
     let mut exporter = ChainExporter::new(attester);
+    if let Some(reference) = &database_head {
+        exporter.push_database_head(reference)?;
+    }
     for (index, json) in receipts.iter().enumerate() {
         let evidence = Evidence::from_json(json.trim_end())
             .map_err(|error| format!("receipt {index}: {error}"))?;
         exporter.push(&evidence)?;
+    }
+    Ok(exporter.finish()?)
+}
+
+/// The database chain: signed storage records in recording order.
+pub fn export_storage_records(
+    records: &[String],
+    attester: &VerifiedPublicKey,
+) -> CliResult<(String, ChainHead)> {
+    let mut exporter = ChainExporter::new(attester);
+    for (index, json) in records.iter().enumerate() {
+        let record = StorageRecord::from_json(json)
+            .map_err(|error| format!("storage record {index}: {error}"))?;
+        exporter.push_record(&record)?;
     }
     Ok(exporter.finish()?)
 }
@@ -171,6 +235,7 @@ fn read_receipts_dir(dir: &Path) -> CliResult<Vec<String>> {
 const JOURNAL_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
      WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id LIMIT $2";
 
+#[cfg(test)]
 fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut client = crate::connect_local_database(database_url)?;
     // Same policy as `praetore run`: a privileged or owner role is allowed for
@@ -182,6 +247,59 @@ fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     read_journal_rows(&mut client, tenant_id)
 }
 
+/// Storage records in recording order (none before migration 0015).
+const STORAGE_RECORDS_QUERY: &str = "SELECT record_json FROM praetore.storage_records \
+     ORDER BY created_at, record_id LIMIT $1";
+
+fn read_storage_records(transaction: &mut postgres::Transaction<'_>) -> CliResult<Vec<String>> {
+    let exists: bool = transaction
+        .query_one(
+            "SELECT pg_catalog.to_regclass('praetore.storage_records') IS NOT NULL",
+            &[],
+        )?
+        .get(0);
+    if !exists {
+        return Ok(Vec::new());
+    }
+    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
+    let rows = transaction.query(STORAGE_RECORDS_QUERY, &[&limit])?;
+    if rows.len() > MAX_CHAIN_ENTRIES {
+        return Err("too many storage records for one export".into());
+    }
+    Ok(rows.iter().map(|row| row.get(0)).collect())
+}
+
+fn read_storage_records_only(database_url: &str) -> CliResult<Vec<String>> {
+    let mut client = crate::connect_local_database(database_url)?;
+    let mut transaction = export_transaction(&mut client, Uuid::nil())?;
+    let records = read_storage_records(&mut transaction)?;
+    transaction.commit()?;
+    Ok(records)
+}
+
+/// The tenant's receipts and the database's storage records, read in one
+/// repeatable-read snapshot so the tenant chain references the database
+/// head of the same moment.
+fn read_tenant_export(
+    database_url: &str,
+    tenant_id: Uuid,
+) -> CliResult<(Vec<String>, Vec<String>)> {
+    let mut client = crate::connect_local_database(database_url)?;
+    if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
+        eprintln!("warning: {error} (the export query still filters by tenant)");
+    }
+    let mut transaction = export_transaction(&mut client, tenant_id)?;
+    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
+    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
+    let records = read_storage_records(&mut transaction)?;
+    transaction.commit()?;
+    if rows.len() > MAX_CHAIN_ENTRIES {
+        return Err("too many journal rows for one export".into());
+    }
+    Ok((rows.iter().map(|row| row.get(0)).collect(), records))
+}
+
+#[cfg(test)]
 fn read_journal_rows(client: &mut postgres::Client, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut transaction = export_transaction(client, tenant_id)?;
     let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
@@ -200,11 +318,12 @@ fn export_transaction(
     client: &mut postgres::Client,
     tenant_id: Uuid,
 ) -> Result<postgres::Transaction<'_>, postgres::Error> {
-    let mut transaction = client.build_transaction().read_only(true).start()?;
-    transaction.query_one(
-        "SELECT set_config('praetore.tenant_id', $1, true)",
-        &[&tenant_id.to_string()],
-    )?;
+    let mut transaction = client
+        .build_transaction()
+        .read_only(true)
+        .isolation_level(postgres::IsolationLevel::RepeatableRead)
+        .start()?;
+    praetore_replay_postgres::set_tenant_context(&mut transaction, tenant_id)?;
     Ok(transaction)
 }
 
@@ -390,6 +509,90 @@ mod tests {
 
     /// Exports real `praetore.execution_journal` rows of one tenant. Run with:
     /// `PRAETORE_TEST_DATABASE_URL=postgresql://user@127.0.0.1:port/db cargo test -p praetore-cli -- --ignored journal_export`
+    /// Option B (GHSA-67vm-x598-vhg3): the database export holds the signed
+    /// adoption record, and a tenant export references its head, read from
+    /// one snapshot. Run with PRAETORE_TEST_DATABASE_URL (a superuser).
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_database_export_and_tenant_reference() {
+        use praetore_core::journal_chain::{
+            DatabaseHead, ExpectedDatabaseHead, JournalKind, verify_journal,
+        };
+        let base_url = std::env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        let name = format!("praetore_export_{}", Uuid::new_v4().simple());
+        let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).unwrap();
+        admin
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+        let (prefix, _) = base_url.rsplit_once('/').unwrap();
+        let url = format!("{prefix}/{name}");
+        let result = std::panic::catch_unwind(|| {
+            let key = praetore_core::EvidenceAttesterKey::from_secret_bytes(&[42; 32]);
+            let record_pin = key.public_key().unwrap();
+            let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+            for (_, sql) in &praetore_replay_postgres::MIGRATIONS[..9] {
+                client.batch_execute(sql).unwrap();
+            }
+            praetore_replay_postgres::apply_migrations_with(
+                &mut client,
+                &praetore_replay_postgres::MigrationOptions {
+                    adopt_legacy_baseline: true,
+                    record_signer: Some(std::sync::Arc::new(key)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let set = set("04-sesion-real-bloqueada-web-fetch");
+            let receipt_pin = read_attester_pin(&set.join("attester-public-key.hex")).unwrap();
+            let receipts = read_receipts_dir(&set.join("evidence")).unwrap();
+            let tenant = Uuid::new_v4();
+            for json in &receipts[..2] {
+                insert_row(
+                    &mut client,
+                    (tenant, Uuid::new_v4(), Uuid::new_v4()),
+                    json,
+                    None,
+                );
+            }
+
+            let records = read_storage_records_only(&url).unwrap();
+            assert_eq!(records.len(), 1, "the adoption record");
+            let (database_text, database_head) =
+                export_storage_records(&records, &record_pin).unwrap();
+            let summary = verify_journal(&database_text, &record_pin, None, None, None).unwrap();
+            assert_eq!(summary.kind, JournalKind::Database);
+            eprintln!("database export: {database_text}");
+
+            let (rows, same_records) = read_tenant_export(&url, tenant).unwrap();
+            assert_eq!(rows, receipts[..2].to_vec());
+            assert_eq!(same_records, records, "one snapshot");
+            let reference = DatabaseHead::from(database_head);
+            let (tenant_text, _) =
+                export_with_database_head(&rows, Some(reference), &receipt_pin).unwrap();
+            let expected = ExpectedDatabaseHead {
+                head: database_head.head,
+                entries: Some(database_head.entries),
+            };
+            let summary =
+                verify_journal(&tenant_text, &receipt_pin, None, None, Some(&expected)).unwrap();
+            assert_eq!(
+                summary.kind,
+                JournalKind::Tenant {
+                    database_head: Some(reference)
+                }
+            );
+            let wrong = ExpectedDatabaseHead {
+                head: praetore_core::journal_chain::ChainLink::GENESIS,
+                entries: None,
+            };
+            assert!(verify_journal(&tenant_text, &receipt_pin, None, None, Some(&wrong)).is_err());
+        });
+        let _ = admin.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_export_reads_only_the_tenant_rows_in_insert_order() {
