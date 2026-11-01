@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Breaking (`praetore-verify evidence --issuer-pins`):** the embedded
+  authority and its issuer pin are now checked at the receipt's signed
+  decision time instead of the verifier's clock. For HighAssurance receipts
+  that is `decided_at`, the engine clock at evaluation, covered by the context
+  hash and the attester signature. A HighAssurance receipt whose authority has
+  since expired now verifies; one whose `decided_at` falls before the
+  authority's `not_before` or after its `not_after` now fails, whatever the
+  current time. Receipts without HighAssurance metadata (v1, v3/v4 without
+  it) record no signed time and are still checked at the current time; this
+  includes the committed hook evidence sets 03, 04 and 05 and both bundles,
+  so sets 04 and 05 still stop verifying on 2027-01-29. JSON and text output
+  add `authority_checked_at` (RFC 3339) and `authority_checked_at_source`
+  (`receipt_decided_at` or `verifier_clock`). A pass shows the authority was
+  valid at that instant, not that it is valid now; anyone holding the
+  attester key can sign a back-dated `decided_at`. The `authority`
+  subcommand and its `--now` are unchanged.
 - `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
   bundles. It took the receipt for the tamper check with
   `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed

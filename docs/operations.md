@@ -337,7 +337,22 @@ target/release/praetore-verify evidence \
 
 `--issuer-pins` on evidence verification additionally validates the authority
 signature, pin validity, and authority subject-key binding against the
-evidence agent. `--require-intent` requires `--issuer-pins`, preventing an
+evidence agent. The issuer pin and authority validity windows are checked at
+the receipt's decision time, not at the verifier's clock: for HighAssurance
+receipts this is `decided_at`, the engine's trusted clock when it evaluated
+the request and checked the authority, which the context hash and attester
+signature cover. A decision time before `not_before` or after `not_after`
+fails (`TRUST_STORE_FAIL` for the pin, `AUTHORITY_EXPIRED` for the
+authority). Receipts that record no decision time (v1, and v3/v4 without
+HighAssurance metadata) carry no signed time, so they are checked at the
+verifier's current time, as before, and stop verifying once their authority
+or pin expires. JSON output reports the instant used as
+`authority_checked_at` and its origin as `authority_checked_at_source`
+(`receipt_decided_at` or `verifier_clock`). Success shows that the authority
+was valid at that instant, not that it is valid now. The decision time is only
+as trustworthy as the attester key: anyone holding that key, or a compromised
+attester, can sign a back-dated `decided_at` and make an expired authority
+pass this check. `--require-intent` requires `--issuer-pins`, preventing an
 intent signature from being accepted under only a self-asserted embedded
 agent key. For standalone authority documents, `--agent agent.json` is
 optional; without it, the CLI verifies the signed subject-key hash is present
