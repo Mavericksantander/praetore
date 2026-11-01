@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Claude Code hook example: HighAssurance receipts.**
+  `examples/claude-code-hook` now evaluates with
+  `AuthorizationEngine::production` (HighAssurance) instead of `strict`.
+  Every receipt it writes, the `unclassified` DENY included, records the
+  engine's signed decision time (`decided_at`), so `praetore-verify evidence
+  --issuer-pins` checks the authority and the issuer pin at that instant and
+  `--require-decision-time` accepts it. Intents are signed v2 for the
+  audience `praetore-claude-hook`, valid for 60 s. The replay guard is a
+  durable local claim store in the hook state (`replay/`): one file per
+  request, created with `create_new` (`O_CREAT|O_EXCL`) and `fsync`ed with
+  its directories; any store error denies without a receipt. Freshness is
+  local (60 s lease, no revocation source). `init` creates `replay/`; state
+  created before this change has none and is refused with a message that
+  points to `init` (same pattern as the SAF-14 check). Profiles and
+  per-agent keys (SAF-14), G7 classification and declared Safety tools
+  (no decision, no receipt) are unchanged, and so is the receipt format.
+  The hook's `verify` checks the authority at `decided_at` when a receipt
+  records it. `verify.sh` takes `--require-decision-time`; `demo.sh` checks
+  that the bundle it regenerates is HighAssurance. The committed `bundle/`
+  and sets 03, 04 and 05 are unchanged and verify as before (they fail
+  `--require-decision-time`, as expected). `evidence/VERIFY.md` section 7
+  describes how to record new sets 04 and 05 with this hook. The G7 hook
+  mutant (`scripts/g7-mutants/hook.patch`) is rebased onto the new code.
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without

@@ -84,4 +84,16 @@ step "4. Verificar los recibos con el propio hook y exportar el bundle"
 "$BIN" verify "$STATE"
 rm -rf "$OUT"
 "$BIN" export "$STATE" "$OUT"
-echo "Bundle en $OUT. Verifícalo con: ./examples/claude-code-hook/verify.sh"
+
+step "5. Comprobar que cada recibo es HighAssurance (hora de decisión firmada)"
+python3 -I - "$OUT" <<'PY'
+import json, pathlib, sys
+receipts = sorted(pathlib.Path(sys.argv[1], "evidence").glob("*.json"))
+missing = [r.name for r in receipts
+           if json.loads(r.read_text()).get("evaluation_mode") != "high_assurance"
+           or not json.loads(r.read_text()).get("decided_at")]
+if not receipts or missing:
+    sys.exit(f"recibos sin decided_at: {missing or 'ninguno exportado'}")
+print(f"OK: {len(receipts)} recibos HighAssurance, todos con decided_at")
+PY
+echo "Bundle en $OUT. Verifícalo con: ./examples/claude-code-hook/verify.sh $OUT --require-decision-time"

@@ -221,10 +221,23 @@ jobs:
       # one altered receipt among them must not.
       - name: verify.sh on 1000 receipts and on one altered receipt
         run: ./examples/claude-code-hook/test-verify.sh
-      - name: Regenerate a bundle and verify it
+      # The hook writes HighAssurance receipts: every regenerated receipt
+      # must record its signed decision time (decided_at). The committed
+      # bundle predates them, so the same check must reject it.
+      - name: Regenerate a bundle and verify it (with --require-decision-time)
         run: |
           ./examples/claude-code-hook/demo.sh "$RUNNER_TEMP/claude-code-hook-bundle"
           ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle"
+          ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle" --require-decision-time
+          if ./examples/claude-code-hook/verify.sh examples/claude-code-hook/bundle --require-decision-time; then
+            echo "::error::the committed bundle has no decided_at but passed --require-decision-time"; exit 1
+          fi
+      - name: HighAssurance hook tests (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_high_assurance -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 8 passed" <<<"$output" || { echo "::error::the HighAssurance hook tests did not run"; exit 1; }
       # SAF-14: two agents sign with different issued identities, and no
       # edit of index.json or of the receipt re-attributes a receipt.
       - name: Per-agent attribution end to end

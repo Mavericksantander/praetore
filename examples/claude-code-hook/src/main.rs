@@ -3,21 +3,26 @@
 //! Each agent (the main session and each subagent in `.claude/agents/`) gets
 //! its own Ed25519 key and an authority signed by a local issuer that grants
 //! only that agent's capabilities. For every tool call the hook builds a
-//! signed `AuthorizationRequest`, evaluates it with a strict engine against
-//! `policy.json`, signs the evidence with a local attester key, appends it to
-//! `receipts.jsonl`, and answers Claude Code: `deny` and `requires approval`
+//! signed `AuthorizationRequest`, evaluates it with a HighAssurance engine
+//! against `policy.json` (signed intent window, local freshness and a durable
+//! replay claim, see [`high_assurance`]), which signs the evidence with a
+//! local attester key and records its decision time (`decided_at`), appends
+//! it to `receipts.jsonl`, and answers Claude Code: `deny` and `requires approval`
 //! are enforced; `allow` adds no decision, so Claude Code's own permission
 //! rules still apply.
 //!
 //! Enforcement is cooperative: it holds only for tool calls that pass through
 //! the hook, and only while the hook is configured.
 
+mod high_assurance;
 mod shell;
 
 #[cfg(test)]
 mod attribution_tests;
 #[cfg(test)]
 mod tests_g7;
+#[cfg(test)]
+mod tests_high_assurance;
 
 use std::{
     collections::BTreeMap,
@@ -31,7 +36,7 @@ use praetore_core::{
     Action, AgentId, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest,
     ClassifiedAction, DecisionOutcome, Evidence, EvidenceAttesterKey, Policy, PolicyCondition,
     PolicyEffect, PolicyRule, PraetoreError, RecordedPolicy, TrustedAuthorityIssuer,
-    authority::Validity, engine::AuthorizationEngine,
+    authority::Validity,
 };
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -164,8 +169,12 @@ fn parse_init_options(options: &[String]) -> Result<(String, i64), BoxError> {
             "--root" => root = value.clone(),
             "--valid-days" => {
                 days = value.parse()?;
-                if !(1..=3650).contains(&days) {
-                    return Err("--valid-days must be between 1 and 3650".into());
+                if !(1..=high_assurance::MAX_VALID_DAYS).contains(&days) {
+                    return Err(format!(
+                        "--valid-days must be between 1 and {}",
+                        high_assurance::MAX_VALID_DAYS
+                    )
+                    .into());
                 }
             }
             _ => return Err(format!("unknown option {flag}").into()),
@@ -180,6 +189,8 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
     let home = std::env::var("HOME").map_err(|_| "HOME is not set")?;
     create_private_directory(directory)?;
     create_private_directory(&directory.join(AGENTS_DIR))?;
+    // HighAssurance replay store: one claim file per evaluated request.
+    create_private_directory(&directory.join(high_assurance::REPLAY_DIR))?;
 
     let now = OffsetDateTime::now_utc();
     let validity = Validity {
@@ -794,7 +805,11 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
         &directory.join(ISSUER_PIN_FILE),
     )?)?)?;
-    let engine = AuthorizationEngine::strict(policy, vec![pin])?;
+    let attester =
+        EvidenceAttesterKey::from_secret_bytes(&read_secret(&directory.join(ATTESTER_KEY_FILE))?);
+    // State created before HighAssurance receipts has no replay store and is
+    // refused here (fail closed) until re-initialized.
+    let engine = high_assurance::engine(directory, policy, pin, attester)?;
 
     let (action_type, capability, mut parameters, path_check) =
         classify(&input.tool_name, &input.tool_input, input.cwd.as_deref());
@@ -815,22 +830,21 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     };
     #[cfg(test)]
     tests_g7::SIGNATURES.with(|count| count.set(count.get() + 1));
-    let mut evidence = if unclassified {
+    // The engine signs the evidence with the attester key (HighAssurance)
+    // after the replay claim inputs are fixed; the claim is the last step.
+    let evidence = if unclassified {
         let action = engine.policy().unclassified(action)?;
         let mut request = context.apply(AuthorizationRequest::new_unclassified(
             identity, authority, action,
         )?);
-        request.sign_intent(&key)?;
+        sign_intent(&mut request, &key, engine.policy())?;
         engine.refuse_unclassified(request)?
     } else {
         let action = engine.policy().classify(action)?.into_mission()?;
         let mut request = context.apply(AuthorizationRequest::new(identity, authority, action)?);
-        request.sign_intent(&key)?;
+        sign_intent(&mut request, &key, engine.policy())?;
         engine.evaluate(request)?
     };
-    evidence.sign(&EvidenceAttesterKey::from_secret_bytes(&read_secret(
-        &directory.join(ATTESTER_KEY_FILE),
-    )?))?;
 
     append_receipt(directory, input, agent, profile_name, &evidence)?;
     let outcome = evidence.decision.outcome;
@@ -854,6 +868,25 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         not_governed: false,
         evidence_id: Some(evidence.evidence_id.to_string()),
     })
+}
+
+/// Signs a HighAssurance (v2) intent: for the hook's audience, under the
+/// digest of the policy being evaluated, valid from now for
+/// [`high_assurance::INTENT_LIFETIME`].
+fn sign_intent<A: praetore_core::RequestAction>(
+    request: &mut AuthorizationRequest<A>,
+    key: &AgentKeyPair,
+    policy: &Policy,
+) -> Result<(), BoxError> {
+    let now = OffsetDateTime::now_utc();
+    request.sign_intent_v2(
+        key,
+        high_assurance::AUDIENCE,
+        now,
+        now + high_assurance::INTENT_LIFETIME,
+        policy.digest()?,
+    )?;
+    Ok(())
 }
 
 /// The signed context every hook request carries.
@@ -1054,13 +1087,14 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     let mut tally: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut identities: BTreeMap<String, String> = BTreeMap::new();
     let mut issuer_bound = 0usize;
+    let mut decision_timed = 0usize;
     let mut failures = 0usize;
     // One decision per receipt: a line copied or replayed into the journal
     // would count one decision twice.
     let mut seen_evidence: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_request: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (index, line) in receipts.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let mut check = || -> Result<(Attribution, String, DecisionOutcome), BoxError> {
+        let mut check = || -> Result<(Attribution, String, DecisionOutcome, bool), BoxError> {
             let record: Value = serde_json::from_str(line)?;
             let evidence = Evidence::from_json(&record["evidence"].to_string())?;
             if !evidence.verify_integrity() {
@@ -1068,7 +1102,11 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
             }
             evidence.verify_attester_signature(&attester)?;
             evidence.verify_agent_intent()?;
-            pin.verify_authority_at(&evidence.authority, now)?;
+            // HighAssurance receipts record the signed decision time: the
+            // authority and the pin are checked at it. Older receipts have
+            // none and are checked at this clock, as before.
+            let checked_at = decision_time(&evidence)?;
+            pin.verify_authority_at(&evidence.authority, checked_at.unwrap_or(now))?;
             evidence
                 .authority
                 .verify_subject_identity(&evidence.agent)?;
@@ -1106,11 +1144,17 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
                     format!("(agent id, request_id) repeated (first on line {first})").into(),
                 );
             }
-            Ok((attribution, agent_id, evidence.decision.outcome))
+            Ok((
+                attribution,
+                agent_id,
+                evidence.decision.outcome,
+                checked_at.is_some(),
+            ))
         };
         match check() {
-            Ok((attribution, agent_id, outcome)) => {
+            Ok((attribution, agent_id, outcome, timed)) => {
                 issuer_bound += usize::from(attribution.issuer_bound);
+                decision_timed += usize::from(timed);
                 *tally
                     .entry((attribution.label(), format!("{outcome:?}")))
                     .or_default() += 1;
@@ -1132,10 +1176,26 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     println!(
         "{verified} receipts verified, {failures} failed; {issuer_bound} name their profile in the issuer-signed authority"
     );
+    println!(
+        "{decision_timed} record a signed decision time (decided_at, HighAssurance); their authority was checked at it"
+    );
     if failures > 0 {
         return Err(format!("{failures} receipts failed verification").into());
     }
     Ok(())
+}
+
+/// The signed decision time of a HighAssurance receipt, `None` for receipts
+/// without HighAssurance metadata. Call it only on verified evidence.
+fn decision_time(evidence: &Evidence) -> Result<Option<OffsetDateTime>, BoxError> {
+    if !evidence.is_high_assurance_shape() {
+        return Ok(None);
+    }
+    let decided_at = evidence
+        .decided_at
+        .as_deref()
+        .ok_or("HighAssurance receipt without decided_at")?;
+    Ok(Some(OffsetDateTime::parse(decided_at, &Rfc3339)?))
 }
 
 /// Writes the receipts as a bundle that `praetore-verify` checks without any

@@ -18,10 +18,35 @@ agente haga por otro camino queda fuera (ver Límites).
 - Por cada tool call, el hook arma un `AuthorizationRequest` firmado con la
   clave del perfil (con `praetore.agent_profile` en los parámetros, que el
   motor exige contra la autoridad, y `agent_id`/`session_id` de Claude Code
-  en el contexto firmado si llegan), lo evalúa con un motor `strict` contra
-  una policy v2 que
-  por defecto niega, firma la evidencia con el atestador y la agrega a
-  `receipts.jsonl`.
+  en el contexto firmado si llegan), lo evalúa con un motor
+  **HighAssurance** (`AuthorizationEngine::production`) contra una policy v2
+  que por defecto niega; el motor firma la evidencia con el atestador y el
+  hook la agrega a `receipts.jsonl`.
+- **Recibos HighAssurance.** Cada recibo registra su hora de decisión
+  firmada (`decided_at`): `praetore-verify evidence --issuer-pins` verifica
+  la autoridad y el pin del emisor a esa hora, y con
+  `--require-decision-time` rechaza los recibos que no la tienen. La
+  intención va firmada (v2) para la audiencia `praetore-claude-hook`, bajo el
+  digest de la policy cargada, y vale 60 s. Freshness es local: no hay fuente
+  de revocación (la clave del emisor se descarta en `init`), así que da una
+  lease de 60 s y no detecta revocaciones; para reemplazar las autoridades
+  hay que hacer otro `init`.
+- **Guard de replay durable.** `init` crea `<estado>/replay/`. Cada request
+  evaluado reclama un archivo `replay/<tenant>/<agent id>/<request id>`
+  creado con `create_new` (`O_CREAT|O_EXCL`): de varios procesos que crean el
+  mismo nombre, el kernel deja ganar a uno solo, así que el mismo request se
+  evalúa una vez aunque el hook corra en procesos concurrentes. El archivo y
+  sus directorios se sincronizan a disco (`fsync`) antes de dar el claim por
+  hecho, y nunca se borran. Cualquier error (directorio ausente o
+  reemplazado, symlink, permisos abiertos a grupo u otros, disco lleno, fallo
+  de `fsync`) niega la tool call sin recibo. El estado debe estar en un
+  sistema de archivos local con create exclusivo atómico.
+- **Un estado anterior a los recibos HighAssurance falla cerrado.** Si
+  `<estado>/replay/` no existe, el hook niega cada tool call gobernada con un
+  mensaje que pide correr `praetore-claude-hook init` en un directorio nuevo
+  (mismo patrón que el chequeo de SAF-14). Las tools `Safety` declaradas
+  siguen sin recibir decisión. Los recibos ya escritos siguen verificando con
+  `verify`.
 - `Deny` → la tool call se bloquea. `RequireApproval` → Claude Code le
   pregunta al usuario. `Allow` → el hook no decide y siguen aplicando los
   permisos propios de Claude Code.
@@ -129,9 +154,15 @@ una variable en posición de comando o junto a `push`, o un alias inline
 Desde la raíz de un clon:
 
 ```sh
-./examples/claude-code-hook/demo.sh     # regenera bundle/ con 22 tool calls fijas
+./examples/claude-code-hook/demo.sh /tmp/bundle-ha   # 22 tool calls fijas, recibos HighAssurance
+./examples/claude-code-hook/verify.sh /tmp/bundle-ha --require-decision-time
 ./examples/claude-code-hook/verify.sh   # verifica bundle/ solo con praetore-verify
 ```
+
+`demo.sh` sin argumento reemplaza `bundle/`. El `bundle/` del repositorio se
+generó antes de los recibos HighAssurance: no tiene `decided_at` y con
+`--require-decision-time` falla (`DECISION_TIME_MISSING`), lo esperado. Sin
+la opción sigue verificando como antes.
 
 `verify.sh` hace lo siguiente, sobre una copia del bundle que toma al
 empezar (verifica y atribuye los mismos bytes, aunque el original cambie
@@ -187,8 +218,13 @@ estado. Para exportar los recibos de una sesión real y verificarlos:
 
 ```sh
 <proyecto>/.claude/bin/praetore-claude-hook export <proyecto>/.claude/praetore <bundle>
-./examples/claude-code-hook/verify.sh <bundle>
+./examples/claude-code-hook/verify.sh <bundle> --require-decision-time
 ```
+
+Un estado creado con un binario anterior no tiene `replay/` y el hook nuevo
+lo rechaza: hay que hacer `init` en un directorio nuevo. Cómo grabar los sets
+de evidencia 04 y 05 con el hook HighAssurance:
+[evidence/VERIFY.md](evidence/VERIFY.md#7-recording-new-sets-04-and-05-highassurance).
 
 Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
 `coder` (sonnet) y `explorer` (haiku, solo lectura).
