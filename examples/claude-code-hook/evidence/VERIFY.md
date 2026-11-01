@@ -39,7 +39,7 @@ Real output, set 05:
 == 2. Digest de la policy publicada
 policy.json -> 60388a9ccfa887b9e712dd4f029f0a2aaa0e0f4df62d648c64629b3dae6f0f68
 
-== 3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada e intención
+== 3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada, intención y policy
 OK: 118 recibos verificados, todos ligados a la policy publicada
 
 == 4. Alterar UN byte de una copia de un recibo y comprobar que falla
@@ -47,7 +47,7 @@ OK: 118 recibos verificados, todos ligados a la policy publicada
 {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"}
 OK: la copia alterada fue rechazada (exit 1)
 
-== 5. Resumen por agente y decisión (de index.json)
+== 5. Resumen por agente y decisión (de index.json, solo informativo)
 coder     Allow            47
 coder     RequireApproval  1
 explorer  Allow            19
@@ -67,7 +67,7 @@ Real output, set 04:
 == 2. Digest de la policy publicada
 policy.json -> 60388a9ccfa887b9e712dd4f029f0a2aaa0e0f4df62d648c64629b3dae6f0f68
 
-== 3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada e intención
+== 3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada, intención y policy
 OK: 8 recibos verificados, todos ligados a la policy publicada
 
 == 4. Alterar UN byte de una copia de un recibo y comprobar que falla
@@ -75,7 +75,7 @@ OK: 8 recibos verificados, todos ligados a la policy publicada
 {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"}
 OK: la copia alterada fue rechazada (exit 1)
 
-== 5. Resumen por agente y decisión (de index.json)
+== 5. Resumen por agente y decisión (de index.json, solo informativo)
 main      Allow            8
 total: Allow 8
 
@@ -90,7 +90,7 @@ Real output, set 03:
 == 2. Digest de la policy publicada
 policy.json -> 03f5e97499562eb2abc4ad1a4a2b1cc728a4907089d9d369a36d6a6b3ea102c3
 
-== 3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada e intención
+== 3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada, intención y policy
 OK: 22 recibos verificados, todos ligados a la policy publicada
 
 == 4. Alterar UN byte de una copia de un recibo y comprobar que falla
@@ -98,7 +98,7 @@ OK: 22 recibos verificados, todos ligados a la policy publicada
 {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"}
 OK: la copia alterada fue rechazada (exit 1)
 
-== 5. Resumen por agente y decisión (de index.json)
+== 5. Resumen por agente y decisión (de index.json, solo informativo)
 coder     Allow            2
 coder     Deny             4
 coder     RequireApproval  5

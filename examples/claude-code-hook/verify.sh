@@ -5,6 +5,8 @@
 # Uso, desde la raíz de un clon:
 #   ./examples/claude-code-hook/verify.sh [bundle]
 # Por defecto verifica examples/claude-code-hook/bundle.
+# Sale con 0 solo si praetore-verify acepta todos los recibos (con la policy
+# publicada) y rechaza la copia alterada; con 1 en cualquier otro caso.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,24 +27,29 @@ POLICY_DIGEST="$("$VERIFY" policy-digest --policy "$BUNDLE/policy.json" --format
   python3 -c 'import json,sys; print(json.load(sys.stdin)["details"]["digest"])')"
 echo "policy.json -> $POLICY_DIGEST"
 
-step "3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada e intención"
-count=0
-for evidence in "$BUNDLE"/evidence/*.json; do
+step "3. Verificar cada recibo: integridad, firma del atestador, autoridad pineada, intención y policy"
+# Glob a un array, sin `ls | head`: con cientos de recibos, `head` cerraba el
+# pipe, `ls` recibía SIGPIPE y pipefail hacía salir el script con 141 aunque
+# todo hubiera verificado.
+shopt -s nullglob
+receipts=("$BUNDLE"/evidence/*.json)
+shopt -u nullglob
+[ "${#receipts[@]}" -gt 0 ] || fail "el bundle no tiene recibos"
+for evidence in "${receipts[@]}"; do
+  # --policy: praetore-verify exige que el recibo registre el digest de la
+  # policy publicada.
   "$VERIFY" evidence \
     --evidence "$evidence" \
     --attester-pin "$BUNDLE/attester-public-key.hex" \
     --issuer-pins "$BUNDLE/issuer-pins.jsonl" \
     --require-intent \
+    --policy "$BUNDLE/policy.json" \
     --format json >/dev/null || fail "$(basename "$evidence") no verificó"
-  BOUND="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["policy_digest"])' "$evidence")"
-  [ "$BOUND" = "$POLICY_DIGEST" ] || fail "$(basename "$evidence"): policy_digest distinto"
-  count=$((count + 1))
 done
-[ "$count" -gt 0 ] || fail "el bundle no tiene recibos"
-echo "OK: $count recibos verificados, todos ligados a la policy publicada"
+echo "OK: ${#receipts[@]} recibos verificados, todos ligados a la policy publicada"
 
 step "4. Alterar UN byte de una copia de un recibo y comprobar que falla"
-SAMPLE="$(ls "$BUNDLE"/evidence/*.json | head -1)"
+SAMPLE="${receipts[0]}"
 python3 - "$SAMPLE" "$WORK/tampered.json" <<'PY'
 import sys
 data = bytearray(open(sys.argv[1], "rb").read())
@@ -65,8 +72,10 @@ set -e
 [ "$TAMPER_RC" -ne 0 ] || fail "la copia alterada verificó (no debería)"
 echo "OK: la copia alterada fue rechazada (exit $TAMPER_RC)"
 
-step "5. Resumen por agente y decisión (de index.json)"
-python3 - "$BUNDLE/index.json" <<'PY'
+step "5. Resumen por agente y decisión (de index.json, solo informativo)"
+# No cambia el código de salida: index.json no está firmado y el resultado ya
+# lo dieron los pasos 3 y 4.
+python3 - "$BUNDLE/index.json" <<'PY' || echo "aviso: no se pudo resumir index.json"
 import collections, json, sys
 index = json.load(open(sys.argv[1]))
 tally = collections.Counter((e["agent"], e["outcome"]) for e in index)

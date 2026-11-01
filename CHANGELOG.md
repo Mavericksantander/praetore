@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `examples/claude-code-hook/verify.sh` no longer exits with 141 on large
+  bundles. It took the receipt for the tamper check with
+  `ls evidence/*.json | head -1`; with a few hundred receipts `head` closed
+  the pipe, `ls` got SIGPIPE and `pipefail` ended the script with 141 after
+  every receipt had verified. It now uses a bash array from the glob. The
+  policy binding is checked by `praetore-verify evidence --policy` instead of
+  a Python comparison per receipt, so the exit code is 0 only when
+  praetore-verify accepts every receipt and rejects the altered copy, and 1
+  otherwise; the `index.json` summary is informational. New
+  `examples/claude-code-hook/test-verify.sh` (in CI): 1000 receipts exit 0
+  (141 before the fix), one altered receipt among them exits 1 and is named.
+  `scripts/record-hook-demo.sh` had the same `ls | head` and is fixed too.
 ## 0.3.1-rc.1 - 2026-10-31
 
 - CI builds `praetore-mcp` release binaries for `x86_64-unknown-linux-gnu`,

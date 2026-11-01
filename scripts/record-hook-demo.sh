@@ -54,7 +54,9 @@ else:
   echo "  OK: $n recibos verificados"
   sleep 1
   say "alterar 1 byte de una copia de un recibo y volver a verificar"
-  python3 - "$(ls "$B"/evidence/*.json | head -1)" "$WORK/tampered.json" <<'PY'
+  # Glob y no `ls | head`: con muchos recibos `ls` recibe SIGPIPE (exit 141).
+  receipts=("$B"/evidence/*.json)
+  python3 - "${receipts[0]}" "$WORK/tampered.json" <<'PY'
 import sys
 d = bytearray(open(sys.argv[1], "rb").read())
 i = d.index(b'"outcome":"') + len('"outcome":"')
