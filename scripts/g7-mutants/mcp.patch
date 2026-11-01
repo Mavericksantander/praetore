@@ -1,8 +1,8 @@
 diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
-index e822f0a..6b2c3ce 100644
+index fb4f619..3aced84 100644
 --- a/crates/praetore-core/src/action.rs
 +++ b/crates/praetore-core/src/action.rs
-@@ -213,6 +213,12 @@ impl MissionAction {
+@@ -300,6 +300,12 @@ impl MissionAction {
      pub fn into_action(self) -> Action {
          self.0
      }
@@ -16,29 +16,34 @@ index e822f0a..6b2c3ce 100644
  
  impl SafetyAction {
 diff --git a/crates/praetore-mcp/src/gate.rs b/crates/praetore-mcp/src/gate.rs
-index b576a04..52eed10 100644
+index c80804e..cfab6ff 100644
 --- a/crates/praetore-mcp/src/gate.rs
 +++ b/crates/praetore-mcp/src/gate.rs
-@@ -1046,7 +1046,7 @@ impl Gate {
- 
-     /// Evaluates and returns the attested evidence without journaling it.
-     pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, GateError> {
--        self.classify_call(server, params)?;
+@@ -1085,11 +1085,8 @@ impl Gate {
+         // G7: classify first. A declared Safety call stops here with no
+         // evaluation and no receipt; an unclassified one is refused by the
+         // engine with a signed DENY, without evaluating any rule.
+-        let unclassified = match self.classify_call(server, params) {
+-            Ok(()) => false,
+-            Err(GateError::UnclassifiedAction { .. }) => true,
+-            Err(error) => return Err(error),
+-        };
 +        // G7 MUTANT: the classify call is removed.
-         let action_type = action_type_of(params);
-         let target = Some(server.to_owned());
-         let mut path_check = None;
-@@ -1063,12 +1063,7 @@ impl Gate {
-             })
-             .map_err(|e| format!("{}: {e}", e.code()))?
-             .with_capability(CAPABILITY);
++        let unclassified = false;
+         let action_type = if unclassified {
+             unclassified_action_type(server, params)
+         } else {
+@@ -1126,12 +1123,7 @@ impl Gate {
+             )?;
+             return self.engine.refuse_unclassified(request).map_err(failed);
+         }
 -        let action = self
 -            .engine
 -            .policy()
 -            .classify(action)
 -            .and_then(ClassifiedAction::into_mission)
--            .map_err(|e| format!("{}: {e}", e.code()))?;
+-            .map_err(failed)?;
 +        let action = praetore_core::MissionAction::mutant_unclassified(action);
-         let mut request =
+         let request = self.signed(
              AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
-                 .map_err(|e| format!("{}: {e}", e.code()))?
+                 .map_err(failed)?,

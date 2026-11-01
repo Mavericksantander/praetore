@@ -1,30 +1,30 @@
 diff --git a/crates/praetore-core/src/engine.rs b/crates/praetore-core/src/engine.rs
-index df416a0..2b056ab 100644
+index f9b1d37..b2c7df0 100644
 --- a/crates/praetore-core/src/engine.rs
 +++ b/crates/praetore-core/src/engine.rs
-@@ -971,7 +971,7 @@ impl AuthorizationEngine {
-         // G7: the action must be a declared Mission action of this engine's
-         // policy (it may have been classified against another policy). Checked
+@@ -1011,7 +1011,7 @@ impl AuthorizationEngine {
+         // engine's policy, and an unclassified one must still be undeclared
+         // (either may have been built against another policy). Checked
          // before the clock, the replay guard or any signature.
--        self.policy.require_mission(&request.action)?;
+-        request.action.check_class(&self.policy)?;
 +        // G7 MUTANT: the engine's class re-check is removed.
          let now = self.clock.now()?;
          if self.mode != EvaluationMode::HighAssurance && request.intent_v2.is_some() {
              return Err(PraetoreError::InvalidRequest(
-@@ -1198,7 +1198,7 @@ impl AuthorizationEngine {
-         request: &AuthorizationRequest,
+@@ -1238,7 +1238,7 @@ impl AuthorizationEngine {
+         request: &AuthorizationRequest<A>,
          now: OffsetDateTime,
      ) -> Result<Decision> {
--        self.policy.require_mission(&request.action)?;
+-        request.action.check_class(&self.policy)?;
 +        // G7 MUTANT: the engine's class re-check is removed.
          request.agent.validate()?;
          request.authority.validate()?;
-         request.action.validate()?;
+         request.action.action().validate()?;
 diff --git a/crates/praetore-core/src/policy.rs b/crates/praetore-core/src/policy.rs
-index 8d0f8b5..aea6aa8 100644
+index a52d23e..060aecb 100644
 --- a/crates/praetore-core/src/policy.rs
 +++ b/crates/praetore-core/src/policy.rs
-@@ -559,7 +559,7 @@ impl Policy {
+@@ -596,7 +596,7 @@ impl Policy {
          #[cfg(feature = "test-probe")]
          crate::probe::record_policy_evaluation(&self.id);
          self.validate()?;

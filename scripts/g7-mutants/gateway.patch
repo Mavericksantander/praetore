@@ -1,8 +1,8 @@
 diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
-index e822f0a..6b2c3ce 100644
+index fb4f619..3aced84 100644
 --- a/crates/praetore-core/src/action.rs
 +++ b/crates/praetore-core/src/action.rs
-@@ -213,6 +213,12 @@ impl MissionAction {
+@@ -300,6 +300,12 @@ impl MissionAction {
      pub fn into_action(self) -> Action {
          self.0
      }
@@ -16,17 +16,30 @@ index e822f0a..6b2c3ce 100644
  
  impl SafetyAction {
 diff --git a/crates/praetore-core/src/authorization.rs b/crates/praetore-core/src/authorization.rs
-index 0d3d85d..abe821f 100644
+index 20cf4d7..4c0cac6 100644
 --- a/crates/praetore-core/src/authorization.rs
 +++ b/crates/praetore-core/src/authorization.rs
-@@ -136,7 +136,9 @@ impl AuthorizationRequest {
-             .map_err(crate::PraetoreError::InvalidRequest)?;
-         let document: AuthorizationRequestDocument = serde_json::from_value(value)
-             .map_err(|error| crate::PraetoreError::InvalidRequest(error.to_string()))?;
--        let action = policy.classify(document.action)?.into_mission()?;
+@@ -170,19 +170,11 @@ impl AuthorizationRequest {
+     /// so the caller can have the engine refuse it with a signed DENY. A
+     /// `Safety` action still returns `SafetyActionNotGoverned`.
+     pub fn classify_json(json: &str, policy: &Policy) -> Result<ClassifiedRequest> {
 +        // G7 MUTANT: the classify call is removed.
 +        let _ = policy;
-+        let action = MissionAction::mutant_unclassified(document.action);
-         let request = Self {
-             request_id: document.request_id,
-             agent: document.agent,
+         let document = parse_document(json)?;
+-        match policy.classify(document.action.clone()) {
+-            Ok(classified) => Ok(ClassifiedRequest::Mission(
+-                document.into_request(classified.into_mission()?)?,
+-            )),
+-            Err(crate::PraetoreError::UnclassifiedAction { .. }) => {
+-                let action = policy.unclassified(document.action.clone())?;
+-                Ok(ClassifiedRequest::Unclassified(
+-                    document.into_request(action)?,
+-                ))
+-            }
+-            Err(error) => Err(error),
+-        }
++        let action = MissionAction::mutant_unclassified(document.action.clone());
++        Ok(ClassifiedRequest::Mission(document.into_request(action)?))
+     }
+ }
+ 

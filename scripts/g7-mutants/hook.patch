@@ -1,8 +1,8 @@
 diff --git a/crates/praetore-core/src/action.rs b/crates/praetore-core/src/action.rs
-index e822f0a..6b2c3ce 100644
+index fb4f619..3aced84 100644
 --- a/crates/praetore-core/src/action.rs
 +++ b/crates/praetore-core/src/action.rs
-@@ -213,6 +213,12 @@ impl MissionAction {
+@@ -300,6 +300,12 @@ impl MissionAction {
      pub fn into_action(self) -> Action {
          self.0
      }
@@ -16,16 +16,16 @@ index e822f0a..6b2c3ce 100644
  
  impl SafetyAction {
 diff --git a/examples/claude-code-hook/src/main.rs b/examples/claude-code-hook/src/main.rs
-index 87ee23c..0193c72 100644
+index ea658cf..b3f39d4 100644
 --- a/examples/claude-code-hook/src/main.rs
 +++ b/examples/claude-code-hook/src/main.rs
-@@ -639,27 +639,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+@@ -700,28 +700,8 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
      // a receipt is appended. A safety action gets no decision from PRÆTORE,
      // so a PRÆTORE failure after this point cannot hold it.
      let policy = load_policy(directory)?;
 -    let action_type = action_type_of(&input.tool_name);
--    match policy.classify(Action::new(action_type, None, json!({}))?) {
--        Ok(ClassifiedAction::Mission(_)) => {}
+-    let unclassified = match policy.classify(Action::new(action_type, None, json!({}))?) {
+-        Ok(ClassifiedAction::Mission(_)) => false,
 -        Ok(ClassifiedAction::Safety(action)) => {
 -            return Ok(Verdict {
 -                outcome: DecisionOutcome::Deny,
@@ -36,24 +36,26 @@ index 87ee23c..0193c72 100644
 -                    action.not_governed()
 -                ),
 -                not_governed: true,
+-                evidence_id: None,
 -            });
 -        }
--        Err(error @ PraetoreError::UnclassifiedAction { .. }) => {
--            // Refused before evaluation, so there is no signed receipt.
--            return Ok(denied(format!("{}: {error}", error.code())));
--        }
+-        // Not declared: the engine refuses it with a signed DENY (engine
+-        // guard `unclassified_action`) after verifying the request like a
+-        // mission request; no policy rule is evaluated.
+-        Err(PraetoreError::UnclassifiedAction { .. }) => true,
 -        Err(error) => return Err(error.into()),
--    }
+-    };
 +    // G7 MUTANT: the classify call is removed.
++    let unclassified = false;
      // Only the absence of `agent_type` is the main session. An explicit
      // `main` (a subagent defined with `name: main`) or `unregistered` is a
      // reserved name and is evaluated as `unregistered`.
-@@ -740,7 +720,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
-         parameters.insert(PROFILE_CONSTRAINT.into(), json!(profile_name));
-     }
-     let action = Action::new(action_type, None, parameters)?.with_capability(capability);
--    let action = engine.policy().classify(action)?.into_mission()?;
-+    let action = praetore_core::MissionAction::mutant_unclassified(action);
-     #[cfg(test)]
-     tests_g7::SIGNATURES.with(|count| count.set(count.get() + 1));
-     let mut request = AuthorizationRequest::new(identity, authority, action)?
+@@ -820,7 +800,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+         request.sign_intent(&key)?;
+         engine.refuse_unclassified(request)?
+     } else {
+-        let action = engine.policy().classify(action)?.into_mission()?;
++        let action = praetore_core::MissionAction::mutant_unclassified(action);
+         let mut request = context.apply(AuthorizationRequest::new(identity, authority, action)?);
+         request.sign_intent(&key)?;
+         engine.evaluate(request)?

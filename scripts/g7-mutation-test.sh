@@ -3,7 +3,8 @@
 # depend on the `classify` call at each entry point.
 #
 # For each entry point (gateway HTTP API, praetore-mcp gate, Claude Code
-# hook), and for the engine's own class re-check, it:
+# hook), for the engine's own class re-check, and for the unclassified
+# refusal deciding before the request is verified, it:
 #   1. runs the G7 runtime tests on the unmodified tree (they must pass);
 #   2. applies scripts/g7-mutants/<entry>.patch, which removes the classify
 #      call and wraps the action unclassified, as the code did before G7
@@ -32,11 +33,12 @@ tests_for() {
     mcp) echo "cargo test --locked -p praetore-mcp --lib g7_" ;;
     hook) echo "cargo test --locked --manifest-path examples/claude-code-hook/Cargo.toml tests_g7" ;;
     engine) echo "cargo test --locked -p praetore-core --test action_classes" ;;
+    unclassified) echo "cargo test --locked -p praetore-core --test action_classes" ;;
   esac
 }
 
 survivors=0
-for mutant in gateway mcp hook engine; do
+for mutant in gateway mcp hook engine unclassified; do
   command="$(tests_for "$mutant")"
   printf '\n== %s: baseline (%s)\n' "$mutant" "$command"
   $command 2>&1 | grep -E '^test |test result' || true
@@ -45,7 +47,7 @@ for mutant in gateway mcp hook engine; do
     exit 1
   fi
 
-  printf '\n== %s: mutant (classify or class re-check removed)\n' "$mutant"
+  printf '\n== %s: mutant applied (scripts/g7-mutants/%s.patch)\n' "$mutant" "$mutant"
   git apply --check "scripts/g7-mutants/$mutant.patch"
   git apply "scripts/g7-mutants/$mutant.patch"
   applied="$mutant"
