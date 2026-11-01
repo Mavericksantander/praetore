@@ -137,9 +137,11 @@ grants capabilities; it does not grant policy permission by itself.
 Set the capability required by the action explicitly with
 `Action::with_capability`. Strict and HighAssurance evaluation reject actions
 without an explicit capability, and Development denies them: the action type
-is never used as an implicit capability. In every mode, a matching `Allow` or
-`RequireApproval` rule without `with_capability` is denied; an authority that
-grants the action type itself does not satisfy it. A policy rule's
+is never used as an implicit capability. In every mode, `AuthorizationEngine`
+denies a matching `Allow` or `RequireApproval` rule without `with_capability`;
+an authority that grants the action type itself does not satisfy it. The
+lower-level `Policy::evaluate` only folds rule effects and does not apply this
+check; use the engine to authorize. A policy rule's
 `with_capability` is an additional rule match condition, not a grant: the
 authority must contain that capability, and the action's own required
 capability must also be granted by the engine.

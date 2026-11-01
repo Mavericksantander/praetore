@@ -429,13 +429,13 @@ impl Clock for FixedClock {
 /// `new` and no `Default`, so an engine without an explicit profile does not
 /// compile:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use praetore_core::{engine::AuthorizationEngine, Policy};
 ///
 /// let engine = AuthorizationEngine::new(Policy::new("local", 1, vec![]));
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use praetore_core::engine::AuthorizationEngine;
 ///
 /// let engine = AuthorizationEngine::default();
