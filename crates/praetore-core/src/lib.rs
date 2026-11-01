@@ -11,6 +11,8 @@ pub mod identity;
 pub mod journal_chain;
 pub mod key_rotation;
 pub mod policy;
+#[cfg(feature = "test-probe")]
+pub mod probe;
 pub mod replay;
 pub mod storage_record;
 

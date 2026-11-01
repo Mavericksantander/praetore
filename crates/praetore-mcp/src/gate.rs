@@ -3,10 +3,10 @@
 
 use crate::store::{self, ACTION_TYPE, AUDIENCE, CAPABILITY, Home, LoadedHome};
 use praetore_core::{
-    Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, DecisionOutcome,
-    Evidence, FreshnessError, FreshnessLease, FreshnessProvider, HighAssuranceConfig,
-    MatchOperator, Policy, ReplayGuard, ReplayGuardError, authority::AuthorityId,
-    engine::AuthorizationEngine, identity::AgentKeyFingerprint,
+    Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, ClassifiedAction,
+    DecisionOutcome, Evidence, FreshnessError, FreshnessLease, FreshnessProvider,
+    HighAssuranceConfig, MatchOperator, Policy, PraetoreError, ReplayGuard, ReplayGuardError,
+    authority::AuthorityId, engine::AuthorizationEngine, identity::AgentKeyFingerprint,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -74,10 +74,59 @@ pub struct Verdict {
     pub journaled: Result<PathBuf, String>,
 }
 
+/// Why a `tools/call` got no verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GateError {
+    /// G7: the call names a safety action (a tool whose name starts with
+    /// `safety:` and that the policy declares `Safety`). PRÆTORE makes no
+    /// decision about it: nothing was evaluated, signed, claimed or
+    /// journaled.
+    SafetyActionNotGoverned { action_type: String },
+    /// G7: the call's action type is not declared in the policy's
+    /// `action_classes`; refused before evaluation.
+    UnclassifiedAction { action_type: String },
+    /// Anything else that prevented a verdict (keys, signing, engine).
+    Failed(String),
+}
+
+impl std::fmt::Display for GateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SafetyActionNotGoverned { action_type } => write!(
+                f,
+                "SAFETY_ACTION_NOT_GOVERNED: safety action {action_type:?} is not governed by PRÆTORE; it was not evaluated, signed or recorded"
+            ),
+            Self::UnclassifiedAction { action_type } => write!(
+                f,
+                "UNCLASSIFIED_ACTION: action type {action_type:?} is not declared in the policy's action_classes"
+            ),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for GateError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+/// The action type of a `tools/call` (G7). A tool whose name starts with
+/// `safety:` is that safety action type; every other call is
+/// [`ACTION_TYPE`], a mission action.
+pub fn action_type_of(params: &Value) -> String {
+    match params.get("name").and_then(Value::as_str) {
+        Some(name) if name.starts_with(praetore_core::policy::SAFETY_ACTION_PREFIX) => {
+            name.to_owned()
+        }
+        _ => ACTION_TYPE.to_owned(),
+    }
+}
+
 /// Anything that can evaluate a `tools/call`. The proxy logic is generic over
 /// this so it can be unit-tested without keys.
 pub trait Evaluator {
-    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String>;
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError>;
 }
 
 /// Builds the action parameters for a `tools/call`.
@@ -976,23 +1025,50 @@ impl Gate {
         !self.path_keys.is_empty()
     }
 
+    /// G7: classifies the call against the policy's `action_classes` before
+    /// anything else: before path resolution, signing, the engine or the
+    /// journal. A safety action or an undeclared action type is refused here.
+    pub fn classify_call(&self, server: &str, params: &Value) -> Result<(), GateError> {
+        let action_type = action_type_of(params);
+        let action = Action::new(action_type.clone(), Some(server.to_owned()), json!({}))
+            .map_err(|e| GateError::Failed(format!("{}: {e}", e.code())))?;
+        match self.engine.policy().classify(action) {
+            Ok(ClassifiedAction::Mission(_)) => Ok(()),
+            Ok(ClassifiedAction::Safety(_)) => {
+                Err(GateError::SafetyActionNotGoverned { action_type })
+            }
+            Err(PraetoreError::UnclassifiedAction { .. }) => {
+                Err(GateError::UnclassifiedAction { action_type })
+            }
+            Err(e) => Err(GateError::Failed(format!("{}: {e}", e.code()))),
+        }
+    }
+
     /// Evaluates and returns the attested evidence without journaling it.
-    pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, String> {
+    pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, GateError> {
+        self.classify_call(server, params)?;
+        let action_type = action_type_of(params);
         let target = Some(server.to_owned());
         let mut path_check = None;
         let mut inline = build_parameters(server, params, false);
         if !self.path_keys.is_empty() {
             path_check = check_paths(&mut inline, &self.path_keys, &self.path_prefixes);
         }
-        let action = Action::new(ACTION_TYPE, target.clone(), inline)
+        let action = Action::new(action_type.clone(), target.clone(), inline)
             .or_else(|_| {
                 // The digest form has no `arguments.<key>` copies, so no path
                 // is checked; conditions on them are unknown (fail closed).
                 path_check = None;
-                Action::new(ACTION_TYPE, target, build_parameters(server, params, true))
+                Action::new(action_type, target, build_parameters(server, params, true))
             })
             .map_err(|e| format!("{}: {e}", e.code()))?
             .with_capability(CAPABILITY);
+        let action = self
+            .engine
+            .policy()
+            .classify(action)
+            .and_then(ClassifiedAction::into_mission)
+            .map_err(|e| format!("{}: {e}", e.code()))?;
         let mut request =
             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
                 .map_err(|e| format!("{}: {e}", e.code()))?
@@ -1016,12 +1092,12 @@ impl Gate {
             .map_err(|e| format!("{}: {e}", e.code()))?;
         self.engine
             .evaluate(request)
-            .map_err(|e| format!("{}: {e}", e.code()))
+            .map_err(|e| GateError::Failed(format!("{}: {e}", e.code())))
     }
 }
 
 impl Evaluator for Gate {
-    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String> {
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
         let journaled = self.journal.append(&evidence);
         Ok(verdict_from(&evidence, journaled))
@@ -1067,6 +1143,8 @@ impl Journal {
     }
 
     pub fn append(&self, evidence: &Evidence) -> Result<PathBuf, String> {
+        #[cfg(test)]
+        tests::JOURNAL_APPENDS.with(|appends| appends.set(appends.get() + 1));
         let mut line = evidence
             .to_json()
             .map_err(|e| format!("cannot serialize evidence: {e}"))?;
@@ -1103,6 +1181,126 @@ fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// Receipt appends on this thread (G7 runtime tests).
+        pub(super) static JOURNAL_APPENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// G7: an initialized home whose policy has its own id (the probe
+    /// counters are per policy id) and declares `safety:halt` Safety, with
+    /// the receipts journal made unavailable: `receipts` is a regular file,
+    /// so no receipt can be written.
+    fn g7_home(policy_id: &str) -> (tempfile::TempDir, Home, Vec<u8>) {
+        use praetore_core::ActionClass;
+        let (temp, root) = canonical_tempdir();
+        let home = Home::new(root.join("home"));
+        store::init(&home).unwrap();
+        let mut policy = store::default_policy()
+            .with_action_class("safety:halt", ActionClass::Safety)
+            .with_action_class("safety:land", ActionClass::Safety);
+        policy.id = policy_id.to_owned();
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let receipts = home.receipts_dir();
+        let _ = fs::remove_dir_all(&receipts);
+        let marker = b"not a directory: the receipts journal is down\n".to_vec();
+        fs::write(&receipts, &marker).unwrap();
+        (temp, home, marker)
+    }
+
+    fn assert_journal_untouched(home: &Home, marker: &[u8]) {
+        assert_eq!(JOURNAL_APPENDS.with(|appends| appends.get()), 0);
+        assert!(home.receipts_dir().is_file());
+        assert_eq!(fs::read(home.receipts_dir()).unwrap(), marker);
+    }
+
+    const G7_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
+
+    #[test]
+    fn g7_safety_call_is_refused_before_the_engine_with_the_journal_down() {
+        for (name, mode) in [
+            ("safety:halt", Mode::Enforce),
+            ("safety:land", Mode::Observe),
+        ] {
+            let policy_id = format!("g7-mcp-safety-{name}-{}", mode.as_str());
+            let (_temp, home, marker) = g7_home(&policy_id);
+            let mut gate = Gate::load(&home, mode).unwrap();
+            JOURNAL_APPENDS.with(|appends| appends.set(0));
+
+            let started = std::time::Instant::now();
+            let result =
+                Evaluator::evaluate(&mut gate, "plant", &json!({"name": name, "arguments": {}}));
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                result.err(),
+                Some(GateError::SafetyActionNotGoverned {
+                    action_type: name.to_owned()
+                })
+            );
+            assert_eq!(praetore_core::probe::engine_calls(&policy_id), 0);
+            assert_eq!(praetore_core::probe::policy_evaluations(&policy_id), 0);
+            assert_journal_untouched(&home, &marker);
+            assert!(elapsed < G7_BOUND, "answered in {elapsed:?}");
+        }
+    }
+
+    #[test]
+    fn g7_proxy_answers_a_safety_call_without_a_receipt() {
+        let policy_id = "g7-mcp-proxy-safety";
+        let (_temp, home, marker) = g7_home(policy_id);
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        JOURNAL_APPENDS.with(|appends| appends.set(0));
+        let line = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"safety:halt","arguments":{}}}
+"#;
+        let started = std::time::Instant::now();
+        let out = crate::proxy::handle_client_line(line, Mode::Enforce, "plant", &mut gate);
+        let elapsed = started.elapsed();
+        assert!(out.to_server.is_none(), "enforce does not forward it");
+        let reply = String::from_utf8(out.to_client.unwrap()).unwrap();
+        assert!(reply.contains("SAFETY_ACTION_NOT_GOVERNED"), "{reply}");
+        assert_eq!(praetore_core::probe::engine_calls(policy_id), 0);
+        assert_journal_untouched(&home, &marker);
+        assert!(elapsed < G7_BOUND, "answered in {elapsed:?}");
+    }
+
+    #[test]
+    fn g7_undeclared_safety_call_is_unclassified() {
+        let policy_id = "g7-mcp-unclassified";
+        let (_temp, home, marker) = g7_home(policy_id);
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        JOURNAL_APPENDS.with(|appends| appends.set(0));
+        let result = Evaluator::evaluate(&mut gate, "plant", &json!({"name": "safety:hold"}));
+        assert_eq!(
+            result.err(),
+            Some(GateError::UnclassifiedAction {
+                action_type: "safety:hold".to_owned()
+            })
+        );
+        assert_eq!(praetore_core::probe::engine_calls(policy_id), 0);
+        assert_journal_untouched(&home, &marker);
+    }
+
+    /// Control: a mission call in the same setup reaches the engine, and the
+    /// journal really is down (no receipt written, so enforce refuses it).
+    #[test]
+    fn g7_mission_call_reaches_the_engine_and_the_journal_is_down() {
+        let policy_id = "g7-mcp-mission-control";
+        let (_temp, home, marker) = g7_home(policy_id);
+        let mut gate = Gate::load(&home, Mode::Enforce).unwrap();
+        JOURNAL_APPENDS.with(|appends| appends.set(0));
+        let verdict = Evaluator::evaluate(
+            &mut gate,
+            "fs",
+            &json!({"name": "read_file", "arguments": {}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+        assert!(verdict.journaled.is_err(), "the journal is down");
+        assert_eq!(praetore_core::probe::engine_calls(policy_id), 1);
+        assert_eq!(JOURNAL_APPENDS.with(|appends| appends.get()), 1);
+        assert_eq!(fs::read(home.receipts_dir()).unwrap(), marker);
+    }
 
     /// A canonical temporary root (macOS `/var` is a symlink to `/private/var`).
     fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {

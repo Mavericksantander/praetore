@@ -882,10 +882,11 @@ fn fixture_with_replay(
             ]
         })
         .unwrap_or_default();
-    let policy = Policy::new_v2("local-gateway-test", 1, rules);
+    let policy = mission_policy(Policy::new_v2("local-gateway-test", 1, rules))
+        .with_mission_actions(["local:set_value"]);
     let clock = FixedClock::try_new(NOW).unwrap();
     let now = clock.now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     let (issued_at, expires_at) = if expired {
         (now - Duration::minutes(2), now - Duration::seconds(1))
     } else {
@@ -1076,7 +1077,7 @@ fn approval_fixture_full(
     )
     .unwrap()
     .with_capability("local:write");
-    let mut policy = Policy::new_v2(
+    let mut policy = mission_policy(Policy::new_v2(
         "human-approval-test",
         1,
         vec![
@@ -1087,12 +1088,12 @@ fn approval_fixture_full(
             )
             .with_capability("local:write"),
         ],
-    );
+    ));
     edit(&mut policy);
     let now = OffsetDateTime::now_utc();
     let clock = Arc::new(Mutex::new(now));
     let policy_digest = policy.digest().unwrap();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request
         .sign_intent_v2(
             &agent_key,
@@ -1574,16 +1575,16 @@ async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
     )
     .unwrap()
     .with_capability("demo:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "local-demo",
         1,
         vec![
             PolicyRule::new("allow-demo-write", "demo:set_value", PolicyEffect::Allow)
                 .with_capability("demo:write"),
         ],
-    );
+    ));
     let now = FixedClock::try_new(NOW).unwrap().now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request
         .sign_intent_v2(
             &agent_key,
@@ -1784,17 +1785,17 @@ fn gateway_does_not_dispatch_when_freshness_expires_after_journal_claim() {
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "dispatch-freshness-test",
         1,
         vec![
             PolicyRule::new("allow-local-set", "local:set_value", PolicyEffect::Allow)
                 .with_capability("local:write"),
         ],
-    );
+    ));
     let initial_time = FixedClock::try_new(NOW).unwrap().now();
     let clock = Arc::new(Mutex::new(initial_time));
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request
         .sign_intent_v2(
             &agent_key,
@@ -1857,7 +1858,9 @@ fn gateway_does_not_dispatch_when_freshness_expires_after_journal_claim() {
 fn changing_signed_action_parameters_before_authorization_fails_closed() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     let mut modified = fixture.request;
-    modified.action.parameters["value"] = json!("privileged");
+    let mut action = modified.action.action().clone();
+    action.parameters["value"] = json!("privileged");
+    modified.action = mission(action);
 
     assert!(matches!(
         fixture.gateway.execute(modified),
@@ -1880,7 +1883,11 @@ fn gateway_uses_atomic_commit_instead_of_standalone_replay_guard() {
 
 #[test]
 fn development_engine_cannot_construct_gateway() {
-    let engine = AuthorizationEngine::development(Policy::new_v2("development-only", 1, vec![]));
+    let engine = AuthorizationEngine::development(mission_policy(Policy::new_v2(
+        "development-only",
+        1,
+        vec![],
+    )));
     assert_eq!(engine.mode(), EvaluationMode::Development);
     assert!(matches!(
         Gateway::new(
@@ -3798,7 +3805,9 @@ fn execution_key_of(receipt_agent: &Uuid, request_id: Uuid) -> ExecutionKey {
 fn second_pending_request(template: &AuthorizationRequest, value: &str) -> AuthorizationRequest {
     let mut request = template.clone();
     request.request_id = Uuid::new_v4();
-    request.action.parameters = json!({"key": "mode", "value": value});
+    let mut action = request.action.action().clone();
+    action.parameters = json!({"key": "mode", "value": value});
+    request.action = mission(action);
     let intent = request
         .intent_v2
         .clone()
@@ -4500,4 +4509,28 @@ fn transient_refusal_at_claim_keeps_the_approval_pending_dispatch() {
     let receipt = gateway.dispatch_approved(key).unwrap();
     assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
     assert_eq!(tool.invocations(), 1);
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

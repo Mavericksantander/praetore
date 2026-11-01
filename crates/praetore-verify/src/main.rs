@@ -7,7 +7,7 @@ use praetore_core::{
     journal_chain::{
         ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES, verify_journal,
     },
-    policy::Policy,
+    policy::RecordedPolicy,
 };
 use serde::Serialize;
 use std::{
@@ -90,7 +90,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (written before G7) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. It does not establish current authorization, freshness, replay state, or permission to execute an action.\n\nAttester pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -536,18 +536,22 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             "journal"
         }
         Command::PolicyDigest { policy } => {
-            let policy = Policy::from_json(&read_limited(&policy)?).map_err(CliError::from_core)?;
+            let policy = read_policy(&policy)?;
             details.insert(
                 "policy_id".into(),
-                serde_json::Value::String(policy.id.clone()),
+                serde_json::Value::String(policy.id().to_owned()),
             );
             details.insert(
                 "policy_version".into(),
-                serde_json::Value::Number(policy.version.into()),
+                serde_json::Value::Number(policy.version().into()),
+            );
+            details.insert(
+                "policy_format_version".into(),
+                serde_json::Value::Number(policy.format_version().into()),
             );
             details.insert(
                 "digest".into(),
-                serde_json::Value::String(policy.digest().map_err(CliError::from_core)?),
+                serde_json::Value::String(policy.digest().to_owned()),
             );
             "policy-digest"
         }
@@ -588,14 +592,19 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
     })
 }
 
-fn read_policy(path: &Path) -> Result<Policy, CliError> {
-    Policy::from_json(&read_limited(path)?).map_err(CliError::from_core)
+/// Reads a policy document as historical evidence recorded it: format 1
+/// (before G7) or format 2. The verifier only digests it and compares the
+/// digest with the one a receipt recorded; it never evaluates it.
+fn read_policy(path: &Path) -> Result<RecordedPolicy, CliError> {
+    RecordedPolicy::from_json(&read_limited(path)?).map_err(CliError::from_core)
 }
 
-fn verify_receipt_policy(evidence: &Evidence, policy: &Policy) -> Result<(), CliError> {
-    evidence.verify_policy(policy).map_err(|_| CliError {
-        code: "POLICY_MISMATCH",
-    })
+fn verify_receipt_policy(evidence: &Evidence, policy: &RecordedPolicy) -> Result<(), CliError> {
+    evidence
+        .verify_recorded_policy(policy)
+        .map_err(|_| CliError {
+            code: "POLICY_MISMATCH",
+        })
 }
 
 fn read_limited(path: &Path) -> Result<String, CliError> {

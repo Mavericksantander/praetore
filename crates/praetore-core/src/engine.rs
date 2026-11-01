@@ -966,6 +966,8 @@ impl AuthorizationEngine {
         request: AuthorizationRequest,
         atomic_commit: Option<&dyn AtomicAuthorizationCommit>,
     ) -> std::result::Result<Evidence, AtomicEvaluationError> {
+        #[cfg(feature = "test-probe")]
+        crate::probe::record_engine_call(&self.policy.id);
         // G7: the action must be a declared Mission action of this engine's
         // policy (it may have been classified against another policy). Checked
         // before the clock, the replay guard or any signature.

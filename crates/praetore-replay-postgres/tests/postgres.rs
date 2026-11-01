@@ -684,17 +684,17 @@ fn create_postgres_gateway(request_id: Uuid) -> PostgresGatewayFixture {
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "postgres-gateway-test",
         1,
         vec![
             PolicyRule::new("allow-local-write", "local:set_value", PolicyEffect::Allow)
                 .with_capability("local:write"),
         ],
-    );
+    ));
     let clock = FixedClock::try_new(TEST_NOW).unwrap();
     let now = clock.now();
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request.request_id = request_id;
     request
         .sign_intent_v2(
@@ -766,7 +766,7 @@ fn create_postgres_approval_gateway_with_clock(
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = Policy::new_v2(
+    let policy = mission_policy(Policy::new_v2(
         "postgres-human-approval",
         1,
         vec![
@@ -777,13 +777,13 @@ fn create_postgres_approval_gateway_with_clock(
             )
             .with_capability("local:write"),
         ],
-    );
+    ));
     // Sign the intent at the engine's time when a clock is injected, so the
     // intent window never depends on host time elapsed during the test.
     let now = clock
         .as_ref()
         .map_or_else(OffsetDateTime::now_utc, praetore_core::engine::Clock::now);
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request.request_id = request_id;
     request
         .sign_intent_v2(
@@ -1324,7 +1324,9 @@ fn postgres_journal_rejects_execution_key_reused_with_different_action() {
     };
     assert!(connect_journal().get(first_key).unwrap().is_some());
     let mut changed = fixture.request.clone();
-    changed.action.parameters["value"] = json!("different");
+    let mut action = changed.action.action().clone();
+    action.parameters["value"] = json!("different");
+    changed.action = mission(action);
     changed.request_id = first.evidence.request_id;
     changed
         .sign_intent_v2(
@@ -6278,4 +6280,28 @@ fn postgres_migrations_0013_database_applies_only_0014() {
         .get(0);
     assert!(!v2_after);
     assert_eq!(recorded_versions(&mut client), all_versions());
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

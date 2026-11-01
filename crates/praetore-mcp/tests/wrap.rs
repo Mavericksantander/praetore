@@ -63,7 +63,7 @@ fn write_policy(home: &Home, extra: Vec<PolicyRule>) {
             .with_capability(CAPABILITY),
     ];
     rules.extend(extra);
-    let policy = Policy::new_v2("test-policy", 1, rules);
+    let policy = mission_policy(Policy::new_v2("test-policy", 1, rules));
     fs::write(
         home.policy(),
         serde_json::to_string_pretty(&policy).unwrap(),
@@ -539,7 +539,7 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
 }
 
 fn write_rules(home: &Home, rules: Vec<PolicyRule>) {
-    let policy = Policy::new_v2("test-policy", 1, rules);
+    let policy = mission_policy(Policy::new_v2("test-policy", 1, rules));
     fs::write(
         home.policy(),
         serde_json::to_string_pretty(&policy).unwrap(),
@@ -1074,4 +1074,28 @@ fn deny_path_prefix_catches_hfs_ignorable_aliases_of_a_missing_name() {
     );
     fs::remove_file(hfs.join("notes.txt")).unwrap();
     assert!(verify_cli(&home).status.success());
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

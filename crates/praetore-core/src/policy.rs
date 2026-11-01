@@ -538,6 +538,8 @@ impl Policy {
         action: &MissionAction,
         context: &BTreeMap<String, Value>,
     ) -> Result<Decision> {
+        #[cfg(feature = "test-probe")]
+        crate::probe::record_policy_evaluation(&self.id);
         self.validate()?;
         self.require_mission(action)?;
         let action = action.action();

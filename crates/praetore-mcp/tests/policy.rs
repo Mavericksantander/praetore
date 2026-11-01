@@ -199,7 +199,8 @@ fn check_reports_hand_written_mistakes() {
     // `value` instead of `expected`, missing fields: invalid, exit 1.
     fs::write(
         &policy,
-        r#"{"id":"p","version":1,"canonical_version":1,"semantics_version":2,"rules":[
+        r#"{"format_version":2,"id":"p","version":1,"canonical_version":1,"semantics_version":2,
+          "action_classes":{"mcp.tools/call":"Mission"},"rules":[
           {"id":"d","action_type":"mcp.tools/call","effect":"Deny",
            "parameter_conditions":[{"key":"tool","operator":"Exact","value":"x"}]}]}"#,
     )
@@ -214,10 +215,26 @@ fn check_reports_hand_written_mistakes() {
     ));
     assert!(!out.status.success());
 
+    // A policy format 1 document (no action_classes, written before G7) is
+    // invalid for evaluation, with a migration hint.
+    fs::write(
+        &policy,
+        r#"{"id":"p","version":1,"canonical_version":1,"semantics_version":2,"rules":[]}"#,
+    )
+    .unwrap();
+    let v1 = run(&with_dir(&["policy", "check"], dir));
+    assert_eq!(v1.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&v1.stdout);
+    assert!(
+        text.contains("unsupported policy format version 1"),
+        "{text}"
+    );
+
     // Valid JSON, but approval without capability: warned.
     fs::write(
         &policy,
-        r#"{"id":"p","version":1,"canonical_version":1,"semantics_version":2,"rules":[
+        r#"{"format_version":2,"id":"p","version":1,"canonical_version":1,"semantics_version":2,
+          "action_classes":{"mcp.tools/call":"Mission"},"rules":[
           {"id":"allow","action_type":"mcp.tools/call","effect":"Allow","required_capability":"mcp:tools/call",
            "target":null,"parameter_conditions":[],"context_conditions":[]},
           {"id":"ra","action_type":"mcp.tools/call","effect":"RequireApproval","required_capability":null,

@@ -10,7 +10,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use praetore_core::{AuthorizationRequest, ErrorKind, canonical::parse_json_rejecting_duplicates};
+use praetore_core::{
+    AuthorizationRequest, ErrorKind, PraetoreError, canonical::parse_json_rejecting_duplicates,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, io, net::SocketAddr, sync::Arc};
@@ -434,7 +436,11 @@ struct ApprovalErrorContext {
 ///
 /// `POST /v1/execute` accepts the serialized `AuthorizationRequest`. The
 /// gateway returns its signed receipt for every completed policy decision,
-/// including denials and approval requirements. Request bodies are size
+/// including denials and approval requirements. The action is classified
+/// against the engine policy's `action_classes` first (G7): a `Safety`
+/// action gets 422 `safety_action_not_governed` and an undeclared one 422
+/// `unclassified_action`, with no evaluation, replay claim, journal write,
+/// signature or dispatch. Request bodies are size
 /// limited and parsed through PRÆTORE's duplicate-key rejecting parser.
 pub fn router(gateway: Arc<Gateway>, auth: ApiAuth) -> Router {
     router_with_options(gateway, auth, HttpOptions::default())
@@ -493,12 +499,27 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
     if let Err(denied) = state.authenticate_role(&headers, ApiRole::Agent) {
         return denied.into_response();
     }
-    let request = match std::str::from_utf8(&body)
-        .ok()
-        .and_then(|json| AuthorizationRequest::from_json(json).ok())
-    {
-        Some(request) => request,
-        None => {
+    // G7: the action is classified against the engine's policy first. A
+    // safety action is answered here, before any replay claim, journal write,
+    // signature or dispatch: PRÆTORE makes no decision about it.
+    let parsed = match std::str::from_utf8(&body) {
+        Ok(json) => AuthorizationRequest::from_json(json, state.gateway.policy()),
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_authorization_request");
+        }
+    };
+    let request = match parsed {
+        Ok(request) => request,
+        Err(PraetoreError::SafetyActionNotGoverned { .. }) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "safety_action_not_governed",
+            );
+        }
+        Err(PraetoreError::UnclassifiedAction { .. }) => {
+            return error_response(StatusCode::UNPROCESSABLE_ENTITY, "unclassified_action");
+        }
+        Err(_) => {
             return error_response(StatusCode::BAD_REQUEST, "invalid_authorization_request");
         }
     };

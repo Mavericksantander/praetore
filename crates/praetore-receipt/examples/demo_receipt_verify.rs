@@ -131,7 +131,8 @@ fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
             PolicyRule::new("allow-demo-read", "read_report", PolicyEffect::Allow)
                 .with_capability("report:read"),
         ],
-    );
+    )
+    .with_mission_actions(["read_report"]);
     let policy_digest = policy.digest()?;
     let issuer_pin = TrustedAuthorityIssuer::new("demo-issuer", issuer_key.public_key())?
         .with_validity(validity)?;
@@ -144,6 +145,7 @@ fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
             .with_replay_guard(Arc::new(DemoReplayGuard(Mutex::new(HashSet::new()))))
             .with_freshness_provider(Arc::new(DemoFreshness));
     let engine = AuthorizationEngine::production_with_clock(policy, config, clock)?;
+    let policy = engine.policy();
 
     let action = Action::new(
         "read_report",
@@ -151,6 +153,7 @@ fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
         serde_json::json!({"report": "fictitious-monthly-summary"}),
     )?
     .with_capability("report:read");
+    let action = policy.classify(action)?.into_mission()?;
     let mut request = AuthorizationRequest::new(agent, authority, action)?;
     request.sign_intent_v2(
         &agent_key,

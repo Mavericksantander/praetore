@@ -47,11 +47,11 @@ impl Drop for Dir {
 }
 
 fn policy(effect: PolicyEffect) -> Policy {
-    Policy::new(
+    mission_policy(Policy::new(
         "journal-policy",
         1,
         vec![PolicyRule::new("read", "read_data", effect)],
-    )
+    ))
 }
 
 fn attester() -> EvidenceAttesterKey {
@@ -71,7 +71,7 @@ fn receipt(index: u8, policy: &Policy) -> Evidence {
     let action = Action::new("read_data", Some("db".into()), json!({ "row": index }))
         .unwrap()
         .with_capability("data:read");
-    let mut request = AuthorizationRequest::new(agent, authority, action).unwrap();
+    let mut request = AuthorizationRequest::new(agent, authority, mission(action)).unwrap();
     request.sign_intent(&agent_key).unwrap();
     let mut evidence = request
         .attest(Decision::allow(
@@ -374,4 +374,28 @@ fn malformed_and_oversized_journals_fail_closed() {
         "json",
     ]);
     assert_fails(&output, "INPUT_TOO_LARGE");
+}
+
+/// G7 test helper: declares every action type a rule names as Mission.
+#[allow(dead_code)]
+fn mission_policy(mut policy: praetore_core::Policy) -> praetore_core::Policy {
+    for rule in &policy.rules {
+        policy
+            .action_classes
+            .entry(rule.action_type.clone())
+            .or_insert(praetore_core::ActionClass::Mission);
+    }
+    policy
+}
+
+/// G7 test helper: classifies `action` as a Mission action. The engine still
+/// checks it against its own policy's `action_classes`.
+#[allow(dead_code)]
+fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
+    praetore_core::Policy::new("classify", 1, vec![])
+        .with_mission_actions([action.action_type.clone()])
+        .classify(action)
+        .expect("classify")
+        .into_mission()
+        .expect("mission action")
 }

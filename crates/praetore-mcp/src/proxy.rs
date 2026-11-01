@@ -4,7 +4,7 @@
 //! This module is pure (no I/O) apart from the `Evaluator` it is handed.
 
 use crate::{
-    gate::{Evaluator, Mode, Verdict},
+    gate::{Evaluator, GateError, Mode, Verdict},
     json::JsonValue,
 };
 use praetore_core::DecisionOutcome;
@@ -327,6 +327,26 @@ fn decide(
         .and_then(Value::as_str)
         .map_or_else(|| "?".to_owned(), display_safe);
     match evaluator.evaluate(server, &call.params) {
+        // G7: a declared safety action is not governed by PRÆTORE. It was not
+        // evaluated, signed or recorded. praetore-mcp does not forward it in
+        // enforce mode (it is not this proxy's to run); observe mode forwards
+        // every call.
+        Err(error @ GateError::SafetyActionNotGoverned { .. }) => match mode {
+            Mode::Enforce => {
+                warnings.push(format!(
+                    "praetore-mcp: {server}/{tool}: {error}; call not forwarded (enforce)"
+                ));
+                CallDecision::Block(format!(
+                    "PRÆTORE does not govern safety actions, so this proxy did not forward it: {error}"
+                ))
+            }
+            Mode::Observe => {
+                warnings.push(format!(
+                    "praetore-mcp: observe: {server}/{tool}: {error}; forwarded WITHOUT a receipt"
+                ));
+                CallDecision::Forward
+            }
+        },
         Err(error) => match mode {
             Mode::Enforce => {
                 warnings.push(format!(
@@ -577,7 +597,7 @@ mod tests {
     }
 
     impl Evaluator for Fixed {
-        fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, String> {
+        fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
             self.calls.push((server.into(), params.clone()));
             let outcome = self.result.clone()?;
             Ok(Verdict {

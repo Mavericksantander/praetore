@@ -929,6 +929,12 @@ impl Gateway {
         })
     }
 
+    /// The engine's policy. Entry points classify incoming actions against
+    /// it (`Policy::classify`) before anything else.
+    pub fn policy(&self) -> &praetore_core::Policy {
+        self.engine.policy()
+    }
+
     /// Adds a pinned approver key. May be called once per approver; a
     /// decision is verified only by the single verifier whose key id matches
     /// and whose tenant scope covers the execution's tenant.
