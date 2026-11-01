@@ -32,15 +32,32 @@ agente haga por otro camino queda fuera (ver Límites).
   lease de 60 s y no detecta revocaciones; para reemplazar las autoridades
   hay que hacer otro `init`.
 - **Guard de replay durable.** `init` crea `<estado>/replay/`. Cada request
-  evaluado reclama un archivo `replay/<tenant>/<agent id>/<request id>`
-  creado con `create_new` (`O_CREAT|O_EXCL`): de varios procesos que crean el
-  mismo nombre, el kernel deja ganar a uno solo, así que el mismo request se
-  evalúa una vez aunque el hook corra en procesos concurrentes. El archivo y
-  sus directorios se sincronizan a disco (`fsync`) antes de dar el claim por
-  hecho, y nunca se borran. Cualquier error (directorio ausente o
-  reemplazado, symlink, permisos abiertos a grupo u otros, disco lleno, fallo
-  de `fsync`) niega la tool call sin recibo. El estado debe estar en un
-  sistema de archivos local con create exclusivo atómico.
+  firmado que el motor evalúa reclama un archivo
+  `replay/<tenant>/<agent id>/<request id>` creado con `create_new`
+  (`O_CREAT|O_EXCL`): de varios procesos que crean el mismo nombre, el kernel
+  deja ganar a uno solo. Lo que garantiza hoy: el claim de un request firmado
+  queda registrado una sola vez, y ese request no se evalúa de nuevo. **No
+  deduplica tool calls:** cada invocación del hook arma un request nuevo (con
+  su propio `request_id`), así que la misma tool call entregada dos veces da
+  dos recibos, cada uno una decisión real del motor. Si un tool call
+  re-entregado debe caer en replay (por ejemplo, derivando `request_id` de
+  `tool_use_id`) está pendiente de decisión (M1 de la revisión de #88).
+  El archivo y sus directorios se sincronizan a disco (`fsync`) antes de dar
+  el claim por hecho, y nunca se borran. En cada claim el hook exige que
+  `replay/` sea un directorio real del usuario actual, sin ningún bit de
+  grupo u otros y, en macOS, sin entradas de ACL extendida; y que el
+  directorio de estado sea del usuario actual y no tenga escritura para grupo
+  u otros. Cualquier error (directorio ausente o reemplazado, symlink, dueño
+  o permisos incorrectos, ACL, disco lleno, fallo de `fsync`) niega la tool
+  call sin recibo. El estado debe estar en un sistema de archivos local con
+  create exclusivo atómico: no en NFS ni en una carpeta sincronizada (por
+  ejemplo, Escritorio y Documentos en iCloud).
+- **El recibo se sincroniza a disco** (`fsync` de `receipts.jsonl` en cada
+  append, y de su directorio al crearlo) antes de que el hook responda. Si
+  escribirlo falla, el hook niega la tool call; el claim de replay ya hecho
+  queda sin recibo. `replay/` no es un registro de decisiones: puede tener
+  claims huérfanos, que no bloquean nada porque su `request_id` no se
+  reutiliza.
 - **Un estado anterior a los recibos HighAssurance falla cerrado.** Si
   `<estado>/replay/` no existe, el hook niega cada tool call gobernada con un
   mensaje que pide correr `praetore-claude-hook init` en un directorio nuevo
@@ -277,3 +294,12 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
   ruta. Hay que usar rutas resueltas.
 - **Raíz fija.** La raíz de la policy es la ruta absoluta dada en `init`.
   Mover el proyecto exige otro `init`.
+- **El estado del hook y los procesos del mismo usuario.** Las operaciones
+  sobre el estado van por ruta, no relativas a un descriptor de directorio:
+  los chequeos de symlink, dueño, permisos y ACL valen en el momento en que
+  corren. Un proceso del mismo usuario está dentro del perímetro de
+  confianza: ya puede leer las claves de los agentes y del atestador en el
+  estado. Lo que puede hacer con `replay/` (borrarlo, reemplazarlo, llenar el
+  disco) hace que el hook niegue, no que permita: esos errores fallan
+  cerrado. Tampoco hay que fiarse de `decided_at` más que de la clave del
+  atestador: quien la tenga puede firmar cualquier `decided_at`.

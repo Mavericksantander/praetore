@@ -315,6 +315,7 @@ name = "praetore-claude-hook"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "libc",
  "praetore-core",
  "rand_core",
  "serde",

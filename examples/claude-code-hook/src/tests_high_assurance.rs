@@ -1,6 +1,8 @@
-//! HighAssurance receipts: every receipt records a signed decision time, the
-//! same request is never evaluated twice, the replay store fails closed, and
-//! hook state created before this change is refused with a pointer to `init`.
+//! HighAssurance receipts: every receipt records a signed decision time, a
+//! signed request is claimed once in the replay store (each hook invocation
+//! builds a new request, so this does not deduplicate tool calls), the store
+//! fails closed, and hook state created before this change is refused with a
+//! pointer to `init`.
 //!
 //! The tests at the top level use only `initialize`, `authorize` and
 //! `verify_receipts`; [`guard`] tests the replay store directly.
@@ -178,13 +180,35 @@ fn state_without_a_replay_store_is_refused_with_a_pointer_to_init() {
     assert!(s.receipts().is_empty());
 }
 
+/// Adds an extended ACL entry granting everyone write access (macOS).
+#[cfg(target_os = "macos")]
+fn add_acl(path: &Path) {
+    let status = std::process::Command::new("/bin/chmod")
+        .arg("+a")
+        .arg("everyone allow add_file,add_subdirectory,delete_child")
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "chmod +a {}", path.display());
+}
+
 /// The replay store is unavailable (replaced by a file, a symlink, opened to
-/// other users, or not writable): every call is denied without a receipt.
+/// other users, not writable, an extended ACL entry on macOS) or the state
+/// directory is writable by others: every call is denied without a receipt.
 #[test]
 fn unavailable_replay_store_fails_closed() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    for broken in ["file", "symlink", "open-permissions", "read-only"] {
+    for broken in [
+        "file",
+        "symlink",
+        "open-permissions",
+        "read-only",
+        "state-0777",
+        "state-group-write",
+        "acl",
+        "state-acl",
+    ] {
         let s = State::new(&format!("unavailable-{broken}"));
         let replay = s.replay();
         match broken {
@@ -208,10 +232,29 @@ fn unavailable_replay_store_fails_closed() {
             "read-only" => {
                 fs::set_permissions(&replay, fs::Permissions::from_mode(0o500)).unwrap();
             }
+            #[cfg(unix)]
+            "state-0777" => {
+                fs::set_permissions(&s.state, fs::Permissions::from_mode(0o777)).unwrap();
+            }
+            #[cfg(unix)]
+            "state-group-write" => {
+                fs::set_permissions(&s.state, fs::Permissions::from_mode(0o720)).unwrap();
+            }
+            #[cfg(target_os = "macos")]
+            "acl" => add_acl(&replay),
+            #[cfg(target_os = "macos")]
+            "state-acl" => add_acl(&s.state),
             _ => continue,
         }
         let result = authorize(&s.state, &s.read(Some("explorer")));
         let error = result.expect_err(broken);
+        let expected = match broken {
+            "acl" | "state-acl" => "extended ACL entries",
+            "state-0777" | "state-group-write" | "open-permissions" => "group/other permissions",
+            _ => "",
+        };
+        // ACL cases run only on macOS (other platforms `continue` above).
+        assert!(error.to_string().contains(expected), "{broken}: {error}");
         assert_eq!(
             fail_closed(error).outcome,
             DecisionOutcome::Deny,
@@ -219,6 +262,33 @@ fn unavailable_replay_store_fails_closed() {
         );
         assert!(s.receipts().is_empty(), "{broken}: receipt appended");
     }
+}
+
+/// The receipt cannot be written after the claim: the hook denies (fail
+/// closed). The claim stays without a receipt; it names a request id that is
+/// never reused, so it blocks nothing.
+#[test]
+fn unwritable_receipts_journal_denies_and_leaves_an_orphan_claim() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let s = State::new("receipts-read-only");
+    assert_eq!(
+        authorize(&s.state, &s.read(Some("explorer")))
+            .unwrap()
+            .outcome,
+        DecisionOutcome::Allow
+    );
+    let journal = s.state.join(RECEIPTS_FILE);
+    #[cfg(unix)]
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o400)).unwrap();
+    let error = authorize(&s.state, &s.read(Some("explorer"))).expect_err("receipt written");
+    assert_eq!(fail_closed(error).outcome, DecisionOutcome::Deny);
+    assert_eq!(s.receipts().len(), 1, "no receipt for the denied call");
+    let claims = fs::read_dir(s.replay().join(uuid::Uuid::nil().to_string()))
+        .unwrap()
+        .map(|agent| fs::read_dir(agent.unwrap().path()).unwrap().count())
+        .sum::<usize>();
+    assert_eq!(claims, 2, "the denied call's claim stays (orphan)");
 }
 
 /// Replay store, tested directly.
@@ -381,5 +451,21 @@ mod guard {
             .count();
         assert_eq!(claims, CALLS);
         assert_eq!(s.receipts().len(), CALLS);
+    }
+
+    /// A store or state directory owned by another user is refused (the
+    /// check is run with another uid, since tests cannot chown).
+    #[test]
+    fn directory_owned_by_another_user_is_refused() {
+        use crate::high_assurance::{Access, check_directory_owned_by, current_uid};
+        let s = State::new("owner");
+        for (path, access) in [
+            (s.replay(), Access::Private),
+            (s.state.clone(), Access::NoForeignWrite),
+        ] {
+            check_directory_owned_by(&path, access, current_uid()).unwrap();
+            let error = check_directory_owned_by(&path, access, current_uid() + 1).unwrap_err();
+            assert!(error.to_string().contains("not by this user"), "{error}");
+        }
     }
 }

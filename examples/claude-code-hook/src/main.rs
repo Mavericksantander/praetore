@@ -961,15 +961,30 @@ fn append_receipt(
         "profile": profile,
         "evidence": serde_json::from_str::<Value>(&evidence.to_json()?)?,
     });
+    let path = directory.join(RECEIPTS_FILE);
     let mut options = fs::OpenOptions::new();
-    options.append(true).create(true);
+    options.append(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(directory.join(RECEIPTS_FILE))?;
+    // Created by this call: its directory entry is synced too.
+    let (mut file, created) = match options.open(&path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            (options.create_new(false).open(&path)?, false)
+        }
+        Err(error) => return Err(error.into()),
+    };
     file.write_all(format!("{line}\n").as_bytes())?;
+    // The receipt is on disk before the hook answers. If anything here
+    // fails, the hook denies; the replay claim already made stays as an
+    // orphan claim (no receipt), which names a request id never reused.
+    file.sync_data()?;
+    if created {
+        fs::File::open(directory)?.sync_all()?;
+    }
     Ok(())
 }
 

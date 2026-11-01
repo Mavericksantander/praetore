@@ -25,6 +25,10 @@ time = { version = "0.3", features = ["formatting"] }
 # The replay guard implements praetore-core's `ReplayGuard` (keys are UUIDs).
 uuid = "1.18"
 
+# geteuid for the replay store owner check.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # G7 runtime tests count engine calls with the test-only probe.
 praetore-core = { path = "../../crates/praetore-core", features = ["test-probe"] }

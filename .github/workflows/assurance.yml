@@ -222,22 +222,53 @@ jobs:
       - name: verify.sh on 1000 receipts and on one altered receipt
         run: ./examples/claude-code-hook/test-verify.sh
       # The hook writes HighAssurance receipts: every regenerated receipt
-      # must record its signed decision time (decided_at). The committed
-      # bundle predates them, so the same check must reject it.
+      # must record its signed decision time (decided_at).
       - name: Regenerate a bundle and verify it (with --require-decision-time)
         run: |
           ./examples/claude-code-hook/demo.sh "$RUNNER_TEMP/claude-code-hook-bundle"
           ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle"
           ./examples/claude-code-hook/verify.sh "$RUNNER_TEMP/claude-code-hook-bundle" --require-decision-time
-          if ./examples/claude-code-hook/verify.sh examples/claude-code-hook/bundle --require-decision-time; then
-            echo "::error::the committed bundle has no decided_at but passed --require-decision-time"; exit 1
-          fi
+      # The flag must reject a receipt without decided_at with exactly
+      # DECISION_TIME_MISSING. Fixture: examples/verify/evidence.json, a
+      # signed v4 receipt without HighAssurance metadata that does not depend
+      # on the hook bundle or the evidence sets being regenerated.
+      - name: --require-decision-time rejects a receipt without decided_at
+        run: |
+          set -euo pipefail
+          cargo build --quiet --release --locked --package praetore-verify
+          set +e
+          out="$(target/release/praetore-verify evidence --evidence examples/verify/evidence.json \
+            --attester-pin examples/verify/attester-public-key.hex \
+            --issuer-pins examples/verify/issuer-pins.jsonl --require-intent \
+            --require-decision-time --format json)"
+          rc=$?
+          set -e
+          echo "$out"
+          [ "$rc" -ne 0 ] || { echo "::error::a receipt without decided_at passed"; exit 1; }
+          python3 -c 'import json,sys; sys.exit(json.loads(sys.argv[1])["code"] != "DECISION_TIME_MISSING")' "$out" ||
+            { echo "::error::expected DECISION_TIME_MISSING"; exit 1; }
+          # Control: the same fixture verifies without the flag.
+          target/release/praetore-verify evidence --evidence examples/verify/evidence.json \
+            --attester-pin examples/verify/attester-public-key.hex \
+            --issuer-pins examples/verify/issuer-pins.jsonl --require-intent --format json
       - name: HighAssurance hook tests (output shown)
         run: |
           set -euo pipefail
           output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_high_assurance -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
-          grep -q "test result: ok. 8 passed" <<<"$output" || { echo "::error::the HighAssurance hook tests did not run"; exit 1; }
+          grep -Eq "test result: ok\. [0-9]+ passed; 0 failed" <<<"$output" || { echo "::error::the HighAssurance hook tests failed"; exit 1; }
+          for test in every_receipt_records_a_signed_decision_time \
+            declared_safety_tool_gets_no_receipt_and_no_claim \
+            state_without_a_replay_store_is_refused_with_a_pointer_to_init \
+            unavailable_replay_store_fails_closed \
+            unwritable_receipts_journal_denies_and_leaves_an_orphan_claim \
+            guard::replaying_the_same_request_is_refused \
+            guard::guard_reports_unavailable_when_the_store_is \
+            guard::concurrent_claims_of_one_request_succeed_exactly_once \
+            guard::concurrent_hook_calls_each_claim_their_own_request \
+            guard::directory_owned_by_another_user_is_refused; do
+            grep -q "^test tests_high_assurance::$test \.\.\. ok$" <<<"$output" || { echo "::error::$test did not run or failed"; exit 1; }
+          done
       # SAF-14: two agents sign with different issued identities, and no
       # edit of index.json or of the receipt re-attributes a receipt.
       - name: Per-agent attribution end to end

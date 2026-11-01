@@ -490,6 +490,13 @@ ls -d "$P/.claude/praetore/replay"   # the HighAssurance replay store
 Because each receipt is checked at its own `decided_at`, the receipts keep
 verifying after the authorities expire.
 
+`decided_at` is only as trustworthy as the attester key, which lives in the
+state directory under the same user account as the agents: whoever holds
+that key can sign any `decided_at`. Keep the state on a local filesystem
+(the replay store needs atomic exclusive create): not a network share and
+not a synced folder such as iCloud Desktop/Documents. A project under
+`~/Desktop` or `~/Documents` with iCloud sync enabled is a synced folder.
+
 Register the hook in `$P/.claude/settings.local.json` as in the example
 README, then restart Claude Code.
 

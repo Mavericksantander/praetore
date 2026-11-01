@@ -12,7 +12,15 @@
   audience `praetore-claude-hook`, valid for 60 s. The replay guard is a
   durable local claim store in the hook state (`replay/`): one file per
   request, created with `create_new` (`O_CREAT|O_EXCL`) and `fsync`ed with
-  its directories; any store error denies without a receipt. Freshness is
+  its directories; on every claim the store must be a real directory owned
+  by the current user with no group/other bits and (macOS) no extended ACL
+  entries, and the state directory must be owned by the user and not
+  group/other-writable; any store error denies without a receipt. The guard
+  records each signed request's claim once; it does not deduplicate tool
+  calls (each invocation builds a new request). `receipts.jsonl` is now
+  `fsync`ed after each append (and its directory on creation); a claim can
+  remain without a receipt when that write fails, and the call is denied.
+  Freshness is
   local (60 s lease, no revocation source). `init` creates `replay/`; state
   created before this change has none and is refused with a message that
   points to `init` (same pattern as the SAF-14 check). Profiles and

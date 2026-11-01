@@ -50,16 +50,30 @@ pub(crate) const MAX_VALID_DAYS: i64 = 3650;
 /// claim is reported. Claims are never removed (the engine's contract: a
 /// removed claim can make an old signed request usable again).
 ///
-/// Fail closed: any error other than `AlreadyExists` (missing or replaced
-/// store, a symlink or a non-directory in the path, permissions open to
-/// group or others, a full disk, a failed `fsync`) is
+/// Fail closed: any error other than `AlreadyExists` is
 /// [`ReplayGuardError::Unavailable`], and the engine then returns no
-/// evidence. A claim whose file was created but whose `fsync` failed stays
-/// claimed: the request is refused and cannot be retried, which is the safe
-/// side.
+/// evidence. That covers a missing or replaced store, a symlink or a
+/// non-directory in the path, a store directory not owned by this user or
+/// with any group/other permission bit or (macOS) an extended ACL entry, a
+/// state directory not owned by this user or writable by group/others, a
+/// full disk and a failed `fsync`. These checks run on every claim. A claim
+/// whose file was created but whose `fsync` failed stays claimed: the
+/// request is refused and cannot be retried, which is the safe side.
+///
+/// Limits. Operations are path-based (not relative to a directory file
+/// descriptor): the checks hold at the moment they run. A process running as
+/// the same user can change the store between the check and the create; it
+/// is inside the trust perimeter anyway, since it can already read the agent
+/// and attester keys in the state directory. What it can do here is make the
+/// hook deny (a removed or replaced store, a full disk), never make it
+/// allow: every such error fails closed. The store is not a decision log: a
+/// claim can exist without a receipt when the receipt write fails after the
+/// claim (the tool call is then denied, and the orphan claim names a
+/// request id that is never reused).
 ///
 /// Requirement: the state directory must be on a local filesystem with
-/// atomic exclusive create (any local POSIX filesystem; not NFSv2).
+/// atomic exclusive create (any local POSIX filesystem; not NFSv2, not a
+/// synced folder such as iCloud Desktop/Documents).
 pub(crate) struct FileReplayGuard {
     root: PathBuf,
 }
@@ -72,7 +86,7 @@ impl FileReplayGuard {
     }
 
     fn claim(&self, tenant: Uuid, agent: Uuid, request: Uuid) -> Result<bool, io::Error> {
-        check_private_directory(&self.root)?;
+        check_store(&self.root)?;
         let tenant_dir = self.root.join(tenant.to_string());
         let agent_dir = tenant_dir.join(agent.to_string());
         for directory in [&tenant_dir, &agent_dir] {
@@ -114,8 +128,57 @@ impl ReplayGuard for FileReplayGuard {
     }
 }
 
-/// A real directory (not a symlink) that only its owner can access.
-fn check_private_directory(path: &Path) -> Result<(), io::Error> {
+/// The replay store and the state directory that holds it.
+fn check_store(replay: &Path) -> Result<(), io::Error> {
+    let state = replay
+        .parent()
+        .ok_or_else(|| io::Error::other("replay store has no state directory"))?;
+    check_directory(state, Access::NoForeignWrite)?;
+    check_directory(replay, Access::Private)
+}
+
+/// Which permission bits a checked directory may not have.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Access {
+    /// No group/other bit at all (the replay store and its subdirectories).
+    Private,
+    /// No group/other write bit (the state directory).
+    NoForeignWrite,
+}
+
+impl Access {
+    fn forbidden_bits(self) -> u32 {
+        match self {
+            Self::Private => 0o077,
+            Self::NoForeignWrite => 0o022,
+        }
+    }
+}
+
+/// A real directory (not a symlink), owned by the effective user, without
+/// the forbidden permission bits and, on macOS, without extended ACL entries.
+/// On Linux a POSIX ACL with named entries shows in the group bits (the
+/// mask), so the bit check covers it.
+fn check_directory(path: &Path, access: Access) -> Result<(), io::Error> {
+    check_directory_owned_by(path, access, current_uid())
+}
+
+#[cfg(unix)]
+pub(crate) fn current_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn current_uid() -> u32 {
+    0
+}
+
+pub(crate) fn check_directory_owned_by(
+    path: &Path,
+    access: Access,
+    uid: u32,
+) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
         return Err(io::Error::other(format!(
@@ -125,15 +188,85 @@ fn check_private_directory(path: &Path) -> Result<(), io::Error> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != uid {
             return Err(io::Error::other(format!(
-                "{} is accessible by group/others",
-                path.display()
+                "{} is owned by uid {}, not by this user (uid {uid})",
+                path.display(),
+                metadata.uid()
+            )));
+        }
+        if metadata.permissions().mode() & access.forbidden_bits() != 0 {
+            return Err(io::Error::other(format!(
+                "{} has group/other permissions ({:o}) that {access:?} forbids",
+                path.display(),
+                metadata.permissions().mode() & 0o777
             )));
         }
     }
+    #[cfg(target_os = "macos")]
+    if acl::has_extended_entries(path)? {
+        return Err(io::Error::other(format!(
+            "{} has extended ACL entries",
+            path.display()
+        )));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (access, uid);
+        return Err(io::Error::other(
+            "directory permissions cannot be verified on this platform",
+        ));
+    }
+    #[cfg(unix)]
     Ok(())
+}
+
+/// macOS extended ACLs (`chmod +a`), which the mode bits do not show.
+#[cfg(target_os = "macos")]
+mod acl {
+    use std::{
+        ffi::CString,
+        io,
+        os::{
+            raw::{c_char, c_int, c_void},
+            unix::ffi::OsStrExt,
+        },
+        path::Path,
+    };
+
+    /// `ACL_TYPE_EXTENDED` and `ACL_FIRST_ENTRY` from `<sys/acl.h>`.
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    /// Whether `path` (not followed if it is a symlink) has at least one
+    /// extended ACL entry. Any error other than "no ACL" is returned, so the
+    /// caller fails closed when ACLs cannot be checked.
+    pub(super) fn has_extended_entries(path: &Path) -> io::Result<bool> {
+        let path = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: `path` is a valid NUL-terminated string for the call.
+        let acl = unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ENOENT) {
+                Ok(false)
+            } else {
+                Err(error)
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl` is a valid ACL returned above and freed only below.
+        let found = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
+        // SAFETY: `acl` came from acl_get_link_np and is not used afterwards.
+        unsafe { acl_free(acl) };
+        Ok(found)
+    }
 }
 
 fn create_private_directory_if_missing(path: &Path) -> Result<(), io::Error> {
@@ -144,9 +277,9 @@ fn create_private_directory_if_missing(path: &Path) -> Result<(), io::Error> {
         builder.mode(0o700);
     }
     match builder.create(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => check_private_directory(path),
-        Err(error) => Err(error),
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => Err(error),
+        // Created now or already there: the same checks either way.
+        _ => check_directory(path, Access::Private),
     }
 }
 
@@ -199,7 +332,7 @@ pub(crate) fn check_state(directory: &Path) -> Result<(), BoxError> {
             directory.display()
         )
         .into()),
-        _ => check_private_directory(&replay)
+        _ => check_store(&replay)
             .map_err(|error| format!("replay store unavailable: {error}").into()),
     }
 }
