@@ -34,6 +34,9 @@ with one altered byte, and prints a summary from `index.json`.
 Real output, set 05:
 
 ```text
+== 0. Copiar el bundle a un directorio temporal
+copia de <repo>/examples/claude-code-hook/evidence/05-sesion-real-final en <tmp>/bundle
+
 == 1. Compilar praetore-verify (cargo build --release --locked)
 
 == 2. Digest de la policy publicada
@@ -47,14 +50,25 @@ OK: 118 recibos verificados, todos ligados a la policy publicada
 {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"}
 OK: la copia alterada fue rechazada (exit 1)
 
-== 5. Resumen por agente y decisión (de index.json, solo informativo)
-coder     Allow            47
-coder     RequireApproval  1
-explorer  Allow            19
-main      Allow            16
-planner   Allow            5
-web-fetch Allow            30
-total: Allow 117, RequireApproval 1
+== 5. Atribución: index.json debe decir lo mismo que los recibos firmados
+coder            Allow            47
+coder            RequireApproval  1
+explorer         Allow            19
+main             Allow            16
+planner          Allow            5
+web-fetch        Allow            30
+perfil coder        agent id bad89773-9990-498e-9240-805809788f62  (nombre del perfil firmado por: agente y atestador)
+perfil explorer     agent id 95dde15e-513a-493d-9af7-4913c50be95a  (nombre del perfil firmado por: agente y atestador)
+perfil main         agent id b8e04f81-6414-41b5-8b52-b671b64122b2  (nombre del perfil firmado por: agente y atestador)
+perfil planner      agent id a096438a-de9d-4fdb-95f2-e088090071cf  (nombre del perfil firmado por: agente y atestador)
+perfil web-fetch    agent id 6d0813bc-d924-4e09-a083-10fabf5b4c33  (nombre del perfil firmado por: agente y atestador)
+OK: cada recibo queda atribuido a la identidad que lo firmó
+
+== 6. Re-atribuir UN recibo en una copia de index.json y comprobar que falla
+evidence/0001-main-Glob-Allow.json: agent main -> web-fetch
+FALLO: evidence/0001-main-Glob-Allow.json: index.json dice agent='web-fetch', el recibo firmado dice 'main'
+FALLO: evidence/0001-main-Glob-Allow.json: index.json dice profile='web-fetch', el recibo firmado dice 'main'
+OK: la re-atribución fue rechazada
 
 == RESULTADO: todas las verificaciones dieron lo esperado
 ```
@@ -62,6 +76,9 @@ total: Allow 117, RequireApproval 1
 Real output, set 04:
 
 ```text
+== 0. Copiar el bundle a un directorio temporal
+copia de <repo>/examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch en <tmp>/bundle
+
 == 1. Compilar praetore-verify (cargo build --release --locked)
 
 == 2. Digest de la policy publicada
@@ -75,9 +92,15 @@ OK: 8 recibos verificados, todos ligados a la policy publicada
 {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"}
 OK: la copia alterada fue rechazada (exit 1)
 
-== 5. Resumen por agente y decisión (de index.json, solo informativo)
-main      Allow            8
-total: Allow 8
+== 5. Atribución: index.json debe decir lo mismo que los recibos firmados
+main             Allow            8
+perfil main         agent id beca5532-3f85-4f4d-972f-0ff6ddcef040  (nombre del perfil firmado por: agente y atestador)
+OK: cada recibo queda atribuido a la identidad que lo firmó
+
+== 6. Re-atribuir UN recibo en una copia de index.json y comprobar que falla
+evidence/0001-main-Glob-Allow.json: agent main -> main-otro
+FALLO: evidence/0001-main-Glob-Allow.json: index.json dice agent='main-otro', el recibo firmado dice 'main'
+OK: la re-atribución fue rechazada
 
 == RESULTADO: todas las verificaciones dieron lo esperado
 ```
@@ -85,6 +108,9 @@ total: Allow 8
 Real output, set 03:
 
 ```text
+== 0. Copiar el bundle a un directorio temporal
+copia de <repo>/examples/claude-code-hook/evidence/03-bundle-demo-reproducible en <tmp>/bundle
+
 == 1. Compilar praetore-verify (cargo build --release --locked)
 
 == 2. Digest de la policy publicada
@@ -98,19 +124,31 @@ OK: 22 recibos verificados, todos ligados a la policy publicada
 {"ok":false,"command":"evidence","code":"EVIDENCE_FAIL"}
 OK: la copia alterada fue rechazada (exit 1)
 
-== 5. Resumen por agente y decisión (de index.json, solo informativo)
-coder     Allow            2
-coder     Deny             4
-coder     RequireApproval  5
-explorer  Allow            1
-explorer  Deny             4
-general-purpose Deny             1
-main      RequireApproval  1
-planner   Allow            1
-planner   Deny             1
-web-fetch Allow            1
-web-fetch Deny             1
-total: Allow 5, Deny 11, RequireApproval 6
+== 5. Atribución: index.json debe decir lo mismo que los recibos firmados
+coder            Allow            2
+coder            Deny             4
+coder            RequireApproval  5
+explorer         Allow            1
+explorer         Deny             4
+main             RequireApproval  1
+planner          Allow            1
+planner          Deny             1
+unregistered(agent_type="general-purpose") Deny             1
+web-fetch        Allow            1
+web-fetch        Deny             1
+perfil coder        agent id 35a39cca-4f4b-4f77-8a18-9b320a293aef  (nombre del perfil firmado por: agente y atestador)
+perfil explorer     agent id bddf4630-df55-41b7-9d37-509107daebd1  (nombre del perfil firmado por: agente y atestador)
+perfil main         agent id ddde02df-82ff-49e7-b9d9-1f8034994d60  (nombre del perfil firmado por: agente y atestador)
+perfil planner      agent id a9009a37-adec-4191-8cdc-45ecca82c1b0  (nombre del perfil firmado por: agente y atestador)
+perfil unregistered agent id c6cc3acc-a18b-4e9e-9dba-242f5f1e5940  (nombre del perfil firmado por: agente y atestador)
+perfil web-fetch    agent id 3e9ef239-ac40-4a11-9a6a-50103a12da99  (nombre del perfil firmado por: agente y atestador)
+OK: cada recibo queda atribuido a la identidad que lo firmó
+
+== 6. Re-atribuir UN recibo en una copia de index.json y comprobar que falla
+evidence/0001-explorer-Read-Allow.json: agent explorer -> planner
+FALLO: evidence/0001-explorer-Read-Allow.json: index.json dice agent='planner', el recibo firmado dice 'explorer'
+FALLO: evidence/0001-explorer-Read-Allow.json: index.json dice profile='planner', el recibo firmado dice 'explorer'
+OK: la re-atribución fue rechazada
 
 == RESULTADO: todas las verificaciones dieron lo esperado
 ```
@@ -129,8 +167,8 @@ echo "exit $?"
 Real output:
 
 ```text
-OK policy-digest OK digest="60388a9ccfa887b9e712dd4f029f0a2aaa0e0f4df62d648c64629b3dae6f0f68" policy_id="claude-code-agents" policy_version=1
-OK evidence OK authority_checked_at_source="verifier_clock" authority_checked_at="2026-11-01T05:15:09.795087Z" authority_verified=true current_authorization=false evidence_id="2d619485-e1d3-48a5-88ff-97fae15cc038" intent_verified=true verification_scope="historical_receipt_integrity_and_attestation"
+OK policy-digest OK digest="60388a9ccfa887b9e712dd4f029f0a2aaa0e0f4df62d648c64629b3dae6f0f68" policy_format_version=1 policy_id="claude-code-agents" policy_version=1
+OK evidence OK authority_checked_at_source="verifier_clock" authority_checked_at="2026-11-01T21:41:27.005347Z" authority_verified=true current_authorization=false evidence_id="2d619485-e1d3-48a5-88ff-97fae15cc038" intent_verified=true receipt_action_type="claude:exec" receipt_decision="RequireApproval" verification_scope="historical_receipt_integrity_and_attestation"
 exit 0
 ```
 
@@ -170,7 +208,7 @@ echo "exit $?"
 Real output (one byte differs, the copy is rejected):
 
 ```text
-3582 122 162
+  3582 122 162
 ERROR evidence EVIDENCE_FAIL
 exit 1
 ```
@@ -253,9 +291,9 @@ Real output. The truncated copy **passes** without `--expected-head` (a
 prefix of a valid chain is a valid chain) and fails with it:
 
 ```text
-OK journal OK entries=118 expected_head_verified=true head="79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9" policy_verified=true verification_scope="historical_journal_integrity_and_attestation"
+OK journal OK database_head=null database_head_verified=false entries=118 expected_head_verified=true head="79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9" kind="tenant" policy_verified=true verification_scope="historical_journal_integrity_and_attestation"
 exit 0
-OK journal OK entries=117 expected_head_verified=false head="4e517e29b4e016aa985695fb26a8eabd7d775915b648da3eaf206541cb1c198e" policy_verified=true verification_scope="historical_journal_integrity_and_attestation"
+OK journal OK database_head=null database_head_verified=false entries=117 expected_head_verified=false head="4e517e29b4e016aa985695fb26a8eabd7d775915b648da3eaf206541cb1c198e" kind="tenant" policy_verified=true verification_scope="historical_journal_integrity_and_attestation"
 exit 0
 journal: head 4e517e29b4e016aa985695fb26a8eabd7d775915b648da3eaf206541cb1c198e does not match the expected head
 ERROR journal JOURNAL_HEAD_MISMATCH
@@ -282,10 +320,10 @@ Real output, set 05:
 == 1. Compilar praetore y praetore-verify (cargo build --release --locked)
 
 == 2. Verificar la cadena publicada contra el head esperado
-{"ok":true,"command":"journal","code":"OK","details":{"entries":118,"expected_head_verified":true,"head":"79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
+{"ok":true,"command":"journal","code":"OK","details":{"database_head":null,"database_head_verified":false,"entries":118,"expected_head_verified":true,"head":"79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9","kind":"tenant","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
 
 == 3. Reproducir: exportar de nuevo desde evidence/ y comparar byte a byte
-{"command":"journal-export","entries":118,"head":"79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9","ok":true}
+{"command":"journal-export","database_head":null,"entries":118,"head":"79a5374eaa24f8bc79d3c3818fbb2624154d93607e3ed3ee6434bef43ae146c9","kind":"tenant","ok":true}
 OK: idéntica a journal-chain.jsonl
 
 == 4. Copia con un recibo borrado (línea 2 eliminada, sin recalcular)
@@ -323,10 +361,10 @@ Real output, set 04:
 == 1. Compilar praetore y praetore-verify (cargo build --release --locked)
 
 == 2. Verificar la cadena publicada contra el head esperado
-{"ok":true,"command":"journal","code":"OK","details":{"entries":8,"expected_head_verified":true,"head":"f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
+{"ok":true,"command":"journal","code":"OK","details":{"database_head":null,"database_head_verified":false,"entries":8,"expected_head_verified":true,"head":"f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0","kind":"tenant","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
 
 == 3. Reproducir: exportar de nuevo desde evidence/ y comparar byte a byte
-{"command":"journal-export","entries":8,"head":"f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0","ok":true}
+{"command":"journal-export","database_head":null,"entries":8,"head":"f1666f5447351b18896792e64c7994d27561896beca37ec695571b73882d5af0","kind":"tenant","ok":true}
 OK: idéntica a journal-chain.jsonl
 
 == 4. Copia con un recibo borrado (línea 2 eliminada, sin recalcular)
@@ -364,10 +402,10 @@ Real output, set 03:
 == 1. Compilar praetore y praetore-verify (cargo build --release --locked)
 
 == 2. Verificar la cadena publicada contra el head esperado
-{"ok":true,"command":"journal","code":"OK","details":{"entries":22,"expected_head_verified":true,"head":"4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
+{"ok":true,"command":"journal","code":"OK","details":{"database_head":null,"database_head_verified":false,"entries":22,"expected_head_verified":true,"head":"4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a","kind":"tenant","policy_verified":true,"verification_scope":"historical_journal_integrity_and_attestation"}}
 
 == 3. Reproducir: exportar de nuevo desde evidence/ y comparar byte a byte
-{"command":"journal-export","entries":22,"head":"4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a","ok":true}
+{"command":"journal-export","database_head":null,"entries":22,"head":"4cea4fe91378a8471368b755e9bbdd23092e76a9d39517cc8e2cb393f83da90a","kind":"tenant","ok":true}
 OK: idéntica a journal-chain.jsonl
 
 == 4. Copia con un recibo borrado (línea 2 eliminada, sin recalcular)
