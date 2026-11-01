@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- A combined decision's signed `reason` now names the same rule as its
+  `decided_by`. When a DENY rule matched before a RECOVER rule
+  (`[deny d, recover r]`), `decided_by` and the recovery obligation named `r`
+  but `reason` named `d`; the reason now follows the rule with the higher
+  effective severity (RECOVER > DENY > REQUIRE_APPROVAL > ALLOW, earlier rule
+  on a tie), so it no longer depends on rule order. Only the `reason` text of
+  that combination changes. The receipt format is unchanged and receipts
+  signed with the old reason still verify (integrity, attester signature and
+  policy digest; see
+  `receipt_with_the_previous_deny_then_recover_reason_still_verifies` in
+  `tests/core/decision.rs`). Dispatch revalidation (`RecordedDecision::records`)
+  only handles ALLOW/REQUIRE_APPROVAL receipts, which never carry a recovery
+  obligation, so it is not affected. New black-box decision tests live in
+  `tests/core/decision.rs` (the `decision` test target of `praetore-core`);
+  the empty `tests/{core,integration,python,security}` placeholders are gone.
 - **Breaking (`praetore-verify evidence --issuer-pins`):** the embedded
   authority and its issuer pin are now checked at the receipt's signed
   decision time instead of the verifier's clock. For HighAssurance receipts

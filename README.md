@@ -729,6 +729,7 @@ praetore/
 ├── docs/
 ├── examples/
 ├── scripts/
+├── tests/core/          # black-box decision tests (praetore-core `decision` target)
 ├── Cargo.toml
 ├── Cargo.lock
 ├── LICENSE
