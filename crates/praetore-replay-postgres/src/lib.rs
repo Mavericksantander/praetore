@@ -12,7 +12,10 @@ pub use connection::{
     DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RustlsConnect, verify_runtime_role,
 };
 pub use execution::PostgresExecutionJournal;
-pub use migrations::{MIGRATIONS, MigrationError, apply_migrations, verify_schema_current};
+pub use migrations::{
+    LegacyBaselineAdoption, MIGRATIONS, MigrationError, MigrationOptions, apply_migrations,
+    apply_migrations_with, legacy_baseline_adoption, verify_schema_current,
+};
 pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,

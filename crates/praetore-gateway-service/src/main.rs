@@ -164,10 +164,39 @@ fn parse_tenant_issuer_bindings(
 }
 
 fn apply_migrations(database: &DatabaseConnector) -> Result<(), Box<dyn std::error::Error>> {
+    let options = migration_options()?;
     let mut client = database.connect()?;
-    let applied = praetore_replay_postgres::apply_migrations(&mut client)?;
+    let applied = praetore_replay_postgres::apply_migrations_with(&mut client, &options)?;
     tracing::info!(?applied, "database migrations applied");
+    if let Some(adoption) = praetore_replay_postgres::legacy_baseline_adoption(&mut client)? {
+        tracing::warn!(%adoption, "schema adopted from a legacy baseline");
+    }
     Ok(())
+}
+
+/// Explicit migration options from the environment, logged at startup:
+/// PRAETORE_ADOPT_LEGACY_BASELINE (off by default) and
+/// PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS (none by default).
+fn migration_options()
+-> Result<praetore_replay_postgres::MigrationOptions, Box<dyn std::error::Error>> {
+    use praetore_replay_postgres::MigrationOptions;
+    let adopt_legacy_baseline = MigrationOptions::parse_adopt_legacy_baseline(
+        std::env::var(MigrationOptions::ADOPT_LEGACY_BASELINE_ENV)
+            .ok()
+            .as_deref(),
+    )?;
+    let trusted_security_definer = MigrationOptions::parse_trusted_security_definer(
+        &std::env::var(MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV).unwrap_or_default(),
+    );
+    tracing::info!(
+        adopt_legacy_baseline,
+        ?trusted_security_definer,
+        "migration options"
+    );
+    Ok(MigrationOptions {
+        adopt_legacy_baseline,
+        trusted_security_definer,
+    })
 }
 
 /// Validates both database URLs (including TLS: non-loopback hosts need

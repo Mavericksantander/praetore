@@ -116,6 +116,13 @@ pub enum MigrationError {
     /// The migrating session would not enforce triggers or foreign keys
     /// (`session_replication_role` other than `origin`).
     UnsafeSession(String),
+    /// The database carries state, planted before or after migrating, that
+    /// would let another role act as the praetore owner or bypass the
+    /// append-only design (checked on every run, fresh database or not).
+    UnsafeDatabase(String),
+    /// An existing `praetore` schema has no migration records and adopting
+    /// it as a legacy 0001-0009 baseline was not requested.
+    LegacyBaselineNotAdopted,
 }
 
 impl std::fmt::Display for MigrationError {
@@ -151,6 +158,14 @@ impl std::fmt::Display for MigrationError {
                  run the migration step with the owner role first"
             ),
             Self::UnsafeSession(reason) => write!(f, "refusing to migrate: {reason}"),
+            Self::UnsafeDatabase(problems) => write!(f, "refusing to migrate: {problems}"),
+            Self::LegacyBaselineNotAdopted => write!(
+                f,
+                "existing praetore schema has no migration records; refusing to migrate. To \
+                 compare it with 0001-0009 and adopt it as a legacy baseline, set \
+                 {}=1 (praetore run --adopt-legacy-baseline)",
+                MigrationOptions::ADOPT_LEGACY_BASELINE_ENV
+            ),
         }
     }
 }
@@ -163,16 +178,73 @@ impl From<postgres::Error> for MigrationError {
     }
 }
 
+/// How `apply_migrations_with` may treat state it would otherwise refuse.
+/// Everything is refused by default; binaries fill this explicitly from
+/// configuration (the library reads no environment).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MigrationOptions {
+    /// Compare an existing `praetore` schema that has no migration records
+    /// with 0001-0009 and, if identical, record 0001-0009 as applied (an
+    /// adopted legacy baseline). Off by default: such a schema is refused.
+    pub adopt_legacy_baseline: bool,
+    /// SECURITY DEFINER functions outside `praetore` that run with the
+    /// owner's rights and that the operator trusts, as rendered by
+    /// `regprocedure` (for example `public.helper(integer)`).
+    pub trusted_security_definer: Vec<String>,
+}
+
+impl MigrationOptions {
+    /// Environment variable the binaries read for `adopt_legacy_baseline`.
+    pub const ADOPT_LEGACY_BASELINE_ENV: &'static str = "PRAETORE_ADOPT_LEGACY_BASELINE";
+    /// Environment variable the binaries read for trusted SECURITY DEFINER
+    /// functions (semicolon-separated `regprocedure` names).
+    pub const TRUSTED_SECURITY_DEFINER_ENV: &'static str =
+        "PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS";
+
+    /// `PRAETORE_ADOPT_LEGACY_BASELINE`: unset, empty or `0` is off, `1` is
+    /// on, anything else is a configuration error.
+    pub fn parse_adopt_legacy_baseline(value: Option<&str>) -> Result<bool, String> {
+        match value.map(str::trim) {
+            None | Some("") | Some("0") => Ok(false),
+            Some("1") => Ok(true),
+            Some(other) => Err(format!(
+                "{}: expected 1 or 0, got {other:?}",
+                Self::ADOPT_LEGACY_BASELINE_ENV
+            )),
+        }
+    }
+
+    /// Semicolon-separated `regprocedure` names, trimmed; empty entries are
+    /// ignored.
+    pub fn parse_trusted_security_definer(value: &str) -> Vec<String> {
+        value
+            .split(';')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
 /// Applies pending migrations and returns the versions applied by this call
-/// (empty when the schema is already current).
+/// (empty when the schema is already current). Refuses an existing schema
+/// without migration records; see `apply_migrations_with`.
 pub fn apply_migrations(client: &mut Client) -> Result<Vec<&'static str>, MigrationError> {
+    apply_migrations_with(client, &MigrationOptions::default())
+}
+
+/// `apply_migrations` with explicit options.
+pub fn apply_migrations_with(
+    client: &mut Client,
+    options: &MigrationOptions,
+) -> Result<Vec<&'static str>, MigrationError> {
     with_safe_search_path(client, |client| {
         check_session_fires_triggers(client)?;
         client.execute(
             "SELECT pg_catalog.pg_advisory_lock($1)",
             &[&MIGRATION_LOCK_KEY],
         )?;
-        let result = apply_locked(client);
+        let result = apply_locked(client, options);
         let unlock = client.execute(
             "SELECT pg_catalog.pg_advisory_unlock($1)",
             &[&MIGRATION_LOCK_KEY],
@@ -225,7 +297,19 @@ fn verify_schema_current_inner(client: &mut Client) -> Result<(), MigrationError
 /// Last migration that existed before the control table was introduced.
 const BASELINE_VERSION: &str = "0009_human_approval_expirations";
 
-fn apply_locked(client: &mut Client) -> Result<Vec<&'static str>, MigrationError> {
+fn apply_locked(
+    client: &mut Client,
+    options: &MigrationOptions,
+) -> Result<Vec<&'static str>, MigrationError> {
+    {
+        let mut transaction = client.build_transaction().read_only(true).start()?;
+        transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
+        let problems = environment_problems(&mut transaction, options)?;
+        transaction.rollback()?;
+        if !problems.is_empty() {
+            return Err(MigrationError::UnsafeDatabase(problems.join("; ")));
+        }
+    }
     let has_control: bool = client
         .query_one(
             "SELECT pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
@@ -240,33 +324,58 @@ fn apply_locked(client: &mut Client) -> Result<Vec<&'static str>, MigrationError
                 &[],
             )?
             .get(0);
+        if has_schema && !options.adopt_legacy_baseline {
+            return Err(MigrationError::LegacyBaselineNotAdopted);
+        }
         // The baseline check and the recording of 0001-0009 commit (or roll
         // back) together, with the praetore tables locked, so the schema
         // cannot change between the comparison and the record.
         let mut transaction = client.transaction()?;
         transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
         let baseline = if has_schema {
-            check_0009_baseline(&mut transaction)?;
-            true
+            Some(check_0009_baseline(&mut transaction)?)
         } else {
-            false
+            None
         };
         transaction.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS praetore; \
              CREATE TABLE praetore.schema_migrations (\
                  version TEXT PRIMARY KEY, \
                  checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
-                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
+                 applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(), \
+                 adopted_legacy_baseline BOOLEAN NOT NULL DEFAULT false, \
+                 adopted_by TEXT, \
+                 baseline_dump_sha256 CHAR(64) \
+                     CHECK (baseline_dump_sha256 ~ '^[0-9a-f]{64}$'), \
+                 CHECK (adopted_legacy_baseline \
+                        = (adopted_by IS NOT NULL AND baseline_dump_sha256 IS NOT NULL)))",
         )?;
-        if baseline {
+        if let Some(expected) = &baseline {
+            let dump_sha256 = dump_checksum(expected);
             for (version, sql) in MIGRATIONS {
                 transaction.execute(
-                    "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
-                    &[&version, &checksum(sql)],
+                    "INSERT INTO praetore.schema_migrations \
+                     (version, checksum, adopted_legacy_baseline, adopted_by, baseline_dump_sha256) \
+                     VALUES ($1, $2, true, CURRENT_USER, $3)",
+                    &[&version, &checksum(sql), &dump_sha256],
                 )?;
                 if version == BASELINE_VERSION {
                     break;
                 }
+            }
+            // DDL that takes no lock on the praetore tables (CREATE OR
+            // REPLACE FUNCTION, GRANT, ALTER SEQUENCE ...) can still commit
+            // while this transaction waits, for example on CREATE TABLE
+            // above. Compare again immediately before COMMIT; what remains is
+            // the window between this query and the COMMIT itself.
+            let mut live = schema_dump(&mut transaction, "praetore", "praetore")?;
+            live.retain(|key, _| !is_control_table_key(key));
+            let differences = dump_differences(&live, expected);
+            if !differences.is_empty() {
+                return Err(MigrationError::UnrecognizedSchema(format!(
+                    "changed while it was being recorded: {}",
+                    differences.join("; ")
+                )));
             }
         }
         transaction.commit()?;
@@ -519,7 +628,9 @@ fn check_session_fires_triggers(client: &mut Client) -> Result<(), MigrationErro
 /// reported as a difference (fail closed). It cannot defend against a
 /// superuser who edits the system catalogs directly: whoever controls the
 /// server as superuser controls what the catalogs say.
-fn check_0009_baseline(transaction: &mut postgres::Transaction<'_>) -> Result<(), MigrationError> {
+fn check_0009_baseline(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<SchemaDump, MigrationError> {
     let tables: Vec<String> = transaction
         .query(
             "SELECT pg_catalog.format('%I.%I', n.nspname, c.relname) \
@@ -539,7 +650,7 @@ fn check_0009_baseline(transaction: &mut postgres::Transaction<'_>) -> Result<()
             tables.join(", ")
         ))?;
     }
-    let live_problems = live_only_problems(transaction)?;
+    let live_problems = baseline_only_problems(transaction)?;
     if !live_problems.is_empty() {
         return Err(MigrationError::UnrecognizedSchema(live_problems.join("; ")));
     }
@@ -564,7 +675,7 @@ fn check_0009_baseline(transaction: &mut postgres::Transaction<'_>) -> Result<()
     savepoint.rollback()?;
     let differences = dump_differences(&live, &expected);
     if differences.is_empty() {
-        Ok(())
+        Ok(expected)
     } else {
         Err(MigrationError::UnrecognizedSchema(differences.join("; ")))
     }
@@ -914,6 +1025,83 @@ fn schema_dump(
     Ok(dump)
 }
 
+/// SHA-256 of a canonical dump (`key`, `field`, `value` lines in order), as
+/// recorded for an adopted legacy baseline.
+fn dump_checksum(dump: &SchemaDump) -> String {
+    let mut hasher = Sha256::new();
+    for (key, fields) in dump {
+        for (field, value) in fields {
+            for part in [
+                key.as_str(),
+                "\t",
+                field.as_str(),
+                "\t",
+                value.as_str(),
+                "\n",
+            ] {
+                hasher.update(part.as_bytes());
+            }
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// How 0001-0009 were recorded when they were adopted from a legacy
+/// baseline instead of executed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyBaselineAdoption {
+    /// When the adoption was recorded (`applied_at`, as text).
+    pub adopted_at: String,
+    /// The migrating role that compared and adopted the schema.
+    pub adopted_by: String,
+    /// SHA-256 of the canonical dump that matched 0001-0009.
+    pub dump_sha256: String,
+}
+
+impl std::fmt::Display for LegacyBaselineAdoption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "0001-0009 adopted from a legacy baseline at {} by {} (schema dump sha256 {})",
+            self.adopted_at, self.adopted_by, self.dump_sha256
+        )
+    }
+}
+
+/// Reports whether 0001-0009 were adopted from a legacy baseline. Needs
+/// only SELECT on `praetore.schema_migrations`; `None` for a schema created
+/// by migrations (or by a runner older than this record).
+pub fn legacy_baseline_adoption(
+    client: &mut Client,
+) -> Result<Option<LegacyBaselineAdoption>, MigrationError> {
+    with_safe_search_path(client, |client| {
+        let has_column: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
+                 WHERE a.attrelid OPERATOR(pg_catalog.=) \
+                       pg_catalog.to_regclass('praetore.schema_migrations') \
+                   AND a.attname OPERATOR(pg_catalog.=) 'adopted_legacy_baseline' \
+                   AND NOT a.attisdropped)",
+                &[],
+            )?
+            .get(0);
+        if !has_column {
+            return Ok(None);
+        }
+        let row = client.query_opt(
+            "SELECT applied_at::pg_catalog.text, adopted_by, baseline_dump_sha256::pg_catalog.text \
+             FROM praetore.schema_migrations \
+             WHERE version OPERATOR(pg_catalog.=) $1 AND adopted_legacy_baseline",
+            &[&BASELINE_VERSION],
+        )?;
+        Ok(row.map(|row| LegacyBaselineAdoption {
+            adopted_at: row.get(0),
+            adopted_by: row.get(1),
+            dump_sha256: row.get(2),
+        }))
+    })
+}
+
 /// At most this many differences are named in one error.
 const MAX_REPORTED_DIFFERENCES: usize = 10;
 
@@ -970,10 +1158,67 @@ fn dump_differences(live: &SchemaDump, expected: &SchemaDump) -> Vec<String> {
     differences
 }
 
-/// Checks on the live database that a per-schema dump cannot express.
-fn live_only_problems(
+/// The future or current owner of `praetore`: the schema owner, or the
+/// migrating role when the schema does not exist yet.
+const OWNER_SQL: &str = "(SELECT COALESCE(\
+     (SELECT n.nspowner FROM pg_catalog.pg_namespace n \
+      WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+     (SELECT r.oid FROM pg_catalog.pg_roles r \
+      WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER)))";
+
+/// A function owner `p.proowner` that has the rights of `owner_role.oid`
+/// (superusers included, since they have every role's rights). Functions
+/// the operator trusts are excluded by name (`$1`,
+/// `MigrationOptions::trusted_security_definer`).
+const OWNER_RIGHTS_SQL: &str = "pg_catalog.pg_has_role(p.proowner, owner_role.oid, 'USAGE') \
+     AND NOT (p.oid::pg_catalog.regprocedure::pg_catalog.text \
+              OPERATOR(pg_catalog.=) ANY ($1::pg_catalog.text[]))";
+
+/// Whether a `search_path` value lets another schema shadow `pg_catalog`
+/// (`pg_catalog` listed after another schema). `"$user", public` does not:
+/// an unlisted `pg_catalog` is searched first.
+fn search_path_shadows_catalog(value: &str) -> bool {
+    let entries: Vec<&str> = value
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    match entries.iter().position(|entry| *entry == "pg_catalog") {
+        None => false,
+        Some(index) => entries[..index]
+            .iter()
+            .any(|entry| !entry.starts_with("pg_temp")),
+    }
+}
+
+/// Keys of the control table, created in the recording transaction.
+fn is_control_table_key(key: &str) -> bool {
+    key == "relation praetore.schema_migrations"
+        || key == "relation praetore.schema_migrations_pkey"
+        || key == "type praetore.schema_migrations"
+        || key == "type praetore._schema_migrations"
+        || key == "internal triggers on praetore.schema_migrations"
+        || key.starts_with("column praetore.schema_migrations.")
+        || key.starts_with("column praetore.schema_migrations_pkey.")
+        || key.starts_with("constraint praetore.schema_migrations.")
+        || (key.starts_with("dependent ") && key.contains("praetore.schema_migrations"))
+}
+
+/// State checked on every `apply_migrations`, fresh database, baseline or
+/// current, because a dump of `praetore` cannot see it: event triggers;
+/// per-database or per-role `row_security`, `session_replication_role` or
+/// a `search_path` that lets another schema shadow `pg_catalog`; default
+/// privileges for the praetore schema, its owner or the migrating role;
+/// SECURITY DEFINER functions outside `praetore` with the owner's rights;
+/// and roles other than the migrating role (and NOLOGIN groups it belongs
+/// to) that can act as the owner. The owner is the schema owner, or the
+/// migrating role for a fresh database.
+fn environment_problems(
     transaction: &mut postgres::Transaction<'_>,
+    options: &MigrationOptions,
 ) -> Result<Vec<String>, MigrationError> {
+    const OWNER: &str = OWNER_SQL;
+    const OWNER_RIGHTS: &str = OWNER_RIGHTS_SQL;
     let mut problems = Vec::new();
     for row in transaction.query(
         "SELECT e.evtname::pg_catalog.text FROM pg_catalog.pg_event_trigger e ORDER BY 1",
@@ -1001,10 +1246,109 @@ fn live_only_problems(
     )? {
         let (role, database, setting): (String, String, String) =
             (row.get(0), row.get(1), row.get(2));
+        if let Some(value) = setting.strip_prefix("search_path=")
+            && !search_path_shadows_catalog(value)
+        {
+            continue;
+        }
         problems.push(format!(
             "setting {setting} for {role} in {database} is not allowed"
         ));
     }
+    for row in transaction.query(
+        &format!(
+            "SELECT pg_catalog.pg_get_userbyid(a.defaclrole)::pg_catalog.text, \
+                COALESCE((SELECT n.nspname::pg_catalog.text FROM pg_catalog.pg_namespace n \
+                          WHERE n.oid OPERATOR(pg_catalog.=) a.defaclnamespace), 'all schemas'), \
+                a.defaclobjtype::pg_catalog.text \
+         FROM pg_catalog.pg_default_acl a \
+         WHERE a.defaclnamespace OPERATOR(pg_catalog.=) \
+                   (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                    WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
+            OR a.defaclrole OPERATOR(pg_catalog.=) {OWNER} \
+            OR a.defaclrole OPERATOR(pg_catalog.=) \
+                   (SELECT r.oid FROM pg_catalog.pg_roles r \
+                    WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER) \
+         ORDER BY 1, 2, 3"
+        ),
+        &[],
+    )? {
+        let (role, schema, kind): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        problems.push(format!(
+            "default privileges of {role} in {schema} (object type {kind}) are not allowed"
+        ));
+    }
+    for row in transaction.query(
+        &format!(
+            "SELECT p.oid::pg_catalog.regprocedure::pg_catalog.text \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) p.pronamespace \
+             CROSS JOIN (SELECT {OWNER} AS oid) owner_role \
+             WHERE p.prosecdef \
+               AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+               AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
+               AND fn.nspname OPERATOR(pg_catalog.<>) 'praetore' \
+               AND {OWNER_RIGHTS} \
+             ORDER BY 1"
+        ),
+        &[&options.trusted_security_definer],
+    )? {
+        let function: String = row.get(0);
+        problems.push(format!(
+            "SECURITY DEFINER function {function} outside praetore runs with the rights of the \
+             praetore owner"
+        ));
+    }
+    for row in transaction.query(
+        &format!(
+            "WITH RECURSIVE \
+             owner_role AS (SELECT {OWNER} AS oid), \
+             migrator AS (SELECT r.oid FROM pg_catalog.pg_roles r \
+                          WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER), \
+             acting(role) AS ( \
+                 SELECT oid FROM owner_role \
+                 UNION \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN acting a ON m.roleid OPERATOR(pg_catalog.=) a.role), \
+             migrator_groups(role) AS ( \
+                 SELECT oid FROM migrator \
+                 UNION \
+                 SELECT m.roleid FROM pg_catalog.pg_auth_members m \
+                 JOIN migrator_groups g ON m.member OPERATOR(pg_catalog.=) g.role) \
+         SELECT r.rolname::pg_catalog.text, r.rolcanlogin, \
+                EXISTS (SELECT 1 FROM migrator_groups g \
+                        WHERE g.role OPERATOR(pg_catalog.=) a.role) \
+         FROM acting a JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.role \
+         WHERE NOT EXISTS (SELECT 1 FROM migrator \
+                           WHERE migrator.oid OPERATOR(pg_catalog.=) a.role) \
+         ORDER BY 1"
+        ),
+        &[],
+    )? {
+        let (role, can_login, on_migrator_path): (String, bool, bool) =
+            (row.get(0), row.get(1), row.get(2));
+        if !on_migrator_path {
+            problems.push(format!(
+                "role {role} can act as the praetore owner (it is, or is a member of, the \
+                 owner role) but is not the migrating role or one of its groups"
+            ));
+        } else if can_login {
+            problems.push(format!(
+                "role {role} owns praetore or links the migrating role to the owner, and can \
+                 log in; the owner and the roles in between must be NOLOGIN"
+            ));
+        }
+    }
+    Ok(problems)
+}
+
+/// Checks only for adopting a legacy baseline: the existing schema owner
+/// must be the migrating role or one of its groups, and no publication may
+/// replicate the praetore tables.
+fn baseline_only_problems(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Vec<String>, MigrationError> {
+    let mut problems = Vec::new();
     let owner = transaction.query_one(
         "WITH RECURSIVE member_of(role) AS ( \
              SELECT r.oid FROM pg_catalog.pg_roles r \
@@ -1027,88 +1371,6 @@ fn live_only_problems(
             "schema praetore is owned by {schema_owner}, and the migrating role {migrator} \
              is neither that role nor a member of it"
         ));
-    }
-    for row in transaction.query(
-        "SELECT pg_catalog.pg_get_userbyid(a.defaclrole)::pg_catalog.text, \
-                COALESCE((SELECT n.nspname::pg_catalog.text FROM pg_catalog.pg_namespace n \
-                          WHERE n.oid OPERATOR(pg_catalog.=) a.defaclnamespace), 'all schemas'), \
-                a.defaclobjtype::pg_catalog.text \
-         FROM pg_catalog.pg_default_acl a \
-         WHERE a.defaclnamespace OPERATOR(pg_catalog.=) \
-                   (SELECT n.oid FROM pg_catalog.pg_namespace n \
-                    WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
-            OR a.defaclrole OPERATOR(pg_catalog.=) \
-                   (SELECT n.nspowner FROM pg_catalog.pg_namespace n \
-                    WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
-            OR a.defaclrole OPERATOR(pg_catalog.=) \
-                   (SELECT r.oid FROM pg_catalog.pg_roles r \
-                    WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER) \
-         ORDER BY 1, 2, 3",
-        &[],
-    )? {
-        let (role, schema, kind): (String, String, String) = (row.get(0), row.get(1), row.get(2));
-        problems.push(format!(
-            "default privileges of {role} in {schema} (object type {kind}) are not allowed"
-        ));
-    }
-    for row in transaction.query(
-        "SELECT p.oid::pg_catalog.regprocedure::pg_catalog.text \
-         FROM pg_catalog.pg_proc p \
-         JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) p.pronamespace \
-         JOIN pg_catalog.pg_namespace owner_ns \
-           ON owner_ns.nspname OPERATOR(pg_catalog.=) 'praetore' \
-         WHERE p.prosecdef \
-           AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
-           AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
-           AND fn.nspname OPERATOR(pg_catalog.<>) 'praetore' \
-           AND pg_catalog.pg_has_role(p.proowner, owner_ns.nspowner, 'USAGE') \
-         ORDER BY 1",
-        &[],
-    )? {
-        let function: String = row.get(0);
-        problems.push(format!(
-            "SECURITY DEFINER function {function} outside praetore runs with the rights of the \
-             praetore owner"
-        ));
-    }
-    for row in transaction.query(
-        "WITH RECURSIVE \
-             owner_role AS (SELECT n.nspowner AS oid FROM pg_catalog.pg_namespace n \
-                            WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
-             migrator AS (SELECT r.oid FROM pg_catalog.pg_roles r \
-                          WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER), \
-             acting(role) AS ( \
-                 SELECT oid FROM owner_role \
-                 UNION \
-                 SELECT m.member FROM pg_catalog.pg_auth_members m \
-                 JOIN acting a ON m.roleid OPERATOR(pg_catalog.=) a.role), \
-             migrator_groups(role) AS ( \
-                 SELECT oid FROM migrator \
-                 UNION \
-                 SELECT m.roleid FROM pg_catalog.pg_auth_members m \
-                 JOIN migrator_groups g ON m.member OPERATOR(pg_catalog.=) g.role) \
-         SELECT r.rolname::pg_catalog.text, r.rolcanlogin, \
-                EXISTS (SELECT 1 FROM migrator_groups g \
-                        WHERE g.role OPERATOR(pg_catalog.=) a.role) \
-         FROM acting a JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.role \
-         WHERE NOT EXISTS (SELECT 1 FROM migrator \
-                           WHERE migrator.oid OPERATOR(pg_catalog.=) a.role) \
-         ORDER BY 1",
-        &[],
-    )? {
-        let (role, can_login, on_migrator_path): (String, bool, bool) =
-            (row.get(0), row.get(1), row.get(2));
-        if !on_migrator_path {
-            problems.push(format!(
-                "role {role} can act as the praetore owner (it is, or is a member of, the \
-                 owner role) but is not the migrating role or one of its groups"
-            ));
-        } else if can_login {
-            problems.push(format!(
-                "role {role} owns praetore or links the migrating role to the owner, and can \
-                 log in; the owner and the roles in between must be NOLOGIN"
-            ));
-        }
     }
     for row in transaction.query(
         "SELECT p.pubname::pg_catalog.text FROM pg_catalog.pg_publication p \
@@ -1210,6 +1472,26 @@ mod tests {
              pg_temp; s.t; praetore_runtime; my_praetore; \
              current_setting('praetore.tenant_id', true)"
         );
+    }
+
+    #[test]
+    fn only_a_search_path_that_lists_another_schema_before_pg_catalog_shadows_it() {
+        for harmless in [
+            "\"$user\", public",
+            "public, extensions",
+            "pg_catalog, public",
+            "pg_temp, pg_catalog",
+            "",
+        ] {
+            assert!(!search_path_shadows_catalog(harmless), "{harmless}");
+        }
+        for hostile in [
+            "public, pg_catalog",
+            "\"$user\", pg_catalog",
+            "x,pg_catalog",
+        ] {
+            assert!(search_path_shadows_catalog(hostile), "{hostile}");
+        }
     }
 
     #[test]

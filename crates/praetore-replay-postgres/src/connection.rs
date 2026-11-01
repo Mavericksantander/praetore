@@ -382,6 +382,9 @@ pub enum RuntimeRoleError {
     /// The role may execute a SECURITY DEFINER function that runs with the
     /// rights of the `praetore` schema owner.
     OwnerFunctionExecutable(String),
+    /// A privilege on the `praetore` schema or an object in it that neither
+    /// the owner nor the migrations grant (see `unexpected_grants`).
+    UnexpectedGrant(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -413,6 +416,10 @@ impl fmt::Display for RuntimeRoleError {
                 f,
                 "runtime database session is exposed to {setting}; the append-only triggers, \
                  row-level security or name resolution could be changed"
+            ),
+            Self::UnexpectedGrant(grants) => write!(
+                f,
+                "praetore objects carry grants the migrations do not make: {grants}"
             ),
             Self::OwnerFunctionExecutable(function) => write!(
                 f,
@@ -547,6 +554,9 @@ fn verify_runtime_role_in(
     if let Some(function) = owner_function_executable(transaction)? {
         return Err(RuntimeRoleError::OwnerFunctionExecutable(function));
     }
+    if let Some(grants) = unexpected_grants(transaction)? {
+        return Err(RuntimeRoleError::UnexpectedGrant(grants));
+    }
     Ok(())
 }
 
@@ -620,10 +630,109 @@ fn unsafe_runtime_setting(
     Ok(None)
 }
 
+/// Every privilege on the `praetore` schema, its relations (sequences and
+/// views included), their columns and its functions, against what the
+/// migrations intend: the object owner's own; `praetore_runtime`'s grants
+/// from 0011 (schema USAGE; SELECT on `schema_migrations` and
+/// `execution_journal_events`; SELECT and INSERT on `replay_claims`,
+/// `execution_journal`, `execution_attestations`, `human_approvals` and
+/// `human_approval_expirations`; UPDATE of `execution_status`,
+/// `output_json`, `not_dispatched_reason` and `updated_at`); the
+/// documented `praetore_observe` shape (schema USAGE and column SELECT on
+/// `execution_journal`, except `output_json`, and `execution_journal_events`);
+/// and PUBLIC EXECUTE on functions that are not SECURITY DEFINER. Anything
+/// else, for example a grant made through `ALTER DEFAULT PRIVILEGES` before
+/// the first migration, is reported (up to ten entries).
+fn unexpected_grants(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "WITH ns AS (SELECT n.oid, n.nspowner, n.nspacl FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         entries(object, kind, rel, col, owner, grantee, privilege, secdef) AS ( \
+             SELECT 'schema praetore', 'n', ''::pg_catalog.text, ''::pg_catalog.text, \
+                    ns.nspowner, a.grantee, a.privilege_type, false \
+             FROM ns CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(ns.nspacl, pg_catalog.acldefault('n', ns.nspowner))) a \
+             UNION ALL \
+             SELECT pg_catalog.concat('relation praetore.', c.relname), 'r', \
+                    c.relname::pg_catalog.text, ''::pg_catalog.text, \
+                    c.relowner, a.grantee, a.privilege_type, false \
+             FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(COALESCE(c.relacl, pg_catalog.acldefault( \
+                 CASE WHEN c.relkind OPERATOR(pg_catalog.=) 'S' THEN 's' ELSE 'r' END::pg_catalog.\"char\", \
+                 c.relowner))) a \
+             WHERE NOT (c.relkind OPERATOR(pg_catalog.=) 'i' OR c.relkind OPERATOR(pg_catalog.=) 'I' \
+                        OR c.relkind OPERATOR(pg_catalog.=) 'c' OR c.relkind OPERATOR(pg_catalog.=) 't') \
+             UNION ALL \
+             SELECT pg_catalog.concat('column praetore.', c.relname, '.', att.attname), 'c', \
+                    c.relname::pg_catalog.text, att.attname::pg_catalog.text, \
+                    c.relowner, a.grantee, a.privilege_type, false \
+             FROM ns JOIN pg_catalog.pg_class c ON c.relnamespace OPERATOR(pg_catalog.=) ns.oid \
+             JOIN pg_catalog.pg_attribute att ON att.attrelid OPERATOR(pg_catalog.=) c.oid \
+             CROSS JOIN LATERAL pg_catalog.aclexplode(att.attacl) a \
+             WHERE att.attacl IS NOT NULL \
+             UNION ALL \
+             SELECT pg_catalog.concat('function ', p.oid::pg_catalog.regprocedure), 'f', \
+                    ''::pg_catalog.text, ''::pg_catalog.text, \
+                    p.proowner, a.grantee, a.privilege_type, p.prosecdef \
+             FROM ns JOIN pg_catalog.pg_proc p ON p.pronamespace OPERATOR(pg_catalog.=) ns.oid \
+             CROSS JOIN LATERAL pg_catalog.aclexplode( \
+                 COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) a), \
+         runtime_allowed(kind, rel, col, privilege) AS (VALUES \
+             ('n', '', '', 'USAGE'), \
+             ('r', 'schema_migrations', '', 'SELECT'), \
+             ('r', 'replay_claims', '', 'SELECT'), ('r', 'replay_claims', '', 'INSERT'), \
+             ('r', 'execution_journal', '', 'SELECT'), ('r', 'execution_journal', '', 'INSERT'), \
+             ('r', 'execution_journal_events', '', 'SELECT'), \
+             ('r', 'execution_attestations', '', 'SELECT'), \
+             ('r', 'execution_attestations', '', 'INSERT'), \
+             ('r', 'human_approvals', '', 'SELECT'), ('r', 'human_approvals', '', 'INSERT'), \
+             ('r', 'human_approval_expirations', '', 'SELECT'), \
+             ('r', 'human_approval_expirations', '', 'INSERT'), \
+             ('c', 'execution_journal', 'execution_status', 'UPDATE'), \
+             ('c', 'execution_journal', 'output_json', 'UPDATE'), \
+             ('c', 'execution_journal', 'not_dispatched_reason', 'UPDATE'), \
+             ('c', 'execution_journal', 'updated_at', 'UPDATE')), \
+         unexpected AS ( \
+             SELECT pg_catalog.concat(e.object, ': ', e.privilege, ' to ', \
+                        CASE WHEN e.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' \
+                             ELSE pg_catalog.pg_get_userbyid(e.grantee)::pg_catalog.text END) AS entry \
+             FROM entries e \
+             LEFT JOIN pg_catalog.pg_roles grantee ON grantee.oid OPERATOR(pg_catalog.=) e.grantee \
+             WHERE NOT ( \
+                 e.grantee OPERATOR(pg_catalog.=) e.owner \
+                 OR (e.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                     AND e.kind OPERATOR(pg_catalog.=) 'f' \
+                     AND e.privilege OPERATOR(pg_catalog.=) 'EXECUTE' AND NOT e.secdef) \
+                 OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_runtime' \
+                     AND EXISTS (SELECT 1 FROM runtime_allowed ra \
+                                 WHERE ra.kind OPERATOR(pg_catalog.=) e.kind \
+                                   AND ra.rel OPERATOR(pg_catalog.=) e.rel \
+                                   AND ra.col OPERATOR(pg_catalog.=) e.col \
+                                   AND ra.privilege OPERATOR(pg_catalog.=) e.privilege)) \
+                 OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_observe' \
+                     AND ((e.kind OPERATOR(pg_catalog.=) 'n' \
+                           AND e.privilege OPERATOR(pg_catalog.=) 'USAGE') \
+                          OR (e.kind OPERATOR(pg_catalog.=) 'c' \
+                              AND e.privilege OPERATOR(pg_catalog.=) 'SELECT' \
+                              AND ((e.rel OPERATOR(pg_catalog.=) 'execution_journal' \
+                                    AND e.col OPERATOR(pg_catalog.<>) 'output_json') \
+                                   OR e.rel OPERATOR(pg_catalog.=) 'execution_journal_events')))))) \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT entry FROM unexpected ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
 /// A SECURITY DEFINER function, in any schema but `pg_catalog` and
 /// `information_schema`, that runs with the rights of the `praetore` schema
-/// owner (its owner has that owner's privileges) and that the session or
-/// current role may execute: calling it would act as the owner.
+/// owner (its owner is that owner, or a non-superuser with its privileges)
+/// and that the session or current role may execute: calling it would act
+/// as the owner. Functions of other superusers are not counted: whatever a
+/// superuser plants is out of scope, and managed services ship such
+/// functions executable by PUBLIC.
 fn owner_function_executable(
     transaction: &mut postgres::Transaction<'_>,
 ) -> Result<Option<String>, RuntimeRoleError> {
@@ -638,6 +747,9 @@ fn owner_function_executable(
            AND fn.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
            AND fn.nspname OPERATOR(pg_catalog.<>) 'information_schema' \
            AND pg_catalog.pg_has_role(p.proowner, owner_ns.nspowner, 'USAGE') \
+           AND (p.proowner OPERATOR(pg_catalog.=) owner_ns.nspowner \
+                OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles su \
+                               WHERE su.oid OPERATOR(pg_catalog.=) p.proowner AND su.rolsuper)) \
            AND (pg_catalog.has_function_privilege(SESSION_USER, p.oid, 'EXECUTE') \
                 OR pg_catalog.has_function_privilege(CURRENT_USER, p.oid, 'EXECUTE'))",
         &[],
