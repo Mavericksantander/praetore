@@ -17,8 +17,9 @@ name, not a certification or a guarantee about the caller's deployment.
 
 `AuthorizationEngine::development` and
 `AuthorizationEngine::development_with_clock` are explicit development
-constructors. The compatibility constructors `new` and `with_clock` are
-deprecated; they preserve their Development behavior. Use `strict` /
+constructors. There is no default mode: `AuthorizationEngine` has no `new`,
+`with_clock` or `Default`, so an engine without an explicitly named profile
+does not compile. Use `strict` /
 `strict_with_clock` when signature validation is required, or `production` /
 `production_with_clock` with `HighAssuranceConfig` for the strongest profile.
 The runnable [`quickstart` example](../crates/praetore-core/examples/quickstart.rs)
@@ -301,11 +302,14 @@ Authority capabilities use explicit names such as `data:read`, `data:write`,
 required authority capability with `Action::with_capability`. There is no
 fallback to `action_type`: Strict and HighAssurance reject an action without
 a capability with an `INVALID_REQUEST` error, and Development returns a DENY
-decision. A policy rule's optional
-`with_capability` is an additional authority requirement. In Strict and
-HighAssurance modes it is mandatory for `Allow` and `RequireApproval` rules: a
-matching rule without it is denied, because the action's capability is chosen
-by the caller and only the rule binds it to the `action_type`.
+decision (`decided_by` engine guard `missing_capability`). A policy rule's
+optional `with_capability` is an additional authority requirement. In every
+mode, including Development, it is mandatory for `Allow` and `RequireApproval`
+rules: a matching rule without it is denied (engine guard
+`unbound_rule_capability`), because the action's capability is chosen by the
+caller and only the rule binds it to the `action_type`. An authority that
+grants the `action_type` itself does not satisfy a missing or different
+`required_capability`.
 
 Example deny-by-default policy for common operations:
 

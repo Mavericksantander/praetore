@@ -424,6 +424,29 @@ impl Clock for FixedClock {
 /// assert_eq!(engine.mode(), EvaluationMode::Development);
 /// ```
 ///
+/// There is no default mode. Every constructor names its profile
+/// (`development*`, `strict*`, `production*`); `AuthorizationEngine` has no
+/// `new` and no `Default`, so an engine without an explicit profile does not
+/// compile:
+///
+/// ```compile_fail,E0599
+/// use praetore_core::{engine::AuthorizationEngine, Policy};
+///
+/// let engine = AuthorizationEngine::new(Policy::new("local", 1, vec![]));
+/// ```
+///
+/// ```compile_fail,E0599
+/// use praetore_core::engine::AuthorizationEngine;
+///
+/// let engine = AuthorizationEngine::default();
+/// ```
+///
+/// In every mode, an action must declare its capability
+/// ([`Action::with_capability`](crate::action::Action::with_capability)) and
+/// every matching Allow or RequireApproval rule must declare
+/// `required_capability`. Granting the action's `action_type` never stands
+/// in for either.
+///
 /// The complete signed-request examples are runnable with
 /// `cargo run -p praetore-core --example quickstart`.
 pub struct AuthorizationEngine {
@@ -1288,11 +1311,9 @@ impl AuthorizationEngine {
 
         // The authority check above uses a caller-chosen capability; only a
         // rule's required_capability binds the authority to the action_type.
-        // Development still accepts such a rule when the authority grants the
-        // action_type itself in addition to the action's capability.
+        // In every mode, a matching Allow/RequireApproval rule without one is
+        // denied: a grant of the action_type itself never stands in for it.
         if decision.outcome != crate::decision::DecisionOutcome::Deny
-            && (self.mode != EvaluationMode::Development
-                || !request.authority.permits(&request.action.action_type))
             && let Some(contribution) = decision.contributions.iter().find(|contribution| {
                 contribution.outcome != crate::decision::DecisionOutcome::Deny
                     && self.policy.rules.iter().any(|rule| {
@@ -2474,10 +2495,12 @@ mod tests {
     }
 
     #[test]
-    fn development_allows_unbound_rule_when_authority_grants_action_type() {
+    fn development_denies_unbound_rule_even_when_authority_grants_action_type() {
+        // Granting the action_type itself never stands in for a rule's
+        // missing required_capability, in Development as in every mode.
         assert_eq!(
             delete_with_read_capability(vec!["read_data".into(), "delete_data".into()]),
-            DecisionOutcome::Allow
+            DecisionOutcome::Deny
         );
     }
 
@@ -2507,6 +2530,26 @@ mod tests {
             decision
                 .reason
                 .contains("does not declare a required capability")
+        );
+        assert_eq!(
+            decision.decided_by,
+            Some(crate::DecidedBy::engine_guard("missing_capability"))
+        );
+    }
+
+    #[test]
+    fn missing_capability_is_denied_even_when_authority_grants_everything_named() {
+        // The authority grants the action_type and the rule's
+        // required_capability; without an action capability it still denies.
+        let mut action = test_action();
+        action.capability = None;
+
+        let decision = evaluate_development(&["read_data", "database", "*"], action);
+
+        assert_eq!(decision.outcome, DecisionOutcome::Deny);
+        assert_eq!(
+            decision.decided_by,
+            Some(crate::DecidedBy::engine_guard("missing_capability"))
         );
     }
 
@@ -2562,6 +2605,20 @@ mod tests {
 
         assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
         assert!(evidence.decision.reason.contains("write:data"));
+        assert_eq!(
+            evidence.decision.decided_by,
+            Some(crate::DecidedBy::engine_guard("authority_capability"))
+        );
+
+        // Granting the action_type ("read_data") does not satisfy the
+        // explicit action capability either.
+        let agent = test_agent();
+        let authority = Authority::new(agent.id.clone(), "praetore-root", vec!["read_data".into()]);
+        let action = test_action().with_capability("write:data");
+        let request = AuthorizationRequest::new(agent, authority, action).unwrap();
+        let evidence = engine.evaluate(request).unwrap();
+        assert_eq!(evidence.decision.outcome, DecisionOutcome::Deny);
+        assert!(evidence.decision.reason.contains("write:data"));
     }
 
     #[test]
@@ -2580,6 +2637,7 @@ mod tests {
                     "read_data",
                     crate::policy::PolicyEffect::Allow,
                 )
+                .with_capability("read_data")
                 .with_context_condition(crate::policy::PolicyCondition::exact(
                     "region",
                     json!("south"),
@@ -3788,11 +3846,22 @@ mod tests {
         effect: crate::policy::PolicyEffect,
         grants: Vec<String>,
     ) -> std::result::Result<DecisionOutcome, PraetoreError> {
-        let policy = Policy::new_v2(
-            "unbound-capability",
-            1,
-            vec![PolicyRule::new("unbound-delete", "delete_data", effect)],
-        );
+        delete_outcome(mode, effect, None, grants)
+    }
+
+    /// Like [`unbound_delete_outcome`], but the `delete_data` rule may declare
+    /// `required_capability`.
+    fn delete_outcome(
+        mode: EvaluationMode,
+        effect: crate::policy::PolicyEffect,
+        required_capability: Option<&str>,
+        grants: Vec<String>,
+    ) -> std::result::Result<DecisionOutcome, PraetoreError> {
+        let mut rule = PolicyRule::new("unbound-delete", "delete_data", effect);
+        if let Some(capability) = required_capability {
+            rule = rule.with_capability(capability);
+        }
+        let policy = Policy::new_v2("unbound-capability", 1, vec![rule]);
         let action = Action::new(
             "delete_data",
             Some("database".into()),
@@ -3858,30 +3927,31 @@ mod tests {
     }
 
     #[test]
-    fn development_unbound_require_approval_still_needs_the_action_type_grant() {
-        assert_eq!(
-            unbound_delete_outcome(
-                EvaluationMode::Development,
-                crate::policy::PolicyEffect::RequireApproval,
-                vec!["read_data".into()],
-            )
-            .unwrap(),
-            DecisionOutcome::Deny
-        );
-        assert_eq!(
-            unbound_delete_outcome(
-                EvaluationMode::Development,
-                crate::policy::PolicyEffect::RequireApproval,
-                vec!["read_data".into(), "delete_data".into()],
-            )
-            .unwrap(),
-            DecisionOutcome::RequireApproval
-        );
+    fn development_unbound_require_approval_is_denied_with_or_without_the_action_type_grant() {
+        for grants in [
+            vec!["read_data".to_string()],
+            vec!["read_data".to_string(), "delete_data".to_string()],
+        ] {
+            assert_eq!(
+                unbound_delete_outcome(
+                    EvaluationMode::Development,
+                    crate::policy::PolicyEffect::RequireApproval,
+                    grants.clone(),
+                )
+                .unwrap(),
+                DecisionOutcome::Deny,
+                "grants {grants:?}"
+            );
+        }
     }
 
     #[test]
-    fn strict_and_high_assurance_deny_unbound_rules_even_when_action_type_is_granted() {
-        for mode in [EvaluationMode::Strict, EvaluationMode::HighAssurance] {
+    fn every_mode_denies_unbound_rules_even_when_action_type_is_granted() {
+        for mode in [
+            EvaluationMode::Development,
+            EvaluationMode::Strict,
+            EvaluationMode::HighAssurance,
+        ] {
             for effect in [
                 crate::policy::PolicyEffect::Allow,
                 crate::policy::PolicyEffect::RequireApproval,
@@ -3898,6 +3968,47 @@ mod tests {
                     "{mode:?} {effect:?} must not fall back to the action_type grant"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_mode_denies_rule_capability_when_authority_grants_only_the_action_type() {
+        // The rule requires `db:delete`; the authority grants only the
+        // action_type `delete_data` (plus the action's own `read_data`).
+        for mode in [
+            EvaluationMode::Development,
+            EvaluationMode::Strict,
+            EvaluationMode::HighAssurance,
+        ] {
+            for effect in [
+                crate::policy::PolicyEffect::Allow,
+                crate::policy::PolicyEffect::RequireApproval,
+            ] {
+                let outcome = delete_outcome(
+                    mode,
+                    effect.clone(),
+                    Some("db:delete"),
+                    vec!["read_data".into(), "delete_data".into()],
+                )
+                .unwrap();
+                assert_eq!(
+                    outcome,
+                    DecisionOutcome::Deny,
+                    "{mode:?} {effect:?} must not satisfy required_capability with the action_type"
+                );
+            }
+            // Control: granting the rule's capability explicitly is what lets it apply.
+            assert_eq!(
+                delete_outcome(
+                    mode,
+                    crate::policy::PolicyEffect::Allow,
+                    Some("db:delete"),
+                    vec!["read_data".into(), "db:delete".into()],
+                )
+                .unwrap(),
+                DecisionOutcome::Allow,
+                "{mode:?} explicit grant"
+            );
         }
     }
 
