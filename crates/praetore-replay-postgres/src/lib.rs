@@ -22,9 +22,9 @@ pub use connection::{
 };
 pub use execution::PostgresExecutionJournal;
 pub use migrations::{
-    LegacyBaselineAdoption, MIGRATIONS, MigrationError, MigrationOptions, apply_migrations,
-    apply_migrations_with, legacy_baseline_adoption, migration_record_inconsistency,
-    verify_schema_current,
+    EventTriggerStatus, LegacyBaselineAdoption, MIGRATIONS, MigrationError, MigrationOptions,
+    apply_migrations, apply_migrations_with, event_trigger_report, legacy_baseline_adoption,
+    migration_record_inconsistency, parse_trusted_default_privileges, verify_schema_current,
 };
 pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,

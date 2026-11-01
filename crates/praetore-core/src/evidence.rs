@@ -105,6 +105,21 @@ impl EvidenceAttesterKey {
     pub fn key_id(&self) -> String {
         key_id(self.signing_key.verifying_key().as_bytes())
     }
+
+    /// Ed25519 signature over `domain || payload`. Crate-internal: only the
+    /// record types of this crate, each with its own domain, sign with it.
+    pub(crate) fn sign_with_domain(&self, domain: &[u8], payload: &[u8]) -> [u8; 64] {
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
+        message.extend_from_slice(payload);
+        self.signing_key.sign(&message).to_bytes()
+    }
+}
+
+/// The attester key id of a public key (as recorded in receipts and
+/// storage records).
+pub(crate) fn attester_key_id(public_key: &VerifiedPublicKey) -> String {
+    key_id(&public_key.as_bytes())
 }
 
 fn key_id(public_key: &[u8; 32]) -> String {

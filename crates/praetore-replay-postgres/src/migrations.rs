@@ -41,7 +41,7 @@ use postgres::Client;
 use sha2::{Digest, Sha256};
 
 /// Ordered `(version, sql)` pairs. Append only; never edit or reorder.
-pub const MIGRATIONS: [(&str, &str); 14] = [
+pub const MIGRATIONS: [(&str, &str); 15] = [
     (
         "0001_replay_claims",
         include_str!("../migrations/0001_replay_claims.sql"),
@@ -98,7 +98,15 @@ pub const MIGRATIONS: [(&str, &str); 14] = [
         "0014_closed_execution_row_lock",
         include_str!("../migrations/0014_closed_execution_row_lock.sql"),
     ),
+    (
+        "0015_storage_records",
+        include_str!("../migrations/0015_storage_records.sql"),
+    ),
 ];
+
+/// The migration that creates `praetore.storage_records`; the runner also
+/// executes it inside an adoption transaction (it is idempotent).
+const STORAGE_RECORDS_VERSION: &str = "0015_storage_records";
 
 /// Arbitrary constant key for `pg_advisory_lock`.
 const MIGRATION_LOCK_KEY: i64 = 0x5052_4145_544f_5245;
@@ -128,6 +136,8 @@ pub enum MigrationError {
     /// An existing `praetore` schema has no migration records and adopting
     /// it as a legacy 0001-0009 baseline was not requested.
     LegacyBaselineNotAdopted,
+    /// Adoption was requested without a storage-record signer.
+    AdoptionRequiresSigner,
     /// The live `praetore` schema differs from what its recorded migrations
     /// create (compared on every run against a scratch apply).
     SchemaDrift(String),
@@ -178,6 +188,11 @@ impl std::fmt::Display for MigrationError {
             Self::InvalidConfiguration(reason) => {
                 write!(f, "invalid migration configuration: {reason}")
             }
+            Self::AdoptionRequiresSigner => write!(
+                f,
+                "adopting a legacy baseline requires signing its storage record with the \
+                 evidence attester key; no signer was configured, refusing to migrate"
+            ),
             Self::LegacyBaselineNotAdopted => write!(
                 f,
                 "existing praetore schema has no migration records; refusing to migrate. To \
@@ -200,7 +215,7 @@ impl From<postgres::Error> for MigrationError {
 /// How `apply_migrations_with` may treat state it would otherwise refuse.
 /// Everything is refused by default; binaries fill this explicitly from
 /// configuration (the library reads no environment).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct MigrationOptions {
     /// Compare an existing `praetore` schema that has no migration records
     /// with 0001-0009 and, if identical, record 0001-0009 as applied (an
@@ -213,6 +228,34 @@ pub struct MigrationOptions {
     /// does not resolve is a configuration error. Whoever can execute a
     /// trusted function acts with its owner's privileges.
     pub trusted_security_definer: Vec<String>,
+    /// Signs the storage record written when a legacy baseline is adopted
+    /// (the binaries pass the evidence attester key). Without a signer,
+    /// adoption is refused.
+    pub record_signer: Option<std::sync::Arc<dyn praetore_core::StorageRecordSigner>>,
+    /// Event triggers the operator trusts, by exact name
+    /// (`PRAETORE_TRUSTED_EVENT_TRIGGERS`); see `environment_problems`.
+    pub trusted_event_triggers: Vec<String>,
+    /// Default-privilege entries the operator trusts, as
+    /// `role:*:objtype` (`PRAETORE_TRUSTED_DEFAULT_PRIVILEGES`).
+    pub trusted_default_privileges: Vec<String>,
+}
+
+impl std::fmt::Debug for MigrationOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MigrationOptions")
+            .field("adopt_legacy_baseline", &self.adopt_legacy_baseline)
+            .field("trusted_security_definer", &self.trusted_security_definer)
+            .field(
+                "record_signer",
+                &self.record_signer.as_ref().map(|signer| signer.key_id()),
+            )
+            .field("trusted_event_triggers", &self.trusted_event_triggers)
+            .field(
+                "trusted_default_privileges",
+                &self.trusted_default_privileges,
+            )
+            .finish()
+    }
 }
 
 impl MigrationOptions {
@@ -234,6 +277,18 @@ impl MigrationOptions {
                 Self::ADOPT_LEGACY_BASELINE_ENV
             )),
         }
+    }
+
+    /// Environment variable for `trusted_event_triggers` (semicolon-separated
+    /// exact names).
+    pub const TRUSTED_EVENT_TRIGGERS_ENV: &'static str = "PRAETORE_TRUSTED_EVENT_TRIGGERS";
+    /// Environment variable for `trusted_default_privileges`
+    /// (semicolon-separated `role:*:objtype`).
+    pub const TRUSTED_DEFAULT_PRIVILEGES_ENV: &'static str = "PRAETORE_TRUSTED_DEFAULT_PRIVILEGES";
+
+    /// Semicolon-separated entries, trimmed; empty entries are ignored.
+    pub fn parse_list(value: &str) -> Vec<String> {
+        Self::parse_trusted_security_definer(value)
     }
 
     /// Semicolon-separated `regprocedure` names, trimmed; empty entries are
@@ -385,6 +440,9 @@ fn apply_locked(
         if has_schema && !options.adopt_legacy_baseline {
             return Err(MigrationError::LegacyBaselineNotAdopted);
         }
+        if has_schema && options.record_signer.is_none() {
+            return Err(MigrationError::AdoptionRequiresSigner);
+        }
         // The baseline check and the recording of 0001-0009 commit (or roll
         // back) together, with the praetore tables locked, so the schema
         // cannot change between the comparison and the record.
@@ -409,6 +467,10 @@ fn apply_locked(
         }
         if let Some(expected) = &baseline {
             let dump_sha256 = dump_checksum(expected);
+            let signer = options
+                .record_signer
+                .as_ref()
+                .ok_or(MigrationError::AdoptionRequiresSigner)?;
             for (version, sql) in MIGRATIONS {
                 transaction.execute(
                     "INSERT INTO praetore.schema_migrations \
@@ -421,13 +483,14 @@ fn apply_locked(
                     break;
                 }
             }
+            record_adoption(&mut transaction, signer.as_ref(), &dump_sha256)?;
             // DDL that takes no lock on the praetore tables (CREATE OR
             // REPLACE FUNCTION, GRANT, ALTER SEQUENCE ...) can still commit
             // while this transaction waits, for example on CREATE TABLE
             // above. Compare again immediately before COMMIT; what remains is
             // the window between this query and the COMMIT itself.
             let mut live = schema_dump(&mut transaction, "praetore", "praetore")?;
-            live.retain(|key, _| !is_control_table_key(key));
+            live.retain(|key, _| !is_control_table_key(key) && !is_storage_records_key(key));
             let differences = dump_differences(&live, expected);
             if !differences.is_empty() {
                 return Err(MigrationError::UnrecognizedSchema(format!(
@@ -1246,6 +1309,15 @@ pub fn migration_record_inconsistency(
     client: &mut Client,
 ) -> Result<Option<String>, MigrationError> {
     with_safe_search_path(client, |client| {
+        let has_table: bool = client
+            .query_one(
+                "SELECT pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
+                &[],
+            )?
+            .get(0);
+        if !has_table {
+            return Ok(None);
+        }
         let has_column: bool = client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute a \
@@ -1338,6 +1410,157 @@ fn dump_differences(live: &SchemaDump, expected: &SchemaDump) -> Vec<String> {
     differences
 }
 
+/// One event trigger and, if it is refused, why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventTriggerStatus {
+    pub name: String,
+    pub listed: bool,
+    pub problem: Option<String>,
+}
+
+/// Every event trigger in the database, checked against
+/// `PRAETORE_TRUSTED_EVENT_TRIGGERS`. An unlisted trigger is refused. A
+/// listed one is accepted only if it can be verified: the trigger and its
+/// function are owned by superusers, the function is not in `praetore`,
+/// and neither owner is, belongs to, or has as member the praetore owner or
+/// the migrating role. A listed trigger that cannot be verified is refused
+/// (fail closed).
+fn event_trigger_statuses(
+    transaction: &mut impl postgres::GenericClient,
+    trusted: &[String],
+) -> Result<Vec<EventTriggerStatus>, MigrationError> {
+    let rows = transaction.query(
+        &format!(
+            "WITH RECURSIVE anchors(role) AS ( \
+                 SELECT {OWNER_SQL} \
+                 UNION SELECT r.oid FROM pg_catalog.pg_roles r \
+                       WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER), \
+             groups(role) AS ( \
+                 SELECT role FROM anchors \
+                 UNION \
+                 SELECT m.roleid FROM pg_catalog.pg_auth_members m \
+                 JOIN groups ON m.member OPERATOR(pg_catalog.=) groups.role), \
+             members(role) AS ( \
+                 SELECT role FROM anchors \
+                 UNION \
+                 SELECT m.member FROM pg_catalog.pg_auth_members m \
+                 JOIN members ON m.roleid OPERATOR(pg_catalog.=) members.role), \
+             related(role) AS (SELECT role FROM groups UNION SELECT role FROM members) \
+             SELECT e.evtname::pg_catalog.text, e.evtevent::pg_catalog.text, \
+                    pg_catalog.pg_get_userbyid(e.evtowner)::pg_catalog.text, \
+                    COALESCE(ow.rolsuper, false), \
+                    p.oid::pg_catalog.regprocedure::pg_catalog.text, \
+                    pg_catalog.pg_get_userbyid(p.proowner)::pg_catalog.text, \
+                    COALESCE(fo.rolsuper, false), \
+                    fn.nspname OPERATOR(pg_catalog.=) 'praetore', \
+                    EXISTS (SELECT 1 FROM related \
+                            WHERE related.role OPERATOR(pg_catalog.=) e.evtowner \
+                               OR related.role OPERATOR(pg_catalog.=) p.proowner) \
+             FROM pg_catalog.pg_event_trigger e \
+             LEFT JOIN pg_catalog.pg_roles ow ON ow.oid OPERATOR(pg_catalog.=) e.evtowner \
+             LEFT JOIN pg_catalog.pg_proc p ON p.oid OPERATOR(pg_catalog.=) e.evtfoid \
+             LEFT JOIN pg_catalog.pg_roles fo ON fo.oid OPERATOR(pg_catalog.=) p.proowner \
+             LEFT JOIN pg_catalog.pg_namespace fn ON fn.oid OPERATOR(pg_catalog.=) p.pronamespace \
+             ORDER BY 1"
+        ),
+        &[],
+    )?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let name: String = row.get(0);
+            let listed = trusted.contains(&name);
+            let (event, owner, owner_super, function, function_owner, function_super) = (
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, bool>(3),
+                row.get::<_, Option<String>>(4).unwrap_or_default(),
+                row.get::<_, Option<String>>(5).unwrap_or_default(),
+                row.get::<_, bool>(6),
+            );
+            let (in_praetore, related): (Option<bool>, bool) = (row.get(7), row.get(8));
+            let problem = if !listed {
+                Some(format!(
+                    "event trigger {name} ({event}) exists; it would run during migrations \
+                     (not listed in PRAETORE_TRUSTED_EVENT_TRIGGERS)"
+                ))
+            } else {
+                let mut reasons = Vec::new();
+                if !owner_super {
+                    reasons.push(format!("its owner {owner} is not a superuser"));
+                }
+                if !function_super {
+                    reasons.push(format!(
+                        "its function {function} is owned by {function_owner}, not a superuser"
+                    ));
+                }
+                if in_praetore.unwrap_or(true) {
+                    reasons.push("its function is in praetore or cannot be resolved".to_owned());
+                }
+                if related {
+                    reasons.push(
+                        "an owner is, belongs to, or has as member the praetore owner or the \
+                         migrating role"
+                            .to_owned(),
+                    );
+                }
+                (!reasons.is_empty()).then(|| {
+                    format!(
+                        "event trigger {name} is listed in PRAETORE_TRUSTED_EVENT_TRIGGERS but \
+                         cannot be verified: {}",
+                        reasons.join("; ")
+                    )
+                })
+            };
+            EventTriggerStatus {
+                name,
+                listed,
+                problem,
+            }
+        })
+        .collect())
+}
+
+/// Event triggers and their status, for the startup log and `praetore
+/// doctor`.
+pub fn event_trigger_report(
+    client: &mut Client,
+    trusted: &[String],
+) -> Result<Vec<EventTriggerStatus>, MigrationError> {
+    with_safe_search_path(client, |client| {
+        let mut transaction = client.build_transaction().read_only(true).start()?;
+        let statuses = event_trigger_statuses(&mut transaction, trusted);
+        transaction.rollback()?;
+        statuses
+    })
+}
+
+/// `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES` entries: `role:*:objtype`, with
+/// `objtype` one of `r`, `S`, `f`, `T`, `n` (as in `pg_default_acl`). Only
+/// global entries can be trusted: entries in `praetore` are never allowed,
+/// and entries in other schemas never apply to praetore objects.
+pub fn parse_trusted_default_privileges(
+    entries: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let parts: Vec<&str> = entry.split(':').collect();
+            match parts.as_slice() {
+                [role, "*", kind]
+                    if !role.is_empty() && matches!(*kind, "r" | "S" | "f" | "T" | "n") =>
+                {
+                    Ok(((*role).to_owned(), (*kind).to_owned()))
+                }
+                _ => Err(format!(
+                    "PRAETORE_TRUSTED_DEFAULT_PRIVILEGES entry {entry:?} must be role:*:objtype \
+                     with objtype r, S, f, T or n"
+                )),
+            }
+        })
+        .collect()
+}
+
 /// The future or current owner of `praetore`: the schema owner, or the
 /// migrating role when the schema does not exist yet.
 const OWNER_SQL: &str = "(SELECT COALESCE(\
@@ -1368,6 +1591,79 @@ fn search_path_shadows_catalog(value: &str) -> bool {
             .iter()
             .any(|entry| !entry.starts_with("pg_temp")),
     }
+}
+
+/// Writes the signed adoption record: creates `praetore.storage_records`
+/// with migration 0015 (idempotent; recorded later in the normal order) and
+/// inserts the record, in the adoption transaction.
+fn record_adoption(
+    transaction: &mut postgres::Transaction<'_>,
+    signer: &dyn praetore_core::StorageRecordSigner,
+    structure_sha256: &str,
+) -> Result<(), MigrationError> {
+    let (_, sql) = MIGRATIONS
+        .iter()
+        .find(|(version, _)| *version == STORAGE_RECORDS_VERSION)
+        .expect("0015 is bundled");
+    transaction.batch_execute(transactional_body(STORAGE_RECORDS_VERSION, sql)?)?;
+    let row = transaction.query_one(
+        "SELECT pg_catalog.to_char(pg_catalog.clock_timestamp() AT TIME ZONE 'UTC', \
+                    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'), \
+                pg_catalog.current_database()::pg_catalog.text, \
+                (SELECT d.oid FROM pg_catalog.pg_database d \
+                 WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()), \
+                SESSION_USER::pg_catalog.text",
+        &[],
+    )?;
+    let payload = praetore_core::StorageRecordPayload {
+        schema_version: praetore_core::storage_record::STORAGE_RECORD_SCHEMA_VERSION,
+        kind: praetore_core::storage_record::LEGACY_BASELINE_ADOPTED.to_owned(),
+        record_id: uuid::Uuid::new_v4(),
+        recorded_at: row.get(0),
+        database: row.get(1),
+        database_oid: row.get(2),
+        recorded_by: row.get(3),
+        migrations: MIGRATIONS
+            .iter()
+            .take_while(|(version, _)| *version <= BASELINE_VERSION)
+            .map(|(version, sql)| praetore_core::RecordedMigration {
+                version: (*version).to_owned(),
+                checksum: checksum(sql),
+            })
+            .collect(),
+        structure_sha256: structure_sha256.to_owned(),
+        key_id: signer.key_id(),
+    };
+    let record = signer.sign_storage_record(payload).map_err(|error| {
+        MigrationError::InvalidConfiguration(format!("cannot sign the adoption record: {error}"))
+    })?;
+    let json = record.to_json().map_err(|error| {
+        MigrationError::InvalidConfiguration(format!("cannot encode the adoption record: {error}"))
+    })?;
+    transaction.execute(
+        "INSERT INTO praetore.storage_records (record_id, kind, record_json) VALUES ($1, $2, $3)",
+        &[&record.record_id, &record.kind, &json],
+    )?;
+    Ok(())
+}
+
+/// Keys of `praetore.storage_records` and its trigger function, which the
+/// adoption transaction creates before 0015 is recorded.
+fn is_storage_records_key(key: &str) -> bool {
+    let Some((_, rest)) = key.split_once("praetore.") else {
+        return false;
+    };
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    matches!(
+        name.as_str(),
+        "storage_records"
+            | "storage_records_pkey"
+            | "_storage_records"
+            | "reject_storage_record_mutation"
+    )
 }
 
 /// Keys of the control table, created in the recording transaction: the
@@ -1411,14 +1707,10 @@ fn environment_problems(
     .map(|function| function.oid)
     .collect();
     let mut problems = Vec::new();
-    for row in transaction.query(
-        "SELECT e.evtname::pg_catalog.text FROM pg_catalog.pg_event_trigger e ORDER BY 1",
-        &[],
-    )? {
-        let name: String = row.get(0);
-        problems.push(format!(
-            "event trigger {name} exists; it would run as the migrating role"
-        ));
+    for status in event_trigger_statuses(transaction, &options.trusted_event_triggers)? {
+        if let Some(problem) = status.problem {
+            problems.push(problem);
+        }
     }
     for row in transaction.query(
         "SELECT COALESCE(r.rolname::pg_catalog.text, 'all roles'), \
@@ -1446,27 +1738,55 @@ fn environment_problems(
             "setting {setting} for {role} in {database} is not allowed"
         ));
     }
+    let trusted_defaults = parse_trusted_default_privileges(&options.trusted_default_privileges)
+        .map_err(MigrationError::InvalidConfiguration)?;
     for row in transaction.query(
         &format!(
             "SELECT pg_catalog.pg_get_userbyid(a.defaclrole)::pg_catalog.text, \
-                COALESCE((SELECT n.nspname::pg_catalog.text FROM pg_catalog.pg_namespace n \
-                          WHERE n.oid OPERATOR(pg_catalog.=) a.defaclnamespace), 'all schemas'), \
-                a.defaclobjtype::pg_catalog.text \
-         FROM pg_catalog.pg_default_acl a \
-         WHERE a.defaclnamespace OPERATOR(pg_catalog.=) \
-                   (SELECT n.oid FROM pg_catalog.pg_namespace n \
-                    WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
-            OR a.defaclrole OPERATOR(pg_catalog.=) {OWNER} \
-            OR a.defaclrole OPERATOR(pg_catalog.=) \
-                   (SELECT r.oid FROM pg_catalog.pg_roles r \
-                    WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER) \
-         ORDER BY 1, 2, 3"
+                    a.defaclnamespace OPERATOR(pg_catalog.<>) 0::pg_catalog.oid, \
+                    a.defaclobjtype::pg_catalog.text, \
+                    NOT EXISTS ( \
+                        SELECT 1 FROM pg_catalog.aclexplode(a.defaclacl) g \
+                        WHERE NOT EXISTS ( \
+                            SELECT 1 FROM pg_catalog.aclexplode(pg_catalog.acldefault( \
+                                CASE WHEN a.defaclobjtype OPERATOR(pg_catalog.=) 'S' THEN 's' \
+                                     ELSE a.defaclobjtype::pg_catalog.text END::pg_catalog.\"char\", \
+                                a.defaclrole)) d \
+                            WHERE d.grantee OPERATOR(pg_catalog.=) g.grantee \
+                              AND d.privilege_type OPERATOR(pg_catalog.=) g.privilege_type \
+                              AND (d.is_grantable OR NOT g.is_grantable))) \
+             FROM pg_catalog.pg_default_acl a \
+             WHERE a.defaclnamespace OPERATOR(pg_catalog.=) \
+                       (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                        WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore') \
+                OR (a.defaclnamespace OPERATOR(pg_catalog.=) 0::pg_catalog.oid \
+                    AND (a.defaclrole OPERATOR(pg_catalog.=) {OWNER} \
+                         OR a.defaclrole OPERATOR(pg_catalog.=) \
+                            (SELECT r.oid FROM pg_catalog.pg_roles r \
+                             WHERE r.rolname OPERATOR(pg_catalog.=) CURRENT_USER))) \
+             ORDER BY 1, 2, 3"
         ),
         &[],
     )? {
-        let (role, schema, kind): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        let (role, in_praetore, kind, revoke_only): (String, bool, String, bool) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        let schema = if in_praetore { "praetore" } else { "all schemas" };
+        let listed = trusted_defaults
+            .iter()
+            .any(|(trusted_role, trusted_kind)| *trusted_role == role && *trusted_kind == kind);
+        if !in_praetore && listed && revoke_only {
+            continue;
+        }
+        let why = if in_praetore {
+            "default privileges in praetore are never allowed"
+        } else if listed {
+            "it is listed in PRAETORE_TRUSTED_DEFAULT_PRIVILEGES but grants privileges; only \
+             entries that only revoke can be trusted"
+        } else {
+            "not allowed"
+        };
         problems.push(format!(
-            "default privileges of {role} in {schema} (object type {kind}) are not allowed"
+            "default privileges of {role} in {schema} (object type {kind}): {why}"
         ));
     }
     for row in transaction.query(

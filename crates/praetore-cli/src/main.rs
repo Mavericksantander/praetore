@@ -328,7 +328,7 @@ fn print_usage() {
            praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
-           praetore journal-export (--receipts-dir <dir> | --tenant <uuid>) --attester-pin <hex file> --output <new file>\n\
+           praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> --output <new file>\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
     );
@@ -686,6 +686,13 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let options = runtime_role_options()?;
+                match options.relaxed().as_slice() {
+                    [] => println!("[ok] runtime role check: no refusal relaxed"),
+                    relaxed => println!(
+                        "[warn] runtime role check relaxed explicitly: {}",
+                        relaxed.join(", ")
+                    ),
+                }
                 match praetore_replay_postgres::verify_runtime_role_with(&mut client, &options) {
                     Ok(()) => println!("[ok] least-privilege runtime database role"),
                     Err(error) => println!("[warn] {error} (acceptable for the local demo only)"),
@@ -719,6 +726,47 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(error) => println!("[failed] {error}"),
+                }
+                let migration_options = migration_options_from_env();
+                for (name, entries) in [
+                    (
+                        praetore_replay_postgres::MigrationOptions::TRUSTED_EVENT_TRIGGERS_ENV,
+                        &migration_options.trusted_event_triggers,
+                    ),
+                    (
+                        praetore_replay_postgres::MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV,
+                        &migration_options.trusted_default_privileges,
+                    ),
+                ] {
+                    if !entries.is_empty() {
+                        println!(
+                            "[warn] migration check relaxed by {name}: {}",
+                            entries.join("; ")
+                        );
+                    }
+                }
+                if let Err(error) = praetore_replay_postgres::parse_trusted_default_privileges(
+                    &migration_options.trusted_default_privileges,
+                ) {
+                    println!("[failed] {error}");
+                    healthy = false;
+                }
+                match praetore_replay_postgres::event_trigger_report(
+                    &mut client,
+                    &migration_options.trusted_event_triggers,
+                ) {
+                    Ok(statuses) => {
+                        for status in statuses {
+                            match status.problem {
+                                None => println!(
+                                    "[warn] trusted event trigger {} verified; it runs during migrations",
+                                    status.name
+                                ),
+                                Some(problem) => println!("[failed] {problem}"),
+                            }
+                        }
+                    }
+                    Err(error) => println!("[warn] event triggers unreadable: {error}"),
                 }
                 match praetore_replay_postgres::runtime_role_members(&mut client) {
                     Ok(members) if members.is_empty() => {}
@@ -793,6 +841,19 @@ fn local_database(database_url: &str) -> Result<DatabaseConnector, Box<dyn std::
         );
     }
     Ok(connector)
+}
+
+/// Migration allowlists from the same variables the gateway reads
+/// (none by default).
+fn migration_options_from_env() -> praetore_replay_postgres::MigrationOptions {
+    use praetore_replay_postgres::MigrationOptions;
+    let list = |name: &str| MigrationOptions::parse_list(&env::var(name).unwrap_or_default());
+    MigrationOptions {
+        trusted_security_definer: list(MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV),
+        trusted_event_triggers: list(MigrationOptions::TRUSTED_EVENT_TRIGGERS_ENV),
+        trusted_default_privileges: list(MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV),
+        ..Default::default()
+    }
 }
 
 /// Runtime role options from the same variables the gateway reads.
@@ -974,17 +1035,20 @@ fn run_gateway(
         .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")
         .unwrap_or_else(|_| database_url.clone());
+    let record_signer: Option<std::sync::Arc<dyn praetore_core::StorageRecordSigner>> =
+        if adopt_legacy_baseline {
+            Some(std::sync::Arc::new(EvidenceAttesterKey::from_secret_bytes(
+                &read_secret(directory, EVIDENCE_KEY_FILE)?,
+            )))
+        } else {
+            None
+        };
     apply_migrations_with(
         &migration_url,
         &praetore_replay_postgres::MigrationOptions {
             adopt_legacy_baseline,
-            trusted_security_definer:
-                praetore_replay_postgres::MigrationOptions::parse_trusted_security_definer(
-                    &env::var(
-                        praetore_replay_postgres::MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV,
-                    )
-                    .unwrap_or_default(),
-                ),
+            record_signer,
+            ..migration_options_from_env()
         },
     )?;
     let runtime_role = praetore_replay_postgres::verify_runtime_role_with(

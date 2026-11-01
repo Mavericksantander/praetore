@@ -917,7 +917,8 @@ fn unsafe_runtime_setting(
 /// from 0011 (schema USAGE; SELECT on `schema_migrations` and
 /// `execution_journal_events`; SELECT and INSERT on `replay_claims`,
 /// `execution_journal`, `execution_attestations`, `human_approvals` and
-/// `human_approval_expirations`; UPDATE of `execution_status`,
+/// `human_approval_expirations`; SELECT on `storage_records` (0015);
+/// UPDATE of `execution_status`,
 /// `output_json`, `not_dispatched_reason` and `updated_at`); the
 /// documented `praetore_observe` shape exactly (schema USAGE; column SELECT
 /// on the ten `execution_journal` and seven `execution_journal_events`
@@ -965,6 +966,7 @@ fn unexpected_grants(
          runtime_allowed(kind, rel, col, privilege) AS (VALUES \
              ('n', '', '', 'USAGE'), \
              ('r', 'schema_migrations', '', 'SELECT'), \
+             ('r', 'storage_records', '', 'SELECT'), \
              ('r', 'replay_claims', '', 'SELECT'), ('r', 'replay_claims', '', 'INSERT'), \
              ('r', 'execution_journal', '', 'SELECT'), ('r', 'execution_journal', '', 'INSERT'), \
              ('r', 'execution_journal_events', '', 'SELECT'), \

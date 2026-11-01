@@ -19,6 +19,26 @@
   `PRAETORE_RUNTIME_ALLOW_SETTINGS=search_path` (exact names; anything else
   is a configuration error; the effective setting is logged at startup), or
   `verify_runtime_role_with` and `RuntimeRoleOptions` in the library.
+- **Breaking (journal chain format):** the journal export gains signed
+  storage records. Adopting a legacy baseline writes a record signed with
+  the evidence attester key into `praetore.storage_records` (migration
+  0015, append-only) in the adoption transaction; adoption without a signer
+  is refused (`MigrationError::AdoptionRequiresSigner`). `praetore
+  journal-export --database` exports them as a database-level chain
+  (`record` lines), and a tenant export of a database with records starts
+  with a `database_head` reference to that chain. `praetore-verify journal`
+  verifies both, and `--database-journal`/`--expected-database-head` check
+  the reference. Chains without records are unchanged; older verifiers
+  refuse chains with the new lines. See
+  `docs/proposals/journal-chain-jsonl.md`.
+- Migration checks accept event triggers and global revoke-only default
+  privileges only when listed explicitly (`PRAETORE_TRUSTED_EVENT_TRIGGERS`,
+  `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES`; off by default; listed event
+  triggers are verified at startup and refused if they cannot be). Default
+  privileges in schemas other than `praetore` are no longer considered.
+  Relaxations are logged at startup and reported by `praetore doctor`.
+  `docs/operations.md` documents them and recommends
+  `PRAETORE_RUNTIME_LOGINS` in production.
 - **Breaking:** an existing `praetore` schema without migration records is
   no longer adopted silently. `apply_migrations` refuses it
   (`MigrationError::LegacyBaselineNotAdopted`). Adoption is explicit:

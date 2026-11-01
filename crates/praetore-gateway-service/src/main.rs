@@ -166,6 +166,18 @@ fn parse_tenant_issuer_bindings(
 fn apply_migrations(database: &DatabaseConnector) -> Result<(), Box<dyn std::error::Error>> {
     let options = migration_options()?;
     let mut client = database.connect()?;
+    for status in praetore_replay_postgres::event_trigger_report(
+        &mut client,
+        &options.trusted_event_triggers,
+    )? {
+        match &status.problem {
+            None => tracing::warn!(
+                event_trigger = %status.name,
+                "trusted event trigger verified; it runs during migrations"
+            ),
+            Some(problem) => tracing::error!(%problem, "event trigger refused"),
+        }
+    }
     let applied = praetore_replay_postgres::apply_migrations_with(&mut client, &options)?;
     tracing::info!(?applied, "database migrations applied");
     if let Some(adoption) = praetore_replay_postgres::legacy_baseline_adoption(&mut client)? {
@@ -180,23 +192,61 @@ fn apply_migrations(database: &DatabaseConnector) -> Result<(), Box<dyn std::err
 fn migration_options()
 -> Result<praetore_replay_postgres::MigrationOptions, Box<dyn std::error::Error>> {
     use praetore_replay_postgres::MigrationOptions;
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
     let adopt_legacy_baseline = MigrationOptions::parse_adopt_legacy_baseline(
         std::env::var(MigrationOptions::ADOPT_LEGACY_BASELINE_ENV)
             .ok()
             .as_deref(),
     )?;
-    let trusted_security_definer = MigrationOptions::parse_trusted_security_definer(
-        &std::env::var(MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV).unwrap_or_default(),
-    );
-    tracing::info!(
+    // Adopting a legacy baseline writes a record signed with the evidence
+    // attester key; without the key there is no signer and adoption fails.
+    let record_signer: Option<std::sync::Arc<dyn praetore_core::StorageRecordSigner>> =
+        if adopt_legacy_baseline {
+            match std::env::var("PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX") {
+                Ok(key) => {
+                    let bytes: [u8; 32] = hex::decode(key)?
+                        .try_into()
+                        .map_err(|_| "evidence attester key must be exactly 32 bytes")?;
+                    Some(std::sync::Arc::new(EvidenceAttesterKey::from_secret_bytes(
+                        &bytes,
+                    )))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+    let options = MigrationOptions {
         adopt_legacy_baseline,
-        ?trusted_security_definer,
-        "migration options"
-    );
-    Ok(MigrationOptions {
-        adopt_legacy_baseline,
-        trusted_security_definer,
-    })
+        trusted_security_definer: MigrationOptions::parse_list(&env(
+            MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV,
+        )),
+        record_signer,
+        trusted_event_triggers: MigrationOptions::parse_list(&env(
+            MigrationOptions::TRUSTED_EVENT_TRIGGERS_ENV,
+        )),
+        trusted_default_privileges: MigrationOptions::parse_list(&env(
+            MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV,
+        )),
+    };
+    praetore_replay_postgres::parse_trusted_default_privileges(
+        &options.trusted_default_privileges,
+    )?;
+    if options.trusted_security_definer.is_empty()
+        && options.trusted_event_triggers.is_empty()
+        && options.trusted_default_privileges.is_empty()
+    {
+        tracing::info!(adopt_legacy_baseline, "migration options: no check relaxed");
+    } else {
+        tracing::warn!(
+            adopt_legacy_baseline,
+            trusted_security_definer = ?options.trusted_security_definer,
+            trusted_event_triggers = ?options.trusted_event_triggers,
+            trusted_default_privileges = ?options.trusted_default_privileges,
+            "migration checks relaxed explicitly"
+        );
+    }
+    Ok(options)
 }
 
 /// Validates both database URLs (including TLS: non-loopback hosts need

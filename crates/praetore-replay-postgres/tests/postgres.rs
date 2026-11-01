@@ -2898,9 +2898,15 @@ fn adopt_legacy_baseline(
         client,
         &praetore_replay_postgres::MigrationOptions {
             adopt_legacy_baseline: true,
+            record_signer: Some(std::sync::Arc::new(adoption_attester())),
             ..Default::default()
         },
     )
+}
+
+/// The key that signs adoption records in these tests.
+fn adoption_attester() -> praetore_core::EvidenceAttesterKey {
+    praetore_core::EvidenceAttesterKey::from_secret_bytes(&[42; 32])
 }
 
 /// Runs migrations the way the pre-runner code did: plain SQL, no record.
@@ -2983,7 +2989,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0011_runtime_role",
             "0012_dispatch_requires_live_approval",
             "0013_dispatch_refused",
-            "0014_closed_execution_row_lock"
+            "0014_closed_execution_row_lock",
+            "0015_storage_records"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -3532,7 +3539,7 @@ fn postgres_migrations_baseline_columns_indexes_and_extra_objects_fail_closed() 
                AS $$ BEGIN END $$; \
              CREATE EVENT TRIGGER t015_ddl ON ddl_command_end \
                EXECUTE FUNCTION public.t015_ddl();",
-            "event trigger t015_ddl exists",
+            "event trigger t015_ddl (ddl_command_end) exists",
         ),
     ] {
         assert_tampered_baseline_refused(tamper, object);
@@ -4549,6 +4556,266 @@ fn postgres_migration_record_inconsistency_is_flagged() {
             .unwrap()
             .is_none(),
         "a database migrated by the runner is consistent"
+    );
+}
+
+/// Option B (GHSA-67vm-x598-vhg3): adopting a legacy baseline writes, in the
+/// same transaction, a storage record signed with the attester key into the
+/// append-only praetore.storage_records.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_adoption_writes_a_signed_append_only_storage_record() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    adopt_legacy_baseline(&mut client).unwrap();
+    let rows = client
+        .query(
+            "SELECT record_json, kind FROM praetore.storage_records",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one adoption record");
+    let record = praetore_core::StorageRecord::from_json(rows[0].get(0)).unwrap();
+    record
+        .verify(&adoption_attester().public_key().unwrap())
+        .expect("signed by the attester key");
+    assert_eq!(rows[0].get::<_, String>(1), "legacy_baseline_adopted");
+    assert_eq!(record.migrations.len(), 9);
+    let adoption = praetore_replay_postgres::legacy_baseline_adoption(&mut client)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.structure_sha256, adoption.structure_sha256);
+    eprintln!("record: {}", record.to_json().unwrap());
+    for statement in [
+        "UPDATE praetore.storage_records SET kind = kind",
+        "DELETE FROM praetore.storage_records",
+        "TRUNCATE praetore.storage_records",
+    ] {
+        assert!(client.batch_execute(statement).is_err(), "{statement}");
+    }
+    // A fresh database has the table and no record.
+    let fresh = ScratchDatabase::create();
+    let mut client = fresh.connect();
+    praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    let count: i64 = client
+        .query_one("SELECT count(*) FROM praetore.storage_records", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0);
+}
+
+/// Option B: no signer, no adoption.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_adoption_without_signer_is_refused() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    let error = praetore_replay_postgres::apply_migrations_with(
+        &mut client,
+        &praetore_replay_postgres::MigrationOptions {
+            adopt_legacy_baseline: true,
+            ..Default::default()
+        },
+    )
+    .expect_err("adoption without a signer");
+    assert!(
+        matches!(
+            error,
+            praetore_replay_postgres::MigrationError::AdoptionRequiresSigner
+        ),
+        "{error}"
+    );
+    eprintln!("refused as expected: {error}");
+    let control: bool = client
+        .query_one(
+            "SELECT pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!control, "nothing may be recorded");
+}
+
+/// M4-2: event triggers are refused unless listed in
+/// PRAETORE_TRUSTED_EVENT_TRIGGERS and verifiable (trigger and function
+/// owned by superusers unrelated to the praetore owner and the migrating
+/// role); a listed trigger that cannot be verified fails closed.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_trusted_event_triggers_allowlist() {
+    use praetore_replay_postgres::MigrationOptions;
+    let platform = TestRole::create("SUPERUSER NOLOGIN");
+    let unprivileged = TestRole::create("NOLOGIN");
+    let trusted = |names: &str| MigrationOptions {
+        trusted_event_triggers: MigrationOptions::parse_list(names),
+        ..Default::default()
+    };
+    let setup = |owner: &str, function_owner: &str| {
+        format!(
+            "CREATE FUNCTION public.platform_ddl_watch() RETURNS event_trigger \
+               LANGUAGE plpgsql AS $$ BEGIN NULL; END $$; \
+             CREATE EVENT TRIGGER platform_ddl_watch ON ddl_command_end \
+               EXECUTE FUNCTION public.platform_ddl_watch(); \
+             ALTER FUNCTION public.platform_ddl_watch() OWNER TO {function_owner}; \
+             ALTER EVENT TRIGGER platform_ddl_watch OWNER TO {owner};"
+        )
+    };
+    // Listed and owned by an unrelated superuser: accepted.
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    client
+        .batch_execute(&setup(&platform.name, &platform.name))
+        .unwrap();
+    let report =
+        praetore_replay_postgres::event_trigger_report(&mut client, &["platform_ddl_watch".into()])
+            .unwrap();
+    assert_eq!(report.len(), 1);
+    assert!(
+        report[0].listed && report[0].problem.is_none(),
+        "{report:?}"
+    );
+    // Not listed: refused.
+    let error = praetore_replay_postgres::apply_migrations(&mut client)
+        .expect_err("an unlisted event trigger");
+    assert!(
+        error
+            .to_string()
+            .contains("not listed in PRAETORE_TRUSTED_EVENT_TRIGGERS"),
+        "{error}"
+    );
+    praetore_replay_postgres::apply_migrations_with(&mut client, &trusted("platform_ddl_watch"))
+        .expect("a listed, verifiable event trigger is accepted");
+    drop(scratch);
+    // Listed, but its function owner cannot be verified (not a superuser),
+    // or an owner is the migrating role: refused.
+    for (owner, function_owner, expected) in [
+        (
+            platform.name.clone(),
+            unprivileged.name.clone(),
+            format!("is owned by {}, not a superuser", unprivileged.name),
+        ),
+        (
+            "CURRENT_USER".to_owned(),
+            platform.name.clone(),
+            "has as member the praetore owner or the migrating role".to_owned(),
+        ),
+    ] {
+        let scratch = ScratchDatabase::create();
+        let mut client = scratch.connect();
+        client
+            .batch_execute(&setup(&owner, &function_owner))
+            .unwrap();
+        let error = praetore_replay_postgres::apply_migrations_with(
+            &mut client,
+            &trusted("platform_ddl_watch"),
+        )
+        .expect_err("a listed event trigger that cannot be verified");
+        let message = error.to_string();
+        assert!(message.contains("cannot be verified"), "{message}");
+        assert!(message.contains(&expected), "{message}");
+        eprintln!("refused as expected: {message}");
+    }
+}
+
+/// M4-2: only default privileges for all schemas or for praetore count;
+/// a global entry can be trusted (PRAETORE_TRUSTED_DEFAULT_PRIVILEGES) only
+/// when it only revokes; entries in praetore never.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_trusted_default_privileges_allowlist() {
+    use praetore_replay_postgres::MigrationOptions;
+    let other = TestRole::create("NOLOGIN");
+    let trusted = |entries: &str| MigrationOptions {
+        trusted_default_privileges: MigrationOptions::parse_list(entries),
+        ..Default::default()
+    };
+    let migrator: String = connect_client()
+        .query_one("SELECT current_user::text", &[])
+        .unwrap()
+        .get(0);
+    // In another schema: never applies to praetore, ignored.
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    client
+        .batch_execute(&format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}",
+            other.name
+        ))
+        .unwrap();
+    praetore_replay_postgres::apply_migrations(&mut client)
+        .expect("default privileges in another schema are not considered");
+    drop(scratch);
+    // Global and revoke-only: refused unless listed.
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    client
+        .batch_execute("ALTER DEFAULT PRIVILEGES FOR ROLE CURRENT_USER REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC")
+        .unwrap();
+    let error = praetore_replay_postgres::apply_migrations(&mut client)
+        .expect_err("an unlisted global entry");
+    assert!(
+        error.to_string().contains("default privileges of"),
+        "{error}"
+    );
+    praetore_replay_postgres::apply_migrations_with(
+        &mut client,
+        &trusted(&format!("{migrator}:*:f")),
+    )
+    .expect("a listed revoke-only global entry is accepted");
+    drop(scratch);
+    // Global and granting: refused even when listed.
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    client
+        .batch_execute(&format!(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE CURRENT_USER GRANT SELECT ON TABLES TO {}",
+            other.name
+        ))
+        .unwrap();
+    let message = praetore_replay_postgres::apply_migrations_with(
+        &mut client,
+        &trusted(&format!("{migrator}:*:r")),
+    )
+    .expect_err("a granting entry")
+    .to_string();
+    assert!(
+        message.contains("only entries that only revoke can be trusted"),
+        "{message}"
+    );
+    drop(scratch);
+    // In praetore: never allowed; and a non-global entry is a config error.
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut client).unwrap();
+    client
+        .batch_execute(&format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA praetore GRANT SELECT ON TABLES TO {}",
+            other.name
+        ))
+        .unwrap();
+    let message = praetore_replay_postgres::apply_migrations_with(
+        &mut client,
+        &trusted(&format!("{migrator}:*:r")),
+    )
+    .expect_err("an entry in praetore")
+    .to_string();
+    assert!(
+        message.contains("default privileges in praetore are never allowed"),
+        "{message}"
+    );
+    let error = praetore_replay_postgres::apply_migrations_with(
+        &mut client,
+        &trusted(&format!("{migrator}:praetore:f")),
+    )
+    .expect_err("not role:*:objtype");
+    assert!(
+        matches!(
+            error,
+            praetore_replay_postgres::MigrationError::InvalidConfiguration(_)
+        ),
+        "{error}"
     );
 }
 
@@ -5907,7 +6174,10 @@ fn postgres_migrations_0013_database_applies_only_0014() {
     let applied = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
     let again = praetore_replay_postgres::apply_migrations(&mut client).unwrap();
     println!("0013 database applied {applied:?}; second run applied {again:?}");
-    assert_eq!(applied, vec!["0014_closed_execution_row_lock"]);
+    assert_eq!(
+        applied,
+        vec!["0014_closed_execution_row_lock", "0015_storage_records"]
+    );
     assert!(again.is_empty());
     let v2_after: bool = client
         .query_one(

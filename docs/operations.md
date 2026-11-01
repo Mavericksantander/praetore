@@ -311,6 +311,61 @@ duplicate claims through newly created clients and concurrent connections.
 That does not replace testing the target deployment's replication and
 disaster-recovery configuration.
 
+### Schema checks, allowlists and managed PostgreSQL
+
+The migration runner and `verify_runtime_role` refuse database state that
+could let another role act as the `praetore` owner or bypass the journal's
+guarantees (see `docs/threat-model.md`, section "Threat model / Modelo de
+amenaza: PostgreSQL journal schema", and GHSA-67vm-x598-vhg3). Some managed
+platforms install such state. Each relaxation is an explicit allowlist, off
+by default, logged at startup and reported by `praetore doctor`:
+
+- `PRAETORE_RUNTIME_LOGINS` (comma-separated login roles): the logins allowed
+  to be members of `praetore_runtime`. Without it, other login members are
+  only reported. **Set it in production**, so that a login added to
+  `praetore_runtime` by mistake is refused at startup.
+- `PRAETORE_SCHEMA_OWNER_MEMBERS` (comma-separated roles): members of the
+  `praetore` schema owner, for example the migrating role of a NOLOGIN owner
+  group.
+- `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS` (semicolon-separated,
+  schema-qualified with the full signature, for example
+  `public.helper(integer)`): SECURITY DEFINER functions with the owner's
+  rights that other roles may execute. An entry that does not resolve is a
+  configuration error. Whoever can execute an allowlisted function acts with
+  its owner's privileges.
+- `PRAETORE_TRUSTED_EVENT_TRIGGERS` (semicolon-separated exact names): event
+  triggers that may exist while migrating. A listed trigger is accepted only
+  if the trigger and its function are owned by superusers, the function is
+  not in `praetore`, and neither owner is, belongs to, or has as member the
+  `praetore` owner or the migrating role; otherwise migrating fails with an
+  error naming the trigger. A listed event trigger runs with its function
+  owner's privileges during every migration DDL.
+- `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES` (semicolon-separated
+  `role:*:objtype`, objtype `r`, `S`, `f`, `T` or `n`): global default
+  privileges of the `praetore` owner or the migrating role that only revoke
+  privileges (for example a hardening `REVOKE EXECUTE ON FUNCTIONS FROM
+  PUBLIC`). Default privileges in other schemas are not considered, because
+  they never apply to `praetore` objects; entries in `praetore`, and global
+  entries that grant privileges, are refused even when listed.
+
+**Supabase (verify on your instance).** Supabase's public `supabase/postgres`
+repository defines these event triggers: `issue_graphql_placeholder`,
+`issue_pg_cron_access`, `issue_pg_graphql_access`, `issue_pg_net_access`,
+`pgrst_ddl_watch` and `pgrst_drop_watch`. A configuration for such an
+instance would be:
+
+```
+PRAETORE_TRUSTED_EVENT_TRIGGERS=issue_graphql_placeholder;issue_pg_cron_access;issue_pg_graphql_access;issue_pg_net_access;pgrst_ddl_watch;pgrst_drop_watch
+```
+
+The runner then verifies each one's owners at startup and refuses to migrate
+if it cannot (for example if they are not owned by superusers unrelated to
+the `praetore` owner and the migrating role). The names, their owners, the
+platform's default privileges and its SECURITY DEFINER functions depend on
+the instance and the platform version: check them on your instance
+(`praetore doctor` lists every event trigger and why it is accepted or
+refused) before adding entries.
+
 ## Offline evidence and authority verification
 
 Build the verifier from the locked workspace:
