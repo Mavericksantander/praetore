@@ -15,6 +15,7 @@ pub mod policy;
 #[cfg(feature = "test-probe")]
 pub mod probe;
 pub mod replay;
+pub mod safety_ingest;
 pub mod safety_namespace;
 pub mod storage_record;
 
@@ -42,6 +43,10 @@ pub use policy::{
 pub use replay::{
     AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
     ReplayGuardError,
+};
+pub use safety_ingest::{
+    SafetyEvent, SafetyEventDraft, SafetyIngestKey, SafetyIngestor, SafetyRecord,
+    SafetyRecordStatus, SafetySourceKey, SourcePins,
 };
 pub use safety_namespace::{
     ManifestField, NamespaceMembership, SafetyActionName, SafetyNameError, SafetyNamespaceError,

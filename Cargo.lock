@@ -1113,6 +1113,7 @@ dependencies = [
  "praetore-core",
  "praetore-gateway",
  "praetore-replay-postgres",
+ "praetore-safety-client",
  "rand_core 0.6.4",
  "reqwest",
  "rustix",
@@ -1282,6 +1283,15 @@ dependencies = [
  "tokio-rustls",
  "tower",
  "uuid",
+]
+
+[[package]]
+name = "praetore-safety-client"
+version = "0.3.1"
+dependencies = [
+ "praetore-core",
+ "rustix",
+ "time",
 ]
 
 [[package]]

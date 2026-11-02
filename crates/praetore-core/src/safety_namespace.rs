@@ -1,7 +1,8 @@
 //! G2: the safety namespace.
 //!
-//! Two pieces, shared by policy loading and by the future ingestion path
-//! for safety actions (SAF-09.5), so their rules cannot diverge:
+//! Two pieces, shared by policy loading and by the ingestion path for safety
+//! actions (SAF-09.5, [`crate::safety_ingest`]), so their rules cannot
+//! diverge:
 //!
 //! * [`SafetyActionName`]: the one validator of `safety:*` names. Policy
 //!   format 2 uses it for every `Safety` entry of `action_classes`.
@@ -27,9 +28,10 @@
 //!   such a name (policy loading uses `parse`), so it is unclassified and
 //!   refused with a signed DENY (`unclassified`).
 //!
-//! The ingestion path (G1) must record such a name, never drop it: keep the
-//! raw input (bounded, and escaped for display) with the reason
-//! `invalid_name` and the [`SafetyNameError`].
+//! The ingestion path (G1, [`crate::safety_ingest`]) records such a name,
+//! never drops it: status `invalid_name`, the [`SafetyNameError`] code as the
+//! reason, the raw name kept exactly in the signed event and the error text
+//! bounded and escaped.
 
 use std::collections::BTreeSet;
 
@@ -228,7 +230,7 @@ impl NamespaceMembership {
 ///
 /// A dedicated role, separate from the evidence attester key (online, on
 /// the decision path), the authority issuer key (grants capabilities) and
-/// the key of the future ingestion path. It is held by whoever releases the
+/// the ingestion key ([`crate::safety_ingest::SafetyIngestKey`]). It is held by whoever releases the
 /// policy and can stay offline: a manifest is signed once per policy
 /// version. Its key id uses its own domain
 /// ([`SAFETY_NAMESPACE_KEY_ID_DOMAIN`]).
