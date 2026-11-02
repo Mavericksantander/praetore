@@ -119,7 +119,6 @@ const MAIN_AGENT: &str = "main";
 /// Profile for any agent without an authority of its own: it holds no
 /// capability, so every request is denied, but with a signed receipt.
 const UNREGISTERED: &str = "unregistered";
-const SUBAGENTS: [&str; 3] = ["planner", "coder", "explorer"];
 const MAX_HOOK_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Longest `agent_id` or `session_id` recorded in a receipt.
@@ -325,7 +324,7 @@ fn initialize_with(
     }
 
     write_private_file(&directory.join(PROJECT_ROOT_FILE), root.as_bytes())?;
-    let policy = default_policy(root, &home);
+    let policy = default_policy_for(root, &home, profiles);
     policy.validate()?;
     write_private_file(
         &directory.join(POLICY_FILE),
@@ -341,9 +340,15 @@ fn initialize_with(
     Ok(())
 }
 
+#[cfg(test)]
 fn default_policy(root: &str, home: &str) -> Policy {
-    let subagents = SUBAGENTS.iter().map(|a| json!(a)).collect::<Vec<_>>();
-    let non_main = PROFILES
+    default_policy_for(root, home, &PROFILES)
+}
+
+/// [`default_policy`] for the given profiles: the subagent rules name every
+/// profile except `main`.
+fn default_policy_for(root: &str, home: &str, profiles: &[(&str, &[&str])]) -> Policy {
+    let non_main = profiles
         .iter()
         .map(|(name, _)| *name)
         .filter(|name| *name != MAIN_AGENT)
@@ -370,7 +375,9 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 "path",
                 format!("{root}/.claude"),
             ))
-            .with_context_condition(PolicyCondition::one_of("profile", subagents)),
+            // Every profile except `main`, not only the example subagents,
+            // so a profile added to `PROFILES` with `fs:write` is held too.
+            .with_context_condition(PolicyCondition::one_of("profile", non_main.clone())),
             PolicyRule::new(
                 "approval-main-governance-writes",
                 "claude:write",
@@ -544,9 +551,21 @@ fn classify(
     };
     // A write also records whether it touches client configuration (see
     // `CLIENT_CONFIG_PATHS`), checked on the lexical and the resolved path.
+    // A write tool without its path parameter (or with another one, such as
+    // `file_path` on NotebookEdit) fails closed: the policy sees
+    // `PATH_CHECK_FAILED`, which no ALLOW matches.
     let write = |path: Option<&str>| {
+        let Some(path) = path else {
+            let check = json!({ "lexical": null, "resolved": null, "status": "missing" });
+            return (
+                "claude:write".to_string(),
+                "fs:write",
+                json!({ "path": PATH_CHECK_FAILED, "client_config": true }),
+                Some(check),
+            );
+        };
         let (action, capability, mut parameters, check) =
-            with_path("claude:write", "fs:write", path);
+            with_path("claude:write", "fs:write", Some(path));
         let client_config = match (&check, root) {
             (None, _) => false,
             (Some(_), None) => true,
@@ -676,7 +695,7 @@ fn command_paths(words: &[shell::PathWord], cwd: Option<&str>, root: Option<&str
             }
         }
         for path in &seen {
-            found.protected |= client_config(path, root);
+            found.protected |= client_config(path, root, Strictness::DotNames);
             found.leaves_root |= !word.program && !within(path, root);
         }
     }
@@ -702,30 +721,152 @@ fn normalize(path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
-/// `path` (absolute, normalized) is under `root` and one of its components,
-/// or a run of them, is in `CLIENT_CONFIG_PATHS`, ignoring case.
-fn client_config(path: &str, root: &str) -> bool {
+/// How far [`client_config`] treats a non-ASCII name as a possible alias.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Strictness {
+    /// Any non-ASCII component that starts with `.` (as written or folded),
+    /// or whose folded form differs from its ASCII lowercase form. For
+    /// writes: a subagent has no need for such names.
+    AllAliases,
+    /// Only a non-ASCII component that starts with `.`. For the `Bash`
+    /// scan, whose words include commit messages and other text.
+    DotNames,
+}
+
+/// `path` (absolute, normalized) is under `root` and touches client
+/// configuration: a component, or a run of them, folded with [`fold_name`]
+/// is in `CLIENT_CONFIG_PATHS`; or a non-ASCII component may alias a name on
+/// a filesystem that folds case and normalization (APFS), see
+/// [`Strictness`]; or a component would complete a bare git repository (see
+/// [`completes_bare_repository`]).
+///
+/// This does not chase aliases one by one: anything non-ASCII that could be
+/// one fails closed instead.
+fn client_config(path: &str, root: &str, strictness: Strictness) -> bool {
     if !within(path, root) {
         return false;
     }
-    let relative = path[root.trim_end_matches('/').len()..].to_lowercase();
-    let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
-    CLIENT_CONFIG_PATHS.iter().any(|entry| {
+    let root = root.trim_end_matches('/');
+    let parts: Vec<&str> = path[root.len()..]
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let folded: Vec<String> = parts.iter().map(|part| fold_name(part)).collect();
+    let listed = CLIENT_CONFIG_PATHS.iter().any(|entry| {
         let entry: Vec<&str> = entry.split('/').collect();
-        parts
+        folded
             .windows(entry.len())
             .any(|window| window == entry.as_slice())
+    });
+    let alias = parts.iter().zip(&folded).any(|(part, folded)| {
+        !part.is_ascii()
+            && (part.starts_with('.')
+                || folded.starts_with('.')
+                || (strictness == Strictness::AllAliases && *folded != part.to_ascii_lowercase()))
+    });
+    listed || alias || completes_bare_repository(root, &parts, &folded)
+}
+
+/// The names git needs to take a directory for a bare repository.
+const BARE_REPOSITORY_NAMES: [&str; 4] = ["HEAD", "config", "objects", "refs"];
+
+/// A component named like a bare-repository entry (`HEAD`, `config`,
+/// `objects`, `refs`) in a directory that already holds two of the others.
+/// git takes a directory with `HEAD`, `objects/` and `refs/` for a bare
+/// repository and runs what its `config` names, so a third entry is held:
+/// the set cannot be completed one write at a time. A lone `config/` or
+/// `refs/` directory is not affected.
+fn completes_bare_repository(root: &str, parts: &[&str], folded: &[String]) -> bool {
+    (0..parts.len()).any(|index| {
+        let Some(name) = BARE_REPOSITORY_NAMES
+            .iter()
+            .find(|name| name.to_ascii_lowercase() == folded[index])
+        else {
+            return false;
+        };
+        let directory = format!("{root}/{}", parts[..index].join("/"));
+        BARE_REPOSITORY_NAMES
+            .iter()
+            .filter(|other| *other != name)
+            .filter(|other| fs::symlink_metadata(format!("{directory}/{other}")).is_ok())
+            .count()
+            >= 2
     })
 }
 
-/// [`client_config`], except under `<root>/.claude` and `<root>/.git`, which
-/// the governance and git-internals rules already decide.
+/// Comparison key of a path component: Unicode default-ignorable code
+/// points dropped, then NFKC, full case folding (`caseless`) and lower case,
+/// repeated to a fixed point, and trailing `.` and spaces dropped. Broader
+/// than APFS's own folding on purpose: a wider key only holds more names.
+fn fold_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    if name.is_ascii() {
+        return name
+            .to_ascii_lowercase()
+            .trim_end_matches(['.', ' '])
+            .to_string();
+    }
+    let mut key: String = name
+        .chars()
+        .filter(|&c| !is_default_ignorable(c))
+        .nfkc()
+        .collect();
+    for _ in 0..8 {
+        let next: String = caseless::default_case_fold_str(&key)
+            .chars()
+            .flat_map(char::to_lowercase)
+            .filter(|&c| !is_default_ignorable(c))
+            .nfkc()
+            .collect();
+        if next == key {
+            break;
+        }
+        key = next;
+    }
+    key.trim_end_matches(['.', ' ']).to_string()
+}
+
+/// `Default_Ignorable_Code_Point` (Unicode 16.0.0, as in praetore-mcp).
+fn is_default_ignorable(c: char) -> bool {
+    const RANGES: [(u32, u32); 17] = [
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    ];
+    let c = u32::from(c);
+    RANGES.iter().any(|&(low, high)| (low..=high).contains(&c))
+}
+
+/// `path` is `<root>/.claude` or `<root>/.git`, or under one (ASCII case
+/// ignored), which the governance and git-internals rules decide.
+fn governed(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path.strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|first| {
+            first.is_ascii() && [".claude", ".git"].contains(&first.to_ascii_lowercase().as_str())
+        })
+}
+
+/// [`client_config`] for a write, except under `<root>/.claude` and
+/// `<root>/.git`, which the governance and git-internals rules decide.
 fn client_config_outside_governance(path: &str, root: &str) -> bool {
-    let lower = path.to_lowercase();
-    let governed = [".claude", ".git"]
-        .iter()
-        .any(|dir| within(&lower, &format!("{}/{dir}", root.to_lowercase())));
-    !governed && client_config(path, root)
+    !governed(path, root) && client_config(path, root, Strictness::AllAliases)
 }
 
 /// `path` is `dir` or under it, by whole segments.
@@ -1031,6 +1172,10 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     // reserved name and is evaluated as `unregistered`.
     let agent = input.agent_type.as_deref().unwrap_or(MAIN_AGENT);
     let reserved = input.agent_type.is_some() && (agent == MAIN_AGENT || agent == UNREGISTERED);
+    // An instance id without an agent type is not the main session either:
+    // a teammate of an agent team can arrive that way. Only a call that
+    // carries neither field is `main`.
+    let teammate = input.agent_type.is_none() && input.agent_id.is_some();
     if agent.len() > 64 {
         return Ok(denied(format!(
             "agent name longer than 64 bytes: {agent:?}"
@@ -1043,6 +1188,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     // so it is denied, with a signed receipt.
     let well_formed = !agent.is_empty()
         && !reserved
+        && !teammate
         && rejected_claim.is_none()
         && agent
             .bytes()
@@ -1066,7 +1212,27 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     let exec_guard = profile_name != MAIN_AGENT
         && action_type_of(&input.tool_name) == "claude:exec"
         && profile_grants(directory, profile_name, "process:execute")?;
-    let profile_name = if exec_guard {
+    let root = read_project_root(directory)?;
+    let (action_type, capability, mut parameters, path_check) = classify(
+        &input.tool_name,
+        &input.tool_input,
+        input.cwd.as_deref(),
+        root.as_deref(),
+    );
+    // The same for writes to client configuration and to `<root>/.claude`
+    // and `<root>/.git` (or a path that failed its check): reserved to the
+    // main session whatever the policy says, so state whose policy predates
+    // these rules is covered too. Without a recorded root every write counts.
+    let write_guard = profile_name != MAIN_AGENT
+        && action_type == "claude:write"
+        && profile_grants(directory, profile_name, "fs:write")?
+        && (parameters["client_config"] == json!(true)
+            || parameters["path"] == json!(PATH_CHECK_FAILED)
+            || match (&root, parameters["path"].as_str()) {
+                (Some(root), Some(path)) => governed(path, root),
+                _ => true,
+            });
+    let profile_name = if exec_guard || write_guard {
         UNREGISTERED
     } else {
         profile_name
@@ -1111,13 +1277,6 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     )?)?)?;
     let engine = AuthorizationEngine::strict(policy, vec![pin])?;
 
-    let root = read_project_root(directory)?;
-    let (action_type, capability, mut parameters, path_check) = classify(
-        &input.tool_name,
-        &input.tool_input,
-        input.cwd.as_deref(),
-        root.as_deref(),
-    );
     // The engine requires every authority constraint to appear among the
     // action parameters, so an authority issued for one profile cannot be
     // used in a request made as another.
@@ -1163,6 +1322,14 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         ),
         None if reserved => format!(
             "agent_type {agent:?} is reserved; evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
+        None if teammate => format!(
+            "agent_id without agent_type is not the main session; evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
+        None if write_guard => format!(
+            "writes to client configuration, .claude and .git are reserved to the main session (GHSA-wg33-3h8v-xvqw); evaluated as '{UNREGISTERED}': {}",
             evidence.decision.reason
         ),
         None if exec_guard => format!(
@@ -1777,9 +1944,11 @@ mod tests {
         let agent_file = json!({ "file_path": f.path(".claude/agents/coder.md") });
         let verdict = f.decide(Some("coder"), "Edit", agent_file.clone());
         assert_eq!(verdict.outcome, DecisionOutcome::Deny);
-        assert_eq!(
-            verdict.rule.as_deref(),
-            Some("deny-subagent-governance-writes")
+        // Held by the hook before the policy (see `tests_bash`).
+        assert!(
+            verdict.reason.contains("reserved to the main session"),
+            "{}",
+            verdict.reason
         );
         let verdict = f.decide(None, "Edit", agent_file);
         assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);

@@ -16,12 +16,16 @@ name = "praetore-claude-hook"
 path = "src/main.rs"
 
 [dependencies]
+# Unicode-aware name comparison for protected paths (APFS folds case and
+# normalization), the same crates and versions as praetore-mcp.
+caseless = "0.2.2"
 hex = "0.4.3"
 praetore-core = { path = "../../crates/praetore-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 time = { version = "0.3", features = ["formatting"] }
+unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 # G7 runtime tests count engine calls with the test-only probe.

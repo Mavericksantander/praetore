@@ -283,10 +283,10 @@ fn subagents_cannot_write_client_configuration_and_main_must_ask() {
                 DecisionOutcome::Deny,
                 "coder {tool} {relative}"
             );
-            assert_eq!(
-                verdict.rule.as_deref(),
-                Some("deny-subagent-client-config-writes"),
-                "coder {tool} {relative}"
+            assert!(
+                verdict.reason.contains("reserved to the main session"),
+                "coder {tool} {relative}: {}",
+                verdict.reason
             );
             let verdict = p.tool(None, tool, input);
             assert_eq!(
@@ -326,10 +326,7 @@ fn subagents_cannot_write_client_configuration_and_main_must_ask() {
         "Write",
         json!({ "file_path": p.path(".claude/settings.json") }),
     );
-    assert_eq!(
-        verdict.rule.as_deref(),
-        Some("deny-subagent-governance-writes")
-    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Deny);
 }
 
 #[test]
@@ -485,6 +482,239 @@ fn monitor_and_powershell_are_commands() {
             verdict.rule.as_deref(),
             Some("approval-unanalyzable-command"),
             "{tool}"
+        );
+    }
+}
+
+/// Names a filesystem that folds case and normalization (APFS) may take for
+/// a protected one, or that hide characters. Spelled as escapes.
+const ALIASES: [&str; 12] = [
+    ".mcp.j\u{17f}on",          // long s
+    "pyrightcon\u{fb01}g.json", // fi ligature
+    ".v\u{17f}code/tasks.json", // long s in a directory
+    ".mcp.j\u{df}on",           // sharp s
+    ".bazelis\u{212a}rc",       // Kelvin sign
+    ".mcp.j\u{307}son",         // combining dot above
+    ".e\u{301}nvrc",            // NFD e with acute
+    "\u{ff0e}mcp.json",         // full-width full stop
+    ".mcp\u{200b}.json",        // zero-width space
+    ".mcp.json\u{200d}",        // zero-width joiner
+    ".mcp.json\u{202e}",        // right-to-left override
+    ".\u{202e}nosj.pcm",        // right-to-left override, reversed name
+];
+
+#[test]
+fn unicode_aliases_of_protected_names_fail_closed() {
+    let p = Project::new("aliases");
+    for name in ALIASES {
+        let path = p.path(name);
+        for (tool, input) in [
+            ("Write", json!({ "file_path": path, "content": "{}" })),
+            ("Edit", json!({ "file_path": path })),
+            ("MultiEdit", json!({ "file_path": path })),
+            ("NotebookEdit", json!({ "notebook_path": path })),
+        ] {
+            let verdict = p.tool(Some("coder"), tool, input.clone());
+            assert_eq!(
+                verdict.outcome,
+                DecisionOutcome::Deny,
+                "coder {tool} {name:?}"
+            );
+            let verdict = p.tool(None, tool, input);
+            assert_eq!(
+                verdict.outcome,
+                DecisionOutcome::RequireApproval,
+                "main {tool} {name:?}"
+            );
+            assert_eq!(
+                verdict.rule.as_deref(),
+                Some("approval-main-client-config-writes"),
+                "main {tool} {name:?}"
+            );
+        }
+        let command = format!("echo x > '{name}'");
+        let verdict = p.bash(None, &command);
+        assert_eq!(
+            verdict.rule.as_deref(),
+            Some("approval-command-touches-protected-path"),
+            "main Bash {command:?}"
+        );
+        assert_eq!(
+            p.bash(Some("coder"), &command).outcome,
+            DecisionOutcome::Deny,
+            "coder Bash {command:?}"
+        );
+    }
+    // Non-ASCII names that cannot alias a protected one are still fine.
+    let verdict = p.tool(
+        Some("coder"),
+        "Write",
+        json!({ "file_path": p.path("docs/caf\u{e9}.md") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+    let verdict = p.bash(None, "git commit -m '\u{c9}sta versi\u{f3}n'");
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_existing_name_that_resolves_to_a_protected_file_is_held() {
+    let p = Project::new("resolved-alias");
+    fs::write(p.root.join(".mcp.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(".mcp.json", p.root.join("servers.json")).unwrap();
+    let input = json!({ "file_path": p.path("servers.json") });
+    assert_eq!(
+        p.tool(Some("coder"), "Write", input.clone()).outcome,
+        DecisionOutcome::Deny
+    );
+    assert_ne!(p.tool(None, "Write", input).outcome, DecisionOutcome::Allow);
+}
+
+/// The default policy without the rules added for GHSA-wg33-3h8v-xvqw, as
+/// an earlier `init` wrote it.
+fn earlier_state(name: &str) -> Project {
+    let p = Project::with_profiles(name, &EARLIER_PROFILES);
+    let mut policy = load_policy(&p.state).unwrap();
+    policy
+        .rules
+        .retain(|rule| !rule.id.contains("client-config") && !rule.id.contains("approval-command"));
+    fs::remove_file(p.state.join(POLICY_FILE)).unwrap();
+    fs::write(
+        p.state.join(POLICY_FILE),
+        serde_json::to_vec_pretty(&policy).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(p.state.join(PROJECT_ROOT_FILE)).unwrap();
+    p
+}
+
+#[test]
+fn earlier_state_cannot_write_client_configuration_either() {
+    let p = earlier_state("earlier-writes");
+    for relative in [
+        ".mcp.json",
+        ".vscode/tasks.json",
+        ".claude/settings.json",
+        "src/a.rs",
+    ] {
+        let verdict = p.tool(
+            Some("coder"),
+            "Write",
+            json!({ "file_path": p.path(relative) }),
+        );
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{relative}");
+        assert!(
+            verdict.reason.contains("reserved to the main session"),
+            "{relative}: {}",
+            verdict.reason
+        );
+    }
+    let receipts = fs::read_to_string(p.state.join(RECEIPTS_FILE)).unwrap();
+    let last: Value = serde_json::from_str(receipts.lines().last().unwrap()).unwrap();
+    assert_eq!(last["profile"], UNREGISTERED);
+    // Reads are untouched.
+    let verdict = p.tool(
+        Some("coder"),
+        "Read",
+        json!({ "file_path": p.path("src/a.rs") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+}
+
+#[test]
+fn an_agent_id_without_an_agent_type_is_not_the_main_session() {
+    let p = Project::new("teammate");
+    let mut input = p.event(None, "Bash", json!({ "command": "ls src" }));
+    input.agent_id = Some(json!("teammate-1"));
+    let verdict = authorize(&p.state, &input).unwrap();
+    assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{verdict:?}");
+    assert!(
+        verdict.reason.contains("agent_id without agent_type"),
+        "{}",
+        verdict.reason
+    );
+    assert_eq!(p.bash(None, "ls src").outcome, DecisionOutcome::Allow);
+}
+
+#[test]
+fn governance_rules_name_every_profile_except_main() {
+    let mut profiles = PROFILES.to_vec();
+    profiles.push(("writer", &["fs:read", "fs:write"]));
+    let p = Project::with_profiles("custom-profile", &profiles);
+    let policy: Value =
+        serde_json::from_slice(&fs::read(p.state.join(POLICY_FILE)).unwrap()).unwrap();
+    for id in [
+        "deny-subagent-governance-writes",
+        "deny-subagent-client-config-writes",
+    ] {
+        let rule = policy["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| rule["id"] == id)
+            .unwrap();
+        let text = rule.to_string();
+        assert!(
+            text.contains("\"writer\"") && !text.contains("\"main\""),
+            "{id}: {text}"
+        );
+    }
+    for relative in [".claude/settings.json", ".mcp.json"] {
+        let verdict = p.tool(
+            Some("writer"),
+            "Write",
+            json!({ "file_path": p.path(relative) }),
+        );
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{relative}");
+    }
+    let verdict = p.tool(
+        Some("writer"),
+        "Write",
+        json!({ "file_path": p.path("src/a.rs") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+}
+
+#[test]
+fn a_write_without_its_path_parameter_is_denied() {
+    let p = Project::new("missing-path");
+    for agent in [None, Some("coder")] {
+        for (tool, input) in [
+            ("NotebookEdit", json!({ "file_path": p.path("a.ipynb") })),
+            ("Write", json!({ "content": "x" })),
+            ("Edit", json!({ "path": p.path("src/a.rs") })),
+        ] {
+            let verdict = p.tool(agent, tool, input);
+            assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{agent:?} {tool}");
+        }
+    }
+}
+
+#[test]
+fn a_write_cannot_complete_a_bare_repository() {
+    let p = Project::new("bare");
+    fs::create_dir_all(p.root.join("sub/objects")).unwrap();
+    fs::write(p.root.join("sub/HEAD"), "ref: refs/heads/main\n").unwrap();
+    for relative in ["sub/refs/heads/main", "sub/config"] {
+        let input = json!({ "file_path": p.path(relative) });
+        assert_eq!(
+            p.tool(Some("coder"), "Write", input.clone()).outcome,
+            DecisionOutcome::Deny,
+            "{relative}"
+        );
+        assert_eq!(
+            p.tool(None, "Write", input).outcome,
+            DecisionOutcome::RequireApproval,
+            "{relative}"
+        );
+    }
+    // One such name alone is an ordinary file or directory.
+    for relative in ["config/app.toml", "other/refs/x.md", "other/HEAD"] {
+        let input = json!({ "file_path": p.path(relative) });
+        assert_eq!(
+            p.tool(Some("coder"), "Write", input).outcome,
+            DecisionOutcome::Allow,
+            "{relative}"
         );
     }
 }

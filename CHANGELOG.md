@@ -32,6 +32,22 @@
   closed on an invalid `project-root`, and maps `Monitor` and `PowerShell` to
   `claude:exec` (`PowerShell` is never analyzed, so `main` needs approval).
   The format-1 policy error now recommends a fresh `init`.
+- **Claude Code hook example: protected names compared after Unicode
+  folding; writes to them reserved to `main` in the binary**
+  (GHSA-wg33-3h8v-xvqw). Path components are compared after dropping
+  default-ignorable code points, NFKC and full case folding (`caseless`,
+  `unicode-normalization`, the versions praetore-mcp uses), and for every
+  profile except `main` a write to a non-ASCII component that starts with
+  `.` or whose folded form differs from its ASCII lowercase form is denied
+  (`main` needs approval). A write that would complete a bare git repository
+  (`HEAD`, `config`, `objects`, `refs`) is held the same way. The hook now
+  denies, whatever the policy says, a write by a profile other than `main`
+  to client configuration, `.claude`, `.git` or a path that failed its
+  check, evaluated as `unregistered` with a signed receipt; without
+  `project-root` every such write is denied. An `agent_id` without an
+  `agent_type` is evaluated as `unregistered`, the governance rules name
+  every profile except `main`, and a write tool without its path parameter
+  is denied.
 
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from

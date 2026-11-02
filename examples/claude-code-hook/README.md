@@ -65,8 +65,13 @@ agente haga por otro camino queda fuera (ver Límites).
 
 Cualquier otro `agent_type`, incluidos agentes incorporados como
 `general-purpose` y los nombres reservados `main` y `unregistered` cuando
-llegan explícitos (solo la ausencia de `agent_type` es la sesión principal),
-se evalúa con el perfil `unregistered`. También un `agent_id` o `session_id`
+llegan explícitos, se evalúa con el perfil `unregistered`. Solo una llamada
+sin `agent_type` y sin `agent_id` es la sesión principal: un `agent_id` sin
+`agent_type` también se evalúa como `unregistered`, porque así puede llegar
+un teammate de un agent team, que no es la sesión del usuario. Un teammate
+que corre como otro proceso de Claude Code sin ninguno de los dos campos no
+se distingue de `main`; con agent teams habilitado, este modelo de perfiles
+no lo cubre. También un `agent_id` o `session_id`
 que no es string ni número, o de más de 128 bytes UTF-8 (el recibo registra
 el motivo, no el valor). Ese perfil no
 tiene capacidades, así que toda solicitud se niega, pero con un recibo
@@ -166,8 +171,8 @@ lo que nombran sus archivos de configuración. Por eso (también
 GHSA-wg33-3h8v-xvqw) el hook trata como protegidas las rutas que Claude Code
 protege en sus modos de permiso
 ([lista](https://code.claude.com/docs/en/permission-modes#protected-paths)),
-comparando componentes completos de la ruta, sin distinguir mayúsculas, en
-cualquier lugar bajo la raíz:
+comparando componentes completos de la ruta en cualquier lugar bajo la raíz,
+después de plegarlos (ver abajo):
 
 - directorios: `.git`, `.config/git`, `.vscode`, `.idea`, `.husky`,
   `.cargo`, `.devcontainer`, `.yarn`, `.mvn`, `.claude`;
@@ -183,10 +188,46 @@ cualquier lugar bajo la raíz:
 
 Los archivos de esa página que no viven en el proyecto (los que se pasan con
 `--settings`, `--mcp-config` o `--agents`, el destino de un settings que es
-symlink, `~/.claude/dev-mods/`) quedan fuera, igual que los archivos que
-convierten el directorio en un repositorio git bare (`HEAD`, `objects`,
-`refs`, `config`), que el sandbox protege pero que aquí darían falsos
-positivos con directorios comunes como `config/`.
+symlink, `~/.claude/dev-mods/`) quedan fuera.
+
+**Nombres equivalentes.** APFS (macOS) compara nombres plegando mayúsculas
+y normalización Unicode, así que un nombre con caracteres no ASCII puede ser
+el mismo archivo que `.mcp.json` (por ejemplo con `\u{17f}`, s larga, en
+lugar de `s`). En vez de perseguir una lista de equivalencias, el hook
+falla cerrado:
+
+1. compara cada componente después de quitar los caracteres ignorables por
+   defecto de Unicode (de ancho cero, de control bidireccional), aplicar
+   NFKC y plegado completo de mayúsculas (`caseless`) hasta un punto fijo, y
+   quitar `.` y espacios finales. Es más amplio que el plegado de APFS a
+   propósito;
+2. además, en una escritura, todo componente no ASCII que empieza con `.`
+   (tal cual o plegado), o cuya forma plegada difiere de su minúscula ASCII,
+   cuenta como configuración: se niega a todo perfil salvo `main`, y `main`
+   necesita aprobación. Un subagente no necesita esos nombres. En el
+   escaneo de `Bash`, cuyas palabras incluyen mensajes de commit y otro
+   texto, solo cuenta el componente no ASCII que empieza con `.`;
+3. si el archivo ya existe, también se compara el nombre resuelto
+   (`canonicalize`), y una ruta que no se resuelve a sí misma ya se niega.
+
+Límites: un nombre no ASCII que no empieza con `.` y que ya está plegado
+(`café.md` en NFC) no se considera; el escaneo de `Bash` sigue siendo
+evadible; un sistema de archivos con otras reglas de equivalencia que estas
+no cubran puede tener otros alias.
+
+**Repositorio git bare.** git toma un directorio con `HEAD`, `objects/` y
+`refs/` por un repositorio bare y ejecuta lo que nombra su `config`. Una
+escritura cuyo componente se llama `HEAD`, `config`, `objects` o `refs` en
+un directorio que ya tiene dos de los otros tres cuenta como configuración,
+así que el conjunto no se puede completar escritura por escritura. Un
+directorio `config/` o `refs/` solo no se ve afectado. El escaneo de `Bash`
+no lo cubre, y `main` puede crear el conjunto con un comando; correr `git`
+dentro de un directorio que escribió un subagente es otro caso de
+ejecución indirecta.
+
+**Escrituras sin ruta.** Una herramienta de escritura sin su parámetro de
+ruta (por ejemplo NotebookEdit con `file_path` en vez de `notebook_path`) se
+niega.
 
 **Ejecución indirecta.** Lo que escribe un subagente lo puede ejecutar
 después la sesión principal: `build.rs`, un test, un script de
@@ -202,19 +243,34 @@ revisar los cambios de un subagente antes de correr tests o builds.
 
 **Estados existentes.** Un estado creado antes de este cambio conserva lo
 que `init` emitió: `coder` sigue teniendo `process:execute`, y la policy no
-trae las reglas `approval-command-*` ni las de configuración. Dos defensas
-cubren ese caso sin re-emitir:
+trae las reglas `approval-command-*` ni las de configuración. El binario
+cubre ese caso sin re-emitir, sin importar lo que diga la policy:
 
-- el hook niega todo comando (`claude:exec`) a un perfil distinto de `main`,
-  aunque su autoridad otorgue `process:execute`: lo evalúa como
-  `unregistered`, con recibo firmado;
-- en cada ejecución escribe una advertencia en stderr si el estado no tiene
-  `project-root` o si un perfil distinto de `main` tiene `process:execute`.
+- niega todo comando (`claude:exec`) a un perfil distinto de `main` cuya
+  autoridad otorgue `process:execute`;
+- niega a un perfil distinto de `main` con `fs:write` toda escritura en
+  configuración (la lista de arriba, con los nombres equivalentes), en
+  `<raíz>/.claude` o `<raíz>/.git`, o en una ruta que no pasó su chequeo.
+  Sin `project-root` no hay raíz contra la cual comparar y toda escritura
+  cuenta, así que en un estado anterior un subagente no escribe nada;
 
-Sin `project-root` no hay raíz contra la cual comparar: todo comando
-analizable cuenta como fuera de la raíz y toda escritura como configuración.
-Un `project-root` vacío, `/`, relativo, no canónico o que no es un
-directorio existente hace fallar cerrado al hook. Para quitar
+los dos casos se evalúan como `unregistered`, con recibo firmado y el motivo
+en el recibo. Esto aplica también a un estado nuevo: allí la escritura de
+`coder` en `.claude/` o `.mcp.json` se niega en el binario antes de llegar a
+las reglas de la policy, que siguen decidiendo para `main` (aprobación).
+
+Además, en cada ejecución el hook escribe una advertencia en stderr si el
+estado no tiene `project-root` o si un perfil distinto de `main` tiene
+`process:execute`. Claude Code no muestra el stderr de un hook que sale con
+0 salvo con el log de depuración, así que esa advertencia no la ve nadie en
+uso normal.
+
+Sin `project-root`, además, todo comando analizable de `main` cuenta como
+fuera de la raíz. Un `project-root` vacío, `/`, relativo, no canónico o que
+no es un directorio existente hace fallar cerrado al hook para **todas** las
+herramientas, también Read; pasa, por ejemplo, si se movió o renombró el
+proyecto. Para recuperarlo, emitir un estado nuevo con `--root` en la ruta
+actual, como abajo. Para quitar
 `process:execute` y tener las reglas nuevas, emitir un estado nuevo y dejar
 el anterior para verificar sus recibos:
 
@@ -440,4 +496,5 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
   `/tmp/x` no se resuelve a sí misma, así que se niega bajo cualquier regla de
   ruta. Hay que usar rutas resueltas.
 - **Raíz fija.** La raíz de la policy es la ruta absoluta dada en `init`.
-  Mover el proyecto exige otro `init`.
+  Mover el proyecto exige otro `init`; hasta entonces el hook niega todo
+  (ver [`Bash` y `process:execute`](#bash-y-processexecute)).
