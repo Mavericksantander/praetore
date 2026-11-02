@@ -179,7 +179,7 @@ pub fn export_storage_records(
     Ok(exporter.finish()?)
 }
 
-fn read_attester_pin(path: &Path) -> CliResult<VerifiedPublicKey> {
+pub(crate) fn read_attester_pin(path: &Path) -> CliResult<VerifiedPublicKey> {
     let text = read_limited(path)?;
     let encoded = text.trim();
     if encoded.len() != 64

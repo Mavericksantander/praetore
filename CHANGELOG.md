@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- **Safety namespace manifest (G2).** New module
+  `praetore_core::safety_namespace`. `SafetyActionName::parse` is the one
+  validator of `safety:*` names (exact ASCII prefix `safety:`, printable
+  ASCII, a name that starts with an ASCII letter or digit, at most
+  `MAX_SAFETY_ACTION_NAME_BYTES` = 128 bytes), with the typed
+  `SafetyNameError`. `Policy::validate` uses it for every `Safety` entry, so
+  a `Safety` entry longer than 128 bytes now fails to load with the new
+  `ActionClassError::SafetyNameTooLong` (G7 accepted up to 1024 bytes).
+  `SafetyNamespaceManifest` (schema version 1) is a signed, canonical JSON
+  statement of the `Safety` names of one format 2 policy, bound to its
+  digest, id and version, built deterministically by
+  `SafetyNamespaceManifest::from_policy`. It is signed by a dedicated
+  `SafetyNamespaceKey` (not the attester or issuer key) under the new domain
+  `PRAETORE_SAFETY_NAMESPACE_V1\0`, with key ids under
+  `PRAETORE_SAFETY_NAMESPACE_KEY_V1\0ed25519\0`. `verify` checks it against a
+  pinned key, `verify_matches_policy` against a policy (digest and exact
+  list), and `classify_name` answers `Declared` or `Undeclared` for the
+  ingestion path; `ensure_distinct_keys` refuses the same key in the
+  namespace and attester or issuer roles (`SameKeyForBothRoles`). Only the
+  canonical encoding parses (`from_json`); a manifest file is that document
+  and one newline (`to_file`, `from_file`). New commands: `praetore policy
+  safety-manifest --policy P --key K --output NEW_FILE [--other-pin A]...`
+  (never overwrites; writes a synced `O_TMPFILE` or temporary file, links
+  it to the output name and checks the linked entry; needs a filesystem
+  with hard links; reads the key with `O_NOFOLLOW`, checks the open
+  descriptor and, on macOS, refuses extended ACLs) and `praetore-verify
+  safety-manifest --manifest M --pin K [--policy P] [--other-pin A]...`,
+  both with `--format json|text`; `--other-pin` (alias `--attester-pin`)
+  refuses a namespace key equal to an attester or issuer key. The manifest authorizes nothing and is not read on
+  the decision path. Golden vector
+  `docs/golden/safety-namespace-manifest-v1.json`; new fuzz target
+  `safety_namespace`.
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without

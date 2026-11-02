@@ -13,6 +13,7 @@ use crate::{
     decision::{DecidedBy, Decision, DecisionContribution, RecoveryObligation},
     error::{PraetoreError, Result},
     identity::AgentIdentity,
+    safety_namespace::{SafetyActionName, SafetyNameError, mentions_safety},
 };
 
 // Policy size and complexity limits. A policy that exceeds any of them is
@@ -47,8 +48,9 @@ pub const MAX_ACTION_CLASSES: usize = 512;
 /// digested for historical verification (see [`RecordedPolicy`]).
 pub const POLICY_FORMAT_VERSION: u8 = 2;
 /// The prefix every safety action type carries, and only safety action
-/// types carry.
-pub const SAFETY_ACTION_PREFIX: &str = "safety:";
+/// types carry. Defined with the shared validator,
+/// [`SafetyActionName`](crate::safety_namespace::SafetyActionName) (G2).
+pub use crate::safety_namespace::SAFETY_ACTION_PREFIX;
 
 /// G7: how a policy classifies an exact `action_type`.
 ///
@@ -98,6 +100,11 @@ pub enum ActionClassError {
     /// that starts with an ASCII letter or digit.
     #[error("Safety action type '{action_type}' must be `safety:` followed by a name")]
     SafetyWithoutPrefix { action_type: String },
+    /// A `Safety` entry is longer than
+    /// [`MAX_SAFETY_ACTION_NAME_BYTES`](crate::safety_namespace::MAX_SAFETY_ACTION_NAME_BYTES)
+    /// bytes (G2).
+    #[error("Safety action type '{action_type}' is longer than {max} bytes")]
+    SafetyNameTooLong { action_type: String, max: usize },
     /// An action type without the `safety:` prefix contains "safety" (ASCII
     /// case-insensitive), so it could be mistaken for a safety action.
     #[error("action type '{action_type}' contains \"safety\" without the `safety:` prefix")]
@@ -117,8 +124,28 @@ fn class_error(error: ActionClassError) -> PraetoreError {
     PraetoreError::PolicyActionClassInvalid(error)
 }
 
+/// Maps a [`SafetyNameError`] for the `Safety` entry `action_type` to the
+/// policy error G7 reports for it.
+fn safety_entry_error(action_type: &str, error: SafetyNameError) -> ActionClassError {
+    let action_type = action_type.to_owned();
+    match error {
+        SafetyNameError::Empty => ActionClassError::InvalidActionType { action_type },
+        SafetyNameError::NotPrintableAscii { .. } => {
+            ActionClassError::NotPrintableAscii { action_type }
+        }
+        SafetyNameError::MissingPrefix { .. } | SafetyNameError::InvalidNameStart { .. } => {
+            ActionClassError::SafetyWithoutPrefix { action_type }
+        }
+        SafetyNameError::TooLong { max, .. } => {
+            ActionClassError::SafetyNameTooLong { action_type, max }
+        }
+    }
+}
+
 /// Checks one `action_classes` entry: prefix and class must agree, and an
-/// unprefixed name may not contain "safety".
+/// unprefixed name may not contain "safety". A `Safety` entry is valid
+/// exactly when [`SafetyActionName::parse`] accepts it (G2), the validator
+/// the safety namespace manifest and the ingestion path share.
 fn validate_action_class_entry(action_type: &str, class: ActionClass) -> Result<()> {
     if action_type.trim().is_empty() || action_type != action_type.trim() {
         return Err(class_error(ActionClassError::InvalidActionType {
@@ -136,32 +163,21 @@ fn validate_action_class_entry(action_type: &str, class: ActionClass) -> Result<
         }));
     }
     let owned = || action_type.to_owned();
-    match (action_type.strip_prefix(SAFETY_ACTION_PREFIX), class) {
-        (Some(name), ActionClass::Safety)
-            if name
-                .bytes()
-                .next()
-                .is_some_and(|b| b.is_ascii_alphanumeric()) =>
-        {
-            Ok(())
-        }
-        (Some(_), ActionClass::Safety) => Err(class_error(ActionClassError::SafetyWithoutPrefix {
-            action_type: owned(),
-        })),
-        (Some(_), ActionClass::Mission) => {
+    match class {
+        ActionClass::Safety => SafetyActionName::parse(action_type)
+            .map(drop)
+            .map_err(|error| class_error(safety_entry_error(action_type, error))),
+        ActionClass::Mission if action_type.starts_with(SAFETY_ACTION_PREFIX) => {
             Err(class_error(ActionClassError::SafetyPrefixNotSafety {
                 action_type: owned(),
             }))
         }
-        (None, ActionClass::Safety) => Err(class_error(ActionClassError::SafetyWithoutPrefix {
-            action_type: owned(),
-        })),
-        (None, ActionClass::Mission) if action_type.to_ascii_lowercase().contains("safety") => {
+        ActionClass::Mission if mentions_safety(action_type) => {
             Err(class_error(ActionClassError::AmbiguousSafetyName {
                 action_type: owned(),
             }))
         }
-        (None, ActionClass::Mission) => Ok(()),
+        ActionClass::Mission => Ok(()),
     }
 }
 

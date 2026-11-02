@@ -15,6 +15,7 @@ pub mod policy;
 #[cfg(feature = "test-probe")]
 pub mod probe;
 pub mod replay;
+pub mod safety_namespace;
 pub mod storage_record;
 
 pub use action::{
@@ -41,6 +42,10 @@ pub use policy::{
 pub use replay::{
     AtomicAuthorizationCommit, AuthorizationCommitError, CompletedAuthorization, ReplayGuard,
     ReplayGuardError,
+};
+pub use safety_namespace::{
+    ManifestField, NamespaceMembership, SafetyActionName, SafetyNameError, SafetyNamespaceError,
+    SafetyNamespaceKey, SafetyNamespaceManifest,
 };
 pub use storage_record::{
     RecordedMigration, StorageRecord, StorageRecordPayload, StorageRecordSigner,
