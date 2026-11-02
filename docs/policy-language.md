@@ -257,8 +257,10 @@ file (64 lowercase hex characters, the same format as an attester pin). It
 never overwrites: an existing `--output` file (or a symlink at that name) is
 an error and stays as it was. The manifest is written and synced to a file
 without a name (Linux `O_TMPFILE`) or with a temporary name in the same
-directory, then linked to the output name, and the linked entry is checked
-to be that file, so a failed or interfered-with write leaves nothing there.
+directory, then linked to the output name, so a failed write leaves
+nothing there. The linked entry is then checked to be that file; if another
+file was swapped in, the command fails, names the path and leaves that
+entry in place: do not use a file at that path after a failure.
 The output directory must be on a filesystem with hard links: on FAT,
 exFAT and some SMB or FUSE mounts the command fails with a message that
 says so (write to a local filesystem such as APFS or ext4 and copy the

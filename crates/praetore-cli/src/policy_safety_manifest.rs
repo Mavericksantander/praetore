@@ -8,8 +8,9 @@
 //! synced to a file without a name (Linux `O_TMPFILE`) or with a temporary
 //! name in the same directory, then linked to the output name, which fails
 //! if the name exists (even as a dangling symlink), and the linked entry is
-//! checked to be that file. A filesystem without hard links (FAT, exFAT,
-//! some SMB mounts) is refused with a message that says so.
+//! checked to be that file; if it is not, the command fails, names the path
+//! and leaves the foreign entry in place. A filesystem without hard links
+//! (FAT, exFAT, some SMB mounts) is refused with a message that says so.
 //!
 //! The key file holds the 32-byte secret of the safety namespace key as 64
 //! lowercase hex characters (one final newline allowed). It is read with

@@ -252,11 +252,17 @@ manifest. The manifest is written and synced to an anonymous file (Linux
 never replaces an existing name. After the link the entry at the output
 name (`lstat`, device and inode) must be the file this process wrote: if
 another file or a symlink was swapped in for the temporary name between
-the sync and the link, the output is removed while it is still that entry
-and the command fails. The temporary name is removed only while it is
-still the file this process created. A filesystem without hard links
-(FAT, exFAT, some SMB or FUSE mounts) is refused with a clear message;
-there is no non-atomic fallback. A process killed between creating and
+the sync and the link, the command fails and names the output path. That
+entry is left in place, not removed: removing it by path would race with
+whoever put it there, it is evidence, and whoever can rename into the
+directory could remove it anyway. A failed command must not be followed by
+using a file at that path. The temporary name is removed only while it is
+still the file this process created (its identity is read from the open
+descriptor after the write, because macOS FAT changes the inode on the
+first write). A filesystem without hard links (FAT, exFAT, some SMB or
+FUSE mounts) is refused with a message that keeps the system error
+(`EPERM` is worded "probably", since it also means "not permitted"); there
+is no non-atomic fallback. A process killed between creating and
 removing a temporary name can leave a `.tmp` file (not on Linux with
 `O_TMPFILE`).
 

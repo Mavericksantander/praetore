@@ -6,8 +6,9 @@
 //! the target name. `link` fails if the name exists (also as a dangling
 //! symlink), so nothing is replaced. After the link, the entry at the
 //! target name is checked (`lstat`, device and inode) against the file this
-//! process wrote; if another entry was put there in between, it is removed
-//! while it is still that entry and the write fails.
+//! process wrote; if another entry was put there in between, the write
+//! fails and names that path. The foreign entry is left in place: removing
+//! it by path would race with whoever put it there, and it is evidence.
 //!
 //! * Linux: an anonymous `O_TMPFILE` file linked with `linkat` through
 //!   `/proc/self/fd`, so there is no temporary name at all. When the
@@ -15,7 +16,9 @@
 //!   is missing, it falls back to the temporary name below.
 //! * Other Unix systems: a temporary name `.<name>.<uuid>.tmp`, created
 //!   with `O_CREAT | O_EXCL`, removed afterwards only while it is still the
-//!   file this process created.
+//!   file this process created (its identity is read from the open
+//!   descriptor after the write and again at removal; see
+//!   [`write_through_temporary`]).
 //!
 //! A filesystem without hard links (FAT, exFAT, some SMB or FUSE mounts)
 //! always fails, with a message that says so; there is deliberately no
@@ -90,41 +93,46 @@ fn remove_if_still(path: &Path, identity: Identity) {
 }
 
 /// After the link: the entry at `path` must be the regular file `ours`. If
-/// it is not, it is removed while it is still the entry that was found, and
-/// the write fails.
+/// it is not, the write fails and names the path. The entry is not removed:
+/// removing by path would race with whoever replaced it, and it is left as
+/// evidence.
 #[cfg(unix)]
 fn check_linked(path: &Path, ours: Identity) -> CliResult<()> {
     match entry_at(path) {
         Some((found, true)) if found == ours => Ok(()),
-        found => {
-            if let Some((found, _)) = found {
-                remove_if_still(path, found);
-            }
-            Err(format!(
-                "cannot create {}: the file was replaced while it was being written; nothing was written",
-                path.display()
-            )
-            .into())
-        }
+        _ => Err(format!(
+            "cannot create {path}: the entry at {path} is not the file this command wrote (it was replaced before the write finished); it was left in place, and nothing was written. Inspect it before using any file at that path",
+            path = path.display()
+        )
+        .into()),
     }
 }
 
-/// The error for a failed link, with a hint when the filesystem has no
-/// hard links.
+/// The error for a failed link, keeping the system error, with a hint when
+/// the filesystem may not have hard links.
+///
+/// * `ENOTSUP` / `EOPNOTSUPP`: the filesystem has no hard links (macOS FAT,
+///   exFAT, some SMB or FUSE mounts).
+/// * `EPERM`: Linux reports a filesystem without hard links (vfat) this
+///   way, but it is also an immutable or append-only directory, a security
+///   module, or a macOS privacy protection, so the hint says "probably".
+///
+/// `EMLINK` (too many links) is not listed: a file this command has just
+/// created has one link.
 #[cfg(unix)]
 fn link_error(path: &Path, error: std::io::Error) -> Box<dyn std::error::Error> {
     let errno = error.raw_os_error();
-    let no_links = [
-        rustix::io::Errno::NOTSUP,
-        rustix::io::Errno::OPNOTSUPP,
-        rustix::io::Errno::PERM,
-        rustix::io::Errno::MLINK,
-    ]
-    .iter()
-    .any(|candidate| errno == Some(candidate.raw_os_error()));
-    if no_links {
+    let is = |candidate: rustix::io::Errno| errno == Some(candidate.raw_os_error());
+    let advice = "this command needs hard links to write the file in one step. Write it to a local filesystem (for example APFS or ext4) and copy it from there";
+    if is(rustix::io::Errno::NOTSUP) || is(rustix::io::Errno::OPNOTSUPP) {
         format!(
-            "cannot create {}: {error}; the filesystem of that directory does not support hard links, which this command needs to write the file in one step. Write it to a local filesystem (for example APFS or ext4) and copy it from there",
+            "cannot create {}: {error}; the filesystem of that directory does not support hard links, and {advice}",
+            path.display()
+        )
+        .into()
+    } else if is(rustix::io::Errno::PERM) {
+        format!(
+            "cannot create {}: {error}; the filesystem of that directory probably does not support hard links (or the operation is not permitted there), and {advice}",
             path.display()
         )
         .into()
@@ -150,15 +158,26 @@ fn write_through_temporary(
         .create_new(true)
         .open(&temporary)
         .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-    let ours = identity_of(&file.metadata()?);
+    // The identity is read from the descriptor after the write, not at
+    // creation: on macOS msdosfs (FAT), `fstat` right after `open` returns a
+    // provisional inode (18446744073709551608 in one run) that becomes the
+    // real one (11) after the first write, so an identity taken at creation
+    // never matched and the `.tmp` was left behind after the expected
+    // `ENOTSUP` from `link`. Reproduction: an `hdiutil`-attached FAT32 image
+    // as the output directory.
     let result = (|| -> CliResult<()> {
         file.write_all(contents)?;
         file.sync_all()?;
+        let ours = identity_of(&file.metadata()?);
         before_link(&temporary);
         fs::hard_link(&temporary, path).map_err(|error| link_error(path, error))?;
         check_linked(path, ours)
     })();
-    remove_if_still(&temporary, ours);
+    // Read again here, so a failed write (before the identity above) still
+    // removes the temporary file while it is ours.
+    if let Ok(metadata) = file.metadata() {
+        remove_if_still(&temporary, identity_of(&metadata));
+    }
     drop(file);
     result
 }
@@ -287,8 +306,9 @@ mod tests {
     }
 
     /// Another file renamed over the temporary name between the sync and
-    /// the link: the output is not left pointing at it, and the other file
-    /// (no longer ours) is not removed.
+    /// the link: the write fails and names the output path, which is left
+    /// in place as evidence, and the other file (no longer ours) is not
+    /// removed.
     #[test]
     fn a_temporary_file_swapped_before_the_link_is_detected() {
         let dir = Dir::new();
@@ -301,8 +321,12 @@ mod tests {
             swapped = Some(tmp.to_path_buf());
         })
         .unwrap_err();
-        assert!(error.to_string().contains("was replaced"), "{error}");
-        assert!(!path.exists());
+        let message = error.to_string();
+        assert!(message.contains("left in place"), "{message}");
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        // Left as evidence: the foreign file is at the output name, and its
+        // other name (the temporary one, no longer ours) is untouched.
+        assert_eq!(fs::read(&path).unwrap(), b"not the manifest");
         let swapped = swapped.unwrap();
         assert_eq!(fs::read(&swapped).unwrap(), b"not the manifest");
 
@@ -315,9 +339,30 @@ mod tests {
             fs::rename(&link, tmp).unwrap();
         })
         .unwrap_err();
-        assert!(error.to_string().contains("was replaced"), "{error}");
-        assert!(fs::symlink_metadata(&path).is_err());
+        assert!(error.to_string().contains("left in place"), "{error}");
+        // The symlink is left as it is, not followed and not removed.
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(!target.exists());
+    }
+
+    /// When the link fails after a complete write, the temporary file (still
+    /// ours) is removed.
+    #[test]
+    fn a_failed_link_removes_the_temporary_file() {
+        let dir = Dir::new();
+        let path = dir.0.join("manifest.json");
+        let error = write_through_temporary(&dir.0, "manifest.json", &path, b"ours\n", |_| {
+            fs::write(&path, b"someone else").unwrap();
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot create"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"someone else");
+        assert_eq!(dir.names(), ["manifest.json"]);
     }
 
     #[test]
@@ -330,6 +375,27 @@ mod tests {
             error.to_string().contains("does not support hard links"),
             "{error}"
         );
+        // EPERM is not only "no hard links": the hint is hedged and the
+        // system error is kept.
+        let error = link_error(
+            Path::new("m.json"),
+            std::io::Error::from_raw_os_error(rustix::io::Errno::PERM.raw_os_error()),
+        )
+        .to_string();
+        assert!(
+            error.contains("probably does not support hard links"),
+            "{error}"
+        );
+        assert!(
+            error.contains("or the operation is not permitted"),
+            "{error}"
+        );
+        assert!(error.contains("os error"), "{error}");
+        let error = link_error(
+            Path::new("m.json"),
+            std::io::Error::from_raw_os_error(rustix::io::Errno::MLINK.raw_os_error()),
+        );
+        assert!(!error.to_string().contains("hard links"), "{error}");
         let error = link_error(
             Path::new("m.json"),
             std::io::Error::from_raw_os_error(rustix::io::Errno::EXIST.raw_os_error()),
