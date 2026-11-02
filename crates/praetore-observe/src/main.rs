@@ -1,7 +1,7 @@
 use praetore_core::VerifiedPublicKey;
 use praetore_observe::{ObserveState, parse_tenant_token_hashes, validate_bind_address};
 use praetore_replay_postgres::{DatabaseConnector, PostgresObservabilityReader};
-use std::{env, fs, net::SocketAddr, path::Path, sync::Arc};
+use std::{env, fs, future::IntoFuture, net::SocketAddr, path::Path, sync::Arc};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,6 +49,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "runtime role check relaxed explicitly"
         );
     }
+    match options.schema_owner() {
+        Some(owner) => tracing::info!(schema_owner = owner, "praetore schema owner is pinned"),
+        None => tracing::warn!(
+            "PRAETORE_SCHEMA_OWNER is not set: the runtime accepts whichever role owns the \
+             praetore schema (set it in production)"
+        ),
+    }
     for function in
         praetore_replay_postgres::describe_trusted_security_definer(&mut client, &options)?
     {
@@ -66,11 +73,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(address).await?;
-        tracing::info!(%address, "PRÆTORE read-only observability service listening");
-        axum::serve(listener, state.router()).await?;
-        Ok::<_, std::io::Error>(())
-    })?;
+    // The reader holds a blocking PostgreSQL client, whose drop must not run
+    // on a runtime thread: bind before anything moves into the runtime, and
+    // keep the last reference (`state`) out here, so that a port in use is
+    // reported as the bind error instead of aborting the process.
+    let listener = runtime.block_on(tokio::net::TcpListener::bind(address))?;
+    tracing::info!(%address, "PRÆTORE read-only observability service listening");
+    let served = runtime.block_on(axum::serve(listener, state.clone().router()).into_future());
+    drop(runtime);
+    drop(state);
+    served?;
     Ok(())
 }

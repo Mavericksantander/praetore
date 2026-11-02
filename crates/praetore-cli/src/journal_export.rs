@@ -37,14 +37,17 @@ pub enum Source {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExportArgs {
     pub source: Source,
-    pub attester_pin: PathBuf,
+    /// One or more attester pins (repeated `--attester-pin`). Every receipt
+    /// and storage record must be signed by one of them; after a key
+    /// rotation, pin the retired key as well as the current one.
+    pub attester_pins: Vec<PathBuf>,
     pub output: PathBuf,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
     let mut receipts_dir = None;
     let mut tenant = None;
-    let mut attester_pin = None;
+    let mut attester_pins = Vec::new();
     let mut output = None;
     let mut database = false;
     let mut args = args.into_iter();
@@ -55,10 +58,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
             }
             continue;
         }
+        if flag == "--attester-pin" {
+            let value = args.next().ok_or("missing value for --attester-pin")?;
+            if attester_pins.len() == MAX_ATTESTER_PINS {
+                return Err(format!("at most {MAX_ATTESTER_PINS} --attester-pin").into());
+            }
+            attester_pins.push(PathBuf::from(value));
+            continue;
+        }
         let slot = match flag.as_str() {
             "--receipts-dir" => &mut receipts_dir,
             "--tenant" => &mut tenant,
-            "--attester-pin" => &mut attester_pin,
             "--output" => &mut output,
             _ => return Err(format!("unexpected argument: {flag}").into()),
         };
@@ -75,22 +85,45 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
         (None, None, true) => Source::StorageRecords,
         _ => return Err("pass exactly one of --receipts-dir, --tenant or --database".into()),
     };
+    if attester_pins.is_empty() {
+        return Err("missing --attester-pin".into());
+    }
     Ok(ExportArgs {
         source,
-        attester_pin: attester_pin.ok_or("missing --attester-pin")?.into(),
+        attester_pins,
         output: output.ok_or("missing --output")?.into(),
     })
 }
 
+/// Most attester pins one export accepts.
+const MAX_ATTESTER_PINS: usize = 16;
+
+/// Hint for a storage record signed by a key that is not pinned.
+const RECORD_PIN_HINT: &str = "storage records keep the signature of the attester key that was \
+     current when they were recorded; after a key rotation, pass the retired key's pin as \
+     another --attester-pin";
+
 pub fn run(args: ExportArgs) -> CliResult<()> {
-    let attester = read_attester_pin(&args.attester_pin)?;
+    let mut attesters: Vec<VerifiedPublicKey> = Vec::with_capacity(args.attester_pins.len());
+    for path in &args.attester_pins {
+        let key = read_attester_pin(path)?;
+        if attesters.contains(&key) {
+            return Err(format!("attester pin {} repeats a key", path.display()).into());
+        }
+        attesters.push(key);
+    }
+    let attester = attesters.as_slice();
+    let records_chain = |records: &[String]| {
+        export_storage_records(records, attester)
+            .map_err(|error| format!("database chain: {error} ({RECORD_PIN_HINT})"))
+    };
     let url = || {
         std::env::var("PRAETORE_GATEWAY_DATABASE_URL")
             .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")
     };
     let (text, head, kind, database_head) = match &args.source {
         Source::ReceiptsDir(dir) => {
-            let (text, head) = export(&read_receipts_dir(dir)?, &attester)?;
+            let (text, head) = export(&read_receipts_dir(dir)?, attester)?;
             (text, head, "tenant", None)
         }
         Source::Database { tenant_id } => {
@@ -98,11 +131,9 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             let database_head = if records.is_empty() {
                 None
             } else {
-                Some(DatabaseHead::from(
-                    export_storage_records(&records, &attester)?.1,
-                ))
+                Some(DatabaseHead::from(records_chain(&records)?.1))
             };
-            let (text, head) = export_with_database_head(&receipts, database_head, &attester)?;
+            let (text, head) = export_with_database_head(&receipts, database_head, attester)?;
             (text, head, "tenant", database_head)
         }
         Source::StorageRecords => {
@@ -110,7 +141,7 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             if records.is_empty() {
                 return Err("the database has no storage records to export".into());
             }
-            let (text, head) = export_storage_records(&records, &attester)?;
+            let (text, head) = records_chain(&records)?;
             (text, head, "database", None)
         }
     };
@@ -142,7 +173,10 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
 /// Chains receipts given as JSON text, in order. Fails on the first receipt
 /// that does not parse, lacks or fails its attester signature, or repeats an
 /// `evidence_id`.
-pub fn export(receipts: &[String], attester: &VerifiedPublicKey) -> CliResult<(String, ChainHead)> {
+pub fn export(
+    receipts: &[String],
+    attester: &[VerifiedPublicKey],
+) -> CliResult<(String, ChainHead)> {
     export_with_database_head(receipts, None, attester)
 }
 
@@ -151,9 +185,9 @@ pub fn export(receipts: &[String], attester: &VerifiedPublicKey) -> CliResult<(S
 pub fn export_with_database_head(
     receipts: &[String],
     database_head: Option<DatabaseHead>,
-    attester: &VerifiedPublicKey,
+    attester: &[VerifiedPublicKey],
 ) -> CliResult<(String, ChainHead)> {
-    let mut exporter = ChainExporter::new(attester);
+    let mut exporter = ChainExporter::with_attesters(attester);
     if let Some(reference) = &database_head {
         exporter.push_database_head(reference)?;
     }
@@ -168,9 +202,9 @@ pub fn export_with_database_head(
 /// The database chain: signed storage records in recording order.
 pub fn export_storage_records(
     records: &[String],
-    attester: &VerifiedPublicKey,
+    attester: &[VerifiedPublicKey],
 ) -> CliResult<(String, ChainHead)> {
-    let mut exporter = ChainExporter::new(attester);
+    let mut exporter = ChainExporter::with_attesters(attester);
     for (index, json) in records.iter().enumerate() {
         let record = StorageRecord::from_json(json)
             .map_err(|error| format!("storage record {index}: {error}"))?;
@@ -377,10 +411,26 @@ mod tests {
             .unwrap(),
             ExportArgs {
                 source: Source::ReceiptsDir("d".into()),
-                attester_pin: "p".into(),
+                attester_pins: vec!["p".into()],
                 output: "o".into(),
             }
         );
+        // Repeated pins (a chain across an attester key rotation).
+        assert_eq!(
+            args(&[
+                "--database",
+                "--attester-pin",
+                "old",
+                "--attester-pin",
+                "new",
+                "--output",
+                "o"
+            ])
+            .unwrap()
+            .attester_pins,
+            vec![PathBuf::from("old"), PathBuf::from("new")]
+        );
+        assert!(args(&["--database", "--output", "o"]).is_err());
     }
 
     fn set(name: &str) -> PathBuf {
@@ -394,7 +444,7 @@ mod tests {
         let set = set("04-sesion-real-bloqueada-web-fetch");
         let attester = read_attester_pin(&set.join("attester-public-key.hex")).unwrap();
         let receipts = read_receipts_dir(&set.join("evidence")).unwrap();
-        let (text, head) = export(&receipts, &attester).unwrap();
+        let (text, head) = export(&receipts, std::slice::from_ref(&attester)).unwrap();
         assert_eq!(head.entries.get(), 8);
         assert_eq!(
             text,
@@ -413,21 +463,27 @@ mod tests {
         let receipts = read_receipts_dir(&set.join("evidence")).unwrap();
 
         // Nothing to export.
-        assert!(export(&[], &attester).is_err());
+        assert!(export(&[], std::slice::from_ref(&attester)).is_err());
         // Same receipt twice.
-        assert!(export(&[receipts[0].clone(), receipts[0].clone()], &attester).is_err());
+        assert!(
+            export(
+                &[receipts[0].clone(), receipts[0].clone()],
+                std::slice::from_ref(&attester)
+            )
+            .is_err()
+        );
         // Altered receipt.
         let altered = receipts[0].replacen("\"reason\":\"P", "\"reason\":\"p", 1);
         assert_ne!(altered, receipts[0]);
-        assert!(export(&[altered], &attester).is_err());
+        assert!(export(&[altered], std::slice::from_ref(&attester)).is_err());
         // Wrong attester key.
         let other = praetore_core::EvidenceAttesterKey::from_secret_bytes(&[9; 32]);
-        assert!(export(&receipts, &other.public_key().unwrap()).is_err());
+        assert!(export(&receipts, &[other.public_key().unwrap()]).is_err());
         // Signature removed.
         let mut unsigned = Evidence::from_json(&receipts[0]).unwrap();
         unsigned.attester_signature = None;
         let unsigned = serde_json::to_string(&unsigned).unwrap();
-        assert!(export(&[unsigned], &attester).is_err());
+        assert!(export(&[unsigned], std::slice::from_ref(&attester)).is_err());
         // A directory with anything other than regular *.json files.
         assert!(read_receipts_dir(&set).is_err());
     }
@@ -558,7 +614,7 @@ mod tests {
             let records = read_storage_records_only(&url).unwrap();
             assert_eq!(records.len(), 1, "the adoption record");
             let (database_text, database_head) =
-                export_storage_records(&records, &record_pin).unwrap();
+                export_storage_records(&records, std::slice::from_ref(&record_pin)).unwrap();
             let summary = verify_journal(&database_text, &record_pin, None, None, None).unwrap();
             assert_eq!(summary.kind, JournalKind::Database);
             eprintln!("database export: {database_text}");
@@ -567,8 +623,12 @@ mod tests {
             assert_eq!(rows, receipts[..2].to_vec());
             assert_eq!(same_records, records, "one snapshot");
             let reference = DatabaseHead::from(database_head);
-            let (tenant_text, _) =
-                export_with_database_head(&rows, Some(reference), &receipt_pin).unwrap();
+            let (tenant_text, _) = export_with_database_head(
+                &rows,
+                Some(reference),
+                std::slice::from_ref(&receipt_pin),
+            )
+            .unwrap();
             let expected = ExpectedDatabaseHead {
                 head: database_head.head,
                 entries: Some(database_head.entries),
@@ -622,8 +682,8 @@ mod tests {
         }
         let rows = read_journal(&url, tenant).unwrap();
         assert_eq!(rows, receipts[..3].to_vec());
-        let (_, head) = export(&rows, &attester).unwrap();
-        let (_, expected) = export(&receipts[..3], &attester).unwrap();
+        let (_, head) = export(&rows, std::slice::from_ref(&attester)).unwrap();
+        let (_, expected) = export(&receipts[..3], std::slice::from_ref(&attester)).unwrap();
         assert_eq!(head, expected);
         assert!(read_journal(&url, Uuid::new_v4()).unwrap().is_empty());
     }
@@ -677,8 +737,17 @@ mod tests {
         // The export path, as the runtime role.
         assert_eq!(read_journal(&runtime_url, a).unwrap(), rows_of_a);
         assert_eq!(read_journal(&runtime_url, b).unwrap(), rows_of_b);
-        let (_, head) = export(&read_journal(&runtime_url, a).unwrap(), &attester).unwrap();
-        assert_eq!(head, export(&rows_of_a, &attester).unwrap().1);
+        let (_, head) = export(
+            &read_journal(&runtime_url, a).unwrap(),
+            std::slice::from_ref(&attester),
+        )
+        .unwrap();
+        assert_eq!(
+            head,
+            export(&rows_of_a, std::slice::from_ref(&attester))
+                .unwrap()
+                .1
+        );
 
         // Second line: the export transaction without any tenant filter still
         // returns only the rows of the tenant in `praetore.tenant_id`.
@@ -749,7 +818,7 @@ mod tests {
         }
         let unknown = read_journal(&runtime_url, Uuid::new_v4()).unwrap();
         assert!(unknown.is_empty());
-        assert!(export(&unknown, &attester).is_err());
+        assert!(export(&unknown, std::slice::from_ref(&attester)).is_err());
 
         // The export transaction is READ ONLY: no insert or update gets through,
         // even ones the runtime role is granted.
@@ -869,7 +938,7 @@ mod tests {
             .unwrap();
         assert_eq!(read_journal_rows(&mut runtime, tenant).unwrap(), expected);
 
-        let (text, head) = export(&expected, &attester).unwrap();
+        let (text, head) = export(&expected, std::slice::from_ref(&attester)).unwrap();
         let chain: Vec<String> = text
             .lines()
             .map(|line| {

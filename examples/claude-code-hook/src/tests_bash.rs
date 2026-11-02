@@ -476,13 +476,11 @@ fn monitor_and_powershell_are_commands() {
         ("PowerShell", json!({ "command": "Get-ChildItem" })),
         ("Monitor", json!({ "ws": { "url": "wss://x.test" } })),
     ] {
+        // Unanalyzable: denied, as any unanalyzable command (#88).
         let verdict = p.tool(None, tool, input);
-        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval, "{tool}");
-        assert_eq!(
-            verdict.rule.as_deref(),
-            Some("approval-unanalyzable-command"),
-            "{tool}"
-        );
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{tool}");
+        assert_eq!(verdict.rule.as_deref(), Some(UNANALYZABLE_RULE), "{tool}");
+        assert_eq!(verdict.deny_class, Some(DenyClass::UnanalyzableCommand));
     }
 }
 
@@ -846,4 +844,81 @@ fn a_write_without_its_path_names_the_cause() {
         "{}",
         verdict.reason
     );
+}
+
+/// Guard denials show only their class, derived from the signed
+/// `praetore.hook_guard`, and never a rule id.
+#[test]
+fn guard_denials_show_only_their_class() {
+    let check = |p: &Project, verdict: &Verdict, class: DenyClass| {
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+        assert_eq!(verdict.deny_class, Some(class), "{verdict:?}");
+        let evidence_id = verdict.evidence_id.clone().unwrap();
+        let text = hook_output(verdict).unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            text,
+            format!(
+                "PRÆTORE denied this tool call: {} (evidence {evidence_id})",
+                class.text()
+            )
+        );
+        let line = stderr_line(verdict).unwrap();
+        for rule in load_policy(&p.state).unwrap().rules {
+            assert!(
+                !text.contains(&rule.id) && !line.contains(&rule.id),
+                "{text} / {line}"
+            );
+        }
+    };
+    let p = Project::with_profiles("guard-classes", &EARLIER_PROFILES);
+    check(
+        &p,
+        &p.bash(Some("coder"), "cargo test"),
+        DenyClass::Capability,
+    );
+    for (tool, input) in [
+        ("Write", json!({ "file_path": p.path(".mcp.json") })),
+        (
+            "Edit",
+            json!({ "file_path": p.path(".claude/settings.json") }),
+        ),
+        ("NotebookEdit", json!({ "file_path": p.path("a.ipynb") })),
+    ] {
+        check(&p, &p.tool(Some("coder"), tool, input), DenyClass::Path);
+    }
+    fs::remove_file(p.state.join(PROJECT_ROOT_FILE)).unwrap();
+    let verdict = p.tool(
+        Some("coder"),
+        "Write",
+        json!({ "file_path": p.path("src/a.rs") }),
+    );
+    assert_eq!(last_context(&p)["praetore.hook_guard"], "no_project_root");
+    check(&p, &verdict, DenyClass::Path);
+    verify_receipts(&p.state).unwrap();
+}
+
+#[test]
+fn state_warnings_reach_the_user_as_a_system_message() {
+    let warnings = vec!["profile 'coder' holds process:execute".to_string()];
+    // No decision (allow): only the message, so Claude Code's own
+    // permissions still decide.
+    let output = with_warnings(None, &warnings).unwrap();
+    assert!(output.get("hookSpecificOutput").is_none(), "{output}");
+    assert!(
+        output["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("holds process:execute")
+    );
+    // A decision is kept as is.
+    let decided = json!({ "hookSpecificOutput": { "permissionDecision": "deny" } });
+    let output = with_warnings(Some(decided.clone()), &warnings).unwrap();
+    assert_eq!(output["hookSpecificOutput"], decided["hookSpecificOutput"]);
+    assert!(output["systemMessage"].is_string());
+    // No warnings, nothing added.
+    assert_eq!(with_warnings(None, &[]), None);
+    assert_eq!(with_warnings(Some(decided.clone()), &[]), Some(decided));
 }

@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **Claude Code hook example: HighAssurance receipts.**
+  `examples/claude-code-hook` now evaluates with
+  `AuthorizationEngine::production` (HighAssurance) instead of `strict`.
+  Every receipt it writes, the `unclassified` DENY included, records the
+  engine's signed decision time (`decided_at`), so `praetore-verify evidence
+  --issuer-pins` checks the authority and the issuer pin at that instant and
+  `--require-decision-time` accepts it. Intents are signed v2 for the
+  audience `praetore-claude-hook`, valid for 60 s. The replay guard is a
+  durable local claim store in the hook state (`replay/`): one file per
+  request, created with `create_new` (`O_CREAT|O_EXCL`) and `fsync`ed with
+  its directories; on every claim the store must be a real directory owned
+  by the current user with no group/other bits and (macOS) no extended ACL
+  entries, and the state directory must be owned by the user and not
+  group/other-writable; any store error denies without a receipt. The guard
+  records each signed request's claim once; it does not deduplicate tool
+  calls (each invocation builds a new request). `receipts.jsonl` is now
+  `fsync`ed after each append (and its directory on creation); a claim can
+  remain without a receipt when that write fails, and the call is denied.
+  Each receipt signs Claude Code's `tool_use_id` (`claude.tool_use_id`, a
+  string or number up to 128 bytes; a longer one or another JSON type is
+  evaluated as `unregistered` and recorded only as `praetore.claim_rejected`;
+  a missing one is not recorded). The `receipts.jsonl` line carries an
+  unsigned copy only when the receipt signs one; `verify` and `export`
+  refuse an unsigned copy on a HighAssurance receipt that signs none, and
+  `export` takes it only from the signed context. Unparseable hook input is
+  denied with a fixed message that does not quote input values. The guard does not forge receipts and does not
+  deduplicate invocations: a re-delivered tool call is evaluated again, and
+  the hook's `verify` warns (without failing) about `tool_use_id`s signed in
+  more than one receipt. An unanalyzable shell command is now denied (rule
+  `deny-unanalyzable-command`, signed receipt) instead of held for approval.
+  A DENY with a receipt shows only its reason class (`capability`, `path`,
+  `unregistered`, `unclassified`, `unanalyzable_command, use simple
+  commands`) and the evidence id, never the rule id or text; a
+  RequireApproval message also includes the evidence id.
+  Freshness is
+  local (60 s lease, no revocation source). `init` creates `replay/`; state
+  created before this change has none and is refused with a message that
+  points to `init` (same pattern as the SAF-14 check). Profiles and
+  per-agent keys (SAF-14), G7 classification and declared Safety tools
+  (no decision, no receipt) are unchanged, and so is the receipt format.
+  The hook's `verify` checks the authority at `decided_at` when a receipt
+  records it. `verify.sh` takes `--require-decision-time`; `demo.sh` checks
+  that the bundle it regenerates is HighAssurance. The committed `bundle/`
+  and sets 03, 04 and 05 are unchanged and verify as before (they fail
+  `--require-decision-time`, as expected). `evidence/VERIFY.md` section 7
+  describes how to record new sets 04 and 05 with this hook. The G7 hook
+  mutant (`scripts/g7-mutants/hook.patch`) is rebased onto the new code.
 - **Claude Code hook example: no subagent profile gets `process:execute` by
   default** (GHSA-wg33-3h8v-xvqw). The hook sees a command's text, not what
   it does when it runs, so `Bash` under `process:execute` is equivalent to
@@ -60,6 +107,14 @@
   again; `commondir` and `gitdir` join the bare-repository names; a write
   without its path parameter says so instead of naming a path rule.
 
+- **Claude Code hook example: guard denials and state warnings with
+  HighAssurance receipts.** A denial by the hook's exec or write guard shows
+  the reason class derived from the signed `praetore.hook_guard`
+  (`exec_reserved_to_main` is `capability`; the write guards are `path`),
+  and `verify` checks the guard claims like `check-attribution.py`. The
+  state warnings also reach the user as `systemMessage`. `PowerShell` and a
+  `Monitor` without a command are unanalyzable, so they are denied like any
+  unanalyzable command.
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without
@@ -209,6 +264,77 @@
   5. Pin the new digest (HighAssurance `policy_digest`). Keep the format 1
      document: receipts that recorded its digest verify only against it
      (`praetore-verify --policy old-policy.json`).
+- **Journal export across an attester key rotation (v0.3.2 follow-up
+  B5-5).** `praetore journal-export` and `praetore-verify journal` accept
+  `--attester-pin` more than once (up to 16 keys); each receipt and storage
+  record is checked against the pinned key its key id names, and nothing is
+  re-signed. A database adopted with a retired key exports and verifies
+  again with the retired and the current pin; with only the current pin the
+  export fails and names the key that signed the adoption record. New
+  library API: `ChainExporter::with_attesters` and
+  `journal_chain::verify_journal_with_attesters`; `export`,
+  `export_with_database_head` and `export_storage_records` of the CLI take
+  a slice of keys.
+- **`praetore-verify journal --policy` on a database chain fails (B5-4)**
+  with `INVALID_REQUEST` (`ChainError::PolicyNotApplicable`) instead of
+  reporting `policy_verified: true` with nothing compared. **Breaking
+  (API):** new `ChainError` variant.
+- **Extension objects in `praetore` are refused (B5-1).** The runtime check
+  (`RuntimeRoleError::ExtensionObjects`) and the migration runner
+  (`UnsafeDatabase`) refuse an extension installed in `praetore` and any
+  `praetore` object that belongs to an extension, which a role with CREATE
+  on the database can install since PostgreSQL 13. **Breaking (API):** new
+  `RuntimeRoleError` variants.
+- **`PRAETORE_SCHEMA_OWNER` (B5-2).** Optional exact role name of the
+  `praetore` schema owner. When set, the runtime check
+  (`RuntimeRoleError::UnexpectedSchemaOwner`) and migrating refuse another
+  owner (and, before the schema exists, another migrating role). Read by the
+  gateway, the CLI and `praetore-observe`; the gateway warns while it is
+  unset. Set it in production. New `RuntimeRoleOptions::with_schema_owner`
+  and `MigrationOptions::schema_owner` (a new public field).
+- **Docs (B5-3).** `docs/operations.md` now says that an allowlisted event
+  trigger runs with the privileges of the role executing the migration DDL
+  (unless its function is SECURITY DEFINER), as a test records, not with its
+  function owner's.
+- **`praetore run`, `praetore-gateway-demo` and `praetore-observe` report a
+  port in use** with exit status 1 and the bind error, instead of aborting
+  (SIGABRT or a panic) while they dropped their blocking PostgreSQL clients
+  on the async runtime thread. The services bind before the state moves into
+  the runtime, and the runtime is dropped before the last reference.
+- **`DEPENDS ON EXTENSION` marks on `praetore` objects are refused** by the
+  runtime check and the migration runner, like extension members: `DROP
+  EXTENSION ... CASCADE` by the extension's owner would drop the marked
+  object (for example an append-only trigger function).
+- **`PRAETORE_SCHEMA_OWNER` with a NOLOGIN owner group.** With no schema yet,
+  a migrating role that is a member of the named NOLOGIN group creates
+  `praetore` owned by the group and runs the migrations as it; any other
+  named role is refused before anything is created. The installation order
+  is in `docs/operations.md`. The CLI and `praetore-observe` now warn, like
+  the gateway, while the variable is unset. Before anything is created, a
+  typed `MigrationError::SchemaOwner` (`SchemaOwnerProblem`) refuses a
+  membership without SET or INHERIT (or a NOINHERIT migrating role), a
+  predefined `pg_*` role, the bootstrap superuser for a new schema, and a
+  missing CREATE privilege on the database; `MigrationError::
+  RuntimeGroupMissing` refuses, before migration 0001, when
+  `praetore_runtime` does not exist and the role running the migrations has
+  no CREATEROLE. The owner is checked again inside the transaction that
+  creates or adopts the schema. `verify_runtime_role` refuses a `pg_*`
+  value as a configuration error. **Breaking (API):** new `MigrationError`
+  variants.
+- **`praetore-verify journal` reports `attester_key_ids`** (entries per
+  signing key id), and a receipt signed by a key that is not pinned fails
+  with `AUTH_FAIL` naming that key id (`ChainError::UnpinnedAttesterKey`).
+  New `journal_chain::verify_journal_report` and `JournalReport`. With
+  `--database-journal`, `database_attester_key_ids` reports that file's
+  signers.
+- **Tests (B5-6 and an intermittent CI failure).** The full ignored
+  PostgreSQL suite runs in parallel: the fault-injection test runs in its own
+  scratch database, and cluster-wide grants of `pg_read_all_data` /
+  `pg_write_all_data` are serialized with every runtime-role check.
+  `postgres_cli_journal_export_tenant_end_to_end` no longer picks two ports
+  that can coincide, and waits for a gateway that accepts its own token
+  rather than any answer to `/healthz` (two gateways on one port made
+  `praetore demo` get 401 `authentication_required`).
 
 ## 0.3.1 - 2026-11-01
 

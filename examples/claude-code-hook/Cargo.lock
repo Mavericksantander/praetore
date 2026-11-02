@@ -325,12 +325,14 @@ version = "0.1.0"
 dependencies = [
  "caseless",
  "hex",
+ "libc",
  "praetore-core",
  "rand_core",
  "serde",
  "serde_json",
  "time",
  "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]

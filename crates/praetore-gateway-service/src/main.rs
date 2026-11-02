@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    future::IntoFuture,
     path::Path,
     sync::Arc,
     time::Duration as StdDuration,
@@ -228,6 +229,11 @@ fn migration_options()
         trusted_default_privileges: MigrationOptions::parse_list(&env(
             MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV,
         )),
+        schema_owner: MigrationOptions::parse_schema_owner(
+            std::env::var(MigrationOptions::SCHEMA_OWNER_ENV)
+                .ok()
+                .as_deref(),
+        ),
     };
     praetore_replay_postgres::parse_trusted_default_privileges(
         &options.trusted_default_privileges,
@@ -301,6 +307,13 @@ fn runtime_role_options()
             trusted_security_definer = ?options.trusted_security_definer(),
             "runtime role check relaxed explicitly"
         );
+    }
+    match options.schema_owner() {
+        Some(owner) => tracing::info!(schema_owner = owner, "praetore schema owner is pinned"),
+        None => tracing::warn!(
+            "PRAETORE_SCHEMA_OWNER is not set: the runtime accepts whichever role owns the \
+             praetore schema (set it in production)"
+        ),
     }
     Ok(options)
 }
@@ -595,12 +608,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(&address).await?;
-        tracing::info!(%address, "PRÆTORE local demo gateway listening");
-        axum::serve(listener, http_api::router(gateway, api_auth)).await?;
-        Ok::<_, std::io::Error>(())
-    })?;
+    // The gateway holds blocking PostgreSQL clients, whose drop must not run
+    // on a runtime thread: bind before anything moves into the runtime, and
+    // keep the last reference (`gateway`) out here, so that a port in use is
+    // reported as the bind error instead of aborting the process.
+    let listener = runtime.block_on(tokio::net::TcpListener::bind(&address))?;
+    tracing::info!(%address, "PRÆTORE local demo gateway listening");
+    let served = runtime.block_on(
+        axum::serve(listener, http_api::router(Arc::clone(&gateway), api_auth)).into_future(),
+    );
+    drop(runtime);
+    drop(gateway);
+    served?;
     Ok(())
 }
 

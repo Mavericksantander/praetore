@@ -335,7 +335,7 @@ fn print_usage() {
            praetore approve <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
-           praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> --output <new file>\n\
+           praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> [--attester-pin <hex file> ...] --output <new file>\n\
            praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
@@ -863,6 +863,9 @@ fn migration_options_from_env() -> praetore_replay_postgres::MigrationOptions {
         trusted_security_definer: list(MigrationOptions::TRUSTED_SECURITY_DEFINER_ENV),
         trusted_event_triggers: list(MigrationOptions::TRUSTED_EVENT_TRIGGERS_ENV),
         trusted_default_privileges: list(MigrationOptions::TRUSTED_DEFAULT_PRIVILEGES_ENV),
+        schema_owner: MigrationOptions::parse_schema_owner(
+            env::var(MigrationOptions::SCHEMA_OWNER_ENV).ok().as_deref(),
+        ),
         ..Default::default()
     }
 }
@@ -1071,9 +1074,10 @@ fn run_gateway(
             ..migration_options_from_env()
         },
     )?;
+    let role_options = runtime_role_options()?;
     let runtime_role = praetore_replay_postgres::verify_runtime_role_with(
         &mut connect_local_database(&database_url)?,
-        &runtime_role_options()?,
+        &role_options,
     );
     let api_auth = local_api_auth(directory, &config)?;
     let gateway = Arc::new(build_gateway(directory, &config, &database_url)?);
@@ -1083,6 +1087,12 @@ fn run_gateway(
         .init();
     if let Err(error) = runtime_role {
         tracing::warn!(%error, "local demo database role is not least-privilege; development only");
+    }
+    if role_options.schema_owner().is_none() {
+        tracing::warn!(
+            "PRAETORE_SCHEMA_OWNER is not set: the runtime accepts whichever role owns the \
+             praetore schema (set it in production)"
+        );
     }
     if let Some(root) = &config.sandbox_root {
         tracing::warn!(
@@ -1098,10 +1108,21 @@ fn run_gateway(
         .enable_all()
         .build()?;
     let options = http_options(&config);
-    runtime.block_on(async move {
-        http_api::serve_local_with_options(config.port, gateway, api_auth, options).await?;
-        Ok::<_, io::Error>(())
-    })?;
+    // The gateway holds blocking PostgreSQL clients, whose drop must not run
+    // on a runtime thread: if serving fails (for example, the port is in
+    // use), the runtime (with any task holding a clone) is dropped first and
+    // the last reference after it, and the error is reported instead of
+    // aborting the process.
+    let served =
+        runtime.block_on({
+            let gateway = Arc::clone(&gateway);
+            async move {
+                http_api::serve_local_with_options(config.port, gateway, api_auth, options).await
+            }
+        });
+    drop(runtime);
+    drop(gateway);
+    served?;
     Ok(())
 }
 

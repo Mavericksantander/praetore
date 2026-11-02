@@ -8,8 +8,8 @@
 //! Whatever it cannot reason about lexically (command substitution, process
 //! substitution, heredocs, `eval`, a shell's `-c`, a variable in command
 //! position or next to `push`, an inline git alias) makes the command
-//! unanalyzable, which the policy treats as requiring approval. False
-//! positives such as `echo git push` or `echo curl` are accepted.
+//! unanalyzable, which the policy denies. False positives such as
+//! `echo git push` or `echo curl` are accepted.
 //!
 //! This is defense in depth, not a security boundary: a script, a Makefile,
 //! an alias or function defined elsewhere, a glob, or an encoded payload

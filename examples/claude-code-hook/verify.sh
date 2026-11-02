@@ -3,8 +3,11 @@
 # praetore-verify. No usa el binario del hook ni ninguna clave privada.
 # Requisitos: cargo (Rust stable) y python3.
 # Uso, desde la raíz de un clon:
-#   ./examples/claude-code-hook/verify.sh [bundle]
-# Por defecto verifica examples/claude-code-hook/bundle.
+#   ./examples/claude-code-hook/verify.sh [bundle] [--require-decision-time]
+# Por defecto verifica examples/claude-code-hook/bundle. Con
+# --require-decision-time cada recibo debe registrar su hora de decisión
+# firmada (decided_at, recibos HighAssurance); praetore-verify rechaza los que
+# no la tienen con DECISION_TIME_MISSING.
 # Sale con 0 solo si praetore-verify acepta todos los recibos (con la policy
 # publicada) y rechaza la copia alterada, e index.json atribuye cada recibo al
 # agente que lo firmó y una copia re-atribuida se rechaza; con 1 en cualquier
@@ -14,7 +17,17 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
-SOURCE="$(cd "${1:-$HERE/bundle}" && pwd)"
+DECISION_TIME=()
+ARGS=()
+for arg in "$@"; do
+  if [ "$arg" = "--require-decision-time" ]; then
+    DECISION_TIME=(--require-decision-time)
+  else
+    ARGS+=("$arg")
+  fi
+done
+[ "${#ARGS[@]}" -le 1 ] || { echo "uso: verify.sh [bundle] [--require-decision-time]" >&2; exit 1; }
+SOURCE="$(cd "${ARGS[0]:-$HERE/bundle}" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -75,10 +88,14 @@ for evidence in "${receipts[@]}"; do
     --attester-pin "$BUNDLE/attester-public-key.hex" \
     --issuer-pins "$BUNDLE/issuer-pins.jsonl" \
     --require-intent \
+    ${DECISION_TIME[@]+"${DECISION_TIME[@]}"} \
     --policy "$BUNDLE/policy.json" \
     --format json >/dev/null || fail "$(basename "$evidence") no verificó"
 done
 echo "OK: ${#receipts[@]} recibos verificados, todos ligados a la policy publicada"
+if [ "${#DECISION_TIME[@]}" -gt 0 ]; then
+  echo "OK: todos registran su hora de decisión firmada (decided_at); autoridad y pin verificados a esa hora"
+fi
 
 step "4. Alterar UN byte de una copia de un recibo y comprobar que falla"
 SAMPLE="${receipts[0]}"
