@@ -47,10 +47,70 @@ const ATTESTER_KEY_FILE: &str = "attester.key";
 const ATTESTER_PIN_FILE: &str = "attester-public-key.hex";
 const AGENTS_DIR: &str = "agents";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
-/// The canonical project root given to `init`. The `Bash` scan resolves the
-/// paths a command names against it. State written before this file existed
-/// falls back to the hook input's `cwd`.
+/// The canonical project root given to `init`. The `Bash` scan and the
+/// client-configuration check resolve paths against it. State written before
+/// this file existed has no root: every analyzable command then counts as
+/// leaving it, every write counts as client configuration, and the hook
+/// warns on stderr (see [`state_warnings`]).
 const PROJECT_ROOT_FILE: &str = "project-root";
+/// Paths inside the project that make Claude Code, git, a shell, an IDE or a
+/// package manager run commands or load configuration: the protected
+/// directories and files of Claude Code's permission modes
+/// (<https://code.claude.com/docs/en/permission-modes#protected-paths>),
+/// matched case-insensitively as whole path components anywhere under the
+/// project root. Writes to them are denied to every profile except `main`,
+/// which needs approval; a command naming one needs approval.
+const CLIENT_CONFIG_PATHS: [&str; 47] = [
+    // Directories.
+    ".git",
+    ".config/git",
+    ".vscode",
+    ".idea",
+    ".husky",
+    ".cargo",
+    ".devcontainer",
+    ".yarn",
+    ".mvn",
+    ".claude",
+    // Files.
+    ".gitconfig",
+    ".gitmodules",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_aliases",
+    ".bash_logout",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".profile",
+    ".envrc",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnp.cjs",
+    ".pnp.loader.mjs",
+    ".pnpmfile.cjs",
+    "bunfig.toml",
+    ".bunfig.toml",
+    ".bazelrc",
+    ".bazelversion",
+    ".bazeliskrc",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yml",
+    ".lefthook.yaml",
+    "gradle-wrapper.properties",
+    "maven-wrapper.properties",
+    ".devcontainer.json",
+    ".ripgreprc",
+    "pyrightconfig.json",
+    ".mcp.json",
+    ".claude.json",
+];
 /// Paths a command may name without counting as leaving the project root.
 const SHELL_DEVICES: [&str; 4] = ["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
 /// More words than this that may name a path count as leaving the root.
@@ -191,6 +251,17 @@ fn parse_init_options(options: &[String]) -> Result<(String, i64), BoxError> {
 }
 
 fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxError> {
+    initialize_with(directory, root, valid_days, &PROFILES)
+}
+
+/// [`initialize`] with the given profiles. Tests use it to build state as an
+/// earlier `init` wrote it.
+fn initialize_with(
+    directory: &Path,
+    root: &Path,
+    valid_days: i64,
+    profiles: &[(&str, &[&str])],
+) -> Result<(), BoxError> {
     let root = fs::canonicalize(root)?;
     let root = root.to_str().ok_or("project root must be valid UTF-8")?;
     let home = std::env::var("HOME").map_err(|_| "HOME is not set")?;
@@ -227,7 +298,7 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
         .as_bytes(),
     )?;
 
-    for (name, capabilities) in PROFILES {
+    for &(name, capabilities) in profiles {
         let secret = random_secret()?;
         let identity = AgentKeyPair::from_secret_bytes(&secret).identity(AgentId::new());
         let mut authority = Authority::new(
@@ -264,7 +335,7 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
     println!("Initialized PRÆTORE hook state at {}", directory.display());
     println!("Project root: {root}");
     println!("Policy digest: {}", policy.digest()?);
-    for (name, capabilities) in PROFILES {
+    for &(name, capabilities) in profiles {
         println!("  {name:<9} {}", capabilities.join(", "));
     }
     Ok(())
@@ -272,6 +343,12 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
 
 fn default_policy(root: &str, home: &str) -> Policy {
     let subagents = SUBAGENTS.iter().map(|a| json!(a)).collect::<Vec<_>>();
+    let non_main = PROFILES
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| *name != MAIN_AGENT)
+        .map(|name| json!(name))
+        .collect::<Vec<_>>();
     // Conditions match the profile whose key signs, not the raw agent_type:
     // an unregistered request may carry any agent_type, including `main`.
     let main_only = || PolicyCondition::exact("profile", json!(MAIN_AGENT));
@@ -304,6 +381,28 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 "path",
                 format!("{root}/.claude"),
             ))
+            .with_context_condition(main_only()),
+            // Client configuration (`CLIENT_CONFIG_PATHS`) outside
+            // `<root>/.claude` and `<root>/.git`, which the rules above cover:
+            // `.mcp.json`, IDE tasks, git hooks managers, shell startup
+            // files... Claude Code, git or a shell run what these files name,
+            // outside this hook. Denied to every profile except `main`, which
+            // needs approval. `client_config` is always present on
+            // `claude:write`, so these rules never match as unknown.
+            PolicyRule::new(
+                "deny-subagent-client-config-writes",
+                "claude:write",
+                PolicyEffect::Deny,
+            )
+            .with_parameter_condition(PolicyCondition::exact("client_config", json!(true)))
+            .with_context_condition(PolicyCondition::one_of("profile", non_main)),
+            PolicyRule::new(
+                "approval-main-client-config-writes",
+                "claude:write",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("fs:write")
+            .with_parameter_condition(PolicyCondition::exact("client_config", json!(true)))
             .with_context_condition(main_only()),
             PolicyRule::new(
                 "approval-git-push",
@@ -443,14 +542,42 @@ fn classify(
         let (parameters, check) = path_param(path);
         (action.to_string(), capability, parameters, check)
     };
+    // A write also records whether it touches client configuration (see
+    // `CLIENT_CONFIG_PATHS`), checked on the lexical and the resolved path.
+    let write = |path: Option<&str>| {
+        let (action, capability, mut parameters, check) =
+            with_path("claude:write", "fs:write", path);
+        let client_config = match (&check, root) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(check), Some(root)) => ["lexical", "resolved"].iter().any(|key| {
+                check[*key]
+                    .as_str()
+                    .is_some_and(|path| client_config_outside_governance(&normalize(path), root))
+            }),
+        };
+        parameters["client_config"] = json!(client_config);
+        (action, capability, parameters, check)
+    };
     match tool_name {
         "Read" => with_path("claude:read", "fs:read", field("file_path")),
         "Grep" | "Glob" => with_path("claude:read", "fs:read", field("path")),
-        "Edit" | "MultiEdit" | "Write" => with_path("claude:write", "fs:write", field("file_path")),
-        "NotebookEdit" => with_path("claude:write", "fs:write", field("notebook_path")),
-        "Bash" => {
+        "Edit" | "MultiEdit" | "Write" => write(field("file_path")),
+        "NotebookEdit" => write(field("notebook_path")),
+        // `Monitor` runs a shell command like `Bash` and gets the same scan.
+        // `PowerShell` is not POSIX shell: the scanner cannot analyze it, so
+        // the main session always needs approval. A `Monitor` without a
+        // command (a WebSocket source) is unanalyzable too.
+        "Bash" | "Monitor" | "PowerShell" => {
             let command = field("command").unwrap_or_default();
-            let parameters = match shell::scan(command) {
+            let scan = match tool_name {
+                "PowerShell" => shell::Scan::Unanalyzable("PowerShell is not analyzed"),
+                "Monitor" if field("command").is_none() => {
+                    shell::Scan::Unanalyzable("Monitor without a command")
+                }
+                _ => shell::scan(command),
+            };
+            let parameters = match scan {
                 shell::Scan::Analyzed(analysis) => {
                     let paths = command_paths(&analysis.paths, cwd, root);
                     json!({
@@ -502,7 +629,8 @@ fn classify(
 /// What the words of an analyzable command name, resolved against the root.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CommandPaths {
-    /// A word names `<root>/.claude` or `<root>/.git`, or something under it.
+    /// A word names a path under the root in `CLIENT_CONFIG_PATHS`
+    /// (`.claude`, `.git`, `.mcp.json`, ...), or something under one.
     protected: bool,
     /// A word names a path outside the root, its value is unknown (a `$`
     /// expansion, a leading `~`), or the command runs outside the root.
@@ -522,7 +650,6 @@ fn command_paths(words: &[shell::PathWord], cwd: Option<&str>, root: Option<&str
             leaves_root: true,
         };
     };
-    let protected_dirs = [format!("{root}/.claude"), format!("{root}/.git")];
     let base = cwd.unwrap_or(root);
     let base = match resolve_path(&normalize(base)) {
         (_, Some(resolved)) => resolved,
@@ -549,7 +676,7 @@ fn command_paths(words: &[shell::PathWord], cwd: Option<&str>, root: Option<&str
             }
         }
         for path in &seen {
-            found.protected |= protected_dirs.iter().any(|dir| within(path, dir));
+            found.protected |= client_config(path, root);
             found.leaves_root |= !word.program && !within(path, root);
         }
     }
@@ -573,6 +700,32 @@ fn normalize(path: &str) -> String {
         }
     }
     format!("/{}", parts.join("/"))
+}
+
+/// `path` (absolute, normalized) is under `root` and one of its components,
+/// or a run of them, is in `CLIENT_CONFIG_PATHS`, ignoring case.
+fn client_config(path: &str, root: &str) -> bool {
+    if !within(path, root) {
+        return false;
+    }
+    let relative = path[root.trim_end_matches('/').len()..].to_lowercase();
+    let parts: Vec<&str> = relative.split('/').filter(|p| !p.is_empty()).collect();
+    CLIENT_CONFIG_PATHS.iter().any(|entry| {
+        let entry: Vec<&str> = entry.split('/').collect();
+        parts
+            .windows(entry.len())
+            .any(|window| window == entry.as_slice())
+    })
+}
+
+/// [`client_config`], except under `<root>/.claude` and `<root>/.git`, which
+/// the governance and git-internals rules already decide.
+fn client_config_outside_governance(path: &str, root: &str) -> bool {
+    let lower = path.to_lowercase();
+    let governed = [".claude", ".git"]
+        .iter()
+        .any(|dir| within(&lower, &format!("{}/{dir}", root.to_lowercase())));
+    !governed && client_config(path, root)
 }
 
 /// `path` is `dir` or under it, by whole segments.
@@ -674,6 +827,9 @@ fn run_hook(directory: &Path) {
     // stderr is for people: invisible, bidi and control characters in tool
     // names and reasons are escaped (`praetore_core::display`).
     let shown = praetore_core::display::escape_for_display;
+    for warning in state_warnings(directory) {
+        eprintln!("PRÆTORE warning: {}", shown(&warning));
+    }
     if verdict.not_governed {
         eprintln!("PRÆTORE: {}", shown(&verdict.reason));
     }
@@ -806,7 +962,7 @@ fn action_type_of(tool_name: &str) -> String {
     match tool_name {
         "Read" | "Grep" | "Glob" => "claude:read".into(),
         "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => "claude:write".into(),
-        "Bash" => "claude:exec".into(),
+        "Bash" | "Monitor" | "PowerShell" => "claude:exec".into(),
         "WebFetch" | "WebSearch" => "claude:network".into(),
         "Agent" | "Task" => "claude:delegate".into(),
         // A name that is not a valid action type (surrounding whitespace,
@@ -832,7 +988,7 @@ fn load_policy(directory: &Path) -> Result<Policy, BoxError> {
     Policy::from_json(&String::from_utf8(read_bounded(&path)?)?).map_err(|error| {
         let hint = match error {
             PraetoreError::PolicyFormatUnsupported { found: 1, .. } => format!(
-                "; this state was written before G7 (policy format 1): migrate {} to format 2 (`praetore policy classify --policy {}` proposes the action_classes table) or run `praetore-claude-hook init` into a new directory",
+                "; this state was written before G7 (policy format 1): run `praetore-claude-hook init` into a new directory (recommended). Migrating {} to format 2 instead (`praetore policy classify --policy {}` proposes the action_classes table) keeps the authorities issued before, including process:execute for subagents (GHSA-wg33-3h8v-xvqw)",
                 path.display(),
                 path.display()
             ),
@@ -901,6 +1057,20 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     } else {
         UNREGISTERED
     };
+    // Defense in depth (GHSA-wg33-3h8v-xvqw): commands are reserved to the
+    // main session whatever an authority grants. A profile other than `main`
+    // that holds `process:execute` (state from an earlier `init`) is
+    // evaluated as `unregistered` for a command, so it is denied with a
+    // signed receipt. Without the capability the engine denies it anyway,
+    // signed by the profile's own key.
+    let exec_guard = profile_name != MAIN_AGENT
+        && action_type_of(&input.tool_name) == "claude:exec"
+        && profile_grants(directory, profile_name, "process:execute")?;
+    let profile_name = if exec_guard {
+        UNREGISTERED
+    } else {
+        profile_name
+    };
     let profile_path = directory
         .join(AGENTS_DIR)
         .join(format!("{profile_name}.json"));
@@ -941,16 +1111,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     )?)?)?;
     let engine = AuthorizationEngine::strict(policy, vec![pin])?;
 
-    let root_file = directory.join(PROJECT_ROOT_FILE);
-    let root = if root_file.exists() {
-        Some(
-            String::from_utf8(read_bounded(&root_file)?)?
-                .trim()
-                .to_string(),
-        )
-    } else {
-        input.cwd.clone()
-    };
+    let root = read_project_root(directory)?;
     let (action_type, capability, mut parameters, path_check) = classify(
         &input.tool_name,
         &input.tool_input,
@@ -1002,6 +1163,10 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         ),
         None if reserved => format!(
             "agent_type {agent:?} is reserved; evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
+        None if exec_guard => format!(
+            "commands are reserved to the main session, but the authority of profile {agent:?} grants process:execute (state from an earlier init: run `praetore-claude-hook init` into a new directory); evaluated as '{UNREGISTERED}': {}",
             evidence.decision.reason
         ),
         None => evidence.decision.reason.clone(),
@@ -1059,6 +1224,75 @@ fn deciding_rules(evidence: &Evidence) -> Option<String> {
         .map(|c| c.rule_id.as_str())
         .collect();
     (!rules.is_empty()).then(|| rules.join(", "))
+}
+
+/// Whether the issued authority of `profile` lists `capability`.
+fn profile_grants(directory: &Path, profile: &str, capability: &str) -> Result<bool, BoxError> {
+    let path = directory.join(AGENTS_DIR).join(format!("{profile}.json"));
+    let profile: AgentProfile = serde_json::from_slice(&read_bounded(&path)?)?;
+    Ok(profile.authority["capabilities"]
+        .as_array()
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some(capability))))
+}
+
+/// The project root recorded by `init`, or `None` for state written before
+/// it was recorded. A recorded root must be an absolute, canonical, existing
+/// directory other than `/`; anything else fails closed, because an empty or
+/// `/` root would make every path count as inside the project.
+fn read_project_root(directory: &Path) -> Result<Option<String>, BoxError> {
+    let path = directory.join(PROJECT_ROOT_FILE);
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let root = String::from_utf8(read_bounded(&path)?)?.trim().to_string();
+    let canonical = fs::canonicalize(&root).ok();
+    let valid = root.starts_with('/')
+        && root != "/"
+        && Path::new(&root).is_dir()
+        && canonical.as_deref() == Some(Path::new(&root));
+    if !valid {
+        return Err(format!(
+            "{} must name the project root as an absolute, canonical, existing directory other than /, found {root:?}; run `praetore-claude-hook init` into a new directory",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(root))
+}
+
+/// Warnings about state written by an earlier `init`, printed on stderr by
+/// every hook run: no recorded project root, or a profile other than `main`
+/// whose authority grants `process:execute`.
+fn state_warnings(directory: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if fs::symlink_metadata(directory.join(PROJECT_ROOT_FILE)).is_err() {
+        warnings.push(format!(
+            "{} has no {PROJECT_ROOT_FILE}: it predates GHSA-wg33-3h8v-xvqw. Run `praetore-claude-hook init` into a new directory",
+            directory.display()
+        ));
+    }
+    let mut profiles: Vec<String> = fs::read_dir(directory.join(AGENTS_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .filter(|name| name != MAIN_AGENT)
+        .collect();
+    profiles.sort();
+    for profile in profiles {
+        if profile_grants(directory, &profile, "process:execute").unwrap_or(false) {
+            warnings.push(format!(
+                "profile '{profile}' holds process:execute; the hook denies it commands, but run `praetore-claude-hook init` into a new directory to re-issue it (GHSA-wg33-3h8v-xvqw)"
+            ));
+        }
+    }
+    warnings
 }
 
 fn denied(reason: String) -> Verdict {

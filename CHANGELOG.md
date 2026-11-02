@@ -18,7 +18,20 @@
   `approval-command-uses-network`). `init` writes the root to
   `project-root` in the state directory. The README documents running
   `Bash` under Claude Code's sandbox. Receipt format unchanged; committed
-  evidence not regenerated.
+  evidence not regenerated (`bundle/` predates the change).
+- **Claude Code hook example: client configuration is protected from
+  subagent writes** (GHSA-wg33-3h8v-xvqw). Writes to the project paths Claude
+  Code lists as protected in its permission modes (`.mcp.json`, `.vscode/`,
+  `.cargo/`, `.husky/`, `.envrc`, shell startup files, and the rest of that
+  list) are denied to every profile except `main`
+  (`deny-subagent-client-config-writes`), and `main` needs approval
+  (`approval-main-client-config-writes`); the `Bash` scan flags the same
+  paths. The hook also denies commands (`claude:exec`) to every profile
+  except `main` whatever its authority grants, warns on stderr about state
+  without `project-root` or with a subagent holding `process:execute`, fails
+  closed on an invalid `project-root`, and maps `Monitor` and `PowerShell` to
+  `claude:exec` (`PowerShell` is never analyzed, so `main` needs approval).
+  The format-1 policy error now recommends a fresh `init`.
 
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
