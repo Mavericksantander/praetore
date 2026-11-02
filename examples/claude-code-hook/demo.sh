@@ -33,17 +33,20 @@ ln -s /etc "$PROJECT/enlace-afuera"
 
 step "3. Pasar tool calls por el hook (mismo wrapper que usa Claude Code)"
 export CLAUDE_PROJECT_DIR="$PROJECT" PRAETORE_HOOK_BIN="$BIN"
+CALLS=0
 call() {
   local agent="$1" tool="$2" input="$3"
+  # Un tool_use_id distinto por llamada, como en Claude Code (va firmado).
+  CALLS=$((CALLS + 1))
   python3 -c '
 import json, sys
-agent, tool, tool_input, cwd = sys.argv[1:]
+agent, tool, tool_input, cwd, number = sys.argv[1:]
 event = {"hook_event_name": "PreToolUse", "tool_name": tool,
          "tool_input": json.loads(tool_input), "cwd": cwd,
-         "tool_use_id": "demo"}
+         "tool_use_id": f"toolu_demo_{int(number):02d}"}
 if agent != "main":
     event["agent_type"] = agent
-print(json.dumps(event))' "$agent" "$tool" "$input" "$PROJECT" |
+print(json.dumps(event))' "$agent" "$tool" "$input" "$PROJECT" "$CALLS" |
     "$HERE/hook/praetore-hook.sh" |
     python3 -c '
 import json, sys
@@ -84,4 +87,16 @@ step "4. Verificar los recibos con el propio hook y exportar el bundle"
 "$BIN" verify "$STATE"
 rm -rf "$OUT"
 "$BIN" export "$STATE" "$OUT"
-echo "Bundle en $OUT. Verifícalo con: ./examples/claude-code-hook/verify.sh"
+
+step "5. Comprobar que cada recibo es HighAssurance (hora de decisión firmada)"
+python3 -I - "$OUT" <<'PY'
+import json, pathlib, sys
+receipts = sorted(pathlib.Path(sys.argv[1], "evidence").glob("*.json"))
+missing = [r.name for r in receipts
+           if json.loads(r.read_text()).get("evaluation_mode") != "high_assurance"
+           or not json.loads(r.read_text()).get("decided_at")]
+if not receipts or missing:
+    sys.exit(f"recibos sin decided_at: {missing or 'ninguno exportado'}")
+print(f"OK: {len(receipts)} recibos HighAssurance, todos con decided_at")
+PY
+echo "Bundle en $OUT. Verifícalo con: ./examples/claude-code-hook/verify.sh $OUT --require-decision-time"

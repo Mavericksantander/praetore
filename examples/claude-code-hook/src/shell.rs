@@ -5,8 +5,8 @@
 //! executes or expands anything. Whatever it cannot reason about lexically
 //! (command substitution, process substitution, heredocs, `eval`, a shell's
 //! `-c`, a variable in command position or next to `push`, an inline git
-//! alias) makes the command unanalyzable, which the policy treats as
-//! requiring approval. False positives such as `echo git push` are accepted.
+//! alias) makes the command unanalyzable, which the policy denies. False
+//! positives such as `echo git push` are accepted.
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Scan {

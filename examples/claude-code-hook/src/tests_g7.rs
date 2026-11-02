@@ -162,7 +162,7 @@ fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
     );
     verify_receipts(&s.state).unwrap();
 
-    // Same client text as a DENY decided by a rule (here: no capability).
+    // The client text names the reason class only, never a rule.
     let output = hook_output(&verdict).unwrap();
     let text = output["hookSpecificOutput"]["permissionDecisionReason"]
         .as_str()
@@ -170,7 +170,7 @@ fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
     assert_eq!(
         text,
         format!(
-            "PRÆTORE denied this tool call (evidence {})",
+            "PRÆTORE denied this tool call: unclassified (evidence {})",
             evidence.evidence_id
         )
     );
@@ -180,7 +180,7 @@ fn undeclared_safety_tool_gets_a_signed_unclassified_deny() {
         .unwrap()
         .to_owned();
     assert_eq!(ruled.outcome, DecisionOutcome::Deny);
-    assert!(ruled_text.starts_with("PRÆTORE denied this tool call (evidence "));
+    assert!(ruled_text.starts_with("PRÆTORE denied this tool call: path (evidence "));
     assert!(!ruled_text.contains("rule"), "{ruled_text}");
 }
 

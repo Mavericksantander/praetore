@@ -16,10 +16,10 @@ index fb4f619..3aced84 100644
  
  impl SafetyAction {
 diff --git a/examples/claude-code-hook/src/main.rs b/examples/claude-code-hook/src/main.rs
-index ea658cf..b3f39d4 100644
+index 060e47c..3cf170e 100644
 --- a/examples/claude-code-hook/src/main.rs
 +++ b/examples/claude-code-hook/src/main.rs
-@@ -700,28 +700,8 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+@@ -786,29 +786,8 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
      // a receipt is appended. A safety action gets no decision from PRÆTORE,
      // so a PRÆTORE failure after this point cannot hold it.
      let policy = load_policy(directory)?;
@@ -37,6 +37,7 @@ index ea658cf..b3f39d4 100644
 -                ),
 -                not_governed: true,
 -                evidence_id: None,
+-                deny_class: None,
 -            });
 -        }
 -        // Not declared: the engine refuses it with a signed DENY (engine
@@ -50,12 +51,12 @@ index ea658cf..b3f39d4 100644
      // Only the absence of `agent_type` is the main session. An explicit
      // `main` (a subagent defined with `name: main`) or `unregistered` is a
      // reserved name and is evaluated as `unregistered`.
-@@ -820,7 +800,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
-         request.sign_intent(&key)?;
+@@ -913,7 +892,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
+         sign_intent(&mut request, &key, engine.policy())?;
          engine.refuse_unclassified(request)?
      } else {
 -        let action = engine.policy().classify(action)?.into_mission()?;
 +        let action = praetore_core::MissionAction::mutant_unclassified(action);
          let mut request = context.apply(AuthorizationRequest::new(identity, authority, action)?);
-         request.sign_intent(&key)?;
+         sign_intent(&mut request, &key, engine.policy())?;
          engine.evaluate(request)?

@@ -18,10 +18,68 @@ agente haga por otro camino queda fuera (ver Límites).
 - Por cada tool call, el hook arma un `AuthorizationRequest` firmado con la
   clave del perfil (con `praetore.agent_profile` en los parámetros, que el
   motor exige contra la autoridad, y `agent_id`/`session_id` de Claude Code
-  en el contexto firmado si llegan), lo evalúa con un motor `strict` contra
-  una policy v2 que
-  por defecto niega, firma la evidencia con el atestador y la agrega a
-  `receipts.jsonl`.
+  en el contexto firmado si llegan), lo evalúa con un motor
+  **HighAssurance** (`AuthorizationEngine::production`) contra una policy v2
+  que por defecto niega; el motor firma la evidencia con el atestador y el
+  hook la agrega a `receipts.jsonl`.
+- **Recibos HighAssurance.** Cada recibo registra su hora de decisión
+  firmada (`decided_at`): `praetore-verify evidence --issuer-pins` verifica
+  la autoridad y el pin del emisor a esa hora, y con
+  `--require-decision-time` rechaza los recibos que no la tienen. La
+  intención va firmada (v2) para la audiencia `praetore-claude-hook`, bajo el
+  digest de la policy cargada, y vale 60 s. Freshness es local: no hay fuente
+  de revocación (la clave del emisor se descarta en `init`), así que da una
+  lease de 60 s y no detecta revocaciones; para reemplazar las autoridades
+  hay que hacer otro `init`.
+- **Guard de replay durable.** `init` crea `<estado>/replay/`. Cada request
+  firmado que el motor evalúa reclama un archivo
+  `replay/<tenant>/<agent id>/<request id>` creado con `create_new`
+  (`O_CREAT|O_EXCL`): de varios procesos que crean el mismo nombre, el kernel
+  deja ganar a uno solo. Lo que garantiza: el claim de un request firmado
+  queda registrado una sola vez y ese request no se evalúa de nuevo, así que
+  no se puede reusar un request firmado para obtener otro recibo. **No
+  deduplica invocaciones:** cada invocación del hook arma un request nuevo
+  (con su propio `request_id`), así que la misma tool call entregada dos
+  veces se evalúa dos veces y da dos recibos, cada uno una decisión real del
+  motor. El hook firma el `tool_use_id` de Claude Code en el contexto del
+  recibo (`claude.tool_use_id`, string o número de hasta 128 bytes). Uno
+  más largo o de otro tipo JSON se evalúa como `unregistered` y se niega con
+  recibo, que registra en `praetore.claim_rejected` la clave y el largo o el
+  tipo, nunca el valor. Uno ausente o vacío no se registra, y la ausencia
+  queda cubierta por la firma. La línea de `receipts.jsonl` lleva una copia
+  sin firmar del `tool_use_id` solo si el recibo lo firma; `verify` y
+  `export` rechazan una copia sin firmar en un recibo HighAssurance que no
+  firma ninguno, y `export` toma el valor solo del contexto firmado.
+  `verify` avisa, sin fallar, de los `tool_use_id` que aparecen en más de un
+  recibo (cuántos y cuáles) y cuenta los recibos sin `tool_use_id`.
+  El archivo y sus directorios se sincronizan a disco (`fsync`) antes de dar
+  el claim por hecho, y nunca se borran. En cada claim el hook exige que
+  `replay/` sea un directorio real del usuario actual, sin ningún bit de
+  grupo u otros y, en macOS, sin entradas de ACL extendida; y que el
+  directorio de estado sea del usuario actual y no tenga escritura para grupo
+  u otros. Cualquier error (directorio ausente o reemplazado, symlink, dueño
+  o permisos incorrectos, ACL, disco lleno, fallo de `fsync`) niega la tool
+  call sin recibo. El estado debe estar en un sistema de archivos local con
+  create exclusivo atómico: no en NFS ni en una carpeta sincronizada (por
+  ejemplo, Escritorio y Documentos en iCloud). En macOS, `~` y `~/Desktop`
+  traen de fábrica una ACL (`group:everyone deny delete`, sin herencia):
+  el estado no puede ser esa carpeta misma, pero sí un subdirectorio (por
+  ejemplo `<proyecto>/.claude/praetore`). `ls -lde <estado>` muestra si el
+  directorio tiene ACL.
+- **El recibo se sincroniza a disco** (`fsync` de `receipts.jsonl` en cada
+  append, y de su directorio al crearlo) antes de que el hook responda. Si
+  escribirlo falla, el hook niega la tool call; el claim de replay ya hecho
+  queda sin recibo. `replay/` no es un registro de decisiones: puede tener
+  claims huérfanos, que no bloquean nada porque su `request_id` no se
+  reutiliza. Al revés también puede pasar: si la línea se escribe pero el
+  `fsync` falla, el hook niega la tool call y aun así puede quedar un recibo
+  (incluso un Allow) de una llamada que se negó por error de E/S.
+- **Un estado anterior a los recibos HighAssurance falla cerrado.** Si
+  `<estado>/replay/` no existe, el hook niega cada tool call gobernada con un
+  mensaje que pide correr `praetore-claude-hook init` en un directorio nuevo
+  (mismo patrón que el chequeo de SAF-14). Las tools `Safety` declaradas
+  siguen sin recibir decisión. Los recibos ya escritos siguen verificando con
+  `verify`.
 - `Deny` → la tool call se bloquea. `RequireApproval` → Claude Code le
   pregunta al usuario. `Allow` → el hook no decide y siguen aplicando los
   permisos propios de Claude Code.
@@ -35,9 +93,15 @@ agente haga por otro camino queda fuera (ver Límites).
   retiene. Una tool `safety:*` no declarada se niega con un DENY firmado
   (motivo `unclassified`, guard `unclassified_action`) que se agrega a
   `receipts.jsonl`; el motor verifica la solicitud igual que una de misión y
-  no evalúa reglas. Todo DENY con recibo se muestra con el mismo texto,
-  `PRÆTORE denied this tool call (evidence ...)`; la regla y el motivo van a
-  stderr y al recibo firmado. La policy por defecto declara `Mission`
+  no evalúa reglas. Todo DENY con recibo se muestra (al modelo y en stderr)
+  solo con su clase de motivo y el id de evidencia,
+  `PRÆTORE denied this tool call: <clase> (evidence ...)`, nunca con el id ni
+  el texto de la regla, que quedan en el recibo firmado. Clases:
+  `capability` (la autoridad no da lo que hace falta), `path` (una regla o
+  el default deny; en la policy por defecto todas son de ruta),
+  `unregistered`, `unclassified` y
+  `unanalyzable_command, use simple commands`. Un `RequireApproval` muestra
+  la regla, el motivo y también `(evidence ...)`. La policy por defecto declara `Mission`
   los tipos `claude:*` y ninguna acción `Safety`.
 - **Migrar la policy antes de actualizar el binario.** Un estado creado
   antes de G7 tiene una policy de formato 1; con el binario nuevo esa policy
@@ -80,7 +144,9 @@ Reglas de la policy por defecto:
   pero con aprobación.
 - Nadie escribe en `<raíz>/.git`.
 - `git push` requiere aprobación (ver abajo cómo se detecta).
-- Un comando que no se puede analizar requiere aprobación.
+- Un comando que no se puede analizar se niega (regla
+  `deny-unanalyzable-command`, con recibo firmado); el mensaje dice
+  `unanalyzable_command, use simple commands`.
 - Los subagentes leen y escriben solo dentro de la raíz del proyecto, con la
   ruta ya resuelta (un symlink que sale de la raíz no cuenta como dentro). La
   sesión principal además lee en cualquier lugar y escribe en
@@ -119,7 +185,7 @@ Detecta `cd x && git push`, `sudo git push`, `/usr/bin/git push` y
 `git -C ../repo push`. Nunca ejecuta ni expande nada.
 
 Si el comando contiene algo que no puede analizar léxicamente, lo marca como
-no analizable y la policy pide aprobación: sustitución de comandos (`$(...)`,
+no analizable y la policy lo niega: sustitución de comandos (`$(...)`,
 backticks), sustitución de procesos, heredocs, `eval`, `sh -c` / `bash -c`,
 una variable en posición de comando o junto a `push`, o un alias inline
 (`git -c alias.x=push x`). Acepta falsos positivos como `echo git push`.
@@ -129,9 +195,15 @@ una variable en posición de comando o junto a `push`, o un alias inline
 Desde la raíz de un clon:
 
 ```sh
-./examples/claude-code-hook/demo.sh     # regenera bundle/ con 22 tool calls fijas
+./examples/claude-code-hook/demo.sh /tmp/bundle-ha   # 22 tool calls fijas, recibos HighAssurance
+./examples/claude-code-hook/verify.sh /tmp/bundle-ha --require-decision-time
 ./examples/claude-code-hook/verify.sh   # verifica bundle/ solo con praetore-verify
 ```
+
+`demo.sh` sin argumento reemplaza `bundle/`. El `bundle/` del repositorio se
+generó antes de los recibos HighAssurance: no tiene `decided_at` y con
+`--require-decision-time` falla (`DECISION_TIME_MISSING`), lo esperado. Sin
+la opción sigue verificando como antes.
 
 `verify.sh` hace lo siguiente, sobre una copia del bundle que toma al
 empezar (verifica y atribuye los mismos bytes, aunque el original cambie
@@ -187,8 +259,13 @@ estado. Para exportar los recibos de una sesión real y verificarlos:
 
 ```sh
 <proyecto>/.claude/bin/praetore-claude-hook export <proyecto>/.claude/praetore <bundle>
-./examples/claude-code-hook/verify.sh <bundle>
+./examples/claude-code-hook/verify.sh <bundle> --require-decision-time
 ```
+
+Un estado creado con un binario anterior no tiene `replay/` y el hook nuevo
+lo rechaza: hay que hacer `init` en un directorio nuevo. Cómo grabar los sets
+de evidencia 04 y 05 con el hook HighAssurance:
+[evidence/VERIFY.md](evidence/VERIFY.md#7-recording-new-sets-04-and-05-highassurance).
 
 Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
 `coder` (sonnet) y `explorer` (haiku, solo lectura).
@@ -241,3 +318,12 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
   ruta. Hay que usar rutas resueltas.
 - **Raíz fija.** La raíz de la policy es la ruta absoluta dada en `init`.
   Mover el proyecto exige otro `init`.
+- **El estado del hook y los procesos del mismo usuario.** Las operaciones
+  sobre el estado van por ruta, no relativas a un descriptor de directorio:
+  los chequeos de symlink, dueño, permisos y ACL valen en el momento en que
+  corren. Un proceso del mismo usuario está dentro del perímetro de
+  confianza: ya puede leer las claves de los agentes y del atestador en el
+  estado. Lo que puede hacer con `replay/` (borrarlo, reemplazarlo, llenar el
+  disco) hace que el hook niegue, no que permita: esos errores fallan
+  cerrado. Tampoco hay que fiarse de `decided_at` más que de la clave del
+  atestador: quien la tenga puede firmar cualquier `decided_at`.

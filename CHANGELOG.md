@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+- **Claude Code hook example: HighAssurance receipts.**
+  `examples/claude-code-hook` now evaluates with
+  `AuthorizationEngine::production` (HighAssurance) instead of `strict`.
+  Every receipt it writes, the `unclassified` DENY included, records the
+  engine's signed decision time (`decided_at`), so `praetore-verify evidence
+  --issuer-pins` checks the authority and the issuer pin at that instant and
+  `--require-decision-time` accepts it. Intents are signed v2 for the
+  audience `praetore-claude-hook`, valid for 60 s. The replay guard is a
+  durable local claim store in the hook state (`replay/`): one file per
+  request, created with `create_new` (`O_CREAT|O_EXCL`) and `fsync`ed with
+  its directories; on every claim the store must be a real directory owned
+  by the current user with no group/other bits and (macOS) no extended ACL
+  entries, and the state directory must be owned by the user and not
+  group/other-writable; any store error denies without a receipt. The guard
+  records each signed request's claim once; it does not deduplicate tool
+  calls (each invocation builds a new request). `receipts.jsonl` is now
+  `fsync`ed after each append (and its directory on creation); a claim can
+  remain without a receipt when that write fails, and the call is denied.
+  Each receipt signs Claude Code's `tool_use_id` (`claude.tool_use_id`, a
+  string or number up to 128 bytes; a longer one or another JSON type is
+  evaluated as `unregistered` and recorded only as `praetore.claim_rejected`;
+  a missing one is not recorded). The `receipts.jsonl` line carries an
+  unsigned copy only when the receipt signs one; `verify` and `export`
+  refuse an unsigned copy on a HighAssurance receipt that signs none, and
+  `export` takes it only from the signed context. Unparseable hook input is
+  denied with a fixed message that does not quote input values. The guard does not forge receipts and does not
+  deduplicate invocations: a re-delivered tool call is evaluated again, and
+  the hook's `verify` warns (without failing) about `tool_use_id`s signed in
+  more than one receipt. An unanalyzable shell command is now denied (rule
+  `deny-unanalyzable-command`, signed receipt) instead of held for approval.
+  A DENY with a receipt shows only its reason class (`capability`, `path`,
+  `unregistered`, `unclassified`, `unanalyzable_command, use simple
+  commands`) and the evidence id, never the rule id or text; a
+  RequireApproval message also includes the evidence id.
+  Freshness is
+  local (60 s lease, no revocation source). `init` creates `replay/`; state
+  created before this change has none and is refused with a message that
+  points to `init` (same pattern as the SAF-14 check). Profiles and
+  per-agent keys (SAF-14), G7 classification and declared Safety tools
+  (no decision, no receipt) are unchanged, and so is the receipt format.
+  The hook's `verify` checks the authority at `decided_at` when a receipt
+  records it. `verify.sh` takes `--require-decision-time`; `demo.sh` checks
+  that the bundle it regenerates is HighAssurance. The committed `bundle/`
+  and sets 03, 04 and 05 are unchanged and verify as before (they fail
+  `--require-decision-time`, as expected). `evidence/VERIFY.md` section 7
+  describes how to record new sets 04 and 05 with this hook. The G7 hook
+  mutant (`scripts/g7-mutants/hook.patch`) is rebased onto the new code.
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without
