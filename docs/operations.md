@@ -338,6 +338,78 @@ amenaza: PostgreSQL journal schema", and GHSA-67vm-x598-vhg3). Some managed
 platforms install such state. Each relaxation is an explicit allowlist, off
 by default, logged at startup and reported by `praetore doctor`:
 
+`PRAETORE_SCHEMA_OWNER` (one exact role name, optional) is not a relaxation
+but a pin: the role that must own the `praetore` schema. When it is set,
+`verify_runtime_role` refuses a schema owned by any other role (or no
+schema), and migrating refuses a schema owned by another role or, when there
+is no schema yet, a migrating role with another name (the schema it creates
+is its own). Without it, the runtime check trusts whichever role owns
+`praetore`, and the structure is compared with the migrations only when
+migrating: a role with CREATE on the database that creates and migrates
+`praetore` before the first legitimate migration would pass a runtime-only
+startup (the next legitimate `migrate` refuses it). **Set it in production**,
+in the gateway, the CLI and `praetore-observe`, to the owner role of the
+migration step (each of them logs a warning while it is unset).
+
+With a NOLOGIN owner group, install in this order (the first migration needs
+the variable already set, so that the schema is created owned by the group):
+
+1. As the database owner or a superuser: create the group `praetore_owner`
+   (NOLOGIN) and the migrating login `praetore_migrator`, `GRANT praetore_owner
+   TO praetore_migrator`, and `GRANT CREATE ON DATABASE <db> TO
+   praetore_migrator, praetore_owner` (the migrating role creates the schema
+   and the scratch schemas of the structure check; the migrations, which run
+   as the group, start with `CREATE SCHEMA IF NOT EXISTS`). Grant the
+   membership with its defaults (`WITH INHERIT TRUE, SET TRUE`), and do not
+   make the migrating role NOINHERIT: it must both `SET ROLE` to the group
+   and use its privileges. Unless the group has CREATEROLE, also create
+   `CREATE ROLE praetore_runtime NOLOGIN` (migration 0011, which runs as the
+   group, otherwise creates it). Do not create the `praetore` schema
+   yourself: a schema without migration records is treated as a legacy
+   baseline.
+2. Set `PRAETORE_SCHEMA_OWNER=praetore_owner` for the migration step and
+   migrate as `praetore_migrator`. With no schema yet, the runner accepts a
+   migrating role that is the named role or a member of it, provided that a
+   named role other than the migrating role is NOLOGIN; it creates `praetore`
+   with `AUTHORIZATION praetore_owner` and runs every migration as the group
+   (`SET LOCAL ROLE`), so the schema and all its objects belong to the group.
+   Before anything is created, the runner refuses (`MigrationError::
+   SchemaOwner`, naming the problem) a role the migrating role is not a
+   member of, a membership without SET (PostgreSQL 16+) or without INHERIT
+   (or a NOINHERIT migrating role), a LOGIN role, a role that does not
+   exist, a predefined `pg_*` role, the bootstrap superuser, and a missing
+   CREATE privilege on the database; and, if `praetore_runtime` does not
+   exist and the group cannot create it, it refuses with
+   `MigrationError::RuntimeGroupMissing` before migration 0001. The owner is
+   checked again inside the transaction that creates or adopts the schema.
+3. Set `PRAETORE_SCHEMA_OWNER=praetore_owner` and
+   `PRAETORE_SCHEMA_OWNER_MEMBERS=praetore_migrator` for the gateway, the CLI
+   and `praetore-observe`: the runtime check refuses any member of the owner
+   that is not listed.
+
+A database already migrated without the variable keeps its owner: set the
+variable to that owner (or move ownership first, then set it). This is also
+the only case in which the bootstrap superuser may be named: a legacy schema
+it already owns. A new schema is never created under the pin for it.
+
+The owner group, each of its members (the roles in
+`PRAETORE_SCHEMA_OWNER_MEMBERS`) and the group's CREATE privilege on the
+database are inside the trust perimeter: a member can act as the owner (for
+example `SET ROLE` to the group and `ALTER TABLE ... NO FORCE ROW LEVEL
+SECURITY`), and CREATE on the database allows installing trusted extensions.
+
+A role with CREATE on the database can, since PostgreSQL 13, install a
+trusted extension (`hstore`, `citext`, `pgcrypto`, ...) into any schema,
+`praetore` included, without CREATE on that schema; the extension's objects
+are then owned by the bootstrap superuser. The migrations create no
+extension objects, so both the runtime check and the migration runner refuse
+an extension installed in `praetore`, any object in `praetore` that belongs
+to an extension (`pg_depend` deptype `e`), and any object in `praetore`
+marked `DEPENDS ON EXTENSION` (deptype `x`), which `DROP EXTENSION` would
+drop with the extension, at the request of whoever owns it; the errors name
+them. Grant CREATE
+on the database only to the roles that run migrations.
+
 - `PRAETORE_RUNTIME_LOGINS` (comma-separated login roles): the logins allowed
   to be members of `praetore_runtime`. Without it, other login members are
   only reported. **Set it in production**, so that a login added to
@@ -356,8 +428,22 @@ by default, logged at startup and reported by `praetore doctor`:
   if the trigger and its function are owned by superusers, the function is
   not in `praetore`, and neither owner is, belongs to, or has as member the
   `praetore` owner or the migrating role; otherwise migrating fails with an
-  error naming the trigger. A listed event trigger runs with its function
-  owner's privileges during every migration DDL.
+  error naming the trigger. A listed event trigger fires on every migration
+  DDL, in the migrating session. Its function runs with the privileges of
+  the role that executes that DDL (the migrating role, or the `praetore`
+  owner when the runner switches to a NOLOGIN owner group with `SET LOCAL
+  ROLE`), not with its owner's, unless it is `SECURITY DEFINER`, in which
+  case it runs with its owner's. PostgreSQL documents that a function
+  "is to be executed with the privileges of the user that calls it" unless it
+  is `SECURITY DEFINER` (`CREATE FUNCTION`), and its event-trigger chapter
+  names no other identity; the test
+  `postgres_migrations_trusted_event_triggers_allowlist` records
+  `session_user = current_user =` the migrating role for every firing of a
+  superuser-owned trigger function. The check verifies owners only, not
+  what the function calls: list only triggers whose code does not depend on
+  objects that other roles can change (functions of other owners, or
+  unqualified names resolved through a `search_path` with a writable
+  schema), because that code would run with the migrating role's rights.
 - `PRAETORE_TRUSTED_DEFAULT_PRIVILEGES` (semicolon-separated
   `role:*:objtype`, objtype `r`, `S`, `f`, `T` or `n`): global default
   privileges of the `praetore` owner or the migrating role that only revoke
@@ -441,6 +527,19 @@ attester key to decisions made before a given date. An OK therefore proves
 that the authority was valid at the signed decision time only as far as the
 attester key is trusted; if an attester key is retired after compromise,
 treat every receipt it signed as unverified.
+
+Journal exports across an attester key rotation: storage records (such as
+the adoption record of a legacy baseline) and receipts keep the signature of
+the key that was current when they were written, and are never re-signed.
+`praetore journal-export` and `praetore-verify journal` therefore take
+`--attester-pin` more than once; pass the retired key's pin together with the
+current one. With only the current pin, exporting any chain of a database
+adopted before the rotation fails, naming the key that signed the adoption
+record. Pinning a retired key keeps accepting everything it signed. After a
+compromise, treat what that key signed as unverified and do not pin it; the
+export of a database whose adoption record it signed then fails, because
+`journal-export --tenant` verifies that record before it references the
+database head (`docs/proposals/journal-chain-jsonl.md`).
 
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins

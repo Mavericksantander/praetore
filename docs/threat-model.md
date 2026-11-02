@@ -226,7 +226,12 @@ inside an untrusted database cannot prove that database trustworthy.
 
 **Inside the trust perimeter.** For the privileges on the `praetore` schema,
 the **owner of the `praetore` schema and its objects, the owner of the
-database, and every superuser are trusted**. They can change any object,
+database, and every superuser are trusted**. When the owner is a NOLOGIN
+group (`PRAETORE_SCHEMA_OWNER`), the group, every member of it (the roles
+in `PRAETORE_SCHEMA_OWNER_MEMBERS`, which can `SET ROLE` to it and, for
+example, turn off forced row-level security) and the group's CREATE
+privilege on the database (which allows installing trusted extensions) are
+inside the perimeter too. They can change any object,
 row, grant or catalog entry after the checks run, or edit the system
 catalogs directly. The checks do not defend against a malicious owner or
 superuser.
@@ -247,7 +252,14 @@ superuser.
   `praetore`; SECURITY DEFINER functions with the owner's rights that a
   role other than their owner may execute (unless listed explicitly).
   Whoever can execute an allowlisted function acts with its owner's
-  privileges.
+  privileges. Extensions installed in `praetore`, objects in `praetore`
+  that belong to an extension (a role with CREATE on the database can
+  install a trusted extension into any schema), and objects in `praetore`
+  marked `DEPENDS ON EXTENSION`, which the extension's owner could drop.
+- With `PRAETORE_SCHEMA_OWNER` set: a `praetore` schema owned by another
+  role, at runtime and when migrating. Without it, `verify_runtime_role`
+  trusts whichever role owns `praetore` and does not compare its structure
+  with the migrations; that comparison runs only in `apply_migrations`.
 - On every `apply_migrations`: the environment (event triggers, default
   privileges, owner memberships, settings) and the structure of `praetore`
   compared with a scratch apply of the recorded migrations; adopting a

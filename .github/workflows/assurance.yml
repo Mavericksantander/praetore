@@ -330,6 +330,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p praetore-replay-postgres --locked
+      - name: Missing praetore_runtime is refused up front (runs first, before any test creates the role)
+        run: |
+          set -euo pipefail
+          output="$(cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_migrations_refuse_a_missing_runtime_group_up_front --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::the test did not run"; exit 1; }
+          grep -q "RUNTIME_GROUP_ABSENT_CHECKED" <<<"$output" || { echo "::error::praetore_runtime already existed; the check did not run"; exit 1; }
       - name: journal-export against PostgreSQL (RLS as the runtime role, order, CLI end to end)
         run: |
           set -euo pipefail
@@ -342,11 +349,26 @@ jobs:
             "--bin praetore journal_export::tests::postgres_export_as_runtime_role_is_confined_by_row_level_security" \
             "--bin praetore journal_export::tests::postgres_export_orders_by_created_at_then_request_id_then_agent_id" \
             "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end" \
+            "--test journal_export_postgres postgres_cli_journal_export_after_attester_key_rotation" \
+            "--test journal_export_postgres postgres_cli_run_reports_a_port_in_use" \
             "--bin praetore journal_export::tests::postgres_database_export_and_tenant_reference" \
             "--bin praetore tests::postgres_find_pending_agent_ignores_hostile_search_path"; do
             read -r flag target name <<<"$test"
             echo "::group::$name"
             output="$(cargo test -p praetore-cli --locked "$flag" "$target" -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          done
+      - name: Services report a port in use (praetore-gateway-demo, praetore-observe)
+        run: |
+          set -euo pipefail
+          for test in \
+            "praetore-gateway-service postgres_gateway_service_reports_a_port_in_use" \
+            "praetore-observe postgres_observe_reports_a_port_in_use"; do
+            read -r package name <<<"$test"
+            echo "::group::$name"
+            output="$(cargo test -p "$package" --locked --test port_in_use -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
             echo "$output"
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
@@ -422,6 +444,9 @@ jobs:
             postgres_migrations_adoption_writes_a_signed_append_only_storage_record \
             postgres_migrations_adoption_without_signer_is_refused \
             postgres_migrations_trusted_event_triggers_allowlist \
+            postgres_extension_objects_in_praetore_are_refused \
+            postgres_schema_owner_is_pinned_by_praetore_schema_owner \
+            postgres_schema_owner_group_performs_the_first_migration \
             postgres_migrations_trusted_default_privileges_allowlist \
             postgres_runtime_role_refuses_foreign_dependencies \
             postgres_documented_observe_grant_supports_list \

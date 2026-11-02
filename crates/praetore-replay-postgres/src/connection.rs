@@ -408,6 +408,19 @@ pub enum RuntimeRoleError {
     ExternalDependent(String),
     /// A runtime option could not be applied.
     InvalidConfiguration(String),
+    /// `PRAETORE_SCHEMA_OWNER` names a role, and the `praetore` schema is
+    /// owned by another one (or does not exist).
+    UnexpectedSchemaOwner {
+        expected: String,
+        actual: Option<String>,
+    },
+    /// An extension is installed in `praetore`, or an object in `praetore`
+    /// belongs to an extension (`pg_depend` deptype `e`) or depends on one
+    /// (`DEPENDS ON EXTENSION`, deptype `x`). Since PostgreSQL
+    /// 13, a role with CREATE on the database can install a trusted
+    /// extension into any schema; its objects are owned by the bootstrap
+    /// superuser.
+    ExtensionObjects(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -456,6 +469,23 @@ impl fmt::Display for RuntimeRoleError {
             Self::InvalidConfiguration(reason) => {
                 write!(f, "invalid runtime role configuration: {reason}")
             }
+            Self::UnexpectedSchemaOwner { expected, actual } => match actual {
+                Some(actual) => write!(
+                    f,
+                    "schema praetore is owned by {actual}, but {} is {expected}",
+                    RuntimeRoleOptions::SCHEMA_OWNER_ENV
+                ),
+                None => write!(
+                    f,
+                    "schema praetore does not exist ({} is {expected})",
+                    RuntimeRoleOptions::SCHEMA_OWNER_ENV
+                ),
+            },
+            Self::ExtensionObjects(objects) => write!(
+                f,
+                "extension objects are in schema praetore (members of an extension, or marked \
+                 DEPENDS ON EXTENSION), which only its migrations may populate: {objects}"
+            ),
             Self::UnexpectedGrant(grants) => write!(
                 f,
                 "praetore objects carry grants the migrations do not make: {grants}"
@@ -514,6 +544,7 @@ pub struct RuntimeRoleOptions {
     trusted_security_definer: Vec<String>,
     runtime_logins: Vec<String>,
     schema_owner_members: Vec<String>,
+    schema_owner: Option<String>,
 }
 
 impl RuntimeRoleOptions {
@@ -585,6 +616,25 @@ impl RuntimeRoleOptions {
         self
     }
 
+    /// Environment variable for `with_schema_owner` (one exact role name).
+    pub const SCHEMA_OWNER_ENV: &'static str = "PRAETORE_SCHEMA_OWNER";
+
+    /// The role that must own the `praetore` schema (exact name, trimmed;
+    /// empty means unset). When set, a schema owned by any other role, or
+    /// no schema, is refused. Without it the runtime trusts whichever role
+    /// owns `praetore`: the structure is compared with the migrations only
+    /// when migrating.
+    pub fn with_schema_owner(mut self, value: &str) -> Self {
+        let value = value.trim();
+        self.schema_owner = (!value.is_empty()).then(|| value.to_owned());
+        self
+    }
+
+    /// The configured schema owner, for the startup log.
+    pub fn schema_owner(&self) -> Option<&str> {
+        self.schema_owner.as_deref()
+    }
+
     /// The trusted SECURITY DEFINER functions, for the startup log.
     pub fn trusted_security_definer(&self) -> &[String] {
         &self.trusted_security_definer
@@ -593,14 +643,15 @@ impl RuntimeRoleOptions {
     /// All runtime-role options from configuration values (the binaries
     /// pass their environment): `PRAETORE_RUNTIME_ALLOW_SETTINGS`,
     /// `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`,
-    /// `PRAETORE_RUNTIME_LOGINS` and `PRAETORE_SCHEMA_OWNER_MEMBERS`. The
-    /// library itself reads no environment.
+    /// `PRAETORE_RUNTIME_LOGINS`, `PRAETORE_SCHEMA_OWNER_MEMBERS` and
+    /// `PRAETORE_SCHEMA_OWNER`. The library itself reads no environment.
     pub fn from_config(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
         let value = |name: &str| lookup(name).unwrap_or_default();
         Ok(Self::from_allow_settings(&value(Self::ALLOW_SETTINGS_ENV))?
             .with_trusted_security_definer(&value(Self::TRUSTED_SECURITY_DEFINER_ENV))
             .with_runtime_logins(&value(Self::RUNTIME_LOGINS_ENV))
-            .with_schema_owner_members(&value(Self::SCHEMA_OWNER_MEMBERS_ENV)))
+            .with_schema_owner_members(&value(Self::SCHEMA_OWNER_MEMBERS_ENV))
+            .with_schema_owner(&value(Self::SCHEMA_OWNER_ENV)))
     }
 
     /// The relaxed refusals, for the startup log.
@@ -787,6 +838,21 @@ fn verify_runtime_role_in(
     if replication_role != "origin" {
         return Err(RuntimeRoleError::TriggersDisabled(replication_role));
     }
+    if let Some(expected) = &options.schema_owner {
+        if expected.starts_with("pg_") {
+            return Err(RuntimeRoleError::InvalidConfiguration(format!(
+                "{} names {expected}, a predefined role, which cannot own the praetore schema",
+                RuntimeRoleOptions::SCHEMA_OWNER_ENV
+            )));
+        }
+        let actual = praetore_schema_owner(transaction)?;
+        if actual.as_deref() != Some(expected.as_str()) {
+            return Err(RuntimeRoleError::UnexpectedSchemaOwner {
+                expected: expected.clone(),
+                actual,
+            });
+        }
+    }
     if let Some(setting) = unsafe_runtime_setting(transaction, options)? {
         return Err(RuntimeRoleError::UnsafeSetting(setting));
     }
@@ -845,6 +911,9 @@ fn verify_runtime_role_in(
     }
     if let Some(grants) = unexpected_grants(transaction)? {
         return Err(RuntimeRoleError::UnexpectedGrant(grants));
+    }
+    if let Some(objects) = extension_objects(transaction)? {
+        return Err(RuntimeRoleError::ExtensionObjects(objects));
     }
     if let Some(objects) = mixed_ownership(transaction)? {
         return Err(RuntimeRoleError::MixedOwnership(objects));
@@ -1121,6 +1190,54 @@ fn unexpected_grants(
                                             AND oa.col OPERATOR(pg_catalog.=) e.col)))))) \
          SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
          FROM (SELECT entry FROM unexpected ORDER BY entry LIMIT 10) first_entries",
+        &[],
+    )?;
+    Ok(row.get(0))
+}
+
+/// The role that owns the `praetore` schema, if it exists.
+pub(crate) fn praetore_schema_owner(
+    client: &mut impl postgres::GenericClient,
+) -> Result<Option<String>, postgres::Error> {
+    Ok(client
+        .query_opt(
+            "SELECT pg_catalog.pg_get_userbyid(n.nspowner)::pg_catalog.text \
+             FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'",
+            &[],
+        )?
+        .map(|row| row.get(0)))
+}
+
+/// Extensions installed in `praetore`, objects in `praetore` that belong
+/// to an extension (`pg_depend` deptype `e`), and objects in `praetore`
+/// marked `DEPENDS ON EXTENSION` (deptype `x`), which `DROP EXTENSION`
+/// drops with the extension: whoever owns that extension could drop them.
+/// Whatever schema the extension itself is in. The migrations create no
+/// such dependency. Up to ten entries.
+pub(crate) fn extension_objects(
+    client: &mut impl postgres::GenericClient,
+) -> Result<Option<String>, postgres::Error> {
+    let row = client.query_one(
+        "WITH ns AS (SELECT n.oid FROM pg_catalog.pg_namespace n \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore'), \
+         objects(entry) AS ( \
+             SELECT pg_catalog.concat('extension ', e.extname, ' (installed in praetore)') \
+             FROM ns JOIN pg_catalog.pg_extension e \
+                 ON e.extnamespace OPERATOR(pg_catalog.=) ns.oid \
+             UNION ALL \
+             SELECT pg_catalog.concat(o.type, ' ', o.identity, \
+                        CASE WHEN d.deptype OPERATOR(pg_catalog.=) 'e' THEN ' (member of extension ' \
+                             ELSE ' (depends on extension ' END, e.extname, ')') \
+             FROM pg_catalog.pg_depend d \
+             JOIN pg_catalog.pg_extension e ON e.oid OPERATOR(pg_catalog.=) d.refobjid \
+             CROSS JOIN LATERAL pg_catalog.pg_identify_object(d.classid, d.objid, d.objsubid) o \
+             WHERE (d.deptype OPERATOR(pg_catalog.=) 'e' \
+                    OR d.deptype OPERATOR(pg_catalog.=) 'x') \
+               AND d.refclassid OPERATOR(pg_catalog.=) \
+                   'pg_catalog.pg_extension'::pg_catalog.regclass \
+               AND o.schema OPERATOR(pg_catalog.=) 'praetore') \
+         SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) \
+         FROM (SELECT entry FROM objects ORDER BY entry LIMIT 10) first_entries",
         &[],
     )?;
     Ok(row.get(0))
