@@ -12,7 +12,10 @@
 #      symlink y un directorio, aunque index.json los liste;
 #   5. rechaza un recibo repetido (copias con otros nombres, hard link);
 #   6. verifica y atribuye la copia que tomó al empezar, aunque el original
-#      cambie durante la verificación.
+#      cambie durante la verificación;
+#   7. las negaciones del guard del hook nombran el guard y el perfil pedido
+#      en el contexto firmado, verify.sh las cuenta aparte, y quitar o
+#      cambiar esos campos rompe la verificación.
 # Uso, desde la raíz de un clon:
 #   ./examples/claude-code-hook/test-attribution.sh [verify.sh]
 set -euo pipefail
@@ -218,6 +221,55 @@ if grep -q '^unset SOURCE$' "$VERIFY_SH" &&
 else
   fail "verify.sh no trabaja sobre una copia (falta 'unset SOURCE' o usa SOURCE después)"
 fi
+
+# 7. Guards del hook (GHSA-wg33-3h8v-xvqw).
+if python3 -I - "$WORK/bundle" <<'PY'; then
+import json, sys
+bundle = sys.argv[1]
+index = json.load(open(f"{bundle}/index.json"))
+guarded = []
+for entry in index:
+    ev = json.load(open(f"{bundle}/{entry['file']}"))
+    context = ev["context"]
+    if "praetore.hook_guard" in context:
+        guarded.append(context["praetore.hook_guard"])
+        assert context["praetore.requested_profile"] == "coder", entry
+        assert context["profile"] == "unregistered" and context["agent"] == "coder", entry
+        assert ev["decision"]["outcome"] == "Deny", entry
+print(guarded)
+assert sorted(guarded) == ["governance_write", "governance_write"], guarded
+PY
+  pass "las negaciones del guard nombran el guard y el perfil pedido en el contexto firmado"
+else
+  fail "las negaciones del guard no nombran el guard o el perfil pedido"
+fi
+if grep -q 'guard=governance_write' "$WORK/good.log"; then
+  pass "verify.sh cuenta aparte las negaciones del guard"
+else
+  fail "verify.sh no muestra las negaciones del guard"
+fi
+guard_tamper() {
+  local name="$1" script="$2" copy="$WORK/$1"
+  cp -R "$WORK/bundle" "$copy"
+  python3 -I - "$copy" <<PY
+import json, sys
+bundle = sys.argv[1]
+index = json.load(open(f"{bundle}/index.json"))
+victim = next(e for e in index if e["agent"] == "coder" and e["profile"] == "unregistered")
+path = f"{bundle}/{victim['file']}"
+ev = json.load(open(path))
+$script
+open(path, "w").write(json.dumps(ev, separators=(",", ":"), sort_keys=True))
+PY
+  rc=$(verify "$copy" "$WORK/$name.log")
+  if [ "$rc" -ne 0 ]; then
+    pass "$name: rechazado (exit $rc)"
+  else
+    fail "$name: aceptado"
+  fi
+}
+guard_tamper guard-removed 'del ev["context"]["praetore.hook_guard"]; del ev["context"]["praetore.requested_profile"]'
+guard_tamper guard-renamed 'ev["context"]["praetore.hook_guard"] = "client_config_write"'
 
 if [ "$failures" -ne 0 ]; then
   echo "$failures test(s) fallaron"

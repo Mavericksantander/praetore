@@ -17,6 +17,9 @@ fn no_deny_message_contains_a_rule_id() {
     let s = State::new("deny-messages");
     let outside = json!({ "file_path": "/etc/passwd" });
     let git = json!({ "file_path": format!("{}/.git/config", s.root.display()) });
+    let mcp = format!("{}/.mcp.json", s.root.display());
+    let settings = format!("{}/.claude/settings.json", s.root.display());
+    let notebook = format!("{}/a.ipynb", s.root.display());
     let cases = [
         (
             s.input(Some("planner"), "Bash", json!({ "command": "ls" })),
@@ -30,12 +33,38 @@ fn no_deny_message_contains_a_rule_id() {
             DenyClass::Unclassified,
         ),
         (
+            s.input(None, "Bash", json!({ "command": "$(echo git) push" })),
+            DenyClass::UnanalyzableCommand,
+        ),
+        // No subagent runs commands (GHSA-wg33-3h8v-xvqw).
+        (
             s.input(
                 Some("coder"),
                 "Bash",
                 json!({ "command": "$(echo git) push" }),
             ),
-            DenyClass::UnanalyzableCommand,
+            DenyClass::Capability,
+        ),
+        // The hook's write guard: class from the signed praetore.hook_guard.
+        (
+            s.input(Some("coder"), "Write", json!({ "file_path": mcp })),
+            DenyClass::Path,
+        ),
+        (
+            s.input(Some("coder"), "Edit", json!({ "file_path": settings })),
+            DenyClass::Path,
+        ),
+        (
+            s.input(
+                Some("coder"),
+                "NotebookEdit",
+                json!({ "file_path": notebook }),
+            ),
+            DenyClass::Path,
+        ),
+        (
+            s.input(None, "NotebookEdit", json!({ "file_path": notebook })),
+            DenyClass::Path,
         ),
     ];
     let rule_ids: Vec<String> = load_policy(&s.state)

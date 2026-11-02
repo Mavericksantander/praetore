@@ -279,7 +279,7 @@ fn tool_mapping_agrees_with_action_type_of() {
         "mcp__server__tool",
         "safety:halt",
     ] {
-        let (action_type, ..) = classify(tool, &json!({}), None);
+        let (action_type, ..) = classify(tool, &json!({}), None, None);
         assert_eq!(action_type, action_type_of(tool), "{tool}");
     }
 }

@@ -20,6 +20,8 @@ mod shell;
 #[cfg(test)]
 mod attribution_tests;
 #[cfg(test)]
+mod tests_bash;
+#[cfg(test)]
 mod tests_g7;
 #[cfg(test)]
 mod tests_high_assurance;
@@ -52,11 +54,78 @@ const ATTESTER_KEY_FILE: &str = "attester.key";
 const ATTESTER_PIN_FILE: &str = "attester-public-key.hex";
 const AGENTS_DIR: &str = "agents";
 const RECEIPTS_FILE: &str = "receipts.jsonl";
+/// The canonical project root given to `init`. The `Bash` scan and the
+/// client-configuration check resolve paths against it. State written before
+/// this file existed has no root: every analyzable command then counts as
+/// leaving it, every write counts as client configuration, and the hook
+/// warns on stderr (see [`state_warnings`]).
+const PROJECT_ROOT_FILE: &str = "project-root";
+/// Paths inside the project that make Claude Code, git, a shell, an IDE or a
+/// package manager run commands or load configuration: the protected
+/// directories and files of Claude Code's permission modes
+/// (<https://code.claude.com/docs/en/permission-modes#protected-paths>),
+/// matched case-insensitively as whole path components anywhere under the
+/// project root. Writes to them are denied to every profile except `main`,
+/// which needs approval; a command naming one needs approval.
+const CLIENT_CONFIG_PATHS: [&str; 47] = [
+    // Directories.
+    ".git",
+    ".config/git",
+    ".vscode",
+    ".idea",
+    ".husky",
+    ".cargo",
+    ".devcontainer",
+    ".yarn",
+    ".mvn",
+    ".claude",
+    // Files.
+    ".gitconfig",
+    ".gitmodules",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_aliases",
+    ".bash_logout",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".profile",
+    ".envrc",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    ".pnp.cjs",
+    ".pnp.loader.mjs",
+    ".pnpmfile.cjs",
+    "bunfig.toml",
+    ".bunfig.toml",
+    ".bazelrc",
+    ".bazelversion",
+    ".bazeliskrc",
+    ".pre-commit-config.yaml",
+    "lefthook.yml",
+    "lefthook.yaml",
+    ".lefthook.yml",
+    ".lefthook.yaml",
+    "gradle-wrapper.properties",
+    "maven-wrapper.properties",
+    ".devcontainer.json",
+    ".ripgreprc",
+    "pyrightconfig.json",
+    ".mcp.json",
+    ".claude.json",
+];
+/// Paths a command may name without counting as leaving the project root.
+const SHELL_DEVICES: [&str; 4] = ["/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
+/// More words than this that may name a path count as leaving the root.
+const MAX_COMMAND_PATHS: usize = 512;
 const MAIN_AGENT: &str = "main";
 /// Profile for any agent without an authority of its own: it holds no
 /// capability, so every request is denied, but with a signed receipt.
 const UNREGISTERED: &str = "unregistered";
-const SUBAGENTS: [&str; 3] = ["planner", "coder", "explorer"];
 const MAX_HOOK_INPUT_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Longest `agent_id` or `session_id` recorded in a receipt.
@@ -69,6 +138,12 @@ const AUTHORITY_LIFETIME_DAYS: i64 = 90;
 const PROFILE_CONSTRAINT: &str = "praetore.agent_profile";
 
 /// Capabilities granted to each agent's authority at `init`.
+///
+/// No subagent gets `process:execute`: the hook cannot see what a command
+/// does once it runs, so a profile that may run `Bash` can in practice do
+/// what every other capability allows (write anywhere the user can, read
+/// outside the project, use the network). Only the main session, the user's
+/// own, gets it.
 const PROFILES: [(&str, &[&str]); 6] = [
     (
         MAIN_AGENT,
@@ -83,7 +158,7 @@ const PROFILES: [(&str, &[&str]); 6] = [
     ),
     ("planner", &["fs:read"]),
     ("explorer", &["fs:read"]),
-    ("coder", &["fs:read", "fs:write", "process:execute"]),
+    ("coder", &["fs:read", "fs:write"]),
     // Claude Code's built-in web reader: network only, no file access.
     ("web-fetch", &["network:invoke"]),
     (UNREGISTERED, &[]),
@@ -160,6 +235,17 @@ enum DenyClass {
 impl DenyClass {
     fn of(evidence: &Evidence, profile: &str) -> Self {
         use praetore_core::DecidedBy;
+        // A denial by the hook's own guard is signed as `unregistered`; its
+        // class comes from the signed `praetore.hook_guard`.
+        match evidence
+            .context
+            .get(HOOK_GUARD_CLAIM)
+            .and_then(Value::as_str)
+        {
+            Some("exec_reserved_to_main") => return Self::Capability,
+            Some(_) => return Self::Path,
+            None => {}
+        }
         if profile == UNREGISTERED {
             return Self::Unregistered;
         }
@@ -249,6 +335,17 @@ fn parse_init_options(options: &[String]) -> Result<(String, i64), BoxError> {
 }
 
 fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxError> {
+    initialize_with(directory, root, valid_days, &PROFILES)
+}
+
+/// [`initialize`] with the given profiles. Tests use it to build state as an
+/// earlier `init` wrote it.
+fn initialize_with(
+    directory: &Path,
+    root: &Path,
+    valid_days: i64,
+    profiles: &[(&str, &[&str])],
+) -> Result<(), BoxError> {
     let root = fs::canonicalize(root)?;
     let root = root.to_str().ok_or("project root must be valid UTF-8")?;
     let home = std::env::var("HOME").map_err(|_| "HOME is not set")?;
@@ -287,7 +384,7 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
         .as_bytes(),
     )?;
 
-    for (name, capabilities) in PROFILES {
+    for &(name, capabilities) in profiles {
         let secret = random_secret()?;
         let identity = AgentKeyPair::from_secret_bytes(&secret).identity(AgentId::new());
         let mut authority = Authority::new(
@@ -313,7 +410,8 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
         )?;
     }
 
-    let policy = default_policy(root, &home);
+    write_private_file(&directory.join(PROJECT_ROOT_FILE), root.as_bytes())?;
+    let policy = default_policy_for(root, &home, profiles);
     policy.validate()?;
     write_private_file(
         &directory.join(POLICY_FILE),
@@ -323,14 +421,26 @@ fn initialize(directory: &Path, root: &Path, valid_days: i64) -> Result<(), BoxE
     println!("Initialized PRÆTORE hook state at {}", directory.display());
     println!("Project root: {root}");
     println!("Policy digest: {}", policy.digest()?);
-    for (name, capabilities) in PROFILES {
+    for &(name, capabilities) in profiles {
         println!("  {name:<9} {}", capabilities.join(", "));
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn default_policy(root: &str, home: &str) -> Policy {
-    let subagents = SUBAGENTS.iter().map(|a| json!(a)).collect::<Vec<_>>();
+    default_policy_for(root, home, &PROFILES)
+}
+
+/// [`default_policy`] for the given profiles: the subagent rules name every
+/// profile except `main`.
+fn default_policy_for(root: &str, home: &str, profiles: &[(&str, &[&str])]) -> Policy {
+    let non_main = profiles
+        .iter()
+        .map(|(name, _)| *name)
+        .filter(|name| *name != MAIN_AGENT)
+        .map(|name| json!(name))
+        .collect::<Vec<_>>();
     // Conditions match the profile whose key signs, not the raw agent_type:
     // an unregistered request may carry any agent_type, including `main`.
     let main_only = || PolicyCondition::exact("profile", json!(MAIN_AGENT));
@@ -352,7 +462,9 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 "path",
                 format!("{root}/.claude"),
             ))
-            .with_context_condition(PolicyCondition::one_of("profile", subagents)),
+            // Every profile except `main`, not only the example subagents,
+            // so a profile added to `PROFILES` with `fs:write` is held too.
+            .with_context_condition(PolicyCondition::one_of("profile", non_main.clone())),
             PolicyRule::new(
                 "approval-main-governance-writes",
                 "claude:write",
@@ -363,6 +475,28 @@ fn default_policy(root: &str, home: &str) -> Policy {
                 "path",
                 format!("{root}/.claude"),
             ))
+            .with_context_condition(main_only()),
+            // Client configuration (`CLIENT_CONFIG_PATHS`) outside
+            // `<root>/.claude` and `<root>/.git`, which the rules above cover:
+            // `.mcp.json`, IDE tasks, git hooks managers, shell startup
+            // files... Claude Code, git or a shell run what these files name,
+            // outside this hook. Denied to every profile except `main`, which
+            // needs approval. `client_config` is always present on
+            // `claude:write`, so these rules never match as unknown.
+            PolicyRule::new(
+                "deny-subagent-client-config-writes",
+                "claude:write",
+                PolicyEffect::Deny,
+            )
+            .with_parameter_condition(PolicyCondition::exact("client_config", json!(true)))
+            .with_context_condition(PolicyCondition::one_of("profile", non_main)),
+            PolicyRule::new(
+                "approval-main-client-config-writes",
+                "claude:write",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("fs:write")
+            .with_parameter_condition(PolicyCondition::exact("client_config", json!(true)))
             .with_context_condition(main_only()),
             PolicyRule::new(
                 "approval-git-push",
@@ -381,6 +515,39 @@ fn default_policy(root: &str, home: &str) -> Policy {
             // simple commands.
             PolicyRule::new(UNANALYZABLE_RULE, "claude:exec", PolicyEffect::Deny)
                 .with_parameter_condition(PolicyCondition::exact("analyzable", json!(false))),
+            // Defense in depth, not a boundary (see `shell`): an analyzable
+            // command whose words name `<root>/.claude` or `<root>/.git`, a
+            // path outside the root, or a network tool is held for approval.
+            // Approval rather than DENY: the scan is lexical and has false
+            // positives (`cat .git/HEAD`, `ls /`), and the only profile with
+            // `process:execute` by default is the user's own session, which
+            // already gets approval for governance writes and `git push`.
+            // `analyzable` keeps an unanalyzable command (no such keys) from
+            // matching these rules as unknown; the rule above denies it.
+            PolicyRule::new(
+                "approval-command-touches-protected-path",
+                "claude:exec",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("process:execute")
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
+            .with_parameter_condition(PolicyCondition::exact("protected_path", json!(true))),
+            PolicyRule::new(
+                "approval-command-leaves-root",
+                "claude:exec",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("process:execute")
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
+            .with_parameter_condition(PolicyCondition::exact("leaves_root", json!(true))),
+            PolicyRule::new(
+                "approval-command-uses-network",
+                "claude:exec",
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability("process:execute")
+            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
+            .with_parameter_condition(PolicyCondition::exact("network", json!(true))),
             PolicyRule::new("allow-read-project", "claude:read", PolicyEffect::Allow)
                 .with_capability("fs:read")
                 .with_parameter_condition(PolicyCondition::path_prefix("path", root)),
@@ -442,6 +609,7 @@ fn classify(
     tool_name: &str,
     input: &Value,
     cwd: Option<&str>,
+    root: Option<&str>,
 ) -> (String, &'static str, Value, Option<Value>) {
     let field = |key: &str| input.get(key).and_then(Value::as_str);
     let path_param = |path: Option<&str>| match path.or(cwd) {
@@ -464,16 +632,64 @@ fn classify(
         let (parameters, check) = path_param(path);
         (action.to_string(), capability, parameters, check)
     };
+    // A write also records whether it touches client configuration (see
+    // `CLIENT_CONFIG_PATHS`), checked on the lexical and the resolved path.
+    // A write tool without its path parameter (or with another one, such as
+    // `file_path` on NotebookEdit) fails closed: the policy sees
+    // `PATH_CHECK_FAILED`, which no ALLOW matches.
+    let write = |path: Option<&str>| {
+        let Some(path) = path else {
+            let check = json!({ "lexical": null, "resolved": null, "status": "missing" });
+            return (
+                "claude:write".to_string(),
+                "fs:write",
+                json!({ "path": PATH_CHECK_FAILED, "client_config": true }),
+                Some(check),
+            );
+        };
+        let (action, capability, mut parameters, check) =
+            with_path("claude:write", "fs:write", Some(path));
+        let client_config = match (&check, root) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(check), Some(root)) => ["lexical", "resolved"].iter().any(|key| {
+                check[*key]
+                    .as_str()
+                    .is_some_and(|path| client_config_outside_governance(&normalize(path), root))
+            }),
+        };
+        parameters["client_config"] = json!(client_config);
+        (action, capability, parameters, check)
+    };
     match tool_name {
         "Read" => with_path("claude:read", "fs:read", field("file_path")),
         "Grep" | "Glob" => with_path("claude:read", "fs:read", field("path")),
-        "Edit" | "MultiEdit" | "Write" => with_path("claude:write", "fs:write", field("file_path")),
-        "NotebookEdit" => with_path("claude:write", "fs:write", field("notebook_path")),
-        "Bash" => {
+        "Edit" | "MultiEdit" | "Write" => write(field("file_path")),
+        "NotebookEdit" => write(field("notebook_path")),
+        // `Monitor` runs a shell command like `Bash` and gets the same scan.
+        // `PowerShell` is not POSIX shell: the scanner cannot analyze it, so
+        // the main session always needs approval. A `Monitor` without a
+        // command (a WebSocket source) is unanalyzable too.
+        "Bash" | "Monitor" | "PowerShell" => {
             let command = field("command").unwrap_or_default();
-            let parameters = match shell::scan(command) {
-                shell::Scan::Analyzed { git_push } => {
-                    json!({ "command": command, "analyzable": true, "git_push": git_push })
+            let scan = match tool_name {
+                "PowerShell" => shell::Scan::Unanalyzable("PowerShell is not analyzed"),
+                "Monitor" if field("command").is_none() => {
+                    shell::Scan::Unanalyzable("Monitor without a command")
+                }
+                _ => shell::scan(command),
+            };
+            let parameters = match scan {
+                shell::Scan::Analyzed(analysis) => {
+                    let paths = command_paths(&analysis.paths, cwd, root);
+                    json!({
+                        "command": command,
+                        "analyzable": true,
+                        "git_push": analysis.git_push,
+                        "protected_path": paths.protected,
+                        "leaves_root": paths.leaves_root,
+                        "network": analysis.network,
+                    })
                 }
                 shell::Scan::Unanalyzable(reason) => json!({
                     "command": command,
@@ -512,6 +728,246 @@ fn classify(
     }
 }
 
+/// What the words of an analyzable command name, resolved against the root.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CommandPaths {
+    /// A word names a path under the root in `CLIENT_CONFIG_PATHS`
+    /// (`.claude`, `.git`, `.mcp.json`, ...), or something under one.
+    protected: bool,
+    /// A word names a path outside the root, its value is unknown (a `$`
+    /// expansion, a leading `~`), or the command runs outside the root.
+    leaves_root: bool,
+}
+
+/// Best effort, not a boundary: every word is taken as a possible path,
+/// joined onto `cwd` and checked lexically (after removing `.` and `..`) and
+/// after resolving symlinks, both for the word as written and normalized.
+/// A program named by path (`/usr/bin/git`) does not count as leaving the
+/// root; it still counts when it names a protected path. Without a root
+/// nothing can be checked, so the command counts as leaving it.
+fn command_paths(words: &[shell::PathWord], cwd: Option<&str>, root: Option<&str>) -> CommandPaths {
+    let Some(root) = root else {
+        return CommandPaths {
+            protected: false,
+            leaves_root: true,
+        };
+    };
+    let base = cwd.unwrap_or(root);
+    let base = match resolve_path(&normalize(base)) {
+        (_, Some(resolved)) => resolved,
+        _ => normalize(base),
+    };
+    let mut found = CommandPaths {
+        protected: false,
+        leaves_root: !within(&base, root) || words.len() > MAX_COMMAND_PATHS,
+    };
+    for word in words.iter().take(MAX_COMMAND_PATHS) {
+        if word.dynamic || word.text.starts_with('~') {
+            found.leaves_root |= !word.program;
+            continue;
+        }
+        if SHELL_DEVICES.contains(&word.text.as_str()) {
+            continue;
+        }
+        let raw = absolute(&word.text, Some(&base));
+        let lexical = normalize(&raw);
+        let mut seen = vec![lexical.clone()];
+        for candidate in [&raw, &lexical] {
+            if let (_, Some(resolved)) = resolve_path(candidate) {
+                seen.push(normalize(&resolved));
+            }
+        }
+        for path in &seen {
+            found.protected |= client_config(path, root, Strictness::DotNames);
+            found.leaves_root |= !word.program && !within(path, root);
+        }
+    }
+    found
+}
+
+/// Removes `.` and `..` segments and repeated slashes from an absolute path,
+/// lexically. A relative path is returned unchanged.
+fn normalize(path: &str) -> String {
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
+}
+
+/// How far [`client_config`] treats a non-ASCII name as a possible alias.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Strictness {
+    /// Any non-ASCII component that starts with `.` (as written or folded),
+    /// or that folds to ASCII (every APFS alias of an ASCII name does). For
+    /// writes: a subagent has no need for such names, while `\u{d1}and\u{fa}.md`
+    /// or a name in NFD stays allowed.
+    AllAliases,
+    /// Only a non-ASCII component that starts with `.`. For the `Bash`
+    /// scan, whose words include commit messages and other text.
+    DotNames,
+}
+
+/// `path` (absolute, normalized) is under `root` and touches client
+/// configuration: a component, or a run of them, folded with [`fold_name`]
+/// is in `CLIENT_CONFIG_PATHS`; or a non-ASCII component may alias a name on
+/// a filesystem that folds case and normalization (APFS), see
+/// [`Strictness`]; or a component would complete a bare git repository (see
+/// [`completes_bare_repository`]).
+///
+/// This does not chase aliases one by one: anything non-ASCII that could be
+/// one fails closed instead.
+fn client_config(path: &str, root: &str, strictness: Strictness) -> bool {
+    if !within(path, root) {
+        return false;
+    }
+    let root = root.trim_end_matches('/');
+    let parts: Vec<&str> = path[root.len()..]
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let folded: Vec<String> = parts.iter().map(|part| fold_name(part)).collect();
+    let listed = CLIENT_CONFIG_PATHS.iter().any(|entry| {
+        let entry: Vec<&str> = entry.split('/').collect();
+        folded
+            .windows(entry.len())
+            .any(|window| window == entry.as_slice())
+    });
+    let alias = parts.iter().zip(&folded).any(|(part, folded)| {
+        !part.is_ascii()
+            && (part.starts_with('.')
+                || folded.starts_with('.')
+                || (strictness == Strictness::AllAliases && folded.is_ascii()))
+    });
+    listed || alias || completes_bare_repository(root, &parts, &folded)
+}
+
+/// The names git looks for to take a directory for a repository directory:
+/// a bare repository (`HEAD`, `config`, `objects`, `refs`) or a linked
+/// worktree's git directory (`commondir`, `gitdir`).
+const BARE_REPOSITORY_NAMES: [&str; 6] =
+    ["HEAD", "config", "objects", "refs", "commondir", "gitdir"];
+
+/// A component named like a repository-directory entry
+/// ([`BARE_REPOSITORY_NAMES`]) in a directory that already holds two of the
+/// others. The check reads the disk at each write, so two writes in parallel
+/// could still complete a set; `main` running git there is the remaining
+/// step.
+/// git takes a directory with `HEAD`, `objects/` and `refs/` for a bare
+/// repository and runs what its `config` names, so a third entry is held:
+/// the set cannot be completed one write at a time. A lone `config/` or
+/// `refs/` directory is not affected.
+fn completes_bare_repository(root: &str, parts: &[&str], folded: &[String]) -> bool {
+    (0..parts.len()).any(|index| {
+        let Some(name) = BARE_REPOSITORY_NAMES
+            .iter()
+            .find(|name| name.to_ascii_lowercase() == folded[index])
+        else {
+            return false;
+        };
+        let directory = format!("{root}/{}", parts[..index].join("/"));
+        BARE_REPOSITORY_NAMES
+            .iter()
+            .filter(|other| *other != name)
+            .filter(|other| fs::symlink_metadata(format!("{directory}/{other}")).is_ok())
+            .count()
+            >= 2
+    })
+}
+
+/// Comparison key of a path component: Unicode default-ignorable code
+/// points dropped, then NFKC, full case folding (`caseless`) and lower case,
+/// repeated to a fixed point, and trailing `.` and spaces dropped. Broader
+/// than APFS's own folding on purpose: a wider key only holds more names.
+fn fold_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    if name.is_ascii() {
+        return name
+            .to_ascii_lowercase()
+            .trim_end_matches(['.', ' '])
+            .to_string();
+    }
+    let mut key: String = name
+        .chars()
+        .filter(|&c| !is_default_ignorable(c))
+        .nfkc()
+        .collect();
+    for _ in 0..8 {
+        let next: String = caseless::default_case_fold_str(&key)
+            .chars()
+            .flat_map(char::to_lowercase)
+            .filter(|&c| !is_default_ignorable(c))
+            .nfkc()
+            .collect();
+        if next == key {
+            break;
+        }
+        key = next;
+    }
+    key.trim_end_matches(['.', ' ']).to_string()
+}
+
+/// `Default_Ignorable_Code_Point` (Unicode 16.0.0, as in praetore-mcp).
+fn is_default_ignorable(c: char) -> bool {
+    const RANGES: [(u32, u32); 17] = [
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x17B4, 0x17B5),
+        (0x180B, 0x180F),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x206F),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF0, 0xFFF8),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0000, 0xE0FFF),
+    ];
+    let c = u32::from(c);
+    RANGES.iter().any(|&(low, high)| (low..=high).contains(&c))
+}
+
+/// `path` is `<root>/.claude` or `<root>/.git`, or under one (ASCII case
+/// ignored), which the governance and git-internals rules decide.
+fn governed(path: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path.strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .and_then(|rest| rest.split('/').next())
+        .is_some_and(|first| {
+            first.is_ascii() && [".claude", ".git"].contains(&first.to_ascii_lowercase().as_str())
+        })
+}
+
+/// [`client_config`] for a write, except under `<root>/.claude` and
+/// `<root>/.git`, which the governance and git-internals rules decide.
+fn client_config_outside_governance(path: &str, root: &str) -> bool {
+    !governed(path, root) && client_config(path, root, Strictness::AllAliases)
+}
+
+/// `path` is `dir` or under it, by whole segments.
+fn within(path: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    dir.is_empty()
+        || path == dir
+        || path
+            .strip_prefix(dir)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
 /// Rule that denies a command the shell scanner cannot analyze.
 const UNANALYZABLE_RULE: &str = "deny-unanalyzable-command";
 
@@ -604,15 +1060,38 @@ fn run_hook(directory: &Path) {
     // stderr is for people: invisible, bidi and control characters in tool
     // names and reasons are escaped (`praetore_core::display`).
     let shown = praetore_core::display::escape_for_display;
+    let warnings = state_warnings(directory);
+    for warning in &warnings {
+        eprintln!("PRÆTORE warning: {}", shown(warning));
+    }
     if verdict.not_governed {
         eprintln!("PRÆTORE: {}", shown(&verdict.reason));
     }
     if let Some(line) = stderr_line(&verdict) {
         eprintln!("{}", shown(&line));
     }
-    if let Some(output) = hook_output(&verdict) {
+    if let Some(output) = with_warnings(hook_output(&verdict), &warnings) {
         println!("{output}");
     }
+}
+
+/// Adds the state warnings (see [`state_warnings`]) as `systemMessage`,
+/// which Claude Code shows to the user; stderr of a hook that exits 0 is not
+/// shown. It does not change the decision: with no decision (`allow`, or a
+/// safety action) the output carries only the message.
+fn with_warnings(output: Option<Value>, warnings: &[String]) -> Option<Value> {
+    if warnings.is_empty() {
+        return output;
+    }
+    let shown = praetore_core::display::escape_for_display;
+    let message = warnings
+        .iter()
+        .map(|warning| shown(warning).to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut output = output.unwrap_or_else(|| json!({}));
+    output["systemMessage"] = json!(format!("PRÆTORE warning: {message}"));
+    Some(output)
 }
 
 /// What stderr says about a DENY with a receipt: the reason class and the
@@ -744,6 +1223,13 @@ fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Va
     (claims, None)
 }
 
+/// Signed context keys of a denial by the hook's own guard: which guard
+/// (`exec_reserved_to_main`, `client_config_write`, `governance_write`,
+/// `path_check_failed`, `no_project_root`) and the profile the call would
+/// otherwise have had.
+const HOOK_GUARD_CLAIM: &str = "praetore.hook_guard";
+const REQUESTED_PROFILE_CLAIM: &str = "praetore.requested_profile";
+
 /// Signed context key for Claude Code's `tool_use_id`. It ties a receipt to
 /// the tool call it was made for; it is not a replay key (a re-delivered
 /// tool call is evaluated again, and `verify` reports the repeat).
@@ -756,7 +1242,7 @@ fn action_type_of(tool_name: &str) -> String {
     match tool_name {
         "Read" | "Grep" | "Glob" => "claude:read".into(),
         "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => "claude:write".into(),
-        "Bash" => "claude:exec".into(),
+        "Bash" | "Monitor" | "PowerShell" => "claude:exec".into(),
         "WebFetch" | "WebSearch" => "claude:network".into(),
         "Agent" | "Task" => "claude:delegate".into(),
         // A name that is not a valid action type (surrounding whitespace,
@@ -782,7 +1268,7 @@ fn load_policy(directory: &Path) -> Result<Policy, BoxError> {
     Policy::from_json(&String::from_utf8(read_bounded(&path)?)?).map_err(|error| {
         let hint = match error {
             PraetoreError::PolicyFormatUnsupported { found: 1, .. } => format!(
-                "; this state was written before G7 (policy format 1): migrate {} to format 2 (`praetore policy classify --policy {}` proposes the action_classes table) or run `praetore-claude-hook init` into a new directory",
+                "; this state was written before G7 (policy format 1): run `praetore-claude-hook init` into a new directory (recommended). Migrating {} to format 2 instead (`praetore policy classify --policy {}` proposes the action_classes table) keeps the authorities issued before, including process:execute for subagents (GHSA-wg33-3h8v-xvqw)",
                 path.display(),
                 path.display()
             ),
@@ -826,18 +1312,23 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     // reserved name and is evaluated as `unregistered`.
     let agent = input.agent_type.as_deref().unwrap_or(MAIN_AGENT);
     let reserved = input.agent_type.is_some() && (agent == MAIN_AGENT || agent == UNREGISTERED);
+    // An instance id without an agent type is not the main session either:
+    // a teammate of an agent team can arrive that way. Only a call that
+    // carries neither field is `main`.
+    let teammate = input.agent_type.is_none() && input.agent_id.is_some();
     if agent.len() > 64 {
         return Ok(denied(format!(
             "agent name longer than 64 bytes: {agent:?}"
         )));
     }
-    let (claims, rejected_claim) = instance_claims(input);
+    let (mut claims, rejected_claim) = instance_claims(input);
     // Only a well-formed name can select a profile file; anything else, any
     // agent without an issued authority, and any request whose instance or
     // session id is rejected, is evaluated as `unregistered`: no capability,
     // so it is denied, with a signed receipt.
     let well_formed = !agent.is_empty()
         && !reserved
+        && !teammate
         && rejected_claim.is_none()
         && agent
             .bytes()
@@ -851,6 +1342,65 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         agent
     } else {
         UNREGISTERED
+    };
+    // Defense in depth (GHSA-wg33-3h8v-xvqw): commands are reserved to the
+    // main session whatever an authority grants. A profile other than `main`
+    // that holds `process:execute` (state from an earlier `init`) is
+    // evaluated as `unregistered` for a command, so it is denied with a
+    // signed receipt. Without the capability the engine denies it anyway,
+    // signed by the profile's own key.
+    let exec_guard = profile_name != MAIN_AGENT
+        && action_type_of(&input.tool_name) == "claude:exec"
+        && profile_grants(directory, profile_name, "process:execute")?;
+    let root = read_project_root(directory)?;
+    let (action_type, capability, mut parameters, path_check) = classify(
+        &input.tool_name,
+        &input.tool_input,
+        input.cwd.as_deref(),
+        root.as_deref(),
+    );
+    // The same for writes to client configuration and to `<root>/.claude`
+    // and `<root>/.git` (or a path that failed its check): reserved to the
+    // main session whatever the policy says, so state whose policy predates
+    // these rules is covered too. Without a recorded root every write counts.
+    let write_guard = profile_name != MAIN_AGENT
+        && action_type == "claude:write"
+        && profile_grants(directory, profile_name, "fs:write")?
+        && (parameters["client_config"] == json!(true)
+            || parameters["path"] == json!(PATH_CHECK_FAILED)
+            || match (&root, parameters["path"].as_str()) {
+                (Some(root), Some(path)) => governed(path, root),
+                _ => true,
+            });
+    // Which guard held the call, and the profile it would have had, are
+    // recorded in the signed context: the engine's own reason (the missing
+    // capability of `unregistered`) does not say why.
+    let guard = if exec_guard {
+        Some("exec_reserved_to_main")
+    } else if write_guard {
+        Some(if parameters["path"] == json!(PATH_CHECK_FAILED) {
+            "path_check_failed"
+        } else if root.is_none() {
+            "no_project_root"
+        } else if parameters["client_config"] == json!(true) {
+            "client_config_write"
+        } else {
+            "governance_write"
+        })
+    } else {
+        None
+    };
+    if let Some(guard) = guard {
+        claims.push((HOOK_GUARD_CLAIM, guard.to_string()));
+        claims.push((REQUESTED_PROFILE_CLAIM, profile_name.to_string()));
+    }
+    let path_missing = path_check
+        .as_ref()
+        .is_some_and(|check| check["status"] == json!("missing"));
+    let profile_name = if guard.is_some() {
+        UNREGISTERED
+    } else {
+        profile_name
     };
     let profile_path = directory
         .join(AGENTS_DIR)
@@ -896,8 +1446,6 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     // refused here (fail closed) until re-initialized.
     let engine = high_assurance::engine(directory, policy, pin, attester)?;
 
-    let (action_type, capability, mut parameters, path_check) =
-        classify(&input.tool_name, &input.tool_input, input.cwd.as_deref());
     // The engine requires every authority constraint to appear among the
     // action parameters, so an authority issued for one profile cannot be
     // used in a request made as another.
@@ -944,11 +1492,34 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
             "agent_type {agent:?} is reserved; evaluated as '{UNREGISTERED}': {}",
             evidence.decision.reason
         ),
+        None if teammate => format!(
+            "agent_id without agent_type is not the main session; evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
+        None if write_guard => format!(
+            "writes to client configuration, .claude and .git are reserved to the main session (guard {}, GHSA-wg33-3h8v-xvqw); evaluated as '{UNREGISTERED}': {}",
+            guard.unwrap_or_default(),
+            evidence.decision.reason
+        ),
+        None if path_missing => format!(
+            "the {} tool input has no path parameter (`notebook_path` for NotebookEdit, `file_path` for Write, Edit and MultiEdit), so the path check fails closed",
+            input.tool_name
+        ),
+        None if exec_guard => format!(
+            "commands are reserved to the main session, but the authority of profile {agent:?} grants process:execute (state from an earlier init: run `praetore-claude-hook init` into a new directory); evaluated as '{UNREGISTERED}': {}",
+            evidence.decision.reason
+        ),
         None => evidence.decision.reason.clone(),
     };
     Ok(Verdict {
         outcome,
-        rule: deciding_rules(&evidence),
+        // A write without its path matches every restrictive path rule;
+        // naming one of them would misstate the cause.
+        rule: if path_missing {
+            None
+        } else {
+            deciding_rules(&evidence)
+        },
         reason,
         not_governed: false,
         evidence_id: Some(evidence.evidence_id.to_string()),
@@ -1020,6 +1591,75 @@ fn deciding_rules(evidence: &Evidence) -> Option<String> {
         .map(|c| c.rule_id.as_str())
         .collect();
     (!rules.is_empty()).then(|| rules.join(", "))
+}
+
+/// Whether the issued authority of `profile` lists `capability`.
+fn profile_grants(directory: &Path, profile: &str, capability: &str) -> Result<bool, BoxError> {
+    let path = directory.join(AGENTS_DIR).join(format!("{profile}.json"));
+    let profile: AgentProfile = serde_json::from_slice(&read_bounded(&path)?)?;
+    Ok(profile.authority["capabilities"]
+        .as_array()
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some(capability))))
+}
+
+/// The project root recorded by `init`, or `None` for state written before
+/// it was recorded. A recorded root must be an absolute, canonical, existing
+/// directory other than `/`; anything else fails closed, because an empty or
+/// `/` root would make every path count as inside the project.
+fn read_project_root(directory: &Path) -> Result<Option<String>, BoxError> {
+    let path = directory.join(PROJECT_ROOT_FILE);
+    if fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let root = String::from_utf8(read_bounded(&path)?)?.trim().to_string();
+    let canonical = fs::canonicalize(&root).ok();
+    let valid = root.starts_with('/')
+        && root != "/"
+        && Path::new(&root).is_dir()
+        && canonical.as_deref() == Some(Path::new(&root));
+    if !valid {
+        return Err(format!(
+            "{} must name the project root as an absolute, canonical, existing directory other than /, found {root:?}; run `praetore-claude-hook init` into a new directory",
+            path.display()
+        )
+        .into());
+    }
+    Ok(Some(root))
+}
+
+/// Warnings about state written by an earlier `init`, printed on stderr by
+/// every hook run: no recorded project root, or a profile other than `main`
+/// whose authority grants `process:execute`.
+fn state_warnings(directory: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if fs::symlink_metadata(directory.join(PROJECT_ROOT_FILE)).is_err() {
+        warnings.push(format!(
+            "{} has no {PROJECT_ROOT_FILE}: it predates GHSA-wg33-3h8v-xvqw. Run `praetore-claude-hook init` into a new directory",
+            directory.display()
+        ));
+    }
+    let mut profiles: Vec<String> = fs::read_dir(directory.join(AGENTS_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .filter(|name| name != MAIN_AGENT)
+        .collect();
+    profiles.sort();
+    for profile in profiles {
+        if profile_grants(directory, &profile, "process:execute").unwrap_or(false) {
+            warnings.push(format!(
+                "profile '{profile}' holds process:execute; the hook denies it commands, but run `praetore-claude-hook init` into a new directory to re-issue it (GHSA-wg33-3h8v-xvqw)"
+            ));
+        }
+    }
+    warnings
 }
 
 fn denied(reason: String) -> Verdict {
@@ -1121,6 +1761,39 @@ impl Attribution {
 /// against the issuer-signed authority. Call it only on evidence whose
 /// signatures were verified; unsigned copies of these names (the
 /// `receipts.jsonl` wrapper, `index.json`) are checked against it.
+/// A denial by the hook's own guard names the guard and the requested
+/// profile together, is a Deny signed as `unregistered`, and requested the
+/// signed agent's profile (the same rule as `check-attribution.py`). Call it
+/// only on verified evidence.
+fn check_guard_claims(evidence: &Evidence, attribution: &Attribution) -> Result<(), BoxError> {
+    let guard = evidence.context.get(HOOK_GUARD_CLAIM);
+    let requested = evidence.context.get(REQUESTED_PROFILE_CLAIM);
+    if guard.is_none() && requested.is_none() {
+        return Ok(());
+    }
+    let known = [
+        "exec_reserved_to_main",
+        "client_config_write",
+        "governance_write",
+        "path_check_failed",
+        "no_project_root",
+    ];
+    let guard_ok = guard
+        .and_then(Value::as_str)
+        .is_some_and(|guard| known.contains(&guard));
+    let requested_ok = requested
+        .and_then(Value::as_str)
+        .is_some_and(|p| p != MAIN_AGENT && p != UNREGISTERED && p == attribution.agent);
+    if !guard_ok
+        || !requested_ok
+        || attribution.profile != UNREGISTERED
+        || evidence.decision.outcome != DecisionOutcome::Deny
+    {
+        return Err("signed hook guard claims are inconsistent".into());
+    }
+    Ok(())
+}
+
 fn signed_attribution(evidence: &Evidence) -> Result<Attribution, BoxError> {
     let agent = evidence
         .context
@@ -1227,6 +1900,7 @@ fn verify_receipts(directory: &Path) -> Result<VerifyReport, BoxError> {
             check_unsigned(&record, "agent", &attribution.agent)?;
             check_unsigned(&record, "profile", &attribution.profile)?;
             let tool_use_id = checked_tool_use_id(&record, &evidence)?;
+            check_guard_claims(&evidence, &attribution)?;
             let profile_path = directory
                 .join(AGENTS_DIR)
                 .join(format!("{}.json", attribution.profile));
@@ -1622,8 +2296,11 @@ mod tests {
             let verdict = f.decide(Some(agent), "Write", write.clone());
             assert_eq!(verdict.outcome, DecisionOutcome::Deny);
             assert!(verdict.reason.contains("fs:write"), "{}", verdict.reason);
+        }
+        // No subagent runs commands (see `tests_bash`).
+        for agent in ["planner", "explorer", "coder"] {
             let verdict = f.decide(Some(agent), "Bash", json!({ "command": "ls" }));
-            assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+            assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{agent}");
         }
         let verdict = f.decide(
             Some("coder"),
@@ -1653,9 +2330,11 @@ mod tests {
         let agent_file = json!({ "file_path": f.path(".claude/agents/coder.md") });
         let verdict = f.decide(Some("coder"), "Edit", agent_file.clone());
         assert_eq!(verdict.outcome, DecisionOutcome::Deny);
-        assert_eq!(
-            verdict.rule.as_deref(),
-            Some("deny-subagent-governance-writes")
+        // Held by the hook before the policy (see `tests_bash`).
+        assert!(
+            verdict.reason.contains("reserved to the main session"),
+            "{}",
+            verdict.reason
         );
         let verdict = f.decide(None, "Edit", agent_file);
         assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
@@ -1667,17 +2346,13 @@ mod tests {
     #[test]
     fn git_push_requires_approval() {
         let f = Fixture::new("push");
-        let verdict = f.decide(
-            Some("coder"),
-            "Bash",
-            json!({ "command": "git push origin main" }),
-        );
+        let verdict = f.decide(None, "Bash", json!({ "command": "git push origin main" }));
         assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
         assert_eq!(
             hook_output(&verdict).unwrap()["hookSpecificOutput"]["permissionDecision"],
             "ask"
         );
-        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": "cargo test" }));
+        let verdict = f.decide(None, "Bash", json!({ "command": "cargo test" }));
         assert_eq!(verdict.outcome, DecisionOutcome::Allow);
         assert!(hook_output(&verdict).is_none());
 
@@ -1700,7 +2375,7 @@ mod tests {
                 DecisionOutcome::Deny,
             ),
         ] {
-            let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
+            let verdict = f.decide(None, "Bash", json!({ "command": command }));
             assert_eq!(verdict.outcome, outcome, "{command}");
             assert!(
                 verdict.rule.as_deref().unwrap_or_default().contains(rule),
@@ -1717,7 +2392,7 @@ mod tests {
         // receipt is signed; the message names only the reason class.
         let f = Fixture::new("heredoc");
         let command = "cd docs && python3 - <<'E'\nprint('hola')\nE\ngrep -n x 01.md";
-        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
+        let verdict = f.decide(None, "Bash", json!({ "command": command }));
         assert_eq!(verdict.outcome, DecisionOutcome::Deny);
         assert_eq!(verdict.rule.as_deref(), Some(UNANALYZABLE_RULE));
         assert_eq!(verdict.deny_class, Some(DenyClass::UnanalyzableCommand));
@@ -1735,7 +2410,7 @@ mod tests {
         verify_receipts(&f.state).unwrap();
 
         // An analyzable push still names approval-git-push.
-        let verdict = f.decide(Some("coder"), "Bash", json!({ "command": "git push" }));
+        let verdict = f.decide(None, "Bash", json!({ "command": "git push" }));
         assert_eq!(verdict.rule.as_deref(), Some("approval-git-push"));
     }
 

@@ -12,6 +12,13 @@ other entry, and verify.sh runs both on one copy of the bundle, so they read
 the same bytes. A receipt that appears twice (same evidence_id, or same
 agent id and request_id) fails: the counts are one per decision.
 
+A denial the hook's own guard decided (GHSA-wg33-3h8v-xvqw) is signed as
+`unregistered` and names, in the signed context, the guard
+(praetore.hook_guard) and the profile the call would otherwise have had
+(praetore.requested_profile). Those fields must come together, name a known
+guard and a profile other than main and unregistered that equals the signed
+agent, and belong to a Deny.
+
 Usage: check-attribution.py <bundle> [index.json]
 Exits 0 when every entry agrees with its signed receipt, 1 otherwise.
 """
@@ -23,6 +30,15 @@ import sys
 
 PROFILE_KEY = "praetore.agent_profile"
 UNREGISTERED = "unregistered"
+GUARD_KEY = "praetore.hook_guard"
+REQUESTED_KEY = "praetore.requested_profile"
+GUARDS = {
+    "exec_reserved_to_main",
+    "client_config_write",
+    "governance_write",
+    "path_check_failed",
+    "no_project_root",
+}
 
 
 def check(bundle, index_path):
@@ -79,6 +95,14 @@ def check(bundle, index_path):
                 errors.append(f"{name}: {what} repetido, ya está en {seen[key]}")
             else:
                 seen[key] = name
+        guard, requested = context.get(GUARD_KEY), context.get(REQUESTED_KEY)
+        if guard is not None or requested is not None:
+            if guard not in GUARDS:
+                errors.append(f"{name}: guard firmado desconocido {guard!r}")
+            if not isinstance(requested, str) or requested in ("main", UNREGISTERED) or requested != agent:
+                errors.append(f"{name}: perfil pedido {requested!r} no corresponde al agente firmado {agent!r}")
+            if profile != UNREGISTERED or evidence["decision"]["outcome"] != "Deny":
+                errors.append(f"{name}: un guard del hook solo firma un Deny como {UNREGISTERED!r}")
         if profile != UNREGISTERED and profile != agent:
             errors.append(f"{name}: agente firmado {agent!r} y perfil firmado {profile!r} difieren")
         if entry.get("agent") != agent:
@@ -99,6 +123,8 @@ def check(bundle, index_path):
         # ASCII under unregistered, so "coder " or a Cyrillic "о" cannot be
         # read as the coder profile.
         label = f"unregistered(agent_type={json.dumps(agent)})" if profile == UNREGISTERED else profile
+        if guard in GUARDS:
+            label = f"unregistered(agent_type={json.dumps(agent)}, guard={guard})"
         tally[(label, evidence["decision"]["outcome"])] += 1
 
     # A bundle comes from one `init`: one identity per profile and vice versa.
