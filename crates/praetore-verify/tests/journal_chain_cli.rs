@@ -315,8 +315,11 @@ fn producer_links_match_the_documented_formula() {
 }
 
 fn storage_record() -> praetore_core::StorageRecord {
+    storage_record_by(&attester())
+}
+
+fn storage_record_by(key: &EvidenceAttesterKey) -> praetore_core::StorageRecord {
     use praetore_core::StorageRecordSigner;
-    let key = attester();
     key.sign_storage_record(praetore_core::StorageRecordPayload {
         schema_version: 1,
         kind: "legacy_baseline_adopted".into(),
@@ -468,6 +471,199 @@ fn database_journal_and_tenant_reference_verify() {
     // The old chain alone still verifies unchanged.
     let output = fx.verify(&fx.text, Some(&fx.expected()));
     assert!(output.status.success());
+}
+
+/// B5-5: a database chain signed by a retired attester key and a tenant
+/// chain signed by the current one verify with both pins (repeated
+/// `--attester-pin`); with only the current pin the old record fails and
+/// names the key that signed it. Nothing is re-signed.
+#[test]
+fn chains_across_an_attester_rotation_need_every_signing_key_pinned() {
+    use praetore_core::journal_chain::DatabaseHead;
+    let fx = Fixture::new();
+    let old = EvidenceAttesterKey::from_secret_bytes(&[9; 32]);
+    let old_pin = fx.dir.write(
+        "old-pin.hex",
+        hex::encode(old.public_key().unwrap().as_bytes()),
+    );
+    let old_public = old.public_key().unwrap();
+    let mut database = ChainExporter::new(&old_public);
+    database.push_record(&storage_record_by(&old)).unwrap();
+    let (database_text, database_head) = database.finish().unwrap();
+    let database_path = fx.dir.write("database.jsonl", &database_text);
+    let pins = [old_public, attester().public_key().unwrap()];
+    let mut tenant = ChainExporter::with_attesters(&pins);
+    tenant
+        .push_database_head(&DatabaseHead::from(database_head))
+        .unwrap();
+    for receipt in &fx.receipts {
+        tenant.push(receipt).unwrap();
+    }
+    let (tenant_text, tenant_head) = tenant.finish().unwrap();
+    let tenant_path = fx.dir.write("tenant.jsonl", &tenant_text);
+    let both = ["--attester-pin", &old_pin, "--attester-pin", &fx.pin];
+    let tenant_head = tenant_head.head.to_hex();
+
+    for (journal, kind) in [(&database_path, "database"), (&tenant_path, "tenant")] {
+        let mut args = vec!["journal", "--journal", journal.as_str()];
+        args.extend(both);
+        if kind == "tenant" {
+            args.extend(["--database-journal", &database_path]);
+            args.extend(["--expected-head", &tenant_head]);
+        }
+        args.extend(["--format", "json"]);
+        let output = run_verify(&args);
+        assert!(
+            output.status.success(),
+            "{kind}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(summary["details"]["kind"], kind);
+        // Which key signed how many entries.
+        let signed_by = if kind == "database" {
+            json!({ old.key_id(): 1 })
+        } else {
+            json!({ attester().key_id(): fx.receipts.len() })
+        };
+        assert_eq!(
+            summary["details"]["attester_key_ids"], signed_by,
+            "{summary}"
+        );
+        // The --database-journal file's signers are reported apart.
+        let database_signed_by = if kind == "tenant" {
+            json!({ old.key_id(): 1 })
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            summary["details"]["database_attester_key_ids"], database_signed_by,
+            "{summary}"
+        );
+    }
+
+    // Only the current pin: the record signed by the retired key fails,
+    // alone or as the database journal of the tenant chain.
+    for args in [
+        vec!["journal", "--journal", &database_path],
+        vec![
+            "journal",
+            "--journal",
+            &tenant_path,
+            "--database-journal",
+            &database_path,
+        ],
+    ] {
+        let mut args = args;
+        args.extend(["--attester-pin", &fx.pin, "--format", "json"]);
+        let output = run_verify(&args);
+        assert_rejected(&output, "EVIDENCE_FAIL");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "signed by attester key {}, not by a pinned key",
+                old.key_id()
+            )),
+            "{stderr}"
+        );
+    }
+    // The receipts are not signed by the retired key alone.
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &tenant_path,
+        "--attester-pin",
+        &old_pin,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "AUTH_FAIL");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "receipt signed by attester key {}, not by a pinned key",
+            attester().key_id()
+        )),
+        "{stderr}"
+    );
+    // The same key twice is refused; other commands take one pin.
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &database_path,
+        "--attester-pin",
+        &old_pin,
+        "--attester-pin",
+        &old_pin,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "TRUST_STORE_FAIL");
+    let receipt = fx
+        .dir
+        .write("receipt.json", fx.receipts[0].to_json().unwrap());
+    let output = run_verify(&[
+        "evidence",
+        "--evidence",
+        &receipt,
+        "--attester-pin",
+        &fx.pin,
+        "--attester-pin",
+        &old_pin,
+        "--format",
+        "json",
+    ]);
+    assert!(!output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["code"], "USAGE");
+}
+
+/// B5-4: `--policy` on a database chain has no receipt to compare with, so
+/// it fails instead of reporting `policy_verified: true`.
+#[test]
+fn policy_is_refused_for_a_database_journal() {
+    let fx = Fixture::new();
+    let key = attester().public_key().unwrap();
+    let mut database = ChainExporter::new(&key);
+    database.push_record(&storage_record()).unwrap();
+    let (database_text, _) = database.finish().unwrap();
+    let database_path = fx.dir.write("database.jsonl", &database_text);
+    let policy = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/claude-code-hook/evidence/03-bundle-demo-reproducible/policy.json"
+    );
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &database_path,
+        "--attester-pin",
+        &fx.pin,
+        "--policy",
+        policy,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "INVALID_REQUEST");
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(summary["details"]["policy_verified"].is_null(), "{summary}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no policy can be verified"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Without --policy the same file verifies.
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &database_path,
+        "--attester-pin",
+        &fx.pin,
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["policy_verified"], false);
 }
 
 /// G7 test helper: declares every action type a rule names as Mission.

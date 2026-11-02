@@ -444,3 +444,172 @@ The `hook-evidence` job in `.github/workflows/assurance.yml` runs
 The `journal-chain` job runs `verify-chain.sh` on the three chains with the
 heads above (pinned in the workflow, so a change to a chain file alone fails
 the job) and also checks that set 04 is rejected against the head of set 05.
+
+## 7. Recording new sets 04 and 05 (HighAssurance)
+
+Sets 04 and 05 were recorded by the hook before it wrote HighAssurance
+receipts. Their receipts carry no signed decision time (`decided_at`), so
+`praetore-verify evidence --issuer-pins` checks their authorities and issuer
+pins at the verifier's clock, and they stop verifying on 2027-01-29, when
+those expire. With `--require-decision-time` they already fail
+(`DECISION_TIME_MISSING`). Receipts from the current hook record
+`decided_at`, and the authority is checked at that instant instead.
+
+This guide is for re-recording both sets from **new real Claude Code
+sessions**. It does not change the committed sets: 03, 04 and 05, and their
+pinned heads, stay in place until the new sets are reviewed. A separate PR
+then replaces them (step 6).
+
+### 1. Install the HighAssurance hook in the project
+
+From the root of a clone, with `P` the project the session runs in:
+
+```sh
+cargo build --release --locked --manifest-path examples/claude-code-hook/Cargo.toml
+cargo build --release --locked --package praetore-cli --package praetore-verify
+P=/path/to/project
+mkdir -p "$P/.claude/bin" "$P/.claude/hooks"
+cp examples/claude-code-hook/target/release/praetore-claude-hook "$P/.claude/bin/"
+cp examples/claude-code-hook/hook/praetore-hook.sh "$P/.claude/hooks/"
+```
+
+The wrapper always uses `$P/.claude/praetore`. A state created by an older
+binary has no `replay/` directory and the new hook denies every governed call
+with `hook state at ... predates HighAssurance receipts ... Run
+praetore-claude-hook init into a new directory`. Keep the old state (its
+receipts still verify with `verify`) and create a new one. Use one fresh
+state per set, so each bundle holds exactly one session:
+
+```sh
+[ -e "$P/.claude/praetore" ] && mv "$P/.claude/praetore" "$P/.claude/praetore-$(date +%Y%m%d-%H%M%S)"
+"$P/.claude/bin/praetore-claude-hook" init "$P/.claude/praetore" --root "$P"
+ls -d "$P/.claude/praetore/replay"   # the HighAssurance replay store
+```
+
+`init` issues authorities valid for 90 days (`--valid-days` up to 3650).
+Because each receipt is checked at its own `decided_at`, the receipts keep
+verifying after the authorities expire.
+
+`decided_at` is only as trustworthy as the attester key, which lives in the
+state directory under the same user account as the agents: whoever holds
+that key can sign any `decided_at`. Keep the state on a local filesystem
+(the replay store needs atomic exclusive create): not a network share and
+not a synced folder such as iCloud Desktop/Documents. A project under
+`~/Desktop` or `~/Documents` with iCloud sync enabled is a synced folder.
+
+Register the hook in `$P/.claude/settings.local.json` as in the example
+README, then restart Claude Code.
+
+### 2. Record the session
+
+Run the real session in Claude Code. When it ends, check the receipts with
+the hook (private state, local only):
+
+```sh
+"$P/.claude/bin/praetore-claude-hook" verify "$P/.claude/praetore"
+```
+
+The last lines must say `N receipts verified, 0 failed` and
+`N record a signed decision time (decided_at, HighAssurance)` with the same N.
+
+Each receipt signs the `tool_use_id` Claude Code sent
+(`context["claude.tool_use_id"]`). The replay store does not forge receipts:
+a signed request is claimed once and cannot be evaluated again. It does not
+deduplicate invocations: a tool call Claude Code delivers twice is evaluated
+twice and gets two receipts. `verify` then prints
+`WARNING: N tool_use_id values are signed in more than one receipt ...` with
+the ids and counts; this does not fail verification. Receipts without a
+`tool_use_id` are counted on their own line.
+
+The hook shows a denied tool call only as a reason class plus the evidence
+id. The class is a fixed function of signed fields of the receipt, so a
+verifier can recompute it from `decision.decided_by` and `context.profile`
+(checked in this order):
+
+| Signed field | Class shown |
+| --- | --- |
+| `context.profile` is `unregistered` | `unregistered` |
+| `decided_by` = engine guard `unclassified_action` | `unclassified` |
+| `decided_by` = any other engine guard (`authority_capability`, `missing_capability`, `authority_constraint`, `unbound_rule_capability`) or an unbound rule | `capability` |
+| `decided_by` = rule `deny-unanalyzable-command` | `unanalyzable_command, use simple commands` |
+| any other rule, or the default deny | `path` |
+
+The signed part is the `rule_id` (and `reason`, `Policy rule '...'
+matched`); the displayed phrase is not itself signed. In the default policy
+every rule or default deny in the last row is about paths; with a custom
+policy, a non-path Deny rule is also shown as `path`.
+
+### 3. Export
+
+Export to a directory **outside the repository** until the set is reviewed.
+The bundle holds only public material (receipts, attester public key, issuer
+pin, policy, index); no private key. Paths and commands in the receipts are
+signed content and cannot be redacted afterwards: review them before
+publishing.
+
+```sh
+OUT=/tmp/new-set-05     # or /tmp/new-set-04
+"$P/.claude/bin/praetore-claude-hook" export "$P/.claude/praetore" "$OUT"
+```
+
+Then move the state aside and `init` a new one before recording the other set
+(step 1).
+
+### 4. Verify with `--require-decision-time`
+
+```sh
+./examples/claude-code-hook/verify.sh "$OUT" --require-decision-time
+V=target/release/praetore-verify
+F="$(ls "$OUT/evidence" | head -1)"
+$V evidence --evidence "$OUT/evidence/$F" --attester-pin "$OUT/attester-public-key.hex" \
+  --issuer-pins "$OUT/issuer-pins.jsonl" --require-intent --require-decision-time \
+  --policy "$OUT/policy.json" --format json
+```
+
+`verify.sh` must end with `RESULTADO: todas las verificaciones dieron lo
+esperado` and print `OK: todos registran su hora de decisión firmada`. The
+single receipt must report `"authority_checked_at_source":"receipt_decided_at"`.
+Real output for a bundle regenerated by `demo.sh` with this hook (2026-11-01,
+macOS arm64):
+
+```text
+{"ok":true,"command":"evidence","code":"OK","details":{"authority_checked_at":"2026-11-01T22:33:57.883508Z","authority_checked_at_source":"receipt_decided_at","authority_verified":true,"current_authorization":false,"evidence_id":"c1962590-9c04-4232-9ac9-7a6f2951b580","intent_verified":true,"policy_verified":true,"receipt_action_type":"claude:read","receipt_decided_by":{"kind":"rule","rule_id":"allow-read-project"},"receipt_decision":"Allow","verification_scope":"historical_receipt_integrity_and_attestation"}}
+```
+
+### 5. Chain and head
+
+```sh
+target/release/praetore journal-export --receipts-dir "$OUT/evidence" \
+  --attester-pin "$OUT/attester-public-key.hex" --output "$OUT/journal-chain.jsonl"
+./examples/claude-code-hook/verify-chain.sh "$OUT" <head printed by journal-export>
+```
+
+`journal-export` prints `"head":"..."`. `verify-chain.sh` must end with
+`RESULTADO: cadena verificada (N entradas) y 5 copias manipuladas
+rechazadas`. Copy the head somewhere outside this repository (another
+repository, a public post, a signed message): the table in section 6 is not
+an external anchor.
+
+### 6. Review, then replace in a separate PR
+
+Share `$OUT` and its head for review first. Once reviewed, one PR (not this
+one) replaces the sets:
+
+- Write a `README.md` for each new set (what the session was, receipt counts
+  from `index.json`, anything that went wrong), as the current sets have.
+- Replace `04-sesion-real-bloqueada-web-fetch/` and `05-sesion-real-final/`
+  with the new bundles, under names that describe the new sessions, plus
+  their `journal-chain.jsonl`.
+- Publish the new heads: `HEAD_04` and `HEAD_05` in
+  `.github/workflows/assurance.yml`, the table in section 6, and the set
+  table in [README.md](README.md). Update the set paths in the workflow's
+  `Verify set 04/05` and `Chain of set 04/05` steps and in the wrong-head
+  check.
+- Add `--require-decision-time` to the CI `verify.sh` calls for the new sets.
+- Update the code that names the old sets:
+  `crates/praetore-verify/src/main.rs` (tests of the committed sets),
+  `crates/praetore-cli/src/journal_export.rs`,
+  `examples/claude-code-hook/src/main.rs`
+  (`committed_receipts_keep_their_signed_attribution`) and the repository
+  `README.md`.
+- Re-run sections 2 and 6 of this file and paste the new real outputs.

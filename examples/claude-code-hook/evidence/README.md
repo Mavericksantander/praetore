@@ -3,6 +3,13 @@
 Receipts recorded by `praetore-claude-hook` (this example) during real and demo
 sessions. How to check them, with real outputs: [VERIFY.md](VERIFY.md).
 
+None of these sets records a signed decision time (`decided_at`): they
+predate HighAssurance receipts, so `praetore-verify evidence
+--require-decision-time` rejects them (`DECISION_TIME_MISSING`), and without
+the flag 04 and 05 stop verifying on 2027-01-29, when their authorities and
+issuer pins expire. How to record new sets 04 and 05 with the HighAssurance
+hook: [VERIFY.md, section 7](VERIFY.md#7-recording-new-sets-04-and-05-highassurance).
+
 | Set | What it is | Receipts | Checked with |
 | --- | --- | --- | --- |
 | [`05-sesion-real-final/`](05-sesion-real-final/) | Real session in `~/Desktop/Paco&Ladrón` | 118: 117 Allow, 0 Deny, 1 RequireApproval | `praetore-verify` (CI) |
