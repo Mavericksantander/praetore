@@ -688,4 +688,48 @@ mod guard {
             assert!(error.to_string().contains("not by this user"), "{error}");
         }
     }
+
+    /// `acl_get_entry` failures fail closed: only `EINVAL` reads as "no
+    /// entries".
+    #[test]
+    fn acl_entry_status_fails_closed() {
+        use crate::high_assurance::first_entry_status;
+        assert!(first_entry_status(0, None).unwrap());
+        assert!(first_entry_status(0, Some(libc::ENOMEM)).unwrap());
+        assert!(!first_entry_status(-1, Some(libc::EINVAL)).unwrap());
+        for (status, errno) in [
+            (-1, Some(libc::ENOMEM)),
+            (-1, Some(libc::EIO)),
+            (-1, Some(libc::EPERM)),
+            (-1, None),
+            (1, None),
+            (-2, Some(libc::EINVAL)),
+        ] {
+            assert!(
+                first_entry_status(status, errno).is_err(),
+                "{status} {errno:?}"
+            );
+        }
+    }
+
+    /// The real call on macOS: no ACL, an ACL entry, and every entry
+    /// removed again.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn acl_check_reads_real_acls() {
+        use crate::high_assurance::acl::has_extended_entries;
+        let s = State::new("acl-real");
+        let dir = s.replay();
+        assert!(!has_extended_entries(&dir).unwrap());
+        super::add_acl(&dir);
+        assert!(has_extended_entries(&dir).unwrap());
+        let status = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(!has_extended_entries(&dir).unwrap());
+        println!("acl check on macOS: none, entry, removed: ok");
+    }
 }

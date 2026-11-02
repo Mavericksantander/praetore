@@ -134,6 +134,7 @@ jobs:
           for case in acl state-acl; do
             grep -q "replay store case $case: denied: .*extended ACL entries" <<<"$output" || { echo "::error::ACL case $case did not run"; exit 1; }
           done
+          grep -q "acl check on macOS: none, entry, removed: ok" <<<"$output" || { echo "::error::the real ACL check test did not run"; exit 1; }
 
   verifier-features:
     name: Offline verifiers build without receipt signing

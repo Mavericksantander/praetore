@@ -232,7 +232,7 @@ pub(crate) fn check_directory_owned_by(
 
 /// macOS extended ACLs (`chmod +a`), which the mode bits do not show.
 #[cfg(target_os = "macos")]
-mod acl {
+pub(crate) mod acl {
     use std::{
         ffi::CString,
         io,
@@ -256,7 +256,13 @@ mod acl {
     /// Whether `path` (not followed if it is a symlink) has at least one
     /// extended ACL entry. Any error other than "no ACL" is returned, so the
     /// caller fails closed when ACLs cannot be checked.
-    pub(super) fn has_extended_entries(path: &Path) -> io::Result<bool> {
+    ///
+    /// Path-based on purpose: every other check of the store (`lstat`,
+    /// owner, mode) and the claim create itself go by path (see the limits
+    /// on [`super::FileReplayGuard`]), so an fd opened only for this call
+    /// would not make the sequence atomic. `acl_get_link_np` does not follow
+    /// a symlink, so it reads the same inode `symlink_metadata` checked.
+    pub(crate) fn has_extended_entries(path: &Path) -> io::Result<bool> {
         let path = CString::new(path.as_os_str().as_bytes())?;
         // SAFETY: `path` is a valid NUL-terminated string for the call.
         let acl = unsafe { acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED) };
@@ -270,10 +276,30 @@ mod acl {
         }
         let mut entry = std::ptr::null_mut();
         // SAFETY: `acl` is a valid ACL returned above and freed only below.
-        let found = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
-        // SAFETY: `acl` came from acl_get_link_np and is not used afterwards.
+        let status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+        // errno is read right after the call, before acl_free can touch it.
+        let errno = io::Error::last_os_error().raw_os_error();
+        // SAFETY: `acl` came from acl_get_link_np; this is its only free, on
+        // the only non-null path, and neither `acl` nor `entry` is used after.
         unsafe { acl_free(acl) };
-        Ok(found)
+        super::first_entry_status(status, errno)
+    }
+}
+
+/// Classifies `acl_get_entry(acl, ACL_FIRST_ENTRY, ..)` on a non-null ACL
+/// (macOS convention): 0 means there is an entry; -1 with `EINVAL` means
+/// there is none; anything else (another errno, no errno, another return
+/// value) is an error, so the check fails closed instead of reading a
+/// failure as "no entries".
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn first_entry_status(status: i32, errno: Option<i32>) -> io::Result<bool> {
+    match (status, errno) {
+        (0, _) => Ok(true),
+        (-1, Some(libc::EINVAL)) => Ok(false),
+        (-1, Some(errno)) => Err(io::Error::from_raw_os_error(errno)),
+        _ => Err(io::Error::other(format!(
+            "acl_get_entry returned {status} (errno {errno:?})"
+        ))),
     }
 }
 
