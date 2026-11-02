@@ -1,0 +1,14 @@
+diff --git a/crates/praetore-core/src/safety_ingest.rs b/crates/praetore-core/src/safety_ingest.rs
+index cf9c438..49503a1 100644
+--- a/crates/praetore-core/src/safety_ingest.rs
++++ b/crates/praetore-core/src/safety_ingest.rs
+@@ -1576,7 +1576,8 @@ impl SafetyIngestor {
+         let expected = head.high_water.saturating_add(1);
+         let mut payloads = Vec::with_capacity(2);
+         let (status, original) = if seq >= expected {
+-            if seq > expected {
++            // G1 MUTANT: the ingester's gap check is removed (no loss record).
++            if false && seq > expected {
+                 let mut loss = self.payload(&chain, &head, SafetyRecordStatus::Loss, &now);
+                 loss.reason = Some(LossReason::SourceSeqGap.as_str().into());
+                 loss.lost_from = Some(expected);

@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **Post-hoc safety ingestion (G1, SAF-09.5).** Safety actions that an
+  executor of an AI-enabled system already ran can be recorded, isolated from
+  the decision path. New module `praetore_core::safety_ingest`:
+  `SafetyEvent` (signed by a `SafetySourceKey` under
+  `PRAETORE_SAFETY_EVENT_V1\0`: `source_id`, monotonic `source_seq`, the raw
+  action name, `occurred_at` by the source clock, optional bounded `params`,
+  `post_hoc: true`), `SafetyRecord` (signed by a `SafetyIngestKey` under
+  `PRAETORE_SAFETY_RECORD_V1\0`, chained per source inside the signed
+  payload; statuses `accepted`, `undeclared`, `invalid_name`, `duplicate`,
+  `conflict`, `late`, `rejected`, `loss`), the `SafetyIngestor` state machine
+  and `verify_safety_chain`. Key ids use `PRAETORE_SAFETY_SOURCE_KEY_V1\0ed25519\0`
+  and `PRAETORE_SAFETY_INGEST_KEY_V1\0ed25519\0`. New crate
+  `praetore-safety-client`: one non-blocking Unix datagram per event, no
+  retry; on failure the event is dropped and counted locally. New binary
+  `praetore-safety-ingest` (in `praetore-cli`; `run`, `doctor`,
+  `public-key`): its own process, database role and key; verifies the safety
+  namespace manifest and refuses any two roles with the same key at
+  startup, without a flag; a `0600` (or `0660` with a group) socket in a
+  directory it owns; a bounded queue whose overflow, like a database outage,
+  becomes a signed loss record; one ingester per tenant (advisory lock);
+  graceful shutdown. Migration `0016_safety_records`: table
+  `praetore.safety_records` (append-only by trigger, an insert trigger that
+  refuses a row that does not extend its chain or whose columns are not its
+  signed fields, forced row-level security per tenant) and the NOLOGIN group
+  `praetore_safety_ingest` (`USAGE` on the schema, `SELECT` on
+  `schema_migrations`, `SELECT`, `INSERT` on `safety_records`); creating it
+  needs `CREATEROLE` in the migrating role, checked before any migration
+  (`MigrationError::GroupRoleMissing`). `verify_safety_ingest_role_with`
+  checks the ingester's role, and `verify_runtime_role` now refuses a
+  gateway role that can insert safety records
+  (`RuntimeRoleError::RoleSeparation`). New export `praetore journal-export
+  --safety --tenant UUID --source ID --ingest-pin HEX_FILE` (verifies before
+  writing, never overwrites; reads `PRAETORE_SAFETY_DATABASE_URL`) and new
+  verifier command `praetore-verify safety-journal --journal JSONL
+  --ingest-pin HEX_FILE [--source-pins JSONL] [--expected-head HEX]`, which
+  checks record signatures, the chain, `source_seq` continuity (gaps covered
+  by loss records), duplicates and conflicts, event signatures and the head,
+  and reports the count of each status. Format:
+  `docs/proposals/safety-ingestion-jsonl.md`. New fuzz target
+  `safety_ingest`; new CI job `g1-mutation`. Transport v1 is local only;
+  HTTP with mutual TLS is future work.
 - **Safety namespace manifest (G2).** New module
   `praetore_core::safety_namespace`. `SafetyActionName::parse` is the one
   validator of `safety:*` names (exact ASCII prefix `safety:`, printable

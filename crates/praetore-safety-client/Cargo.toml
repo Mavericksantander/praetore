@@ -1,0 +1,21 @@
+[package]
+name = "praetore-safety-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+description = "Non-blocking client that reports post-hoc safety events to praetore-safety-ingest."
+
+[dependencies]
+praetore-core = { path = "../praetore-core" }
+
+[target.'cfg(unix)'.dependencies]
+# SO_SNDBUF on the client socket: on macOS a Unix datagram larger than the
+# send buffer (2048 bytes by default) is refused.
+rustix = { version = "1.1", default-features = false, features = ["std", "net"] }
+
+[dev-dependencies]
+time = "0.3"

@@ -470,6 +470,111 @@ the instance and the platform version: check them on your instance
 (`praetore doctor` lists every event trigger and why it is accepted or
 refused) before adding entries.
 
+## Post-hoc safety ingestion (G1)
+
+`praetore-safety-ingest` records safety actions that executors of
+AI-enabled systems already ran (SAF-09.5). Executors never wait for it; see
+[the threat model](threat-model.md#post-hoc-safety-ingestion-g1) for what a
+record shows and what it does not, and
+[the format](proposals/safety-ingestion-jsonl.md).
+
+### Deployment
+
+- Run one ingester per tenant, on the host of the executors it serves
+  (transport v1 is a local Unix datagram socket). A second ingester for the
+  same tenant refuses to start (PostgreSQL advisory lock per tenant).
+- Give it its own OS user. The socket directory must be owned by that user
+  and not writable by others; the socket is created `0600`, or `0660` with
+  `PRAETORE_SAFETY_SOCKET_GROUP=<gid>` for executors in that group (then the
+  directory may be group-writable but not world-writable). An existing
+  non-socket entry at the path is never replaced; a stale socket nobody
+  listens on is.
+- The ingester never migrates. Apply migrations (0016 creates
+  `praetore.safety_records` and the `praetore_safety_ingest` group) with the
+  owner role first, as for the gateway; the ingester checks that the schema
+  is current.
+- It fails closed at startup, for ingestion only: a missing or invalid
+  manifest, any two roles with the same key, an unsafe database role, a
+  schema that is not current, the tenant lock held elsewhere, or an unsafe
+  socket path. The executors are not affected; their events are dropped
+  locally (counted by the client) until an ingester runs, and the gap shows
+  as a loss record once events arrive again.
+- `praetore-safety-ingest doctor` runs the same checks (configuration,
+  manifest, distinct keys, database role, schema, tenant lock, socket path)
+  without binding the socket and exits non-zero if one fails.
+- `SIGTERM` or `SIGINT` stops reading, drains the queue, records pending
+  losses and removes the socket.
+
+| Variable | Meaning |
+| --- | --- |
+| `PRAETORE_SAFETY_SOCKET` | absolute socket path |
+| `PRAETORE_SAFETY_SOCKET_GROUP` | optional numeric gid for a `0660` socket |
+| `PRAETORE_SAFETY_TENANT_ID` | the tenant of every record |
+| `PRAETORE_SAFETY_INGEST_KEY_FILE` | the ingestion key, 64 lowercase hex characters; read with `O_NOFOLLOW`, owner-only, at most 128 bytes (a key in the environment is refused) |
+| `PRAETORE_SAFETY_MANIFEST_FILE` | the signed safety namespace manifest (`praetore policy safety-manifest`), canonical file form |
+| `PRAETORE_SAFETY_NAMESPACE_PIN_FILE` | the namespace public key the manifest must verify under |
+| `PRAETORE_SAFETY_ATTESTER_PIN_FILE` | the gateway's evidence attester public key, only to refuse it as another role's key |
+| `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id":"executor-1","public_key":"<64 hex>"}` per line, at most 256 sources, no key twice |
+| `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own role; the file form is read as an owner-only secret file. TLS `verify-full` is required unless the host is loopback or a Unix socket |
+| `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096); when full, messages are dropped and recorded as a `queue_overflow` loss |
+
+The runtime-role relaxations (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
+`PRAETORE_SCHEMA_OWNER`, `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`, ...)
+apply to the ingester's role check as they do to the gateway's.
+
+### Roles
+
+Migration 0016 grants the NOLOGIN group `praetore_safety_ingest`:
+
+| Object | Privileges |
+| --- | --- |
+| schema `praetore` | `USAGE` |
+| `schema_migrations` | `SELECT` (startup schema check) |
+| `safety_records` | `SELECT`, `INSERT` |
+
+Create the ingester's login role as a member of that group only, for
+example `CREATE ROLE praetore_safety LOGIN PASSWORD '...' IN ROLE
+praetore_safety_ingest;`. `verify_safety_ingest_role_with` refuses, at
+startup, a role that is privileged, owns or can create in `praetore`, is a
+member of `praetore_runtime`, or holds any privilege on another `praetore`
+table (column privileges included), plus the database-wide checks of the
+runtime role. The gateway's runtime role gets nothing on `safety_records`,
+and `verify_runtime_role` refuses one that can insert into it. Exports read
+with any role that may select from the table, for example the ingester's
+(`PRAETORE_SAFETY_DATABASE_URL`).
+
+### Keys
+
+| Key | Held by | Pinned by |
+| --- | --- | --- |
+| source key (one per `source_id`) | the executor | the ingester (`PRAETORE_SAFETY_SOURCE_PINS_FILE`) and the verifier (`--source-pins`) |
+| ingestion key | the ingester only | the exporter and the verifier (`--ingest-pin`) |
+| namespace key | whoever releases the policy (offline) | the ingester (`PRAETORE_SAFETY_NAMESPACE_PIN_FILE`) |
+
+Generate each as 32 random bytes in hex (for example `(umask 077; openssl
+rand -hex 32 > ingest.key)`); the public key is what you pin:
+`praetore-safety-ingest public-key ingest.key > ingest.pub` prints it for any
+of these secret key files (the file must be owner-only). A
+compromised source key lets its holder sign any event for that source:
+remove its pin, restart the ingester and treat that source's later records
+as untrusted. After rotating the ingestion key, records keep the old key's
+signature (the table is append-only): pin both keys when exporting and
+verifying (`--ingest-pin` is repeatable); the ingester logs a chain whose
+last record is signed by another key.
+
+### Export and verification
+
+```sh
+PRAETORE_SAFETY_DATABASE_URL=... praetore journal-export --safety \
+  --tenant <uuid> --source executor-1 --ingest-pin ingest.pub --output executor-1.jsonl
+praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin ingest.pub \
+  --source-pins sources.jsonl --expected-head <anchored head> --format json
+```
+
+Export `_unattributed` too (`--source _unattributed`): it holds the
+`rejected` inputs and the losses inside the ingester. Anchor heads outside
+the operator's control to detect truncation (SAF-13).
+
 ## Offline evidence and authority verification
 
 Build the verifier from the locked workspace:
@@ -577,6 +682,14 @@ required. A v3 attestation carries
 `crash_recovered`); unknown reasons fail with `RECEIPT_INVALID`, a reason that
 does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
+
+`praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin
+ingest.pub [--source-pins sources.jsonl] [--expected-head HEX] --format json`
+verifies one exported chain of post-hoc safety records (G1; see
+[Post-hoc safety ingestion](#post-hoc-safety-ingestion-g1)) and reports the
+count of each status (`accepted`, `undeclared`, `invalid_name`, `duplicate`,
+`conflict`, `late`, `rejected`, `loss`, lost events and dropped messages).
+It does not show that an action ran or that every action was reported.
 
 Receipt verification lives in the `praetore-receipt` crate, which has no
 server dependencies (no axum or tokio); `praetore-gateway` re-exports it.

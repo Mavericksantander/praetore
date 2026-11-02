@@ -71,4 +71,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "safety_ingest"
+path = "fuzz_targets/safety_ingest.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

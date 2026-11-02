@@ -1,0 +1,22 @@
+diff --git a/crates/praetore-core/src/safety_ingest.rs b/crates/praetore-core/src/safety_ingest.rs
+index cf9c438..cd93d8a 100644
+--- a/crates/praetore-core/src/safety_ingest.rs
++++ b/crates/praetore-core/src/safety_ingest.rs
+@@ -1554,9 +1554,14 @@ impl SafetyIngestor {
+         let event = match self.authenticate(input) {
+             Ok(event) => event,
+             Err(rejection) => {
+-                return self
+-                    .prepare_rejected(input, &rejection, &now)
+-                    .map_err(IngestError::Record);
++                // G1 MUTANT: input that does not verify is dropped silently.
++                let _ = rejection;
++                return Ok(PreparedRecords {
++                    chain: UNATTRIBUTED_CHAIN.to_owned(),
++                    records: Vec::new(),
++                    high_waters: Vec::new(),
++                    head: self.head(UNATTRIBUTED_CHAIN),
++                });
+             }
+         };
+         let chain = event.source_id.clone();

@@ -55,6 +55,38 @@ Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at e
 > [docs/policy-language.md](../policy-language.md#safety-namespace-manifest-g2)
 > and [the threat model](../threat-model.md#safety-namespace-manifest-g2).
 
+> **G1 update (post-hoc safety ingestion).** Implemented, transport v1
+> (local Unix domain socket):
+>
+> 1. `praetore-safety-ingest` is a separate process with its own database
+>    role (a member of `praetore_safety_ingest`, never of
+>    `praetore_runtime`), its own key (the ingestion key) and its own
+>    socket. Nothing on the decision path reads what it stores.
+> 2. Each event is signed by its source's key under
+>    `PRAETORE_SAFETY_EVENT_V1\0` and carries `source_id`, a monotonic
+>    `source_seq`, the raw action name, `occurred_at` (source clock),
+>    optional bounded `params` and `post_hoc: true`. The ingester verifies
+>    it against pinned source keys and classifies the name against the G2
+>    manifest: `accepted`, `undeclared` or `invalid_name`. Input that does
+>    not verify is stored as a signed `rejected` record, never dropped.
+> 3. Records are signed by the ingestion key under
+>    `PRAETORE_SAFETY_RECORD_V1\0` and chained per source inside the signed
+>    payload (`praetore.safety_records`, migration 0016, append-only, row
+>    level security per tenant). A `source_seq` gap is a signed loss record;
+>    a resend is `duplicate`, another event with a used `source_seq` is
+>    `conflict`.
+> 4. The client (`praetore-safety-client`) never blocks: one non-blocking
+>    `sendto` per event, no retry; on failure the event is dropped locally
+>    and counted. An ingester that is down, slow or misconfigured does not
+>    delay or condition the executor or its failsafe. The ingester itself
+>    fails closed at startup (missing or invalid manifest, shared keys,
+>    unsafe role), which affects only ingestion.
+> 5. `praetore journal-export --safety` exports one source's chain and
+>    `praetore-verify safety-journal` verifies it.
+>
+> Format: [safety-ingestion-jsonl.md](safety-ingestion-jsonl.md). Network
+> transport (HTTP with mutual TLS) is future work.
+
 **Scope (PROPUESTA, superseded by G7 for the classification):** an optional,
 opt-in extension that lives outside the core. It does not change
 `praetore-core`, the gateway crates, their APIs or their semantics, and it is
@@ -66,14 +98,16 @@ nothing in PRÆTORE changes. Break-glass (§2) is still only this proposal.
 - **SAF-09.3 (implemented by G7).** Every mission action requires a
   synchronously signed decision before it runs. Fail closed: no decision
   means no execution.
-- **SAF-09.5 (partly implemented: G2 done, G1 pending).** Safety-action
+- **SAF-09.5 (implemented: G2 and G1, transport v1).** Safety-action
   ingestion is isolated from the decision path, with its own process,
   credentials and key. An ingestion failure does not affect the executor.
   G2 provides the shared name validator and the signed safety namespace
-  manifest the ingestion process will check names against; the ingestion
-  process itself (G1) is a separate change. Until it exists, PRÆTORE keeps
-  no record of safety actions: the G7 entry points refuse them with
-  `SAFETY_ACTION_NOT_GOVERNED` and write nothing.
+  manifest; G1 provides `praetore-safety-ingest`, which records safety
+  actions after the fact (post-hoc) as signed records chained per source,
+  over a local Unix socket that the executor's client never waits on. The
+  G7 entry points still refuse safety actions with
+  `SAFETY_ACTION_NOT_GOVERNED` and write nothing: recording is the
+  executor's report to the ingester, not a decision.
 
 What G7 does not do: it does not decide or record safety actions (only
 `praetore-mcp`, as a transparent proxy, passes a declared one through to the

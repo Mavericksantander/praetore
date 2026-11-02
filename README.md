@@ -441,8 +441,12 @@ code or test that backs it. None of it is a security or production guarantee.
   `Safety` (load-time typed errors). The gateway HTTP API, the
   `praetore-mcp` gate and the Claude Code hook classify first and answer a
   safety action with `SAFETY_ACTION_NOT_GOVERNED` before any evaluation,
-  replay claim, journal write or signature. PRÆTORE does not record safety
-  actions yet (SAF-09.5, pending). Format 1 policies are rejected for
+  replay claim, journal write or signature. Safety actions are recorded
+  only after the fact, by a separate ingestion process
+  (`praetore-safety-ingest`, SAF-09.5, G1: own process, database role and
+  key; the executor's client never waits for it; see
+  [docs/proposals/safety-ingestion-jsonl.md](docs/proposals/safety-ingestion-jsonl.md)).
+  Format 1 policies are rejected for
   evaluation; evidence that recorded a format 1 digest still verifies against
   its format 1 document (`praetore-verify --policy`, `RecordedPolicy`).
   `praetore policy classify --policy <path>` proposes the table. See

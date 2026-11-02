@@ -14,11 +14,12 @@ mod connection;
 mod execution;
 mod migrations;
 mod observability;
+mod safety;
 
 pub use connection::{
     DatabaseConnector, DatabaseUrlError, RuntimeRoleError, RuntimeRoleOptions, RustlsConnect,
     TrustedSecurityDefiner, describe_trusted_security_definer, runtime_role_members,
-    verify_runtime_role, verify_runtime_role_with,
+    verify_runtime_role, verify_runtime_role_with, verify_safety_ingest_role_with,
 };
 pub use execution::PostgresExecutionJournal;
 pub use migrations::{
@@ -31,6 +32,7 @@ pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,
 };
+pub use safety::{PostgresSafetyStore, SafetyStoreError, StoredHead, read_safety_chain};
 
 pub struct PostgresReplayGuard {
     client: Mutex<Client>,

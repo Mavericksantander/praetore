@@ -124,8 +124,10 @@ Trust boundaries are explicit:
 * With a loaded policy, a declared `Safety` action is answered before any
   evaluation, replay claim, journal write or signature, so an unavailable
   journal does not hold it. `praetore-mcp` forwards it to the wrapped server
-  without a receipt in both modes. PRÆTORE keeps no record of safety actions
-  until a separate ingestion path exists (SAF-09.5).
+  without a receipt in both modes. Safety actions are recorded only after
+  the fact, by the separate ingestion path (SAF-09.5, G1; see
+  [Post-hoc safety ingestion (G1)](#post-hoc-safety-ingestion-g1)), never
+  on the decision path.
 * An undeclared `safety:*` action is refused at every entry point.
 * Upgrades: a release with G7 does not load a policy format 1 document.
   State written before G7 refuses every tool call after the upgrade until
@@ -231,7 +233,7 @@ and in another role (`SameKeyForBothRoles`, `SAFETY_MANIFEST_SAME_KEY`).
 it for each `--other-pin` (repeatable: the attester and every issuer key;
 `--attester-pin` is an alias). There the check is opt-in, because an
 offline command does not know a deployment's other keys. The ingestion path
-(G1) and any online loader that holds the namespace key or pin together
+(`praetore-safety-ingest`, G1) and any online loader that holds the namespace key or pin together
 with the attester or issuer key must enforce it at startup, without a flag.
 
 The namespace key file is opened once with `O_NOFOLLOW | O_NONBLOCK |
@@ -268,7 +270,7 @@ removing a temporary name can leave a `.tmp` file (not on Linux with
 
 Names: `SafetyActionName::parse` is shared by policy loading and the
 manifest, so a name the policy accepts is exactly a name the manifest and
-the future ingestion path accept. The entry points keep the G7 prefix rule
+the ingestion path accept. The entry points keep the G7 prefix rule
 and do not call `parse`; a name that starts with `safety:` but fails it can
 never be declared, so it fails closed:
 
@@ -277,11 +279,75 @@ never be declared, so it fails closed:
 | Gateway HTTP API | 422 `safety_action_not_governed`, no receipt (the same answer as every `safety:` name: it depends only on the public prefix rule) |
 | `praetore-mcp` gate | signed DENY, `unclassified`; nothing forwarded |
 | Claude Code hook | signed DENY, `unclassified` |
-| Ingestion path (G1, not built) | must record it with the raw input (bounded, escaped for display) and the reason `invalid_name`, never drop it |
+| Ingestion path (`praetore-safety-ingest`, G1) | records it, never drops it: status `invalid_name`, the error code as `reason`, the raw name kept exactly in the signed event, the error text bounded and escaped as `detail` |
 
 Text output escapes invisible characters (a policy id may contain them).
 JSON output and the manifest file keep the exact bytes, by design: a
 consumer that shows JSON output to a person must escape it itself.
+
+### Post-hoc safety ingestion (G1)
+
+`praetore-safety-ingest` records safety actions after the fact (SAF-09.5).
+The executor of an AI-enabled system runs the action without waiting for
+PRÆTORE and then reports it with `praetore-safety-client`: one non-blocking
+datagram on a local Unix socket, no retry. Format and verification:
+[docs/proposals/safety-ingestion-jsonl.md](proposals/safety-ingestion-jsonl.md).
+
+Isolation from the decision path:
+
+* Its own process, database role (a LOGIN member of
+  `praetore_safety_ingest`; `verify_safety_ingest_role_with` refuses a role
+  that is also a member of `praetore_runtime` or holds any privilege on
+  another `praetore` table, and `verify_runtime_role` refuses a gateway role
+  that can insert safety records), key (the ingestion key, distinct from the
+  attester, namespace and source keys, checked at startup without a flag)
+  and socket.
+* The client never blocks: a send is one non-blocking `sendto`. With no
+  ingester, a dead one or one whose queue is full, it returns at once
+  (measured in `crates/praetore-safety-client/tests/nonblocking.rs`) and the
+  event is dropped and counted locally. Nothing in the executor's failsafe
+  waits on the ingester or the database.
+* The ingester fails closed at startup, for ingestion only: a missing or
+  invalid manifest, a key shared by two roles, an unsafe database role, a
+  schema that is not current, another ingester holding the tenant lock or an
+  unsafe socket path makes it refuse to start. Executors keep working; their
+  events are dropped locally until an ingester runs.
+
+What a verified chain shows: the holder of the ingestion key recorded these
+records, in this order, under this tenant; with source pins, each event was
+signed by its source's key; every `source_seq` up to the high-water mark is
+an event or covered by a signed loss record; input that did not verify is a
+signed `rejected` record (bounded, escaped raw copy), not a silent drop.
+
+What it does not show:
+
+* **That an action ran, when, or what it did.** Events are post-hoc
+  statements by the source. `occurred_at` is the source's clock;
+  `recorded_at` is the ingester's. PRÆTORE decided nothing.
+* **That every action was reported.** An executor can stay silent. An event
+  the client dropped (no ingester, full queue) is visible only as a gap
+  when a later event of that source arrives; the last events before a
+  source stops are invisible. Messages dropped inside the ingester (full
+  queue, database unavailable) are counted in an unattributed loss record,
+  not attributed to a source.
+* **Anything after a source key is compromised.** Its holder can sign any
+  event for that source; reusing positions shows as `conflict`, new
+  positions look legitimate.
+* **Completeness against truncation or rewriting.** A prefix of a valid
+  chain verifies; only `--expected-head` with a head anchored outside the
+  operator's control detects truncation. The holder of the ingestion key
+  can rebuild a whole chain. The table is append-only by trigger and the
+  insert trigger refuses a row that does not extend its chain, but the
+  schema owner and superusers are trusted, as for the journal.
+* **Who wrote to the socket.** Authentication is the source signature;
+  anyone who can write to the socket (mode `0600`, or `0660` with a group)
+  can fill the unattributed chain with `rejected` records.
+
+Row-level security uses the same `tenant_isolation` policy as the journal.
+One ingester serves one tenant (advisory lock per tenant). Like the
+gateway, it sets the tenant context itself: RLS keeps each transaction to
+the tenant it names, but does not stop a compromised ingester from naming
+another tenant.
 
 ## Invariants and traceability
 
@@ -305,6 +371,11 @@ consumer that shows JSON output to a person must escape it itself.
 | CLI emits stable machine result and failure status | verifier `Summary` and exit handling | `verify_cli` integration tests | Input/output transport is operator-controlled |
 | One validator of `safety:*` names (G2) | `SafetyActionName::parse`, used by `Policy::validate` for every `Safety` entry and by `SafetyNamespaceManifest` | `safety_action_name_rules_are_pinned`, `policy_loading_accepts_a_safety_entry_exactly_when_the_shared_validator_does` | Homoglyph / invisible-character names |
 | A safety namespace manifest verifies only under its pinned key and domain (G2) | `SafetyNamespaceManifest::verify`, `SAFETY_NAMESPACE_DOMAIN` | `tampering_with_any_signed_field_is_rejected`, `manifest_signatures_do_not_cross_domains`, `no_domain_is_a_prefix_of_another` | Namespace forgery / cross-protocol signature reuse |
+| Safety ingestion never blocks the executor (G1) | `SafetyClient::send_bytes`: one non-blocking `sendto`, no retry | `no_ingester_returns_at_once_and_counts_the_drop`, `a_stalled_ingester_with_a_full_queue_never_blocks_the_sender`, `postgres_safety_ingest_records_overflow_and_storage_loss_without_blocking_the_client` | Denial of service of the failsafe through ingestion |
+| Input that does not verify is recorded, never dropped (G1) | `SafetyIngestor::prepare` (`rejected` records) | `input_that_does_not_verify_is_recorded_as_rejected_never_dropped`; mutant `scripts/g1-mutants/rejected.patch` | Silent loss / repudiation |
+| A `source_seq` gap is a signed loss record, and a gap without one fails verification (G1) | `SafetyIngestor::prepare`, `verify_safety_chain` | `a_source_seq_gap_is_recorded_as_a_signed_loss_record`, `a_gap_without_a_loss_record_fails_even_when_signed`; mutants `ingest-gap`, `verify-gap` | Deletion of events |
+| An edited, removed or reordered safety record fails verification (G1) | record signature and in-payload chain (`chain_seq`, `prev_record_hash`) | `an_edited_removed_or_reordered_record_fails_verification`, `postgres_safety_ingest_end_to_end` | Journal tampering |
+| The ingester's role is separate from the gateway's (G1) | `verify_safety_ingest_role_with`, `verify_runtime_role` | `postgres_safety_ingest_role_is_separate_from_the_runtime_role` | Privilege confusion |
 | Python verification is Rust-backed | `praetore-python` PyO3 crate calls core evidence APIs | Python `test_verify.py` good, tampered, and wrong-key fixtures | Python API intentionally has no evaluate or policy features |
 | Parser surfaces are fuzzed in bounded CI smoke | `fuzz/fuzz_targets` and seed corpora | Each target is run by `fuzz-smoke` workflow job | A short smoke run is not exhaustive fuzz coverage |
 | Build and dependency controls run in CI | `.github/workflows/assurance.yml` | `rust`, `audit`, `fuzz-smoke`, `python-verify`, `sbom`, and `release-integrity` jobs | Hosted CI and action supply chain remain trusted dependencies |

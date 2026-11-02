@@ -85,6 +85,39 @@ policy, time and key give the same bytes. Verify it with
 namespace.pin [--policy ./policy.json]`. The manifest authorizes nothing;
 see [docs/policy-language.md](../../docs/policy-language.md#safety-namespace-manifest-g2).
 
+### Post-hoc safety ingestion (G1)
+
+`praetore-safety-ingest` (a second binary of this crate) records safety
+actions that executors already ran, reported with `praetore-safety-client`
+over a local Unix socket. It runs as its own process, with its own database
+role (a LOGIN member of `praetore_safety_ingest`) and its own key, and is
+configured through `PRAETORE_SAFETY_*` variables (see
+[docs/operations.md](../../docs/operations.md#post-hoc-safety-ingestion-g1)):
+
+```sh
+praetore-safety-ingest public-key ingest.key > ingest.pub   # the value to pin
+praetore-safety-ingest doctor                               # startup checks only
+praetore-safety-ingest run                                  # the default
+```
+
+It verifies each event against the pinned source keys, classifies its name
+against the signed safety namespace manifest (`accepted`, `undeclared`,
+`invalid_name`), stores input that does not verify as a signed `rejected`
+record, and records a `source_seq` gap as a signed loss record. It refuses
+to start on a missing or invalid manifest, any two roles sharing a key, or
+an unsafe database role; executors are not affected by that.
+
+```sh
+PRAETORE_SAFETY_DATABASE_URL=... praetore journal-export --safety \
+  --tenant <uuid> --source executor-1 --ingest-pin ingest.pub --output executor-1.jsonl
+praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin ingest.pub \
+  --source-pins sources.jsonl [--expected-head <hex>]
+```
+
+exports one source's chain (or `--source _unattributed`) after verifying it,
+never overwriting, and verifies it offline. Format:
+[docs/proposals/safety-ingestion-jsonl.md](../../docs/proposals/safety-ingestion-jsonl.md).
+
 ### Human approval
 
 `init` also creates a local human approver key (`approver.key`, owner-only)

@@ -51,6 +51,16 @@ jobs:
           run "test result: ok\. 21 passed" cargo test --locked -p praetore-core --test safety_namespace
           run "test result: ok\. 7 passed" cargo test --locked -p praetore-cli --test safety_manifest_cli
           run "test result: ok\. 8 passed" cargo test --locked -p praetore-verify --test safety_manifest_cli
+          # G1: post-hoc safety ingestion (core types and chain verifier, the
+          # non-blocking client, praetore-safety-ingest, journal-export
+          # --safety and praetore-verify safety-journal). The PostgreSQL
+          # end-to-end tests run in the replay-postgres job.
+          run "test result: ok\. 21 passed" cargo test --locked -p praetore-core --lib safety_ingest
+          run "test result: ok\. 5 passed" \
+            cargo test --locked -p praetore-safety-client --test nonblocking -- --nocapture
+          run "test result: ok\. 2 passed" cargo test --locked -p praetore-cli --bin praetore-safety-ingest -- --skip secret_file::
+          run "test result: ok\. 1 passed" cargo test --locked -p praetore-cli --bin praetore safety_export
+          run "test result: ok\. 2 passed" cargo test --locked -p praetore-verify --test safety_journal_cli
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"
@@ -208,6 +218,7 @@ jobs:
       - run: cargo +nightly fuzz run --fuzz-dir fuzz engine_evaluate_high_assurance -- -max_total_time=10
       - run: cargo +nightly fuzz run --fuzz-dir fuzz path_prefix -- -max_total_time=10
       - run: cargo +nightly fuzz run --fuzz-dir fuzz safety_namespace -- -max_total_time=10
+      - run: cargo +nightly fuzz run --fuzz-dir fuzz safety_ingest -- -max_total_time=10
 
   python-verify:
     name: Python evidence verification
@@ -314,6 +325,18 @@ jobs:
       # runtime tests to fail on every mutant; exits 1 if one survives.
       - run: ./scripts/g7-mutation-test.sh
 
+  g1-mutation:
+    name: G1 mutation test (gap check and rejected records removed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Applies scripts/g1-mutants/*.patch one at a time (the ingester's gap
+      # check, the verifier's gap check, the rejected-record path) and
+      # requires the G1 tests to fail on every mutant; exits 1 if one
+      # survives.
+      - run: ./scripts/g1-mutation-test.sh
+
   replay-postgres:
     name: PostgreSQL replay guard integration
     runs-on: ubuntu-latest
@@ -363,6 +386,26 @@ jobs:
             read -r flag target name <<<"$test"
             echo "::group::$name"
             output="$(cargo test -p praetore-cli --locked "$flag" "$target" -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          done
+      - name: G1 safety ingestion against PostgreSQL (table, roles, binary, export, verify)
+        run: |
+          set -euo pipefail
+          # The end-to-end tests run target/debug/praetore-verify (built in
+          # the journal-export step above) and the praetore-safety-ingest
+          # binary; each uses its own scratch database and login role.
+          cargo build -p praetore-verify --locked
+          for test in \
+            "praetore-replay-postgres --test postgres g1_safety::postgres_safety_records_are_chained_append_only_and_tenant_isolated" \
+            "praetore-replay-postgres --test postgres g1_safety::postgres_safety_ingest_role_is_separate_from_the_runtime_role" \
+            "praetore-cli --test safety_ingest_postgres postgres_safety_ingest_end_to_end" \
+            "praetore-cli --test safety_ingest_postgres postgres_safety_ingest_refuses_to_start_on_a_bad_manifest_or_a_shared_key" \
+            "praetore-cli --test safety_ingest_postgres postgres_safety_ingest_records_overflow_and_storage_loss_without_blocking_the_client"; do
+            read -r package flag target name <<<"$test"
+            echo "::group::$name"
+            output="$(cargo test -p "$package" --locked "$flag" "$target" -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; exit 1; }
             echo "$output"
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
@@ -548,6 +591,7 @@ jobs:
       - run: cargo cyclonedx --manifest-path crates/praetore-python/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-replay-postgres/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path crates/praetore-gateway/Cargo.toml --format json --all
+      - run: cargo cyclonedx --manifest-path crates/praetore-safety-client/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path fuzz/Cargo.toml --format json --all
       - run: find crates fuzz -name '*.cdx.json' -print
       - uses: actions/upload-artifact@v4
@@ -688,6 +732,7 @@ jobs:
       - python-verify
       - claude-code-hook-example
       - g7-mutation
+      - g1-mutation
       - replay-postgres
       - sbom
       - release-integrity

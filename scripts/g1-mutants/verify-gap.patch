@@ -1,0 +1,14 @@
+diff --git a/crates/praetore-core/src/safety_ingest.rs b/crates/praetore-core/src/safety_ingest.rs
+index cf9c438..e4e5c1b 100644
+--- a/crates/praetore-core/src/safety_ingest.rs
++++ b/crates/praetore-core/src/safety_ingest.rs
+@@ -1957,7 +1957,8 @@ pub fn verify_safety_chain(
+                     return Err(SafetyChainError::WrongChain { line });
+                 }
+                 let seq = event_seq.unwrap_or_default();
+-                if seq != high_water + 1 {
++                // G1 MUTANT: the verifier's gap check is removed.
++                if false && seq != high_water + 1 {
+                     return Err(SafetyChainError::SequenceGap {
+                         line,
+                         expected: high_water + 1,

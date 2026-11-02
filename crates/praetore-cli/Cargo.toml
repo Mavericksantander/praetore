@@ -13,6 +13,12 @@ description = "Local PostgreSQL-backed PRÆTORE gateway demo CLI."
 name = "praetore"
 path = "src/main.rs"
 
+# G1 (SAF-09.5): post-hoc safety ingestion, a separate process with its own
+# database role and key.
+[[bin]]
+name = "praetore-safety-ingest"
+path = "src/safety_ingest_main.rs"
+
 [dependencies]
 ed25519-dalek = "2"
 hex = "0.4.3"
@@ -25,7 +31,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = "1.18"
@@ -33,4 +39,7 @@ uuid = "1.18"
 [target.'cfg(unix)'.dependencies]
 # G2: open secret files with O_NOFOLLOW and check the open descriptor
 # (`secret_file.rs`), and the effective uid for the owner check.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "net", "process"] }
+
+[dev-dependencies]
+praetore-safety-client = { path = "../praetore-safety-client" }

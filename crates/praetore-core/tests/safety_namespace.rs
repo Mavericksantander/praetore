@@ -14,6 +14,10 @@ use praetore_core::{
     PolicyEffect, PolicyRule, PraetoreError, SafetyActionName, SafetyNameError,
     SafetyNamespaceError, SafetyNamespaceKey, SafetyNamespaceManifest, VerifiedPublicKey,
     canonical::JsonError,
+    safety_ingest::{
+        SAFETY_EVENT_DOMAIN, SAFETY_INGEST_KEY_ID_DOMAIN, SAFETY_RECORD_DOMAIN,
+        SAFETY_SOURCE_KEY_ID_DOMAIN,
+    },
     safety_namespace::{
         MAX_SAFETY_ACTION_NAME_BYTES, SAFETY_NAMESPACE_DOMAIN, SAFETY_NAMESPACE_KEY_ID_DOMAIN,
         safety_namespace_key_id,
@@ -853,6 +857,11 @@ fn no_domain_is_a_prefix_of_another() {
         b"PRAETORE_HEAD_STATEMENT_V1\0",
         SAFETY_NAMESPACE_DOMAIN,
         SAFETY_NAMESPACE_KEY_ID_DOMAIN,
+        // G1: safety events, safety records and their key ids.
+        SAFETY_EVENT_DOMAIN,
+        SAFETY_RECORD_DOMAIN,
+        SAFETY_SOURCE_KEY_ID_DOMAIN,
+        SAFETY_INGEST_KEY_ID_DOMAIN,
     ] {
         assert!(
             domains.literals.contains(known),
@@ -864,6 +873,14 @@ fn no_domain_is_a_prefix_of_another() {
     // written without a NUL.
     assert!(domains.names.contains("PRAETORE_HEAD_STATEMENT_SIG_V1"));
     assert!(domains.names.contains("PRAETORE_SAFETY_NAMESPACE_V1"));
+    for name in [
+        "PRAETORE_SAFETY_EVENT_V1",
+        "PRAETORE_SAFETY_RECORD_V1",
+        "PRAETORE_SAFETY_SOURCE_KEY_V1",
+        "PRAETORE_SAFETY_INGEST_KEY_V1",
+    ] {
+        assert!(domains.names.contains(name), "{name} not found by the scan");
+    }
     for a in &domains.literals {
         for b in &domains.literals {
             assert!(

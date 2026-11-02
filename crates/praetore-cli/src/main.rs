@@ -31,6 +31,7 @@ mod journal_export;
 mod new_file;
 mod policy_classify;
 mod policy_safety_manifest;
+mod safety_export;
 mod secret_file;
 
 const POLICY_FILE: &str = "policy.json";
@@ -290,7 +291,14 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             ensure_no_arguments(args)?;
             dispatch_approved(Path::new(&directory), &execution_id, agent.as_deref())
         }
-        "journal-export" => journal_export::run(journal_export::parse(args)?),
+        "journal-export" => {
+            let args: Vec<String> = args.collect();
+            if args.iter().any(|arg| arg == "--safety") {
+                safety_export::run(safety_export::parse(args.into_iter())?)
+            } else {
+                journal_export::run(journal_export::parse(args.into_iter())?)
+            }
+        }
         "policy" => match args.next().as_deref() {
             Some("classify") => policy_classify::run(&policy_classify::parse(args)?),
             Some("safety-manifest") => {
@@ -342,6 +350,8 @@ fn print_usage() {
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
            praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> [--attester-pin <hex file> ...] --output <new file>\n\
+           praetore journal-export --safety --tenant <uuid> --source <id> --ingest-pin <hex file> [--ingest-pin <hex file> ...] [--source-pins <jsonl>] --output <new file>\n\
+             (one safety chain of praetore-safety-ingest; reads PRAETORE_SAFETY_DATABASE_URL)\n\
            praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\
            praetore policy safety-manifest --policy <path> --key <hex file> --output <new file> [--other-pin <hex file>]... [--issued-at <rfc3339>] [--format json|text]\n\
              (signs the policy's safety namespace manifest; never overwrites)\n\

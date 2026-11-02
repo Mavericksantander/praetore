@@ -8,6 +8,7 @@ use praetore_core::{
         ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES, verify_journal_report,
     },
     policy::{Policy, RecordedPolicy},
+    safety_ingest::{MAX_SAFETY_CHAIN_BYTES, SourcePins, verify_safety_chain},
     safety_namespace::SafetyNamespaceManifest,
 };
 use serde::Serialize;
@@ -93,13 +94,20 @@ enum Command {
         policy: Option<PathBuf>,
         other_pins: Vec<PathBuf>,
     },
+    /// G1: one exported safety chain.
+    SafetyJournal {
+        journal: PathBuf,
+        ingest_pins: Vec<PathBuf>,
+        source_pins: Option<PathBuf>,
+        expected_head: Option<String>,
+    },
 }
 
 fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n  praetore-verify safety-manifest --manifest PATH --pin HEX_FILE [--policy PATH] [--other-pin HEX_FILE]... [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (written before G7) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. --attester-pin may be repeated (up to 16 keys) for a chain that spans an attester key rotation: each entry must be signed by the pinned key its key id names, so pin the retired key as well as the current one. --policy applies to receipts; with a database journal it fails with INVALID_REQUEST. It does not establish current authorization, freshness, replay state, or permission to execute an action. The safety-manifest command verifies a safety namespace manifest (from `praetore policy safety-manifest`) against the pinned namespace key; with --policy (format 2) it also requires the manifest to match that policy exactly (id, version, digest and the list of Safety names); each --other-pin (repeatable, alias --attester-pin) names the public key of another role (the attester or an issuer), and a namespace pin equal to any of them is refused (SAFETY_MANIFEST_SAME_KEY). The manifest file must be its canonical JSON followed by one newline. It shows namespace agreement at that policy digest; it authorizes nothing.\n\nAttester and namespace pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n  praetore-verify safety-manifest --manifest PATH --pin HEX_FILE [--policy PATH] [--other-pin HEX_FILE]... [--format json|text]\n  praetore-verify safety-journal --journal JSONL --ingest-pin HEX_FILE [--ingest-pin HEX_FILE ...] [--source-pins JSONL] [--expected-head HEX] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (written before G7) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head. --attester-pin may be repeated (up to 16 keys) for a chain that spans an attester key rotation: each entry must be signed by the pinned key its key id names, so pin the retired key as well as the current one. --policy applies to receipts; with a database journal it fails with INVALID_REQUEST. It does not establish current authorization, freshness, replay state, or permission to execute an action. The safety-manifest command verifies a safety namespace manifest (from `praetore policy safety-manifest`) against the pinned namespace key; with --policy (format 2) it also requires the manifest to match that policy exactly (id, version, digest and the list of Safety names); each --other-pin (repeatable, alias --attester-pin) names the public key of another role (the attester or an issuer), and a namespace pin equal to any of them is refused (SAFETY_MANIFEST_SAME_KEY). The manifest file must be its canonical JSON followed by one newline. It shows namespace agreement at that policy digest; it authorizes nothing. The safety-journal command verifies one exported chain of post-hoc safety records (from `praetore journal-export --safety`, see docs/proposals/safety-ingestion-jsonl.md): every record's hash and signature against the pinned ingestion key(s), the hash chain (chain_seq, prev_record_hash), source_seq continuity (every gap covered by a signed loss record), the consistency of duplicate, conflict and late records, and with --source-pins every event's signature against its source key; with --expected-head the last record_hash must equal that value. It reports the count of each status. It shows what the ingester recorded, after the fact and by the source's clock; it does not show that an action ran or that nothing else ran, and without --expected-head a truncated chain still verifies.\n\nAttester and namespace pin files contain a lowercase 32-byte Ed25519 public-key hex value. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -220,6 +228,14 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             }
             // `journal` takes several attester pins (a chain that spans a
             // key rotation); every other flag is given at most once.
+            if command_name == "safety-journal" && flag == "--ingest-pin" {
+                if journal_pins.len() == MAX_ATTESTER_PINS {
+                    return Err(CliError::usage());
+                }
+                journal_pins.push(PathBuf::from(value));
+                index += 1;
+                continue;
+            }
             if command_name == "journal" && flag == "--attester-pin" {
                 if journal_pins.len() == MAX_ATTESTER_PINS {
                     return Err(CliError::usage());
@@ -365,6 +381,23 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 pin: path("--pin")?,
                 policy: optional_path("--policy"),
                 other_pins: std::mem::take(&mut other_pins),
+            }
+        }
+        "safety-journal" => {
+            if values.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "--journal" | "--source-pins" | "--expected-head"
+                )
+            }) || journal_pins.is_empty()
+            {
+                return Err(CliError::usage());
+            }
+            Command::SafetyJournal {
+                journal: path("--journal")?,
+                ingest_pins: std::mem::take(&mut journal_pins),
+                source_pins: optional_path("--source-pins"),
+                expected_head: values.get("--expected-head").and_then(Option::clone),
             }
         }
         _ => return Err(CliError::usage()),
@@ -707,6 +740,21 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             )?;
             "safety-manifest"
         }
+        Command::SafetyJournal {
+            journal,
+            ingest_pins,
+            source_pins,
+            expected_head,
+        } => {
+            verify_safety_journal(
+                &journal,
+                &ingest_pins,
+                source_pins.as_deref(),
+                expected_head.as_deref(),
+                &mut details,
+            )?;
+            "safety-journal"
+        }
     };
     Ok(Summary {
         ok: true,
@@ -714,6 +762,77 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
         code: "OK",
         details,
     })
+}
+
+/// G1: verifies one exported safety chain (see
+/// `praetore_core::safety_ingest::verify_safety_chain`) and reports its
+/// counts. The reason for a failure goes to stderr, escaped for display.
+fn verify_safety_journal(
+    journal: &Path,
+    ingest_pins: &[PathBuf],
+    source_pins: Option<&Path>,
+    expected_head: Option<&str>,
+    details: &mut BTreeMap<String, serde_json::Value>,
+) -> Result<(), CliError> {
+    if let Some(head) = expected_head
+        && (head.len() != 64 || !head.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return Err(CliError::usage());
+    }
+    let pins = read_attester_pins(ingest_pins)?;
+    let source_pins = source_pins
+        .map(|path| {
+            SourcePins::from_jsonl(&read_limited(path)?).map_err(|error| {
+                eprintln!(
+                    "source pins: {}",
+                    praetore_core::display::escape_for_display(&error)
+                );
+                CliError {
+                    code: "TRUST_STORE_FAIL",
+                }
+            })
+        })
+        .transpose()?;
+    let text = read_limited_to(journal, MAX_SAFETY_CHAIN_BYTES)?;
+    let report = verify_safety_chain(&text, &pins, source_pins.as_ref(), expected_head).map_err(
+        |error| {
+            eprintln!(
+                "safety-journal: {}",
+                praetore_core::display::escape_for_display(&error.to_string())
+            );
+            CliError { code: error.code() }
+        },
+    )?;
+    let json = |value: serde_json::Value| value;
+    details.insert("chain".into(), json(report.chain.clone().into()));
+    details.insert(
+        "tenant_id".into(),
+        json(report.tenant_id.to_string().into()),
+    );
+    details.insert("entries".into(), json(report.entries.into()));
+    details.insert("head".into(), json(report.head.clone().into()));
+    details.insert("high_water".into(), json(report.high_water.into()));
+    details.insert(
+        "counts".into(),
+        serde_json::to_value(&report.counts).map_err(|_| CliError { code: "INTERNAL" })?,
+    );
+    details.insert(
+        "head_verified".into(),
+        serde_json::Value::Bool(expected_head.is_some()),
+    );
+    details.insert(
+        "source_signatures_verified".into(),
+        serde_json::Value::Bool(report.source_signatures_verified),
+    );
+    details.insert(
+        "ingest_key_ids".into(),
+        serde_json::to_value(&report.signed_by).map_err(|_| CliError { code: "INTERNAL" })?,
+    );
+    details.insert(
+        "verification_scope".into(),
+        serde_json::Value::String("post_hoc_safety_records_integrity".into()),
+    );
+    Ok(())
 }
 
 /// G2: verifies a safety namespace manifest against the pinned namespace key
@@ -972,6 +1091,7 @@ fn command_name(args: &[String]) -> &'static str {
         Some("authority") => "authority",
         Some("receipt") => "receipt",
         Some("safety-manifest") => "safety-manifest",
+        Some("safety-journal") => "safety-journal",
         _ => "unknown",
     }
 }
