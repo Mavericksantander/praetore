@@ -34,6 +34,7 @@ pub enum SecretFileError {
     /// Readable, writable or executable by group or others.
     NotPrivate,
     /// Has extended ACL entries (macOS), or they could not be checked.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ExtendedAcl,
     /// Larger than the limit.
     TooLarge { max: u64 },
