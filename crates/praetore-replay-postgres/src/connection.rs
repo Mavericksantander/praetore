@@ -421,6 +421,12 @@ pub enum RuntimeRoleError {
     /// extension into any schema; its objects are owned by the bootstrap
     /// superuser.
     ExtensionObjects(String),
+    /// The gateway runtime role can write safety records (it is a member of
+    /// `praetore_safety_ingest` or holds INSERT on `safety_records`), or the
+    /// safety ingester's role can act as the gateway runtime role or holds
+    /// a privilege on another `praetore` table (G1, SAF-09.5: ingestion has
+    /// its own credentials).
+    RoleSeparation(String),
 }
 
 impl fmt::Display for RuntimeRoleError {
@@ -485,6 +491,10 @@ impl fmt::Display for RuntimeRoleError {
                 f,
                 "extension objects are in schema praetore (members of an extension, or marked \
                  DEPENDS ON EXTENSION), which only its migrations may populate: {objects}"
+            ),
+            Self::RoleSeparation(reason) => write!(
+                f,
+                "the gateway runtime role and the safety ingestion role must be separate: {reason}"
             ),
             Self::UnexpectedGrant(grants) => write!(
                 f,
@@ -820,14 +830,126 @@ pub fn verify_runtime_role_with(
         "SET LOCAL search_path = {}",
         crate::RUNTIME_SEARCH_PATH
     ))?;
-    let result = verify_runtime_role_in(&mut transaction, options);
+    let result = verify_runtime_role_in(&mut transaction, options, RoleKind::Runtime);
     transaction.rollback()?;
     result
+}
+
+/// Which connection [`verify_runtime_role_in`] checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleKind {
+    /// The gateway runtime connection (`praetore_runtime`).
+    Runtime,
+    /// The safety ingester's connection (`praetore_safety_ingest`, G1).
+    SafetyIngest,
+}
+
+/// The checks of [`verify_runtime_role_with`] for the connection of
+/// `praetore-safety-ingest` (G1, SAF-09.5): the same database-wide checks
+/// (settings, foreign dependencies, grants, extension objects, ownership,
+/// memberships, external dependents), and for its session and current
+/// role: not privileged, not an owner, no CREATE on the schema, not a
+/// member of `praetore_runtime`, and no privilege on a `praetore` table
+/// other than SELECT on `schema_migrations` and SELECT and INSERT on
+/// `safety_records` (through `praetore_safety_ingest`).
+pub fn verify_safety_ingest_role_with(
+    client: &mut Client,
+    options: &RuntimeRoleOptions,
+) -> Result<(), RuntimeRoleError> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    let schemas: Vec<String> = transaction
+        .query_one(
+            "SELECT pg_catalog.current_schemas(true)::pg_catalog.text[]",
+            &[],
+        )?
+        .get(0);
+    if !options.allow_search_path
+        && let Some(first) = schemas.iter().find(|schema| !schema.starts_with("pg_temp"))
+        && first != "pg_catalog"
+    {
+        return Err(RuntimeRoleError::UnsafeSetting(format!(
+            "search_path that puts {first} before pg_catalog ({})",
+            schemas.join(", ")
+        )));
+    }
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let result = verify_runtime_role_in(&mut transaction, options, RoleKind::SafetyIngest);
+    transaction.rollback()?;
+    result
+}
+
+/// Whether `role` can write safety records: a member of
+/// `praetore_safety_ingest`, or INSERT on `praetore.safety_records`.
+fn can_write_safety_records(
+    transaction: &mut postgres::Transaction<'_>,
+    role: &str,
+) -> Result<bool, RuntimeRoleError> {
+    Ok(transaction
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g \
+                            WHERE g.rolname OPERATOR(pg_catalog.=) 'praetore_safety_ingest' \
+                              AND pg_catalog.pg_has_role($1, g.oid, 'MEMBER')) \
+                 OR COALESCE((SELECT pg_catalog.has_table_privilege($1, c.oid, 'INSERT') \
+                              FROM pg_catalog.pg_class c \
+                              JOIN pg_catalog.pg_namespace n \
+                                ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                              WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                                AND c.relname OPERATOR(pg_catalog.=) 'safety_records'), false)",
+            &[&role],
+        )?
+        .get(0))
+}
+
+/// For the safety ingester's role: a member of `praetore_runtime`, or the
+/// `praetore` tables on which it holds a privilege beyond SELECT on
+/// `schema_migrations` and SELECT and INSERT on `safety_records`, column
+/// privileges included (up to ten).
+fn safety_ingest_excess(
+    transaction: &mut postgres::Transaction<'_>,
+    role: &str,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g \
+                        WHERE g.rolname OPERATOR(pg_catalog.=) 'praetore_runtime' \
+                          AND pg_catalog.pg_has_role($1, g.oid, 'MEMBER')), \
+                (SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) FROM ( \
+                     SELECT pg_catalog.concat('praetore.', c.relname) AS entry \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n \
+                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                       AND (c.relkind OPERATOR(pg_catalog.=) 'r' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'p' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'v' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'm') \
+                       AND CASE c.relname \
+                           WHEN 'safety_records' THEN pg_catalog.has_table_privilege($1, c.oid, \
+                               'UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                           WHEN 'schema_migrations' THEN pg_catalog.has_table_privilege($1, c.oid, \
+                               'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                           ELSE pg_catalog.has_table_privilege($1, c.oid, \
+                                    'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                                OR pg_catalog.has_any_column_privilege($1, c.oid, \
+                                    'SELECT, INSERT, UPDATE, REFERENCES') \
+                           END \
+                     ORDER BY 1 LIMIT 10) first_entries)",
+        &[&role],
+    )?;
+    if row.get::<_, bool>(0) {
+        return Ok(Some(format!("role {role} is a member of praetore_runtime")));
+    }
+    Ok(row
+        .get::<_, Option<String>>(1)
+        .map(|tables| format!("role {role} holds privileges on {tables}")))
 }
 
 fn verify_runtime_role_in(
     transaction: &mut postgres::Transaction<'_>,
     options: &RuntimeRoleOptions,
+    kind: RoleKind,
 ) -> Result<(), RuntimeRoleError> {
     let replication_role: String = transaction
         .query_one(
@@ -902,8 +1024,23 @@ fn verify_runtime_role_in(
         if row.get::<_, bool>(2) {
             return Err(RuntimeRoleError::CanCreateInSchema(role));
         }
-        if row.get::<_, bool>(3) {
+        if row.get::<_, bool>(3) && kind == RoleKind::Runtime {
             return Err(RuntimeRoleError::ExcessTablePrivilege(role));
+        }
+        match kind {
+            RoleKind::Runtime => {
+                if can_write_safety_records(transaction, &role)? {
+                    return Err(RuntimeRoleError::RoleSeparation(format!(
+                        "runtime role {role} can insert safety records (a member of \
+                         praetore_safety_ingest, or INSERT on praetore.safety_records)"
+                    )));
+                }
+            }
+            RoleKind::SafetyIngest => {
+                if let Some(reason) = safety_ingest_excess(transaction, &role)? {
+                    return Err(RuntimeRoleError::RoleSeparation(reason));
+                }
+            }
         }
     }
     if let Some(function) = owner_function_executable(transaction, options)? {
@@ -1088,6 +1225,8 @@ fn unsafe_runtime_setting(
 /// `execution_journal_events`; SELECT and INSERT on `replay_claims`,
 /// `execution_journal`, `execution_attestations`, `human_approvals` and
 /// `human_approval_expirations`; SELECT on `storage_records` (0015);
+/// `praetore_safety_ingest`'s grants from 0016 (schema USAGE, SELECT on
+/// `schema_migrations`, SELECT and INSERT on `safety_records`);
 /// UPDATE of `execution_status`,
 /// `output_json`, `not_dispatched_reason` and `updated_at`); the
 /// documented `praetore_observe` shape exactly (schema USAGE; column SELECT
@@ -1149,6 +1288,10 @@ fn unexpected_grants(
              ('c', 'execution_journal', 'output_json', 'UPDATE'), \
              ('c', 'execution_journal', 'not_dispatched_reason', 'UPDATE'), \
              ('c', 'execution_journal', 'updated_at', 'UPDATE')), \
+         ingest_allowed(kind, rel, privilege) AS (VALUES \
+             ('n', '', 'USAGE'), \
+             ('r', 'schema_migrations', 'SELECT'), \
+             ('r', 'safety_records', 'SELECT'), ('r', 'safety_records', 'INSERT')), \
          observe_allowed(rel, col) AS (VALUES \
              ('execution_journal', 'tenant_id'), ('execution_journal', 'agent_id'), \
              ('execution_journal', 'request_id'), ('execution_journal', 'request_digest'), \
@@ -1180,6 +1323,13 @@ fn unexpected_grants(
                                    AND ra.rel OPERATOR(pg_catalog.=) e.rel \
                                    AND ra.col OPERATOR(pg_catalog.=) e.col \
                                    AND ra.privilege OPERATOR(pg_catalog.=) e.privilege)) \
+                 OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_safety_ingest' \
+                     AND NOT e.grantable \
+                     AND EXISTS (SELECT 1 FROM ingest_allowed ia \
+                                 WHERE ia.kind OPERATOR(pg_catalog.=) e.kind \
+                                   AND ia.rel OPERATOR(pg_catalog.=) e.rel \
+                                   AND e.col OPERATOR(pg_catalog.=) '' \
+                                   AND ia.privilege OPERATOR(pg_catalog.=) e.privilege)) \
                  OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_observe' AND NOT e.grantable \
                      AND ((e.kind OPERATOR(pg_catalog.=) 'n' \
                            AND e.privilege OPERATOR(pg_catalog.=) 'USAGE') \

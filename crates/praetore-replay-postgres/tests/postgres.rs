@@ -3071,9 +3071,11 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             .get(0);
         let policies = client
             .query(
+                // The policies 0008 creates (0016 adds one on safety_records).
                 "SELECT p.oid FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = 'praetore' ORDER BY c.relname",
+                 WHERE n.nspname = 'praetore' AND c.relname <> 'safety_records' \
+                 ORDER BY c.relname",
                 &[],
             )
             .unwrap()
@@ -3092,7 +3094,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0012_dispatch_requires_live_approval",
             "0013_dispatch_refused",
             "0014_closed_execution_row_lock",
-            "0015_storage_records"
+            "0015_storage_records",
+            "0016_safety_records"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -5412,8 +5415,39 @@ fn postgres_migrations_refuse_a_missing_runtime_group_up_front() {
              EXCEPTION WHEN duplicate_object THEN NULL; END $$",
         )
         .unwrap();
+    // G1: migration 0016 creates praetore_safety_ingest the same way, and
+    // the same check refuses up front when the group cannot create it.
+    let safety_exists: bool = connect_client()
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'praetore_safety_ingest')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    if !safety_exists {
+        let error = praetore_replay_postgres::apply_migrations_with(&mut client, &options)
+            .expect_err("praetore_safety_ingest is missing and the group cannot create it");
+        assert!(
+            matches!(&error, MigrationError::GroupRoleMissing { group: "praetore_safety_ingest", acting_role, .. }
+                if *acting_role == group.name),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("CREATE ROLE praetore_safety_ingest NOLOGIN"),
+            "{error}"
+        );
+        eprintln!("refused as expected: {error}");
+        connect_client()
+            .batch_execute(
+                "DO $$ BEGIN CREATE ROLE praetore_safety_ingest NOLOGIN; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+            )
+            .unwrap();
+    }
     praetore_replay_postgres::apply_migrations_with(&mut client, &options)
-        .expect("migrates once praetore_runtime exists");
+        .expect("migrates once praetore_runtime and praetore_safety_ingest exist");
     println!("{RUNTIME_GROUP_ABSENT_MARKER}");
 }
 
@@ -6878,7 +6912,11 @@ fn postgres_migrations_0013_database_applies_only_0014() {
     println!("0013 database applied {applied:?}; second run applied {again:?}");
     assert_eq!(
         applied,
-        vec!["0014_closed_execution_row_lock", "0015_storage_records"]
+        vec![
+            "0014_closed_execution_row_lock",
+            "0015_storage_records",
+            "0016_safety_records"
+        ]
     );
     assert!(again.is_empty());
     let v2_after: bool = client
@@ -7115,4 +7153,404 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
         .expect("classify")
         .into_mission()
         .expect("mission action")
+}
+
+// ---------------------------------------------------------------------------
+// G1 (SAF-09.5): post-hoc safety records (migration 0016).
+
+mod g1_safety {
+    use super::*;
+    use praetore_core::{
+        ActionClass, SafetyNamespaceKey, SafetyNamespaceManifest,
+        safety_ingest::{
+            IngestorConfig, PreparedRecords, SafetyEventDraft, SafetyIngestKey, SafetyIngestor,
+            SafetySourceKey, SourcePins, verify_safety_chain,
+        },
+    };
+    use praetore_replay_postgres::{
+        PostgresSafetyStore, RuntimeRoleError, read_safety_chain, verify_safety_ingest_role_with,
+    };
+    use std::collections::BTreeMap;
+
+    const TENANT_A: Uuid = Uuid::from_u128(0xa1);
+    const TENANT_B: Uuid = Uuid::from_u128(0xb2);
+
+    fn source_key() -> SafetySourceKey {
+        SafetySourceKey::from_secret_bytes(&[0x31; 32])
+    }
+
+    fn ingest_key() -> SafetyIngestKey {
+        SafetyIngestKey::from_secret_bytes(&[0x32; 32])
+    }
+
+    fn ingestor(tenant: Uuid) -> SafetyIngestor {
+        let namespace = SafetyNamespaceKey::from_secret_bytes(&[0x33; 32]);
+        let policy =
+            Policy::new_v2("ops", 1, vec![]).with_action_class("safety:halt", ActionClass::Safety);
+        let manifest =
+            SafetyNamespaceManifest::from_policy(&policy, test_now(), &namespace).unwrap();
+        let mut sources = SourcePins::default();
+        sources
+            .insert("executor-1", source_key().public_key().unwrap())
+            .unwrap();
+        SafetyIngestor::new(IngestorConfig {
+            ingest_key: ingest_key(),
+            tenant_id: tenant,
+            manifest,
+            namespace_pin: namespace.public_key().unwrap(),
+            attester_pin: EvidenceAttesterKey::from_secret_bytes(&[0x34; 32])
+                .public_key()
+                .unwrap(),
+            sources,
+            heads: BTreeMap::new(),
+        })
+        .unwrap()
+    }
+
+    fn event(seq: u64, action: &str) -> Vec<u8> {
+        source_key()
+            .sign_event(SafetyEventDraft {
+                source_id: "executor-1".into(),
+                source_seq: seq,
+                action: action.into(),
+                occurred_at: test_now(),
+                params: BTreeMap::new(),
+            })
+            .unwrap()
+            .to_wire()
+            .unwrap()
+    }
+
+    fn ingest(
+        ingestor: &mut SafetyIngestor,
+        store: &mut PostgresSafetyStore,
+        input: &[u8],
+    ) -> PreparedRecords {
+        let prepared = ingestor.prepare(input, test_now(), store).unwrap();
+        store.store(ingestor.tenant_id(), &prepared).unwrap();
+        ingestor.commit(&prepared);
+        prepared
+    }
+
+    fn chain_text(client: &mut Client, tenant: Uuid, chain: &str) -> String {
+        read_safety_chain(client, tenant, chain)
+            .unwrap()
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    fn database_error(error: &postgres::Error) -> String {
+        error
+            .as_db_error()
+            .map_or_else(|| error.to_string(), |db| db.message().to_owned())
+    }
+
+    /// A migrated scratch database with a login member of
+    /// `praetore_safety_ingest` and one of `praetore_runtime`.
+    fn scratch_with_roles() -> (ScratchDatabase, TestRole, TestRole) {
+        let ingest = TestRole::create("LOGIN NOBYPASSRLS");
+        let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+        let scratch = migrated_with_runtime(&runtime);
+        scratch
+            .connect()
+            .batch_execute(&format!("GRANT praetore_safety_ingest TO {}", ingest.name))
+            .unwrap();
+        (scratch, ingest, runtime)
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_records_are_chained_append_only_and_tenant_isolated() {
+        let (scratch, ingest_role, runtime) = scratch_with_roles();
+        let mut admin = scratch.connect();
+        let mut client = connect_scratch_as(&scratch, &ingest_role.name);
+        verify_safety_ingest_role_with(&mut client, &Default::default())
+            .expect("the migrations' own grants are accepted for the ingester");
+        praetore_replay_postgres::verify_schema_current(&mut client).unwrap();
+        let mut store = PostgresSafetyStore::from_client(client);
+        assert!(store.try_lock_tenant(TENANT_A).unwrap());
+        let mut other =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        assert!(
+            !other.try_lock_tenant(TENANT_A).unwrap(),
+            "a second ingester got the lock"
+        );
+        assert!(other.try_lock_tenant(TENANT_B).unwrap());
+
+        let mut first = ingestor(TENANT_A);
+        for input in [
+            event(1, "safety:halt"),
+            event(2, "safety:freeze"),
+            event(5, "safety:halt"),
+            event(2, "safety:freeze"),
+            event(1, "safety:other"),
+            event(3, "safety:halt"),
+            b"garbage".to_vec(),
+        ] {
+            ingest(&mut first, &mut store, &input);
+        }
+        // The duplicate lookup reads storage: a fresh ingester resumes from
+        // the stored heads and still sees seq 1 and 2.
+        let pin = ingest_key().public_key().unwrap();
+        let heads = store.load_heads(TENANT_A, &pin).unwrap();
+        assert_eq!(heads["executor-1"].head, first.head("executor-1"));
+        assert_eq!(heads["_unattributed"].head, first.head("_unattributed"));
+        let mut resumed = ingestor(TENANT_A);
+        resumed
+            .set_heads(
+                heads
+                    .into_iter()
+                    .map(|(chain, stored)| (chain, stored.head))
+                    .collect(),
+            )
+            .unwrap();
+        let duplicate = ingest(&mut resumed, &mut store, &event(2, "safety:freeze"));
+        assert_eq!(
+            duplicate.records[0].payload().status,
+            praetore_core::SafetyRecordStatus::Duplicate
+        );
+        ingest(&mut resumed, &mut store, &event(6, "safety:halt"));
+
+        let text = chain_text(store.client(), TENANT_A, "executor-1");
+        let report = verify_safety_chain(&text, std::slice::from_ref(&pin), None, None).unwrap();
+        assert_eq!(report.entries, 9);
+        assert_eq!(report.counts.accepted, 3);
+        assert_eq!(report.counts.undeclared, 1);
+        assert_eq!(report.counts.loss, 1);
+        assert_eq!(report.counts.late, 1);
+        assert_eq!(report.counts.duplicate, 2);
+        assert_eq!(report.counts.conflict, 1);
+        assert_eq!(report.high_water, 6);
+        let rejected = chain_text(store.client(), TENANT_A, "_unattributed");
+        assert_eq!(
+            verify_safety_chain(&rejected, std::slice::from_ref(&pin), None, None)
+                .unwrap()
+                .counts
+                .rejected,
+            1
+        );
+
+        // Row-level security: another tenant's context sees none of it and
+        // cannot write it.
+        assert!(chain_text(store.client(), TENANT_B, "executor-1").is_empty());
+        let mut b = ingestor(TENANT_B);
+        // A first record of tenant A (chain_seq 0, so the link trigger
+        // passes) under tenant B's context: the policy's WITH CHECK refuses.
+        let genesis = ingestor(TENANT_A)
+            .prepare(&event(1, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        let error = store.store(TENANT_B, &genesis).unwrap_err().to_string();
+        assert!(error.contains("row-level security"), "{error}");
+        // Any later record of A under B's context: B cannot see A's chain, so
+        // the record does not extend any chain it can see.
+        let mut a = resumed;
+        let foreign = a
+            .prepare(&event(7, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        let error = store.store(TENANT_B, &foreign).unwrap_err().to_string();
+        assert!(error.contains("does not extend"), "{error}");
+        ingest(&mut b, &mut store, &event(1, "safety:halt"));
+        assert_eq!(
+            chain_text(store.client(), TENANT_B, "executor-1")
+                .lines()
+                .count(),
+            1
+        );
+
+        // The next record extends the chain; inserting it again is refused,
+        // and so is a record (validly signed) that skips a chain position.
+        store.store(TENANT_A, &foreign).unwrap();
+        a.commit(&foreign);
+        let error = store.store(TENANT_A, &foreign).unwrap_err().to_string();
+        assert!(error.contains("duplicate key"), "{error}");
+        let mut skipping = a
+            .prepare(&event(8, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        let mut payload = skipping.records[0].payload().clone();
+        payload.chain_seq += 1;
+        skipping.records[0] = ingest_key().sign_record(payload).unwrap();
+        let error = store.store(TENANT_A, &skipping).unwrap_err().to_string();
+        assert!(error.contains("does not extend its chain"), "{error}");
+        // The columns must be the record's signed fields.
+        let next = a
+            .prepare(&event(8, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        let json = next.records[0].to_json().unwrap();
+        let mut transaction = admin.transaction().unwrap();
+        transaction
+            .batch_execute(&format!(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', '{TENANT_A}', true)"
+            ))
+            .unwrap();
+        let payload = next.records[0].payload();
+        for (prev, status, label) in [
+            ("1".repeat(64), payload.status.as_str(), "wrong prev"),
+            (payload.prev_record_hash.clone(), "loss", "status column"),
+        ] {
+            let mut savepoint = transaction.savepoint("g1").unwrap();
+            let error = savepoint
+                .execute(
+                    "INSERT INTO praetore.safety_records (tenant_id, chain, chain_seq, record_id, \
+                     status, source_seq, event_hash, high_water, prev_record_hash, record_hash, \
+                     record_json) VALUES ($1, $2, $3, $4, $5, $6, $7, 8, $8, $9, $10)",
+                    &[
+                        &TENANT_A,
+                        &payload.chain,
+                        &(payload.chain_seq as i64),
+                        &payload.record_id,
+                        &status,
+                        &Some(8i64),
+                        &payload.event_hash,
+                        &prev,
+                        &next.records[0].record_hash(),
+                        &json,
+                    ],
+                )
+                .unwrap_err();
+            let message = database_error(&error);
+            assert!(
+                message.contains("do not match record_json") || message.contains("violates check"),
+                "{label}: {message}"
+            );
+            savepoint.rollback().unwrap();
+        }
+        transaction.rollback().unwrap();
+
+        // Append-only, even for the owner (a superuser here).
+        for statement in [
+            "UPDATE praetore.safety_records SET status = status",
+            "DELETE FROM praetore.safety_records",
+            "TRUNCATE praetore.safety_records",
+        ] {
+            let error = admin.batch_execute(statement).unwrap_err();
+            assert!(
+                database_error(&error).contains("append-only"),
+                "{statement}: {error}"
+            );
+        }
+        // The ingester's role has no UPDATE or DELETE either, and the
+        // gateway runtime role cannot even read the table.
+        for statement in [
+            "UPDATE praetore.safety_records SET status = status",
+            "DELETE FROM praetore.safety_records",
+        ] {
+            let error = store.client().batch_execute(statement).unwrap_err();
+            assert!(
+                database_error(&error).contains("permission denied"),
+                "{error}"
+            );
+        }
+        let mut gateway = connect_scratch_as(&scratch, &runtime.name);
+        let error = gateway
+            .query("SELECT 1 FROM praetore.safety_records", &[])
+            .unwrap_err();
+        assert!(
+            database_error(&error).contains("permission denied"),
+            "{error}"
+        );
+        verify_runtime_role(&mut gateway).expect("the 0016 grants do not upset the runtime check");
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_ingest_role_is_separate_from_the_runtime_role() {
+        let (scratch, ingest_role, runtime) = scratch_with_roles();
+        let mut admin = scratch.connect();
+        let mut ingest = connect_scratch_as(&scratch, &ingest_role.name);
+        let mut gateway = connect_scratch_as(&scratch, &runtime.name);
+        let options = praetore_replay_postgres::RuntimeRoleOptions::default();
+        verify_safety_ingest_role_with(&mut ingest, &options).unwrap();
+        verify_runtime_role(&mut gateway).unwrap();
+        let (i, r) = (&ingest_role.name, &runtime.name);
+        let separation =
+            |result: Result<(), RuntimeRoleError>, expected: &str, what: &str| match result {
+                Err(RuntimeRoleError::RoleSeparation(reason)) => {
+                    assert!(reason.contains(expected), "{what}: {reason}");
+                    eprintln!("refused as expected ({what}): {reason}");
+                }
+                other => panic!("{what}: expected RoleSeparation, got {other:?}"),
+            };
+        // The ingester's role may not act as the gateway's, nor the other way.
+        admin
+            .batch_execute(&format!("GRANT praetore_runtime TO {i}"))
+            .unwrap();
+        let result = verify_safety_ingest_role_with(&mut ingest, &options);
+        admin
+            .batch_execute(&format!("REVOKE praetore_runtime FROM {i}"))
+            .unwrap();
+        separation(
+            result,
+            "member of praetore_runtime",
+            "ingest in praetore_runtime",
+        );
+        admin
+            .batch_execute(&format!("GRANT praetore_safety_ingest TO {r}"))
+            .unwrap();
+        let result = verify_runtime_role(&mut gateway);
+        admin
+            .batch_execute(&format!("REVOKE praetore_safety_ingest FROM {r}"))
+            .unwrap();
+        separation(
+            result,
+            "can insert safety records",
+            "runtime in praetore_safety_ingest",
+        );
+        // A direct grant is refused too.
+        admin
+            .batch_execute(&format!("GRANT INSERT ON praetore.safety_records TO {r}"))
+            .unwrap();
+        let result = verify_runtime_role(&mut gateway);
+        admin
+            .batch_execute(&format!(
+                "REVOKE INSERT ON praetore.safety_records FROM {r}"
+            ))
+            .unwrap();
+        separation(result, "can insert safety records", "runtime with INSERT");
+        // The ingester's role may touch no other table.
+        for (grant, revoke) in [
+            (
+                format!("GRANT SELECT ON praetore.execution_journal TO {i}"),
+                format!("REVOKE SELECT ON praetore.execution_journal FROM {i}"),
+            ),
+            (
+                format!("GRANT SELECT (evidence_json) ON praetore.execution_journal TO {i}"),
+                format!("REVOKE SELECT (evidence_json) ON praetore.execution_journal FROM {i}"),
+            ),
+            (
+                format!("GRANT DELETE ON praetore.safety_records TO {i}"),
+                format!("REVOKE DELETE ON praetore.safety_records FROM {i}"),
+            ),
+        ] {
+            admin.batch_execute(&grant).unwrap();
+            let result = verify_safety_ingest_role_with(&mut ingest, &options);
+            admin.batch_execute(&revoke).unwrap();
+            separation(result, "holds privileges on praetore.", &grant);
+        }
+        // A grant to the group beyond 0016's is an unexpected grant, for
+        // both connections.
+        admin
+            .batch_execute("GRANT UPDATE ON praetore.safety_records TO praetore_safety_ingest")
+            .unwrap();
+        let runtime_result = verify_runtime_role(&mut gateway);
+        let ingest_result = verify_safety_ingest_role_with(&mut ingest, &options);
+        admin
+            .batch_execute("REVOKE UPDATE ON praetore.safety_records FROM praetore_safety_ingest")
+            .unwrap();
+        assert!(
+            matches!(&runtime_result, Err(RuntimeRoleError::UnexpectedGrant(grants))
+                if grants.contains("relation praetore.safety_records: UPDATE to praetore_safety_ingest")),
+            "{runtime_result:?}"
+        );
+        assert!(ingest_result.is_err(), "{ingest_result:?}");
+        // The schema owner (a superuser) is refused as the ingester.
+        let error = verify_safety_ingest_role_with(&mut admin, &options).unwrap_err();
+        assert!(
+            matches!(error, RuntimeRoleError::PrivilegedRole(_)),
+            "{error}"
+        );
+        // Restored: both pass again.
+        verify_safety_ingest_role_with(&mut ingest, &options).unwrap();
+        verify_runtime_role(&mut gateway).unwrap();
+    }
 }

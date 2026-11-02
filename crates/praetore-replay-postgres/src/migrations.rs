@@ -41,7 +41,7 @@ use postgres::Client;
 use sha2::{Digest, Sha256};
 
 /// Ordered `(version, sql)` pairs. Append only; never edit or reorder.
-pub const MIGRATIONS: [(&str, &str); 15] = [
+pub const MIGRATIONS: [(&str, &str); 16] = [
     (
         "0001_replay_claims",
         include_str!("../migrations/0001_replay_claims.sql"),
@@ -102,6 +102,10 @@ pub const MIGRATIONS: [(&str, &str); 15] = [
         "0015_storage_records",
         include_str!("../migrations/0015_storage_records.sql"),
     ),
+    (
+        "0016_safety_records",
+        include_str!("../migrations/0016_safety_records.sql"),
+    ),
 ];
 
 /// The migration that creates `praetore.storage_records`; the runner also
@@ -153,6 +157,14 @@ pub enum MigrationError {
     /// `praetore_runtime` does not exist and the role that runs migration
     /// 0011 (`acting_role`) cannot create it; checked before any migration.
     RuntimeGroupMissing {
+        acting_role: String,
+    },
+    /// A group role a pending migration creates (`praetore_safety_ingest`,
+    /// migration 0016) does not exist and the role that runs that migration
+    /// (`acting_role`) cannot create it; checked before any migration.
+    GroupRoleMissing {
+        group: &'static str,
+        version: &'static str,
         acting_role: String,
     },
 }
@@ -277,6 +289,16 @@ impl std::fmt::Display for MigrationError {
                  which runs the migrations, has no CREATEROLE to create it (migration 0011); \
                  pre-create it as the database owner or a superuser: CREATE ROLE \
                  praetore_runtime NOLOGIN"
+            ),
+            Self::GroupRoleMissing {
+                group,
+                version,
+                acting_role,
+            } => write!(
+                f,
+                "refusing to migrate: role {group} does not exist and {acting_role}, which runs \
+                 the migrations, has no CREATEROLE to create it (migration {version}); \
+                 pre-create it as the database owner or a superuser: CREATE ROLE {group} NOLOGIN"
             ),
             Self::AdoptionRequiresSigner => write!(
                 f,
@@ -517,6 +539,10 @@ fn owner_role_statement(
 /// The migration that creates (or only grants to) `praetore_runtime`.
 const RUNTIME_GROUP_VERSION: &str = "0011_runtime_role";
 
+/// The migration that creates (or only grants to) `praetore_safety_ingest`,
+/// the group of the safety ingester's login role (G1).
+const SAFETY_INGEST_GROUP_VERSION: &str = "0016_safety_records";
+
 /// Last migration that existed before the control table was introduced.
 const BASELINE_VERSION: &str = "0009_human_approval_expirations";
 
@@ -528,7 +554,24 @@ fn apply_locked(
         let mut transaction = client.build_transaction().read_only(true).start()?;
         transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
         schema_owner_check(&mut transaction, options)?;
-        runtime_group_check(&mut transaction, options)?;
+        runtime_group_check(
+            &mut transaction,
+            options,
+            "praetore_runtime",
+            RUNTIME_GROUP_VERSION,
+        )
+        .map_err(|error| match error {
+            MigrationError::GroupRoleMissing { acting_role, .. } => {
+                MigrationError::RuntimeGroupMissing { acting_role }
+            }
+            other => other,
+        })?;
+        runtime_group_check(
+            &mut transaction,
+            options,
+            "praetore_safety_ingest",
+            SAFETY_INGEST_GROUP_VERSION,
+        )?;
         let problems = environment_problems(&mut transaction, options)?;
         transaction.rollback()?;
         if !problems.is_empty() {
@@ -1911,20 +1954,24 @@ fn schema_owner_check(
     Ok(())
 }
 
-/// Migration 0011 creates `praetore_runtime` when it does not exist, which
-/// needs CREATEROLE (or superuser) in the role that runs the migrations: the
-/// owner of an existing schema, else the `PRAETORE_SCHEMA_OWNER` group,
-/// else the migrating role. Refuses up front, before migration 0001, when
-/// 0011 is still to run and that role cannot create it.
+/// Migration 0011 creates `praetore_runtime` (and 0016
+/// `praetore_safety_ingest`) when it does not exist, which needs CREATEROLE
+/// (or superuser) in the role that runs the migrations: the owner of an
+/// existing schema, else the `PRAETORE_SCHEMA_OWNER` group, else the
+/// migrating role. Refuses up front, before migration 0001, when the
+/// migration (`version`) is still to run and that role cannot create
+/// `group`.
 fn runtime_group_check(
     transaction: &mut postgres::Transaction<'_>,
     options: &MigrationOptions,
+    group: &'static str,
+    version: &'static str,
 ) -> Result<(), MigrationError> {
     let row = transaction.query_one(
         "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
-                        WHERE r.rolname OPERATOR(pg_catalog.=) 'praetore_runtime'), \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) $1), \
                 pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
-        &[],
+        &[&group],
     )?;
     let (runtime_exists, has_control): (bool, bool) = (row.get(0), row.get(1));
     if runtime_exists {
@@ -1935,7 +1982,7 @@ fn runtime_group_check(
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM praetore.schema_migrations \
                                 WHERE version OPERATOR(pg_catalog.=) $1)",
-                &[&RUNTIME_GROUP_VERSION],
+                &[&version],
             )?
             .get(0);
         if recorded {
@@ -1961,7 +2008,11 @@ fn runtime_group_check(
     if can_create {
         Ok(())
     } else {
-        Err(MigrationError::RuntimeGroupMissing { acting_role })
+        Err(MigrationError::GroupRoleMissing {
+            group,
+            version,
+            acting_role,
+        })
     }
 }
 
