@@ -13,6 +13,23 @@
 //!
 //! The manifest authorizes nothing. No engine, gateway, gate or hook reads
 //! it: it is not consulted on the decision path.
+//!
+//! # Entry points and names that fail [`SafetyActionName::parse`]
+//!
+//! The entry points do not call `parse`; they keep the G7 behavior, which
+//! is fail closed for these names:
+//!
+//! * Gateway HTTP API: every action type that starts with `safety:`,
+//!   whether `parse` accepts it or not (`safety:`, `safety:_x`, a name over
+//!   128 bytes), gets the same 422 `safety_action_not_governed` with no
+//!   receipt, so the answer depends only on the public prefix rule.
+//! * `praetore-mcp` gate and the Claude Code hook: no policy can declare
+//!   such a name (policy loading uses `parse`), so it is unclassified and
+//!   refused with a signed DENY (`unclassified`).
+//!
+//! The ingestion path (G1) must record such a name, never drop it: keep the
+//! raw input (bounded, and escaped for display) with the reason
+//! `invalid_name` and the [`SafetyNameError`].
 
 use std::collections::BTreeSet;
 
@@ -257,6 +274,35 @@ impl SafetyNamespaceKey {
     }
 }
 
+/// Refuses the same public key in the namespace role and in another role
+/// (the evidence attester or the authority issuer). Distinct domains already
+/// keep signatures from crossing roles; this keeps a compromise of the
+/// online decision host from also giving the namespace key. The ingestion
+/// path (G1) and any online loader that holds both keys or pins call it at
+/// startup.
+///
+/// ```
+/// use praetore_core::{EvidenceAttesterKey, SafetyNamespaceError, SafetyNamespaceKey};
+/// use praetore_core::safety_namespace::ensure_distinct_keys;
+///
+/// let namespace = SafetyNamespaceKey::from_secret_bytes(&[1; 32]).public_key().unwrap();
+/// let attester = EvidenceAttesterKey::from_secret_bytes(&[2; 32]).public_key().unwrap();
+/// assert!(ensure_distinct_keys(&namespace, &attester).is_ok());
+/// assert_eq!(
+///     ensure_distinct_keys(&namespace, &namespace),
+///     Err(SafetyNamespaceError::SameKeyForBothRoles)
+/// );
+/// ```
+pub fn ensure_distinct_keys(
+    namespace: &VerifiedPublicKey,
+    other_role: &VerifiedPublicKey,
+) -> Result<(), SafetyNamespaceError> {
+    if namespace.as_bytes() == other_role.as_bytes() {
+        return Err(SafetyNamespaceError::SameKeyForBothRoles);
+    }
+    Ok(())
+}
+
 /// The key id a manifest signed by `public_key` records.
 pub fn safety_namespace_key_id(public_key: &VerifiedPublicKey) -> String {
     key_id_of(&public_key.as_bytes())
@@ -340,6 +386,15 @@ pub enum SafetyNamespaceError {
     /// The manifest was not derived from the given policy.
     #[error("safety namespace manifest does not match the policy: {field} differs")]
     PolicyMismatch { field: ManifestField },
+    /// The document is valid but its bytes are not the canonical encoding
+    /// (whitespace, key order, escapes, or a file without exactly one final
+    /// newline). One manifest has exactly one valid file representation.
+    #[error("safety namespace manifest is not in its canonical encoding")]
+    NotCanonical,
+    /// The namespace key and a key of another role (the evidence attester
+    /// or the authority issuer) are the same public key.
+    #[error("the safety namespace key must not be the key of another role")]
+    SameKeyForBothRoles,
 }
 
 impl SafetyNamespaceError {
@@ -351,7 +406,9 @@ impl SafetyNamespaceError {
             | Self::InvalidField { .. }
             | Self::InvalidSafetyName { .. }
             | Self::SafetyActionsNotCanonical
-            | Self::TooManySafetyActions { .. } => "SAFETY_MANIFEST_INVALID",
+            | Self::TooManySafetyActions { .. }
+            | Self::NotCanonical => "SAFETY_MANIFEST_INVALID",
+            Self::SameKeyForBothRoles => "SAFETY_MANIFEST_SAME_KEY",
             Self::UnsupportedSchemaVersion { .. } => "SAFETY_MANIFEST_VERSION_UNSUPPORTED",
             Self::KeyIdMismatch => "SAFETY_MANIFEST_KEY_MISMATCH",
             Self::SignatureInvalid => "SAFETY_MANIFEST_SIGNATURE_INVALID",
@@ -388,8 +445,12 @@ fn declared_safety_actions(
 /// A signed statement of the safety namespace of one format 2 policy
 /// (schema version 1).
 ///
-/// The file is the canonical JSON (keys sorted, no whitespace) of this
-/// object:
+/// The document is the canonical JSON (keys sorted, no whitespace, the
+/// repository's canonical string encoding) of this object, and a manifest
+/// file is that document followed by exactly one newline
+/// ([`Self::to_file`], [`Self::from_file`]). Any other encoding of the same
+/// content is rejected with [`SafetyNamespaceError::NotCanonical`], so a
+/// manifest can be identified by the hash of its file:
 ///
 /// | Field | Value |
 /// | --- | --- |
@@ -515,15 +576,38 @@ impl SafetyNamespaceManifest {
             signature: String::new(),
         };
         manifest.signature = hex::encode(key.sign(&manifest.signing_payload()?));
-        // The file must be readable back by `from_json`.
+        // The document must be readable back by `from_json` (size limit).
         manifest.to_json()?;
         Ok(manifest)
     }
 
-    /// Parses and validates a manifest document (strict JSON, no unknown
-    /// fields, every field in its single valid form). Does not check the
-    /// signature; see [`Self::verify`].
+    /// Parses and validates a manifest document: strict JSON, no unknown
+    /// fields, every field in its single valid form, and `text` exactly the
+    /// canonical encoding ([`Self::to_json`]). Does not check the signature;
+    /// see [`Self::verify`].
     pub fn from_json(text: &str) -> Result<Self, SafetyNamespaceError> {
+        let manifest = Self::from_json_content(text)?;
+        if manifest.to_json()? != text {
+            return Err(SafetyNamespaceError::NotCanonical);
+        }
+        Ok(manifest)
+    }
+
+    /// Parses a manifest file: the canonical document followed by exactly
+    /// one `\n` ([`Self::to_file`]).
+    pub fn from_file(text: &str) -> Result<Self, SafetyNamespaceError> {
+        let document = text
+            .strip_suffix('\n')
+            .ok_or(SafetyNamespaceError::NotCanonical)?;
+        Self::from_json(document)
+    }
+
+    /// The bytes of a manifest file: [`Self::to_json`] and one `\n`.
+    pub fn to_file(&self) -> Result<String, SafetyNamespaceError> {
+        Ok(self.to_json()? + "\n")
+    }
+
+    fn from_json_content(text: &str) -> Result<Self, SafetyNamespaceError> {
         let value = parse_json_strict(text).map_err(SafetyNamespaceError::Json)?;
         let raw: RawManifest = serde_json::from_value(value)
             .map_err(|error| SafetyNamespaceError::Schema(error.to_string()))?;
@@ -581,8 +665,9 @@ impl SafetyNamespaceManifest {
         })
     }
 
-    /// The canonical JSON of the whole manifest: the bytes of a manifest
-    /// file (the CLI adds a final newline).
+    /// The canonical JSON of the whole manifest, the only text
+    /// [`Self::from_json`] accepts. A file adds one newline
+    /// ([`Self::to_file`]).
     pub fn to_json(&self) -> Result<String, SafetyNamespaceError> {
         let bytes = canonical_json(self).map_err(SafetyNamespaceError::Json)?;
         if bytes.len() > MAX_JSON_VALUE_BYTES {

@@ -61,11 +61,13 @@ fn manifest_json() -> String {
     manifest_of(&policy()).to_json().unwrap()
 }
 
-/// `json` with `edit` applied, re-serialized.
+/// `json` with `edit` applied, in canonical encoding (so that the check
+/// under test, not the encoding, rejects it).
 fn edited(json: &str, edit: impl FnOnce(&mut Value)) -> String {
     let mut value: Value = serde_json::from_str(json).unwrap();
     edit(&mut value);
-    value.to_string()
+    String::from_utf8(praetore_core::canonical::canonicalize_json(&value.to_string()).unwrap())
+        .unwrap()
 }
 
 fn parse_and_verify(json: &str) -> Result<SafetyNamespaceManifest, SafetyNamespaceError> {
@@ -602,6 +604,118 @@ fn manifest_documents_are_parsed_strictly() {
     ));
 }
 
+/// One manifest, one file: any other encoding of a valid manifest is
+/// refused before its signature is considered.
+#[test]
+fn only_the_canonical_encoding_is_accepted() {
+    let json = manifest_json();
+    parse_and_verify(&json).unwrap();
+    let value: Value = serde_json::from_str(&json).unwrap();
+    let not_canonical = Err(SafetyNamespaceError::NotCanonical);
+    for (what, text) in [
+        (
+            "pretty-printed",
+            serde_json::to_string_pretty(&value).unwrap(),
+        ),
+        ("leading space", format!(" {json}")),
+        ("trailing space", format!("{json} ")),
+        ("trailing newline", format!("{json}\n")),
+        ("reordered keys", {
+            // `signature` moved from last to first.
+            let signature = value["signature"].as_str().unwrap();
+            let without = json.replace(&format!(",\"signature\":\"{signature}\""), "");
+            format!("{{\"signature\":\"{signature}\",{}", &without[1..])
+        }),
+        (
+            "escaped character",
+            json.replacen("safety:halt", "\\u0073afety:halt", 1),
+        ),
+        (
+            "escaped hyphen",
+            json.replacen("2026-11-01", "2026\\u002d11-01", 1),
+        ),
+    ] {
+        assert_eq!(
+            SafetyNamespaceManifest::from_json(&text).map(drop),
+            not_canonical,
+            "{what}: {text}"
+        );
+    }
+
+    // A file is the document and exactly one newline.
+    let manifest = SafetyNamespaceManifest::from_json(&json).unwrap();
+    let file = manifest.to_file().unwrap();
+    assert_eq!(file, format!("{json}\n"));
+    assert_eq!(SafetyNamespaceManifest::from_file(&file).unwrap(), manifest);
+    for text in [json.clone(), format!("{json}\n\n"), format!("{json}\r\n")] {
+        assert_eq!(
+            SafetyNamespaceManifest::from_file(&text).map(drop),
+            not_canonical,
+            "{text:?}"
+        );
+    }
+}
+
+/// The same public key in the namespace role and in the attester (or
+/// issuer) role is refused.
+#[test]
+fn the_namespace_key_must_differ_from_the_other_roles() {
+    use praetore_core::safety_namespace::ensure_distinct_keys;
+    let attester = EvidenceAttesterKey::from_secret_bytes(&NAMESPACE_SECRET);
+    assert_eq!(
+        ensure_distinct_keys(&pin(), &attester.public_key().unwrap()),
+        Err(SafetyNamespaceError::SameKeyForBothRoles)
+    );
+    assert_eq!(
+        SafetyNamespaceError::SameKeyForBothRoles.code(),
+        "SAFETY_MANIFEST_SAME_KEY"
+    );
+    let other = EvidenceAttesterKey::from_secret_bytes(&[0x48; 32]);
+    ensure_distinct_keys(&pin(), &other.public_key().unwrap()).unwrap();
+    let issuer = AgentKeyPair::from_secret_bytes(&NAMESPACE_SECRET);
+    assert_eq!(
+        ensure_distinct_keys(&pin(), &issuer.public_key()),
+        Err(SafetyNamespaceError::SameKeyForBothRoles)
+    );
+}
+
+/// A name that starts with `safety:` but fails `parse` is a valid action
+/// type that no policy can declare: the entry points refuse it (the gateway
+/// with the reserved-prefix 422, `praetore-mcp` and the hook with a signed
+/// unclassified DENY), and the ingestion path must record it as invalid.
+#[test]
+fn prefixed_names_that_fail_the_validator_are_always_unclassified() {
+    let policy = policy();
+    let long = format!("safety:{}", "a".repeat(MAX_SAFETY_ACTION_NAME_BYTES));
+    for name in [
+        "safety:",
+        "safety:_x",
+        "safety::x",
+        "safety:-x",
+        long.as_str(),
+    ] {
+        assert!(SafetyActionName::parse(name).is_err(), "{name}");
+        let action = Action::new(name, None, json!({})).unwrap();
+        assert!(
+            matches!(
+                policy.classify(action.clone()),
+                Err(PraetoreError::UnclassifiedAction { .. })
+            ),
+            "{name}"
+        );
+        assert!(policy.unclassified(action).is_ok(), "{name}");
+        // And no policy can declare it.
+        assert!(
+            policy
+                .clone()
+                .with_action_class(name, ActionClass::Safety)
+                .validate()
+                .is_err(),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn error_codes_are_stable() {
     for (error, code) in [
@@ -635,9 +749,20 @@ fn error_codes_are_stable() {
 // ---------------------------------------------------------------------------
 // Domain separation.
 
-/// Every `PRAETORE_..._V<n>\0...` literal in the repository's sources and
-/// docs, with `\0` (or `\x00`) decoded.
-fn repository_domains() -> BTreeSet<Vec<u8>> {
+/// Domain candidates found in every text file of the repository (any file
+/// type, any directory except build output, `.git` and fuzz corpora):
+///
+/// * `literals`: every `PRAETORE_..._V<n>\0...` literal, with `\0` (or
+///   `\x00`) decoded: the exact bytes code signs or hashes under;
+/// * `names`: every `PRAETORE_..._V<n>` token, with or without a NUL, so a
+///   domain a proposal writes without `\0` (such as SAF-13's
+///   `PRAETORE_HEAD_STATEMENT_SIG_V1`) is covered too.
+struct Domains {
+    literals: BTreeSet<Vec<u8>>,
+    names: BTreeSet<String>,
+}
+
+fn repository_domains() -> Domains {
     fn walk(path: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = fs::read_dir(path) else {
             return;
@@ -648,26 +773,32 @@ fn repository_domains() -> BTreeSet<Vec<u8>> {
             if path.is_dir() {
                 if !matches!(
                     name.to_str(),
-                    Some("target" | "node_modules" | ".git" | "corpus")
+                    Some("target" | "node_modules" | ".git" | "corpus" | "artifacts")
                 ) {
                     walk(&path, out);
                 }
-            } else if matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("rs" | "py" | "ts" | "js" | "mjs" | "md")
-            ) {
+            } else if entry.metadata().is_ok_and(|m| m.len() <= 4 * 1024 * 1024) {
                 out.push(path);
             }
         }
     }
+    fn is_name(token: &str) -> bool {
+        token
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            && token.rsplit_once("_V").is_some_and(|(_, version)| {
+                !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit())
+            })
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    // Docs too: a proposal may reserve a domain before any code uses it.
-    for dir in ["crates", "examples", "packages", "fuzz", "tests", "docs"] {
-        walk(&root.join(dir), &mut files);
-    }
-    let mut domains = BTreeSet::new();
+    walk(&root, &mut files);
+    let mut domains = Domains {
+        literals: BTreeSet::new(),
+        names: BTreeSet::new(),
+    };
     for file in files {
+        // Binary and non-UTF-8 files are skipped.
         let Ok(text) = fs::read_to_string(&file) else {
             continue;
         };
@@ -680,16 +811,14 @@ fn repository_domains() -> BTreeSet<Vec<u8>> {
             let literal = &candidate[..end];
             rest = &candidate["PRAETORE_".len()..];
             let decoded = literal.replace("\\x00", "\0").replace("\\0", "\0");
-            let Some(nul) = decoded.find('\0') else {
+            let name = decoded.split('\0').next().unwrap_or_default();
+            let name = name.split('\\').next().unwrap_or_default();
+            if !is_name(name) {
                 continue;
-            };
-            let name = &decoded[..nul];
-            let is_domain = name
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-                && name.contains("_V");
-            if is_domain && !decoded.contains('\\') {
-                domains.insert(decoded.into_bytes());
+            }
+            domains.names.insert(name.to_owned());
+            if decoded.contains('\0') && !decoded.contains('\\') {
+                domains.literals.insert(decoded.into_bytes());
             }
         }
     }
@@ -699,7 +828,7 @@ fn repository_domains() -> BTreeSet<Vec<u8>> {
 #[test]
 fn no_domain_is_a_prefix_of_another() {
     let domains = repository_domains();
-    // The scan finds every known domain, the new ones included.
+    // The scan finds every known domain literal, the new ones included.
     for known in [
         &b"PRAETORE_EVIDENCE_V1\0"[..],
         b"PRAETORE_EVIDENCE_V2\0",
@@ -720,23 +849,38 @@ fn no_domain_is_a_prefix_of_another() {
         b"PRAETORE_AGENT_KEY_V1\0ed25519\0",
         b"PRAETORE_ATTESTER_KEY_V1\0ed25519\0",
         b"PRAETORE_ISSUER_KEY_V1\0ed25519\0",
-        b"PRAETORE_HEAD_STATEMENT_V1\0", // proposed in SAF-13
+        // SAF-13 Q4 (proposal): a hash prefix for the head statement.
+        b"PRAETORE_HEAD_STATEMENT_V1\0",
         SAFETY_NAMESPACE_DOMAIN,
         SAFETY_NAMESPACE_KEY_ID_DOMAIN,
     ] {
         assert!(
-            domains.contains(known),
+            domains.literals.contains(known),
             "{} not found by the scan",
             String::from_utf8_lossy(known)
         );
     }
-    for a in &domains {
-        for b in &domains {
+    // SAF-13 PROPUESTA 2 (proposal): the head statement signature domain,
+    // written without a NUL.
+    assert!(domains.names.contains("PRAETORE_HEAD_STATEMENT_SIG_V1"));
+    assert!(domains.names.contains("PRAETORE_SAFETY_NAMESPACE_V1"));
+    for a in &domains.literals {
+        for b in &domains.literals {
             assert!(
                 a == b || !b.starts_with(a),
                 "{:?} is a prefix of {:?}",
                 String::from_utf8_lossy(a),
                 String::from_utf8_lossy(b)
+            );
+        }
+    }
+    // Stricter, on the names alone: no name is a byte prefix of another, so
+    // no two domains collide even if one were written without its NUL.
+    for a in &domains.names {
+        for b in &domains.names {
+            assert!(
+                a == b || !b.starts_with(a.as_str()),
+                "{a} is a prefix of {b}"
             );
         }
     }
@@ -752,6 +896,7 @@ fn manifest_signatures_do_not_cross_domains() {
     let signature = hex::decode(manifest.signature()).unwrap();
     let raw = SigningKey::from_bytes(&NAMESPACE_SECRET);
     let others: Vec<Vec<u8>> = repository_domains()
+        .literals
         .into_iter()
         .filter(|domain| domain.as_slice() != SAFETY_NAMESPACE_DOMAIN)
         .collect();

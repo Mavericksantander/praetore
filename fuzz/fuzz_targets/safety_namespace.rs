@@ -20,12 +20,14 @@ fuzz_target!(|input: &[u8]| {
         assert!(name.name_after_prefix().as_bytes()[0].is_ascii_alphanumeric());
     }
 
-    // A parsed manifest re-encodes to a document that parses to the same
-    // manifest, and verification never panics.
+    // Only the canonical encoding parses (one manifest, one document), and
+    // verification never panics.
     if let Ok(manifest) = SafetyNamespaceManifest::from_json(text) {
         let encoded = manifest.to_json().expect("a parsed manifest encodes");
+        assert_eq!(encoded, text, "a non-canonical document was accepted");
+        let file = manifest.to_file().expect("a parsed manifest has a file");
         assert_eq!(
-            SafetyNamespaceManifest::from_json(&encoded).expect("re-encoded manifest parses"),
+            SafetyNamespaceManifest::from_file(&file).expect("its file parses"),
             manifest
         );
         let pin = SafetyNamespaceKey::from_secret_bytes(&[1; 32])
