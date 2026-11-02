@@ -216,9 +216,12 @@ any wrapped server matches the entry and is forwarded without a receipt.
 Declare only the safety actions the executor really runs, and keep the
 policy under the same review as any other policy change.
 
-Recording safety actions (SAF-09.5: isolated ingestion with its own process,
-credentials and key) is not implemented; until it is, PRÆTORE keeps no
-record of them.
+Recording safety actions is a separate, isolated path (SAF-09.5, G1): the
+executor runs the action first and reports it afterwards to
+`praetore-safety-ingest`, which has its own process, database role and key,
+and stores signed post-hoc records chained per source. The executor's
+client never waits for it. See
+[docs/proposals/safety-ingestion-jsonl.md](proposals/safety-ingestion-jsonl.md).
 
 Classification needs the policy. If `policy.json` cannot be read or parsed,
 the hook and the `praetore-mcp` gate refuse every tool call, `safety:*`
@@ -234,8 +237,8 @@ or digit, printable ASCII only (no whitespace, control or format
 characters, homoglyphs or full-width characters), at most 128 bytes. Each
 failure is a typed `SafetyNameError` (`Empty`, `TooLong`,
 `NotPrintableAscii`, `MissingPrefix`, `InvalidNameStart`). Policy loading
-uses it for every `Safety` entry, and so will the ingestion path for safety
-actions (SAF-09.5), so the two cannot disagree on what a safety name is.
+uses it for every `Safety` entry, and so does the ingestion path for safety
+actions (SAF-09.5, G1), so the two cannot disagree on what a safety name is.
 
 A safety namespace manifest is a signed statement of the `Safety` names one
 format 2 policy declares. An executor of an AI-enabled system and PRÆTORE
@@ -274,9 +277,9 @@ other permission bits, no extended ACL entries (macOS), at most 128 bytes,
 the public key of another role, the evidence attester or an authority
 issuer, and both commands refuse a namespace key equal to any of them
 (`SAFETY_MANIFEST_SAME_KEY`). The flag is opt-in in these offline
-commands; the ingestion path (G1) and online loaders that hold the
-namespace key or pin together with another role's key run the check
-without a flag.
+commands; the ingestion path (`praetore-safety-ingest`, G1) and online
+loaders that hold the namespace key or pin together with another role's key
+run the check without a flag.
 
 The manifest (`SafetyNamespaceManifest`, schema version 1) is canonical
 JSON (the repository's canonical encoding: keys sorted, no whitespace),
@@ -310,8 +313,9 @@ authority issuer key, which grants capabilities. The key id has its own
 domain, so the same public key never has the same id in two roles.
 
 For the ingestion path, `manifest.classify_name(&name)` answers `Declared`
-or `Undeclared`. An undeclared name is a value, not an error, so it can be
-recorded (marked `undeclared`) rather than dropped.
+or `Undeclared`. An undeclared name is a value, not an error, so
+`praetore-safety-ingest` records it (status `undeclared`) rather than
+dropping it.
 
 The entry points keep the G7 prefix rule and do not call
 `SafetyActionName::parse`. A name that starts with `safety:` but fails
@@ -319,8 +323,10 @@ The entry points keep the G7 prefix rule and do not call
 declared, so it is refused: the gateway answers it with the same 422
 `safety_action_not_governed` as every `safety:` name, with no receipt;
 `praetore-mcp` and the hook refuse it with a signed `unclassified` DENY.
-The ingestion path must record such a name with its raw input (bounded,
-and escaped for display) and the reason `invalid_name`, never drop it.
+The ingestion path records such a name, never drops it: status
+`invalid_name`, the `SafetyNameError` code as `reason`, the raw name kept
+exactly in the signed event and the error text bounded and escaped as
+`detail`.
 
 JSON output of both commands is exact by design (a `policy_id` with an
 invisible character is printed as it is); text output escapes it.
