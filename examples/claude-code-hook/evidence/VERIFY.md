@@ -521,6 +521,24 @@ twice and gets two receipts. `verify` then prints
 the ids and counts; this does not fail verification. Receipts without a
 `tool_use_id` are counted on their own line.
 
+The hook shows a denied tool call only as a reason class plus the evidence
+id. The class is a fixed function of signed fields of the receipt, so a
+verifier can recompute it from `decision.decided_by` and `context.profile`
+(checked in this order):
+
+| Signed field | Class shown |
+| --- | --- |
+| `context.profile` is `unregistered` | `unregistered` |
+| `decided_by` = engine guard `unclassified_action` | `unclassified` |
+| `decided_by` = any other engine guard (`authority_capability`, `missing_capability`, `authority_constraint`, `unbound_rule_capability`) or an unbound rule | `capability` |
+| `decided_by` = rule `deny-unanalyzable-command` | `unanalyzable_command, use simple commands` |
+| any other rule, or the default deny | `path` |
+
+The signed part is the `rule_id` (and `reason`, `Policy rule '...'
+matched`); the displayed phrase is not itself signed. In the default policy
+every rule or default deny in the last row is about paths; with a custom
+policy, a non-path Deny rule is also shown as `path`.
+
 ### 3. Export
 
 Export to a directory **outside the repository** until the set is reviewed.

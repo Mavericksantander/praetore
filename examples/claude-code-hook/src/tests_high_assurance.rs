@@ -255,6 +255,8 @@ fn unavailable_replay_store_fails_closed() {
         };
         // ACL cases run only on macOS (other platforms `continue` above).
         assert!(error.to_string().contains(expected), "{broken}: {error}");
+        // Shown with --nocapture: CI checks that the ACL cases ran on macOS.
+        println!("replay store case {broken}: denied: {error}");
         assert_eq!(
             fail_closed(error).outcome,
             DecisionOutcome::Deny,
@@ -353,7 +355,7 @@ fn missing_tool_use_id_is_recorded_as_absent() {
     let mut missing = s.read(Some("explorer"));
     missing.tool_use_id = None;
     let mut empty = s.read(Some("explorer"));
-    empty.tool_use_id = Some(String::new());
+    empty.tool_use_id = Some(json!(""));
     for input in [missing, empty] {
         let verdict = authorize(&s.state, &input).unwrap();
         assert_eq!(verdict.outcome, DecisionOutcome::Allow);
@@ -375,7 +377,7 @@ fn missing_tool_use_id_is_recorded_as_absent() {
 fn tool_use_id_is_bounded_and_escaped() {
     let s = State::new("tool-use-id-bounds");
     let mut long = s.read(Some("explorer"));
-    long.tool_use_id = Some("x".repeat(129));
+    long.tool_use_id = Some(json!("x".repeat(129)));
     let verdict = authorize(&s.state, &long).unwrap();
     assert_eq!(verdict.outcome, DecisionOutcome::Deny);
     assert_eq!(verdict.deny_class, Some(DenyClass::Unregistered));
@@ -384,7 +386,7 @@ fn tool_use_id_is_bounded_and_escaped() {
     assert_eq!(rejected["bytes"], 129);
 
     let mut odd = s.read(Some("explorer"));
-    odd.tool_use_id = Some("toolu_\u{202e}x\n".into());
+    odd.tool_use_id = Some(json!("toolu_\u{202e}x\n"));
     for _ in 0..2 {
         authorize(&s.state, &odd).unwrap();
     }
@@ -400,6 +402,113 @@ fn tool_use_id_is_bounded_and_escaped() {
         !warning.contains('\u{202e}') && !warning.contains('\n'),
         "{warning:?}"
     );
+}
+
+/// The `receipts.jsonl` line carries an unsigned copy of the tool_use_id
+/// only when the receipt signs it. A rejected (oversized) id leaves no raw
+/// copy; adding one fails `verify` and `export`. `export` takes the id only
+/// from the signed context.
+#[test]
+fn unsigned_tool_use_id_copy_only_when_signed() {
+    let s = State::new("tool-use-id-wrapper");
+    authorize(&s.state, &s.read(Some("explorer"))).unwrap();
+    let mut long = s.read(Some("explorer"));
+    long.tool_use_id = Some(json!("y".repeat(200)));
+    authorize(&s.state, &long).unwrap();
+    let journal = s.state.join(RECEIPTS_FILE);
+    let lines: Vec<Value> = fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["tool_use_id"], "toolu_ha");
+    assert!(lines[1].get("tool_use_id").is_none(), "{}", lines[1]);
+    assert!(
+        !fs::read_to_string(&journal)
+            .unwrap()
+            .contains(&"y".repeat(200))
+    );
+    verify_receipts(&s.state).unwrap();
+    let out = s.root.join("bundle");
+    export_bundle(&s.state, &out).unwrap();
+    let index: Vec<Value> =
+        serde_json::from_slice(&fs::read(out.join("index.json")).unwrap()).unwrap();
+    assert_eq!(index[0]["tool_use_id"], "toolu_ha");
+    assert!(index[1]["tool_use_id"].is_null());
+
+    // An unsigned copy on the line that signs none: refused.
+    let mut forged = lines.clone();
+    forged[1]["tool_use_id"] = json!("toolu_ha");
+    let text: String = forged.iter().map(|line| format!("{line}\n")).collect();
+    fs::write(&journal, text).unwrap();
+    let error = verify_receipts(&s.state).unwrap_err().to_string();
+    assert!(error.contains("1 receipts failed"), "{error}");
+    let error = export_bundle(&s.state, &s.root.join("bundle-2"))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("signs no tool_use_id"), "{error}");
+
+    // An absent copy on a line that signs one is fine.
+    let mut dropped = lines;
+    dropped[0].as_object_mut().unwrap().remove("tool_use_id");
+    let text: String = dropped.iter().map(|line| format!("{line}\n")).collect();
+    fs::write(&journal, text).unwrap();
+    verify_receipts(&s.state).unwrap();
+}
+
+/// A numeric tool_use_id is signed as its canonical text; any other JSON
+/// type is rejected like an oversized id (evaluated as `unregistered`,
+/// signed Deny, `praetore.claim_rejected` with the key and the JSON type,
+/// never the value). Unparseable input fails closed with a fixed message
+/// that does not echo input values.
+#[test]
+fn tool_use_id_of_any_json_type_is_handled() {
+    let s = State::new("tool-use-id-types");
+    let mut number = s.read(Some("explorer"));
+    number.tool_use_id = Some(json!(12345));
+    assert_eq!(
+        authorize(&s.state, &number).unwrap().outcome,
+        DecisionOutcome::Allow
+    );
+    assert_eq!(s.receipts()[0].context[TOOL_USE_ID_CLAIM], "12345");
+
+    for (value, kind) in [
+        (json!({ "secret": "zzz-value" }), "object"),
+        (json!(["zzz-value"]), "array"),
+        (json!(true), "boolean"),
+    ] {
+        let mut input = s.read(Some("explorer"));
+        input.tool_use_id = Some(value);
+        let verdict = authorize(&s.state, &input).unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{kind}");
+        assert_eq!(verdict.deny_class, Some(DenyClass::Unregistered));
+        let evidence = s.receipts().pop().unwrap();
+        let rejected = &evidence.context["praetore.claim_rejected"];
+        assert_eq!(rejected["key"], TOOL_USE_ID_CLAIM);
+        assert_eq!(rejected["type"], kind);
+        assert!(!evidence.to_json().unwrap().contains("zzz-value"), "{kind}");
+    }
+    verify_receipts(&s.state).unwrap();
+
+    // The whole event parses with a non-string tool_use_id.
+    let event = br#"{"tool_name":"Read","tool_input":{},"tool_use_id":{"a":1}}"#;
+    assert!(parse_hook_input(event).is_ok());
+    // An event that does not parse: fixed text, no input value in it.
+    for bad in [
+        &br#"{"tool_name":12345678,"tool_input":{}}"#[..],
+        br#"{"tool_name":"Read","agent_type":"zzz-value-1"#,
+        br#""zzz-value""#,
+    ] {
+        let message = fail_closed(parse_hook_input(bad).err().unwrap()).reason;
+        assert!(
+            !message.contains("12345678") && !message.contains("zzz-value"),
+            "{message}"
+        );
+        assert!(
+            message.contains("not a valid PreToolUse event"),
+            "{message}"
+        );
+    }
 }
 
 /// Replay store, tested directly.

@@ -20,9 +20,14 @@
   calls (each invocation builds a new request). `receipts.jsonl` is now
   `fsync`ed after each append (and its directory on creation); a claim can
   remain without a receipt when that write fails, and the call is denied.
-  Each receipt signs Claude Code's `tool_use_id` (`claude.tool_use_id`,
-  up to 128 bytes; a longer one is evaluated as `unregistered`; a missing
-  one is not recorded). The guard does not forge receipts and does not
+  Each receipt signs Claude Code's `tool_use_id` (`claude.tool_use_id`, a
+  string or number up to 128 bytes; a longer one or another JSON type is
+  evaluated as `unregistered` and recorded only as `praetore.claim_rejected`;
+  a missing one is not recorded). The `receipts.jsonl` line carries an
+  unsigned copy only when the receipt signs one; `verify` and `export`
+  refuse an unsigned copy on a HighAssurance receipt that signs none, and
+  `export` takes it only from the signed context. Unparseable hook input is
+  denied with a fixed message that does not quote input values. The guard does not forge receipts and does not
   deduplicate invocations: a re-delivered tool call is evaluated again, and
   the hook's `verify` warns (without failing) about `tool_use_id`s signed in
   more than one receipt. An unanalyzable shell command is now denied (rule

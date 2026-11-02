@@ -42,11 +42,16 @@ agente haga por otro camino queda fuera (ver Límites).
   (con su propio `request_id`), así que la misma tool call entregada dos
   veces se evalúa dos veces y da dos recibos, cada uno una decisión real del
   motor. El hook firma el `tool_use_id` de Claude Code en el contexto del
-  recibo (`claude.tool_use_id`, hasta 128 bytes; uno más largo se evalúa
-  como `unregistered` y se niega con recibo; uno ausente o vacío no se
-  registra, y la ausencia queda cubierta por la firma). `verify` avisa, sin
-  fallar, de los `tool_use_id` que aparecen en más de un recibo (cuántos y
-  cuáles) y cuenta los recibos sin `tool_use_id`.
+  recibo (`claude.tool_use_id`, string o número de hasta 128 bytes). Uno
+  más largo o de otro tipo JSON se evalúa como `unregistered` y se niega con
+  recibo, que registra en `praetore.claim_rejected` la clave y el largo o el
+  tipo, nunca el valor. Uno ausente o vacío no se registra, y la ausencia
+  queda cubierta por la firma. La línea de `receipts.jsonl` lleva una copia
+  sin firmar del `tool_use_id` solo si el recibo lo firma; `verify` y
+  `export` rechazan una copia sin firmar en un recibo HighAssurance que no
+  firma ninguno, y `export` toma el valor solo del contexto firmado.
+  `verify` avisa, sin fallar, de los `tool_use_id` que aparecen en más de un
+  recibo (cuántos y cuáles) y cuenta los recibos sin `tool_use_id`.
   El archivo y sus directorios se sincronizan a disco (`fsync`) antes de dar
   el claim por hecho, y nunca se borran. En cada claim el hook exige que
   `replay/` sea un directorio real del usuario actual, sin ningún bit de
@@ -56,13 +61,19 @@ agente haga por otro camino queda fuera (ver Límites).
   o permisos incorrectos, ACL, disco lleno, fallo de `fsync`) niega la tool
   call sin recibo. El estado debe estar en un sistema de archivos local con
   create exclusivo atómico: no en NFS ni en una carpeta sincronizada (por
-  ejemplo, Escritorio y Documentos en iCloud).
+  ejemplo, Escritorio y Documentos en iCloud). En macOS, `~` y `~/Desktop`
+  traen de fábrica una ACL (`group:everyone deny delete`, sin herencia):
+  el estado no puede ser esa carpeta misma, pero sí un subdirectorio (por
+  ejemplo `<proyecto>/.claude/praetore`). `ls -lde <estado>` muestra si el
+  directorio tiene ACL.
 - **El recibo se sincroniza a disco** (`fsync` de `receipts.jsonl` en cada
   append, y de su directorio al crearlo) antes de que el hook responda. Si
   escribirlo falla, el hook niega la tool call; el claim de replay ya hecho
   queda sin recibo. `replay/` no es un registro de decisiones: puede tener
   claims huérfanos, que no bloquean nada porque su `request_id` no se
-  reutiliza.
+  reutiliza. Al revés también puede pasar: si la línea se escribe pero el
+  `fsync` falla, el hook niega la tool call y aun así puede quedar un recibo
+  (incluso un Allow) de una llamada que se negó por error de E/S.
 - **Un estado anterior a los recibos HighAssurance falla cerrado.** Si
   `<estado>/replay/` no existe, el hook niega cada tool call gobernada con un
   mensaje que pide correr `praetore-claude-hook init` en un directorio nuevo

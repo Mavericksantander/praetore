@@ -102,8 +102,12 @@ struct HookInput {
     tool_name: String,
     #[serde(default)]
     tool_input: Value,
+    /// Signed as `claude.tool_use_id` when it is a string or number of at
+    /// most 128 bytes; any other JSON type is rejected like an oversized id
+    /// (see [`instance_claims`]). A `Value`, so a non-string does not fail
+    /// parsing.
     #[serde(default)]
-    tool_use_id: Option<String>,
+    tool_use_id: Option<Value>,
     #[serde(default)]
     agent_type: Option<String>,
     /// Claude Code's id for the subagent instance the hook fires in. It is
@@ -141,7 +145,8 @@ enum DenyClass {
     Capability,
     /// A policy rule or the default deny (in the default policy every such
     /// deny is path-scoped: outside the project, `.git`, `.claude`, or a
-    /// path that does not resolve to itself).
+    /// path that does not resolve to itself). With a custom policy, a Deny
+    /// or Recover rule that is not about paths is also shown as `path`.
     Path,
     /// The request was evaluated as `unregistered` (no profile, a reserved
     /// name, or a rejected instance/session/tool_use id).
@@ -643,7 +648,15 @@ fn read_hook_input() -> Result<HookInput, BoxError> {
     if buffer.len() as u64 > MAX_HOOK_INPUT_BYTES {
         return Err("hook input exceeds 32 MiB".into());
     }
-    Ok(serde_json::from_slice(&buffer)?)
+    parse_hook_input(&buffer)
+}
+
+/// The serde error can quote input values; the model sees this fixed text
+/// instead.
+fn parse_hook_input(buffer: &[u8]) -> Result<HookInput, BoxError> {
+    serde_json::from_slice(buffer).map_err(|_| {
+        "hook input is not a valid PreToolUse event (JSON object with a string tool_name)".into()
+    })
 }
 
 fn hook_output(verdict: &Verdict) -> Option<Value> {
@@ -693,11 +706,10 @@ fn hook_output(verdict: &Verdict) -> Option<Value> {
 /// never the value.
 fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Value>) {
     let mut claims = Vec::new();
-    let tool_use_id = input.tool_use_id.clone().map(Value::String);
     for (key, value) in [
         ("claude.agent_id", &input.agent_id),
         ("claude.session_id", &input.session_id),
-        (TOOL_USE_ID_CLAIM, &tool_use_id),
+        (TOOL_USE_ID_CLAIM, &input.tool_use_id),
     ] {
         let text = match value {
             None | Some(Value::Null) => continue,
@@ -1030,13 +1042,18 @@ fn append_receipt(
 ) -> Result<(), BoxError> {
     #[cfg(test)]
     tests_g7::APPENDS.with(|count| count.set(count.get() + 1));
-    let line = json!({
-        "tool_use_id": input.tool_use_id,
+    let mut line = json!({
         "tool_name": input.tool_name,
         "agent": agent,
         "profile": profile,
         "evidence": serde_json::from_str::<Value>(&evidence.to_json()?)?,
     });
+    // An unsigned copy of the tool_use_id only when the receipt signs it: a
+    // rejected (oversized or non-string) id is recorded only as the signed
+    // `praetore.claim_rejected`, never as a raw value.
+    if let Some(signed) = evidence.context.get(TOOL_USE_ID_CLAIM) {
+        line["tool_use_id"] = signed.clone();
+    }
     let path = directory.join(RECEIPTS_FILE);
     let mut options = fs::OpenOptions::new();
     options.append(true).create_new(true);
@@ -1209,10 +1226,7 @@ fn verify_receipts(directory: &Path) -> Result<VerifyReport, BoxError> {
             let attribution = signed_attribution(&evidence)?;
             check_unsigned(&record, "agent", &attribution.agent)?;
             check_unsigned(&record, "profile", &attribution.profile)?;
-            let tool_use_id = signed_tool_use_id(&evidence)?;
-            if let Some(signed) = &tool_use_id {
-                check_unsigned(&record, "tool_use_id", signed)?;
-            }
+            let tool_use_id = checked_tool_use_id(&record, &evidence)?;
             let profile_path = directory
                 .join(AGENTS_DIR)
                 .join(format!("{}.json", attribution.profile));
@@ -1347,6 +1361,30 @@ impl VerifyReport {
     }
 }
 
+/// The signed `tool_use_id` of a `receipts.jsonl` line, checked against the
+/// line's unsigned copy. Call it only on verified evidence.
+///
+/// - The receipt signs one: the copy must be absent or equal.
+/// - It signs none: the copy must be absent (or null). A HighAssurance
+///   receipt with an unsigned copy fails. Receipts from before
+///   HighAssurance (the hook then wrote an unsigned copy and signed none)
+///   still verify; their copy is ignored and never exported.
+fn checked_tool_use_id(record: &Value, evidence: &Evidence) -> Result<Option<String>, BoxError> {
+    let signed = signed_tool_use_id(evidence)?;
+    let unsigned = record.get("tool_use_id").filter(|value| !value.is_null());
+    match (&signed, unsigned) {
+        (Some(signed), _) => check_unsigned(record, "tool_use_id", signed)?,
+        (None, None) => {}
+        (None, Some(_)) if !evidence.is_high_assurance_shape() => {}
+        (None, Some(_)) => {
+            return Err(
+                "unsigned field tool_use_id is present but the receipt signs no tool_use_id".into(),
+            );
+        }
+    }
+    Ok(signed)
+}
+
 /// The `tool_use_id` signed in a receipt's context, if any. Call it only on
 /// verified evidence.
 fn signed_tool_use_id(evidence: &Evidence) -> Result<Option<String>, BoxError> {
@@ -1394,14 +1432,9 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
         // a line whose wrapper disagrees is not exported.
         let attribution = signed_attribution(&evidence)
             .map_err(|error| format!("receipt {}: {error}", number + 1))?;
-        let tool_use_id = signed_tool_use_id(&evidence)
-            .map_err(|error| format!("receipt {}: {error}", number + 1))?;
-        check_unsigned(&record, "agent", &attribution.agent)
+        let tool_use_id = check_unsigned(&record, "agent", &attribution.agent)
             .and_then(|()| check_unsigned(&record, "profile", &attribution.profile))
-            .and_then(|()| match &tool_use_id {
-                Some(signed) => check_unsigned(&record, "tool_use_id", signed),
-                None => Ok(()),
-            })
+            .and_then(|()| checked_tool_use_id(&record, &evidence))
             .map_err(|error| format!("receipt {}: {error}", number + 1))?;
         let agent = attribution.agent.as_str();
         let tool = record["tool_name"].as_str().unwrap_or("unknown");
@@ -1419,7 +1452,8 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
             "agent_id": evidence.agent.id.as_uuid().to_string(),
             "tool_name": tool,
             "profile": attribution.profile,
-            "tool_use_id": record["tool_use_id"],
+            // Only the signed value; null when the receipt signs none.
+            "tool_use_id": tool_use_id,
             "outcome": outcome,
             "rule": deciding_rules(&evidence),
             "reason": evidence.decision.reason,

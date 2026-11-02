@@ -62,7 +62,8 @@ pub(crate) const MAX_VALID_DAYS: i64 = 3650;
 /// evidence. That covers a missing or replaced store, a symlink or a
 /// non-directory in the path, a store directory not owned by this user or
 /// with any group/other permission bit or (macOS) an extended ACL entry, a
-/// state directory not owned by this user or writable by group/others, a
+/// state directory not owned by this user, writable by group/others or
+/// (macOS) with an extended ACL entry, a
 /// full disk and a failed `fsync`. These checks run on every claim. A claim
 /// whose file was created but whose `fsync` failed stays claimed: the
 /// request is refused and cannot be retried, which is the safe side.

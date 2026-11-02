@@ -122,6 +122,18 @@ jobs:
       - run: cargo test -p praetore-python --locked
       - name: T-013B confinement tests (macOS portable walk)
         run: cargo test --locked -p praetore-sandbox-fs -- --nocapture
+      # The hook's replay store checks extended ACLs only on macOS (FFI to
+      # acl_get_link_np): its tests must run here, and the ACL cases must
+      # not be skipped.
+      - name: Claude Code hook tests (macOS, ACL checks)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -Eq "test result: ok\. [0-9]+ passed; 0 failed" <<<"$output" || { echo "::error::the hook tests failed"; exit 1; }
+          for case in acl state-acl; do
+            grep -q "replay store case $case: denied: .*extended ACL entries" <<<"$output" || { echo "::error::ACL case $case did not run"; exit 1; }
+          done
 
   verifier-features:
     name: Offline verifiers build without receipt signing
