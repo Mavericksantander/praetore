@@ -60,6 +60,31 @@ file and never writes or rewrites it. Add the two fields yourself, review
 every `Mission` entry, and keep the old document: receipts that recorded its
 digest verify only against it (`praetore-verify --policy`).
 
+### Safety namespace manifest (G2)
+
+```sh
+(umask 077; openssl rand -hex 32 > namespace.key)
+praetore policy safety-manifest --policy ./policy.json --key namespace.key \
+  --output safety-manifest.json
+```
+
+writes the signed safety namespace manifest of a format 2 policy (its
+digest, id, version and the sorted list of its `Safety` names) and prints a
+summary with the `public_key` that verifiers pin. It never overwrites: an
+existing `--output` file is an error and is left as it was, and a failed
+write leaves nothing (the manifest goes through a synced anonymous or
+temporary file linked to the output name; the output directory needs a
+filesystem with hard links, so not FAT or exFAT). The key is a dedicated
+32-byte secret (64 lowercase hex characters): a regular file, not a
+symlink, owned by you, no group or other permissions, no extended ACL
+entries on macOS, at most 128 bytes. It is not the evidence or issuer key;
+each `--other-pin <hex file>` (repeatable, alias `--attester-pin`) refuses
+it if it equals that public key. `--issued-at <RFC 3339>` fixes the time; the same
+policy, time and key give the same bytes. Verify it with
+`praetore-verify safety-manifest --manifest safety-manifest.json --pin
+namespace.pin [--policy ./policy.json]`. The manifest authorizes nothing;
+see [docs/policy-language.md](../../docs/policy-language.md#safety-namespace-manifest-g2).
+
 ### Human approval
 
 `init` also creates a local human approver key (`approver.key`, owner-only)

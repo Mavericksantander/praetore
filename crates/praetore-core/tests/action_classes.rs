@@ -574,3 +574,18 @@ fn the_unclassified_deny_constants_are_stable() {
         "unclassified_action"
     );
 }
+
+/// G2: a `Safety` entry is checked by the shared validator
+/// (`SafetyActionName::parse`), which bounds its length; a longer `Safety`
+/// entry makes the whole policy invalid.
+#[test]
+fn safety_entries_are_bounded_by_the_shared_validator() {
+    let name = format!("safety:{}", "a".repeat(200));
+    let result = Policy::new_v2("p", 1, vec![])
+        .with_action_class(name.as_str(), ActionClass::Safety)
+        .validate();
+    assert!(
+        matches!(result, Err(PraetoreError::PolicyActionClassInvalid(_))),
+        "{result:?}"
+    );
+}

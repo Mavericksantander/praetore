@@ -64,4 +64,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "safety_namespace"
+path = "fuzz_targets/safety_namespace.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
