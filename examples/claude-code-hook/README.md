@@ -35,13 +35,18 @@ agente haga por otro camino queda fuera (ver Límites).
   firmado que el motor evalúa reclama un archivo
   `replay/<tenant>/<agent id>/<request id>` creado con `create_new`
   (`O_CREAT|O_EXCL`): de varios procesos que crean el mismo nombre, el kernel
-  deja ganar a uno solo. Lo que garantiza hoy: el claim de un request firmado
-  queda registrado una sola vez, y ese request no se evalúa de nuevo. **No
-  deduplica tool calls:** cada invocación del hook arma un request nuevo (con
-  su propio `request_id`), así que la misma tool call entregada dos veces da
-  dos recibos, cada uno una decisión real del motor. Si un tool call
-  re-entregado debe caer en replay (por ejemplo, derivando `request_id` de
-  `tool_use_id`) está pendiente de decisión (M1 de la revisión de #88).
+  deja ganar a uno solo. Lo que garantiza: el claim de un request firmado
+  queda registrado una sola vez y ese request no se evalúa de nuevo, así que
+  no se puede reusar un request firmado para obtener otro recibo. **No
+  deduplica invocaciones:** cada invocación del hook arma un request nuevo
+  (con su propio `request_id`), así que la misma tool call entregada dos
+  veces se evalúa dos veces y da dos recibos, cada uno una decisión real del
+  motor. El hook firma el `tool_use_id` de Claude Code en el contexto del
+  recibo (`claude.tool_use_id`, hasta 128 bytes; uno más largo se evalúa
+  como `unregistered` y se niega con recibo; uno ausente o vacío no se
+  registra, y la ausencia queda cubierta por la firma). `verify` avisa, sin
+  fallar, de los `tool_use_id` que aparecen en más de un recibo (cuántos y
+  cuáles) y cuenta los recibos sin `tool_use_id`.
   El archivo y sus directorios se sincronizan a disco (`fsync`) antes de dar
   el claim por hecho, y nunca se borran. En cada claim el hook exige que
   `replay/` sea un directorio real del usuario actual, sin ningún bit de
@@ -77,9 +82,15 @@ agente haga por otro camino queda fuera (ver Límites).
   retiene. Una tool `safety:*` no declarada se niega con un DENY firmado
   (motivo `unclassified`, guard `unclassified_action`) que se agrega a
   `receipts.jsonl`; el motor verifica la solicitud igual que una de misión y
-  no evalúa reglas. Todo DENY con recibo se muestra con el mismo texto,
-  `PRÆTORE denied this tool call (evidence ...)`; la regla y el motivo van a
-  stderr y al recibo firmado. La policy por defecto declara `Mission`
+  no evalúa reglas. Todo DENY con recibo se muestra (al modelo y en stderr)
+  solo con su clase de motivo y el id de evidencia,
+  `PRÆTORE denied this tool call: <clase> (evidence ...)`, nunca con el id ni
+  el texto de la regla, que quedan en el recibo firmado. Clases:
+  `capability` (la autoridad no da lo que hace falta), `path` (una regla o
+  el default deny; en la policy por defecto todas son de ruta),
+  `unregistered`, `unclassified` y
+  `unanalyzable_command, use simple commands`. Un `RequireApproval` muestra
+  la regla, el motivo y también `(evidence ...)`. La policy por defecto declara `Mission`
   los tipos `claude:*` y ninguna acción `Safety`.
 - **Migrar la policy antes de actualizar el binario.** Un estado creado
   antes de G7 tiene una policy de formato 1; con el binario nuevo esa policy
@@ -122,7 +133,9 @@ Reglas de la policy por defecto:
   pero con aprobación.
 - Nadie escribe en `<raíz>/.git`.
 - `git push` requiere aprobación (ver abajo cómo se detecta).
-- Un comando que no se puede analizar requiere aprobación.
+- Un comando que no se puede analizar se niega (regla
+  `deny-unanalyzable-command`, con recibo firmado); el mensaje dice
+  `unanalyzable_command, use simple commands`.
 - Los subagentes leen y escriben solo dentro de la raíz del proyecto, con la
   ruta ya resuelta (un symlink que sale de la raíz no cuenta como dentro). La
   sesión principal además lee en cualquier lugar y escribe en
@@ -161,7 +174,7 @@ Detecta `cd x && git push`, `sudo git push`, `/usr/bin/git push` y
 `git -C ../repo push`. Nunca ejecuta ni expande nada.
 
 Si el comando contiene algo que no puede analizar léxicamente, lo marca como
-no analizable y la policy pide aprobación: sustitución de comandos (`$(...)`,
+no analizable y la policy lo niega: sustitución de comandos (`$(...)`,
 backticks), sustitución de procesos, heredocs, `eval`, `sh -c` / `bash -c`,
 una variable en posición de comando o junto a `push`, o un alias inline
 (`git -c alias.x=push x`). Acepta falsos positivos como `echo git push`.

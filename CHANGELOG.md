@@ -20,6 +20,17 @@
   calls (each invocation builds a new request). `receipts.jsonl` is now
   `fsync`ed after each append (and its directory on creation); a claim can
   remain without a receipt when that write fails, and the call is denied.
+  Each receipt signs Claude Code's `tool_use_id` (`claude.tool_use_id`,
+  up to 128 bytes; a longer one is evaluated as `unregistered`; a missing
+  one is not recorded). The guard does not forge receipts and does not
+  deduplicate invocations: a re-delivered tool call is evaluated again, and
+  the hook's `verify` warns (without failing) about `tool_use_id`s signed in
+  more than one receipt. An unanalyzable shell command is now denied (rule
+  `deny-unanalyzable-command`, signed receipt) instead of held for approval.
+  A DENY with a receipt shows only its reason class (`capability`, `path`,
+  `unregistered`, `unclassified`, `unanalyzable_command, use simple
+  commands`) and the evidence id, never the rule id or text; a
+  RequireApproval message also includes the evidence id.
   Freshness is
   local (60 s lease, no revocation source). `init` creates `replay/`; state
   created before this change has none and is refused with a message that

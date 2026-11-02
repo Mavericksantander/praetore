@@ -512,6 +512,15 @@ the hook (private state, local only):
 The last lines must say `N receipts verified, 0 failed` and
 `N record a signed decision time (decided_at, HighAssurance)` with the same N.
 
+Each receipt signs the `tool_use_id` Claude Code sent
+(`context["claude.tool_use_id"]`). The replay store does not forge receipts:
+a signed request is claimed once and cannot be evaluated again. It does not
+deduplicate invocations: a tool call Claude Code delivers twice is evaluated
+twice and gets two receipts. `verify` then prints
+`WARNING: N tool_use_id values are signed in more than one receipt ...` with
+the ids and counts; this does not fail verification. Receipts without a
+`tool_use_id` are counted on their own line.
+
 ### 3. Export
 
 Export to a directory **outside the repository** until the set is reviewed.

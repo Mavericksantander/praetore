@@ -262,6 +262,10 @@ jobs:
             state_without_a_replay_store_is_refused_with_a_pointer_to_init \
             unavailable_replay_store_fails_closed \
             unwritable_receipts_journal_denies_and_leaves_an_orphan_claim \
+            tool_use_id_is_signed_and_tampering_fails \
+            same_tool_use_id_twice_is_allowed_and_reported \
+            missing_tool_use_id_is_recorded_as_absent \
+            tool_use_id_is_bounded_and_escaped \
             guard::replaying_the_same_request_is_refused \
             guard::guard_reports_unavailable_when_the_store_is \
             guard::concurrent_claims_of_one_request_succeed_exactly_once \

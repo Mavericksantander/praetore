@@ -39,6 +39,13 @@ pub(crate) const MAX_VALID_DAYS: i64 = 3650;
 
 /// Durable, fail-closed, one-time claim store on the local filesystem.
 ///
+/// What it guarantees: a signed request is claimed once, so it cannot be
+/// evaluated again to obtain a second receipt. What it does not do:
+/// deduplicate hook invocations. Each invocation builds a new request with a
+/// new `request_id`, so a re-delivered tool call is evaluated again and gets
+/// its own receipt; the signed `claude.tool_use_id` lets `verify` report
+/// such repeats.
+///
 /// One claim is one file, `replay/<tenant>/<agent>/<request>`, created with
 /// `create_new` (`O_CREAT | O_EXCL`). The create is the claim: the kernel
 /// guarantees that of several processes creating the same name, exactly one

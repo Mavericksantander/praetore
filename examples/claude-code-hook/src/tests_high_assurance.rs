@@ -12,13 +12,13 @@ use std::path::PathBuf;
 use super::*;
 use crate::high_assurance::REPLAY_DIR;
 
-struct State {
-    root: PathBuf,
-    state: PathBuf,
+pub(crate) struct State {
+    pub(crate) root: PathBuf,
+    pub(crate) state: PathBuf,
 }
 
 impl State {
-    fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         let base = std::env::temp_dir().join(format!(
             "praetore-claude-hook-ha-{name}-{}",
             std::process::id()
@@ -31,7 +31,7 @@ impl State {
         Self { root, state }
     }
 
-    fn input(&self, agent: Option<&str>, tool: &str, tool_input: Value) -> HookInput {
+    pub(crate) fn input(&self, agent: Option<&str>, tool: &str, tool_input: Value) -> HookInput {
         let mut input = json!({
             "tool_name": tool,
             "tool_input": tool_input,
@@ -44,12 +44,12 @@ impl State {
         serde_json::from_value(input).unwrap()
     }
 
-    fn read(&self, agent: Option<&str>) -> HookInput {
+    pub(crate) fn read(&self, agent: Option<&str>) -> HookInput {
         let file = format!("{}/README.md", self.root.display());
         self.input(agent, "Read", json!({ "file_path": file }))
     }
 
-    fn receipts(&self) -> Vec<Evidence> {
+    pub(crate) fn receipts(&self) -> Vec<Evidence> {
         match fs::read_to_string(self.state.join(RECEIPTS_FILE)) {
             Ok(text) => text
                 .lines()
@@ -289,6 +289,117 @@ fn unwritable_receipts_journal_denies_and_leaves_an_orphan_claim() {
         .map(|agent| fs::read_dir(agent.unwrap().path()).unwrap().count())
         .sum::<usize>();
     assert_eq!(claims, 2, "the denied call's claim stays (orphan)");
+}
+
+/// The `tool_use_id` is signed in the receipt context: editing it in the
+/// receipt breaks the signatures, and editing only the unsigned copy in the
+/// `receipts.jsonl` line is caught by `verify`.
+#[test]
+fn tool_use_id_is_signed_and_tampering_fails() {
+    let s = State::new("tool-use-id-signed");
+    authorize(&s.state, &s.read(Some("explorer"))).unwrap();
+    let evidence = &s.receipts()[0];
+    assert_eq!(evidence.context[TOOL_USE_ID_CLAIM], "toolu_ha");
+    verify_receipts(&s.state).unwrap();
+
+    let journal = s.state.join(RECEIPTS_FILE);
+    let original = fs::read_to_string(&journal).unwrap();
+    for (what, edit) in [
+        ("signed copy", "\"claude.tool_use_id\":\"toolu_ha\""),
+        ("unsigned copy", "\"tool_use_id\":\"toolu_ha\""),
+    ] {
+        assert_eq!(original.matches(edit).count(), 1, "{what}");
+        fs::write(
+            &journal,
+            original.replace(edit, &edit.replace("toolu_ha", "toolu_xx")),
+        )
+        .unwrap();
+        assert!(
+            verify_receipts(&s.state).is_err(),
+            "{what} edited, verify passed"
+        );
+    }
+}
+
+/// A re-delivered tool call (same `tool_use_id`) is evaluated again and
+/// allowed: each delivery is a separate decision with its own receipt.
+/// `verify` passes and reports the repeat as a warning.
+#[test]
+fn same_tool_use_id_twice_is_allowed_and_reported() {
+    let s = State::new("tool-use-id-twice");
+    for _ in 0..2 {
+        let verdict = authorize(&s.state, &s.read(Some("explorer"))).unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+    }
+    assert_eq!(s.receipts().len(), 2);
+    let report = verify_receipts(&s.state).unwrap();
+    assert_eq!(report.repeated_tool_use_ids(), vec![("toolu_ha", 2)]);
+    let warning = report.repeated_tool_use_id_warning().unwrap();
+    assert!(
+        warning.starts_with("WARNING: 1 tool_use_id values"),
+        "{warning}"
+    );
+    assert!(warning.contains("toolu_ha (x2)"), "{warning}");
+}
+
+/// A missing or empty `tool_use_id` is evaluated normally and no key is
+/// signed: the absence is covered by the signature, and `verify` counts
+/// such receipts separately (an absence is not a repeat). Claude Code
+/// always sends one; the hook does not deny without it because it is not a
+/// replay key.
+#[test]
+fn missing_tool_use_id_is_recorded_as_absent() {
+    let s = State::new("tool-use-id-missing");
+    let mut missing = s.read(Some("explorer"));
+    missing.tool_use_id = None;
+    let mut empty = s.read(Some("explorer"));
+    empty.tool_use_id = Some(String::new());
+    for input in [missing, empty] {
+        let verdict = authorize(&s.state, &input).unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+    }
+    for evidence in s.receipts() {
+        assert!(!evidence.context.contains_key(TOOL_USE_ID_CLAIM));
+    }
+    let report = verify_receipts(&s.state).unwrap();
+    assert_eq!(report.without_tool_use_id, 2);
+    assert!(report.repeated_tool_use_ids().is_empty());
+}
+
+/// An oversized `tool_use_id` is rejected like an oversized agent or
+/// session id: evaluated as `unregistered` and denied, with a signed
+/// receipt that records the rejection (key and length, not the value).
+/// Control characters in an accepted id are signed as sent and escaped in
+/// the warning.
+#[test]
+fn tool_use_id_is_bounded_and_escaped() {
+    let s = State::new("tool-use-id-bounds");
+    let mut long = s.read(Some("explorer"));
+    long.tool_use_id = Some("x".repeat(129));
+    let verdict = authorize(&s.state, &long).unwrap();
+    assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+    assert_eq!(verdict.deny_class, Some(DenyClass::Unregistered));
+    let rejected = &s.receipts()[0].context["praetore.claim_rejected"];
+    assert_eq!(rejected["key"], TOOL_USE_ID_CLAIM);
+    assert_eq!(rejected["bytes"], 129);
+
+    let mut odd = s.read(Some("explorer"));
+    odd.tool_use_id = Some("toolu_\u{202e}x\n".into());
+    for _ in 0..2 {
+        authorize(&s.state, &odd).unwrap();
+    }
+    assert_eq!(
+        s.receipts()[1].context[TOOL_USE_ID_CLAIM],
+        "toolu_\u{202e}x\n"
+    );
+    let warning = verify_receipts(&s.state)
+        .unwrap()
+        .repeated_tool_use_id_warning()
+        .unwrap();
+    assert!(
+        !warning.contains('\u{202e}') && !warning.contains('\n'),
+        "{warning:?}"
+    );
 }
 
 /// Replay store, tested directly.

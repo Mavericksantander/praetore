@@ -33,17 +33,20 @@ ln -s /etc "$PROJECT/enlace-afuera"
 
 step "3. Pasar tool calls por el hook (mismo wrapper que usa Claude Code)"
 export CLAUDE_PROJECT_DIR="$PROJECT" PRAETORE_HOOK_BIN="$BIN"
+CALLS=0
 call() {
   local agent="$1" tool="$2" input="$3"
+  # Un tool_use_id distinto por llamada, como en Claude Code (va firmado).
+  CALLS=$((CALLS + 1))
   python3 -c '
 import json, sys
-agent, tool, tool_input, cwd = sys.argv[1:]
+agent, tool, tool_input, cwd, number = sys.argv[1:]
 event = {"hook_event_name": "PreToolUse", "tool_name": tool,
          "tool_input": json.loads(tool_input), "cwd": cwd,
-         "tool_use_id": "demo"}
+         "tool_use_id": f"toolu_demo_{int(number):02d}"}
 if agent != "main":
     event["agent_type"] = agent
-print(json.dumps(event))' "$agent" "$tool" "$input" "$PROJECT" |
+print(json.dumps(event))' "$agent" "$tool" "$input" "$PROJECT" "$CALLS" |
     "$HERE/hook/praetore-hook.sh" |
     python3 -c '
 import json, sys

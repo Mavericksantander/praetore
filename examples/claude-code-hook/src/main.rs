@@ -23,6 +23,8 @@ mod attribution_tests;
 mod tests_g7;
 #[cfg(test)]
 mod tests_high_assurance;
+#[cfg(test)]
+mod tests_messages;
 
 use std::{
     collections::BTreeMap,
@@ -125,6 +127,62 @@ struct Verdict {
     not_governed: bool,
     /// The signed receipt behind the decision, when there is one.
     evidence_id: Option<String>,
+    /// For a DENY with a receipt, the only reason shown outside the receipt
+    /// (see [`DenyClass`]).
+    deny_class: Option<DenyClass>,
+}
+
+/// Why a tool call with a signed receipt was denied, as shown to the model
+/// and on stderr. Never a rule id or rule text: those stay in the receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenyClass {
+    /// The agent's authority does not grant what the action needs (an
+    /// engine guard: capability, authority constraint, unbound rule).
+    Capability,
+    /// A policy rule or the default deny (in the default policy every such
+    /// deny is path-scoped: outside the project, `.git`, `.claude`, or a
+    /// path that does not resolve to itself).
+    Path,
+    /// The request was evaluated as `unregistered` (no profile, a reserved
+    /// name, or a rejected instance/session/tool_use id).
+    Unregistered,
+    /// The action type is not declared in the policy (G7).
+    Unclassified,
+    /// A shell command the scanner cannot analyze.
+    UnanalyzableCommand,
+}
+
+impl DenyClass {
+    fn of(evidence: &Evidence, profile: &str) -> Self {
+        use praetore_core::DecidedBy;
+        if profile == UNREGISTERED {
+            return Self::Unregistered;
+        }
+        match evidence.decision.decided_by() {
+            Some(DecidedBy::EngineGuard { guard })
+                if guard == praetore_core::UNCLASSIFIED_ACTION_GUARD =>
+            {
+                Self::Unclassified
+            }
+            Some(DecidedBy::EngineGuard { .. }) | Some(DecidedBy::UnboundRule { .. }) => {
+                Self::Capability
+            }
+            Some(DecidedBy::Rule { rule_id }) if rule_id == UNANALYZABLE_RULE => {
+                Self::UnanalyzableCommand
+            }
+            _ => Self::Path,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Self::Capability => "capability",
+            Self::Path => "path",
+            Self::Unregistered => "unregistered",
+            Self::Unclassified => "unclassified",
+            Self::UnanalyzableCommand => "unanalyzable_command, use simple commands",
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -136,7 +194,9 @@ fn main() -> ExitCode {
             run_hook(Path::new(directory));
             Ok(())
         }
-        [command, directory] if command == "verify" => verify_receipts(Path::new(directory)),
+        [command, directory] if command == "verify" => {
+            verify_receipts(Path::new(directory)).map(|_| ())
+        }
         [command, directory, out] if command == "export" => {
             export_bundle(Path::new(directory), Path::new(out))
         }
@@ -308,18 +368,14 @@ fn default_policy(root: &str, home: &str) -> Policy {
             // `git_push` exists only for analyzable commands. Without this
             // condition, an unanalyzable command (no `git_push` key) matched
             // this rule as unknown under policy semantics v2 and was reported
-            // as a git push. The unanalyzable rule below still holds it.
+            // as a git push. The unanalyzable rule below denies it.
             .with_parameter_condition(PolicyCondition::exact("analyzable", json!(true)))
             .with_parameter_condition(PolicyCondition::exact("git_push", json!(true))),
             // A command the scanner cannot analyze lexically might push, so it
-            // is held for approval instead of allowed.
-            PolicyRule::new(
-                "approval-unanalyzable-command",
-                "claude:exec",
-                PolicyEffect::RequireApproval,
-            )
-            .with_capability("process:execute")
-            .with_parameter_condition(PolicyCondition::exact("analyzable", json!(false))),
+            // is denied (with a signed receipt): the agent is told to use
+            // simple commands.
+            PolicyRule::new(UNANALYZABLE_RULE, "claude:exec", PolicyEffect::Deny)
+                .with_parameter_condition(PolicyCondition::exact("analyzable", json!(false))),
             PolicyRule::new("allow-read-project", "claude:read", PolicyEffect::Allow)
                 .with_capability("fs:read")
                 .with_parameter_condition(PolicyCondition::path_prefix("path", root)),
@@ -451,6 +507,9 @@ fn classify(
     }
 }
 
+/// Rule that denies a command the shell scanner cannot analyze.
+const UNANALYZABLE_RULE: &str = "deny-unanalyzable-command";
+
 /// What the policy sees in place of a path that does not resolve to itself.
 const PATH_CHECK_FAILED: &str = "praetore-claude-hook:path-check-failed";
 
@@ -543,21 +602,23 @@ fn run_hook(directory: &Path) {
     if verdict.not_governed {
         eprintln!("PRÆTORE: {}", shown(&verdict.reason));
     }
-    if verdict.outcome == DecisionOutcome::Deny && verdict.evidence_id.is_some() {
-        // The model only sees the uniform text (see `hook_output`); the rule
-        // and reason are in the signed receipt and here.
-        eprintln!(
-            "PRÆTORE{}: {}",
-            verdict
-                .rule
-                .as_deref()
-                .map(|rule| format!(" [rule {}]", shown(rule)))
-                .unwrap_or_default(),
-            shown(&verdict.reason)
-        );
+    if let Some(line) = stderr_line(&verdict) {
+        eprintln!("{}", shown(&line));
     }
     if let Some(output) = hook_output(&verdict) {
         println!("{output}");
+    }
+}
+
+/// What stderr says about a DENY with a receipt: the reason class and the
+/// evidence id only. The rule and its reason are in the signed receipt.
+fn stderr_line(verdict: &Verdict) -> Option<String> {
+    match (verdict.outcome, verdict.deny_class, &verdict.evidence_id) {
+        (DecisionOutcome::Deny, Some(class), Some(evidence_id)) => Some(format!(
+            "PRÆTORE: denied ({}), evidence {evidence_id}",
+            class.text()
+        )),
+        _ => None,
     }
 }
 
@@ -570,6 +631,7 @@ fn fail_closed(error: BoxError) -> Verdict {
         reason: format!("hook error, failing closed: {error}"),
         not_governed: false,
         evidence_id: None,
+        deny_class: None,
     }
 }
 
@@ -593,44 +655,49 @@ fn hook_output(verdict: &Verdict) -> Option<Value> {
         DecisionOutcome::RequireApproval => "ask",
         DecisionOutcome::Deny => "deny",
     };
-    // G7: every DENY with a receipt gets the same text, whatever decided it
-    // (a rule, an engine guard or an action type the policy does not
-    // declare), so the reason cannot reveal what the policy declares.
-    if decision == "deny"
-        && let Some(evidence_id) = &verdict.evidence_id
-    {
-        return Some(json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": decision,
-                "permissionDecisionReason": format!("PRÆTORE denied this tool call (evidence {evidence_id})"),
-            }
-        }));
-    }
-    let rule = verdict
-        .rule
-        .as_deref()
-        .map(|rule| format!(" [rule {rule}]"))
-        .unwrap_or_default();
+    // A DENY with a receipt shows only its reason class (see `DenyClass`)
+    // and the evidence id, never the rule id or rule text.
+    let text = match (decision, verdict.deny_class, &verdict.evidence_id) {
+        ("deny", Some(class), Some(evidence_id)) => format!(
+            "PRÆTORE denied this tool call: {} (evidence {evidence_id})",
+            class.text()
+        ),
+        _ => {
+            let rule = verdict
+                .rule
+                .as_deref()
+                .map(|rule| format!(" [rule {rule}]"))
+                .unwrap_or_default();
+            let evidence = verdict
+                .evidence_id
+                .as_deref()
+                .map(|id| format!(" (evidence {id})"))
+                .unwrap_or_default();
+            format!("PRÆTORE{rule}: {}{evidence}", verdict.reason)
+        }
+    };
     Some(json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": decision,
-            "permissionDecisionReason": format!("PRÆTORE{rule}: {}", verdict.reason),
+            "permissionDecisionReason": text,
         }
     }))
 }
 
-/// Instance and session ids as Claude Code reports them, ready for the
-/// signed context, or why one was rejected. A string is kept as is; a number
+/// Instance, session and tool-use ids as Claude Code reports them, ready for
+/// the signed context, or why one was rejected. A missing or empty id is not
+/// recorded: its absence is itself covered by the signature. A string is kept as is; a number
 /// becomes its canonical JSON text, so a future numeric id does not deny
 /// every call. The rejection names the key, the JSON type and the length,
 /// never the value.
 fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Value>) {
     let mut claims = Vec::new();
+    let tool_use_id = input.tool_use_id.clone().map(Value::String);
     for (key, value) in [
         ("claude.agent_id", &input.agent_id),
         ("claude.session_id", &input.session_id),
+        (TOOL_USE_ID_CLAIM, &tool_use_id),
     ] {
         let text = match value {
             None | Some(Value::Null) => continue,
@@ -664,6 +731,11 @@ fn instance_claims(input: &HookInput) -> (Vec<(&'static str, String)>, Option<Va
     }
     (claims, None)
 }
+
+/// Signed context key for Claude Code's `tool_use_id`. It ties a receipt to
+/// the tool call it was made for; it is not a replay key (a re-delivered
+/// tool call is evaluated again, and `verify` reports the repeat).
+const TOOL_USE_ID_CLAIM: &str = "claude.tool_use_id";
 
 /// G7: tools whose name starts with `safety:` are safety actions of that
 /// exact type; the policy must declare them `Safety`. Every other tool maps
@@ -728,6 +800,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
                 ),
                 not_governed: true,
                 evidence_id: None,
+                deny_class: None,
             });
         }
         // Not declared: the engine refuses it with a signed DENY (engine
@@ -867,6 +940,8 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
         reason,
         not_governed: false,
         evidence_id: Some(evidence.evidence_id.to_string()),
+        deny_class: (outcome == DecisionOutcome::Deny)
+            .then(|| DenyClass::of(&evidence, profile_name)),
     })
 }
 
@@ -942,6 +1017,7 @@ fn denied(reason: String) -> Verdict {
         reason,
         not_governed: false,
         evidence_id: None,
+        deny_class: None,
     }
 }
 
@@ -1085,7 +1161,7 @@ fn check_unsigned(record: &Value, field: &str, signed: &str) -> Result<(), BoxEr
 /// profile named in the authority, that the signing identity is the one in
 /// `agents/<profile>.json`, and that the unsigned `agent`/`profile` fields
 /// of the line agree. The tally is built from the signed names only.
-fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
+fn verify_receipts(directory: &Path) -> Result<VerifyReport, BoxError> {
     let pin = TrustedAuthorityIssuer::from_pin_json(&String::from_utf8(read_bounded(
         &directory.join(ISSUER_PIN_FILE),
     )?)?)?;
@@ -1108,8 +1184,10 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     // would count one decision twice.
     let mut seen_evidence: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_request: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut report = VerifyReport::default();
     for (index, line) in receipts.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
-        let mut check = || -> Result<(Attribution, String, DecisionOutcome, bool), BoxError> {
+        type Checked = (Attribution, String, DecisionOutcome, bool, Option<String>);
+        let mut check = || -> Result<Checked, BoxError> {
             let record: Value = serde_json::from_str(line)?;
             let evidence = Evidence::from_json(&record["evidence"].to_string())?;
             if !evidence.verify_integrity() {
@@ -1131,6 +1209,10 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
             let attribution = signed_attribution(&evidence)?;
             check_unsigned(&record, "agent", &attribution.agent)?;
             check_unsigned(&record, "profile", &attribution.profile)?;
+            let tool_use_id = signed_tool_use_id(&evidence)?;
+            if let Some(signed) = &tool_use_id {
+                check_unsigned(&record, "tool_use_id", signed)?;
+            }
             let profile_path = directory
                 .join(AGENTS_DIR)
                 .join(format!("{}.json", attribution.profile));
@@ -1164,12 +1246,17 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
                 agent_id,
                 evidence.decision.outcome,
                 checked_at.is_some(),
+                tool_use_id,
             ))
         };
         match check() {
-            Ok((attribution, agent_id, outcome, timed)) => {
+            Ok((attribution, agent_id, outcome, timed, tool_use_id)) => {
                 issuer_bound += usize::from(attribution.issuer_bound);
                 decision_timed += usize::from(timed);
+                match tool_use_id {
+                    Some(id) => *report.tool_use_ids.entry(id).or_default() += 1,
+                    None => report.without_tool_use_id += 1,
+                }
                 *tally
                     .entry((attribution.label(), format!("{outcome:?}")))
                     .or_default() += 1;
@@ -1194,10 +1281,80 @@ fn verify_receipts(directory: &Path) -> Result<(), BoxError> {
     println!(
         "{decision_timed} record a signed decision time (decided_at, HighAssurance); their authority was checked at it"
     );
+    report.print_tool_use_ids();
     if failures > 0 {
         return Err(format!("{failures} receipts failed verification").into());
     }
-    Ok(())
+    Ok(report)
+}
+
+/// What `verify` reports about signed `tool_use_id`s, beyond pass/fail.
+#[derive(Debug, Default)]
+struct VerifyReport {
+    /// Receipts per signed `tool_use_id`.
+    tool_use_ids: BTreeMap<String, usize>,
+    /// Verified receipts that sign no `tool_use_id` (none was sent, or the
+    /// receipt predates it).
+    without_tool_use_id: usize,
+}
+
+impl VerifyReport {
+    /// `tool_use_id`s signed in more than one receipt, with their count.
+    fn repeated_tool_use_ids(&self) -> Vec<(&str, usize)> {
+        self.tool_use_ids
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(id, count)| (id.as_str(), *count))
+            .collect()
+    }
+
+    /// A repeat is a warning, not a failure: Claude Code may re-deliver a
+    /// tool call, and each delivery is a separate, real decision.
+    fn print_tool_use_ids(&self) {
+        if let Some(warning) = self.repeated_tool_use_id_warning() {
+            println!("{warning}");
+        }
+        if self.without_tool_use_id > 0 {
+            println!(
+                "{} receipts sign no tool_use_id (none was sent, or the receipt predates it)",
+                self.without_tool_use_id
+            );
+        }
+    }
+
+    /// The warning line for repeated `tool_use_id`s; ids are escaped for
+    /// display (invisible, bidi and control characters).
+    fn repeated_tool_use_id_warning(&self) -> Option<String> {
+        let repeated = self.repeated_tool_use_ids();
+        if repeated.is_empty() {
+            return None;
+        }
+        let receipts: usize = repeated.iter().map(|(_, count)| count).sum();
+        let ids = repeated
+            .iter()
+            .map(|(id, count)| {
+                format!(
+                    "{} (x{count})",
+                    praetore_core::display::escape_for_display(id)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(format!(
+            "WARNING: {} tool_use_id values are signed in more than one receipt ({receipts} receipts; each is a separate decision): {ids}",
+            repeated.len()
+        ))
+    }
+}
+
+/// The `tool_use_id` signed in a receipt's context, if any. Call it only on
+/// verified evidence.
+fn signed_tool_use_id(evidence: &Evidence) -> Result<Option<String>, BoxError> {
+    match evidence.context.get(TOOL_USE_ID_CLAIM) {
+        None => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id.clone())),
+        Some(_) => Err(format!("signed {TOOL_USE_ID_CLAIM} is not a string").into()),
+    }
 }
 
 /// The signed decision time of a HighAssurance receipt, `None` for receipts
@@ -1237,8 +1394,14 @@ fn export_bundle(directory: &Path, out: &Path) -> Result<(), BoxError> {
         // a line whose wrapper disagrees is not exported.
         let attribution = signed_attribution(&evidence)
             .map_err(|error| format!("receipt {}: {error}", number + 1))?;
+        let tool_use_id = signed_tool_use_id(&evidence)
+            .map_err(|error| format!("receipt {}: {error}", number + 1))?;
         check_unsigned(&record, "agent", &attribution.agent)
             .and_then(|()| check_unsigned(&record, "profile", &attribution.profile))
+            .and_then(|()| match &tool_use_id {
+                Some(signed) => check_unsigned(&record, "tool_use_id", signed),
+                None => Ok(()),
+            })
             .map_err(|error| format!("receipt {}: {error}", number + 1))?;
         let agent = attribution.agent.as_str();
         let tool = record["tool_name"].as_str().unwrap_or("unknown");
@@ -1484,18 +1647,27 @@ mod tests {
         assert_eq!(verdict.outcome, DecisionOutcome::Allow);
         assert!(hook_output(&verdict).is_none());
 
-        for (command, rule) in [
-            ("cd x && git push", "approval-git-push"),
-            ("git -C ../repo push --force", "approval-git-push"),
-            ("$(echo git) push", "approval-unanalyzable-command"),
-            ("bash -c 'git push'", "approval-unanalyzable-command"),
+        for (command, rule, outcome) in [
+            (
+                "cd x && git push",
+                "approval-git-push",
+                DecisionOutcome::RequireApproval,
+            ),
+            (
+                "git -C ../repo push --force",
+                "approval-git-push",
+                DecisionOutcome::RequireApproval,
+            ),
+            // Unanalyzable: denied, not held for approval.
+            ("$(echo git) push", UNANALYZABLE_RULE, DecisionOutcome::Deny),
+            (
+                "bash -c 'git push'",
+                UNANALYZABLE_RULE,
+                DecisionOutcome::Deny,
+            ),
         ] {
             let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
-            assert_eq!(
-                verdict.outcome,
-                DecisionOutcome::RequireApproval,
-                "{command}"
-            );
+            assert_eq!(verdict.outcome, outcome, "{command}");
             assert!(
                 verdict.rule.as_deref().unwrap_or_default().contains(rule),
                 "{command}: {:?}",
@@ -1507,15 +1679,26 @@ mod tests {
     #[test]
     fn unanalyzable_command_without_push_is_not_reported_as_git_push() {
         // Shape of receipt 0093 in evidence/05-sesion-real-final: a heredoc
-        // with no `git push`, held only because it cannot be analyzed.
+        // with no `git push`, denied only because it cannot be analyzed. The
+        // receipt is signed; the message names only the reason class.
         let f = Fixture::new("heredoc");
         let command = "cd docs && python3 - <<'E'\nprint('hola')\nE\ngrep -n x 01.md";
         let verdict = f.decide(Some("coder"), "Bash", json!({ "command": command }));
-        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+        assert_eq!(verdict.rule.as_deref(), Some(UNANALYZABLE_RULE));
+        assert_eq!(verdict.deny_class, Some(DenyClass::UnanalyzableCommand));
+        let text = hook_output(&verdict).unwrap()["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         assert_eq!(
-            verdict.rule.as_deref(),
-            Some("approval-unanalyzable-command")
+            text,
+            format!(
+                "PRÆTORE denied this tool call: unanalyzable_command, use simple commands (evidence {})",
+                verdict.evidence_id.as_deref().unwrap()
+            )
         );
+        verify_receipts(&f.state).unwrap();
 
         // An analyzable push still names approval-git-push.
         let verdict = f.decide(Some("coder"), "Bash", json!({ "command": "git push" }));
