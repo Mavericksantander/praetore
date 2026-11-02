@@ -142,10 +142,8 @@ fn read_private_file_owned_by(
 /// from libSystem.
 ///
 /// The Claude Code hook (#88) has its own ACL FFI, by path
-/// (`acl_get_link_np`) and treating any `acl_get_entry` failure as "no
-/// entries". Both should later move to one shared helper based on this
-/// variant: on the open descriptor, and failing closed on any error other
-/// than "no ACL" or "empty ACL".
+/// (`acl_get_link_np`). Both fail closed; they should later be unified in
+/// one shared helper.
 #[cfg(target_os = "macos")]
 mod acl {
     use super::SecretFileError;
