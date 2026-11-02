@@ -260,33 +260,56 @@ fn writes_nothing_when_an_input_is_invalid() {
     assert!(!output.exists());
 }
 
-/// The namespace key is refused when it is the attester's key.
+/// The namespace key is refused when it equals any `--other-pin` (the
+/// attester or an issuer); `--attester-pin` is an alias.
 #[test]
-fn refuses_the_attester_key_as_the_namespace_key() {
+fn refuses_the_key_of_another_role_as_the_namespace_key() {
     let (dir, policy, key) = fixture();
     let output = dir.path("manifest.json");
-    let same = dir.write("attester.pin", hex::encode(pin().as_bytes()));
-    let mut args = manifest_args(&policy, &key, &output);
-    args.extend(["--attester-pin", same.to_str().unwrap()]);
-    let result = praetore(&args);
-    assert!(!result.status.success());
-    assert!(
-        String::from_utf8_lossy(&result.stderr).contains("key of another role"),
-        "{result:?}"
-    );
-    assert!(!output.exists());
+    let same = dir.write("same.pin", hex::encode(pin().as_bytes()));
+    let other = |name: &str, seed: u8| {
+        dir.write(
+            name,
+            hex::encode(
+                praetore_core::EvidenceAttesterKey::from_secret_bytes(&[seed; 32])
+                    .public_key()
+                    .unwrap()
+                    .as_bytes(),
+            ),
+        )
+    };
+    let attester = other("attester.pin", 0x52);
+    let issuer = other("issuer.pin", 0x53);
+    for flags in [
+        vec!["--other-pin", same.to_str().unwrap()],
+        vec!["--attester-pin", same.to_str().unwrap()],
+        vec![
+            "--other-pin",
+            attester.to_str().unwrap(),
+            "--other-pin",
+            issuer.to_str().unwrap(),
+            "--other-pin",
+            same.to_str().unwrap(),
+        ],
+    ] {
+        let mut args = manifest_args(&policy, &key, &output);
+        args.extend(flags.iter().copied());
+        let result = praetore(&args);
+        assert!(!result.status.success(), "{flags:?}");
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("key of another role"),
+            "{result:?}"
+        );
+        assert!(!output.exists());
+    }
 
-    let other = dir.write(
-        "other.pin",
-        hex::encode(
-            praetore_core::EvidenceAttesterKey::from_secret_bytes(&[0x52; 32])
-                .public_key()
-                .unwrap()
-                .as_bytes(),
-        ),
-    );
     let mut args = manifest_args(&policy, &key, &output);
-    args.extend(["--attester-pin", other.to_str().unwrap()]);
+    args.extend([
+        "--other-pin",
+        attester.to_str().unwrap(),
+        "--attester-pin",
+        issuer.to_str().unwrap(),
+    ]);
     assert!(praetore(&args).status.success());
 }
 

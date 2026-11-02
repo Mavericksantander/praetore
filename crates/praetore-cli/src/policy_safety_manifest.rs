@@ -1,20 +1,28 @@
 //! `praetore policy safety-manifest --policy PATH --key HEX_FILE --output
-//! NEW_FILE [--attester-pin HEX_FILE] [--issued-at RFC3339] [--format
+//! NEW_FILE [--other-pin HEX_FILE]... [--issued-at RFC3339] [--format
 //! json|text]` (G2): writes the signed safety namespace manifest of a
 //! format 2 policy.
 //!
 //! It never overwrites, and a failed write leaves nothing at the output
-//! path: the manifest is written and synced to a temporary file in the same
-//! directory, then hard-linked to the output name, which fails if the name
-//! exists (even as a dangling symlink), and the temporary file is removed.
+//! path ([`crate::new_file::write_new_file`]): the manifest is written and
+//! synced to a file without a name (Linux `O_TMPFILE`) or with a temporary
+//! name in the same directory, then linked to the output name, which fails
+//! if the name exists (even as a dangling symlink), and the linked entry is
+//! checked to be that file. A filesystem without hard links (FAT, exFAT,
+//! some SMB mounts) is refused with a message that says so.
 //!
 //! The key file holds the 32-byte secret of the safety namespace key as 64
 //! lowercase hex characters (one final newline allowed). It is read with
 //! [`crate::secret_file::read_private_file`]: not a symlink, a regular file
 //! owned by the current user, no group or other permission bits, at most
 //! 128 bytes. It must be its own key, not the evidence attester key or the
-//! authority issuer key; with `--attester-pin`, the same public key is
-//! refused (`SameKeyForBothRoles`).
+//! authority issuer key. Each `--other-pin` (repeatable; `--attester-pin`
+//! is an alias) names the public key of another role, the evidence
+//! attester or an authority issuer, and the namespace key is refused if it
+//! is any of them (`SameKeyForBothRoles`). The flag is opt-in here because
+//! this offline command does not know a deployment's other keys; the
+//! ingestion path (G1) and any online loader that holds the namespace key
+//! or pin with another role's key must run the same check without a flag.
 //!
 //! JSON output is exact (a policy id is printed as it is, invisible
 //! characters included) by design; text output escapes them.
@@ -26,7 +34,7 @@ use praetore_core::{
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -47,20 +55,27 @@ pub struct Args {
     pub policy: PathBuf,
     pub key: PathBuf,
     pub output: PathBuf,
-    pub attester_pin: Option<PathBuf>,
+    /// Public keys of other roles (attester, issuers) the namespace key
+    /// must differ from.
+    pub other_pins: Vec<PathBuf>,
     pub issued_at: Option<String>,
     pub format: Format,
 }
 
 pub fn parse(mut args: impl Iterator<Item = String>) -> CliResult<Args> {
-    let (mut policy, mut key, mut output, mut attester_pin, mut issued_at, mut format) =
-        (None, None, None, None, None, None);
+    let (mut policy, mut key, mut output, mut issued_at, mut format) =
+        (None, None, None, None, None);
+    let mut other_pins = Vec::new();
     while let Some(flag) = args.next() {
+        if flag == "--other-pin" || flag == "--attester-pin" {
+            let value = args.next().ok_or(format!("missing value for {flag}"))?;
+            other_pins.push(PathBuf::from(value));
+            continue;
+        }
         let slot = match flag.as_str() {
             "--policy" => &mut policy,
             "--key" => &mut key,
             "--output" => &mut output,
-            "--attester-pin" => &mut attester_pin,
             "--issued-at" => &mut issued_at,
             "--format" => &mut format,
             _ => return Err(format!("unexpected argument: {flag}").into()),
@@ -75,7 +90,7 @@ pub fn parse(mut args: impl Iterator<Item = String>) -> CliResult<Args> {
         policy: policy.ok_or(usage)?.into(),
         key: key.ok_or(usage)?.into(),
         output: output.ok_or(usage)?.into(),
-        attester_pin: attester_pin.map(PathBuf::from),
+        other_pins,
         issued_at,
         format: match format.as_deref() {
             None | Some("text") => Format::Text,
@@ -113,46 +128,6 @@ fn read_key(path: &Path) -> CliResult<SafetyNamespaceKey> {
         .try_into()
         .map_err(|_| "the key must be a 32-byte secret")?;
     Ok(SafetyNamespaceKey::from_secret_bytes(&secret))
-}
-
-/// Writes `contents` to `path`, which must not exist, so that `path` either
-/// does not appear or holds every byte: a temporary file in the same
-/// directory is written and synced, then hard-linked to `path` (`link`
-/// fails if `path` exists, also as a dangling symlink, so it never
-/// replaces anything), and removed.
-pub(crate) fn write_new_file(path: &Path, contents: &[u8]) -> CliResult<()> {
-    let name = path
-        .file_name()
-        .ok_or_else(|| format!("{} does not name a file", path.display()))?;
-    let directory = match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let temporary = directory.join(format!(
-        ".{}.{}.tmp",
-        name.to_string_lossy(),
-        uuid::Uuid::new_v4()
-    ));
-    let written = (|| -> CliResult<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        fs::hard_link(&temporary, path)
-            .map_err(|error| format!("cannot create {}: {error}", path.display()).into())
-    })();
-    let _ = fs::remove_file(&temporary);
-    written?;
-    // Persist the new directory entry. Best effort: the file is complete
-    // either way.
-    if let Ok(directory) = fs::File::open(directory) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
 }
 
 fn issued_at(value: Option<&str>) -> CliResult<OffsetDateTime> {
@@ -202,15 +177,17 @@ pub fn text_line(summary: &Value) -> String {
 pub fn write(args: &Args) -> CliResult<Value> {
     let policy = read_policy(&args.policy)?;
     let key = read_key(&args.key)?;
-    if let Some(pin) = &args.attester_pin {
-        let attester = crate::journal_export::read_attester_pin(pin)?;
-        ensure_distinct_keys(&key.public_key()?, &attester)?;
+    let namespace = key.public_key()?;
+    for pin in &args.other_pins {
+        let other = crate::journal_export::read_attester_pin(pin)?;
+        ensure_distinct_keys(&namespace, &other)
+            .map_err(|error| format!("{error} ({})", pin.display()))?;
     }
     let manifest =
         SafetyNamespaceManifest::from_policy(&policy, issued_at(args.issued_at.as_deref())?, &key)?;
     // Never overwrite: an existing file may be the manifest an executor
     // already holds.
-    write_new_file(&args.output, manifest.to_file()?.as_bytes())?;
+    crate::new_file::write_new_file(&args.output, manifest.to_file()?.as_bytes())?;
     summary(&manifest, &key, &args.output)
 }
 
@@ -240,7 +217,7 @@ mod tests {
                 policy: "p".into(),
                 key: "k".into(),
                 output: "o".into(),
-                attester_pin: None,
+                other_pins: Vec::new(),
                 issued_at: None,
                 format: Format::Text,
             }
@@ -261,58 +238,31 @@ mod tests {
         );
         assert_eq!(
             args(&[
+                "--policy",
+                "p",
+                "--key",
+                "k",
+                "--output",
+                "o",
+                "--other-pin",
+                "a",
+                "--attester-pin",
+                "b",
+                "--other-pin",
+                "c",
+            ])
+            .unwrap()
+            .other_pins,
+            [PathBuf::from("a"), PathBuf::from("b"), PathBuf::from("c")]
+        );
+        assert_eq!(
+            args(&[
                 "--format", "json", "--policy", "p", "--key", "k", "--output", "o"
             ])
             .unwrap()
             .format,
             Format::Json
         );
-    }
-
-    fn temporary_directory() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "praetore-write-new-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    #[test]
-    fn write_new_file_never_replaces_and_leaves_no_temporary_file() {
-        let directory = temporary_directory();
-        let path = directory.join("manifest.json");
-        write_new_file(&path, b"first\n").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"first\n");
-        let error = write_new_file(&path, b"second\n").unwrap_err();
-        assert!(error.to_string().contains("cannot create"), "{error}");
-        assert_eq!(fs::read(&path).unwrap(), b"first\n");
-
-        #[cfg(unix)]
-        {
-            // A dangling symlink at the output name is not followed.
-            let target = directory.join("elsewhere");
-            let link = directory.join("link.json");
-            std::os::unix::fs::symlink(&target, &link).unwrap();
-            assert!(write_new_file(&link, b"x").is_err());
-            assert!(!target.exists());
-        }
-
-        // A failed write leaves nothing: here the directory does not exist.
-        let missing = directory.join("missing").join("manifest.json");
-        assert!(write_new_file(&missing, b"x").is_err());
-        assert!(!missing.exists());
-
-        let names: Vec<String> = fs::read_dir(&directory)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            names.iter().all(|name| !name.ends_with(".tmp")),
-            "{names:?}"
-        );
-        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

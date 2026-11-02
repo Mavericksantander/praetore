@@ -255,16 +255,26 @@ praetore-verify safety-manifest --manifest safety-manifest.json \
 `praetore policy safety-manifest` prints the `public_key` to put in the pin
 file (64 lowercase hex characters, the same format as an attester pin). It
 never overwrites: an existing `--output` file (or a symlink at that name) is
-an error and stays as it was. The manifest is written and synced to a
-temporary file in the same directory and then hard-linked to the output
-name, so a failed write leaves nothing there. `--issued-at <RFC 3339>` fixes
-the issue time; the same policy, time and key always give the same bytes.
+an error and stays as it was. The manifest is written and synced to a file
+without a name (Linux `O_TMPFILE`) or with a temporary name in the same
+directory, then linked to the output name, and the linked entry is checked
+to be that file, so a failed or interfered-with write leaves nothing there.
+The output directory must be on a filesystem with hard links: on FAT,
+exFAT and some SMB or FUSE mounts the command fails with a message that
+says so (write to a local filesystem such as APFS or ext4 and copy the
+file); there is no non-atomic fallback. `--issued-at <RFC 3339>` fixes the
+issue time; the same policy, time and key always give the same bytes.
 The key file is opened once without following a symlink and checked on the
 open descriptor: a regular file owned by the current user, no group or
-other permission bits, at most 128 bytes, 64 lowercase hex characters and
-at most one final newline. With `--attester-pin <hex file>`, both commands
-refuse a namespace key equal to the attester key
-(`SAFETY_MANIFEST_SAME_KEY`).
+other permission bits, no extended ACL entries (macOS), at most 128 bytes,
+64 lowercase hex characters and at most one final newline. Each
+`--other-pin <hex file>` (repeatable; `--attester-pin` is an alias) names
+the public key of another role, the evidence attester or an authority
+issuer, and both commands refuse a namespace key equal to any of them
+(`SAFETY_MANIFEST_SAME_KEY`). The flag is opt-in in these offline
+commands; the ingestion path (G1) and online loaders that hold the
+namespace key or pin together with another role's key run the check
+without a flag.
 
 The manifest (`SafetyNamespaceManifest`, schema version 1) is canonical
 JSON (the repository's canonical encoding: keys sorted, no whitespace),

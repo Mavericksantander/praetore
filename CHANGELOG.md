@@ -23,11 +23,14 @@
   namespace and attester or issuer roles (`SameKeyForBothRoles`). Only the
   canonical encoding parses (`from_json`); a manifest file is that document
   and one newline (`to_file`, `from_file`). New commands: `praetore policy
-  safety-manifest --policy P --key K --output NEW_FILE [--attester-pin A]`
-  (never overwrites; writes through a synced temporary file hard-linked to
-  the output name; reads the key with `O_NOFOLLOW` and checks the open
-  descriptor) and `praetore-verify safety-manifest --manifest M --pin K
-  [--policy P] [--attester-pin A]`, both with `--format json|text`. The manifest authorizes nothing and is not read on
+  safety-manifest --policy P --key K --output NEW_FILE [--other-pin A]...`
+  (never overwrites; writes a synced `O_TMPFILE` or temporary file, links
+  it to the output name and checks the linked entry; needs a filesystem
+  with hard links; reads the key with `O_NOFOLLOW`, checks the open
+  descriptor and, on macOS, refuses extended ACLs) and `praetore-verify
+  safety-manifest --manifest M --pin K [--policy P] [--other-pin A]...`,
+  both with `--format json|text`; `--other-pin` (alias `--attester-pin`)
+  refuses a namespace key equal to an attester or issuer key. The manifest authorizes nothing and is not read on
   the decision path. Golden vector
   `docs/golden/safety-namespace-manifest-v1.json`; new fuzz target
   `safety_namespace`.

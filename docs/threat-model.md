@@ -228,23 +228,37 @@ are present.
 `ensure_distinct_keys` refuses the same public key in the namespace role
 and in another role (`SameKeyForBothRoles`, `SAFETY_MANIFEST_SAME_KEY`).
 `praetore policy safety-manifest` and `praetore-verify safety-manifest` call
-it with `--attester-pin`; the ingestion path (G1) and any online loader that
-holds the namespace pin together with the attester or issuer key must call
-it at startup.
+it for each `--other-pin` (repeatable: the attester and every issuer key;
+`--attester-pin` is an alias). There the check is opt-in, because an
+offline command does not know a deployment's other keys. The ingestion path
+(G1) and any online loader that holds the namespace key or pin together
+with the attester or issuer key must enforce it at startup, without a flag.
 
 The namespace key file is opened once with `O_NOFOLLOW | O_NONBLOCK |
 O_CLOEXEC` and checked with `fstat` on that descriptor (regular file, owned
 by the effective uid, no group or other bits, at most 128 bytes) before it
 is read through the same descriptor, so a symlink, a FIFO or a file swapped
-between the check and the read is refused. Symlinks in parent directories
-are still followed. The local demo keys (`read_secret`) are still checked
+between the check and the read is refused. On macOS a file with any
+extended ACL entry (`chmod +a`), which the mode bits do not show, is
+refused, and so is one whose ACL cannot be read; on Linux a POSIX ACL with
+named entries sets the group bits to its mask, so the mode check already
+covers it. Symlinks in parent directories are still followed. The local demo keys (`read_secret`) are still checked
 by path; moving them to the same helper is a follow-up.
 
 One manifest has one valid file: the canonical document and one newline.
 Any other encoding is rejected, so a hash of the file identifies the
-manifest. The manifest is written through a synced temporary file
-hard-linked to the output name, which never replaces an existing name and
-never leaves a partial file there.
+manifest. The manifest is written and synced to an anonymous file (Linux
+`O_TMPFILE`) or a temporary name, then linked to the output name, which
+never replaces an existing name. After the link the entry at the output
+name (`lstat`, device and inode) must be the file this process wrote: if
+another file or a symlink was swapped in for the temporary name between
+the sync and the link, the output is removed while it is still that entry
+and the command fails. The temporary name is removed only while it is
+still the file this process created. A filesystem without hard links
+(FAT, exFAT, some SMB or FUSE mounts) is refused with a clear message;
+there is no non-atomic fallback. A process killed between creating and
+removing a temporary name can leave a `.tmp` file (not on Linux with
+`O_TMPFILE`).
 
 Names: `SafetyActionName::parse` is shared by policy loading and the
 manifest, so a name the policy accepts is exactly a name the manifest and

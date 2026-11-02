@@ -8,6 +8,13 @@
 //! descriptor with the size limit enforced again while reading. There is no
 //! window between the check and the read in which the path can be swapped.
 //!
+//! Access control lists: on macOS an extended ACL (`chmod +a`) can grant
+//! access that the mode bits do not show, so a file with any extended ACL
+//! entry is refused (checked on the same descriptor, `acl_get_fd_np`; an
+//! error while checking is a refusal). On Linux a POSIX ACL with named user
+//! or group entries sets the group bits to its mask, so the mode check
+//! already refuses it. Other platforms are not checked for ACLs.
+//!
 //! Only the safety namespace key uses it for now. `read_secret` in
 //! `main.rs` (the local demo keys) still checks by path; moving it here is
 //! a follow-up.
@@ -26,6 +33,8 @@ pub enum SecretFileError {
     WrongOwner,
     /// Readable, writable or executable by group or others.
     NotPrivate,
+    /// Has extended ACL entries (macOS), or they could not be checked.
+    ExtendedAcl,
     /// Larger than the limit.
     TooLarge { max: u64 },
     /// Missing or unreadable.
@@ -44,6 +53,9 @@ impl fmt::Display for SecretFileError {
             Self::NotPrivate => {
                 f.write_str("is accessible by group or others; set its mode to 0600 or 0400")
             }
+            Self::ExtendedAcl => f.write_str(
+                "has extended ACL entries, or they cannot be checked; remove them (chmod -N)",
+            ),
             Self::TooLarge { max } => write!(f, "is larger than {max} bytes"),
             Self::Unreadable(reason) => write!(f, "cannot be read: {reason}"),
             Self::Unsupported => {
@@ -101,8 +113,14 @@ fn read_private_file_owned_by(
     if metadata.uid() != owner {
         return Err(SecretFileError::WrongOwner);
     }
+    // On Linux this also covers POSIX ACLs: with named entries, the group
+    // bits hold the ACL mask, so any extra grant shows up here.
     if metadata.permissions().mode() & 0o077 != 0 {
         return Err(SecretFileError::NotPrivate);
+    }
+    #[cfg(target_os = "macos")]
+    if acl::has_extended_entries(&file)? {
+        return Err(SecretFileError::ExtendedAcl);
     }
     if metadata.len() > max_bytes {
         return Err(SecretFileError::TooLarge { max: max_bytes });
@@ -116,6 +134,62 @@ fn read_private_file_owned_by(
         return Err(SecretFileError::TooLarge { max: max_bytes });
     }
     Ok(contents)
+}
+
+/// macOS extended ACLs, which the mode bits do not show. Neither rustix nor
+/// libc exposes the ACL API, so this declares the three functions it needs
+/// from libSystem.
+#[cfg(target_os = "macos")]
+mod acl {
+    use super::SecretFileError;
+    use std::{
+        fs::File,
+        os::{
+            fd::AsRawFd,
+            raw::{c_int, c_void},
+        },
+    };
+
+    /// `ACL_TYPE_EXTENDED` and `ACL_FIRST_ENTRY` from `<sys/acl.h>`.
+    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_free(object: *mut c_void) -> c_int;
+    }
+
+    /// Whether the open `file` has at least one extended ACL entry. "No
+    /// ACL" (`ENOENT`) is `false`; every other error is
+    /// [`SecretFileError::ExtendedAcl`], so the caller refuses the file
+    /// when its ACL cannot be checked.
+    pub(super) fn has_extended_entries(file: &File) -> Result<bool, SecretFileError> {
+        let no_entry = rustix::io::Errno::NOENT.raw_os_error();
+        // SAFETY: `file` is open for the whole call, so its descriptor is
+        // valid; the call only reads it and returns an owned ACL or NULL.
+        let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(errno) if errno == no_entry => Ok(false),
+                _ => Err(SecretFileError::ExtendedAcl),
+            };
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl` is the non-NULL ACL returned above and is freed only
+        // below; `entry` is a valid out pointer for the call.
+        let status = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        // SAFETY: `acl` came from `acl_get_fd_np`, is freed once, and is not
+        // used afterwards (`entry` points into it and is not used either).
+        unsafe { acl_free(acl) };
+        match status {
+            0 => Ok(true),
+            // No first entry: an empty ACL.
+            _ if errno == Some(rustix::io::Errno::INVAL.raw_os_error()) => Ok(false),
+            _ => Err(SecretFileError::ExtendedAcl),
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -228,6 +302,43 @@ mod tests {
             read_private_file_owned_by(&path, 128, me.wrapping_add(1)),
             Err(SecretFileError::WrongOwner)
         );
+    }
+
+    /// An ACL can grant access the mode bits do not show (macOS).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn refuses_a_file_with_an_extended_acl() {
+        let dir = Dir::new();
+        let path = dir.private("key", b"abc");
+        assert!(read_private_file(&path, 128).is_ok());
+        let chmod = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("chmod")
+                    .args(args)
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            )
+        };
+        chmod(&["+a", "everyone allow read"]);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            read_private_file(&path, 128),
+            Err(SecretFileError::ExtendedAcl)
+        );
+        // A deny entry is refused too: any extended entry is.
+        chmod(&["-N"]);
+        chmod(&["+a", "everyone deny write"]);
+        assert_eq!(
+            read_private_file(&path, 128),
+            Err(SecretFileError::ExtendedAcl)
+        );
+        chmod(&["-N"]);
+        assert!(read_private_file(&path, 128).is_ok());
     }
 
     #[test]

@@ -306,43 +306,61 @@ fn only_the_canonical_file_is_accepted() {
     }
 }
 
-/// With `--attester-pin`, a namespace pin equal to the attester key is
-/// refused before the signature is considered.
+/// A namespace pin equal to any `--other-pin` (attester or issuer keys,
+/// repeatable; `--attester-pin` is an alias) is refused before the
+/// signature is considered.
 #[test]
-fn the_namespace_pin_must_not_be_the_attester_key() {
+fn the_namespace_pin_must_not_be_the_key_of_another_role() {
     let dir = Dir::new();
     let (manifest, pin, _) = golden_files(&dir);
-    let output = verify(&[
-        "--manifest",
-        &manifest,
-        "--pin",
-        &pin,
-        "--attester-pin",
-        &pin,
-        "--format",
-        "json",
-    ]);
-    assert_fails(&output, "SAFETY_MANIFEST_SAME_KEY");
-    let other = dir.write(
-        "attester.pin",
-        hex::encode(
-            EvidenceAttesterKey::from_secret_bytes(&[0x63; 32])
-                .public_key()
-                .unwrap()
-                .as_bytes(),
-        ),
+    let other = |name: &str, seed: u8| {
+        dir.write(
+            name,
+            hex::encode(
+                EvidenceAttesterKey::from_secret_bytes(&[seed; 32])
+                    .public_key()
+                    .unwrap()
+                    .as_bytes(),
+            ),
+        )
+    };
+    let attester = other("attester.pin", 0x63);
+    let issuer = other("issuer.pin", 0x64);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--manifest", manifest.as_str(), "--pin", pin.as_str()];
+        args.extend_from_slice(extra);
+        args.extend(["--format", "json"]);
+        verify(&args)
+    };
+    assert_fails(&run(&["--other-pin", &pin]), "SAFETY_MANIFEST_SAME_KEY");
+    assert_fails(&run(&["--attester-pin", &pin]), "SAFETY_MANIFEST_SAME_KEY");
+    assert_fails(
+        &run(&[
+            "--other-pin",
+            &attester,
+            "--other-pin",
+            &issuer,
+            "--other-pin",
+            &pin,
+        ]),
+        "SAFETY_MANIFEST_SAME_KEY",
     );
-    let output = verify(&[
-        "--manifest",
-        &manifest,
-        "--pin",
-        &pin,
-        "--attester-pin",
-        &other,
-        "--format",
-        "json",
-    ]);
+    let output = run(&["--other-pin", &attester, "--attester-pin", &issuer]);
     assert!(output.status.success(), "{output:?}");
+    // The flag belongs to safety-manifest only.
+    let evidence = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args([
+            "policy-digest",
+            "--policy",
+            &pin,
+            "--other-pin",
+            &pin,
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_fails(&evidence, "USAGE");
 }
 
 #[test]

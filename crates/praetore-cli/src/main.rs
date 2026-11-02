@@ -28,6 +28,7 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 mod journal_export;
+mod new_file;
 mod policy_classify;
 mod policy_safety_manifest;
 mod secret_file;
@@ -342,7 +343,7 @@ fn print_usage() {
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
            praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> --output <new file>\n\
            praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\
-           praetore policy safety-manifest --policy <path> --key <hex file> --output <new file> [--attester-pin <hex file>] [--issued-at <rfc3339>] [--format json|text]\n\
+           praetore policy safety-manifest --policy <path> --key <hex file> --output <new file> [--other-pin <hex file>]... [--issued-at <rfc3339>] [--format json|text]\n\
              (signs the policy's safety namespace manifest; never overwrites)\n\
          \n\
          Configure PRAETORE_GATEWAY_DATABASE_URL with a local PostgreSQL URL before doctor/run."
