@@ -200,34 +200,42 @@ falla cerrado:
    defecto de Unicode (de ancho cero, de control bidireccional), aplicar
    NFKC y plegado completo de mayúsculas (`caseless`) hasta un punto fijo, y
    quitar `.` y espacios finales. Es más amplio que el plegado de APFS a
-   propósito;
+   propósito. Las escrituras y el escaneo de `Bash` comparan así la lista
+   de arriba: en los dos se compara el nombre ya plegado;
 2. además, en una escritura, todo componente no ASCII que empieza con `.`
-   (tal cual o plegado), o cuya forma plegada difiere de su minúscula ASCII,
-   cuenta como configuración: se niega a todo perfil salvo `main`, y `main`
-   necesita aprobación. Un subagente no necesita esos nombres. En el
-   escaneo de `Bash`, cuyas palabras incluyen mensajes de commit y otro
-   texto, solo cuenta el componente no ASCII que empieza con `.`;
+   (tal cual o plegado), o que se pliega a un nombre ASCII, cuenta como
+   configuración: se niega a todo perfil salvo `main`, y `main` necesita
+   aprobación. Todo alias de APFS de un nombre ASCII se pliega a ASCII, y un
+   subagente no necesita esos nombres; `\u{d1}and\u{fa}.md`, un nombre en
+   NFD o uno con caracteres de ancho completo junto a otros no ASCII siguen
+   permitidos. En el escaneo de `Bash`, cuyas palabras incluyen mensajes de
+   commit y otro texto, esta regla extra solo toma el componente no ASCII
+   que empieza con `.`;
 3. si el archivo ya existe, también se compara el nombre resuelto
    (`canonicalize`), y una ruta que no se resuelve a sí misma ya se niega.
 
-Límites: un nombre no ASCII que no empieza con `.` y que ya está plegado
-(`café.md` en NFC) no se considera; el escaneo de `Bash` sigue siendo
+Límites: un nombre no ASCII que no empieza con `.` y que no se pliega a
+ASCII (`café.md`) no se considera; el escaneo de `Bash` sigue siendo
 evadible; un sistema de archivos con otras reglas de equivalencia que estas
 no cubran puede tener otros alias.
 
 **Repositorio git bare.** git toma un directorio con `HEAD`, `objects/` y
-`refs/` por un repositorio bare y ejecuta lo que nombra su `config`. Una
-escritura cuyo componente se llama `HEAD`, `config`, `objects` o `refs` en
-un directorio que ya tiene dos de los otros tres cuenta como configuración,
-así que el conjunto no se puede completar escritura por escritura. Un
-directorio `config/` o `refs/` solo no se ve afectado. El escaneo de `Bash`
-no lo cubre, y `main` puede crear el conjunto con un comando; correr `git`
-dentro de un directorio que escribió un subagente es otro caso de
-ejecución indirecta.
+`refs/` por un repositorio bare y ejecuta lo que nombra su `config`; con
+`commondir` o `gitdir`, por el directorio git de un worktree enlazado. Una
+escritura cuyo componente se llama `HEAD`, `config`, `objects`, `refs`,
+`commondir` o `gitdir` en un directorio que ya tiene dos de los otros cuenta
+como configuración, así que el conjunto no se puede completar escritura por
+escritura. Un directorio `config/` o `refs/` solo no se ve afectado. Límites:
+el chequeo mira el disco en cada escritura, así que dos escrituras en
+paralelo (dos subagentes a la vez) todavía pueden completarlo; el escaneo de
+`Bash` no lo cubre, y `main` puede crear el conjunto con un comando. El paso
+que falta en todos los casos es que `main` corra `git` en ese directorio:
+otro caso de ejecución indirecta.
 
 **Escrituras sin ruta.** Una herramienta de escritura sin su parámetro de
 ruta (por ejemplo NotebookEdit con `file_path` en vez de `notebook_path`) se
-niega.
+niega, y el motivo lo dice (`praetore.path_check` con estado `missing` en el
+contexto firmado).
 
 **Ejecución indirecta.** Lo que escribe un subagente lo puede ejecutar
 después la sesión principal: `build.rs`, un test, un script de
@@ -254,8 +262,17 @@ cubre ese caso sin re-emitir, sin importar lo que diga la policy:
   Sin `project-root` no hay raíz contra la cual comparar y toda escritura
   cuenta, así que en un estado anterior un subagente no escribe nada;
 
-los dos casos se evalúan como `unregistered`, con recibo firmado y el motivo
-en el recibo. Esto aplica también a un estado nuevo: allí la escritura de
+los dos casos se evalúan como `unregistered`, con recibo firmado. El motivo
+que firma el motor es la capacidad que le falta a `unregistered` (por ejemplo
+`authority does not permit capability: fs:write`); por qué se llegó ahí lo
+dicen dos campos del contexto firmado: `praetore.hook_guard`
+(`exec_reserved_to_main`, `client_config_write`, `governance_write`,
+`path_check_failed` o `no_project_root`) y `praetore.requested_profile`, el
+perfil que la llamada habría tenido. `check-attribution.py` (en `verify.sh`)
+exige que vengan juntos, en un Deny firmado como `unregistered`, con un
+perfil pedido igual al agente firmado, y los cuenta aparte. Esa negación no
+la firma la clave del perfil pedido, así que no prueba que la pidió esa
+instancia. Esto aplica también a un estado nuevo: allí la escritura de
 `coder` en `.claude/` o `.mcp.json` se niega en el binario antes de llegar a
 las reglas de la policy, que siguen decidiendo para `main` (aprobación).
 
@@ -451,6 +468,10 @@ Los subagentes de ejemplo (`agents/`) son `planner` (opus, solo lectura),
   verificando. `verify` compara cada recibo con el `agents/<perfil>.json`
   actual: reemplazar o re-emitir ese archivo hace fallar los recibos
   anteriores (los terceros verifican con los pins del bundle).
+- **Una negación de un guard del hook** (ver
+  [`Bash` y `process:execute`](#bash-y-processexecute)) la firma
+  `unregistered` y nombra el guard y el perfil pedido en el contexto
+  firmado.
 - **Atribuye al perfil, no aísla.** La firma dice qué perfil (`agent_type`)
   pidió la acción, y con SAF-14 el emisor firma para qué perfil emitió cada
   identidad. Pero las claves de todos los perfiles y la del atestador viven

@@ -48,6 +48,17 @@
   `agent_type` is evaluated as `unregistered`, the governance rules name
   every profile except `main`, and a write tool without its path parameter
   is denied.
+- **Claude Code hook example: guard denials name the guard in the signed
+  receipt.** A denial by the hook's exec or write guard records
+  `praetore.hook_guard` (`exec_reserved_to_main`, `client_config_write`,
+  `governance_write`, `path_check_failed`, `no_project_root`) and
+  `praetore.requested_profile` in the signed context; `check-attribution.py`
+  (run by `verify.sh`) requires them together on a Deny signed as
+  `unregistered` and counts them apart, and `test-attribution.sh` checks
+  them. A non-ASCII name now counts as a possible alias only if it starts
+  with `.` or folds to ASCII, so ordinary non-ASCII file names are writable
+  again; `commondir` and `gitdir` join the bare-repository names; a write
+  without its path parameter says so instead of naming a path rule.
 
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from

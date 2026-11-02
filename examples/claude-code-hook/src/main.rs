@@ -725,8 +725,9 @@ fn normalize(path: &str) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Strictness {
     /// Any non-ASCII component that starts with `.` (as written or folded),
-    /// or whose folded form differs from its ASCII lowercase form. For
-    /// writes: a subagent has no need for such names.
+    /// or that folds to ASCII (every APFS alias of an ASCII name does). For
+    /// writes: a subagent has no need for such names, while `\u{d1}and\u{fa}.md`
+    /// or a name in NFD stays allowed.
     AllAliases,
     /// Only a non-ASCII component that starts with `.`. For the `Bash`
     /// scan, whose words include commit messages and other text.
@@ -762,16 +763,22 @@ fn client_config(path: &str, root: &str, strictness: Strictness) -> bool {
         !part.is_ascii()
             && (part.starts_with('.')
                 || folded.starts_with('.')
-                || (strictness == Strictness::AllAliases && *folded != part.to_ascii_lowercase()))
+                || (strictness == Strictness::AllAliases && folded.is_ascii()))
     });
     listed || alias || completes_bare_repository(root, &parts, &folded)
 }
 
-/// The names git needs to take a directory for a bare repository.
-const BARE_REPOSITORY_NAMES: [&str; 4] = ["HEAD", "config", "objects", "refs"];
+/// The names git looks for to take a directory for a repository directory:
+/// a bare repository (`HEAD`, `config`, `objects`, `refs`) or a linked
+/// worktree's git directory (`commondir`, `gitdir`).
+const BARE_REPOSITORY_NAMES: [&str; 6] =
+    ["HEAD", "config", "objects", "refs", "commondir", "gitdir"];
 
-/// A component named like a bare-repository entry (`HEAD`, `config`,
-/// `objects`, `refs`) in a directory that already holds two of the others.
+/// A component named like a repository-directory entry
+/// ([`BARE_REPOSITORY_NAMES`]) in a directory that already holds two of the
+/// others. The check reads the disk at each write, so two writes in parallel
+/// could still complete a set; `main` running git there is the remaining
+/// step.
 /// git takes a directory with `HEAD`, `objects/` and `refs/` for a bare
 /// repository and runs what its `config` names, so a third entry is held:
 /// the set cannot be completed one write at a time. A lone `config/` or
@@ -1181,7 +1188,7 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
             "agent name longer than 64 bytes: {agent:?}"
         )));
     }
-    let (claims, rejected_claim) = instance_claims(input);
+    let (mut claims, rejected_claim) = instance_claims(input);
     // Only a well-formed name can select a profile file; anything else, any
     // agent without an issued authority, and any request whose instance or
     // session id is rejected, is evaluated as `unregistered`: no capability,
@@ -1232,7 +1239,32 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
                 (Some(root), Some(path)) => governed(path, root),
                 _ => true,
             });
-    let profile_name = if exec_guard || write_guard {
+    // Which guard held the call, and the profile it would have had, are
+    // recorded in the signed context: the engine's own reason (the missing
+    // capability of `unregistered`) does not say why.
+    let guard = if exec_guard {
+        Some("exec_reserved_to_main")
+    } else if write_guard {
+        Some(if parameters["path"] == json!(PATH_CHECK_FAILED) {
+            "path_check_failed"
+        } else if root.is_none() {
+            "no_project_root"
+        } else if parameters["client_config"] == json!(true) {
+            "client_config_write"
+        } else {
+            "governance_write"
+        })
+    } else {
+        None
+    };
+    if let Some(guard) = guard {
+        claims.push(("praetore.hook_guard", guard.to_string()));
+        claims.push(("praetore.requested_profile", profile_name.to_string()));
+    }
+    let path_missing = path_check
+        .as_ref()
+        .is_some_and(|check| check["status"] == json!("missing"));
+    let profile_name = if guard.is_some() {
         UNREGISTERED
     } else {
         profile_name
@@ -1329,8 +1361,13 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
             evidence.decision.reason
         ),
         None if write_guard => format!(
-            "writes to client configuration, .claude and .git are reserved to the main session (GHSA-wg33-3h8v-xvqw); evaluated as '{UNREGISTERED}': {}",
+            "writes to client configuration, .claude and .git are reserved to the main session (guard {}, GHSA-wg33-3h8v-xvqw); evaluated as '{UNREGISTERED}': {}",
+            guard.unwrap_or_default(),
             evidence.decision.reason
+        ),
+        None if path_missing => format!(
+            "the {} tool input has no path parameter (`notebook_path` for NotebookEdit, `file_path` for Write, Edit and MultiEdit), so the path check fails closed",
+            input.tool_name
         ),
         None if exec_guard => format!(
             "commands are reserved to the main session, but the authority of profile {agent:?} grants process:execute (state from an earlier init: run `praetore-claude-hook init` into a new directory); evaluated as '{UNREGISTERED}': {}",
@@ -1340,7 +1377,13 @@ fn authorize(directory: &Path, input: &HookInput) -> Result<Verdict, BoxError> {
     };
     Ok(Verdict {
         outcome,
-        rule: deciding_rules(&evidence),
+        // A write without its path matches every restrictive path rule;
+        // naming one of them would misstate the cause.
+        rule: if path_missing {
+            None
+        } else {
+            deciding_rules(&evidence)
+        },
         reason,
         not_governed: false,
         evidence_id: Some(evidence.evidence_id.to_string()),

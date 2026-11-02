@@ -718,3 +718,132 @@ fn a_write_cannot_complete_a_bare_repository() {
         );
     }
 }
+
+/// The signed context of the last receipt.
+fn last_context(p: &Project) -> Value {
+    let receipts = fs::read_to_string(p.state.join(RECEIPTS_FILE)).unwrap();
+    let last: Value = serde_json::from_str(receipts.lines().last().unwrap()).unwrap();
+    last["evidence"]["context"].clone()
+}
+
+/// Fails if a guard is removed or stops recording itself: each guard's
+/// denial carries `praetore.hook_guard` and `praetore.requested_profile` in
+/// the signed context, evaluated as `unregistered`.
+#[test]
+fn guards_record_their_kind_in_the_signed_receipt() {
+    let p = Project::new("guard-kinds");
+    for (tool, input, guard) in [
+        (
+            "Write",
+            json!({ "file_path": p.path(".claude/settings.json") }),
+            "governance_write",
+        ),
+        (
+            "Edit",
+            json!({ "file_path": p.path(".git/config") }),
+            "governance_write",
+        ),
+        (
+            "Write",
+            json!({ "file_path": p.path(".mcp.json") }),
+            "client_config_write",
+        ),
+        (
+            "NotebookEdit",
+            json!({ "file_path": p.path("a.ipynb") }),
+            "path_check_failed",
+        ),
+    ] {
+        let verdict = p.tool(Some("coder"), tool, input);
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny, "{tool} {guard}");
+        let context = last_context(&p);
+        assert_eq!(context["praetore.hook_guard"], guard, "{tool}: {context}");
+        assert_eq!(context["praetore.requested_profile"], "coder", "{context}");
+        assert_eq!(context["profile"], UNREGISTERED, "{context}");
+        assert_eq!(context["agent"], "coder", "{context}");
+    }
+    // No guard, no such fields.
+    let verdict = p.tool(
+        Some("coder"),
+        "Write",
+        json!({ "file_path": p.path("src/lib.rs") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Allow);
+    let context = last_context(&p);
+    assert!(context.get("praetore.hook_guard").is_none(), "{context}");
+    assert!(
+        context.get("praetore.requested_profile").is_none(),
+        "{context}"
+    );
+    // Without a recorded root.
+    fs::remove_file(p.state.join(PROJECT_ROOT_FILE)).unwrap();
+    p.tool(
+        Some("coder"),
+        "Write",
+        json!({ "file_path": p.path("src/lib.rs") }),
+    );
+    assert_eq!(last_context(&p)["praetore.hook_guard"], "no_project_root");
+    verify_receipts(&p.state).unwrap();
+
+    let p = Project::with_profiles("guard-exec", &EARLIER_PROFILES);
+    let verdict = p.bash(Some("coder"), "cargo test");
+    assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+    let context = last_context(&p);
+    assert_eq!(context["praetore.hook_guard"], "exec_reserved_to_main");
+    assert_eq!(context["praetore.requested_profile"], "coder");
+    verify_receipts(&p.state).unwrap();
+}
+
+#[test]
+fn ordinary_non_ascii_names_stay_writable() {
+    let p = Project::new("non-ascii");
+    for relative in [
+        "docs/\u{d1}and\u{fa}.md", // capital N with tilde
+        "docs/\u{dc}bersicht.md",  // capital U with diaeresis
+        "docs/cafe\u{301}.md",     // NFD
+        "docs/\u{30d5}\u{30a1}\u{30a4}\u{30eb}\u{ff08}\u{ff11}\u{ff09}.md", // full-width (1)
+        "docs/A\u{f1}o.md",
+    ] {
+        let verdict = p.tool(
+            Some("coder"),
+            "Write",
+            json!({ "file_path": p.path(relative) }),
+        );
+        assert_eq!(
+            verdict.outcome,
+            DecisionOutcome::Allow,
+            "{relative:?}: {verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn a_write_cannot_complete_a_linked_worktree_git_directory() {
+    let p = Project::new("gitdir");
+    fs::create_dir_all(p.root.join("sub")).unwrap();
+    fs::write(p.root.join("sub/HEAD"), "ref: refs/heads/main\n").unwrap();
+    fs::write(p.root.join("sub/commondir"), "../.git\n").unwrap();
+    let verdict = p.tool(
+        Some("coder"),
+        "Write",
+        json!({ "file_path": p.path("sub/gitdir") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+}
+
+#[test]
+fn a_write_without_its_path_names_the_cause() {
+    let p = Project::new("missing-path-reason");
+    let verdict = p.tool(
+        None,
+        "NotebookEdit",
+        json!({ "file_path": p.path("a.ipynb") }),
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+    assert_eq!(verdict.rule, None);
+    assert!(
+        verdict.reason.contains("no path parameter"),
+        "{}",
+        verdict.reason
+    );
+}
