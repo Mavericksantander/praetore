@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+- **Claude Code hook example: no subagent profile gets `process:execute` by
+  default** (GHSA-wg33-3h8v-xvqw). The hook sees a command's text, not what
+  it does when it runs, so `Bash` under `process:execute` is equivalent to
+  every other capability; the README now says so, and that the `.claude/`
+  write rule for subagents holds for Write/Edit only. `coder` loses
+  `process:execute` in `PROFILES` (the main session keeps it) and
+  `agents/coder.md` no longer lists `Bash`. State written by an earlier
+  `init` keeps what it was issued; the README documents re-running `init`
+  into a new directory. As defense in depth, not a boundary, the `Bash` scan
+  now also flags an analyzable command whose words name `<root>/.claude` or
+  `<root>/.git`, a path outside the project root, or a common network tool,
+  and the default policy holds each for approval
+  (`approval-command-touches-protected-path`, `approval-command-leaves-root`,
+  `approval-command-uses-network`). `init` writes the root to
+  `project-root` in the state directory. The README documents running
+  `Bash` under Claude Code's sandbox. Receipt format unchanged; committed
+  evidence not regenerated (`bundle/` predates the change).
+- **Claude Code hook example: client configuration is protected from
+  subagent writes** (GHSA-wg33-3h8v-xvqw). Writes to the project paths Claude
+  Code lists as protected in its permission modes (`.mcp.json`, `.vscode/`,
+  `.cargo/`, `.husky/`, `.envrc`, shell startup files, and the rest of that
+  list) are denied to every profile except `main`
+  (`deny-subagent-client-config-writes`), and `main` needs approval
+  (`approval-main-client-config-writes`); the `Bash` scan flags the same
+  paths. The hook also denies commands (`claude:exec`) to every profile
+  except `main` whatever its authority grants, warns on stderr about state
+  without `project-root` or with a subagent holding `process:execute`, fails
+  closed on an invalid `project-root`, and maps `Monitor` and `PowerShell` to
+  `claude:exec` (`PowerShell` is never analyzed, so `main` needs approval).
+  The format-1 policy error now recommends a fresh `init`.
+- **Claude Code hook example: protected names compared after Unicode
+  folding; writes to them reserved to `main` in the binary**
+  (GHSA-wg33-3h8v-xvqw). Path components are compared after dropping
+  default-ignorable code points, NFKC and full case folding (`caseless`,
+  `unicode-normalization`, the versions praetore-mcp uses), and for every
+  profile except `main` a write to a non-ASCII component that starts with
+  `.` or whose folded form differs from its ASCII lowercase form is denied
+  (`main` needs approval). A write that would complete a bare git repository
+  (`HEAD`, `config`, `objects`, `refs`) is held the same way. The hook now
+  denies, whatever the policy says, a write by a profile other than `main`
+  to client configuration, `.claude`, `.git` or a path that failed its
+  check, evaluated as `unregistered` with a signed receipt; without
+  `project-root` every such write is denied. An `agent_id` without an
+  `agent_type` is evaluated as `unregistered`, the governance rules name
+  every profile except `main`, and a write tool without its path parameter
+  is denied.
+- **Claude Code hook example: guard denials name the guard in the signed
+  receipt.** A denial by the hook's exec or write guard records
+  `praetore.hook_guard` (`exec_reserved_to_main`, `client_config_write`,
+  `governance_write`, `path_check_failed`, `no_project_root`) and
+  `praetore.requested_profile` in the signed context; `check-attribution.py`
+  (run by `verify.sh`) requires them together on a Deny signed as
+  `unregistered` and counts them apart, and `test-attribution.sh` checks
+  them. A non-ASCII name now counts as a possible alias only if it starts
+  with `.` or folds to ASCII, so ordinary non-ASCII file names are writable
+  again; `commondir` and `gitdir` join the bare-repository names; a write
+  without its path parameter says so instead of naming a path rule.
+
 - **Breaking (API, G7): `AuthorizationRequest.action` is a `MissionAction`.**
   `praetore-core` separates mission actions, which PRÆTORE decides, from
   safety actions, which the executor of an AI-enabled system runs without
