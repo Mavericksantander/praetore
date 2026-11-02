@@ -477,6 +477,17 @@ fn apply_locked(
             // CREATE SCHEMA IF NOT EXISTS would still need CREATE on the
             // database, which a NOLOGIN owner group may not have.
             transaction.batch_execute(CONTROL_TABLE_DDL)?;
+        } else if let Some(owner) = &options.schema_owner {
+            // PRAETORE_SCHEMA_OWNER may name a group of the migrating role
+            // (checked by `environment_problems`): create the schema owned
+            // by it, and the control table as it, as later migrations do.
+            let owner: String = transaction
+                .query_one("SELECT pg_catalog.quote_ident($1)", &[owner])?
+                .get(0);
+            transaction.batch_execute(&format!(
+                "CREATE SCHEMA praetore AUTHORIZATION {owner}; SET LOCAL ROLE {owner}; \
+                 {CONTROL_TABLE_DDL}"
+            ))?;
         } else {
             transaction.batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS praetore; {CONTROL_TABLE_DDL}"
@@ -1732,13 +1743,36 @@ fn environment_problems(
             )),
             Some(_) => {}
             None => {
-                let migrator: String = transaction
-                    .query_one("SELECT CURRENT_USER::pg_catalog.text", &[])?
-                    .get(0);
-                if migrator != *expected {
+                // The schema is created owned by the configured role: the
+                // migrating role itself, or a group it is a member of (a
+                // NOLOGIN owner group, which it SETs ROLE to). The acting
+                // roles of that owner are then checked below.
+                let row = transaction.query_one(
+                    "SELECT CURRENT_USER::pg_catalog.text, r.oid IS NOT NULL, \
+                            COALESCE(pg_catalog.pg_has_role(CURRENT_USER, r.oid, 'MEMBER'), false), \
+                            COALESCE(r.rolcanlogin, false) \
+                     FROM (SELECT 1) one \
+                     LEFT JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) $1",
+                    &[expected],
+                )?;
+                let (migrator, exists, member, login): (String, bool, bool, bool) =
+                    (row.get(0), row.get(1), row.get(2), row.get(3));
+                if !exists {
                     problems.push(format!(
-                        "schema praetore does not exist and would be created owned by the \
-                         migrating role {migrator}, but {} is {expected}",
+                        "{} names role {expected}, which does not exist",
+                        MigrationOptions::SCHEMA_OWNER_ENV
+                    ));
+                } else if migrator != *expected && !member {
+                    problems.push(format!(
+                        "schema praetore does not exist and the migrating role {migrator} is \
+                         neither {} ({expected}) nor a member of it, so it cannot create the \
+                         schema owned by that role",
+                        MigrationOptions::SCHEMA_OWNER_ENV
+                    ));
+                } else if migrator != *expected && login {
+                    problems.push(format!(
+                        "{} names {expected}, a LOGIN role other than the migrating role \
+                         {migrator}; an owner group must be NOLOGIN",
                         MigrationOptions::SCHEMA_OWNER_ENV
                     ));
                 }
@@ -1747,8 +1781,8 @@ fn environment_problems(
     }
     if let Some(objects) = crate::connection::extension_objects(transaction)? {
         problems.push(format!(
-            "extension objects are in schema praetore, which only its migrations may \
-             populate: {objects}"
+            "extension objects are in schema praetore (members of an extension, or marked \
+             DEPENDS ON EXTENSION), which only its migrations may populate: {objects}"
         ));
     }
     for status in event_trigger_statuses(transaction, &options.trusted_event_triggers)? {

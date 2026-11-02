@@ -349,15 +349,46 @@ migrating: a role with CREATE on the database that creates and migrates
 `praetore` before the first legitimate migration would pass a runtime-only
 startup (the next legitimate `migrate` refuses it). **Set it in production**,
 in the gateway, the CLI and `praetore-observe`, to the owner role of the
-migration step (the gateway logs a warning while it is unset).
+migration step (each of them logs a warning while it is unset).
+
+With a NOLOGIN owner group, install in this order (the first migration needs
+the variable already set, so that the schema is created owned by the group):
+
+1. As the database owner or a superuser: create the group `praetore_owner`
+   (NOLOGIN) and the migrating login `praetore_migrator`, `GRANT praetore_owner
+   TO praetore_migrator`, and `GRANT CREATE ON DATABASE <db> TO
+   praetore_migrator, praetore_owner` (the migrating role creates the schema
+   and the scratch schemas of the structure check; the migrations, which run
+   as the group, start with `CREATE SCHEMA IF NOT EXISTS`). Do not create the
+   `praetore` schema yourself: a schema without migration records is treated
+   as a legacy baseline.
+2. Set `PRAETORE_SCHEMA_OWNER=praetore_owner` for the migration step and
+   migrate as `praetore_migrator`. With no schema yet, the runner accepts a
+   migrating role that is the named role or a member of it, provided that a
+   named role other than the migrating role is NOLOGIN; it creates `praetore`
+   with `AUTHORIZATION praetore_owner` and runs every migration as the group
+   (`SET LOCAL ROLE`), so the schema and all its objects belong to the group.
+   Any other named role (one the migrating role is not a member of, a LOGIN
+   role, or a role that does not exist) is refused before anything is
+   created.
+3. Set `PRAETORE_SCHEMA_OWNER=praetore_owner` and
+   `PRAETORE_SCHEMA_OWNER_MEMBERS=praetore_migrator` for the gateway, the CLI
+   and `praetore-observe`: the runtime check refuses any member of the owner
+   that is not listed.
+
+A database already migrated without the variable keeps its owner: set the
+variable to that owner (or move ownership first, then set it).
 
 A role with CREATE on the database can, since PostgreSQL 13, install a
 trusted extension (`hstore`, `citext`, `pgcrypto`, ...) into any schema,
 `praetore` included, without CREATE on that schema; the extension's objects
 are then owned by the bootstrap superuser. The migrations create no
 extension objects, so both the runtime check and the migration runner refuse
-an extension installed in `praetore` and any object in `praetore` that
-belongs to an extension (`pg_depend` deptype `e`), naming them. Grant CREATE
+an extension installed in `praetore`, any object in `praetore` that belongs
+to an extension (`pg_depend` deptype `e`), and any object in `praetore`
+marked `DEPENDS ON EXTENSION` (deptype `x`), which `DROP EXTENSION` would
+drop with the extension, at the request of whoever owns it; the errors name
+them. Grant CREATE
 on the database only to the roles that run migrations.
 
 - `PRAETORE_RUNTIME_LOGINS` (comma-separated login roles): the logins allowed

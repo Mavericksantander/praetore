@@ -292,6 +292,19 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
           done
+      - name: Services report a port in use (praetore-gateway-demo, praetore-observe)
+        run: |
+          set -euo pipefail
+          for test in \
+            "praetore-gateway-service postgres_gateway_service_reports_a_port_in_use" \
+            "praetore-observe postgres_observe_reports_a_port_in_use"; do
+            read -r package name <<<"$test"
+            echo "::group::$name"
+            output="$(cargo test -p "$package" --locked --test port_in_use -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          done
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored claim_is_unique_and_survives_a_new_client
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored concurrent_connections_allow_exactly_one_claim
       - run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored a_lost_database_connection_fails_closed_and_a_new_client_recovers
@@ -365,6 +378,7 @@ jobs:
             postgres_migrations_trusted_event_triggers_allowlist \
             postgres_extension_objects_in_praetore_are_refused \
             postgres_schema_owner_is_pinned_by_praetore_schema_owner \
+            postgres_schema_owner_group_performs_the_first_migration \
             postgres_migrations_trusted_default_privileges_allowlist \
             postgres_runtime_role_refuses_foreign_dependencies \
             postgres_documented_observe_grant_supports_list \

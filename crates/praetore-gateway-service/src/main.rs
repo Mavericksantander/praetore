@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    future::IntoFuture,
     path::Path,
     sync::Arc,
     time::Duration as StdDuration,
@@ -607,12 +608,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
-        let listener = tokio::net::TcpListener::bind(&address).await?;
-        tracing::info!(%address, "PRÆTORE local demo gateway listening");
-        axum::serve(listener, http_api::router(gateway, api_auth)).await?;
-        Ok::<_, std::io::Error>(())
-    })?;
+    // The gateway holds blocking PostgreSQL clients, whose drop must not run
+    // on a runtime thread: bind before anything moves into the runtime, and
+    // keep the last reference (`gateway`) out here, so that a port in use is
+    // reported as the bind error instead of aborting the process.
+    let listener = runtime.block_on(tokio::net::TcpListener::bind(&address))?;
+    tracing::info!(%address, "PRÆTORE local demo gateway listening");
+    let served = runtime.block_on(
+        axum::serve(listener, http_api::router(Arc::clone(&gateway), api_auth)).into_future(),
+    );
+    drop(runtime);
+    drop(gateway);
+    served?;
     Ok(())
 }
 

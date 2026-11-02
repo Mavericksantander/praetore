@@ -710,6 +710,7 @@ fn postgres_cli_run_reports_a_port_in_use() {
         .arg(&dir)
         .env("PRAETORE_GATEWAY_DATABASE_URL", &runtime_url)
         .env("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL", &admin_url)
+        .env_remove("PRAETORE_SCHEMA_OWNER")
         .output()
         .unwrap();
     let log = format!(
@@ -720,6 +721,7 @@ fn postgres_cli_run_reports_a_port_in_use() {
     assert_eq!(output.status.code(), Some(1), "{log}");
     assert!(log.contains("Address already in use"), "{log}");
     assert!(!log.contains("panicked"), "{log}");
+    assert!(log.contains("PRAETORE_SCHEMA_OWNER is not set"), "{log}");
     drop(taken);
     fs::remove_dir_all(&work).unwrap();
 }

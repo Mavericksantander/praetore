@@ -13,7 +13,11 @@ use crate::{Evidence, PraetoreError, RecordedPolicy, StorageRecord, VerifiedPubl
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, fmt, num::NonZeroU64};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    num::NonZeroU64,
+};
 use uuid::Uuid;
 
 /// Domain separation prefix of every receipt link (25 bytes, NUL included).
@@ -98,6 +102,16 @@ pub struct JournalSummary {
     pub kind: JournalKind,
 }
 
+/// [`JournalSummary`] with the attester key ids that signed the entries:
+/// for each key id, how many receipts and storage records it signed. With
+/// several pins, this shows, for example, receipts signed by a retired key
+/// after a rotation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JournalReport {
+    pub summary: JournalSummary,
+    pub signed_by: BTreeMap<String, u64>,
+}
+
 /// What a tenant chain's database reference must match: a head, and the
 /// number of entries when it is known (from a database chain file).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +161,9 @@ pub enum ChainError {
     /// A policy was given for a database chain, whose storage records
     /// record no policy digest, so there is nothing to compare it with.
     PolicyNotApplicable,
+    /// The receipt names an attester key id that is not among the pinned
+    /// keys (for example a retired key that was not pinned).
+    UnpinnedAttesterKey { line: u64, key_id: String },
 }
 
 impl ChainError {
@@ -161,6 +178,7 @@ impl ChainError {
             Self::Record { .. } => "EVIDENCE_FAIL",
             Self::DatabaseHeadMismatch => "JOURNAL_HEAD_MISMATCH",
             Self::PolicyNotApplicable => "INVALID_REQUEST",
+            Self::UnpinnedAttesterKey { .. } => "AUTH_FAIL",
             Self::TooLarge => "INPUT_TOO_LARGE",
             Self::Malformed { .. } => "INVALID_REQUEST",
             Self::MissingSignature { .. } => "AUTH_FAIL",
@@ -207,6 +225,10 @@ impl fmt::Display for ChainError {
                 f,
                 "the tenant chain's database reference is missing or does not match the \
                  database chain"
+            ),
+            Self::UnpinnedAttesterKey { line, key_id } => write!(
+                f,
+                "entry {line}: receipt signed by attester key {key_id}, not by a pinned key"
             ),
             Self::PolicyNotApplicable => write!(
                 f,
@@ -276,6 +298,8 @@ struct ChainState<'k> {
     kind: Kind,
     receipts: u64,
     database_head: Option<DatabaseHead>,
+    /// Entries per signing attester key id.
+    signed_by: BTreeMap<String, u64>,
 }
 
 impl<'k> ChainState<'k> {
@@ -290,6 +314,7 @@ impl<'k> ChainState<'k> {
             prev: ChainLink::GENESIS,
             seen: HashSet::new(),
             seen_records: HashSet::new(),
+            signed_by: BTreeMap::new(),
             kind: Kind::Unknown,
             receipts: 0,
             database_head: None,
@@ -336,6 +361,7 @@ impl<'k> ChainState<'k> {
             });
         }
         self.kind = Kind::Database;
+        *self.signed_by.entry(record.key_id.clone()).or_default() += 1;
         self.prev = record_link(self.seq, &self.prev, record);
         self.seq += 1;
         Ok(())
@@ -363,6 +389,15 @@ impl<'k> ChainState<'k> {
         if evidence.attester_signature.is_none() {
             return Err(ChainError::MissingSignature { line });
         }
+        if let Some(key_id) = &evidence.attester_key_id
+            && !self.attesters.is_empty()
+            && !self.attesters.iter().any(|(pinned, _)| pinned == key_id)
+        {
+            return Err(ChainError::UnpinnedAttesterKey {
+                line,
+                key_id: key_id.clone(),
+            });
+        }
         let attester =
             self.attester(evidence.attester_key_id.as_deref())
                 .ok_or(ChainError::Evidence {
@@ -384,6 +419,9 @@ impl<'k> ChainState<'k> {
             return Err(ChainError::PolicyMismatch { line });
         }
         self.prev = link(self.seq, &self.prev, evidence)?;
+        if let Some(key_id) = &evidence.attester_key_id {
+            *self.signed_by.entry(key_id.clone()).or_default() += 1;
+        }
         self.seq += 1;
         self.kind = Kind::Tenant;
         self.receipts += 1;
@@ -563,6 +601,25 @@ pub fn verify_journal_with_attesters(
     expected_head: Option<&ChainLink>,
     expected_database_head: Option<&ExpectedDatabaseHead>,
 ) -> Result<JournalSummary, ChainError> {
+    verify_journal_report(
+        text,
+        attesters,
+        policy,
+        expected_head,
+        expected_database_head,
+    )
+    .map(|report| report.summary)
+}
+
+/// [`verify_journal_with_attesters`] that also reports which attester key
+/// ids signed the entries ([`JournalReport`]).
+pub fn verify_journal_report(
+    text: &str,
+    attesters: &[VerifiedPublicKey],
+    policy: Option<&RecordedPolicy>,
+    expected_head: Option<&ChainLink>,
+    expected_database_head: Option<&ExpectedDatabaseHead>,
+) -> Result<JournalReport, ChainError> {
     if text.len() > MAX_CHAIN_BYTES {
         return Err(ChainError::TooLarge);
     }
@@ -635,7 +692,10 @@ pub fn verify_journal_with_attesters(
             return Err(ChainError::DatabaseHeadMismatch);
         }
     }
-    Ok(summary)
+    Ok(JournalReport {
+        summary,
+        signed_by: state.signed_by,
+    })
 }
 
 #[cfg(test)]
@@ -887,11 +947,35 @@ mod tests {
             .unwrap();
             assert_eq!(summary.head, head);
         }
-        // The receipts are not signed by the old key alone.
-        assert!(matches!(
-            verify_journal_with_attesters(&tenant, &[old_pin], None, None, None),
-            Err(ChainError::Evidence { line: 1, .. })
-        ));
+        // The report says which key signed what.
+        let report = verify_journal_report(&database, &both, None, None, None).unwrap();
+        assert_eq!(
+            report.signed_by,
+            BTreeMap::from([(old.key_id(), 2)]),
+            "{report:?}"
+        );
+        let report = verify_journal_report(&tenant, &both, None, None, None).unwrap();
+        let current_id = crate::evidence::attester_key_id(&current_pin);
+        assert_eq!(
+            report.signed_by,
+            BTreeMap::from([(current_id.clone(), SET_03_CHAIN.lines().count() as u64)]),
+            "{report:?}"
+        );
+        // The receipts are not signed by the old key alone, and the error
+        // names the key that signed them.
+        let error =
+            verify_journal_with_attesters(&tenant, &[old_pin], None, None, None).unwrap_err();
+        assert!(
+            matches!(&error, ChainError::UnpinnedAttesterKey { line: 1, key_id } if *key_id == current_id),
+            "{error}"
+        );
+        assert_eq!(error.code(), "AUTH_FAIL");
+        assert!(
+            error.to_string().contains(&format!(
+                "signed by attester key {current_id}, not by a pinned key"
+            )),
+            "{error}"
+        );
         // No pin at all verifies nothing.
         assert!(verify_journal_with_attesters(&database, &[], None, None, None).is_err());
         assert!(verify_journal_with_attesters(&tenant, &[], None, None, None).is_err());

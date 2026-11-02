@@ -520,6 +520,16 @@ fn chains_across_an_attester_rotation_need_every_signing_key_pinned() {
         );
         let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(summary["details"]["kind"], kind);
+        // Which key signed how many entries.
+        let signed_by = if kind == "database" {
+            json!({ old.key_id(): 1 })
+        } else {
+            json!({ attester().key_id(): fx.receipts.len() })
+        };
+        assert_eq!(
+            summary["details"]["attester_key_ids"], signed_by,
+            "{summary}"
+        );
     }
 
     // Only the current pin: the record signed by the retired key fails,
@@ -558,6 +568,14 @@ fn chains_across_an_attester_rotation_need_every_signing_key_pinned() {
         "json",
     ]);
     assert_rejected(&output, "AUTH_FAIL");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "receipt signed by attester key {}, not by a pinned key",
+            attester().key_id()
+        )),
+        "{stderr}"
+    );
     // The same key twice is refused; other commands take one pin.
     let output = run_verify(&[
         "journal",

@@ -247,9 +247,10 @@ superuser.
   `praetore`; SECURITY DEFINER functions with the owner's rights that a
   role other than their owner may execute (unless listed explicitly).
   Whoever can execute an allowlisted function acts with its owner's
-  privileges. Extensions installed in `praetore` and objects in `praetore`
+  privileges. Extensions installed in `praetore`, objects in `praetore`
   that belong to an extension (a role with CREATE on the database can
-  install a trusted extension into any schema).
+  install a trusted extension into any schema), and objects in `praetore`
+  marked `DEPENDS ON EXTENSION`, which the extension's owner could drop.
 - With `PRAETORE_SCHEMA_OWNER` set: a `praetore` schema owned by another
   role, at runtime and when migrating. Without it, `verify_runtime_role`
   trusts whichever role owns `praetore` and does not compare its structure

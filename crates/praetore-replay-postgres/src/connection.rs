@@ -415,7 +415,8 @@ pub enum RuntimeRoleError {
         actual: Option<String>,
     },
     /// An extension is installed in `praetore`, or an object in `praetore`
-    /// belongs to an extension (`pg_depend` deptype `e`). Since PostgreSQL
+    /// belongs to an extension (`pg_depend` deptype `e`) or depends on one
+    /// (`DEPENDS ON EXTENSION`, deptype `x`). Since PostgreSQL
     /// 13, a role with CREATE on the database can install a trusted
     /// extension into any schema; its objects are owned by the bootstrap
     /// superuser.
@@ -482,8 +483,8 @@ impl fmt::Display for RuntimeRoleError {
             },
             Self::ExtensionObjects(objects) => write!(
                 f,
-                "extension objects are in schema praetore, which only its migrations may \
-                 populate: {objects}"
+                "extension objects are in schema praetore (members of an extension, or marked \
+                 DEPENDS ON EXTENSION), which only its migrations may populate: {objects}"
             ),
             Self::UnexpectedGrant(grants) => write!(
                 f,
@@ -1201,10 +1202,12 @@ pub(crate) fn praetore_schema_owner(
         .map(|row| row.get(0)))
 }
 
-/// Extensions installed in `praetore`, and objects in `praetore` that belong
-/// to an extension (`pg_depend` deptype `e`, whatever schema the extension
-/// itself is in). The migrations create no extension objects. Up to ten
-/// entries.
+/// Extensions installed in `praetore`, objects in `praetore` that belong
+/// to an extension (`pg_depend` deptype `e`), and objects in `praetore`
+/// marked `DEPENDS ON EXTENSION` (deptype `x`), which `DROP EXTENSION`
+/// drops with the extension: whoever owns that extension could drop them.
+/// Whatever schema the extension itself is in. The migrations create no
+/// such dependency. Up to ten entries.
 pub(crate) fn extension_objects(
     client: &mut impl postgres::GenericClient,
 ) -> Result<Option<String>, postgres::Error> {
@@ -1216,12 +1219,14 @@ pub(crate) fn extension_objects(
              FROM ns JOIN pg_catalog.pg_extension e \
                  ON e.extnamespace OPERATOR(pg_catalog.=) ns.oid \
              UNION ALL \
-             SELECT pg_catalog.concat(o.type, ' ', o.identity, ' (member of extension ', \
-                        e.extname, ')') \
+             SELECT pg_catalog.concat(o.type, ' ', o.identity, \
+                        CASE WHEN d.deptype OPERATOR(pg_catalog.=) 'e' THEN ' (member of extension ' \
+                             ELSE ' (depends on extension ' END, e.extname, ')') \
              FROM pg_catalog.pg_depend d \
              JOIN pg_catalog.pg_extension e ON e.oid OPERATOR(pg_catalog.=) d.refobjid \
              CROSS JOIN LATERAL pg_catalog.pg_identify_object(d.classid, d.objid, d.objsubid) o \
-             WHERE d.deptype OPERATOR(pg_catalog.=) 'e' \
+             WHERE (d.deptype OPERATOR(pg_catalog.=) 'e' \
+                    OR d.deptype OPERATOR(pg_catalog.=) 'x') \
                AND d.refclassid OPERATOR(pg_catalog.=) \
                    'pg_catalog.pg_extension'::pg_catalog.regclass \
                AND o.schema OPERATOR(pg_catalog.=) 'praetore') \

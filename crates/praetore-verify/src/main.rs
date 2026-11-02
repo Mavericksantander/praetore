@@ -5,7 +5,7 @@ use praetore_core::{
     evidence::Evidence,
     identity::{AgentIdentity, VerifiedPublicKey},
     journal_chain::{
-        ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES,
+        ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES, verify_journal_report,
         verify_journal_with_attesters,
     },
     policy::RecordedPolicy,
@@ -529,7 +529,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 (None, None) => None,
             };
             let text = read_limited_to(&journal, MAX_CHAIN_BYTES)?;
-            let summary = verify_journal_with_attesters(
+            let report = verify_journal_report(
                 &text,
                 &attesters,
                 policy.as_ref(),
@@ -540,7 +540,20 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 eprintln!("journal: {error}");
                 CliError { code: error.code() }
             })?;
+            let summary = report.summary;
             let chain = summary.head;
+            // Which pinned key signed how many entries: with several pins,
+            // entries signed by a retired key after a rotation show here.
+            details.insert(
+                "attester_key_ids".into(),
+                serde_json::Value::Object(
+                    report
+                        .signed_by
+                        .iter()
+                        .map(|(key_id, entries)| (key_id.clone(), (*entries).into()))
+                        .collect(),
+                ),
+            );
             let (kind, database_head) = match summary.kind {
                 JournalKind::Database => ("database", None),
                 JournalKind::Tenant { database_head } => ("tenant", database_head),

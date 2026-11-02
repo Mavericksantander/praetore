@@ -183,9 +183,25 @@
   trigger runs with the privileges of the role executing the migration DDL
   (unless its function is SECURITY DEFINER), as a test records, not with its
   function owner's.
-- **`praetore run` reports a port in use** with exit status 1 and the bind
-  error, instead of aborting (SIGABRT) while it dropped its PostgreSQL
-  clients on the async runtime thread.
+- **`praetore run`, `praetore-gateway-demo` and `praetore-observe` report a
+  port in use** with exit status 1 and the bind error, instead of aborting
+  (SIGABRT or a panic) while they dropped their blocking PostgreSQL clients
+  on the async runtime thread. The services bind before the state moves into
+  the runtime, and the runtime is dropped before the last reference.
+- **`DEPENDS ON EXTENSION` marks on `praetore` objects are refused** by the
+  runtime check and the migration runner, like extension members: `DROP
+  EXTENSION ... CASCADE` by the extension's owner would drop the marked
+  object (for example an append-only trigger function).
+- **`PRAETORE_SCHEMA_OWNER` with a NOLOGIN owner group.** With no schema yet,
+  a migrating role that is a member of the named NOLOGIN group creates
+  `praetore` owned by the group and runs the migrations as it; any other
+  named role is refused before anything is created. The installation order
+  is in `docs/operations.md`. The CLI and `praetore-observe` now warn, like
+  the gateway, while the variable is unset.
+- **`praetore-verify journal` reports `attester_key_ids`** (entries per
+  signing key id), and a receipt signed by a key that is not pinned fails
+  with `AUTH_FAIL` naming that key id (`ChainError::UnpinnedAttesterKey`).
+  New `journal_chain::verify_journal_report` and `JournalReport`.
 - **Tests (B5-6 and an intermittent CI failure).** The full ignored
   PostgreSQL suite runs in parallel: the fault-injection test runs in its own
   scratch database, and cluster-wide grants of `pg_read_all_data` /

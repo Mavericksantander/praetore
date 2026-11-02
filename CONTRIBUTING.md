@@ -83,7 +83,11 @@ itself in a child process against its own scratch database
 (`in_own_scratch_database`), and a test that grants a cluster-wide role
 (`pg_read_all_data`, `pg_write_all_data`) holds `CLUSTER_WIDE_GRANTS`
 exclusively until it revokes it, while every runtime-role check takes it
-shared. Keep new tests to that rule: per-test roles (`TestRole`) and
+shared. That lock exists only inside one test process: running these tests
+in several processes at once (`cargo nextest`, which runs one process per
+test, or two `cargo test` runs against the same cluster) is not supported.
+`cargo test` runs test binaries one after another, and CI runs one test per
+invocation. Keep new tests to that rule: per-test roles (`TestRole`) and
 databases (`ScratchDatabase`), and cleanup on drop. Also skip
 `postgres_apd_and_migrations_survive_restart` (a staged restart test) and
 `postgres_runtime_role_must_not_own_or_bypass_the_schema`, which must log in
