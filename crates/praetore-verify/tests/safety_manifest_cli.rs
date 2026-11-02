@@ -42,6 +42,13 @@ impl Drop for Dir {
     }
 }
 
+/// `value` as a manifest file: canonical JSON and one newline, so the check
+/// under test, not the encoding, rejects it.
+fn canonical_file(value: &Value) -> String {
+    let bytes = praetore_core::canonical::canonicalize_json(&value.to_string()).unwrap();
+    String::from_utf8(bytes).unwrap() + "\n"
+}
+
 fn golden() -> Value {
     serde_json::from_str(GOLDEN).unwrap()
 }
@@ -142,7 +149,7 @@ fn text_output_is_one_escaped_line() {
         &key,
     )
     .unwrap();
-    let manifest = dir.write("invisible.json", built.to_json().unwrap());
+    let manifest = dir.write("invisible.json", built.to_file().unwrap());
     let pin = dir.write(
         "invisible.pin",
         hex::encode(key.public_key().unwrap().as_bytes()),
@@ -179,7 +186,7 @@ fn a_wrong_pin_or_a_tampered_manifest_fails() {
     let tampered = |name: &str, edit: &dyn Fn(&mut Value)| {
         let mut value = original.clone();
         edit(&mut value);
-        dir.write(name, value.to_string())
+        dir.write(name, canonical_file(&value))
     };
     let added = tampered("added.json", &|v| {
         v["safety_actions"] = json!(["safety:halt", "safety:hold"])
@@ -261,12 +268,81 @@ fn the_attester_key_cannot_stand_in_for_the_namespace_key() {
     assert_ne!(attester.key_id(), golden["key_id"].as_str().unwrap());
     let mut value: Value = serde_json::from_str(golden["manifest"].as_str().unwrap()).unwrap();
     value["key_id"] = json!(attester.key_id());
-    let manifest = dir.write("attester-id.json", value.to_string());
+    let manifest = dir.write("attester-id.json", canonical_file(&value));
     let pin = dir.write("pin", golden["namespace_public_key_hex"].as_str().unwrap());
     assert_fails(
         &verify_json(&manifest, &pin, None),
         "SAFETY_MANIFEST_KEY_MISMATCH",
     );
+}
+
+/// One manifest, one file: the canonical document and exactly one newline.
+#[test]
+fn only_the_canonical_file_is_accepted() {
+    let dir = Dir::new();
+    let (_, pin, _) = golden_files(&dir);
+    let document = golden()["manifest"].as_str().unwrap().to_owned();
+    let value: Value = serde_json::from_str(&document).unwrap();
+    for (name, text) in [
+        ("no-newline.json", document.clone()),
+        ("two-newlines.json", format!("{document}\n\n")),
+        ("crlf.json", format!("{document}\r\n")),
+        (
+            "pretty.json",
+            serde_json::to_string_pretty(&value).unwrap() + "\n",
+        ),
+        (
+            "escaped.json",
+            document.replacen("safety:halt", "\\u0073afety:halt", 1) + "\n",
+        ),
+    ] {
+        let file = dir.write(name, text);
+        let output = verify_json(&file, &pin, None);
+        assert_fails(&output, "SAFETY_MANIFEST_INVALID");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("canonical encoding"),
+            "{name}: {output:?}"
+        );
+    }
+}
+
+/// With `--attester-pin`, a namespace pin equal to the attester key is
+/// refused before the signature is considered.
+#[test]
+fn the_namespace_pin_must_not_be_the_attester_key() {
+    let dir = Dir::new();
+    let (manifest, pin, _) = golden_files(&dir);
+    let output = verify(&[
+        "--manifest",
+        &manifest,
+        "--pin",
+        &pin,
+        "--attester-pin",
+        &pin,
+        "--format",
+        "json",
+    ]);
+    assert_fails(&output, "SAFETY_MANIFEST_SAME_KEY");
+    let other = dir.write(
+        "attester.pin",
+        hex::encode(
+            EvidenceAttesterKey::from_secret_bytes(&[0x63; 32])
+                .public_key()
+                .unwrap()
+                .as_bytes(),
+        ),
+    );
+    let output = verify(&[
+        "--manifest",
+        &manifest,
+        "--pin",
+        &pin,
+        "--attester-pin",
+        &other,
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success(), "{output:?}");
 }
 
 #[test]
@@ -281,7 +357,7 @@ fn usage_errors_are_reported() {
             manifest.as_str(),
             "--pin",
             pin.as_str(),
-            "--attester-pin",
+            "--issuer-pins",
             pin.as_str(),
             "--format",
             "json",

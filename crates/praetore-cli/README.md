@@ -71,9 +71,13 @@ praetore policy safety-manifest --policy ./policy.json --key namespace.key \
 writes the signed safety namespace manifest of a format 2 policy (its
 digest, id, version and the sorted list of its `Safety` names) and prints a
 summary with the `public_key` that verifiers pin. It never overwrites: an
-existing `--output` file is an error and is left as it was. The key is a
-dedicated 32-byte secret (64 lowercase hex characters, owner-only), not the
-evidence or issuer key. `--issued-at <RFC 3339>` fixes the time; the same
+existing `--output` file is an error and is left as it was, and a failed
+write leaves nothing (the manifest goes through a synced temporary file
+hard-linked to the output name). The key is a dedicated 32-byte secret (64
+lowercase hex characters): a regular file, not a symlink, owned by you, no
+group or other permissions, at most 128 bytes. It is not the evidence or
+issuer key; `--attester-pin <hex file>` refuses it if it is the attester
+key. `--issued-at <RFC 3339>` fixes the time; the same
 policy, time and key give the same bytes. Verify it with
 `praetore-verify safety-manifest --manifest safety-manifest.json --pin
 namespace.pin [--policy ./policy.json]`. The manifest authorizes nothing;

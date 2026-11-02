@@ -222,13 +222,46 @@ prefix-free with, every other domain in the repository
 (`crates/praetore-core/tests/safety_namespace.rs` scans them), so even the
 same key bytes used in two roles give signatures that do not verify across
 roles and key ids that differ. Using one key for two roles is still a
-deployment error.
+deployment error, which `ensure_distinct_keys` detects wherever both keys
+are present.
+
+`ensure_distinct_keys` refuses the same public key in the namespace role
+and in another role (`SameKeyForBothRoles`, `SAFETY_MANIFEST_SAME_KEY`).
+`praetore policy safety-manifest` and `praetore-verify safety-manifest` call
+it with `--attester-pin`; the ingestion path (G1) and any online loader that
+holds the namespace pin together with the attester or issuer key must call
+it at startup.
+
+The namespace key file is opened once with `O_NOFOLLOW | O_NONBLOCK |
+O_CLOEXEC` and checked with `fstat` on that descriptor (regular file, owned
+by the effective uid, no group or other bits, at most 128 bytes) before it
+is read through the same descriptor, so a symlink, a FIFO or a file swapped
+between the check and the read is refused. Symlinks in parent directories
+are still followed. The local demo keys (`read_secret`) are still checked
+by path; moving them to the same helper is a follow-up.
+
+One manifest has one valid file: the canonical document and one newline.
+Any other encoding is rejected, so a hash of the file identifies the
+manifest. The manifest is written through a synced temporary file
+hard-linked to the output name, which never replaces an existing name and
+never leaves a partial file there.
 
 Names: `SafetyActionName::parse` is shared by policy loading and the
 manifest, so a name the policy accepts is exactly a name the manifest and
-the future ingestion path accept. Text output escapes invisible characters
-(a policy id may contain them); JSON output and the manifest file keep the
-exact bytes.
+the future ingestion path accept. The entry points keep the G7 prefix rule
+and do not call `parse`; a name that starts with `safety:` but fails it can
+never be declared, so it fails closed:
+
+| Entry point | `safety:` name that fails `parse` (`safety:`, `safety:_x`, over 128 bytes) |
+| --- | --- |
+| Gateway HTTP API | 422 `safety_action_not_governed`, no receipt (the same answer as every `safety:` name: it depends only on the public prefix rule) |
+| `praetore-mcp` gate | signed DENY, `unclassified`; nothing forwarded |
+| Claude Code hook | signed DENY, `unclassified` |
+| Ingestion path (G1, not built) | must record it with the raw input (bounded, escaped for display) and the reason `invalid_name`, never drop it |
+
+Text output escapes invisible characters (a policy id may contain them).
+JSON output and the manifest file keep the exact bytes, by design: a
+consumer that shows JSON output to a person must escape it itself.
 
 ## Invariants and traceability
 

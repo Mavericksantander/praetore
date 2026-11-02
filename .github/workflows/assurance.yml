@@ -48,9 +48,9 @@ jobs:
           # G2: the shared safety name validator and the signed safety
           # namespace manifest (core, `praetore policy safety-manifest`,
           # `praetore-verify safety-manifest`).
-          run "test result: ok\. 18 passed" cargo test --locked -p praetore-core --test safety_namespace
-          run "test result: ok\. 5 passed" cargo test --locked -p praetore-cli --test safety_manifest_cli
-          run "test result: ok\. 6 passed" cargo test --locked -p praetore-verify --test safety_manifest_cli
+          run "test result: ok\. 21 passed" cargo test --locked -p praetore-core --test safety_namespace
+          run "test result: ok\. 7 passed" cargo test --locked -p praetore-cli --test safety_manifest_cli
+          run "test result: ok\. 8 passed" cargo test --locked -p praetore-verify --test safety_manifest_cli
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"

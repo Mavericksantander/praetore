@@ -44,6 +44,11 @@ Status: proposal only, a nice-to-have for a pilot program. Baseline: `main` at e
 >    with `--policy` checks that it matches that policy exactly.
 > 3. `manifest.classify_name(&name)` answers `Declared` or `Undeclared`, so
 >    the ingestion path can record an undeclared name instead of dropping it.
+>    A name that starts with `safety:` but fails `SafetyActionName::parse`
+>    must also be recorded, with its raw input (bounded, escaped for
+>    display) and the reason `invalid_name`. `ensure_distinct_keys` refuses
+>    the same key in the namespace and attester or issuer roles; the
+>    ingestion path calls it at startup.
 >
 > The manifest authorizes nothing and is not read on the decision path. See
 > [docs/policy-language.md](../policy-language.md#safety-namespace-manifest-g2)

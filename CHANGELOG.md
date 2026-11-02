@@ -19,10 +19,15 @@
   `PRAETORE_SAFETY_NAMESPACE_KEY_V1\0ed25519\0`. `verify` checks it against a
   pinned key, `verify_matches_policy` against a policy (digest and exact
   list), and `classify_name` answers `Declared` or `Undeclared` for the
-  ingestion path. New commands: `praetore policy safety-manifest --policy P
-  --key K --output NEW_FILE` (never overwrites) and `praetore-verify
-  safety-manifest --manifest M --pin K [--policy P]`, both with
-  `--format json|text`. The manifest authorizes nothing and is not read on
+  ingestion path; `ensure_distinct_keys` refuses the same key in the
+  namespace and attester or issuer roles (`SameKeyForBothRoles`). Only the
+  canonical encoding parses (`from_json`); a manifest file is that document
+  and one newline (`to_file`, `from_file`). New commands: `praetore policy
+  safety-manifest --policy P --key K --output NEW_FILE [--attester-pin A]`
+  (never overwrites; writes through a synced temporary file hard-linked to
+  the output name; reads the key with `O_NOFOLLOW` and checks the open
+  descriptor) and `praetore-verify safety-manifest --manifest M --pin K
+  [--policy P] [--attester-pin A]`, both with `--format json|text`. The manifest authorizes nothing and is not read on
   the decision path. Golden vector
   `docs/golden/safety-namespace-manifest-v1.json`; new fuzz target
   `safety_namespace`.

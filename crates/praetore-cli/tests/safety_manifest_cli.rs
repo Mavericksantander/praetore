@@ -127,7 +127,7 @@ fn writes_a_manifest_that_verifies_against_the_policy() {
 
     let text = fs::read_to_string(&output).unwrap();
     assert!(text.ends_with("}\n"));
-    let manifest = SafetyNamespaceManifest::from_json(text.trim_end()).unwrap();
+    let manifest = SafetyNamespaceManifest::from_file(&text).unwrap();
     manifest.verify(&pin()).unwrap();
     manifest.verify_matches_policy(&policy()).unwrap();
     assert_eq!(summary["key_id"], manifest.key_id());
@@ -221,7 +221,35 @@ fn writes_nothing_when_an_input_is_invalid() {
         fs::set_permissions(&open_key, fs::Permissions::from_mode(0o644)).unwrap();
         let result = praetore(&manifest_args(&policy, &open_key, &output));
         assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("permissions"));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("group or others"));
+
+        // A symlink to an owner-only key, a FIFO and an oversized file.
+        let link = dir.path("link.key");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        let result = praetore(&manifest_args(&policy, &link, &output));
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("symbolic link"));
+
+        let fifo = dir.path("fifo.key");
+        assert!(
+            Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let result = praetore(&manifest_args(&policy, &fifo, &output));
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("not a regular file"));
+
+        let big = dir.write_private(
+            "big.key",
+            &format!("{}\n{}", hex::encode(SECRET), "a".repeat(100)),
+        );
+        let result = praetore(&manifest_args(&policy, &big, &output));
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("larger than 128 bytes"));
     }
 
     // An invalid time.
@@ -230,6 +258,74 @@ fn writes_nothing_when_an_input_is_invalid() {
     assert!(!praetore(&args).status.success());
 
     assert!(!output.exists());
+}
+
+/// The namespace key is refused when it is the attester's key.
+#[test]
+fn refuses_the_attester_key_as_the_namespace_key() {
+    let (dir, policy, key) = fixture();
+    let output = dir.path("manifest.json");
+    let same = dir.write("attester.pin", hex::encode(pin().as_bytes()));
+    let mut args = manifest_args(&policy, &key, &output);
+    args.extend(["--attester-pin", same.to_str().unwrap()]);
+    let result = praetore(&args);
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("key of another role"),
+        "{result:?}"
+    );
+    assert!(!output.exists());
+
+    let other = dir.write(
+        "other.pin",
+        hex::encode(
+            praetore_core::EvidenceAttesterKey::from_secret_bytes(&[0x52; 32])
+                .public_key()
+                .unwrap()
+                .as_bytes(),
+        ),
+    );
+    let mut args = manifest_args(&policy, &key, &output);
+    args.extend(["--attester-pin", other.to_str().unwrap()]);
+    assert!(praetore(&args).status.success());
+}
+
+/// The manifest is written through a temporary file that is always
+/// removed; nothing else is left in the directory.
+#[test]
+fn leaves_no_temporary_file() {
+    let (dir, policy, key) = fixture();
+    let output = dir.path("manifest.json");
+    assert!(
+        praetore(&manifest_args(&policy, &key, &output))
+            .status
+            .success()
+    );
+    assert!(
+        !praetore(&manifest_args(&policy, &key, &output))
+            .status
+            .success()
+    );
+    #[cfg(unix)]
+    {
+        let dangling = dir.path("dangling.json");
+        std::os::unix::fs::symlink(dir.path("nowhere"), &dangling).unwrap();
+        assert!(
+            !praetore(&manifest_args(&policy, &key, &dangling))
+                .status
+                .success()
+        );
+        assert!(!dir.path("nowhere").exists());
+    }
+    let mut names: Vec<String> = fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let mut expected = vec!["manifest.json", "namespace.key", "policy.json"];
+    #[cfg(unix)]
+    expected.insert(0, "dangling.json");
+    assert_eq!(names, expected);
 }
 
 #[test]

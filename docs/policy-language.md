@@ -254,12 +254,25 @@ praetore-verify safety-manifest --manifest safety-manifest.json \
 
 `praetore policy safety-manifest` prints the `public_key` to put in the pin
 file (64 lowercase hex characters, the same format as an attester pin). It
-never overwrites: an existing `--output` file is an error and stays as it
-was. `--issued-at <RFC 3339>` fixes the issue time; the same policy, time
-and key always give the same bytes.
+never overwrites: an existing `--output` file (or a symlink at that name) is
+an error and stays as it was. The manifest is written and synced to a
+temporary file in the same directory and then hard-linked to the output
+name, so a failed write leaves nothing there. `--issued-at <RFC 3339>` fixes
+the issue time; the same policy, time and key always give the same bytes.
+The key file is opened once without following a symlink and checked on the
+open descriptor: a regular file owned by the current user, no group or
+other permission bits, at most 128 bytes, 64 lowercase hex characters and
+at most one final newline. With `--attester-pin <hex file>`, both commands
+refuse a namespace key equal to the attester key
+(`SAFETY_MANIFEST_SAME_KEY`).
 
 The manifest (`SafetyNamespaceManifest`, schema version 1) is canonical
-JSON with these fields:
+JSON (the repository's canonical encoding: keys sorted, no whitespace),
+and a manifest file is exactly that document followed by one newline. Any
+other encoding of the same content (indentation, another key order, a
+`\u` escape, no final newline or two) is rejected as not canonical, so
+one manifest has exactly one valid file and can be identified by the hash
+of that file. The fields:
 
 | Field | Value |
 | --- | --- |
@@ -287,6 +300,18 @@ domain, so the same public key never has the same id in two roles.
 For the ingestion path, `manifest.classify_name(&name)` answers `Declared`
 or `Undeclared`. An undeclared name is a value, not an error, so it can be
 recorded (marked `undeclared`) rather than dropped.
+
+The entry points keep the G7 prefix rule and do not call
+`SafetyActionName::parse`. A name that starts with `safety:` but fails
+`parse` (`safety:`, `safety:_x`, a name over 128 bytes) can never be
+declared, so it is refused: the gateway answers it with the same 422
+`safety_action_not_governed` as every `safety:` name, with no receipt;
+`praetore-mcp` and the hook refuse it with a signed `unclassified` DENY.
+The ingestion path must record such a name with its raw input (bounded,
+and escaped for display) and the reason `invalid_name`, never drop it.
+
+JSON output of both commands is exact by design (a `policy_id` with an
+invisible character is printed as it is); text output escapes it.
 
 The manifest authorizes nothing. No engine, gateway, gate or hook reads it;
 see [the threat model](threat-model.md#safety-namespace-manifest-g2).
