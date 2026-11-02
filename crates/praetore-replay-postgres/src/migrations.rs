@@ -144,6 +144,84 @@ pub enum MigrationError {
     /// An option could not be applied, for example a trusted SECURITY
     /// DEFINER function that does not resolve.
     InvalidConfiguration(String),
+    /// `PRAETORE_SCHEMA_OWNER` (here `expected`) cannot be honoured; checked
+    /// before anything is created.
+    SchemaOwner {
+        expected: String,
+        problem: SchemaOwnerProblem,
+    },
+    /// `praetore_runtime` does not exist and the role that runs migration
+    /// 0011 (`acting_role`) cannot create it; checked before any migration.
+    RuntimeGroupMissing {
+        acting_role: String,
+    },
+}
+
+/// Why `PRAETORE_SCHEMA_OWNER` refuses to migrate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchemaOwnerProblem {
+    /// The existing `praetore` schema is owned by another role.
+    OwnedByOther { actual: String },
+    /// No role has that name.
+    RoleMissing,
+    /// A predefined role (`pg_*`).
+    PredefinedRole,
+    /// The bootstrap superuser, for a schema that does not exist yet (an
+    /// existing schema it already owns, the legacy case, is accepted).
+    BootstrapSuperuser,
+    /// The migrating role is neither that role nor a member of it.
+    NotMember { migrator: String },
+    /// A LOGIN role other than the migrating role (an owner group must be
+    /// NOLOGIN).
+    LoginRole { migrator: String },
+    /// The migrating role is a member but may not `SET ROLE` to it
+    /// (`WITH SET FALSE`, PostgreSQL 16+).
+    CannotSetRole { migrator: String },
+    /// The migrating role is a member but does not inherit its privileges
+    /// (`WITH INHERIT FALSE`, or a NOINHERIT migrating role), so it could
+    /// not read the schema the group owns.
+    CannotUseRole { migrator: String },
+    /// `role` lacks CREATE on the database (the migrating role creates the
+    /// schema; the group runs migration 0001, `CREATE SCHEMA IF NOT EXISTS`).
+    CannotCreateInDatabase { role: String },
+}
+
+impl std::fmt::Display for SchemaOwnerProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OwnedByOther { actual } => write!(f, "schema praetore is owned by {actual}"),
+            Self::RoleMissing => write!(f, "no role has that name"),
+            Self::PredefinedRole => write!(f, "it is a predefined (pg_*) role"),
+            Self::BootstrapSuperuser => write!(
+                f,
+                "it is the bootstrap superuser, which may keep a legacy schema it already \
+                 owns but not create a new one"
+            ),
+            Self::NotMember { migrator } => write!(
+                f,
+                "the migrating role {migrator} is neither that role nor a member of it, so it \
+                 cannot create the schema owned by that role"
+            ),
+            Self::LoginRole { migrator } => write!(
+                f,
+                "it is a LOGIN role other than the migrating role {migrator}; an owner group \
+                 must be NOLOGIN"
+            ),
+            Self::CannotSetRole { migrator } => write!(
+                f,
+                "the migrating role {migrator} is a member without the SET option (GRANT ... \
+                 WITH SET TRUE)"
+            ),
+            Self::CannotUseRole { migrator } => write!(
+                f,
+                "the migrating role {migrator} does not inherit its privileges (GRANT ... WITH \
+                 INHERIT TRUE, and the migrating role must not be NOINHERIT)"
+            ),
+            Self::CannotCreateInDatabase { role } => {
+                write!(f, "{role} has no CREATE privilege on the database")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for MigrationError {
@@ -188,6 +266,18 @@ impl std::fmt::Display for MigrationError {
             Self::InvalidConfiguration(reason) => {
                 write!(f, "invalid migration configuration: {reason}")
             }
+            Self::SchemaOwner { expected, problem } => write!(
+                f,
+                "refusing to migrate: {} is {expected}, but {problem}; nothing was created",
+                MigrationOptions::SCHEMA_OWNER_ENV
+            ),
+            Self::RuntimeGroupMissing { acting_role } => write!(
+                f,
+                "refusing to migrate: role praetore_runtime does not exist and {acting_role}, \
+                 which runs the migrations, has no CREATEROLE to create it (migration 0011); \
+                 pre-create it as the database owner or a superuser: CREATE ROLE \
+                 praetore_runtime NOLOGIN"
+            ),
             Self::AdoptionRequiresSigner => write!(
                 f,
                 "adopting a legacy baseline requires signing its storage record with the \
@@ -424,6 +514,9 @@ fn owner_role_statement(
     }))
 }
 
+/// The migration that creates (or only grants to) `praetore_runtime`.
+const RUNTIME_GROUP_VERSION: &str = "0011_runtime_role";
+
 /// Last migration that existed before the control table was introduced.
 const BASELINE_VERSION: &str = "0009_human_approval_expirations";
 
@@ -434,6 +527,8 @@ fn apply_locked(
     {
         let mut transaction = client.build_transaction().read_only(true).start()?;
         transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
+        schema_owner_check(&mut transaction, options)?;
+        runtime_group_check(&mut transaction, options)?;
         let problems = environment_problems(&mut transaction, options)?;
         transaction.rollback()?;
         if !problems.is_empty() {
@@ -465,6 +560,10 @@ fn apply_locked(
         // cannot change between the comparison and the record.
         let mut transaction = client.transaction()?;
         transaction.batch_execute(&format!("SET LOCAL search_path = {SAFE_SEARCH_PATH}"))?;
+        // Again inside the transaction that creates or adopts the schema: a
+        // schema created by another role since the read-only check above is
+        // refused here, adoption enabled or not.
+        schema_owner_check(&mut transaction, options)?;
         let baseline = if has_schema {
             Some(check_0009_baseline(&mut transaction)?)
         } else {
@@ -1720,6 +1819,152 @@ fn is_control_table_key(key: &str) -> bool {
 /// and roles other than the migrating role (and NOLOGIN groups it belongs
 /// to) that can act as the owner. The owner is the schema owner, or the
 /// migrating role for a fresh database.
+/// `PRAETORE_SCHEMA_OWNER`: an existing schema must be owned by the named
+/// role. Without a schema, the named role must exist, must not be a
+/// predefined role or the bootstrap superuser, and must be the migrating
+/// role or a NOLOGIN group that the migrating role can SET ROLE to and whose
+/// privileges it inherits, with CREATE on the database for both. All of it
+/// is checked before anything is created.
+fn schema_owner_check(
+    transaction: &mut postgres::Transaction<'_>,
+    options: &MigrationOptions,
+) -> Result<(), MigrationError> {
+    let Some(expected) = &options.schema_owner else {
+        return Ok(());
+    };
+    let refuse = |problem| {
+        Err(MigrationError::SchemaOwner {
+            expected: expected.clone(),
+            problem,
+        })
+    };
+    if expected.starts_with("pg_") {
+        return refuse(SchemaOwnerProblem::PredefinedRole);
+    }
+    if let Some(actual) = crate::connection::praetore_schema_owner(transaction)? {
+        return if actual == *expected {
+            Ok(())
+        } else {
+            refuse(SchemaOwnerProblem::OwnedByOther { actual })
+        };
+    }
+    let row = transaction.query_one(
+        "SELECT CURRENT_USER::pg_catalog.text, r.oid IS NOT NULL, \
+                COALESCE(r.oid OPERATOR(pg_catalog.=) 10::pg_catalog.oid, false), \
+                COALESCE(r.rolcanlogin, false), \
+                COALESCE(pg_catalog.pg_has_role(CURRENT_USER, r.oid, 'MEMBER'), false), \
+                COALESCE(pg_catalog.pg_has_role(CURRENT_USER, r.oid, 'USAGE'), false), \
+                pg_catalog.current_setting('server_version_num')::pg_catalog.int4, \
+                pg_catalog.has_database_privilege(CURRENT_USER, \
+                    pg_catalog.current_database(), 'CREATE'), \
+                COALESCE(pg_catalog.has_database_privilege(r.oid, \
+                    pg_catalog.current_database(), 'CREATE'), false) \
+         FROM (SELECT 1) one \
+         LEFT JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) $1",
+        &[expected],
+    )?;
+    let migrator: String = row.get(0);
+    let (exists, bootstrap, login, member, usage): (bool, bool, bool, bool, bool) =
+        (row.get(1), row.get(2), row.get(3), row.get(4), row.get(5));
+    let (version, migrator_creates, owner_creates): (i32, bool, bool) =
+        (row.get(6), row.get(7), row.get(8));
+    if !exists {
+        return refuse(SchemaOwnerProblem::RoleMissing);
+    }
+    if bootstrap {
+        return refuse(SchemaOwnerProblem::BootstrapSuperuser);
+    }
+    if !migrator_creates {
+        return refuse(SchemaOwnerProblem::CannotCreateInDatabase { role: migrator });
+    }
+    if migrator == *expected {
+        return Ok(());
+    }
+    if !member {
+        return refuse(SchemaOwnerProblem::NotMember { migrator });
+    }
+    if login {
+        return refuse(SchemaOwnerProblem::LoginRole { migrator });
+    }
+    // Before PostgreSQL 16 every member may SET ROLE; the SET option and
+    // pg_has_role(..., 'SET') exist from 16 on.
+    if version >= 160_000 {
+        let can_set: bool = transaction
+            .query_one(
+                "SELECT pg_catalog.pg_has_role(CURRENT_USER, r.oid, 'SET') \
+                 FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) $1",
+                &[expected],
+            )?
+            .get(0);
+        if !can_set {
+            return refuse(SchemaOwnerProblem::CannotSetRole { migrator });
+        }
+    }
+    if !usage {
+        return refuse(SchemaOwnerProblem::CannotUseRole { migrator });
+    }
+    if !owner_creates {
+        return refuse(SchemaOwnerProblem::CannotCreateInDatabase {
+            role: expected.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Migration 0011 creates `praetore_runtime` when it does not exist, which
+/// needs CREATEROLE (or superuser) in the role that runs the migrations: the
+/// owner of an existing schema, else the `PRAETORE_SCHEMA_OWNER` group,
+/// else the migrating role. Refuses up front, before migration 0001, when
+/// 0011 is still to run and that role cannot create it.
+fn runtime_group_check(
+    transaction: &mut postgres::Transaction<'_>,
+    options: &MigrationOptions,
+) -> Result<(), MigrationError> {
+    let row = transaction.query_one(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) 'praetore_runtime'), \
+                pg_catalog.to_regclass('praetore.schema_migrations') IS NOT NULL",
+        &[],
+    )?;
+    let (runtime_exists, has_control): (bool, bool) = (row.get(0), row.get(1));
+    if runtime_exists {
+        return Ok(());
+    }
+    if has_control {
+        let recorded: bool = transaction
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM praetore.schema_migrations \
+                                WHERE version OPERATOR(pg_catalog.=) $1)",
+                &[&RUNTIME_GROUP_VERSION],
+            )?
+            .get(0);
+        if recorded {
+            return Ok(());
+        }
+    }
+    let acting_role: String = match crate::connection::praetore_schema_owner(transaction)? {
+        Some(owner) => owner,
+        None => match &options.schema_owner {
+            Some(owner) => owner.clone(),
+            None => transaction
+                .query_one("SELECT CURRENT_USER::pg_catalog.text", &[])?
+                .get(0),
+        },
+    };
+    let can_create: bool = transaction
+        .query_one(
+            "SELECT COALESCE((SELECT r.rolsuper OR r.rolcreaterole FROM pg_catalog.pg_roles r \
+                              WHERE r.rolname OPERATOR(pg_catalog.=) $1), false)",
+            &[&acting_role],
+        )?
+        .get(0);
+    if can_create {
+        Ok(())
+    } else {
+        Err(MigrationError::RuntimeGroupMissing { acting_role })
+    }
+}
+
 fn environment_problems(
     transaction: &mut postgres::Transaction<'_>,
     options: &MigrationOptions,
@@ -1735,50 +1980,6 @@ fn environment_problems(
     .map(|function| function.oid)
     .collect();
     let mut problems = Vec::new();
-    if let Some(expected) = &options.schema_owner {
-        match crate::connection::praetore_schema_owner(transaction)? {
-            Some(actual) if actual != *expected => problems.push(format!(
-                "schema praetore is owned by {actual}, but {} is {expected}",
-                MigrationOptions::SCHEMA_OWNER_ENV
-            )),
-            Some(_) => {}
-            None => {
-                // The schema is created owned by the configured role: the
-                // migrating role itself, or a group it is a member of (a
-                // NOLOGIN owner group, which it SETs ROLE to). The acting
-                // roles of that owner are then checked below.
-                let row = transaction.query_one(
-                    "SELECT CURRENT_USER::pg_catalog.text, r.oid IS NOT NULL, \
-                            COALESCE(pg_catalog.pg_has_role(CURRENT_USER, r.oid, 'MEMBER'), false), \
-                            COALESCE(r.rolcanlogin, false) \
-                     FROM (SELECT 1) one \
-                     LEFT JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) $1",
-                    &[expected],
-                )?;
-                let (migrator, exists, member, login): (String, bool, bool, bool) =
-                    (row.get(0), row.get(1), row.get(2), row.get(3));
-                if !exists {
-                    problems.push(format!(
-                        "{} names role {expected}, which does not exist",
-                        MigrationOptions::SCHEMA_OWNER_ENV
-                    ));
-                } else if migrator != *expected && !member {
-                    problems.push(format!(
-                        "schema praetore does not exist and the migrating role {migrator} is \
-                         neither {} ({expected}) nor a member of it, so it cannot create the \
-                         schema owned by that role",
-                        MigrationOptions::SCHEMA_OWNER_ENV
-                    ));
-                } else if migrator != *expected && login {
-                    problems.push(format!(
-                        "{} names {expected}, a LOGIN role other than the migrating role \
-                         {migrator}; an owner group must be NOLOGIN",
-                        MigrationOptions::SCHEMA_OWNER_ENV
-                    ));
-                }
-            }
-        }
-    }
     if let Some(objects) = crate::connection::extension_objects(transaction)? {
         problems.push(format!(
             "extension objects are in schema praetore (members of an extension, or marked \

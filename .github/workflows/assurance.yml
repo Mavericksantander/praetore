@@ -269,6 +269,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test -p praetore-replay-postgres --locked
+      - name: Missing praetore_runtime is refused up front (runs first, before any test creates the role)
+        run: |
+          set -euo pipefail
+          output="$(cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_migrations_refuse_a_missing_runtime_group_up_front --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::the test did not run"; exit 1; }
+          grep -q "RUNTIME_GROUP_ABSENT_CHECKED" <<<"$output" || { echo "::error::praetore_runtime already existed; the check did not run"; exit 1; }
       - name: journal-export against PostgreSQL (RLS as the runtime role, order, CLI end to end)
         run: |
           set -euo pipefail

@@ -81,8 +81,10 @@ trigger), signed with the evidence attester key that the binary passes in
   a record, `attester_key_id` of a receipt); a line signed by a key outside
   the set fails, naming that key (`AUTH_FAIL` for a receipt,
   `EVIDENCE_FAIL` for a record). `praetore-verify journal` reports, in
-  `attester_key_ids`, how many entries each key id signed, so that entries
-  signed by a retired key after the rotation are visible. After a rotation, pass the retired key's
+  `attester_key_ids`, how many entries of `--journal` each key id signed,
+  so that entries signed by a retired key after the rotation are visible;
+  with `--database-journal`, `database_attester_key_ids` does the same for
+  that file (`null` without it). After a rotation, pass the retired key's
   pin together with the current one: with only the current pin, every
   export of a database adopted before the rotation fails
   (`journal-export --tenant` reads the database chain to reference its

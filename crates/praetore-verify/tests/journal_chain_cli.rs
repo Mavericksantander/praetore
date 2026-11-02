@@ -530,6 +530,16 @@ fn chains_across_an_attester_rotation_need_every_signing_key_pinned() {
             summary["details"]["attester_key_ids"], signed_by,
             "{summary}"
         );
+        // The --database-journal file's signers are reported apart.
+        let database_signed_by = if kind == "tenant" {
+            json!({ old.key_id(): 1 })
+        } else {
+            Value::Null
+        };
+        assert_eq!(
+            summary["details"]["database_attester_key_ids"], database_signed_by,
+            "{summary}"
+        );
     }
 
     // Only the current pin: the record signed by the retired key fails,

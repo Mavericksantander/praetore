@@ -5087,13 +5087,23 @@ fn postgres_schema_owner_is_pinned_by_praetore_schema_owner() {
     eprintln!("runtime refused as expected: {message}");
     verify_runtime_role_with(&mut client, &pinned(&squatter.name))
         .expect("the pinned owner is accepted");
+    // D-4: a predefined role is a configuration error.
+    let error = verify_runtime_role_with(&mut client, &pinned("pg_database_owner"))
+        .expect_err("a predefined role as PRAETORE_SCHEMA_OWNER");
+    assert!(
+        matches!(
+            error,
+            praetore_replay_postgres::RuntimeRoleError::InvalidConfiguration(_)
+        ),
+        "{error}"
+    );
     let message =
         praetore_replay_postgres::apply_migrations_with(&mut admin, &migrate_as(&admin_role))
             .expect_err("migrating a schema owned by another role")
             .to_string();
     assert!(
         message.contains(&format!(
-            "schema praetore is owned by {}, but PRAETORE_SCHEMA_OWNER is {admin_role}",
+            "PRAETORE_SCHEMA_OWNER is {admin_role}, but schema praetore is owned by {}",
             squatter.name
         )),
         "{message}"
@@ -5111,12 +5121,15 @@ fn postgres_schema_owner_is_pinned_by_praetore_schema_owner() {
             .expect_err("PRAETORE_SCHEMA_OWNER is another LOGIN role");
     let message = error.to_string();
     assert!(
-        matches!(error, MigrationError::UnsafeDatabase(_))
-            && message.contains(&format!(
-                "PRAETORE_SCHEMA_OWNER names {}, a LOGIN role other than the migrating role \
-                 {admin_role}",
-                squatter.name
-            )),
+        matches!(
+            &error,
+            MigrationError::SchemaOwner {
+                problem: praetore_replay_postgres::SchemaOwnerProblem::LoginRole { .. },
+                ..
+            }
+        ) && message.contains(&format!(
+            "it is a LOGIN role other than the migrating role {admin_role}"
+        )),
         "{message}"
     );
     let exists: bool = admin
@@ -5127,7 +5140,34 @@ fn postgres_schema_owner_is_pinned_by_praetore_schema_owner() {
         .unwrap()
         .get(0);
     assert!(!exists, "nothing was created");
-    praetore_replay_postgres::apply_migrations_with(&mut admin, &migrate_as(&admin_role)).unwrap();
+    // D-4: the bootstrap superuser (as in CI) may not create a new schema
+    // under the pin, but keeps one it already owns (the legacy case).
+    let bootstrap: bool = admin
+        .query_one(
+            "SELECT oid = 10 FROM pg_roles WHERE rolname = current_user",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    if bootstrap {
+        let error =
+            praetore_replay_postgres::apply_migrations_with(&mut admin, &migrate_as(&admin_role))
+                .expect_err("the bootstrap superuser creating a pinned schema");
+        assert!(
+            matches!(
+                error,
+                MigrationError::SchemaOwner {
+                    problem: praetore_replay_postgres::SchemaOwnerProblem::BootstrapSuperuser,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    } else {
+        praetore_replay_postgres::apply_migrations_with(&mut admin, &migrate_as(&admin_role))
+            .unwrap();
+    }
     praetore_replay_postgres::apply_migrations_with(&mut admin, &migrate_as(&admin_role)).unwrap();
     admin
         .batch_execute(&format!("GRANT praetore_runtime TO {}", runtime.name))
@@ -5231,33 +5271,67 @@ fn postgres_schema_owner_group_performs_the_first_migration() {
     drop(client);
     drop(scratch);
 
-    // Fail closed for any other owner.
-    for (owner, expected) in [
+    // Fail closed for any other owner, before anything is created (D-1,
+    // D-4): a group the migrating role is not a member of, a LOGIN role, a
+    // role that does not exist, a predefined role, a membership without SET
+    // or without INHERIT, and a NOINHERIT migrating role.
+    let set_false = TestRole::create("NOLOGIN");
+    let inherit_false = TestRole::create("NOLOGIN");
+    let noinherit_migrator = TestRole::create("LOGIN NOINHERIT");
+    connect_client()
+        .batch_execute(&format!(
+            "GRANT {set_false} TO {m} WITH SET FALSE; \
+             GRANT {inherit_false} TO {m} WITH INHERIT FALSE; \
+             GRANT {group} TO {noinherit}",
+            set_false = set_false.name,
+            inherit_false = inherit_false.name,
+            group = group.name,
+            noinherit = noinherit_migrator.name,
+            m = migrator.name
+        ))
+        .unwrap();
+    use praetore_replay_postgres::{MigrationError, SchemaOwnerProblem as P};
+    for (owner, user, expected) in [
+        (&other_group.name, &migrator.name, "NotMember"),
+        (&other_login.name, &migrator.name, "LoginRole"),
         (
-            other_group.name.clone(),
-            format!(
-                "the migrating role {} is neither PRAETORE_SCHEMA_OWNER ({}) nor a member of it",
-                migrator.name, other_group.name
-            ),
+            &"praetore_no_such_owner".to_owned(),
+            &migrator.name,
+            "RoleMissing",
         ),
         (
-            other_login.name.clone(),
-            format!(
-                "PRAETORE_SCHEMA_OWNER names {}, a LOGIN role other than the migrating role {}",
-                other_login.name, migrator.name
-            ),
+            &"pg_write_all_data".to_owned(),
+            &migrator.name,
+            "PredefinedRole",
         ),
-        (
-            "praetore_no_such_owner".to_owned(),
-            "names role praetore_no_such_owner, which does not exist".to_owned(),
-        ),
+        (&set_false.name, &migrator.name, "CannotSetRole"),
+        (&inherit_false.name, &migrator.name, "CannotUseRole"),
+        (&group.name, &noinherit_migrator.name, "CannotUseRole"),
     ] {
         let scratch = scratch_for_migrator();
-        let mut client = connect_scratch_as(&scratch, &migrator.name);
-        let message = praetore_replay_postgres::apply_migrations_with(&mut client, &pinned(&owner))
-            .expect_err(&owner)
-            .to_string();
-        assert!(message.contains(&expected), "{owner}: {message}");
+        scratch
+            .connect()
+            .batch_execute(&format!(
+                "GRANT CREATE ON DATABASE {} TO {}, {}, {}",
+                scratch.name, set_false.name, inherit_false.name, noinherit_migrator.name
+            ))
+            .unwrap();
+        let mut client = connect_scratch_as(&scratch, user);
+        let error = praetore_replay_postgres::apply_migrations_with(&mut client, &pinned(owner))
+            .expect_err(owner);
+        let MigrationError::SchemaOwner { problem, .. } = &error else {
+            panic!("{owner}: not a SchemaOwner error: {error}");
+        };
+        let name = match problem {
+            P::NotMember { .. } => "NotMember",
+            P::LoginRole { .. } => "LoginRole",
+            P::RoleMissing => "RoleMissing",
+            P::PredefinedRole => "PredefinedRole",
+            P::CannotSetRole { .. } => "CannotSetRole",
+            P::CannotUseRole { .. } => "CannotUseRole",
+            other => panic!("{owner}: unexpected {other:?}"),
+        };
+        assert_eq!(name, expected, "{owner}: {error}");
         let exists: bool = client
             .query_one(
                 "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'praetore')",
@@ -5266,8 +5340,81 @@ fn postgres_schema_owner_group_performs_the_first_migration() {
             .unwrap()
             .get(0);
         assert!(!exists, "{owner}: nothing was created");
-        eprintln!("refused as expected: {message}");
+        eprintln!("refused as expected: {error}");
     }
+}
+
+const RUNTIME_GROUP_ABSENT_MARKER: &str = "RUNTIME_GROUP_ABSENT_CHECKED";
+
+/// D-2: on a cluster without `praetore_runtime`, migrating as a NOLOGIN
+/// owner group without CREATEROLE is refused before migration 0001, with
+/// the step to take; once the role is pre-created, the same migration
+/// succeeds. It needs a cluster where `praetore_runtime` does not exist yet
+/// (CI runs it first, and checks the marker it prints); elsewhere it only
+/// reports that it could not run.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL on a cluster without praetore_runtime"]
+fn postgres_migrations_refuse_a_missing_runtime_group_up_front() {
+    use praetore_replay_postgres::{MigrationError, MigrationOptions};
+    let exists: bool = connect_client()
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'praetore_runtime')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    if exists {
+        eprintln!("praetore_runtime exists on this cluster: not checked");
+        return;
+    }
+    let group = TestRole::create("NOLOGIN");
+    let migrator = TestRole::create("LOGIN");
+    let scratch = ScratchDatabase::create();
+    scratch
+        .connect()
+        .batch_execute(&format!(
+            "GRANT CREATE ON DATABASE {db} TO {g}, {m}; GRANT {g} TO {m}",
+            db = scratch.name,
+            g = group.name,
+            m = migrator.name
+        ))
+        .unwrap();
+    let options = MigrationOptions {
+        schema_owner: Some(group.name.clone()),
+        ..Default::default()
+    };
+    let mut client = connect_scratch_as(&scratch, &migrator.name);
+    let error = praetore_replay_postgres::apply_migrations_with(&mut client, &options)
+        .expect_err("praetore_runtime is missing and the group cannot create it");
+    assert!(
+        matches!(&error, MigrationError::RuntimeGroupMissing { acting_role } if *acting_role == group.name),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("CREATE ROLE praetore_runtime NOLOGIN"),
+        "{error}"
+    );
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'praetore')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(!exists, "nothing was created");
+    eprintln!("refused as expected: {error}");
+    // The documented step: pre-create the role, then migrate.
+    connect_client()
+        .batch_execute(
+            "DO $$ BEGIN CREATE ROLE praetore_runtime NOLOGIN; \
+             EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+        )
+        .unwrap();
+    praetore_replay_postgres::apply_migrations_with(&mut client, &options)
+        .expect("migrates once praetore_runtime exists");
+    println!("{RUNTIME_GROUP_ABSENT_MARKER}");
 }
 
 /// M4-2: only default privileges for all schemas or for praetore count;

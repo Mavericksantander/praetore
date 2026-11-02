@@ -91,7 +91,10 @@ invocation. Keep new tests to that rule: per-test roles (`TestRole`) and
 databases (`ScratchDatabase`), and cleanup on drop. Also skip
 `postgres_apd_and_migrations_survive_restart` (a staged restart test) and
 `postgres_runtime_role_must_not_own_or_bypass_the_schema`, which must log in
-as `postgres` (see the CI job).
+as `postgres` (see the CI job). `postgres_migrations_refuse_a_missing_runtime_group_up_front`
+checks something only on a cluster where `praetore_runtime` does not exist
+yet: run it first on a fresh cluster; it prints
+`RUNTIME_GROUP_ABSENT_CHECKED` when it did (elsewhere it returns early).
 
 To refresh the standalone fuzzer lockfile when its manifest changes, run
 `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`, then audit and fuzz

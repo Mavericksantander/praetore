@@ -839,6 +839,12 @@ fn verify_runtime_role_in(
         return Err(RuntimeRoleError::TriggersDisabled(replication_role));
     }
     if let Some(expected) = &options.schema_owner {
+        if expected.starts_with("pg_") {
+            return Err(RuntimeRoleError::InvalidConfiguration(format!(
+                "{} names {expected}, a predefined role, which cannot own the praetore schema",
+                RuntimeRoleOptions::SCHEMA_OWNER_ENV
+            )));
+        }
         let actual = praetore_schema_owner(transaction)?;
         if actual.as_deref() != Some(expected.as_str()) {
             return Err(RuntimeRoleError::UnexpectedSchemaOwner {

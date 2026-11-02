@@ -226,7 +226,12 @@ inside an untrusted database cannot prove that database trustworthy.
 
 **Inside the trust perimeter.** For the privileges on the `praetore` schema,
 the **owner of the `praetore` schema and its objects, the owner of the
-database, and every superuser are trusted**. They can change any object,
+database, and every superuser are trusted**. When the owner is a NOLOGIN
+group (`PRAETORE_SCHEMA_OWNER`), the group, every member of it (the roles
+in `PRAETORE_SCHEMA_OWNER_MEMBERS`, which can `SET ROLE` to it and, for
+example, turn off forced row-level security) and the group's CREATE
+privilege on the database (which allows installing trusted extensions) are
+inside the perimeter too. They can change any object,
 row, grant or catalog entry after the checks run, or edit the system
 catalogs directly. The checks do not defend against a malicious owner or
 superuser.

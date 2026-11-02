@@ -359,25 +359,44 @@ the variable already set, so that the schema is created owned by the group):
    TO praetore_migrator`, and `GRANT CREATE ON DATABASE <db> TO
    praetore_migrator, praetore_owner` (the migrating role creates the schema
    and the scratch schemas of the structure check; the migrations, which run
-   as the group, start with `CREATE SCHEMA IF NOT EXISTS`). Do not create the
-   `praetore` schema yourself: a schema without migration records is treated
-   as a legacy baseline.
+   as the group, start with `CREATE SCHEMA IF NOT EXISTS`). Grant the
+   membership with its defaults (`WITH INHERIT TRUE, SET TRUE`), and do not
+   make the migrating role NOINHERIT: it must both `SET ROLE` to the group
+   and use its privileges. Unless the group has CREATEROLE, also create
+   `CREATE ROLE praetore_runtime NOLOGIN` (migration 0011, which runs as the
+   group, otherwise creates it). Do not create the `praetore` schema
+   yourself: a schema without migration records is treated as a legacy
+   baseline.
 2. Set `PRAETORE_SCHEMA_OWNER=praetore_owner` for the migration step and
    migrate as `praetore_migrator`. With no schema yet, the runner accepts a
    migrating role that is the named role or a member of it, provided that a
    named role other than the migrating role is NOLOGIN; it creates `praetore`
    with `AUTHORIZATION praetore_owner` and runs every migration as the group
    (`SET LOCAL ROLE`), so the schema and all its objects belong to the group.
-   Any other named role (one the migrating role is not a member of, a LOGIN
-   role, or a role that does not exist) is refused before anything is
-   created.
+   Before anything is created, the runner refuses (`MigrationError::
+   SchemaOwner`, naming the problem) a role the migrating role is not a
+   member of, a membership without SET (PostgreSQL 16+) or without INHERIT
+   (or a NOINHERIT migrating role), a LOGIN role, a role that does not
+   exist, a predefined `pg_*` role, the bootstrap superuser, and a missing
+   CREATE privilege on the database; and, if `praetore_runtime` does not
+   exist and the group cannot create it, it refuses with
+   `MigrationError::RuntimeGroupMissing` before migration 0001. The owner is
+   checked again inside the transaction that creates or adopts the schema.
 3. Set `PRAETORE_SCHEMA_OWNER=praetore_owner` and
    `PRAETORE_SCHEMA_OWNER_MEMBERS=praetore_migrator` for the gateway, the CLI
    and `praetore-observe`: the runtime check refuses any member of the owner
    that is not listed.
 
 A database already migrated without the variable keeps its owner: set the
-variable to that owner (or move ownership first, then set it).
+variable to that owner (or move ownership first, then set it). This is also
+the only case in which the bootstrap superuser may be named: a legacy schema
+it already owns. A new schema is never created under the pin for it.
+
+The owner group, each of its members (the roles in
+`PRAETORE_SCHEMA_OWNER_MEMBERS`) and the group's CREATE privilege on the
+database are inside the trust perimeter: a member can act as the owner (for
+example `SET ROLE` to the group and `ALTER TABLE ... NO FORCE ROW LEVEL
+SECURITY`), and CREATE on the database allows installing trusted extensions.
 
 A role with CREATE on the database can, since PostgreSQL 13, install a
 trusted extension (`hstore`, `citext`, `pgcrypto`, ...) into any schema,

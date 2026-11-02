@@ -6,7 +6,6 @@ use praetore_core::{
     identity::{AgentIdentity, VerifiedPublicKey},
     journal_chain::{
         ChainLink, ExpectedDatabaseHead, JournalKind, MAX_CHAIN_BYTES, verify_journal_report,
-        verify_journal_with_attesters,
     },
     policy::RecordedPolicy,
 };
@@ -500,15 +499,21 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 .transpose()?;
             let policy = policy.as_deref().map(read_policy).transpose()?;
             let attesters = read_attester_pins(&attester_pins)?;
+            // Signing key ids of the --database-journal file, reported apart
+            // from those of --journal.
+            let mut database_signed_by = None;
             let expected_database = match (&database_journal, &expected_database_head) {
                 (Some(path), _) => {
                     let text = read_limited_to(path, MAX_CHAIN_BYTES)?;
-                    let summary =
-                        verify_journal_with_attesters(&text, &attesters, None, None, None)
-                            .map_err(|error| {
-                                eprintln!("database journal: {error}");
-                                CliError { code: error.code() }
-                            })?;
+                    let database_report = verify_journal_report(
+                        &text, &attesters, None, None, None,
+                    )
+                    .map_err(|error| {
+                        eprintln!("database journal: {error}");
+                        CliError { code: error.code() }
+                    })?;
+                    let summary = database_report.summary;
+                    database_signed_by = Some(database_report.signed_by);
                     if summary.kind != JournalKind::Database {
                         eprintln!("database journal: not a database journal");
                         return Err(CliError {
@@ -544,6 +549,17 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             let chain = summary.head;
             // Which pinned key signed how many entries: with several pins,
             // entries signed by a retired key after a rotation show here.
+            details.insert(
+                "database_attester_key_ids".into(),
+                database_signed_by.map_or(serde_json::Value::Null, |signed_by| {
+                    serde_json::Value::Object(
+                        signed_by
+                            .into_iter()
+                            .map(|(key_id, entries)| (key_id, entries.into()))
+                            .collect(),
+                    )
+                }),
+            );
             details.insert(
                 "attester_key_ids".into(),
                 serde_json::Value::Object(

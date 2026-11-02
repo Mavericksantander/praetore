@@ -197,11 +197,23 @@
   `praetore` owned by the group and runs the migrations as it; any other
   named role is refused before anything is created. The installation order
   is in `docs/operations.md`. The CLI and `praetore-observe` now warn, like
-  the gateway, while the variable is unset.
+  the gateway, while the variable is unset. Before anything is created, a
+  typed `MigrationError::SchemaOwner` (`SchemaOwnerProblem`) refuses a
+  membership without SET or INHERIT (or a NOINHERIT migrating role), a
+  predefined `pg_*` role, the bootstrap superuser for a new schema, and a
+  missing CREATE privilege on the database; `MigrationError::
+  RuntimeGroupMissing` refuses, before migration 0001, when
+  `praetore_runtime` does not exist and the role running the migrations has
+  no CREATEROLE. The owner is checked again inside the transaction that
+  creates or adopts the schema. `verify_runtime_role` refuses a `pg_*`
+  value as a configuration error. **Breaking (API):** new `MigrationError`
+  variants.
 - **`praetore-verify journal` reports `attester_key_ids`** (entries per
   signing key id), and a receipt signed by a key that is not pinned fails
   with `AUTH_FAIL` naming that key id (`ChainError::UnpinnedAttesterKey`).
-  New `journal_chain::verify_journal_report` and `JournalReport`.
+  New `journal_chain::verify_journal_report` and `JournalReport`. With
+  `--database-journal`, `database_attester_key_ids` reports that file's
+  signers.
 - **Tests (B5-6 and an intermittent CI failure).** The full ignored
   PostgreSQL suite runs in parallel: the fault-injection test runs in its own
   scratch database, and cluster-wide grants of `pg_read_all_data` /
