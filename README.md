@@ -101,6 +101,10 @@ For the HighAssurance-only variant:
 cargo run -p praetore-core --example high_assurance
 ```
 
+For a guided walkthrough (three agent actions, the decision for each, the
+hash-linked evidence chain and tamper detection), run `make demo`; see
+[docs/DEMO.md](docs/DEMO.md).
+
 ---
 
 ## Install with your AI coding agent

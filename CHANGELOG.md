@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Walkthrough demo.** `make demo` (or `cargo run --locked -p praetore-core
+  --example demo`) runs three decisions of a simulated agent (allowed, denied
+  by a policy rule, outside its authority), exports the signed receipts as a
+  hash-linked chain, verifies it and rejects two altered copies; `make
+  demo-verify` re-checks the chain with `praetore-verify`. Demonstration
+  configuration only: in-memory replay guard and a fixed freshness lease with
+  no revocation source. See `docs/DEMO.md`. Runs in CI (`assurance.yml`).
+
 - **Post-hoc safety ingestion (G1, SAF-09.5).** Safety actions that an
   executor of an AI-enabled system already ran can be recorded, isolated from
   the decision path. New module `praetore_core::safety_ingest`:
