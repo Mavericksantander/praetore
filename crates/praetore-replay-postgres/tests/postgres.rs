@@ -7265,7 +7265,22 @@ mod g1_safety {
             .connect()
             .batch_execute(&format!("GRANT praetore_safety_ingest TO {}", ingest.name))
             .unwrap();
+        register(&scratch, &ingest.name, TENANT_A, &ingest_key().key_id());
         (scratch, ingest, runtime)
+    }
+
+    /// Registers (or re-registers) `role` for `tenant` and an ingestion key
+    /// id, as the schema owner does (migration 0017).
+    fn register(scratch: &ScratchDatabase, role: &str, tenant: Uuid, key_id: &str) {
+        scratch
+            .connect()
+            .execute(
+                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
+                 VALUES ($1, $2, $3) ON CONFLICT (role_name) DO UPDATE \
+                 SET tenant_id = EXCLUDED.tenant_id, ingest_key_id = EXCLUDED.ingest_key_id",
+                &[&role, &tenant, &key_id],
+            )
+            .unwrap();
     }
 
     fn event_in(epoch: u64, seq: u64) -> Vec<u8> {
@@ -7473,7 +7488,31 @@ mod g1_safety {
         let old_key = SafetyIngestKey::from_secret_bytes(&[0x35; 32]);
         let old_pin = old_key.public_key().unwrap();
         let mut old = ingestor_with(TENANT_A, old_key);
+        register(&scratch, &ingest_role.name, TENANT_A, old.key_id());
         ingest(&mut old, &mut store, &event(1, "safety:halt"));
+        // The schema owner registers the new key for the tenant; the old
+        // one can no longer write.
+        register(
+            &scratch,
+            &ingest_role.name,
+            TENANT_A,
+            &ingest_key().key_id(),
+        );
+        assert!(matches!(
+            store.check_registration(TENANT_A, Some(old.key_id())),
+            Err(praetore_replay_postgres::SafetyStoreError::Registration { .. })
+        ));
+        let refused = old
+            .prepare(&event(2, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        let error = store.store(TENANT_A, &refused).unwrap_err().to_string();
+        assert!(
+            error.contains("not signed by the ingestion key registered"),
+            "{error}"
+        );
+        store
+            .check_registration(TENANT_A, Some(&ingest_key().key_id()))
+            .unwrap();
         let new_pin = ingest_key().public_key().unwrap();
         // The key changed and the old one is not registered: fail closed.
         match store.load_heads(TENANT_A, std::slice::from_ref(&new_pin)) {
@@ -7573,31 +7612,76 @@ mod g1_safety {
             1
         );
 
-        // Row-level security: another tenant's context sees none of it and
-        // cannot write it.
+        // Row-level security follows the registered role, not the
+        // praetore.tenant_id setting (which any session can set). Tenant B
+        // has its own role and key.
+        let role_b = TestRole::create("LOGIN NOBYPASSRLS");
+        scratch
+            .connect()
+            .batch_execute(&format!("GRANT praetore_safety_ingest TO {}", role_b.name))
+            .unwrap();
+        let key_b = SafetyIngestKey::from_secret_bytes(&[0x36; 32]);
+        // One key per tenant: A's key cannot be registered for B.
+        let error = scratch
+            .connect()
+            .execute(
+                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
+                 VALUES ($1, $2, $3)",
+                &[&role_b.name, &TENANT_B, &ingest_key().key_id()],
+            )
+            .unwrap_err();
+        assert!(database_error(&error).contains("duplicate key"), "{error}");
+        register(&scratch, &role_b.name, TENANT_B, &key_b.key_id());
+        let mut store_b =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &role_b.name));
+        store_b
+            .check_registration(TENANT_B, Some(&key_b.key_id()))
+            .unwrap();
+        assert!(store_b.check_registration(TENANT_A, None).is_err());
+        let mut b = ingestor_with(TENANT_B, key_b);
+        ingest(&mut b, &mut store_b, &event(1, "safety:halt"));
+        // The report's query: A's role sets B's tenant and reads.
+        let rows: Vec<(Uuid, i64)> = {
+            let mut transaction = store.client().transaction().unwrap();
+            transaction
+                .batch_execute(&format!("SET LOCAL praetore.tenant_id = '{TENANT_B}'"))
+                .unwrap();
+            let rows = transaction
+                .query(
+                    "SELECT tenant_id, count(*) FROM praetore.safety_records GROUP BY tenant_id",
+                    &[],
+                )
+                .unwrap();
+            rows.iter().map(|row| (row.get(0), row.get(1))).collect()
+        };
+        assert_eq!(rows, [(TENANT_A, 10)], "A's role sees only A's rows");
         assert!(chain_text(store.client(), TENANT_B, "executor-1").is_empty());
-        let mut b = ingestor(TENANT_B);
-        // A first record of tenant A (chain_seq 0, so the link trigger
-        // passes) under tenant B's context: the policy's WITH CHECK refuses.
-        let genesis = ingestor(TENANT_A)
+        assert_eq!(
+            chain_text(store_b.client(), TENANT_B, "executor-1")
+                .lines()
+                .count(),
+            1
+        );
+        assert!(chain_text(store_b.client(), TENANT_A, "executor-1").is_empty());
+        // A's role cannot write B's rows, even a first record (chain_seq 0,
+        // so the link check alone would pass) signed by B's key.
+        let genesis = ingestor_with(TENANT_B, SafetyIngestKey::from_secret_bytes(&[0x36; 32]))
             .prepare(&event(1, "safety:halt"), test_now(), &mut store)
             .unwrap();
         let error = store.store(TENANT_B, &genesis).unwrap_err().to_string();
-        assert!(error.contains("row-level security"), "{error}");
-        // Any later record of A under B's context: B cannot see A's chain, so
-        // the record does not extend any chain it can see.
+        assert!(
+            error.contains("row-level security") || error.contains("registered for its tenant"),
+            "{error}"
+        );
         let mut a = resumed;
         let foreign = a
             .prepare(&event(7, "safety:halt"), test_now(), &mut store)
             .unwrap();
-        let error = store.store(TENANT_B, &foreign).unwrap_err().to_string();
-        assert!(error.contains("does not extend"), "{error}");
-        ingest(&mut b, &mut store, &event(1, "safety:halt"));
-        assert_eq!(
-            chain_text(store.client(), TENANT_B, "executor-1")
-                .lines()
-                .count(),
-            1
+        // B's role cannot extend A's chain either.
+        let error = store_b.store(TENANT_A, &foreign).unwrap_err().to_string();
+        assert!(
+            error.contains("row-level security") || error.contains("registered for its tenant"),
+            "{error}"
         );
 
         // The next record extends the chain; inserting it again is refused,

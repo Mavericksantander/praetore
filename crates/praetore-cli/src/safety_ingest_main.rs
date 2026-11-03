@@ -407,6 +407,7 @@ fn open_store(
     verify_safety_ingest_role_with(&mut client, &runtime.role_options)?;
     verify_schema_current(&mut client)?;
     let mut store = PostgresSafetyStore::from_client(client);
+    store.check_registration(ingestor.tenant_id(), Some(ingestor.key_id()))?;
     if !store.try_lock_tenant(ingestor.tenant_id())? {
         return Err(format!(
             "another praetore-safety-ingest holds the lock of tenant {}; refusing to start",
@@ -568,7 +569,8 @@ fn doctor() -> Result<()> {
                 Ok((_, heads)) => report(
                     true,
                     format!(
-                        "database role, schema and tenant lock ({} chains)",
+                        "database role, schema, tenant registration and tenant lock ({} \
+                         chains)",
                         heads.len()
                     ),
                 ),

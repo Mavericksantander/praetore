@@ -94,6 +94,15 @@ impl Scratch {
         client
             .batch_execute(&format!("GRANT praetore_safety_ingest TO {role}"))
             .unwrap();
+        // The schema owner registers the role for the tenant and key
+        // (migration 0017).
+        client
+            .execute(
+                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
+                 VALUES ($1, $2, $3)",
+                &[&role, &TENANT, &ingest_key().key_id()],
+            )
+            .unwrap();
         let ingest = with_database(&with_user(&admin_url(), &role), &database);
         Self {
             database,

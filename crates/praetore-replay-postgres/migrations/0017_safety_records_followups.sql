@@ -11,6 +11,13 @@
 --   source_seq). The column is the signed field (NULL on the unattributed
 --   chain). Records of schema version 1 (no epoch) are not readable by this
 --   version: export them before upgrading (docs/operations.md).
+-- * tenant registry: row-level security on safety_records no longer reads
+--   the praetore.tenant_id setting (any session can set it). Each tenant's
+--   ingester has its own login role, registered by the schema owner in
+--   praetore.safety_ingest_tenants with the tenant and the id of its
+--   ingestion key; a role sees and inserts only its registered tenant's
+--   rows, and only records signed by the registered key. A tenant has one
+--   role and one key, and a key belongs to one tenant.
 --
 -- Forward-only, applied inside the runner's transaction (no BEGIN/COMMIT
 -- here). docs/operations.md has the manual rollback of 0016 and 0017.
@@ -24,6 +31,36 @@ DROP INDEX praetore.safety_records_source_seq;
 CREATE INDEX safety_records_source_seq
     ON praetore.safety_records (tenant_id, chain, source_epoch, source_seq)
     WHERE source_seq IS NOT NULL;
+
+CREATE TABLE praetore.safety_ingest_tenants (
+    role_name NAME PRIMARY KEY,
+    tenant_id UUID NOT NULL UNIQUE,
+    ingest_key_id CHAR(64) NOT NULL UNIQUE CHECK (ingest_key_id ~ '^[0-9a-f]{64}$'),
+    registered_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+REVOKE ALL ON TABLE praetore.safety_ingest_tenants FROM PUBLIC;
+
+-- An ingest role reads only its own registration: the login role of the
+-- session (session_user, which SET ROLE does not change). Not forced, so
+-- the owner manages every row.
+ALTER TABLE praetore.safety_ingest_tenants ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own_registration ON praetore.safety_ingest_tenants
+FOR SELECT
+USING (role_name OPERATOR(pg_catalog.=) SESSION_USER);
+
+GRANT SELECT ON praetore.safety_ingest_tenants TO praetore_safety_ingest;
+
+DROP POLICY tenant_isolation ON praetore.safety_records;
+CREATE POLICY registered_tenant ON praetore.safety_records
+USING (
+    tenant_id = (SELECT t.tenant_id FROM praetore.safety_ingest_tenants t
+                 WHERE t.role_name OPERATOR(pg_catalog.=) SESSION_USER)
+)
+WITH CHECK (
+    tenant_id = (SELECT t.tenant_id FROM praetore.safety_ingest_tenants t
+                 WHERE t.role_name OPERATOR(pg_catalog.=) SESSION_USER)
+);
 
 CREATE OR REPLACE FUNCTION praetore.check_safety_record_link()
 RETURNS TRIGGER
@@ -47,6 +84,12 @@ BEGIN
        OR COALESCE((body->>'high_water')::BIGINT, 0) IS DISTINCT FROM NEW.high_water
        OR (body->>'source_epoch')::BIGINT IS DISTINCT FROM NEW.source_epoch THEN
         RAISE EXCEPTION 'safety record columns do not match record_json';
+    END IF;
+    IF body->>'key_id' IS DISTINCT FROM
+       (SELECT t.ingest_key_id::TEXT FROM praetore.safety_ingest_tenants t
+        WHERE t.role_name OPERATOR(pg_catalog.=) SESSION_USER
+          AND t.tenant_id = NEW.tenant_id) THEN
+        RAISE EXCEPTION 'safety record is not signed by the ingestion key registered for its tenant';
     END IF;
     IF NEW.chain_seq = 0 THEN
         IF NEW.prev_record_hash::TEXT <> repeat('0', 64) THEN

@@ -174,22 +174,27 @@ pub fn run(args: SafetyExportArgs) -> CliResult<()> {
     };
     let connector = praetore_replay_postgres::DatabaseConnector::from_url(&database_url()?)?
         .connect_timeout(std::time::Duration::from_secs(3));
-    let mut client = connector.connect()?;
+    // Row-level security shows only the rows of the tenant the role is
+    // registered for: say so instead of exporting an empty chain.
+    let mut store =
+        praetore_replay_postgres::PostgresSafetyStore::from_client(connector.connect()?);
+    store.check_registration(args.tenant_id, None)?;
+    let client = store.client();
     let (anchor, records, next_from_seq) = match args.range {
         None => (
             None,
-            praetore_replay_postgres::read_safety_chain(&mut client, args.tenant_id, &args.chain)
+            praetore_replay_postgres::read_safety_chain(client, args.tenant_id, &args.chain)
                 .map_err(|error| match error {
-                praetore_replay_postgres::SafetyStoreError::TooLarge => {
-                    format!("{error}: export it in ranges with --from-seq 0 [--limit N]").into()
-                }
-                error => Box::<dyn std::error::Error>::from(error),
-            })?,
+                    praetore_replay_postgres::SafetyStoreError::TooLarge => {
+                        format!("{error}: export it in ranges with --from-seq 0 [--limit N]").into()
+                    }
+                    error => Box::<dyn std::error::Error>::from(error),
+                })?,
             None,
         ),
         Some((from_seq, limit)) => {
             let range = praetore_replay_postgres::read_safety_chain_range(
-                &mut client,
+                client,
                 args.tenant_id,
                 &args.chain,
                 from_seq,

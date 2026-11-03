@@ -4,8 +4,10 @@
 //! Used by `praetore-safety-ingest`, with its own login role (a member of
 //! `praetore_safety_ingest`, checked by
 //! [`crate::verify_safety_ingest_role_with`]), and by `praetore
-//! journal-export --safety`. Every transaction sets the tenant context, so
-//! the `tenant_isolation` policy applies as for the journal tables.
+//! journal-export --safety`. Row-level security (migration 0017) shows a
+//! session only the rows of the tenant its login role is registered for in
+//! `praetore.safety_ingest_tenants`; [`PostgresSafetyStore::check_registration`]
+//! checks that registration before anything is read or written.
 
 use std::collections::BTreeMap;
 
@@ -44,6 +46,14 @@ pub enum SafetyStoreError {
     },
     /// Too many records for one export.
     TooLarge,
+    /// The login role is not registered in `praetore.safety_ingest_tenants`,
+    /// or is registered for another tenant or ingestion key.
+    Registration {
+        role: String,
+        expected_tenant: Uuid,
+        expected_key_id: Option<String>,
+        found: Option<(Uuid, String)>,
+    },
 }
 
 impl std::fmt::Display for SafetyStoreError {
@@ -71,6 +81,32 @@ impl std::fmt::Display for SafetyStoreError {
                  (PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE); refusing to continue the chain"
             ),
             Self::TooLarge => write!(f, "too many safety records for one export"),
+            Self::Registration {
+                role,
+                expected_tenant,
+                expected_key_id,
+                found,
+            } => {
+                let key = expected_key_id.as_deref().unwrap_or("<ingestion key id>");
+                match found {
+                    None => write!(
+                        f,
+                        "database role {role} is not registered for safety ingestion; the \
+                         schema owner registers it once: INSERT INTO \
+                         praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
+                         VALUES ('{role}', '{expected_tenant}', '{key}')"
+                    ),
+                    Some((tenant, key_id)) => write!(
+                        f,
+                        "database role {role} is registered for tenant {tenant} with ingestion \
+                         key {key_id}, not for tenant {expected_tenant}{}; refusing to start",
+                        expected_key_id
+                            .as_deref()
+                            .map(|key| format!(" with key {key}"))
+                            .unwrap_or_default()
+                    ),
+                }
+            }
         }
     }
 }
@@ -103,6 +139,47 @@ impl PostgresSafetyStore {
 
     pub fn client(&mut self) -> &mut Client {
         &mut self.client
+    }
+
+    /// Checks that the session's login role is registered for `tenant_id`
+    /// (and, with `key_id`, for that ingestion key id) in
+    /// `praetore.safety_ingest_tenants`. Row-level security shows and
+    /// accepts only that tenant's rows, and the insert trigger only records
+    /// signed by that key, so a mismatch would otherwise show up as an empty
+    /// chain or a refused insert.
+    pub fn check_registration(
+        &mut self,
+        tenant_id: Uuid,
+        key_id: Option<&str>,
+    ) -> Result<(), SafetyStoreError> {
+        let row = self.client.query_one(
+            "SELECT SESSION_USER::pg_catalog.text, t.tenant_id, \
+                    t.ingest_key_id::pg_catalog.text \
+             FROM (SELECT 1) one \
+             LEFT JOIN praetore.safety_ingest_tenants t \
+               ON t.role_name OPERATOR(pg_catalog.=) SESSION_USER",
+            &[],
+        )?;
+        let role: String = row.get(0);
+        let found = match (
+            row.get::<_, Option<Uuid>>(1),
+            row.get::<_, Option<String>>(2),
+        ) {
+            (Some(tenant), Some(key)) => Some((tenant, key)),
+            _ => None,
+        };
+        let matches = found.as_ref().is_some_and(|(tenant, key)| {
+            *tenant == tenant_id && key_id.is_none_or(|expected| expected == key)
+        });
+        if matches {
+            return Ok(());
+        }
+        Err(SafetyStoreError::Registration {
+            role,
+            expected_tenant: tenant_id,
+            expected_key_id: key_id.map(str::to_owned),
+            found,
+        })
     }
 
     /// Takes the session advisory lock of `tenant_id`'s safety chains, so

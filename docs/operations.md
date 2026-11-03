@@ -562,17 +562,38 @@ Migration 0016 grants the NOLOGIN group `praetore_safety_ingest`:
 | schema `praetore` | `USAGE` |
 | `schema_migrations` | `SELECT` (startup schema check) |
 | `safety_records` | `SELECT`, `INSERT` |
+| `safety_ingest_tenants` | `SELECT` (migration 0017; row-level security shows only its own row) |
 
-Create the ingester's login role as a member of that group only, for
-example `CREATE ROLE praetore_safety LOGIN PASSWORD '...' IN ROLE
-praetore_safety_ingest;`. `verify_safety_ingest_role_with` refuses, at
+Create one login role per tenant, each a member of that group only, for
+example `CREATE ROLE praetore_safety_t1 LOGIN PASSWORD '...' IN ROLE
+praetore_safety_ingest;`, and register it as the schema owner with its
+tenant and the id of its ingestion key (`praetore-safety-ingest doctor`
+prints the key id, and the exact statement when the role is not
+registered):
+
+```sql
+INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id)
+VALUES ('praetore_safety_t1', '<tenant uuid>', '<ingestion key id>');
+```
+
+Row-level security on `safety_records` shows and accepts only the rows of
+the tenant the session's login role (`session_user`) is registered for; the
+`praetore.tenant_id` setting no longer matters for this table. The insert
+trigger accepts only records signed by the registered key. A tenant has one
+role and one key, and a key is registered for one tenant: registering one
+key for two tenants is refused. The ingester and `praetore journal-export
+--safety` check the registration before reading or writing and refuse a
+role registered for another tenant (or, for the ingester, another key).
+When rotating the ingestion key, update the row first (`UPDATE
+praetore.safety_ingest_tenants SET ingest_key_id = '<new key id>' WHERE
+role_name = '...'`), then restart the ingester with the new key. `verify_safety_ingest_role_with` refuses, at
 startup, a role that is privileged, owns or can create in `praetore`, is a
 member of `praetore_runtime`, or holds any privilege on another `praetore`
 table (column privileges included), plus the database-wide checks of the
 runtime role. The gateway's runtime role gets nothing on `safety_records`,
-and `verify_runtime_role` refuses one that can insert into it. Exports read
-with any role that may select from the table, for example the ingester's
-(`PRAETORE_SAFETY_DATABASE_URL`).
+and `verify_runtime_role` refuses one that can insert into it. Export with
+the tenant's registered role (`PRAETORE_SAFETY_DATABASE_URL`); any other
+role sees no rows.
 
 ### Keys
 
@@ -591,8 +612,8 @@ remove its pin, restart the ingester and treat that source's later records
 as untrusted. After rotating the ingestion key, records keep the old key's
 signature (the table is append-only): pin both keys when exporting and
 verifying (`--ingest-pin` is repeatable). To rotate, list the old public
-key in `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` (one 64-hex key per line)
-and start the ingester with the new key: each chain continues under the new
+key in `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` (one 64-hex key per line),
+update the tenant's `safety_ingest_tenants` row to the new key id, and start the ingester with the new key: each chain continues under the new
 key, and the ingester logs every chain whose last record the previous key
 signed. A chain whose last record is signed by a key that is neither the
 current one nor listed there makes the ingester refuse to start: a key
