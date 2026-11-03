@@ -1,11 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 - 2026-11-03
 
-- **Post-hoc safety ingestion: format 2 and hardening (G1 follow-ups).**
-  Changes the unreleased G1 format and behavior; records written by an
-  earlier build of `main` (format 1) cannot be read and must be exported and
-  removed first (`docs/operations.md`, "Source epochs").
+Post-hoc ingestion of safety actions that executors of AI-enabled systems
+already ran (G1, format 2: #92, #94, #95; migrations 0016 to 0018), the
+safety namespace manifest (G2), mission safety classes in policies (G7,
+policy format 2), HighAssurance receipts in the Claude Code hook example,
+the walkthrough demo, and the v0.3.1 follow-ups. GitHub release with
+checksums only; nothing is published to crates.io.
+
+### Known limitations (planned for v0.3.3)
+
+- **R7: any role of the database can take a tenant's ingestion lock.** The
+  per-tenant PostgreSQL advisory lock needs no privilege, so a session of
+  another tenant's ingester, of the gateway or of any other login can hold
+  it and keep that tenant's `praetore-safety-ingest` from starting (denial
+  of service; it cannot read or write the tenant's records). The refusal
+  and `praetore-safety-ingest doctor` name the holding session
+  (`docs/operations.md`, "Deployment").
+- **L95-1: a group-writable socket directory.** With
+  `PRAETORE_SAFETY_SOCKET_GROUP` the socket's parent directory may be
+  writable by that group. A member of the group can then remove or replace
+  the socket (executors would report to another process, and those events
+  would be lost; it cannot sign records) or entries the ingester creates
+  there at startup (which then fails). By replacing the temporary entry
+  the ingester binds in (`.bind-<pid>`) with a symbolic link, a member can
+  also make the `chmod`/`chown` of that startup apply to another file of the
+  ingester's user, for example its signing key (which would then be
+  readable by the group). Give the directory the sticky bit (`chmod 1770`)
+  or keep it writable by the ingester's user only (`docs/operations.md`,
+  "Deployment").
+
+### Changes
+
+- **Post-hoc safety ingestion: format 2 and hardening (G1 follow-ups, #94,
+  #95).** Changes the G1 format of #92 before its first release; records
+  written by an earlier build of `main` (format 1) cannot be read and must
+  be exported and removed first (`docs/operations.md`, "Source epochs").
   - Format 2: every event signs `source_epoch`, the source's run (persisted
     by `praetore_safety_client::EpochFile`, which fails closed instead of
     starting again from 1); `source_seq` starts at 1 in each epoch and a
@@ -74,7 +105,7 @@
   configuration only: in-memory replay guard and a fixed freshness lease with
   no revocation source. See `docs/DEMO.md`. Runs in CI (`assurance.yml`).
 
-- **Post-hoc safety ingestion (G1, SAF-09.5).** Safety actions that an
+- **Post-hoc safety ingestion (G1, SAF-09.5, #92).** Safety actions that an
   executor of an AI-enabled system already ran can be recorded, isolated from
   the decision path. New module `praetore_core::safety_ingest`:
   `SafetyEvent` (signed by a `SafetySourceKey` under
@@ -435,7 +466,7 @@
   (`RuntimeRoleError::UnexpectedSchemaOwner`) and migrating refuse another
   owner (and, before the schema exists, another migrating role). Read by the
   gateway, the CLI and `praetore-observe`; the gateway warns while it is
-  unset. Set it in production. New `RuntimeRoleOptions::with_schema_owner`
+  unset. Set it in every deployment. New `RuntimeRoleOptions::with_schema_owner`
   and `MigrationOptions::schema_owner` (a new public field).
 - **Docs (B5-3).** `docs/operations.md` now says that an allowlisted event
   trigger runs with the privileges of the role executing the migration DDL

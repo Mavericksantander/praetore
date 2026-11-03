@@ -523,6 +523,17 @@ record shows and what it does not, and
   `application_name` and start time, from `pg_locks` and
   `pg_stat_activity`). Stop it with `SELECT pg_terminate_backend(<pid>)` as
   a role allowed to, and find out why that role took the lock.
+- **Known limitation (until v0.3.3): a group-writable socket directory.**
+  With `PRAETORE_SAFETY_SOCKET_GROUP` the directory may be writable by that
+  group, and a member can then remove or replace the socket (executors
+  would report to another process and those events would be lost; it cannot
+  sign records) or the entries the ingester creates there at startup. By
+  replacing the temporary entry the ingester binds in (`.bind-<pid>`) with a
+  symbolic link, a member can also make the `chmod`/`chown` of that startup
+  apply to another file of the ingester's user, for example its signing key
+  (which would then be readable by the group). Give the directory the sticky
+  bit (`chmod 1770`), so that only the owner of an entry can remove or rename
+  it, or keep it writable by the ingester's user only.
 - Give it its own OS user. The socket directory must be owned by that user
   and not writable by others; the socket is created `0600`, or `0660` with
   `PRAETORE_SAFETY_SOCKET_GROUP=<gid>` for executors in that group (then the
