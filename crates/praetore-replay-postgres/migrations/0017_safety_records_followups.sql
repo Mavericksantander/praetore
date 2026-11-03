@@ -18,6 +18,8 @@
 --   ingestion key; a role sees and inserts only its registered tenant's
 --   rows, and only records signed by the registered key. A tenant has one
 --   role and one key, and a key belongs to one tenant.
+-- * record_id is unique per tenant, not across tenants: a global constraint
+--   would tell one tenant's role whether another tenant holds a record_id.
 --
 -- Forward-only, applied inside the runner's transaction (no BEGIN/COMMIT
 -- here). docs/operations.md has the manual rollback of 0016 and 0017.
@@ -26,6 +28,10 @@ ALTER TABLE praetore.safety_records
     ADD COLUMN source_epoch BIGINT CHECK (source_epoch >= 1),
     ADD CONSTRAINT safety_records_epoch_per_chain
         CHECK ((source_epoch IS NULL) = (chain = '_unattributed')) NOT VALID;
+
+ALTER TABLE praetore.safety_records
+    DROP CONSTRAINT safety_records_record_id_key,
+    ADD CONSTRAINT safety_records_tenant_record_id UNIQUE (tenant_id, record_id);
 
 DROP INDEX praetore.safety_records_source_seq;
 CREATE INDEX safety_records_source_seq

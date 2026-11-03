@@ -7166,7 +7166,7 @@ mod g1_safety {
         ActionClass, SafetyNamespaceKey, SafetyNamespaceManifest,
         safety_ingest::{
             IngestorConfig, PreparedRecords, SafetyEventDraft, SafetyIngestKey, SafetyIngestor,
-            SafetySourceKey, SourcePins, verify_safety_chain,
+            SafetyRecord, SafetySourceKey, SourcePins, verify_safety_chain,
         },
     };
     use praetore_replay_postgres::{
@@ -7667,6 +7667,27 @@ mod g1_safety {
             1
         );
         assert!(chain_text(store_b.client(), TENANT_A, "executor-1").is_empty());
+        // record_id is unique per tenant: B may hold a record_id that A
+        // holds (and learns nothing about A from inserting it).
+        let a_record_id = SafetyRecord::from_json(
+            chain_text(store.client(), TENANT_A, "executor-1")
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap()
+        .payload()
+        .record_id;
+        let mut same_id = b
+            .prepare(&event(2, "safety:halt"), test_now(), &mut store_b)
+            .unwrap();
+        let mut payload = same_id.records[0].payload().clone();
+        payload.record_id = a_record_id;
+        same_id.records[0] = SafetyIngestKey::from_secret_bytes(&[0x36; 32])
+            .sign_record(payload)
+            .unwrap();
+        store_b.store(TENANT_B, &same_id).unwrap();
+        b.commit(&same_id);
         // A's role cannot write B's rows, even a first record (chain_seq 0,
         // so the link check alone would pass) signed by B's key.
         let genesis = ingestor_with(TENANT_B, SafetyIngestKey::from_secret_bytes(&[0x36; 32]))
