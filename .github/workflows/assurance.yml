@@ -59,8 +59,8 @@ jobs:
           run "test result: ok\. 5 passed" \
             cargo test --locked -p praetore-safety-client --test nonblocking -- --nocapture
           run "test result: ok\. 2 passed" cargo test --locked -p praetore-cli --bin praetore-safety-ingest -- --skip secret_file::
-          run "test result: ok\. 1 passed" cargo test --locked -p praetore-cli --bin praetore safety_export
-          run "test result: ok\. 2 passed" cargo test --locked -p praetore-verify --test safety_journal_cli
+          run "test result: ok\. 2 passed" cargo test --locked -p praetore-cli --bin praetore safety_export
+          run "test result: ok\. 3 passed" cargo test --locked -p praetore-verify --test safety_journal_cli
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"
