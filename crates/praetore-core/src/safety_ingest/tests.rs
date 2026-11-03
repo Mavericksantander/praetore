@@ -972,3 +972,45 @@ fn an_event_far_from_the_ingester_clock_is_marked_with_its_skew() {
         future[0].record_hash()
     );
 }
+
+#[test]
+fn the_high_water_is_signed_and_checked_by_the_verifier() {
+    let mut harness = Harness::new();
+    harness.ingest(&wire(&event(1, "safety:halt")));
+    let records = harness.ingest(&wire(&event(4, "safety:halt")));
+    assert_eq!(records[0].payload().high_water, Some(3));
+    assert_eq!(records[1].payload().high_water, Some(4));
+    assert_eq!(records[1].next_head().high_water, 4);
+    // Unattributed records carry none.
+    let rejected = harness.ingest(b"garbage");
+    assert_eq!(rejected[0].payload().high_water, None);
+    // A record re-signed with another high_water (the ingestion key is
+    // honest about the signature, not about the value) fails verification.
+    let mut lines = lines(harness.chain("executor-1"));
+    let mut payload = records[1].payload().clone();
+    payload.high_water = Some(9);
+    lines[2] = ingest_key()
+        .sign_record(payload)
+        .unwrap()
+        .to_json()
+        .unwrap()
+        + "
+";
+    let text = lines.concat();
+    let result = verify_safety_chain(&text, &[ingest_pin()], None, None);
+    assert!(
+        matches!(
+            result,
+            Err(SafetyChainError::SequenceInconsistent { line: 2, .. })
+        ),
+        "{result:?}"
+    );
+    // A source-chain record without one, or an unattributed one with one,
+    // is not a valid record.
+    let mut missing = records[1].payload().clone();
+    missing.high_water = None;
+    assert!(ingest_key().sign_record(missing).is_err());
+    let mut extra = rejected[0].payload().clone();
+    extra.high_water = Some(0);
+    assert!(ingest_key().sign_record(extra).is_err());
+}

@@ -72,7 +72,14 @@ Cada registro es el JSON canónico (claves ordenadas, sin espacios) de un
 objeto con `schema_version` (1), `record_id`, `tenant_id`, `chain`,
 `chain_seq`, `prev_record_hash`, `recorded_at` (RFC 3339 UTC, reloj del
 ingestor), `status`, `key_id` (la llave de ingesta), `record_hash`,
-`signature` y los campos opcionales que exige su `status` (abajo). El payload
+`signature` y los campos opcionales que exige su `status` (abajo). En una
+cadena de fuente, cada registro firma además `high_water`: el high-water de
+`source_seq` después de él. El ingester reanuda desde ese valor firmado (la
+columna `high_water` de la tabla debe coincidir; lo exige el trigger) y el
+verificador comprueba que coincide con el que calcula. En `_unattributed` no
+va. Un evento verificado con `occurred_at` a más de
+`PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` del reloj del ingester lleva
+`clock_skew_seconds` (`occurred_at - recorded_at`). El payload
 es todo salvo `record_hash` y `signature`, en JSON canónico; `record_hash =
 hex(SHA-256("PRAETORE_SAFETY_RECORD_V1\0" || payload))` y `signature =
 hex(Ed25519("PRAETORE_SAFETY_RECORD_V1\0" || payload))`. Cualquier otra

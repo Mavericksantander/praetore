@@ -3095,7 +3095,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0013_dispatch_refused",
             "0014_closed_execution_row_lock",
             "0015_storage_records",
-            "0016_safety_records"
+            "0016_safety_records",
+            "0017_safety_records_followups"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -6915,7 +6916,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
         vec![
             "0014_closed_execution_row_lock",
             "0015_storage_records",
-            "0016_safety_records"
+            "0016_safety_records",
+            "0017_safety_records_followups"
         ]
     );
     assert!(again.is_empty());
@@ -7263,6 +7265,32 @@ mod g1_safety {
             .batch_execute(&format!("GRANT praetore_safety_ingest TO {}", ingest.name))
             .unwrap();
         (scratch, ingest, runtime)
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_high_water_column_must_equal_the_signed_value() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut ingestor = ingestor(TENANT_A);
+        ingest(&mut ingestor, &mut store, &event(1, "safety:halt"));
+        let mut prepared = ingestor
+            .prepare(&event(2, "safety:halt"), test_now(), &mut store)
+            .unwrap();
+        assert_eq!(prepared.high_waters, vec![2]);
+        // A forged column (the ingester would resume from it) is refused.
+        prepared.high_waters = vec![1000];
+        let error = store.store(TENANT_A, &prepared).unwrap_err().to_string();
+        assert!(error.contains("do not match record_json"), "{error}");
+        prepared.high_waters = vec![2];
+        store.store(TENANT_A, &prepared).unwrap();
+        ingestor.commit(&prepared);
+        let pin = ingest_key().public_key().unwrap();
+        let heads = store
+            .load_heads(TENANT_A, std::slice::from_ref(&pin))
+            .unwrap();
+        assert_eq!(heads["executor-1"].head.high_water, 2);
     }
 
     #[test]

@@ -162,17 +162,18 @@ impl PostgresSafetyStore {
             if record.verify(ingest_pins).is_err() {
                 return Err(SafetyStoreError::HeadSignature { chain });
             }
-            heads.insert(
-                chain,
-                StoredHead {
-                    head: ChainHead {
-                        next_chain_seq: record.payload().chain_seq + 1,
-                        prev_record_hash: record.record_hash().to_owned(),
-                        high_water: high_water as u64,
-                    },
-                    key_id,
-                },
-            );
+            // The head comes from the signed record; the column is only an
+            // index and must agree with it.
+            let head = record.next_head();
+            if head.high_water != high_water as u64 {
+                return Err(SafetyStoreError::Record {
+                    chain,
+                    error: SafetyRecordError::Invalid(
+                        "the high_water column differs from the signed high_water".into(),
+                    ),
+                });
+            }
+            heads.insert(chain, StoredHead { head, key_id });
         }
         Ok(heads)
     }

@@ -862,6 +862,12 @@ pub struct SafetyRecordPayload {
     /// by the source's clock).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_skew_seconds: Option<i64>,
+    /// On a source chain: the `source_seq` high-water mark after this
+    /// record (every `source_seq` up to it is an event or covered by a loss
+    /// record). Signed, so an ingester resumes from the last signed record
+    /// and not from an unsigned column. Absent on the unattributed chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_water: Option<u64>,
     /// The ingestion key id.
     pub key_id: String,
 }
@@ -898,6 +904,21 @@ fn invalid(message: impl Into<String>) -> SafetyRecordError {
 }
 
 impl SafetyRecordPayload {
+    /// The high-water mark after a record of this status on a source chain,
+    /// given the one before it.
+    fn high_water_after(&self, previous: u64) -> u64 {
+        match self.status {
+            SafetyRecordStatus::Accepted
+            | SafetyRecordStatus::Undeclared
+            | SafetyRecordStatus::InvalidName => self
+                .event
+                .as_ref()
+                .map_or(previous, |event| event.source_seq),
+            SafetyRecordStatus::Loss => self.lost_to.unwrap_or(previous),
+            _ => previous,
+        }
+    }
+
     fn canonical_bytes(&self) -> Result<Vec<u8>, SafetyRecordError> {
         canonical_json(self).map_err(|error| invalid(format!("cannot encode: {error}")))
     }
@@ -935,6 +956,11 @@ impl SafetyRecordPayload {
             return Err(invalid("detail is not bounded escaped text"));
         }
         let unattributed = self.chain == UNATTRIBUTED_CHAIN;
+        match self.high_water {
+            None if unattributed => {}
+            Some(high_water) if !unattributed && high_water <= MAX_SAFE_INTEGER => {}
+            _ => return Err(invalid("wrong high_water for the chain")),
+        }
         let has = |present: bool, field: &str| -> Result<(), SafetyRecordError> {
             if present {
                 Ok(())
@@ -1190,23 +1216,13 @@ impl SafetyRecord {
     }
 
     /// The chain position after this record: what the next record of the
-    /// chain links to, and the `source_seq` high-water mark.
-    fn next_head(&self, previous_high_water: u64) -> ChainHead {
-        let payload = &self.payload;
-        let high_water = match payload.status {
-            SafetyRecordStatus::Accepted
-            | SafetyRecordStatus::Undeclared
-            | SafetyRecordStatus::InvalidName => payload
-                .event
-                .as_ref()
-                .map_or(previous_high_water, |event| event.source_seq),
-            SafetyRecordStatus::Loss => payload.lost_to.unwrap_or(previous_high_water),
-            _ => previous_high_water,
-        };
+    /// chain links to, and the signed `source_seq` high-water mark (0 on the
+    /// unattributed chain).
+    pub fn next_head(&self) -> ChainHead {
         ChainHead {
-            next_chain_seq: payload.chain_seq + 1,
+            next_chain_seq: self.payload.chain_seq + 1,
             prev_record_hash: self.record_hash.clone(),
-            high_water,
+            high_water: self.payload.high_water.unwrap_or(0),
         }
     }
 }
@@ -1235,9 +1251,9 @@ impl Default for ChainHead {
 }
 
 impl ChainHead {
-    /// The head after `record`, given the head before it.
+    /// The head after `record`.
     pub fn after(&self, record: &SafetyRecord) -> Self {
-        record.next_head(self.high_water)
+        record.next_head()
     }
 }
 
@@ -1495,6 +1511,7 @@ impl SafetyIngestor {
             dropped: None,
             raw: None,
             clock_skew_seconds: None,
+            high_water: None,
             key_id: self.key_id.clone(),
         }
     }
@@ -1514,6 +1531,8 @@ impl SafetyIngestor {
         for mut payload in payloads {
             payload.chain_seq = head.next_chain_seq;
             payload.prev_record_hash = head.prev_record_hash.clone();
+            payload.high_water =
+                (chain != UNATTRIBUTED_CHAIN).then(|| payload.high_water_after(head.high_water));
             let record = self.key.sign_record(payload)?;
             head = head.after(&record);
             high_waters.push(head.high_water);
@@ -2105,6 +2124,12 @@ pub fn verify_safety_chain(
                     counts.conflict += 1;
                 }
             }
+        }
+        if !unattributed && payload.high_water != Some(high_water) {
+            return Err(inconsistent(format!(
+                "the signed high_water is {:?}, not {high_water}",
+                payload.high_water
+            )));
         }
         *summary.signed_by.entry(payload.key_id.clone()).or_default() += 1;
         summary.entries += 1;
