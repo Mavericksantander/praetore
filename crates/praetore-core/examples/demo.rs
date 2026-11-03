@@ -46,6 +46,14 @@ type DemoResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 const AUDIENCE: &str = "demo-gateway";
 const REFUND_LIMIT_CLP: u64 = 500_000;
+const OUTPUT_FILES: [&str; 6] = [
+    "journal.jsonl",
+    "journal-tampered.jsonl",
+    "journal-relinked.jsonl",
+    "attester-public-key.hex",
+    "policy.json",
+    "expected-head.txt",
+];
 
 /// In-memory replay guard: rejects a reused request id within this process.
 /// Not durable across restarts. Production deployments use the Postgres
@@ -163,8 +171,7 @@ fn attempts() -> DemoResult<Vec<Attempt>> {
         Attempt {
             label: "2",
             description: format!(
-                "reembolsar 2.500.000 CLP (límite de la política: {} CLP)",
-                "500.000"
+                "reembolsar 2500000 CLP (límite de la política: {REFUND_LIMIT_CLP} CLP)"
             ),
             action: Action::new(
                 "create_refund",
@@ -231,6 +238,14 @@ fn main() -> DemoResult<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/praetore-demo"));
     fs::create_dir_all(&out_dir)?;
+    // Remove outputs of an earlier run so a failed run never leaves a mix of
+    // files signed with different keys.
+    for name in OUTPUT_FILES {
+        match fs::remove_file(out_dir.join(name)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+    }
 
     println!("PRÆTORE: demo del kernel de autorización determinista");
     println!();
@@ -239,6 +254,8 @@ fn main() -> DemoResult<()> {
     println!("  - Frescura con lease fijo de 1 minuto y SIN fuente de revocación:");
     println!("    una llave o autoridad revocada seguiría siendo aceptada.");
     println!("  - Llaves generadas al vuelo; los hashes cambian en cada ejecución.");
+    println!("  - El head esperado lo produce este mismo proceso. Solo prueba algo si");
+    println!("    se ancla fuera del control del productor (ver alteración C).");
 
     // --- Setup: issuer, agent, authority, policy, attester. ---------------
     let now = SystemClock.now();
@@ -273,10 +290,12 @@ fn main() -> DemoResult<()> {
     );
     println!(
         "Política `demo-payments-policy` v1 (digest {}…):",
-        &policy_digest[..16]
+        short(&policy_digest)
     );
     println!("  - allow-read-accounts     read_account          requiere accounts:read");
-    println!("  - deny-refund-over-limit  create_refund         si amount_clp > 500000");
+    println!(
+        "  - deny-refund-over-limit  create_refund         si amount_clp > {REFUND_LIMIT_CLP}"
+    );
     println!("  - allow-refunds           create_refund         requiere refunds:create");
     println!("  - allow-customer-export   export_customer_data  requiere customers:export");
 
@@ -354,7 +373,7 @@ fn main() -> DemoResult<()> {
             .unwrap_or_default();
         println!(
             "  seq {index}  prev {}…  {:<5}  {}",
-            &prev[..16],
+            short(prev),
             outcome,
             entry["evidence"]["action"]["action_type"]
                 .as_str()
@@ -399,12 +418,39 @@ fn main() -> DemoResult<()> {
         .ok_or("la eliminación del recibo 2 no fue detectada")?;
     println!("  Alteración B: se borra el recibo 2 de la cadena.");
     println!("    -> RECHAZADA [{}]: {error}", error.code());
+
+    // C: delete receipt 2 and rebuild the links over the remaining receipts.
+    // The link is an unkeyed SHA-256, so anyone can do this; only the
+    // expected head catches it.
+    let mut relinker = ChainExporter::new(&attester_public_key);
+    relinker.push(&receipts[0])?;
+    relinker.push(&receipts[2])?;
+    let (relinked, _) = relinker.finish()?;
+    let without_head = verify_chain(&relinked, &attester_public_key, None, None);
+    check(
+        without_head.is_ok(),
+        "la cadena re-enlazada debería verificar sin head esperado",
+    )?;
+    let error = verify_chain(&relinked, &attester_public_key, None, Some(&head.head))
+        .err()
+        .ok_or("la cadena re-enlazada no fue detectada con el head esperado")?;
+    println!("  Alteración C: se borra el recibo 2 y se recalculan todos los enlaces.");
+    println!("    -> sin head esperado: la cadena VERIFICA (los enlaces no llevan llave).");
+    println!(
+        "    -> con head esperado: RECHAZADA [{}]: {error}",
+        error.code()
+    );
+    println!("    Por eso el head debe anclarse fuera del control de quien produce la");
+    println!("    cadena. Esta demo no lo ancla.");
     let tampered_path = out_dir.join("journal-tampered.jsonl");
     fs::write(&tampered_path, &tampered_outcome)?;
+    let relinked_path = out_dir.join("journal-relinked.jsonl");
+    fs::write(&relinked_path, &relinked)?;
 
     section("Archivos para verificar con un binario independiente");
     println!("  {}", chain_path.display());
     println!("  {}", tampered_path.display());
+    println!("  {}", relinked_path.display());
     println!("  {}", pin_path.display());
     println!("  {}", policy_path.display());
     println!("  {}", head_path.display());
@@ -415,8 +461,15 @@ fn main() -> DemoResult<()> {
     println!("    --policy {} \\", policy_path.display());
     println!("    --expected-head \"$(cat {})\"", head_path.display());
     println!();
-    println!("Demo completa: 3 decisiones, cadena verificada, 2 alteraciones detectadas.");
+    println!(
+        "Demo completa: 3 decisiones, cadena verificada, 3 alteraciones detectadas (C solo con head)."
+    );
     Ok(())
+}
+
+/// First 16 characters, or the whole text if shorter (never panics).
+fn short(text: &str) -> &str {
+    text.get(..16).unwrap_or(text)
 }
 
 /// Copy of the chain where the second receipt's outcome reads `Allow`.
