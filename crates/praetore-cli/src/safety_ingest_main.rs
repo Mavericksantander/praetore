@@ -1131,8 +1131,23 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         drop(listener);
-        // A stale socket (nobody listens) is replaced.
-        let (listener, _) = bind_socket(&socket, None).unwrap();
+        // A stale socket (nobody listens) is replaced. Another test of this
+        // process may fork a child (mkfifo) that holds a copy of the
+        // listener's descriptor until it execs, so the socket can look alive
+        // for a moment: retry briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (listener, _) = loop {
+            match bind_socket(&socket, None) {
+                Ok(bound) => break bound,
+                Err(error)
+                    if error.to_string().contains("another process listens")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
         // A live one is not.
         assert!(
             bind_socket(&socket, None)
