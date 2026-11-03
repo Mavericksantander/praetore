@@ -15,8 +15,9 @@
     `set_heads`; `IngestorConfig::heads` is removed), and `commit` now
     returns an error unless the records extend the current head.
   - New `rejected` reasons `seq_jump_too_large`, `stale_epoch` and
-    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP` and a
-    fixed epoch step of 10^9); an
+    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP` and
+    `PRAETORE_SAFETY_MAX_EPOCH_JUMP`, which also bounds a chain's first
+    epoch); an
     event far from the ingester's clock carries `clock_skew_seconds`
     (`PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS`). A chain head signed by an
     unregistered ingestion key fails closed; previous keys of a rotation are

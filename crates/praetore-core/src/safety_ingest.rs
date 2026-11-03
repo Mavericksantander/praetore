@@ -89,11 +89,8 @@ pub const MAX_SOURCE_PINS: usize = 256;
 /// Default of [`IngestorConfig::max_seq_jump`].
 pub const DEFAULT_MAX_SEQ_JUMP: u64 = 1_000_000;
 
-/// The largest accepted step of `source_epoch` above an existing chain's
-/// epoch. Independent of `max_seq_jump`: a source's epoch also advances on
-/// starts that send nothing (a crash loop), so a small seq limit must not
-/// lock a source out. The first event of a chain may carry any epoch.
-pub const MAX_EPOCH_JUMP: u64 = 1_000_000_000;
+/// Default of [`IngestorConfig::max_epoch_jump`].
+pub const DEFAULT_MAX_EPOCH_JUMP: u64 = 1_000_000;
 /// Default of [`IngestorConfig::max_clock_skew_seconds`].
 pub const DEFAULT_MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 
@@ -351,7 +348,8 @@ pub enum RejectReason {
     /// unattributed chain; the source chain does not change.
     StaleEpoch,
     /// A verified event whose `source_epoch` is more than
-    /// [`MAX_EPOCH_JUMP`] above its chain's current epoch.
+    /// [`IngestorConfig::max_epoch_jump`] above its chain's current epoch
+    /// (0 for a chain without records).
     EpochJumpTooLarge,
 }
 
@@ -1409,6 +1407,8 @@ pub enum IngestSetupError {
     NoSources,
     #[error("max_seq_jump must be between 1 and 2^53 - 1")]
     InvalidMaxSeqJump,
+    #[error("max_epoch_jump must be between 1 and 2^53 - 1")]
+    InvalidMaxEpochJump,
 }
 
 /// Why one input produced no record.
@@ -1439,6 +1439,7 @@ pub struct SafetyIngestor {
     sources: SourcePins,
     heads: BTreeMap<String, ChainHead>,
     max_seq_jump: u64,
+    max_epoch_jump: u64,
     max_clock_skew_seconds: u64,
 }
 
@@ -1471,6 +1472,16 @@ pub struct IngestorConfig {
     /// compromised source key) cannot push the chain to the end of the
     /// `source_seq` range.
     pub max_seq_jump: u64,
+    /// The largest accepted step of `source_epoch` above a chain's epoch
+    /// (at least 1; [`DEFAULT_MAX_EPOCH_JUMP`] by default). A chain without
+    /// records is at epoch 0, so this also bounds the first epoch of a
+    /// chain. A verified event further ahead is recorded as `rejected`
+    /// ([`RejectReason::EpochJumpTooLarge`]) and does not move the chain, so
+    /// one event cannot push it to the end of the epoch range and lock its
+    /// source out. A source's epoch also advances on starts that send
+    /// nothing (a crash loop): keep this above the starts a source can make
+    /// between two events.
+    pub max_epoch_jump: u64,
     /// The largest `|occurred_at - recorded_at|`, in seconds, recorded
     /// without a mark ([`DEFAULT_MAX_CLOCK_SKEW_SECONDS`] by default). Above
     /// it the record keeps its status and carries `clock_skew_seconds`.
@@ -1492,6 +1503,9 @@ impl SafetyIngestor {
         }
         if config.max_seq_jump == 0 || config.max_seq_jump > MAX_SAFE_INTEGER {
             return Err(IngestSetupError::InvalidMaxSeqJump);
+        }
+        if config.max_epoch_jump == 0 || config.max_epoch_jump > MAX_SAFE_INTEGER {
+            return Err(IngestSetupError::InvalidMaxEpochJump);
         }
         let ingest_pin = config
             .ingest_key
@@ -1526,6 +1540,7 @@ impl SafetyIngestor {
             sources: config.sources,
             heads: BTreeMap::new(),
             max_seq_jump: config.max_seq_jump,
+            max_epoch_jump: config.max_epoch_jump,
             max_clock_skew_seconds: config.max_clock_skew_seconds,
         };
         Ok(ingestor)
@@ -1845,7 +1860,7 @@ impl SafetyIngestor {
         let head = self.head(&event.source_id);
         let epoch = event.source_epoch;
         let high_water = if epoch > head.epoch {
-            if self.heads.contains_key(&event.source_id) && epoch - head.epoch > MAX_EPOCH_JUMP {
+            if epoch - head.epoch > self.max_epoch_jump {
                 return false;
             }
             0
@@ -1911,7 +1926,7 @@ impl SafetyIngestor {
                 ),
             );
         }
-        if self.heads.contains_key(&chain) && epoch - head.epoch > MAX_EPOCH_JUMP {
+        if epoch - head.epoch > self.max_epoch_jump {
             return reject(
                 RejectReason::EpochJumpTooLarge,
                 format!(
@@ -1919,7 +1934,7 @@ impl SafetyIngestor {
                      maximum step is {}",
                     epoch - head.epoch,
                     head.epoch,
-                    MAX_EPOCH_JUMP
+                    self.max_epoch_jump
                 ),
             );
         }

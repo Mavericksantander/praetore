@@ -38,6 +38,7 @@
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
 //! | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` differs from the ingester's clock by more than this (default 300) keeps its status and carries `clock_skew_seconds` |
 //! | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` |
+//! | `PRAETORE_SAFETY_MAX_EPOCH_JUMP` | largest accepted step of `source_epoch` above a chain's epoch, 0 for a new chain, so it also bounds a chain's first epoch (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`epoch_jump_too_large`) on `_unattributed` |
 //!
 //! The runtime-role relaxations of the gateway (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
 //! `PRAETORE_SCHEMA_OWNER`, ...) apply to the ingester's role check too.
@@ -68,10 +69,10 @@ use std::{
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
-        DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP, FloodControl,
-        FloodLimits, IngestorConfig, LossReason, MAX_FLOOD_LIMIT, MAX_SAFETY_EVENT_BYTES,
-        PreparedRecords, SafetyIngestKey, SafetyIngestor, SafetyRecord, SafetyRecordStatus,
-        SourcePins,
+        DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_EPOCH_JUMP,
+        DEFAULT_MAX_SEQ_JUMP, FloodControl, FloodLimits, IngestorConfig, LossReason,
+        MAX_FLOOD_LIMIT, MAX_SAFETY_EVENT_BYTES, PreparedRecords, SafetyIngestKey, SafetyIngestor,
+        SafetyRecord, SafetyRecordStatus, SourcePins,
     },
 };
 use praetore_replay_postgres::{
@@ -151,6 +152,7 @@ struct Config {
     database: DatabaseConnector,
     queue_capacity: usize,
     max_seq_jump: u64,
+    max_epoch_jump: u64,
     max_clock_skew_seconds: u64,
     flood: FloodLimits,
     allowed_uids: Option<Vec<u32>>,
@@ -323,6 +325,14 @@ fn load_config() -> Result<Config> {
             .filter(|jump| (1..=MAX_SAFE_SEQ).contains(jump))
             .ok_or("PRAETORE_SAFETY_MAX_SEQ_JUMP must be between 1 and 2^53 - 1")?,
     };
+    let max_epoch_jump = match var("PRAETORE_SAFETY_MAX_EPOCH_JUMP") {
+        None => DEFAULT_MAX_EPOCH_JUMP,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|jump| (1..=MAX_SAFE_SEQ).contains(jump))
+            .ok_or("PRAETORE_SAFETY_MAX_EPOCH_JUMP must be between 1 and 2^53 - 1")?,
+    };
     let max_clock_skew_seconds = match var("PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS") {
         None => DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         Some(value) => value
@@ -383,6 +393,7 @@ fn load_config() -> Result<Config> {
         database,
         queue_capacity,
         max_seq_jump,
+        max_epoch_jump,
         max_clock_skew_seconds,
         flood,
         allowed_uids,
@@ -437,6 +448,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
         attester_pin: config.attester_pin,
         sources: config.sources,
         max_seq_jump: config.max_seq_jump,
+        max_epoch_jump: config.max_epoch_jump,
         max_clock_skew_seconds: config.max_clock_skew_seconds,
     })?;
     Ok((

@@ -7211,6 +7211,7 @@ mod g1_safety {
                 .unwrap(),
             sources,
             max_seq_jump: praetore_core::safety_ingest::DEFAULT_MAX_SEQ_JUMP,
+            max_epoch_jump: praetore_core::safety_ingest::DEFAULT_MAX_EPOCH_JUMP,
             max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         })
         .unwrap()
