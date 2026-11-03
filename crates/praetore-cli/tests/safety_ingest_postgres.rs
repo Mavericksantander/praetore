@@ -956,14 +956,15 @@ fn postgres_safety_ingest_flood_is_bounded_and_counted() {
     let client_dropped = (garbage + events + replays) as i64 - sent;
     assert_eq!(client_dropped as u64, client.dropped());
     // Wait until every message the ingester received is accounted for:
-    // stored as a record, or in a signed count.
+    // stored as a record, or in a signed count. Every record but a loss
+    // stands for one message: a replay of an event the queue dropped
+    // arrives after the chain moved on and is recorded as `late`.
     let deadline = Instant::now() + Duration::from_secs(30);
     let accounted = |scratch: &Scratch| {
         let records: i64 = scratch
             .admin()
             .query_one(
-                "SELECT count(*) FROM praetore.safety_records \
-                 WHERE status IN ('accepted', 'rejected')",
+                "SELECT count(*) FROM praetore.safety_records WHERE status <> 'loss'",
                 &[],
             )
             .unwrap()
