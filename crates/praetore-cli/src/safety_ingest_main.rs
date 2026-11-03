@@ -1108,6 +1108,11 @@ impl Worker<'_> {
 mod tests {
     use super::*;
 
+    /// bind_socket sets the process umask while it binds and restores it:
+    /// two tests binding at once could restore it under each other, so
+    /// they take this lock.
+    static SOCKETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct Dir(PathBuf);
 
     impl Dir {
@@ -1128,6 +1133,9 @@ mod tests {
 
     #[test]
     fn the_socket_is_created_owner_only_or_with_its_group() {
+        let _serial = SOCKETS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = Dir::new("mode", 0o700);
         let socket = dir.0.join("s");
         let (listener, _) = bind_socket(&socket, None).unwrap();
@@ -1172,6 +1180,9 @@ mod tests {
 
     #[test]
     fn an_unsafe_socket_path_is_refused() {
+        let _serial = SOCKETS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Not a socket: never replaced.
         let dir = Dir::new("file", 0o700);
         let socket = dir.0.join("s");
