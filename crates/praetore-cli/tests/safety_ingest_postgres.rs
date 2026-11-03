@@ -98,8 +98,8 @@ impl Scratch {
         // (migration 0017).
         client
             .execute(
-                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
-                 VALUES ($1, $2, $3)",
+                "INSERT INTO praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id) \
+                 VALUES ($1::pg_catalog.text::pg_catalog.regrole, $2, $3)",
                 &[&role, &TENANT, &ingest_key().key_id()],
             )
             .unwrap();

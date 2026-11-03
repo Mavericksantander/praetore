@@ -42,8 +42,17 @@
     `praetore.tenant_id` setting, and the insert trigger accepts only
     records naming the tenant's registered key. The ingester and the
     exporter check the registration at startup. A documented manual
-    rollback of 0016 and 0017 (`docs/rollback/g1-safety-records.sql`) is
+    rollback of 0016 to 0018 (`docs/rollback/g1-safety-records.sql`) is
     tested in CI.
+  - Migration `0018_safety_audit_and_role_oids`: registrations name the
+    login role by OID (`'<role>'::regrole`), so a role dropped and created
+    again with the same name is not registered; the read-only group
+    `praetore_safety_audit` and `praetore.safety_audit_tenants` let a login
+    role export and audit the tenants it is registered for, without write
+    access (`verify_safety_audit_role_with`).
+  - `PRAETORE_SAFETY_MAX_EPOCH_JUMP` bounds the step of `source_epoch` and a
+    chain's first epoch. The ingester binds its socket without changing the
+    process umask.
   - `praetore journal-export --safety --from-seq N [--limit M]` exports a
     chain in ranges, each anchored on the record before it, and
     `praetore-verify safety-journal --range [--expected-anchor HEX]`

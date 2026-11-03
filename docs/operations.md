@@ -329,6 +329,37 @@ duplicate claims through newly created clients and concurrent connections.
 That does not replace testing the target deployment's replication and
 disaster-recovery configuration.
 
+
+#### Read-only export and audit roles
+
+Migration 0018 creates the NOLOGIN group `praetore_safety_audit` for login
+roles that export and audit safety records without being able to write
+them:
+
+| Object | Privileges |
+| --- | --- |
+| schema `praetore` | `USAGE` |
+| `schema_migrations` | `SELECT` |
+| `safety_records` | `SELECT` (row-level security: only the registered tenants) |
+| `safety_audit_tenants` | `SELECT` (only its own registrations) |
+
+Create the role as a member of that group only and register it, as the
+schema owner, for each tenant it may read:
+
+```sql
+CREATE ROLE praetore_audit_1 LOGIN PASSWORD '...' IN ROLE praetore_safety_audit;
+INSERT INTO praetore.safety_audit_tenants (role_oid, tenant_id)
+VALUES ('praetore_audit_1'::regrole, '<tenant uuid>');
+```
+
+`praetore journal-export --safety` accepts such a role
+(`PRAETORE_SAFETY_DATABASE_URL`) and checks that it is registered for the
+tenant. `verify_safety_audit_role_with` refuses an audit role that is
+privileged, owns or can create in `praetore`, is a member of
+`praetore_runtime` or `praetore_safety_ingest`, or holds any other
+privilege on a `praetore` table. It cannot insert, update or delete safety
+records, and it does not see `safety_ingest_tenants` or the ingestion key
+ids registered there.
 ### Schema checks, allowlists and managed PostgreSQL
 
 The migration runner and `verify_runtime_role` refuse database state that
@@ -621,9 +652,16 @@ prints the key id, and the exact statement when the role is not
 registered):
 
 ```sql
-INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id)
-VALUES ('praetore_safety_t1', '<tenant uuid>', '<ingestion key id>');
+INSERT INTO praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id)
+VALUES ('praetore_safety_t1'::regrole, '<tenant uuid>', '<ingestion key id>');
 ```
+
+A registration names the role by its OID (migration 0018), not its name: a
+role dropped and created again with the same name is a new role and is not
+registered. List the registrations with `SELECT role_oid::regrole,
+tenant_id, ingest_key_id FROM praetore.safety_ingest_tenants`; a row whose
+role no longer exists shows a bare number and keeps the tenant (and key)
+taken until the schema owner deletes it.
 
 Row-level security on `safety_records` shows and accepts only the rows of
 the tenant the session's login role (`session_user`) is registered for; the
@@ -638,7 +676,7 @@ key for two tenants is refused. The ingester and `praetore journal-export
 role registered for another tenant (or, for the ingester, another key).
 When rotating the ingestion key, update the row first (`UPDATE
 praetore.safety_ingest_tenants SET ingest_key_id = '<new key id>' WHERE
-role_name = '...'`), then restart the ingester with the new key. `verify_safety_ingest_role_with` refuses, at
+role_oid = 'praetore_safety_t1'::regrole`), then restart the ingester with the new key. `verify_safety_ingest_role_with` refuses, at
 startup, a role that is privileged, owns or can create in `praetore`, is a
 member of `praetore_runtime`, or holds any privilege on another `praetore`
 table (column privileges included), plus the database-wide checks of the
@@ -672,7 +710,7 @@ current one nor listed there makes the ingester refuse to start: a key
 change must be registered, and a row signed by an unknown key is never
 continued.
 
-### Rolling back the safety-record storage (0016 and 0017)
+### Rolling back the safety-record storage (0016 to 0018)
 
 The migration runner is forward-only. To remove the G1 storage (for example
 to downgrade to a release without it, or to start over after an unreleased
@@ -689,18 +727,19 @@ psql "$OWNER_URL" -v ON_ERROR_STOP=1 \
 ```
 
 In one transaction it drops `praetore.safety_records` (with its triggers and
-policies), `praetore.safety_ingest_tenants` and the two trigger functions,
-revokes what 0016 granted `praetore_safety_ingest` in this database, and
-deletes the `0016_safety_records` and `0017_safety_records_followups` rows of
-`praetore.schema_migrations`. It destroys every safety record, so without
+policies), `praetore.safety_ingest_tenants`, `praetore.safety_audit_tenants`
+and the two trigger functions, revokes what 0016 and 0018 granted
+`praetore_safety_ingest` and `praetore_safety_audit` in this database, and
+deletes the `0016_safety_records`, `0017_safety_records_followups` and
+`0018_safety_audit_and_role_oids` rows of `praetore.schema_migrations`. It destroys every safety record, so without
 the confirmation setting it refuses to run while the table holds any. The
 table has `FORCE ROW LEVEL SECURITY`, so an owner without superuser or
 `BYPASSRLS` would see no rows; the script lifts it first, inside the same
 transaction, so the check counts every record. The test runs it as such an
 owner. The
-group role is cluster-wide and is not dropped (`DROP ROLE
-praetore_safety_ingest` once no database uses it). Afterwards
-`apply_migrations` applies 0016 and 0017 again, and the tenant
+group roles are cluster-wide and are not dropped (`DROP ROLE
+praetore_safety_ingest, praetore_safety_audit` once no database uses them). Afterwards
+`apply_migrations` applies 0016 to 0018 again, and the tenant
 registrations must be inserted again. The test
 `postgres_safety_manual_rollback_removes_0016_and_0017_and_they_apply_again`
 runs this script against a scratch database in CI.

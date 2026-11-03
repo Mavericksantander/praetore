@@ -54,6 +54,12 @@ pub enum SafetyStoreError {
         expected_key_id: Option<String>,
         found: Option<(Uuid, String)>,
     },
+    /// An audit role (`praetore_safety_audit`) is not registered for the
+    /// tenant in `praetore.safety_audit_tenants`.
+    AuditRegistration {
+        role: String,
+        tenant: Uuid,
+    },
 }
 
 impl std::fmt::Display for SafetyStoreError {
@@ -81,6 +87,12 @@ impl std::fmt::Display for SafetyStoreError {
                  (PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE); refusing to continue the chain"
             ),
             Self::TooLarge => write!(f, "too many safety records for one export"),
+            Self::AuditRegistration { role, tenant } => write!(
+                f,
+                "audit role {role} is not registered for tenant {tenant}; the schema owner \
+                 registers it once: INSERT INTO praetore.safety_audit_tenants (role_oid, \
+                 tenant_id) VALUES ('{role}'::regrole, '{tenant}')"
+            ),
             Self::Registration {
                 role,
                 expected_tenant,
@@ -93,8 +105,10 @@ impl std::fmt::Display for SafetyStoreError {
                         f,
                         "database role {role} is not registered for safety ingestion; the \
                          schema owner registers it once: INSERT INTO \
-                         praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
-                         VALUES ('{role}', '{expected_tenant}', '{key}')"
+                         praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id) \
+                         VALUES ('{role}'::regrole, '{expected_tenant}', '{key}') (or, for a \
+                         read-only export, register an audit role in \
+                         praetore.safety_audit_tenants)"
                     ),
                     Some((tenant, key_id)) => write!(
                         f,
@@ -160,7 +174,9 @@ impl PostgresSafetyStore {
                     t.ingest_key_id::pg_catalog.text \
              FROM (SELECT 1) one \
              LEFT JOIN praetore.safety_ingest_tenants t \
-               ON t.role_name OPERATOR(pg_catalog.=) SESSION_USER",
+               ON t.role_oid OPERATOR(pg_catalog.=) \
+                  (SELECT r.oid FROM pg_catalog.pg_roles r \
+                   WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER)",
             &[],
         )?;
         let role: String = row.get(0);
@@ -182,6 +198,41 @@ impl PostgresSafetyStore {
             expected_tenant: tenant_id,
             expected_key_id: key_id.map(str::to_owned),
             found,
+        })
+    }
+
+    /// For an export: checks that the session's login role may read
+    /// `tenant_id`'s records, as that tenant's registered ingest role or as
+    /// an audit role registered for it in `praetore.safety_audit_tenants`.
+    /// Row-level security would otherwise show an empty chain.
+    pub fn check_read_access(&mut self, tenant_id: Uuid) -> Result<(), SafetyStoreError> {
+        let audit: bool = self
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g \
+                                WHERE g.rolname OPERATOR(pg_catalog.=) 'praetore_safety_audit' \
+                                  AND pg_catalog.pg_has_role(SESSION_USER, g.oid, 'MEMBER'))",
+                &[],
+            )?
+            .get(0);
+        if !audit {
+            return self.check_registration(tenant_id, None);
+        }
+        let row = self.client.query_one(
+            "SELECT SESSION_USER::pg_catalog.text, EXISTS ( \
+                 SELECT 1 FROM praetore.safety_audit_tenants a \
+                 WHERE a.tenant_id = $1 \
+                   AND a.role_oid OPERATOR(pg_catalog.=) \
+                       (SELECT r.oid FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER))",
+            &[&tenant_id],
+        )?;
+        if row.get::<_, bool>(1) {
+            return Ok(());
+        }
+        Err(SafetyStoreError::AuditRegistration {
+            role: row.get(0),
+            tenant: tenant_id,
         })
     }
 

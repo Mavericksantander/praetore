@@ -178,7 +178,8 @@ pub fn run(args: SafetyExportArgs) -> CliResult<()> {
     // registered for: say so instead of exporting an empty chain.
     let mut store =
         praetore_replay_postgres::PostgresSafetyStore::from_client(connector.connect()?);
-    store.check_registration(args.tenant_id, None)?;
+    // The tenant's ingest role, or a read-only audit role registered for it.
+    store.check_read_access(args.tenant_id)?;
     let client = store.client();
     let (anchor, records, next_from_seq) = match args.range {
         None => (
