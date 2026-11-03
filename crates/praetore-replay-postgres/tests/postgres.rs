@@ -7336,9 +7336,14 @@ mod g1_safety {
         assert_eq!(status(&prepared), ["accepted"]);
         let prepared = ingest(&mut restarted, &mut store, &event_in(2, 2));
         assert_eq!(status(&prepared), ["accepted"]);
-        // Duplicates are looked up within the epoch (the store's index).
+        // Duplicates are looked up within the epoch (the store's index): an
+        // exact one is counted, not stored.
         let prepared = ingest(&mut restarted, &mut store, &event_in(2, 2));
-        assert_eq!(status(&prepared), ["duplicate"]);
+        assert!(prepared.records.is_empty());
+        assert_eq!(
+            prepared.suppressed.map(|s| s.reason),
+            Some(praetore_core::safety_ingest::LossReason::Duplicate)
+        );
         let prepared = ingest(&mut restarted, &mut store, &event_in(1, 4));
         assert_eq!(prepared.chain, "_unattributed");
         assert_eq!(
@@ -7349,7 +7354,6 @@ mod g1_safety {
         let report = verify_safety_chain(&text, std::slice::from_ref(&pin), None, None).unwrap();
         assert_eq!(report.counts.epochs, 2);
         assert_eq!(report.counts.accepted, 5);
-        assert_eq!(report.counts.duplicate, 1);
         assert_eq!(report.counts.conflict, 0);
         assert_eq!((report.source_epoch, report.high_water), (2, 2));
         // The column is the signed epoch (NULL on the unattributed chain).
@@ -7369,7 +7373,6 @@ mod g1_safety {
             ("executor-1", Some(1)),
             ("executor-1", Some(1)),
             ("executor-1", Some(1)),
-            ("executor-1", Some(2)),
             ("executor-1", Some(2)),
             ("executor-1", Some(2)),
         ]
@@ -7587,20 +7590,21 @@ mod g1_safety {
             )
             .unwrap();
         let duplicate = ingest(&mut resumed, &mut store, &event(2, "safety:freeze"));
+        assert!(duplicate.records.is_empty());
         assert_eq!(
-            duplicate.records[0].payload().status,
-            praetore_core::SafetyRecordStatus::Duplicate
+            duplicate.suppressed.map(|s| s.reason),
+            Some(praetore_core::safety_ingest::LossReason::Duplicate)
         );
         ingest(&mut resumed, &mut store, &event(6, "safety:halt"));
 
         let text = chain_text(store.client(), TENANT_A, "executor-1");
         let report = verify_safety_chain(&text, std::slice::from_ref(&pin), None, None).unwrap();
-        assert_eq!(report.entries, 9);
+        assert_eq!(report.entries, 7);
         assert_eq!(report.counts.accepted, 3);
         assert_eq!(report.counts.undeclared, 1);
         assert_eq!(report.counts.loss, 1);
         assert_eq!(report.counts.late, 1);
-        assert_eq!(report.counts.duplicate, 2);
+        assert_eq!(report.counts.duplicate, 0);
         assert_eq!(report.counts.conflict, 1);
         assert_eq!(report.high_water, 6);
         let rejected = chain_text(store.client(), TENANT_A, "_unattributed");
@@ -7654,7 +7658,7 @@ mod g1_safety {
                 .unwrap();
             rows.iter().map(|row| (row.get(0), row.get(1))).collect()
         };
-        assert_eq!(rows, [(TENANT_A, 10)], "A's role sees only A's rows");
+        assert_eq!(rows, [(TENANT_A, 8)], "A's role sees only A's rows");
         assert!(chain_text(store.client(), TENANT_B, "executor-1").is_empty());
         assert_eq!(
             chain_text(store_b.client(), TENANT_B, "executor-1")

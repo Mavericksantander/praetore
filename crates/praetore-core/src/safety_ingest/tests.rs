@@ -136,6 +136,15 @@ impl Harness {
         self.store(prepared)
     }
 
+    /// Prepares without storing: what the ingester would do with `input`.
+    fn suppressed(&mut self, input: &[u8]) -> Option<Suppressed> {
+        let prepared = self
+            .ingestor
+            .prepare(input, now(), &mut self.lookup)
+            .unwrap();
+        prepared.suppressed
+    }
+
     fn statuses(&mut self, input: &[u8]) -> Vec<SafetyRecordStatus> {
         self.ingest(input)
             .iter()
@@ -469,21 +478,24 @@ fn a_source_seq_gap_is_recorded_as_a_signed_loss_record() {
 }
 
 #[test]
-fn a_resent_event_is_a_duplicate_and_another_event_with_its_seq_a_conflict() {
+fn a_resent_event_is_counted_not_stored_and_another_event_with_its_seq_is_a_conflict() {
     let mut harness = Harness::new();
     let first = harness.ingest(&wire(&event(1, "safety:halt")));
     harness.ingest(&wire(&event(2, "safety:halt")));
-    // The same event again, in another encoding: duplicate.
+    // The same event again, in another encoding: an exact duplicate, which
+    // creates no record (it is counted; see FloodControl).
     let pretty = serde_json::to_vec_pretty(
         &serde_json::from_slice::<Value>(&wire(&event(1, "safety:halt"))).unwrap(),
     )
     .unwrap();
-    let duplicate = harness.ingest(&pretty);
-    assert_eq!(duplicate[0].payload().status, SafetyRecordStatus::Duplicate);
     assert_eq!(
-        duplicate[0].payload().original_record_hash.as_deref(),
-        Some(first[0].record_hash())
+        harness.suppressed(&pretty),
+        Some(Suppressed {
+            reason: LossReason::Duplicate,
+            source_id: Some("executor-1".into()),
+        })
     );
+    assert!(harness.ingest(&pretty).is_empty());
     // Another validly signed event with source_seq 1: conflict.
     let conflict = harness.ingest(&wire(&event(1, "safety:stop_all")));
     assert_eq!(conflict[0].payload().status, SafetyRecordStatus::Conflict);
@@ -498,7 +510,7 @@ fn a_resent_event_is_a_duplicate_and_another_event_with_its_seq_a_conflict() {
         [SafetyRecordStatus::Accepted]
     );
     let report = harness.verify("executor-1").unwrap();
-    assert_eq!((report.counts.duplicate, report.counts.conflict), (1, 1));
+    assert_eq!((report.counts.duplicate, report.counts.conflict), (0, 1));
 }
 
 #[test]
@@ -510,13 +522,11 @@ fn an_event_for_a_lost_seq_is_late_and_only_once() {
         harness.statuses(&wire(&event(2, "safety:halt"))),
         [SafetyRecordStatus::Late]
     );
-    assert_eq!(
-        harness.statuses(&wire(&event(2, "safety:halt"))),
-        [SafetyRecordStatus::Duplicate]
-    );
+    // Once filled, the same event is an exact duplicate: not stored.
+    assert!(harness.statuses(&wire(&event(2, "safety:halt"))).is_empty());
     let report = harness.verify("executor-1").unwrap();
     assert_eq!(report.counts.late, 1);
-    assert_eq!(report.counts.duplicate, 1);
+    assert_eq!(report.counts.duplicate, 0);
 }
 
 #[test]
@@ -708,7 +718,8 @@ fn sample_chain() -> String {
     for seq in [1, 2, 5, 6] {
         harness.ingest(&wire(&event(seq, "safety:halt")));
     }
-    harness.ingest(&wire(&event(6, "safety:halt")));
+    // A conflict of seq 6.
+    harness.ingest(&wire(&event(6, "safety:stop_all")));
     harness.chain("executor-1").to_owned()
 }
 
@@ -722,7 +733,7 @@ fn an_exported_chain_verifies_with_its_head_and_counts() {
     assert_eq!(report.counts.accepted, 4);
     assert_eq!(report.counts.loss, 1);
     assert_eq!(report.counts.lost_events, 2);
-    assert_eq!(report.counts.duplicate, 1);
+    assert_eq!(report.counts.conflict, 1);
     assert!(report.source_signatures_verified);
     assert_eq!(report.signed_by[&ingest_key().key_id()], 6);
     verify_safety_chain(&text, &[ingest_pin()], None, Some(&report.head)).unwrap();
@@ -823,16 +834,32 @@ fn a_loss_record_must_be_followed_by_its_event() {
 }
 
 #[test]
-fn a_duplicate_that_names_the_wrong_original_fails() {
+fn a_duplicate_record_is_still_verified_and_one_naming_the_wrong_original_fails() {
+    // The ingester no longer writes `duplicate` records, but the verifier
+    // still checks them (chains written before the change).
     let mut harness = Harness::new();
-    harness.ingest(&wire(&event(1, "safety:halt")));
+    let first = harness.ingest(&wire(&event(1, "safety:halt")));
     let second = harness.ingest(&wire(&event(2, "safety:halt")));
-    let duplicate = harness.ingest(&wire(&event(1, "safety:halt")));
-    let mut payload = duplicate[0].payload().clone();
-    payload.original_record_hash = Some(second[0].record_hash().to_owned());
-    let forged = ingest_key().sign_record(payload).unwrap();
+    let conflict = harness.ingest(&wire(&event(1, "safety:stop_all")));
+    let duplicate_of = |original: &SafetyRecord| {
+        let mut payload = conflict[0].payload().clone();
+        let event = event(1, "safety:halt");
+        payload.status = SafetyRecordStatus::Duplicate;
+        payload.event_hash = Some(event.event_hash());
+        payload.event = Some(event);
+        payload.original_record_hash = Some(original.record_hash().to_owned());
+        ingest_key()
+            .sign_record(payload)
+            .unwrap()
+            .to_json()
+            .unwrap()
+            + "\n"
+    };
     let mut chain = lines(harness.chain("executor-1"));
-    chain[2] = forged.to_json().unwrap() + "\n";
+    chain[2] = duplicate_of(&first[0]);
+    let report = verify_safety_chain(&chain.concat(), &[ingest_pin()], None, None).unwrap();
+    assert_eq!(report.counts.duplicate, 1);
+    chain[2] = duplicate_of(&second[0]);
     assert!(matches!(
         verify_safety_chain(&chain.concat(), &[ingest_pin()], None, None),
         Err(SafetyChainError::SequenceInconsistent { .. })
@@ -1114,10 +1141,12 @@ fn a_restarted_source_starts_a_new_epoch_whose_seq_starts_at_one() {
     let restarted = harness.ingest(&epoch(2, 1));
     assert_eq!(status_strs(&restarted), ["accepted"]);
     harness.ingest(&epoch(2, 2));
-    // A duplicate within epoch 2 is a duplicate of epoch 2's event, not a
-    // conflict with epoch 1's.
-    let duplicate = harness.ingest(&epoch(2, 2));
-    assert_eq!(status_strs(&duplicate), ["duplicate"]);
+    // The same event again within epoch 2 is an exact duplicate of epoch
+    // 2's event (not stored), not a conflict with epoch 1's.
+    assert_eq!(
+        harness.suppressed(&epoch(2, 2)).map(|s| s.reason),
+        Some(LossReason::Duplicate)
+    );
     // A gap in the new epoch counts from 1 of that epoch.
     let restarted = harness.ingest(&epoch(3, 4));
     assert_eq!(status_strs(&restarted), ["loss", "accepted"]);
@@ -1141,7 +1170,6 @@ fn a_restarted_source_starts_a_new_epoch_whose_seq_starts_at_one() {
     assert_eq!(report.source_epoch, 3);
     assert_eq!(report.high_water, 4);
     assert_eq!(report.counts.accepted, 6);
-    assert_eq!(report.counts.duplicate, 1);
     assert_eq!(report.counts.conflict, 0);
     // A record whose epoch goes back fails verification even when signed.
     let lines = lines(harness.chain("executor-1"));
@@ -1155,4 +1183,107 @@ fn status_strs(records: &[SafetyRecord]) -> Vec<&'static str> {
         .iter()
         .map(|record| record.payload().status.as_str())
         .collect()
+}
+
+#[test]
+fn a_flood_is_bounded_and_every_suppressed_message_is_counted_in_a_signed_record() {
+    let mut harness = Harness::new();
+    let mut flood = FloodControl::new(FloodLimits {
+        source_rate: 10,
+        source_burst: 20,
+        rejected_rate: 1,
+        rejected_burst: 5,
+    })
+    .unwrap();
+    let start = std::time::Duration::from_secs(1);
+    let send = |harness: &mut Harness, flood: &mut FloodControl, input: &[u8]| {
+        let prepared = harness
+            .ingestor
+            .prepare_limited(input, now(), start, &mut harness.lookup, flood)
+            .unwrap();
+        if let Some(suppressed) = &prepared.suppressed {
+            flood.count(suppressed);
+        }
+        harness.store(prepared).len()
+    };
+    // 1000 garbage datagrams, 1000 events of one source and 1000 replays of
+    // its first event, all within the same instant.
+    let mut stored = 0;
+    for _ in 0..1000 {
+        stored += send(&mut harness, &mut flood, b"garbage");
+    }
+    for seq in 1..=1000 {
+        stored += send(&mut harness, &mut flood, &wire(&event(seq, "safety:halt")));
+    }
+    let replay = wire(&event(1, "safety:halt"));
+    for _ in 0..1000 {
+        stored += send(&mut harness, &mut flood, &replay);
+    }
+    // 5 rejected records and 20 events: the chains stay bounded. The
+    // replays spend the source's budget too (they are verified events).
+    assert_eq!(stored, 5 + 20);
+    let pending = flood.take_pending();
+    let counted: BTreeMap<&str, u64> = pending
+        .iter()
+        .map(|count| (count.reason.as_str(), count.count))
+        .collect();
+    assert_eq!(
+        counted,
+        BTreeMap::from([("rate_limited", 1980), ("rejected_suppressed", 995)])
+    );
+    for count in &pending {
+        let prepared = harness
+            .ingestor
+            .prepare_count(count.reason, count.count, count.detail.as_deref(), now())
+            .unwrap();
+        harness.store(prepared);
+    }
+    let unattributed = verify_safety_chain(
+        harness.chain(UNATTRIBUTED_CHAIN),
+        &[ingest_pin()],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(unattributed.counts.rejected, 5);
+    assert_eq!(unattributed.counts.dropped_by_reason["rate_limited"], 1980);
+    assert_eq!(
+        unattributed.counts.dropped_by_reason["rejected_suppressed"],
+        995
+    );
+    assert!(
+        harness
+            .chain(UNATTRIBUTED_CHAIN)
+            .contains("\"detail\":\"executor-1=1980\"")
+    );
+    // Later, within the rate: the source chain shows the rate-limited
+    // events as a gap, and the replay is counted as a duplicate.
+    let later = start + std::time::Duration::from_secs(10);
+    let prepared = harness
+        .ingestor
+        .prepare_limited(
+            &wire(&event(1001, "safety:halt")),
+            now(),
+            later,
+            &mut harness.lookup,
+            &mut flood,
+        )
+        .unwrap();
+    let statuses: Vec<_> = prepared
+        .records
+        .iter()
+        .map(|record| record.payload().status.as_str())
+        .collect();
+    assert_eq!(statuses, ["loss", "accepted"]);
+    assert_eq!(prepared.records[0].payload().lost_from, Some(21));
+    harness.store(prepared);
+    let replayed = harness
+        .ingestor
+        .prepare_limited(&replay, now(), later, &mut harness.lookup, &mut flood)
+        .unwrap();
+    assert_eq!(
+        replayed.suppressed.map(|s| s.reason),
+        Some(LossReason::Duplicate)
+    );
+    harness.verify("executor-1").unwrap();
 }

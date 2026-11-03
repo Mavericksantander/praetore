@@ -1,9 +1,8 @@
 diff --git a/crates/praetore-core/src/safety_ingest.rs b/crates/praetore-core/src/safety_ingest.rs
-index cf9c438..cd93d8a 100644
 --- a/crates/praetore-core/src/safety_ingest.rs
 +++ b/crates/praetore-core/src/safety_ingest.rs
-@@ -1554,9 +1554,14 @@ impl SafetyIngestor {
-         let event = match self.authenticate(input) {
+@@ -1798,9 +1798,15 @@
+         let event = match authenticated {
              Ok(event) => event,
              Err(rejection) => {
 -                return self
@@ -16,6 +15,7 @@ index cf9c438..cd93d8a 100644
 +                    records: Vec::new(),
 +                    high_waters: Vec::new(),
 +                    head: self.head(UNATTRIBUTED_CHAIN),
++                    suppressed: None,
 +                });
              }
          };

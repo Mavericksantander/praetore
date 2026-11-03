@@ -786,8 +786,9 @@ const NAME_ERROR_CODES: [&str; 5] = [
     "invalid_name_start",
 ];
 
-/// Why events were lost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Why events were lost, or why messages were counted instead of recorded
+/// one by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LossReason {
     /// `source_seq` jumped: the events `lost_from..=lost_to` never arrived.
     SourceSeqGap,
@@ -797,6 +798,20 @@ pub enum LossReason {
     /// The database was unavailable: `dropped` messages could not be stored
     /// (unattributed).
     StorageError,
+    /// Verified events above their source's rate limit, not recorded
+    /// (unattributed; `detail` names the sources). The source chain shows
+    /// them as a `source_seq` gap when its next event is recorded.
+    RateLimited,
+    /// Inputs that did not verify, above the rate of individual `rejected`
+    /// records (unattributed).
+    RejectedSuppressed,
+    /// Exact duplicates (an event already recorded with the same event
+    /// hash): counted, never stored again (unattributed; `detail` names the
+    /// sources).
+    Duplicate,
+    /// Datagrams from a process whose user id is not allowed, not read
+    /// (unattributed; Linux only).
+    PeerRefused,
 }
 
 impl LossReason {
@@ -805,13 +820,25 @@ impl LossReason {
             Self::SourceSeqGap => "source_seq_gap",
             Self::QueueOverflow => "queue_overflow",
             Self::StorageError => "storage_error",
+            Self::RateLimited => "rate_limited",
+            Self::RejectedSuppressed => "rejected_suppressed",
+            Self::Duplicate => "duplicate",
+            Self::PeerRefused => "peer_refused",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        [Self::SourceSeqGap, Self::QueueOverflow, Self::StorageError]
-            .into_iter()
-            .find(|reason| reason.as_str() == text)
+        [
+            Self::SourceSeqGap,
+            Self::QueueOverflow,
+            Self::StorageError,
+            Self::RateLimited,
+            Self::RejectedSuppressed,
+            Self::Duplicate,
+            Self::PeerRefused,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == text)
     }
 }
 
@@ -1118,7 +1145,14 @@ impl SafetyRecordPayload {
                             _ => return Err(invalid("loss record with a wrong range")),
                         }
                     }
-                    Some(LossReason::QueueOverflow | LossReason::StorageError) => {
+                    Some(
+                        LossReason::QueueOverflow
+                        | LossReason::StorageError
+                        | LossReason::RateLimited
+                        | LossReason::RejectedSuppressed
+                        | LossReason::Duplicate
+                        | LossReason::PeerRefused,
+                    ) => {
                         has(unattributed, "chain")?;
                         has(
                             self.lost_from.is_none() && self.lost_to.is_none(),
@@ -1335,6 +1369,18 @@ pub struct PreparedRecords {
     /// so that the ingester can resume from the last record of a chain).
     pub high_waters: Vec<u64>,
     pub head: ChainHead,
+    /// The input was counted instead of recorded (no records): an exact
+    /// duplicate, or above a rate limit. Add it to
+    /// [`FloodControl::count`] so that it is recorded in a signed count.
+    pub suppressed: Option<Suppressed>,
+}
+
+/// An input counted instead of recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suppressed {
+    pub reason: LossReason,
+    /// The verified source, if any.
+    pub source_id: Option<String>,
 }
 
 /// Why the ingester could not be configured.
@@ -1596,6 +1642,7 @@ impl SafetyIngestor {
             records,
             high_waters,
             head,
+            suppressed: None,
         })
     }
 
@@ -1606,6 +1653,19 @@ impl SafetyIngestor {
         &self,
         reason: LossReason,
         dropped: u64,
+        now: OffsetDateTime,
+    ) -> Result<PreparedRecords, SafetyRecordError> {
+        self.prepare_count(reason, dropped, None, now)
+    }
+
+    /// A signed count of `count` messages not recorded one by one, with an
+    /// optional detail (for example the sources concerned), on the
+    /// unattributed chain.
+    pub fn prepare_count(
+        &self,
+        reason: LossReason,
+        dropped: u64,
+        detail: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<PreparedRecords, SafetyRecordError> {
         if reason == LossReason::SourceSeqGap {
@@ -1620,6 +1680,7 @@ impl SafetyIngestor {
         );
         payload.reason = Some(reason.as_str().into());
         payload.dropped = Some(dropped.min(MAX_SAFE_INTEGER));
+        payload.detail = detail.map(bounded_detail);
         self.sign_all(UNATTRIBUTED_CHAIN, vec![payload], head)
     }
 
@@ -1680,9 +1741,61 @@ impl SafetyIngestor {
         now: OffsetDateTime,
         lookup: &mut L,
     ) -> Result<PreparedRecords, IngestError<L::Error>> {
+        self.prepare_authenticated(input, self.authenticate(input), now, lookup)
+    }
+
+    /// [`Self::prepare`] behind `flood`'s rate limits, at `elapsed` on a
+    /// monotonic clock: a verified event above its source's rate, or an
+    /// input that does not verify above the rate of individual `rejected`
+    /// records, is not recorded and comes back as
+    /// [`PreparedRecords::suppressed`] (to count with
+    /// [`FloodControl::count`]). The rate is checked after the signature, so
+    /// only the holder of a source key spends that source's budget.
+    pub fn prepare_limited<L: EventLookup>(
+        &self,
+        input: &[u8],
+        now: OffsetDateTime,
+        elapsed: std::time::Duration,
+        lookup: &mut L,
+        flood: &mut FloodControl,
+    ) -> Result<PreparedRecords, IngestError<L::Error>> {
+        let authenticated = self.authenticate(input);
+        let suppressed = match &authenticated {
+            Ok(event) => (!flood.admit_event(&event.source_id, elapsed)).then(|| Suppressed {
+                reason: LossReason::RateLimited,
+                source_id: Some(event.source_id.clone()),
+            }),
+            Err(_) => (!flood.admit_rejected(elapsed)).then_some(Suppressed {
+                reason: LossReason::RejectedSuppressed,
+                source_id: None,
+            }),
+        };
+        if let Some(suppressed) = suppressed {
+            return Ok(self.suppressed(suppressed));
+        }
+        self.prepare_authenticated(input, authenticated, now, lookup)
+    }
+
+    fn suppressed(&self, suppressed: Suppressed) -> PreparedRecords {
+        PreparedRecords {
+            chain: UNATTRIBUTED_CHAIN.to_owned(),
+            records: Vec::new(),
+            high_waters: Vec::new(),
+            head: self.head(UNATTRIBUTED_CHAIN),
+            suppressed: Some(suppressed),
+        }
+    }
+
+    fn prepare_authenticated<L: EventLookup>(
+        &self,
+        input: &[u8],
+        authenticated: Result<SafetyEvent, EventRejection>,
+        now: OffsetDateTime,
+        lookup: &mut L,
+    ) -> Result<PreparedRecords, IngestError<L::Error>> {
         let now_instant = now;
         let now = Self::now_text(now).map_err(IngestError::Record)?;
-        let event = match self.authenticate(input) {
+        let event = match authenticated {
             Ok(event) => event,
             Err(rejection) => {
                 return self
@@ -1774,8 +1887,13 @@ impl SafetyIngestor {
                 .first_event(self.tenant_id, &chain, epoch, seq)
                 .map_err(IngestError::Lookup)?
             {
+                // An exact duplicate is counted, not stored again: a replay
+                // of a captured datagram cannot grow the chain.
                 Some(first) if first.event_hash == event_hash => {
-                    (SafetyRecordStatus::Duplicate, Some(first.record_hash))
+                    return Ok(self.suppressed(Suppressed {
+                        reason: LossReason::Duplicate,
+                        source_id: Some(chain),
+                    }));
                 }
                 Some(first) => (SafetyRecordStatus::Conflict, Some(first.record_hash)),
                 None => (SafetyRecordStatus::Late, None),
@@ -1862,8 +1980,12 @@ pub struct SafetyCounts {
     pub loss: u64,
     /// `source_seq` values covered by gap loss records.
     pub lost_events: u64,
-    /// Messages dropped inside the ingester (unattributed loss records).
+    /// Messages not recorded one by one (unattributed loss records):
+    /// dropped inside the ingester, rate limited, suppressed rejections and
+    /// exact duplicates, from peers refused.
     pub dropped_messages: u64,
+    /// `dropped_messages` by reason.
+    pub dropped_by_reason: BTreeMap<String, u64>,
     /// Event records marked with `clock_skew_seconds`.
     pub clock_skew: u64,
     /// Source epochs (chain segments) on a source chain: each is a run of
@@ -2263,6 +2385,10 @@ fn verify_chain_text(
                             return Err(SafetyChainError::WrongChain { line });
                         }
                         counts.dropped_messages += dropped;
+                        *counts
+                            .dropped_by_reason
+                            .entry(payload.reason.clone().unwrap_or_default())
+                            .or_default() += dropped;
                     }
                     _ => return Err(broken("loss record with a wrong shape")),
                 }
@@ -2380,6 +2506,13 @@ fn verify_chain_text(
     }
     Ok(report)
 }
+
+mod flood;
+
+pub use flood::{
+    DEFAULT_FLOOD_LIMITS, FloodControl, FloodLimits, InvalidFloodLimits, MAX_FLOOD_LIMIT,
+    PendingCount,
+};
 
 #[cfg(test)]
 mod tests;

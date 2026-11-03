@@ -117,11 +117,12 @@ cambia la cadena de la fuente.
 | `accepted` | fuente | evento verificado, `source_seq` siguiente, nombre declarado en el manifiesto |
 | `undeclared` | fuente | igual, nombre válido pero no declarado |
 | `invalid_name` | fuente | igual, `action` falla `SafetyActionName::parse`; `reason` es el código (`empty`, `too_long`, `not_printable_ascii`, `missing_prefix`, `invalid_name_start`) y `detail` el error escapado |
-| `duplicate` | fuente | `source_seq` ya registrado con el **mismo** `event_hash`; `original_record_hash` apunta al primero |
+| `duplicate` | fuente | `source_seq` ya registrado con el **mismo** `event_hash`; `original_record_hash` apunta al primero. El ingestor ya no lo escribe (ver "Duplicados"); el verificador lo sigue aceptando |
 | `conflict` | fuente | `source_seq` ya registrado con **otro** `event_hash`; `original_record_hash` apunta al primero |
 | `late` | fuente | `source_seq` que antes se registró como perdido |
 | `loss` (`source_seq_gap`) | fuente | `lost_from..=lost_to` nunca llegaron; va justo antes del evento que reveló el hueco |
 | `loss` (`queue_overflow`, `storage_error`) | `_unattributed` | `dropped` mensajes no se leyeron (cola llena) o no se pudieron guardar (base caída) |
+| `loss` (`rate_limited`, `rejected_suppressed`, `duplicate`, `peer_refused`) | `_unattributed` | conteo firmado de `dropped` mensajes que no se registraron uno por uno: eventos verificados sobre el límite de su fuente, entradas inválidas sobre el límite de `rejected`, duplicados exactos y datagramas de un uid no permitido (solo Linux). `detail` nombra las fuentes cuando se conocen |
 | `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`, `seq_jump_too_large`, `stale_epoch`, `epoch_jump_too_large`), `detail` y `raw`. `seq_jump_too_large` es un evento verificado cuyo `source_seq` está más de `PRAETORE_SAFETY_MAX_SEQ_JUMP` por encima del high-water de su cadena: queda aquí y la cadena de la fuente no cambia |
 
 Todo registro con evento lleva `event` (el evento completo, con su firma),
@@ -132,11 +133,22 @@ imprimible: `\\` para la barra invertida y `\xNN` para cualquier otro byte),
 `len`, `sha256` de la entrada completa y `truncated`. Nada se descarta en
 silencio: lo que no verifica se guarda como `rejected`.
 
-**Duplicados (decisión).** Un reenvío del mismo evento no es idempotente:
-se guarda como `duplicate`, para que un replay sea visible en la cadena. No
-mueve el `source_seq` esperado. Un evento distinto con un `source_seq` ya
-usado se guarda como `conflict` (dos eventos firmados por la misma fuente
-con la misma posición: un error o una llave comprometida).
+**Duplicados (decisión, cambiada).** La primera versión guardaba cada
+reenvío del mismo evento como `duplicate`, para que un replay fuera visible
+en la cadena; un replay de datagramas capturados podía entonces hacer
+crecer la cadena sin límite. Ahora un duplicado exacto (mismo `event_hash`
+que el primer evento de su `source_epoch` y `source_seq`) no crea registro:
+se cuenta en el registro firmado de conteo (`loss`, `duplicate`) de
+`_unattributed`, por fuente, y no mueve el `source_seq` esperado. Un evento
+distinto con un `source_seq` ya usado se guarda como `conflict` (dos eventos
+firmados por la misma fuente con la misma posición: un error o una llave
+comprometida).
+
+**Inundación.** Los límites por fuente (después de verificar la firma) y
+para entradas inválidas acotan cuántos registros individuales crea una
+inundación; lo demás va a conteos firmados, uno por motivo y por segundo
+como mucho. Un evento limitado por tasa aparece en la cadena de su fuente
+como hueco (`loss`, `source_seq_gap`) cuando se registra el siguiente.
 
 ## Export
 
@@ -193,8 +205,10 @@ fuente. No prueba:
   `--expected-head` con un head anclado fuera del control del operador lo
   detecta. Con la llave de ingesta se puede rehacer una cadena entera.
 - **Integridad de `_unattributed`.** Cualquiera con acceso al socket puede
-  llenarla de `rejected`; los permisos del socket (0600, o 0660 con un grupo)
-  lo limitan.
+  enviar basura: los permisos del socket (0600, o 0660 con un grupo) y, en
+  Linux, `PRAETORE_SAFETY_ALLOWED_UIDS` lo limitan, y los límites de tasa
+  acotan cuántos `rejected` individuales crea (el resto se cuenta). En macOS
+  no hay verificación del uid del emisor: solo los permisos del socket.
 
 ## Futuro
 

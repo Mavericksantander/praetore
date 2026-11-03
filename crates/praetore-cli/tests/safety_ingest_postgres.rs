@@ -485,8 +485,8 @@ fn postgres_safety_ingest_end_to_end() {
             params: BTreeMap::new(),
         })
         .unwrap();
-    // The same event twice is a duplicate (another occurred_at would make
-    // it a conflict).
+    // The same event twice is an exact duplicate, counted and not stored
+    // again (another occurred_at would make it a conflict).
     let six = wire(event(6, "safety:halt"));
     let inputs: Vec<Vec<u8>> = vec![
         wire(event(1, "safety:halt")),
@@ -505,13 +505,14 @@ fn postgres_safety_ingest_end_to_end() {
         thread::sleep(Duration::from_millis(30));
     }
     // executor-1: accepted, undeclared, invalid_name, loss (4-5), accepted,
-    // duplicate, conflict. _unattributed: three rejected.
-    scratch.wait_for("executor-1", 7);
-    scratch.wait_for("_unattributed", 3);
+    // conflict. _unattributed: three rejected and the count of the
+    // duplicate (written once the ingester is idle).
+    scratch.wait_for("executor-1", 6);
+    scratch.wait_for("_unattributed", 4);
 
     let out = files.path("executor-1.jsonl");
     let summary = export(&files, &scratch, "executor-1", &out);
-    assert_eq!(summary["entries"], 7, "{summary}");
+    assert_eq!(summary["entries"], 6, "{summary}");
     let head = summary["head"].as_str().unwrap().to_owned();
     let (verified, report) = verify(&files, &out, Some(&head));
     assert!(verified, "{report}");
@@ -567,7 +568,7 @@ fn postgres_safety_ingest_end_to_end() {
         ("invalid_name", 1),
         ("loss", 1),
         ("lost_events", 2),
-        ("duplicate", 1),
+        ("duplicate", 0),
         ("conflict", 1),
     ] {
         assert_eq!(counts[status], count, "{status}: {report}");
@@ -605,11 +606,22 @@ fn postgres_safety_ingest_end_to_end() {
         .collect();
     let reasons: Vec<&str> = records
         .iter()
+        .filter(|r| r["status"] == "rejected")
         .map(|r| r["reason"].as_str().unwrap())
         .collect();
     assert_eq!(
         reasons,
         ["malformed", "signature_invalid", "unknown_source"]
+    );
+    let duplicate = records
+        .iter()
+        .find(|r| r["status"] == "loss" && r["reason"] == "duplicate")
+        .expect("a signed count of the duplicate");
+    assert_eq!(duplicate["dropped"], 1);
+    assert_eq!(duplicate["detail"], "executor-1=1");
+    assert_eq!(
+        summary["counts"]["dropped_by_reason"]["duplicate"], 1,
+        "{summary}"
     );
     assert_eq!(records[0]["raw"]["escaped"], "\\x00\\xffnot json");
 
@@ -663,7 +675,7 @@ fn postgres_safety_ingest_end_to_end() {
     let ingester = Ingester::start(&files, &scratch, &[]);
     send(&client, &wire(event(8, "safety:halt"))).unwrap();
     // seq 7 was dropped by the client while no ingester ran: a loss record.
-    scratch.wait_for("executor-1", 9);
+    scratch.wait_for("executor-1", 8);
     let out = files.path("executor-1-after.jsonl");
     let summary = export(&files, &scratch, "executor-1", &out);
     assert_eq!(summary["counts"]["lost_events"], 3, "{summary}");
@@ -885,4 +897,190 @@ fn postgres_safety_ingest_records_overflow_and_storage_loss_without_blocking_the
         "{reasons:?}\n{log}"
     );
     println!("loss records: {reasons:?}; counts {counts}");
+}
+
+/// Every `dropped` count on the unattributed chain, by reason, read as the
+/// superuser.
+fn dropped_by_reason(scratch: &Scratch) -> BTreeMap<String, i64> {
+    let mut counts = BTreeMap::new();
+    for row in scratch
+        .admin()
+        .query(
+            "SELECT record_json FROM praetore.safety_records \
+             WHERE chain = '_unattributed' AND status = 'loss'",
+            &[],
+        )
+        .unwrap()
+    {
+        let record: Value = serde_json::from_str(&row.get::<_, String>(0)).unwrap();
+        *counts
+            .entry(record["reason"].as_str().unwrap().to_owned())
+            .or_default() += record["dropped"].as_i64().unwrap();
+    }
+    counts
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_safety_ingest_flood_is_bounded_and_counted() {
+    let scratch = Scratch::create();
+    let files = Files::new();
+    let ingester = Ingester::start(
+        &files,
+        &scratch,
+        &[
+            ("PRAETORE_SAFETY_SOURCE_RATE", "1"),
+            ("PRAETORE_SAFETY_SOURCE_BURST", "10"),
+            ("PRAETORE_SAFETY_REJECTED_RATE", "1"),
+            ("PRAETORE_SAFETY_REJECTED_BURST", "5"),
+        ],
+    );
+    let client = SafetyClient::new(files.socket()).unwrap();
+    // A flood: garbage, events of one source and replays of its first
+    // event. Every send returns at once (send() asserts the bound), and a
+    // full socket buffer or queue only drops: the executor never waits.
+    let garbage = 2000;
+    let events = 500;
+    let replays = 500;
+    let mut sent = 0i64;
+    for _ in 0..garbage {
+        sent += i64::from(send(&client, b"garbage").is_ok());
+    }
+    for seq in 1..=events {
+        sent += i64::from(send(&client, &event(seq, "safety:halt").to_wire().unwrap()).is_ok());
+    }
+    let replay = event(1, "safety:halt").to_wire().unwrap();
+    for _ in 0..replays {
+        sent += i64::from(send(&client, &replay).is_ok());
+    }
+    let client_dropped = (garbage + events + replays) as i64 - sent;
+    assert_eq!(client_dropped as u64, client.dropped());
+    // Wait until every message the ingester received is accounted for:
+    // stored as a record, or in a signed count.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let accounted = |scratch: &Scratch| {
+        let records: i64 = scratch
+            .admin()
+            .query_one(
+                "SELECT count(*) FROM praetore.safety_records \
+                 WHERE status IN ('accepted', 'rejected')",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        records + dropped_by_reason(scratch).values().sum::<i64>()
+    };
+    while accounted(&scratch) < sent {
+        assert!(
+            Instant::now() < deadline,
+            "{} of {sent} messages accounted for: {:?}\n{}",
+            accounted(&scratch),
+            dropped_by_reason(&scratch),
+            ingester.log()
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let log = ingester.stop();
+    assert_eq!(accounted(&scratch), sent, "{log}");
+    // Bounded: a few seconds of the rate limits, plus about one count
+    // record per reason per second.
+    let total: i64 = scratch
+        .admin()
+        .query_one("SELECT count(*) FROM praetore.safety_records", &[])
+        .unwrap()
+        .get(0);
+    assert!(total < 100, "{total} records for {sent} messages");
+    // Individual records stay within the rate limits (bursts of 5 and 10,
+    // one per second after that); the rest is in signed counts, including
+    // what the full queue dropped.
+    let dropped = dropped_by_reason(&scratch);
+    let rows = |status: &str| -> i64 {
+        scratch
+            .admin()
+            .query_one(
+                "SELECT count(*) FROM praetore.safety_records WHERE status = $1",
+                &[&status],
+            )
+            .unwrap()
+            .get(0)
+    };
+    assert!(
+        rows("rejected") <= 5 + 30,
+        "{} rejected records",
+        rows("rejected")
+    );
+    assert!(
+        rows("accepted") <= 10 + 30,
+        "{} accepted records",
+        rows("accepted")
+    );
+    for reason in ["rejected_suppressed", "rate_limited"] {
+        assert!(dropped.get(reason).copied().unwrap_or(0) > 0, "{dropped:?}");
+    }
+    // Both chains verify.
+    for chain in ["executor-1", "_unattributed"] {
+        let out = files.path(&format!("flood-{chain}.jsonl"));
+        export(&files, &scratch, chain, &out);
+        let (verified, report) = verify(&files, &out, None);
+        assert!(verified, "{chain}: {report}");
+    }
+}
+
+/// `PRAETORE_SAFETY_ALLOWED_UIDS` (Linux): datagrams from another user id
+/// are counted as `peer_refused` and not read; on other platforms the
+/// setting makes startup fail.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_safety_ingest_checks_the_sender_uid() {
+    let scratch = Scratch::create();
+    let files = Files::new();
+    let own = rustix::process::geteuid().as_raw();
+    let other = if own == 0 { 1 } else { 0 };
+    if !cfg!(target_os = "linux") {
+        let output = files
+            .command(&scratch, "run")
+            .env("PRAETORE_SAFETY_ALLOWED_UIDS", own.to_string())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("needs Linux"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    // Allowed: this process's uid.
+    let ingester = Ingester::start(
+        &files,
+        &scratch,
+        &[("PRAETORE_SAFETY_ALLOWED_UIDS", &format!("{other},{own}"))],
+    );
+    let client = SafetyClient::new(files.socket()).unwrap();
+    send(&client, &event(1, "safety:halt").to_wire().unwrap()).unwrap();
+    scratch.wait_for("executor-1", 1);
+    ingester.stop();
+    // Not allowed: only another uid.
+    let ingester = Ingester::start(
+        &files,
+        &scratch,
+        &[("PRAETORE_SAFETY_ALLOWED_UIDS", &other.to_string())],
+    );
+    let client = SafetyClient::new(files.socket()).unwrap();
+    for seq in 2..=4 {
+        send(&client, &event(seq, "safety:halt").to_wire().unwrap()).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while dropped_by_reason(&scratch)
+        .get("peer_refused")
+        .copied()
+        .unwrap_or(0)
+        < 3
+    {
+        assert!(Instant::now() < deadline, "{}", ingester.log());
+        thread::sleep(Duration::from_millis(100));
+    }
+    ingester.stop();
+    assert_eq!(scratch.count("executor-1"), 1);
+    assert_eq!(dropped_by_reason(&scratch)["peer_refused"], 3);
 }

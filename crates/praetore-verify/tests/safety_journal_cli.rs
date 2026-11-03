@@ -191,7 +191,9 @@ fn a_source_chain_verifies_and_reports_every_status() {
         ("invalid_name", 1),
         ("loss", 1),
         ("lost_events", 2),
-        ("duplicate", 1),
+        // The resent event 6 is an exact duplicate: counted by the
+        // ingester, not stored.
+        ("duplicate", 0),
         ("conflict", 1),
         ("rejected", 0),
     ] {

@@ -392,22 +392,19 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
           done
-      - name: G1 safety ingestion against PostgreSQL (table, roles, binary, export, verify)
+      - name: G1 safety ingestion against PostgreSQL (binary, flood, sender check, export, verify)
         run: |
           set -euo pipefail
-          # The end-to-end tests run target/debug/praetore-verify (built in
-          # the journal-export step above) and the praetore-safety-ingest
-          # binary; each uses its own scratch database and login role.
+          # The end-to-end tests run target/debug/praetore-verify and the
+          # praetore-safety-ingest binary; each uses its own scratch
+          # database and login role. Every ignored test of the file runs
+          # (the praetore-replay-postgres G1 tests run in the next step).
           cargo build -p praetore-verify --locked
-          for test in \
-            "praetore-replay-postgres --test postgres g1_safety::postgres_safety_records_are_chained_append_only_and_tenant_isolated" \
-            "praetore-replay-postgres --test postgres g1_safety::postgres_safety_ingest_role_is_separate_from_the_runtime_role" \
-            "praetore-cli --test safety_ingest_postgres postgres_safety_ingest_end_to_end" \
-            "praetore-cli --test safety_ingest_postgres postgres_safety_ingest_refuses_to_start_on_a_bad_manifest_or_a_shared_key" \
-            "praetore-cli --test safety_ingest_postgres postgres_safety_ingest_records_overflow_and_storage_loss_without_blocking_the_client"; do
-            read -r package flag target name <<<"$test"
+          tests="$(cargo test -q -p praetore-cli --locked --test safety_ingest_postgres -- --ignored --list 2>/dev/null | sed -n 's/: test$//p')"
+          [ "$(wc -w <<<"$tests")" -ge 5 ] || { echo "::error::expected at least 5 G1 end-to-end tests: $tests"; exit 1; }
+          for name in $tests; do
             echo "::group::$name"
-            output="$(cargo test -p "$package" --locked "$flag" "$target" -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; exit 1; }
+            output="$(cargo test -p praetore-cli --locked --test safety_ingest_postgres -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; exit 1; }
             echo "$output"
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }

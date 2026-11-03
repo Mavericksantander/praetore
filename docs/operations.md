@@ -519,7 +519,33 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own role; the file form is read as an owner-only secret file. TLS `verify-full` is required unless the host is loopback or a Unix socket |
 | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096); when full, messages are dropped and recorded as a `queue_overflow` loss |
 | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` (the source's clock) differs from the ingester's clock by more than this many seconds (default 300) keeps its status and carries the signed field `clock_skew_seconds` (`occurred_at - recorded_at`); `praetore-verify safety-journal` counts them as `clock_skew` |
+| `PRAETORE_SAFETY_SOURCE_RATE`, `PRAETORE_SAFETY_SOURCE_BURST` | verified events recorded per second for one source (default 100), and the burst after a quiet period (default 1000), 1 to 1000000. Events above it are not recorded; they are counted in a signed `loss` record (`rate_limited`, `detail` names the sources), and the source's chain shows them as a `source_seq` gap when its next event is recorded |
+| `PRAETORE_SAFETY_REJECTED_RATE`, `PRAETORE_SAFETY_REJECTED_BURST` | individual `rejected` records per second for all inputs that do not verify (default 10, burst 100); the rest are counted (`rejected_suppressed`) |
+| `PRAETORE_SAFETY_ALLOWED_UIDS` | optional, Linux only: comma-separated user ids allowed to send (at most 32). The ingester turns on `SO_PASSCRED` and reads each datagram's `SCM_CREDENTIALS`; a datagram from another user id is not read and is counted (`peer_refused`). On any other platform setting it makes startup fail: there the socket permissions (`0600`, or `0660` with `PRAETORE_SAFETY_SOCKET_GROUP`) are the only check of who may send |
 | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark, and of `source_epoch` above a chain's epoch (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`, `epoch_jump_too_large`) on `_unattributed` and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+
+### Floods
+
+A local process that can write to the socket can send as fast as it likes.
+The ingester bounds what that costs: rates are checked after the
+signature, so only a source key's holder spends that source's budget; an
+exact duplicate of a recorded event (a replayed datagram) creates no record;
+and everything not recorded one by one (rate limited, suppressed rejections,
+exact duplicates, refused peers, a full queue, the database down) is added
+to a signed count on `_unattributed` (`loss`, with `reason` and `dropped`),
+written at most once per second and reason, when the ingester is idle and
+when it stops. `praetore-verify safety-journal` reports the counts as
+`dropped_by_reason`. None of this touches the executors: the client sends
+one non-blocking datagram and never waits, so an executor's failsafe runs
+whatever the ingester does.
+
+**Exact duplicates (change to the G1 decision).** G1 first recorded every
+resent event as a `duplicate` record, to keep replays visible. A replay of
+captured datagrams could then grow a chain without bound, so an exact
+duplicate is now only counted (`duplicate` in the signed counts, per
+source). A different event with a used `source_seq` is still a `conflict`
+record. Chains written before the change may hold `duplicate` records, and
+the verifier still checks them.
 
 ### Source epochs
 

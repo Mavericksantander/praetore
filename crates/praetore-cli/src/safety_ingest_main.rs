@@ -63,14 +63,15 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
-        ChainHead, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP, IngestorConfig,
-        LossReason, MAX_SAFETY_EVENT_BYTES, PreparedRecords, SafetyIngestKey, SafetyIngestor,
+        ChainHead, DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP,
+        FloodControl, FloodLimits, IngestorConfig, LossReason, MAX_FLOOD_LIMIT,
+        MAX_SAFETY_EVENT_BYTES, PreparedRecords, SafetyIngestKey, SafetyIngestor,
         SafetyRecordStatus, SourcePins,
     },
 };
@@ -98,6 +99,11 @@ const MAX_QUEUE_CAPACITY: usize = 4096;
 const POLL: Duration = Duration::from_millis(200);
 /// 2^53 - 1, the largest `source_seq`.
 const MAX_SAFE_SEQ: u64 = (1 << 53) - 1;
+/// Counts of suppressed or dropped messages are recorded at most this
+/// often (and when the ingester is idle or stops), so that a flood adds
+/// about one record per reason per interval.
+const COUNT_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ALLOWED_UIDS: usize = 32;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -147,6 +153,8 @@ struct Config {
     queue_capacity: usize,
     max_seq_jump: u64,
     max_clock_skew_seconds: u64,
+    flood: FloodLimits,
+    allowed_uids: Option<Vec<u32>>,
     role_options: RuntimeRoleOptions,
 }
 
@@ -324,6 +332,44 @@ fn load_config() -> Result<Config> {
             .filter(|seconds| *seconds <= MAX_SAFE_SEQ)
             .ok_or("PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS must be a number of seconds")?,
     };
+    let limit = |name: &str, default: u64| -> Result<u64> {
+        match var(name) {
+            None => Ok(default),
+            Some(value) => value
+                .parse::<u64>()
+                .ok()
+                .filter(|limit| (1..=MAX_FLOOD_LIMIT).contains(limit))
+                .ok_or_else(|| format!("{name} must be between 1 and {MAX_FLOOD_LIMIT}").into()),
+        }
+    };
+    let flood = FloodLimits {
+        source_rate: limit(
+            "PRAETORE_SAFETY_SOURCE_RATE",
+            DEFAULT_FLOOD_LIMITS.source_rate,
+        )?,
+        source_burst: limit(
+            "PRAETORE_SAFETY_SOURCE_BURST",
+            DEFAULT_FLOOD_LIMITS.source_burst,
+        )?,
+        rejected_rate: limit(
+            "PRAETORE_SAFETY_REJECTED_RATE",
+            DEFAULT_FLOOD_LIMITS.rejected_rate,
+        )?,
+        rejected_burst: limit(
+            "PRAETORE_SAFETY_REJECTED_BURST",
+            DEFAULT_FLOOD_LIMITS.rejected_burst,
+        )?,
+    };
+    let allowed_uids = var("PRAETORE_SAFETY_ALLOWED_UIDS")
+        .map(|value| parse_allowed_uids(&value))
+        .transpose()?;
+    if allowed_uids.is_some() && !cfg!(target_os = "linux") {
+        return Err("PRAETORE_SAFETY_ALLOWED_UIDS needs Linux (SO_PASSCRED and \
+                    SCM_CREDENTIALS); on this platform the socket permissions \
+                    (0600, or 0660 with PRAETORE_SAFETY_SOCKET_GROUP) are the only check of \
+                    who may send"
+            .into());
+    }
     let role_options = RuntimeRoleOptions::from_config(|name| std::env::var(name).ok())?;
     Ok(Config {
         socket,
@@ -339,8 +385,32 @@ fn load_config() -> Result<Config> {
         queue_capacity,
         max_seq_jump,
         max_clock_skew_seconds,
+        flood,
+        allowed_uids,
         role_options,
     })
+}
+
+/// `PRAETORE_SAFETY_ALLOWED_UIDS`: comma-separated numeric user ids, at
+/// least one, at most 32, no repeats.
+fn parse_allowed_uids(value: &str) -> Result<Vec<u32>> {
+    let mut uids = Vec::new();
+    for part in value.split(',') {
+        let uid = part
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("PRAETORE_SAFETY_ALLOWED_UIDS: {part:?} is not a user id"))?;
+        if uids.contains(&uid) {
+            return Err(format!("PRAETORE_SAFETY_ALLOWED_UIDS lists {uid} twice").into());
+        }
+        uids.push(uid);
+    }
+    if uids.len() > MAX_ALLOWED_UIDS {
+        return Err(
+            format!("PRAETORE_SAFETY_ALLOWED_UIDS lists more than {MAX_ALLOWED_UIDS}").into(),
+        );
+    }
+    Ok(uids)
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +450,8 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
             socket_gid: config.socket_gid,
             database: config.database,
             queue_capacity: config.queue_capacity,
+            flood: config.flood,
+            allowed_uids: config.allowed_uids,
             role_options: config.role_options,
         },
     ))
@@ -394,6 +466,8 @@ struct Runtime {
     socket_gid: Option<u32>,
     database: DatabaseConnector,
     queue_capacity: usize,
+    flood: FloodLimits,
+    allowed_uids: Option<Vec<u32>>,
     role_options: RuntimeRoleOptions,
 }
 
@@ -624,21 +698,29 @@ fn run() -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     spawn_signal_thread(Arc::clone(&stop))?;
     let overflow = Arc::new(AtomicU64::new(0));
+    let refused = Arc::new(AtomicU64::new(0));
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(runtime.queue_capacity);
+    let peers = PeerCheck::new(&listener, runtime.allowed_uids.clone())?;
     let reader = {
         let stop = Arc::clone(&stop);
         let overflow = Arc::clone(&overflow);
+        let refused = Arc::clone(&refused);
         thread::Builder::new()
             .name("safety-socket".into())
-            .spawn(move || read_socket(listener, sender, &stop, &overflow))?
+            .spawn(move || read_socket(listener, sender, &stop, &overflow, &peers, &refused))?
     };
 
+    let started = Instant::now();
     let mut worker = Worker {
         ingestor,
         store: Some(store),
         runtime: &runtime,
         overflow: &overflow,
+        refused: &refused,
         storage_dropped: 0,
+        flood: FloodControl::new(runtime.flood)?,
+        started,
+        last_count: started,
     };
     loop {
         match receiver.recv_timeout(POLL) {
@@ -656,7 +738,10 @@ fn run() -> Result<()> {
     {
         let _ = std::fs::remove_file(&runtime.socket);
     }
-    let pending = worker.overflow.load(Ordering::Relaxed) + worker.storage_dropped;
+    let pending = worker.overflow.load(Ordering::Relaxed)
+        + worker.refused.load(Ordering::Relaxed)
+        + worker.storage_dropped
+        + u64::from(worker.flood.has_pending());
     log(format!(
         "stopped{}",
         if pending > 0 {
@@ -694,6 +779,66 @@ fn spawn_signal_thread(stop: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// The sender check of `PRAETORE_SAFETY_ALLOWED_UIDS` (Linux only): with
+/// `SO_PASSCRED` the kernel attaches the sending process's credentials to
+/// every datagram (`SCM_CREDENTIALS`), and a datagram from any other user
+/// id is counted (`peer_refused`) and not read.
+struct PeerCheck {
+    allowed: Option<Vec<u32>>,
+}
+
+impl PeerCheck {
+    fn new(listener: &UnixDatagram, allowed: Option<Vec<u32>>) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if allowed.is_some() {
+            rustix::net::sockopt::set_socket_passcred(listener, true)
+                .map_err(|error| format!("SO_PASSCRED on the socket: {error}"))?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = listener;
+            if allowed.is_some() {
+                return Err("PRAETORE_SAFETY_ALLOWED_UIDS needs Linux".into());
+            }
+        }
+        Ok(Self { allowed })
+    }
+
+    /// Receives one datagram: its length, and whether its sender is
+    /// allowed.
+    fn recv(&self, listener: &UnixDatagram, buffer: &mut [u8]) -> std::io::Result<(usize, bool)> {
+        let Some(allowed) = &self.allowed else {
+            return listener.recv(buffer).map(|read| (read, true));
+        };
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+            let mut space =
+                [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmCredentials(1))];
+            let mut control = RecvAncillaryBuffer::new(&mut space);
+            let mut iov = [std::io::IoSliceMut::new(buffer)];
+            let received = recvmsg(listener, &mut iov, &mut control, RecvFlags::CMSG_CLOEXEC)?;
+            let mut sender = None;
+            for message in control.drain() {
+                if let RecvAncillaryMessage::ScmCredentials(credentials) = message {
+                    sender = Some(credentials.uid.as_raw());
+                }
+            }
+            Ok((
+                received.bytes,
+                sender.is_some_and(|uid| allowed.contains(&uid)),
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (allowed, listener, buffer);
+            Err(std::io::Error::other(
+                "PRAETORE_SAFETY_ALLOWED_UIDS needs Linux",
+            ))
+        }
+    }
+}
+
 /// Reads datagrams into the bounded queue. Never waits for the database:
 /// when the queue is full the message is counted and dropped.
 fn read_socket(
@@ -701,14 +846,19 @@ fn read_socket(
     sender: mpsc::SyncSender<Vec<u8>>,
     stop: &AtomicBool,
     overflow: &AtomicU64,
+    peers: &PeerCheck,
+    refused: &AtomicU64,
 ) {
     let mut buffer = vec![0; RECEIVE_BYTES];
     while !stop.load(Ordering::SeqCst) {
-        match listener.recv(&mut buffer) {
+        match peers.recv(&listener, &mut buffer) {
+            Ok((_, false)) => {
+                refused.fetch_add(1, Ordering::Relaxed);
+            }
             // A zero-length datagram is a liveness probe (another ingester
             // starting); it is not an event.
-            Ok(0) => {}
-            Ok(read) => match sender.try_send(buffer[..read].to_vec()) {
+            Ok((0, true)) => {}
+            Ok((read, true)) => match sender.try_send(buffer[..read.min(RECEIVE_BYTES)].to_vec()) {
                 Ok(()) => {}
                 Err(mpsc::TrySendError::Full(_)) => {
                     overflow.fetch_add(1, Ordering::Relaxed);
@@ -735,21 +885,30 @@ struct Worker<'a> {
     store: Option<PostgresSafetyStore>,
     runtime: &'a Runtime,
     overflow: &'a AtomicU64,
+    refused: &'a AtomicU64,
     storage_dropped: u64,
+    flood: FloodControl,
+    started: Instant,
+    last_count: Instant,
 }
 
 impl Worker<'_> {
     fn handle(&mut self, message: &[u8]) {
-        self.flush_dropped();
+        if self.last_count.elapsed() >= COUNT_INTERVAL {
+            self.flush_dropped();
+        }
         let Some(store) = self.store.as_mut() else {
             self.storage_dropped += 1;
             self.reconnect();
             return;
         };
-        let prepared = match self
-            .ingestor
-            .prepare(message, OffsetDateTime::now_utc(), store)
-        {
+        let prepared = match self.ingestor.prepare_limited(
+            message,
+            OffsetDateTime::now_utc(),
+            self.started.elapsed(),
+            store,
+            &mut self.flood,
+        ) {
             Ok(prepared) => prepared,
             Err(error) => {
                 log(format!("message not recorded: {error}"));
@@ -758,6 +917,10 @@ impl Worker<'_> {
                 return;
             }
         };
+        if let Some(suppressed) = &prepared.suppressed {
+            self.flood.count(suppressed);
+            return;
+        }
         if self.persist(&prepared) {
             for record in &prepared.records {
                 let payload = record.payload();
@@ -838,14 +1001,47 @@ impl Worker<'_> {
     }
 
     /// Records the messages dropped so far (a full queue, the database
-    /// unavailable) as signed loss records on the unattributed chain.
+    /// unavailable) and the counts of suppressed ones (rate limits, exact
+    /// duplicates, refused peers) as signed records on the unattributed
+    /// chain.
     fn flush_dropped(&mut self) {
+        self.last_count = Instant::now();
+        self.flood.add(
+            LossReason::PeerRefused,
+            None,
+            self.refused.swap(0, Ordering::Relaxed),
+        );
         if self.store.is_none() {
-            if self.overflow.load(Ordering::Relaxed) + self.storage_dropped > 0 {
+            if self.overflow.load(Ordering::Relaxed) + self.storage_dropped > 0
+                || self.flood.has_pending()
+            {
                 self.reconnect();
             }
             if self.store.is_none() {
                 return;
+            }
+        }
+        for count in self.flood.take_pending() {
+            let stored = match self.ingestor.prepare_count(
+                count.reason,
+                count.count,
+                count.detail.as_deref(),
+                OffsetDateTime::now_utc(),
+            ) {
+                Ok(prepared) => self.persist(&prepared),
+                Err(error) => {
+                    log(format!("cannot sign a count record: {error}"));
+                    false
+                }
+            };
+            if stored {
+                log(format!(
+                    "recorded {} messages not stored one by one ({})",
+                    count.count,
+                    count.reason.as_str()
+                ));
+            } else {
+                self.flood.restore(count);
             }
         }
         let overflow = self.overflow.swap(0, Ordering::Relaxed);
