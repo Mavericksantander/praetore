@@ -41,7 +41,7 @@ use postgres::Client;
 use sha2::{Digest, Sha256};
 
 /// Ordered `(version, sql)` pairs. Append only; never edit or reorder.
-pub const MIGRATIONS: [(&str, &str); 17] = [
+pub const MIGRATIONS: [(&str, &str); 18] = [
     (
         "0001_replay_claims",
         include_str!("../migrations/0001_replay_claims.sql"),
@@ -109,6 +109,10 @@ pub const MIGRATIONS: [(&str, &str); 17] = [
     (
         "0017_safety_records_followups",
         include_str!("../migrations/0017_safety_records_followups.sql"),
+    ),
+    (
+        "0018_safety_audit_and_role_oids",
+        include_str!("../migrations/0018_safety_audit_and_role_oids.sql"),
     ),
 ];
 
@@ -547,6 +551,10 @@ const RUNTIME_GROUP_VERSION: &str = "0011_runtime_role";
 /// the group of the safety ingester's login role (G1).
 const SAFETY_INGEST_GROUP_VERSION: &str = "0016_safety_records";
 
+/// The migration that creates (or only grants to) `praetore_safety_audit`,
+/// the group of read-only login roles that export and audit safety records.
+const SAFETY_AUDIT_GROUP_VERSION: &str = "0018_safety_audit_and_role_oids";
+
 /// Last migration that existed before the control table was introduced.
 const BASELINE_VERSION: &str = "0009_human_approval_expirations";
 
@@ -575,6 +583,12 @@ fn apply_locked(
             options,
             "praetore_safety_ingest",
             SAFETY_INGEST_GROUP_VERSION,
+        )?;
+        runtime_group_check(
+            &mut transaction,
+            options,
+            "praetore_safety_audit",
+            SAFETY_AUDIT_GROUP_VERSION,
         )?;
         let problems = environment_problems(&mut transaction, options)?;
         transaction.rollback()?;
@@ -1959,7 +1973,8 @@ fn schema_owner_check(
 }
 
 /// Migration 0011 creates `praetore_runtime` (and 0016
-/// `praetore_safety_ingest`) when it does not exist, which needs CREATEROLE
+/// `praetore_safety_ingest`, 0018 `praetore_safety_audit`) when it does not
+/// exist, which needs CREATEROLE
 /// (or superuser) in the role that runs the migrations: the owner of an
 /// existing schema, else the `PRAETORE_SCHEMA_OWNER` group, else the
 /// migrating role. Refuses up front, before migration 0001, when the

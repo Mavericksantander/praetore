@@ -38,6 +38,7 @@
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
 //! | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` differs from the ingester's clock by more than this (default 300) keeps its status and carries `clock_skew_seconds` |
 //! | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` |
+//! | `PRAETORE_SAFETY_MAX_EPOCH_JUMP` | largest accepted step of `source_epoch` above a chain's epoch, 0 for a new chain, so it also bounds a chain's first epoch (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`epoch_jump_too_large`) on `_unattributed` |
 //!
 //! The runtime-role relaxations of the gateway (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
 //! `PRAETORE_SCHEMA_OWNER`, ...) apply to the ingester's role check too.
@@ -68,10 +69,10 @@ use std::{
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
-        DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP, FloodControl,
-        FloodLimits, IngestorConfig, LossReason, MAX_FLOOD_LIMIT, MAX_SAFETY_EVENT_BYTES,
-        PreparedRecords, SafetyIngestKey, SafetyIngestor, SafetyRecord, SafetyRecordStatus,
-        SourcePins,
+        DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_EPOCH_JUMP,
+        DEFAULT_MAX_SEQ_JUMP, FloodControl, FloodLimits, IngestorConfig, LossReason,
+        MAX_FLOOD_LIMIT, MAX_SAFETY_EVENT_BYTES, PreparedRecords, SafetyIngestKey, SafetyIngestor,
+        SafetyRecord, SafetyRecordStatus, SourcePins,
     },
 };
 use praetore_replay_postgres::{
@@ -151,6 +152,7 @@ struct Config {
     database: DatabaseConnector,
     queue_capacity: usize,
     max_seq_jump: u64,
+    max_epoch_jump: u64,
     max_clock_skew_seconds: u64,
     flood: FloodLimits,
     allowed_uids: Option<Vec<u32>>,
@@ -323,6 +325,14 @@ fn load_config() -> Result<Config> {
             .filter(|jump| (1..=MAX_SAFE_SEQ).contains(jump))
             .ok_or("PRAETORE_SAFETY_MAX_SEQ_JUMP must be between 1 and 2^53 - 1")?,
     };
+    let max_epoch_jump = match var("PRAETORE_SAFETY_MAX_EPOCH_JUMP") {
+        None => DEFAULT_MAX_EPOCH_JUMP,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|jump| (1..=MAX_SAFE_SEQ).contains(jump))
+            .ok_or("PRAETORE_SAFETY_MAX_EPOCH_JUMP must be between 1 and 2^53 - 1")?,
+    };
     let max_clock_skew_seconds = match var("PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS") {
         None => DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         Some(value) => value
@@ -383,6 +393,7 @@ fn load_config() -> Result<Config> {
         database,
         queue_capacity,
         max_seq_jump,
+        max_epoch_jump,
         max_clock_skew_seconds,
         flood,
         allowed_uids,
@@ -437,6 +448,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
         attester_pin: config.attester_pin,
         sources: config.sources,
         max_seq_jump: config.max_seq_jump,
+        max_epoch_jump: config.max_epoch_jump,
         max_clock_skew_seconds: config.max_clock_skew_seconds,
     })?;
     Ok((
@@ -488,8 +500,20 @@ fn open_store(
     let mut store = PostgresSafetyStore::from_client(client);
     store.check_registration(ingestor.tenant_id(), Some(ingestor.key_id()))?;
     if !store.try_lock_tenant(ingestor.tenant_id())? {
+        // Any role of the database can take this lock (a known
+        // limitation): name the holder so the operator can stop it.
+        let holders = store
+            .tenant_lock_holders(ingestor.tenant_id())
+            .map(|holders| {
+                if holders.is_empty() {
+                    "holder not visible".to_owned()
+                } else {
+                    holders.join("; ")
+                }
+            })
+            .unwrap_or_else(|error| format!("holder unknown: {error}"));
         return Err(format!(
-            "another praetore-safety-ingest holds the lock of tenant {}; refusing to start",
+            "another session holds the lock of tenant {} ({holders}); refusing to start",
             ingestor.tenant_id()
         )
         .into());
@@ -575,16 +599,23 @@ fn bind_socket(socket: &Path, group: Option<u32>) -> Result<(UnixDatagram, (u64,
         log(format!("removing the stale socket {}", socket.display()));
         std::fs::remove_file(socket)?;
     }
-    // Created 0600 (umask 0177): no window in which others could connect.
-    let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
-    let bound = UnixDatagram::bind(socket);
-    rustix::process::umask(previous);
-    let listener = bound.map_err(|error| format!("bind {}: {error}", socket.display()))?;
+    // Bound inside a private directory (0700) next to the socket, given its
+    // mode and group there, then renamed into place: there is no window in
+    // which others could connect, and the process umask (shared by every
+    // thread) is never changed.
+    let private = PrivateBindDir::create(socket)?;
+    let staged = private.0.join("s");
+    let listener = UnixDatagram::bind(&staged)
+        .map_err(|error| format!("bind {}: {error}", socket.display()))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
     if let Some(gid) = group {
-        rustix::fs::chown(socket, None, Some(rustix::fs::Gid::from_raw(gid)))
+        rustix::fs::chown(&staged, None, Some(rustix::fs::Gid::from_raw(gid)))
             .map_err(|error| format!("chown {} to gid {gid}: {error}", socket.display()))?;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o660))?;
     }
+    std::fs::rename(&staged, socket)
+        .map_err(|error| format!("rename the socket to {}: {error}", socket.display()))?;
+    drop(private);
     let metadata = std::fs::symlink_metadata(socket)?;
     if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
         return Err(format!("{} is not the socket this process bound", socket.display()).into());
@@ -592,6 +623,38 @@ fn bind_socket(socket: &Path, group: Option<u32>) -> Result<(UnixDatagram, (u64,
     let _ = rustix::net::sockopt::set_socket_recv_buffer_size(&listener, RECEIVE_BUFFER_BYTES);
     listener.set_read_timeout(Some(POLL))?;
     Ok((listener, (metadata.dev(), metadata.ino())))
+}
+
+/// A directory only this user can enter, next to the socket, removed on
+/// drop (with whatever is still in it).
+struct PrivateBindDir(PathBuf);
+
+impl PrivateBindDir {
+    fn create(socket: &Path) -> Result<Self> {
+        let parent = match socket.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let path = parent.join(format!(".bind-{}", std::process::id()));
+        // A leftover of a crashed start of this pid: removed without
+        // following links.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path)?,
+            Ok(_) => std::fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&path)
+            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for PrivateBindDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Prints the public key of a secret key file (read as a private file).
@@ -1108,11 +1171,6 @@ impl Worker<'_> {
 mod tests {
     use super::*;
 
-    /// bind_socket sets the process umask while it binds and restores it:
-    /// two tests binding at once could restore it under each other, so
-    /// they take this lock.
-    static SOCKETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct Dir(PathBuf);
 
     impl Dir {
@@ -1133,9 +1191,6 @@ mod tests {
 
     #[test]
     fn the_socket_is_created_owner_only_or_with_its_group() {
-        let _serial = SOCKETS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = Dir::new("mode", 0o700);
         let socket = dir.0.join("s");
         let (listener, _) = bind_socket(&socket, None).unwrap();
@@ -1180,9 +1235,6 @@ mod tests {
 
     #[test]
     fn an_unsafe_socket_path_is_refused() {
-        let _serial = SOCKETS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Not a socket: never replaced.
         let dir = Dir::new("file", 0o700);
         let socket = dir.0.join("s");

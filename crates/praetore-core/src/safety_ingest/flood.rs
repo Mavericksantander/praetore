@@ -178,12 +178,21 @@ impl FloodControl {
             .collect()
     }
 
-    /// Puts back a count that could not be recorded.
+    /// Puts back a count that could not be recorded (taken with
+    /// [`Self::take_pending`]), so the next flush records it.
+    ///
+    /// Public because the ingester binary (`praetore-cli`) puts a count back
+    /// when its database write fails. It can only add to the pending counts
+    /// of this process's own `FloodControl` (as [`Self::add`] does): it
+    /// never removes a count and touches no signed record.
     pub fn restore(&mut self, pending: PendingCount) {
         if pending.sources.is_empty() {
             self.add(pending.reason, None, pending.count);
         } else {
-            let attributed: u64 = pending.sources.values().sum();
+            let attributed = pending
+                .sources
+                .values()
+                .fold(0u64, |sum, count| sum.saturating_add(*count));
             for (source, count) in &pending.sources {
                 self.add(pending.reason, Some(source), *count);
             }

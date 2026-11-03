@@ -4,8 +4,8 @@
 use praetore_core::{
     ActionClass, EvidenceAttesterKey, Policy, SafetyNamespaceKey, SafetyNamespaceManifest,
     safety_ingest::{
-        DEFAULT_MAX_SEQ_JUMP, IngestorConfig, LossReason, MemoryLookup, SafetyEventDraft,
-        SafetyIngestKey, SafetyIngestor, SafetySourceKey, SourcePins,
+        DEFAULT_MAX_EPOCH_JUMP, DEFAULT_MAX_SEQ_JUMP, IngestorConfig, LossReason, MemoryLookup,
+        SafetyEventDraft, SafetyIngestKey, SafetyIngestor, SafetySourceKey, SourcePins,
     },
 };
 use serde_json::Value;
@@ -79,6 +79,7 @@ fn chains() -> (String, String) {
             .unwrap(),
         sources,
         max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
+        max_epoch_jump: DEFAULT_MAX_EPOCH_JUMP,
         max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     })
     .unwrap();

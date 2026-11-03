@@ -54,6 +54,12 @@ pub enum SafetyStoreError {
         expected_key_id: Option<String>,
         found: Option<(Uuid, String)>,
     },
+    /// An audit role (`praetore_safety_audit`) is not registered for the
+    /// tenant in `praetore.safety_audit_tenants`.
+    AuditRegistration {
+        role: String,
+        tenant: Uuid,
+    },
 }
 
 impl std::fmt::Display for SafetyStoreError {
@@ -81,6 +87,12 @@ impl std::fmt::Display for SafetyStoreError {
                  (PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE); refusing to continue the chain"
             ),
             Self::TooLarge => write!(f, "too many safety records for one export"),
+            Self::AuditRegistration { role, tenant } => write!(
+                f,
+                "audit role {role} is not registered for tenant {tenant}; the schema owner \
+                 registers it once: INSERT INTO praetore.safety_audit_tenants (role_oid, \
+                 tenant_id) VALUES ('{role}'::regrole, '{tenant}')"
+            ),
             Self::Registration {
                 role,
                 expected_tenant,
@@ -93,8 +105,10 @@ impl std::fmt::Display for SafetyStoreError {
                         f,
                         "database role {role} is not registered for safety ingestion; the \
                          schema owner registers it once: INSERT INTO \
-                         praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
-                         VALUES ('{role}', '{expected_tenant}', '{key}')"
+                         praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id) \
+                         VALUES ('{role}'::regrole, '{expected_tenant}', '{key}') (or, for a \
+                         read-only export, register an audit role in \
+                         praetore.safety_audit_tenants)"
                     ),
                     Some((tenant, key_id)) => write!(
                         f,
@@ -160,7 +174,9 @@ impl PostgresSafetyStore {
                     t.ingest_key_id::pg_catalog.text \
              FROM (SELECT 1) one \
              LEFT JOIN praetore.safety_ingest_tenants t \
-               ON t.role_name OPERATOR(pg_catalog.=) SESSION_USER",
+               ON t.role_oid OPERATOR(pg_catalog.=) \
+                  (SELECT r.oid FROM pg_catalog.pg_roles r \
+                   WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER)",
             &[],
         )?;
         let role: String = row.get(0);
@@ -185,6 +201,41 @@ impl PostgresSafetyStore {
         })
     }
 
+    /// For an export: checks that the session's login role may read
+    /// `tenant_id`'s records, as that tenant's registered ingest role or as
+    /// an audit role registered for it in `praetore.safety_audit_tenants`.
+    /// Row-level security would otherwise show an empty chain.
+    pub fn check_read_access(&mut self, tenant_id: Uuid) -> Result<(), SafetyStoreError> {
+        let audit: bool = self
+            .client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles g \
+                                WHERE g.rolname OPERATOR(pg_catalog.=) 'praetore_safety_audit' \
+                                  AND pg_catalog.pg_has_role(SESSION_USER, g.oid, 'MEMBER'))",
+                &[],
+            )?
+            .get(0);
+        if !audit {
+            return self.check_registration(tenant_id, None);
+        }
+        let row = self.client.query_one(
+            "SELECT SESSION_USER::pg_catalog.text, EXISTS ( \
+                 SELECT 1 FROM praetore.safety_audit_tenants a \
+                 WHERE a.tenant_id = $1 \
+                   AND a.role_oid OPERATOR(pg_catalog.=) \
+                       (SELECT r.oid FROM pg_catalog.pg_roles r \
+                        WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER))",
+            &[&tenant_id],
+        )?;
+        if row.get::<_, bool>(1) {
+            return Ok(());
+        }
+        Err(SafetyStoreError::AuditRegistration {
+            role: row.get(0),
+            tenant: tenant_id,
+        })
+    }
+
     /// Takes the session advisory lock of `tenant_id`'s safety chains, so
     /// that a second ingester for the same tenant refuses to start. Held
     /// until the connection closes. `false` when another session holds it.
@@ -196,6 +247,39 @@ impl PostgresSafetyStore {
                 &[&SAFETY_LOCK_CLASS, &tenant_id.to_string()],
             )?
             .get(0))
+    }
+
+    /// The sessions holding the lock of `tenant_id` (see
+    /// [`Self::try_lock_tenant`]): `pid`, login role, `application_name`
+    /// and start time, as `pg_stat_activity` shows them to this role. The
+    /// lock needs no privilege, so any role of the database can hold it
+    /// (a known limitation): this tells the operator whom to stop.
+    pub fn tenant_lock_holders(
+        &mut self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<String>, SafetyStoreError> {
+        let rows = self.client.query(
+            "SELECT l.pid, coalesce(a.usename::text, '?'), coalesce(a.application_name, ''), \
+                    coalesce(a.backend_start::text, '?') \
+             FROM pg_catalog.pg_locks l \
+             LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid \
+             WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 \
+               AND l.classid = $1::bigint::oid \
+               AND l.objid = ((pg_catalog.hashtext($2)::bigint + 4294967296) % 4294967296)::oid \
+               AND l.pid <> pg_catalog.pg_backend_pid() \
+             ORDER BY l.pid",
+            &[&i64::from(SAFETY_LOCK_CLASS), &tenant_id.to_string()],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let pid: i32 = row.get(0);
+                let user: String = row.get(1);
+                let application: String = row.get(2);
+                let started: String = row.get(3);
+                format!("pid {pid}, role {user}, application {application:?}, since {started}")
+            })
+            .collect())
     }
 
     /// The last record of every chain of `tenant_id`. Each must parse, and

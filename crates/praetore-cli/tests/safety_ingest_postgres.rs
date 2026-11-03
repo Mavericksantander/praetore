@@ -98,8 +98,8 @@ impl Scratch {
         // (migration 0017).
         client
             .execute(
-                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
-                 VALUES ($1, $2, $3)",
+                "INSERT INTO praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id) \
+                 VALUES ($1::pg_catalog.text::pg_catalog.regrole, $2, $3)",
                 &[&role, &TENANT, &ingest_key().key_id()],
             )
             .unwrap();
@@ -778,10 +778,23 @@ fn postgres_safety_ingest_refuses_to_start_on_a_bad_manifest_or_a_shared_key() {
         .output()
         .unwrap();
     assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The refusal names the holding session.
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("holds the lock"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("holds the lock") && stderr.contains("(pid ") && stderr.contains(", role "),
+        "{stderr}"
+    );
+    // So does doctor.
+    let doctor = files
+        .command(&scratch, "doctor")
+        .env("PRAETORE_SAFETY_SOCKET", files.path("second.sock"))
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&doctor.stdout);
+    assert!(!doctor.status.success());
+    assert!(
+        report.contains("holds the lock") && report.contains("(pid "),
+        "{report}"
     );
     first.stop();
 }

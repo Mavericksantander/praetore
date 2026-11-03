@@ -25,26 +25,54 @@
 //! The transport is local only (v1). Reporting over the network (HTTP with
 //! mutual TLS) is future work.
 //!
+//! Neither the epoch nor the client may stop the executor: if the epoch
+//! cannot be persisted, this run does not report (never with a guessed
+//! epoch), logs why, and the executor and its failsafe run as always.
+//!
 //! ```no_run
 //! use praetore_core::{SafetyEventDraft, SafetySourceKey};
 //! use praetore_safety_client::{EpochFile, SafetyClient};
 //!
+//! # fn halt_the_actuators() {}
 //! let key = SafetySourceKey::generate();
-//! // Once per start of the source, before the first event.
-//! let epoch = EpochFile::new("/var/lib/executor-1/safety-epoch").start().unwrap();
-//! let client = SafetyClient::new("/run/praetore-safety/ingest.sock").unwrap();
-//! let event = key
-//!     .sign_event(SafetyEventDraft {
+//! // Once per start of the source, before the first event. A failure turns
+//! // reporting off for this run; it is not a reason to stop or to delay
+//! // the start.
+//! let reporter = match EpochFile::new("/var/lib/executor-1/safety-epoch").start() {
+//!     Ok(epoch) => match SafetyClient::new("/run/praetore-safety/ingest.sock") {
+//!         Ok(client) => Some((epoch, client)),
+//!         Err(error) => {
+//!             eprintln!("safety reporting off: {error}");
+//!             None
+//!         }
+//!     },
+//!     Err(error) => {
+//!         // Do not fall back to epoch 1: the ingester would reject every
+//!         // event as stale_epoch. Alert the operator instead.
+//!         eprintln!("safety reporting off: cannot persist the source epoch: {error}");
+//!         None
+//!     }
+//! };
+//! let mut source_seq = 0;
+//!
+//! // The safety action runs first, whatever happens to reporting.
+//! halt_the_actuators();
+//! if let Some((epoch, client)) = &reporter {
+//!     source_seq += 1;
+//!     let draft = SafetyEventDraft {
 //!         source_id: "executor-1".into(),
-//!         source_epoch: epoch,
-//!         source_seq: 1,
+//!         source_epoch: *epoch,
+//!         source_seq,
 //!         action: "safety:halt".into(),
 //!         occurred_at: time::OffsetDateTime::now_utc(),
 //!         params: Default::default(),
-//!     })
-//!     .unwrap();
-//! // The action already ran; the result of reporting it does not matter to it.
-//! let _ = client.send(&event);
+//!     };
+//!     // The action already ran; the result of reporting it does not matter
+//!     // to it.
+//!     if let Ok(event) = key.sign_event(draft) {
+//!         let _ = client.send(&event);
+//!     }
+//! }
 //! ```
 
 #![cfg(unix)]

@@ -842,6 +842,8 @@ enum RoleKind {
     Runtime,
     /// The safety ingester's connection (`praetore_safety_ingest`, G1).
     SafetyIngest,
+    /// A read-only export and audit connection (`praetore_safety_audit`).
+    SafetyAudit,
 }
 
 /// The checks of [`verify_runtime_role_with`] for the connection of
@@ -879,6 +881,73 @@ pub fn verify_safety_ingest_role_with(
     let result = verify_runtime_role_in(&mut transaction, options, RoleKind::SafetyIngest);
     transaction.rollback()?;
     result
+}
+
+/// The checks of [`verify_safety_ingest_role_with`] for a read-only login
+/// role that exports and audits safety records (`praetore_safety_audit`,
+/// migration 0018): not privileged, not an owner, no CREATE on the schema,
+/// not a member of `praetore_runtime` or `praetore_safety_ingest`, and no
+/// privilege on a `praetore` table other than SELECT on
+/// `schema_migrations`, `safety_records` and `safety_audit_tenants`.
+pub fn verify_safety_audit_role_with(
+    client: &mut Client,
+    options: &RuntimeRoleOptions,
+) -> Result<(), RuntimeRoleError> {
+    let mut transaction = client.build_transaction().read_only(true).start()?;
+    transaction.batch_execute(&format!(
+        "SET LOCAL search_path = {}",
+        crate::RUNTIME_SEARCH_PATH
+    ))?;
+    let result = verify_runtime_role_in(&mut transaction, options, RoleKind::SafetyAudit);
+    transaction.rollback()?;
+    result
+}
+
+/// For an audit role: a member of `praetore_runtime` or
+/// `praetore_safety_ingest`, or the `praetore` tables on which it holds a
+/// privilege beyond SELECT on `schema_migrations`, `safety_records` and
+/// `safety_audit_tenants` (up to ten).
+fn safety_audit_excess(
+    transaction: &mut postgres::Transaction<'_>,
+    role: &str,
+) -> Result<Option<String>, RuntimeRoleError> {
+    let row = transaction.query_one(
+        "SELECT (SELECT g.rolname::pg_catalog.text FROM pg_catalog.pg_roles g \
+                 WHERE (g.rolname OPERATOR(pg_catalog.=) 'praetore_runtime' \
+                        OR g.rolname OPERATOR(pg_catalog.=) 'praetore_safety_ingest') \
+                   AND pg_catalog.pg_has_role($1, g.oid, 'MEMBER') \
+                 ORDER BY 1 LIMIT 1), \
+                (SELECT pg_catalog.string_agg(entry, ', ' ORDER BY entry) FROM ( \
+                     SELECT pg_catalog.concat('praetore.', c.relname) AS entry \
+                     FROM pg_catalog.pg_class c \
+                     JOIN pg_catalog.pg_namespace n \
+                       ON n.oid OPERATOR(pg_catalog.=) c.relnamespace \
+                     WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+                       AND (c.relkind OPERATOR(pg_catalog.=) 'r' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'p' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'v' \
+                            OR c.relkind OPERATOR(pg_catalog.=) 'm') \
+                       AND CASE \
+                           WHEN c.relname IN ('safety_records', 'schema_migrations', \
+                                              'safety_audit_tenants') \
+                           THEN pg_catalog.has_table_privilege($1, c.oid, \
+                                    'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                                OR pg_catalog.has_any_column_privilege($1, c.oid, \
+                                    'INSERT, UPDATE, REFERENCES') \
+                           ELSE pg_catalog.has_table_privilege($1, c.oid, \
+                                    'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                                OR pg_catalog.has_any_column_privilege($1, c.oid, \
+                                    'SELECT, INSERT, UPDATE, REFERENCES') \
+                           END \
+                     ORDER BY 1 LIMIT 10) first_entries)",
+        &[&role],
+    )?;
+    if let Some(group) = row.get::<_, Option<String>>(0) {
+        return Ok(Some(format!("audit role {role} is a member of {group}")));
+    }
+    Ok(row
+        .get::<_, Option<String>>(1)
+        .map(|tables| format!("audit role {role} holds privileges on {tables}")))
 }
 
 /// Whether `role` can write safety records: a member of
@@ -1043,6 +1112,11 @@ fn verify_runtime_role_in(
             }
             RoleKind::SafetyIngest => {
                 if let Some(reason) = safety_ingest_excess(transaction, &role)? {
+                    return Err(RuntimeRoleError::RoleSeparation(reason));
+                }
+            }
+            RoleKind::SafetyAudit => {
+                if let Some(reason) = safety_audit_excess(transaction, &role)? {
                     return Err(RuntimeRoleError::RoleSeparation(reason));
                 }
             }
@@ -1231,7 +1305,10 @@ fn unsafe_runtime_setting(
 /// `execution_journal`, `execution_attestations`, `human_approvals` and
 /// `human_approval_expirations`; SELECT on `storage_records` (0015);
 /// `praetore_safety_ingest`'s grants from 0016 (schema USAGE, SELECT on
-/// `schema_migrations`, SELECT and INSERT on `safety_records`);
+/// `schema_migrations`, SELECT and INSERT on `safety_records`, SELECT on
+/// `safety_ingest_tenants` (0017)); `praetore_safety_audit`'s from 0018
+/// (schema USAGE, SELECT on `schema_migrations`, `safety_records` and
+/// `safety_audit_tenants`);
 /// UPDATE of `execution_status`,
 /// `output_json`, `not_dispatched_reason` and `updated_at`); the
 /// documented `praetore_observe` shape exactly (schema USAGE; column SELECT
@@ -1298,6 +1375,11 @@ fn unexpected_grants(
              ('r', 'schema_migrations', 'SELECT'), \
              ('r', 'safety_records', 'SELECT'), ('r', 'safety_records', 'INSERT'), \
              ('r', 'safety_ingest_tenants', 'SELECT')), \
+         audit_allowed(kind, rel, privilege) AS (VALUES \
+             ('n', '', 'USAGE'), \
+             ('r', 'schema_migrations', 'SELECT'), \
+             ('r', 'safety_records', 'SELECT'), \
+             ('r', 'safety_audit_tenants', 'SELECT')), \
          observe_allowed(rel, col) AS (VALUES \
              ('execution_journal', 'tenant_id'), ('execution_journal', 'agent_id'), \
              ('execution_journal', 'request_id'), ('execution_journal', 'request_digest'), \
@@ -1336,6 +1418,13 @@ fn unexpected_grants(
                                    AND ia.rel OPERATOR(pg_catalog.=) e.rel \
                                    AND e.col OPERATOR(pg_catalog.=) '' \
                                    AND ia.privilege OPERATOR(pg_catalog.=) e.privilege)) \
+                 OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_safety_audit' \
+                     AND NOT e.grantable \
+                     AND EXISTS (SELECT 1 FROM audit_allowed aa \
+                                 WHERE aa.kind OPERATOR(pg_catalog.=) e.kind \
+                                   AND aa.rel OPERATOR(pg_catalog.=) e.rel \
+                                   AND e.col OPERATOR(pg_catalog.=) '' \
+                                   AND aa.privilege OPERATOR(pg_catalog.=) e.privilege)) \
                  OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_observe' AND NOT e.grantable \
                      AND ((e.kind OPERATOR(pg_catalog.=) 'n' \
                            AND e.privilege OPERATOR(pg_catalog.=) 'USAGE') \

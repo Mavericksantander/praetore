@@ -3071,12 +3071,13 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             .get(0);
         let policies = client
             .query(
-                // The policies 0008 creates (0016 and 0017 add theirs on
-                // safety_records and safety_ingest_tenants).
+                // The policies 0008 creates (0016 to 0018 add theirs on
+                // the safety tables).
                 "SELECT p.oid FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = 'praetore' \
-                   AND c.relname NOT IN ('safety_records', 'safety_ingest_tenants') \
+                   AND c.relname NOT IN ('safety_records', 'safety_ingest_tenants', \
+                                         'safety_audit_tenants') \
                  ORDER BY c.relname",
                 &[],
             )
@@ -3098,7 +3099,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0014_closed_execution_row_lock",
             "0015_storage_records",
             "0016_safety_records",
-            "0017_safety_records_followups"
+            "0017_safety_records_followups",
+            "0018_safety_audit_and_role_oids"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -5449,8 +5451,31 @@ fn postgres_migrations_refuse_a_missing_runtime_group_up_front() {
             )
             .unwrap();
     }
+    // And 0018 praetore_safety_audit.
+    let audit_exists: bool = connect_client()
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'praetore_safety_audit')",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    if !audit_exists {
+        let error = praetore_replay_postgres::apply_migrations_with(&mut client, &options)
+            .expect_err("praetore_safety_audit is missing and the group cannot create it");
+        assert!(
+            matches!(&error, MigrationError::GroupRoleMissing { group: "praetore_safety_audit", acting_role, .. }
+                if *acting_role == group.name),
+            "{error}"
+        );
+        connect_client()
+            .batch_execute(
+                "DO $$ BEGIN CREATE ROLE praetore_safety_audit NOLOGIN; \
+                 EXCEPTION WHEN duplicate_object THEN NULL; END $$",
+            )
+            .unwrap();
+    }
     praetore_replay_postgres::apply_migrations_with(&mut client, &options)
-        .expect("migrates once praetore_runtime and praetore_safety_ingest exist");
+        .expect("migrates once praetore_runtime and the safety groups exist");
     println!("{RUNTIME_GROUP_ABSENT_MARKER}");
 }
 
@@ -6919,7 +6944,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0014_closed_execution_row_lock",
             "0015_storage_records",
             "0016_safety_records",
-            "0017_safety_records_followups"
+            "0017_safety_records_followups",
+            "0018_safety_audit_and_role_oids"
         ]
     );
     assert!(again.is_empty());
@@ -7211,6 +7237,7 @@ mod g1_safety {
                 .unwrap(),
             sources,
             max_seq_jump: praetore_core::safety_ingest::DEFAULT_MAX_SEQ_JUMP,
+            max_epoch_jump: praetore_core::safety_ingest::DEFAULT_MAX_EPOCH_JUMP,
             max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         })
         .unwrap()
@@ -7271,13 +7298,13 @@ mod g1_safety {
     }
 
     /// Registers (or re-registers) `role` for `tenant` and an ingestion key
-    /// id, as the schema owner does (migration 0017).
+    /// id, as the schema owner does (migrations 0017 and 0018).
     fn register(scratch: &ScratchDatabase, role: &str, tenant: Uuid, key_id: &str) {
         scratch
             .connect()
             .execute(
-                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
-                 VALUES ($1, $2, $3) ON CONFLICT (role_name) DO UPDATE \
+                "INSERT INTO praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id) \
+                 VALUES ($1::pg_catalog.text::pg_catalog.regrole, $2, $3) ON CONFLICT (role_oid) DO UPDATE \
                  SET tenant_id = EXCLUDED.tenant_id, ingest_key_id = EXCLUDED.ingest_key_id",
                 &[&role, &tenant, &key_id],
             )
@@ -7378,6 +7405,164 @@ mod g1_safety {
         assert_eq!(epochs, expected);
     }
 
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_audit_role_reads_only_its_registered_tenants() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut ingestor = ingestor(TENANT_A);
+        ingest(&mut ingestor, &mut store, &event(1, "safety:halt"));
+        ingest(&mut ingestor, &mut store, &event(2, "safety:halt"));
+        let auditor = TestRole::create("LOGIN");
+        let admin = || scratch.connect();
+        admin()
+            .batch_execute(&format!("GRANT praetore_safety_audit TO {}", auditor.name))
+            .unwrap();
+        let connect = || connect_scratch_as(&scratch, &auditor.name);
+        // The role checks accept it as an audit role, and not as an
+        // ingester (no INSERT, not in praetore_safety_ingest).
+        praetore_replay_postgres::verify_safety_audit_role_with(
+            &mut connect(),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(verify_safety_ingest_role_with(&mut connect(), &Default::default()).is_err());
+        // Not registered: it sees nothing, and the export check says why.
+        let mut audit = PostgresSafetyStore::from_client(connect());
+        assert!(chain_text(audit.client(), TENANT_A, "executor-1").is_empty());
+        let error = audit.check_read_access(TENANT_A).unwrap_err();
+        assert!(
+            error.to_string().contains("safety_audit_tenants"),
+            "{error}"
+        );
+        // Registered for A: it reads A's chain, and only A's.
+        admin()
+            .execute(
+                "INSERT INTO praetore.safety_audit_tenants (role_oid, tenant_id) \
+                 VALUES ($1::pg_catalog.text::pg_catalog.regrole, $2)",
+                &[&auditor.name, &TENANT_A],
+            )
+            .unwrap();
+        audit.check_read_access(TENANT_A).unwrap();
+        assert!(audit.check_read_access(TENANT_B).is_err());
+        let text = chain_text(audit.client(), TENANT_A, "executor-1");
+        assert_eq!(text.lines().count(), 2);
+        let seen: i64 = audit
+            .client()
+            .query_one("SELECT count(*) FROM praetore.safety_records", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(seen, 2, "only tenant A's rows");
+        // Read-only, and the ingest registry is not visible to it.
+        let mut client = connect();
+        for statement in [
+            "DELETE FROM praetore.safety_records",
+            "UPDATE praetore.safety_records SET status = status",
+            "SELECT count(*) FROM praetore.safety_ingest_tenants",
+            "INSERT INTO praetore.safety_audit_tenants (role_oid, tenant_id) \
+             VALUES (SESSION_USER::pg_catalog.regrole, '00000000-0000-0000-0000-00000000000b')",
+        ] {
+            let error = client.batch_execute(statement).unwrap_err();
+            assert!(
+                database_error(&error).contains("permission denied"),
+                "{statement}: {error}"
+            );
+        }
+        // An audit role in praetore_safety_ingest is refused.
+        admin()
+            .batch_execute(&format!("GRANT praetore_safety_ingest TO {}", auditor.name))
+            .unwrap();
+        let error = praetore_replay_postgres::verify_safety_audit_role_with(
+            &mut connect(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("member of praetore_safety_ingest"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_registration_is_by_role_oid_not_name() {
+        let (scratch, _ingest_role, _runtime) = scratch_with_roles();
+        // A role dropped and created again with the same name is a new role:
+        // it does not inherit the registration.
+        let name = format!("t015_{}", Uuid::new_v4().simple());
+        let create = || {
+            connect_client()
+                .batch_execute(&format!(
+                    "CREATE ROLE {name} LOGIN PASSWORD '{TEST_ROLE_PASSWORD}'"
+                ))
+                .unwrap();
+            scratch
+                .connect()
+                .batch_execute(&format!("GRANT praetore_safety_ingest TO {name}"))
+                .unwrap();
+        };
+        create();
+        register(
+            &scratch,
+            &name,
+            TENANT_B,
+            &SafetyIngestKey::from_secret_bytes(&[0x42; 32]).key_id(),
+        );
+        let mut store = PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &name));
+        store.check_registration(TENANT_B, None).unwrap();
+        drop(store);
+        scratch
+            .connect()
+            .batch_execute(&format!("REVOKE praetore_safety_ingest FROM {name}"))
+            .unwrap();
+        connect_client()
+            .batch_execute(&format!("DROP ROLE {name}"))
+            .unwrap();
+        create();
+        let mut store = PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &name));
+        let error = store.check_registration(TENANT_B, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                praetore_replay_postgres::SafetyStoreError::Registration { found: None, .. }
+            ),
+            "{error}"
+        );
+        assert!(chain_text(store.client(), TENANT_B, "executor-1").is_empty());
+        drop(store);
+        // The stale row of the dropped role is the owner's to delete; the
+        // new role is then registered by its own OID.
+        scratch
+            .connect()
+            .execute(
+                "DELETE FROM praetore.safety_ingest_tenants WHERE tenant_id = $1 \
+                 AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.oid = role_oid)",
+                &[&TENANT_B],
+            )
+            .unwrap();
+        register(
+            &scratch,
+            &name,
+            TENANT_B,
+            &SafetyIngestKey::from_secret_bytes(&[0x42; 32]).key_id(),
+        );
+        PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &name))
+            .check_registration(TENANT_B, None)
+            .unwrap();
+        scratch
+            .connect()
+            .batch_execute(&format!(
+                "REVOKE praetore_safety_ingest FROM {name}; DROP OWNED BY {name}"
+            ))
+            .unwrap();
+        connect_client()
+            .batch_execute(&format!("DROP ROLE {name}"))
+            .unwrap();
+    }
+
     /// The manual rollback of 0016 and 0017 documented in
     /// docs/operations.md.
     const ROLLBACK: &str = include_str!("../../../docs/rollback/g1-safety-records.sql");
@@ -7432,7 +7617,7 @@ mod g1_safety {
         assert!(
             !remaining
                 .iter()
-                .any(|v| v.starts_with("0016") || v.starts_with("0017")),
+                .any(|v| ["0016", "0017", "0018"].iter().any(|p| v.starts_with(p))),
             "{remaining:?}"
         );
         let row = owner
@@ -7445,11 +7630,14 @@ mod g1_safety {
                                       AND p.proname IN ('check_safety_record_link', \
                                                         'reject_safety_record_mutation')), \
                         NOT pg_catalog.has_schema_privilege('praetore_safety_ingest', \
+                                                            'praetore', 'USAGE'), \
+                        pg_catalog.to_regclass('praetore.safety_audit_tenants') IS NULL, \
+                        NOT pg_catalog.has_schema_privilege('praetore_safety_audit', \
                                                             'praetore', 'USAGE')",
                 &[],
             )
             .unwrap();
-        for index in 0..4 {
+        for index in 0..6 {
             assert!(
                 row.get::<_, bool>(index),
                 "column {index} after the rollback"
@@ -7654,6 +7842,39 @@ mod g1_safety {
             "a second ingester got the lock"
         );
         assert!(other.try_lock_tenant(TENANT_B).unwrap());
+        // The refused one can name the holder.
+        let holder_pid: i32 = store
+            .client()
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let holders = other.tenant_lock_holders(TENANT_A).unwrap();
+        assert_eq!(holders.len(), 1, "{holders:?}");
+        assert!(
+            holders[0].starts_with(&format!("pid {holder_pid}, role {}", ingest_role.name)),
+            "{holders:?}"
+        );
+        assert!(store.tenant_lock_holders(TENANT_A).unwrap().is_empty());
+        // Known limitation: any role of the database can take a tenant's
+        // lock; the holder is then named, whoever it is.
+        let tenant_c = Uuid::from_u128(0xc);
+        let mut squatter = connect_scratch_as(&scratch, &runtime.name);
+        assert!(
+            squatter
+                .query_one(
+                    "SELECT pg_catalog.pg_try_advisory_lock(1396786757, pg_catalog.hashtext($1))",
+                    &[&tenant_c.to_string()],
+                )
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        assert!(!other.try_lock_tenant(tenant_c).unwrap());
+        let holders = other.tenant_lock_holders(tenant_c).unwrap();
+        assert!(
+            holders.len() == 1 && holders[0].contains(&format!("role {}", runtime.name)),
+            "{holders:?}"
+        );
+        drop(squatter);
 
         let mut first = ingestor(TENANT_A);
         for input in [
@@ -7719,8 +7940,8 @@ mod g1_safety {
         let error = scratch
             .connect()
             .execute(
-                "INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id) \
-                 VALUES ($1, $2, $3)",
+                "INSERT INTO praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id) \
+                 VALUES ($1::pg_catalog.text::pg_catalog.regrole, $2, $3)",
                 &[&role_b.name, &TENANT_B, &ingest_key().key_id()],
             )
             .unwrap_err();

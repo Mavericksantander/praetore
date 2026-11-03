@@ -329,6 +329,37 @@ duplicate claims through newly created clients and concurrent connections.
 That does not replace testing the target deployment's replication and
 disaster-recovery configuration.
 
+
+#### Read-only export and audit roles
+
+Migration 0018 creates the NOLOGIN group `praetore_safety_audit` for login
+roles that export and audit safety records without being able to write
+them:
+
+| Object | Privileges |
+| --- | --- |
+| schema `praetore` | `USAGE` |
+| `schema_migrations` | `SELECT` |
+| `safety_records` | `SELECT` (row-level security: only the registered tenants) |
+| `safety_audit_tenants` | `SELECT` (only its own registrations) |
+
+Create the role as a member of that group only and register it, as the
+schema owner, for each tenant it may read:
+
+```sql
+CREATE ROLE praetore_audit_1 LOGIN PASSWORD '...' IN ROLE praetore_safety_audit;
+INSERT INTO praetore.safety_audit_tenants (role_oid, tenant_id)
+VALUES ('praetore_audit_1'::regrole, '<tenant uuid>');
+```
+
+`praetore journal-export --safety` accepts such a role
+(`PRAETORE_SAFETY_DATABASE_URL`) and checks that it is registered for the
+tenant. `verify_safety_audit_role_with` refuses an audit role that is
+privileged, owns or can create in `praetore`, is a member of
+`praetore_runtime` or `praetore_safety_ingest`, or holds any other
+privilege on a `praetore` table. It cannot insert, update or delete safety
+records, and it does not see `safety_ingest_tenants` or the ingestion key
+ids registered there.
 ### Schema checks, allowlists and managed PostgreSQL
 
 The migration runner and `verify_runtime_role` refuse database state that
@@ -483,6 +514,15 @@ record shows and what it does not, and
 - Run one ingester per tenant, on the host of the executors it serves
   (transport v1 is a local Unix datagram socket). A second ingester for the
   same tenant refuses to start (PostgreSQL advisory lock per tenant).
+- **Known limitation (until v0.3.3): any role of the database can take a
+  tenant's lock.** A PostgreSQL advisory lock needs no privilege, so a
+  session of another tenant's ingester, of the gateway or of any other login
+  can hold the lock of tenant A, and A's ingester then refuses to start (a
+  denial of service; it cannot read or write A's records). The refusal, and
+  `praetore-safety-ingest doctor`, name the holder (`pid`, login role,
+  `application_name` and start time, from `pg_locks` and
+  `pg_stat_activity`). Stop it with `SELECT pg_terminate_backend(<pid>)` as
+  a role allowed to, and find out why that role took the lock.
 - Give it its own OS user. The socket directory must be owned by that user
   and not writable by others; the socket is created `0600`, or `0660` with
   `PRAETORE_SAFETY_SOCKET_GROUP=<gid>` for executors in that group (then the
@@ -522,7 +562,8 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_SOURCE_RATE`, `PRAETORE_SAFETY_SOURCE_BURST` | verified events recorded per second for one source (default 100), and the burst after a quiet period (default 1000), 1 to 1000000. Events above it are not recorded; they are counted in a signed `loss` record (`rate_limited`, `detail` names the sources), and the source's chain shows them as a `source_seq` gap when its next event is recorded |
 | `PRAETORE_SAFETY_REJECTED_RATE`, `PRAETORE_SAFETY_REJECTED_BURST` | individual `rejected` records per second for all inputs that do not verify (default 10, burst 100); the rest are counted (`rejected_suppressed`) |
 | `PRAETORE_SAFETY_ALLOWED_UIDS` | optional, Linux only: comma-separated user ids allowed to send (at most 32). The ingester turns on `SO_PASSCRED` and reads each datagram's `SCM_CREDENTIALS`; a datagram from another user id is not read and is counted (`peer_refused`). On any other platform setting it makes startup fail: there the socket permissions (`0600`, or `0660` with `PRAETORE_SAFETY_SOCKET_GROUP`) are the only check of who may send |
-| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed`; so is one whose `source_epoch` is more than 10^9 above its existing chain's epoch (`epoch_jump_too_large`, a fixed bound: the epoch also advances on starts that send nothing, and the first event of a chain may carry any epoch) and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+| `PRAETORE_SAFETY_MAX_EPOCH_JUMP` | largest accepted step of `source_epoch` above a chain's epoch (default 1000000, 1 to 2^53 - 1). A chain without records is at epoch 0, so this also bounds its first epoch. A verified event further ahead is recorded as `rejected` (`epoch_jump_too_large`) on `_unattributed` and does not move the chain. A source's epoch advances on every start, also on starts that send nothing (a crash loop): keep this above the starts a source can make between two events. If a source is refused anyway (for example after the manual rollback, with an epoch file that kept counting), raise this setting or reset the source's epoch file to a value within it |
 
 ### Floods
 
@@ -566,8 +607,11 @@ for example `42`. Keep it on persistent storage, one file per `source_id`,
 in a directory that only the source's user can write (the file and its
 temporary are created owner-only, and a leftover temporary is replaced
 without following links). If it cannot be read, holds anything else, or cannot be
-written, `start` fails and the source must not report: falling back to 1
-would make the ingester record every event as `rejected` (`stale_epoch`).
+written, `start` fails and the source must not report during that run:
+falling back to 1 would make the ingester record every event as `rejected`
+(`stale_epoch`). The failure must not stop or delay the executor either:
+log it, alert the operator, and run without reporting (the crate example of
+`praetore-safety-client` shows the pattern; never `unwrap` it).
 Restoring the file from an old backup has the same effect until the epoch
 passes the chain's again; set it to at least the epoch that
 `praetore-verify safety-journal` reports (`source_epoch`).
@@ -608,9 +652,16 @@ prints the key id, and the exact statement when the role is not
 registered):
 
 ```sql
-INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id)
-VALUES ('praetore_safety_t1', '<tenant uuid>', '<ingestion key id>');
+INSERT INTO praetore.safety_ingest_tenants (role_oid, tenant_id, ingest_key_id)
+VALUES ('praetore_safety_t1'::regrole, '<tenant uuid>', '<ingestion key id>');
 ```
+
+A registration names the role by its OID (migration 0018), not its name: a
+role dropped and created again with the same name is a new role and is not
+registered. List the registrations with `SELECT role_oid::regrole,
+tenant_id, ingest_key_id FROM praetore.safety_ingest_tenants`; a row whose
+role no longer exists shows a bare number and keeps the tenant (and key)
+taken until the schema owner deletes it.
 
 Row-level security on `safety_records` shows and accepts only the rows of
 the tenant the session's login role (`session_user`) is registered for; the
@@ -625,7 +676,7 @@ key for two tenants is refused. The ingester and `praetore journal-export
 role registered for another tenant (or, for the ingester, another key).
 When rotating the ingestion key, update the row first (`UPDATE
 praetore.safety_ingest_tenants SET ingest_key_id = '<new key id>' WHERE
-role_name = '...'`), then restart the ingester with the new key. `verify_safety_ingest_role_with` refuses, at
+role_oid = 'praetore_safety_t1'::regrole`), then restart the ingester with the new key. `verify_safety_ingest_role_with` refuses, at
 startup, a role that is privileged, owns or can create in `praetore`, is a
 member of `praetore_runtime`, or holds any privilege on another `praetore`
 table (column privileges included), plus the database-wide checks of the
@@ -659,7 +710,7 @@ current one nor listed there makes the ingester refuse to start: a key
 change must be registered, and a row signed by an unknown key is never
 continued.
 
-### Rolling back the safety-record storage (0016 and 0017)
+### Rolling back the safety-record storage (0016 to 0018)
 
 The migration runner is forward-only. To remove the G1 storage (for example
 to downgrade to a release without it, or to start over after an unreleased
@@ -676,18 +727,19 @@ psql "$OWNER_URL" -v ON_ERROR_STOP=1 \
 ```
 
 In one transaction it drops `praetore.safety_records` (with its triggers and
-policies), `praetore.safety_ingest_tenants` and the two trigger functions,
-revokes what 0016 granted `praetore_safety_ingest` in this database, and
-deletes the `0016_safety_records` and `0017_safety_records_followups` rows of
-`praetore.schema_migrations`. It destroys every safety record, so without
+policies), `praetore.safety_ingest_tenants`, `praetore.safety_audit_tenants`
+and the two trigger functions, revokes what 0016 and 0018 granted
+`praetore_safety_ingest` and `praetore_safety_audit` in this database, and
+deletes the `0016_safety_records`, `0017_safety_records_followups` and
+`0018_safety_audit_and_role_oids` rows of `praetore.schema_migrations`. It destroys every safety record, so without
 the confirmation setting it refuses to run while the table holds any. The
 table has `FORCE ROW LEVEL SECURITY`, so an owner without superuser or
 `BYPASSRLS` would see no rows; the script lifts it first, inside the same
 transaction, so the check counts every record. The test runs it as such an
 owner. The
-group role is cluster-wide and is not dropped (`DROP ROLE
-praetore_safety_ingest` once no database uses it). Afterwards
-`apply_migrations` applies 0016 and 0017 again, and the tenant
+group roles are cluster-wide and are not dropped (`DROP ROLE
+praetore_safety_ingest, praetore_safety_audit` once no database uses them). Afterwards
+`apply_migrations` applies 0016 to 0018 again, and the tenant
 registrations must be inserted again. The test
 `postgres_safety_manual_rollback_removes_0016_and_0017_and_they_apply_again`
 runs this script against a scratch database in CI.

@@ -15,8 +15,9 @@
     `set_heads`; `IngestorConfig::heads` is removed), and `commit` now
     returns an error unless the records extend the current head.
   - New `rejected` reasons `seq_jump_too_large`, `stale_epoch` and
-    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP` and a
-    fixed epoch step of 10^9); an
+    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP` and
+    `PRAETORE_SAFETY_MAX_EPOCH_JUMP`, which also bounds a chain's first
+    epoch); an
     event far from the ingester's clock carries `clock_skew_seconds`
     (`PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS`). A chain head signed by an
     unregistered ingestion key fails closed; previous keys of a rotation are
@@ -41,13 +42,27 @@
     `praetore.tenant_id` setting, and the insert trigger accepts only
     records naming the tenant's registered key. The ingester and the
     exporter check the registration at startup. A documented manual
-    rollback of 0016 and 0017 (`docs/rollback/g1-safety-records.sql`) is
+    rollback of 0016 to 0018 (`docs/rollback/g1-safety-records.sql`) is
     tested in CI.
+  - Migration `0018_safety_audit_and_role_oids`: registrations name the
+    login role by OID (`'<role>'::regrole`), so a role dropped and created
+    again with the same name is not registered; the read-only group
+    `praetore_safety_audit` and `praetore.safety_audit_tenants` let a login
+    role export and audit the tenants it is registered for, without write
+    access (`verify_safety_audit_role_with`).
+  - `PRAETORE_SAFETY_MAX_EPOCH_JUMP` bounds the step of `source_epoch` and a
+    chain's first epoch. The ingester binds its socket without changing the
+    process umask.
   - `praetore journal-export --safety --from-seq N [--limit M]` exports a
     chain in ranges, each anchored on the record before it, and
     `praetore-verify safety-journal --range [--expected-anchor HEX]`
     verifies one. Without `--expected-head` the verifier now warns
     (`head_not_anchored`). It reports epochs and `dropped_by_reason`.
+  - **Known limitation:** the per-tenant advisory lock needs no privilege,
+    so any role of the database can hold a tenant's lock and keep its
+    ingester from starting (denial of service only). The refusal and
+    `praetore-safety-ingest doctor` name the holding session. A lock that
+    only the tenant's registered role can take is planned for v0.3.3.
   - CI runs every ignored PostgreSQL test one by one
     (`scripts/postgres-ignored-tests.sh`) and every G1 end-to-end test.
 

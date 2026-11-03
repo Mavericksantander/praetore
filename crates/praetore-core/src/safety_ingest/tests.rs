@@ -61,6 +61,7 @@ fn config() -> IngestorConfig {
         attester_pin: attester_pin(),
         sources: pins(),
         max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
+        max_epoch_jump: DEFAULT_MAX_EPOCH_JUMP,
         max_clock_skew_seconds: DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     }
 }
@@ -1159,11 +1160,11 @@ fn a_restarted_source_starts_a_new_epoch_whose_seq_starts_at_one() {
     assert_eq!(stale[0].payload().reason.as_deref(), Some("stale_epoch"));
     assert_eq!(harness.ingestor.head("executor-1"), before);
     // An epoch too far ahead is rejected too.
-    // (MAX_EPOCH_JUMP, not max_seq_jump: crash loops advance the epoch.)
-    let near = harness.ingest(&epoch(3 + DEFAULT_MAX_SEQ_JUMP + 1, 1));
+    // Up to max_epoch_jump is a new segment; one more is rejected.
+    let current = 3 + DEFAULT_MAX_EPOCH_JUMP;
+    let near = harness.ingest(&epoch(current, 1));
     assert_eq!(status_strs(&near), ["accepted"]);
-    let current = 3 + DEFAULT_MAX_SEQ_JUMP + 1;
-    let far = harness.ingest(&epoch(current + MAX_EPOCH_JUMP + 1, 1));
+    let far = harness.ingest(&epoch(current + DEFAULT_MAX_EPOCH_JUMP + 1, 1));
     assert_eq!(
         far[0].payload().reason.as_deref(),
         Some("epoch_jump_too_large")
@@ -1353,4 +1354,59 @@ fn heads_come_only_from_signed_records_and_commit_only_extends_the_current_head(
             .resume_heads([first[0].clone(), newer.records[0].clone()], &[])
             .is_err()
     );
+}
+
+#[test]
+fn the_first_epoch_and_every_epoch_step_are_bounded_by_max_epoch_jump() {
+    let epoch = |epoch, seq| {
+        wire(&event_in(
+            &source_key(),
+            "executor-1",
+            epoch,
+            seq,
+            "safety:halt",
+        ))
+    };
+    let mut harness = Harness::new();
+    harness.ingestor = SafetyIngestor::new(IngestorConfig {
+        max_epoch_jump: 5,
+        ..config()
+    })
+    .unwrap();
+    // A new chain is at epoch 0: a first event at the end of the epoch range
+    // (which would lock the chain) is rejected and the chain stays empty.
+    let locked = harness.ingest(&epoch(MAX_SAFE_INTEGER, 1));
+    assert_eq!(locked[0].payload().chain, UNATTRIBUTED_CHAIN);
+    assert_eq!(
+        locked[0].payload().reason.as_deref(),
+        Some("epoch_jump_too_large")
+    );
+    assert_eq!(harness.ingestor.head("executor-1"), ChainHead::default());
+    let first = harness.ingest(&epoch(6, 1));
+    assert_eq!(
+        first[0].payload().reason.as_deref(),
+        Some("epoch_jump_too_large")
+    );
+    // A first epoch of 5 is accepted; from 5, 10 is a step of 5 (accepted)
+    // and 16 a step of 6 (rejected, the chain stays at 10).
+    assert_eq!(status_strs(&harness.ingest(&epoch(5, 1))), ["accepted"]);
+    assert_eq!(status_strs(&harness.ingest(&epoch(10, 1))), ["accepted"]);
+    let far = harness.ingest(&epoch(16, 1));
+    assert_eq!(
+        far[0].payload().reason.as_deref(),
+        Some("epoch_jump_too_large")
+    );
+    assert_eq!(harness.ingestor.head("executor-1").epoch, 10);
+    harness.verify("executor-1").unwrap();
+    harness.verify(UNATTRIBUTED_CHAIN).unwrap();
+    for jump in [0, MAX_SAFE_INTEGER + 1] {
+        assert_eq!(
+            SafetyIngestor::new(IngestorConfig {
+                max_epoch_jump: jump,
+                ..config()
+            })
+            .unwrap_err(),
+            IngestSetupError::InvalidMaxEpochJump
+        );
+    }
 }
