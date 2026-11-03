@@ -366,6 +366,16 @@ fn ok(output: Output, what: &str) -> Output {
 }
 
 fn export(files: &Files, scratch: &Scratch, chain: &str, output: &Path) -> Value {
+    export_with(files, scratch, chain, output, &[])
+}
+
+fn export_with(
+    files: &Files,
+    scratch: &Scratch,
+    chain: &str,
+    output: &Path,
+    extra: &[&str],
+) -> Value {
     let result = ok(
         Command::new(PRAETORE)
             .args([
@@ -380,6 +390,7 @@ fn export(files: &Files, scratch: &Scratch, chain: &str, output: &Path) -> Value
                 "--output",
                 output.to_str().unwrap(),
             ])
+            .args(extra)
             .env("PRAETORE_SAFETY_DATABASE_URL", &scratch.ingest)
             .env_remove("PRAETORE_SAFETY_DATABASE_URL_FILE")
             .output()
@@ -390,6 +401,15 @@ fn export(files: &Files, scratch: &Scratch, chain: &str, output: &Path) -> Value
 }
 
 fn verify(files: &Files, journal: &Path, expected_head: Option<&str>) -> (bool, Value) {
+    verify_with(files, journal, expected_head, &[])
+}
+
+fn verify_with(
+    files: &Files,
+    journal: &Path,
+    expected_head: Option<&str>,
+    extra: &[&str],
+) -> (bool, Value) {
     let mut command = Command::new(verifier());
     command.args([
         "safety-journal",
@@ -405,6 +425,7 @@ fn verify(files: &Files, journal: &Path, expected_head: Option<&str>) -> (bool, 
     if let Some(head) = expected_head {
         command.args(["--expected-head", head]);
     }
+    command.args(extra);
     let output = command.output().unwrap();
     (
         output.status.success(),
@@ -483,6 +504,51 @@ fn postgres_safety_ingest_end_to_end() {
     let head = summary["head"].as_str().unwrap().to_owned();
     let (verified, report) = verify(&files, &out, Some(&head));
     assert!(verified, "{report}");
+    // The same chain in two ranges: the second is anchored on the first
+    // one's head and ends at the full head.
+    let first = files.path("executor-1-range-0.jsonl");
+    let first_summary = export_with(
+        &files,
+        &scratch,
+        "executor-1",
+        &first,
+        &["--from-seq", "0", "--limit", "3"],
+    );
+    let next = first_summary["next_from_seq"].as_u64().unwrap();
+    assert!((3..=4).contains(&next), "{first_summary}");
+    let second = files.path("executor-1-range-1.jsonl");
+    let second_summary = export_with(
+        &files,
+        &scratch,
+        "executor-1",
+        &second,
+        &["--from-seq", &next.to_string()],
+    );
+    assert_eq!(
+        second_summary["next_from_seq"],
+        Value::Null,
+        "{second_summary}"
+    );
+    assert_eq!(second_summary["head"], head.as_str());
+    let first_head = first_summary["head"].as_str().unwrap();
+    let (range_verified, range_report) = verify_with(&files, &second, Some(&head), &[]);
+    assert!(
+        !range_verified,
+        "a range is not a whole chain: {range_report}"
+    );
+    let mut command_args = vec!["--range", "--expected-anchor", first_head];
+    let (range_verified, range_report) = verify_with(&files, &second, Some(&head), &command_args);
+    assert!(range_verified, "{range_report}");
+    assert_eq!(
+        range_report["details"]["range_start"], next,
+        "{range_report}"
+    );
+    command_args[2] = &head;
+    let (range_verified, _) = verify_with(&files, &second, Some(&head), &command_args);
+    assert!(
+        !range_verified,
+        "a range anchored on the wrong record verified"
+    );
     let counts = &report["details"]["counts"];
     for (status, count) in [
         ("accepted", 2),

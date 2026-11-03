@@ -1,8 +1,16 @@
 //! `praetore journal-export --safety --tenant UUID --source ID --ingest-pin
-//! HEX_FILE [--ingest-pin HEX_FILE]... [--source-pins JSONL] --output NEW`
-//! (G1): exports one safety chain (`praetore.safety_records`, migration
-//! 0016) as JSONL, one canonical record per line in `chain_seq` order
-//! (`docs/proposals/safety-ingestion-jsonl.md`).
+//! HEX_FILE [--ingest-pin HEX_FILE]... [--source-pins JSONL] [--from-seq N
+//! [--limit M]] --output NEW` (G1): exports one safety chain
+//! (`praetore.safety_records`, migration 0016) as JSONL, one canonical record
+//! per line in `chain_seq` order (`docs/proposals/safety-ingestion-jsonl.md`).
+//!
+//! Without `--from-seq` the whole chain is exported (at most
+//! `MAX_SAFETY_CHAIN_ENTRIES` records and `MAX_SAFETY_CHAIN_BYTES`). With
+//! `--from-seq N` one range is exported: the anchor record (`chain_seq` N - 1,
+//! for N > 0) on the first line, then up to `--limit` records (default
+//! 50000) within the size limit; the output names `next_from_seq` for the
+//! next range. Verify a range with `praetore-verify safety-journal --range
+//! --expected-anchor <head of the previous range>`.
 //!
 //! The chain is verified with `praetore_core::safety_ingest::verify_safety_chain`,
 //! the code `praetore-verify safety-journal` runs, before anything is
@@ -14,7 +22,10 @@
 
 use praetore_core::{
     VerifiedPublicKey,
-    safety_ingest::{SourcePins, is_valid_chain, verify_safety_chain},
+    safety_ingest::{
+        MAX_SAFETY_CHAIN_BYTES, MAX_SAFETY_CHAIN_ENTRIES, SourcePins, is_valid_chain,
+        verify_safety_chain, verify_safety_chain_range,
+    },
 };
 use std::{
     io::{Read, Write},
@@ -34,10 +45,16 @@ pub struct SafetyExportArgs {
     pub ingest_pins: Vec<PathBuf>,
     pub source_pins: Option<PathBuf>,
     pub output: PathBuf,
+    /// `Some((from_seq, limit))` for a range export.
+    pub range: Option<(u64, usize)>,
 }
+
+/// Default `--limit` of a range export.
+pub const DEFAULT_RANGE_LIMIT: usize = 50_000;
 
 pub fn parse(args: impl Iterator<Item = String>) -> CliResult<SafetyExportArgs> {
     let (mut tenant, mut chain, mut source_pins, mut output) = (None, None, None, None);
+    let (mut from_seq, mut limit) = (None, None);
     let mut ingest_pins = Vec::new();
     let mut safety = false;
     let mut args = args.into_iter();
@@ -61,6 +78,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<SafetyExportArgs> 
             "--source" => &mut chain,
             "--source-pins" => &mut source_pins,
             "--output" => &mut output,
+            "--from-seq" => &mut from_seq,
+            "--limit" => &mut limit,
             _ => return Err(format!("unexpected argument for --safety: {flag}").into()),
         };
         let value = args.next().ok_or(format!("missing value for {flag}"))?;
@@ -78,6 +97,28 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<SafetyExportArgs> 
     if ingest_pins.is_empty() {
         return Err("missing --ingest-pin".into());
     }
+    let range = match (from_seq, limit) {
+        (None, None) => None,
+        (None, Some(_)) => return Err("--limit needs --from-seq".into()),
+        (Some(from), limit) => {
+            let from = from
+                .parse::<u64>()
+                .ok()
+                .filter(|seq| *seq < (1 << 53))
+                .ok_or("--from-seq must be a chain_seq (0 or more)")?;
+            let limit = match limit {
+                None => DEFAULT_RANGE_LIMIT,
+                Some(value) => value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| (1..=MAX_SAFETY_CHAIN_ENTRIES).contains(limit))
+                    .ok_or(format!(
+                        "--limit must be between 1 and {MAX_SAFETY_CHAIN_ENTRIES}"
+                    ))?,
+            };
+            Some((from, limit))
+        }
+    };
     Ok(SafetyExportArgs {
         tenant_id: Uuid::parse_str(&tenant.ok_or("missing --tenant")?)
             .map_err(|_| "--tenant must be a UUID")?,
@@ -85,6 +126,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<SafetyExportArgs> 
         ingest_pins,
         source_pins: source_pins.map(PathBuf::from),
         output: output.ok_or("missing --output")?.into(),
+        range,
     })
 }
 
@@ -133,8 +175,30 @@ pub fn run(args: SafetyExportArgs) -> CliResult<()> {
     let connector = praetore_replay_postgres::DatabaseConnector::from_url(&database_url()?)?
         .connect_timeout(std::time::Duration::from_secs(3));
     let mut client = connector.connect()?;
-    let records =
-        praetore_replay_postgres::read_safety_chain(&mut client, args.tenant_id, &args.chain)?;
+    let (anchor, records, next_from_seq) = match args.range {
+        None => (
+            None,
+            praetore_replay_postgres::read_safety_chain(&mut client, args.tenant_id, &args.chain)
+                .map_err(|error| match error {
+                praetore_replay_postgres::SafetyStoreError::TooLarge => {
+                    format!("{error}: export it in ranges with --from-seq 0 [--limit N]").into()
+                }
+                error => Box::<dyn std::error::Error>::from(error),
+            })?,
+            None,
+        ),
+        Some((from_seq, limit)) => {
+            let range = praetore_replay_postgres::read_safety_chain_range(
+                &mut client,
+                args.tenant_id,
+                &args.chain,
+                from_seq,
+                limit,
+                MAX_SAFETY_CHAIN_BYTES,
+            )?;
+            (range.anchor, range.records, range.next_from_seq)
+        }
+    };
     if records.is_empty() {
         return Err(format!(
             "tenant {} has no safety records on chain {}",
@@ -143,12 +207,18 @@ pub fn run(args: SafetyExportArgs) -> CliResult<()> {
         .into());
     }
     let mut text = String::new();
-    for record in &records {
+    for record in anchor.iter().chain(&records) {
         text.push_str(record);
         text.push('\n');
     }
-    let report = verify_safety_chain(&text, &pins, source_pins.as_ref(), None)
-        .map_err(|error| format!("{} ({})", error, error.code()))?;
+    let report = match args.range {
+        // A range starting at 0 has no anchor: it is a plain export.
+        Some((from_seq, _)) if from_seq > 0 => {
+            verify_safety_chain_range(&text, &pins, source_pins.as_ref(), None, None)
+        }
+        _ => verify_safety_chain(&text, &pins, source_pins.as_ref(), None),
+    }
+    .map_err(|error| format!("{} ({})", error, error.code()))?;
     // Never overwrite: an existing file may be an anchored export.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -170,6 +240,10 @@ pub fn run(args: SafetyExportArgs) -> CliResult<()> {
             "high_water": report.high_water,
             "counts": report.counts,
             "source_signatures_verified": report.source_signatures_verified,
+            "range_start": report.range_start,
+            "anchor": report.anchor,
+            "unchecked_references": report.unchecked_references,
+            "next_from_seq": next_from_seq,
         })
     );
     Ok(())
@@ -181,6 +255,46 @@ mod tests {
 
     fn args(list: &[&str]) -> CliResult<SafetyExportArgs> {
         parse(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn safety_export_range_arguments() {
+        let tenant = "00000000-0000-0000-0000-000000000001";
+        let base = [
+            "--safety",
+            "--tenant",
+            tenant,
+            "--source",
+            "e",
+            "--ingest-pin",
+            "p",
+            "--output",
+            "o",
+        ];
+        let with = |extra: &[&str]| {
+            let mut all = base.to_vec();
+            all.extend_from_slice(extra);
+            args(&all)
+        };
+        assert_eq!(with(&[]).unwrap().range, None);
+        assert_eq!(
+            with(&["--from-seq", "7"]).unwrap().range,
+            Some((7, DEFAULT_RANGE_LIMIT))
+        );
+        assert_eq!(
+            with(&["--from-seq", "0", "--limit", "10"]).unwrap().range,
+            Some((0, 10))
+        );
+        for bad in [
+            &["--limit", "10"][..],
+            &["--from-seq", "-1"],
+            &["--from-seq", "x"],
+            &["--from-seq", "1", "--limit", "0"],
+            &["--from-seq", "1", "--limit", "200001"],
+            &["--from-seq", "1", "--from-seq", "2"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

@@ -584,6 +584,25 @@ Export `_unattributed` too (`--source _unattributed`): it holds the
 `rejected` inputs and the losses inside the ingester. Anchor heads outside
 the operator's control to detect truncation (SAF-13).
 
+A whole-chain export holds at most 200000 records and 64 MiB. Export a
+longer chain in ranges: `--from-seq 0 --limit N` writes the first range and
+prints `next_from_seq`; each later range (`--from-seq <next_from_seq>`)
+starts with its anchor, the record just before it. Verify each later range
+with `--range --expected-anchor <head of the previous range>`; the last
+range's head is the chain's head. A range never ends between a gap loss
+record and the event that revealed it. `duplicate`, `conflict` and `late`
+records whose earlier record is in an earlier range are reported as
+`unchecked_references`: verify the earlier ranges to cover them.
+
+```sh
+praetore journal-export --safety --tenant <uuid> --source executor-1 \
+  --ingest-pin ingest.pub --from-seq 0 --limit 50000 --output part-0.jsonl
+praetore journal-export --safety --tenant <uuid> --source executor-1 \
+  --ingest-pin ingest.pub --from-seq <next_from_seq> --output part-1.jsonl
+praetore-verify safety-journal --journal part-1.jsonl --ingest-pin ingest.pub \
+  --range --expected-anchor <head of part-0> --format json
+```
+
 ## Offline evidence and authority verification
 
 Build the verifier from the locked workspace:

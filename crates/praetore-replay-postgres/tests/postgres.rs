@@ -7269,6 +7269,80 @@ mod g1_safety {
 
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_chain_exports_in_ranges_that_chain_to_the_full_head() {
+        use praetore_core::safety_ingest::verify_safety_chain_range;
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut ingestor = ingestor(TENANT_A);
+        // Gaps (loss + event pairs), duplicates and late events.
+        for seq in [1, 2, 4, 2, 3, 7, 8, 8, 12, 5, 13, 14, 20, 21] {
+            ingest(&mut ingestor, &mut store, &event(seq, "safety:halt"));
+        }
+        let pin = ingest_key().public_key().unwrap();
+        let full = chain_text(store.client(), TENANT_A, "executor-1");
+        let full = verify_safety_chain(&full, std::slice::from_ref(&pin), None, None).unwrap();
+        for limit in [1, 2, 3, 5, 100] {
+            let mut from = 0;
+            let mut previous_head: Option<String> = None;
+            let mut covered = 0;
+            loop {
+                let range = praetore_replay_postgres::read_safety_chain_range(
+                    store.client(),
+                    TENANT_A,
+                    "executor-1",
+                    from,
+                    limit,
+                    usize::MAX,
+                )
+                .unwrap();
+                let text: String = range
+                    .anchor
+                    .iter()
+                    .chain(&range.records)
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                let report = if from == 0 {
+                    verify_safety_chain(&text, std::slice::from_ref(&pin), None, None)
+                } else {
+                    verify_safety_chain_range(
+                        &text,
+                        std::slice::from_ref(&pin),
+                        None,
+                        previous_head.as_deref(),
+                        None,
+                    )
+                }
+                .unwrap_or_else(|error| panic!("limit {limit}, from {from}: {error}"));
+                covered += report.entries;
+                previous_head = Some(report.head.clone());
+                match range.next_from_seq {
+                    Some(next) => {
+                        assert_eq!(next, from + range.records.len() as u64);
+                        from = next;
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(covered, full.entries, "limit {limit}");
+            assert_eq!(previous_head.as_deref(), Some(full.head.as_str()));
+        }
+        // A range whose anchor does not exist is refused.
+        assert!(
+            praetore_replay_postgres::read_safety_chain_range(
+                store.client(),
+                TENANT_A,
+                "executor-1",
+                full.entries + 5,
+                10,
+                usize::MAX,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_high_water_column_must_equal_the_signed_value() {
         let (scratch, ingest_role, _runtime) = scratch_with_roles();
         let mut store =

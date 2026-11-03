@@ -1792,6 +1792,15 @@ pub struct SafetyChainReport {
     pub source_signatures_verified: bool,
     /// Records per ingestion key id.
     pub signed_by: BTreeMap<String, u64>,
+    /// For a range ([`verify_safety_chain_range`]): the `record_hash` of
+    /// the anchor (the record just before the range).
+    pub anchor: Option<String>,
+    /// For a range: the `chain_seq` of its first record.
+    pub range_start: Option<u64>,
+    /// For a range: `duplicate`, `conflict` and `late` records whose
+    /// earlier record lies before the range, so they were checked only
+    /// against the anchor's high-water mark.
+    pub unchecked_references: u64,
 }
 
 /// Why an exported chain was not accepted. Every variant is a failure.
@@ -1933,6 +1942,52 @@ pub fn verify_safety_chain(
     source_pins: Option<&SourcePins>,
     expected_head: Option<&str>,
 ) -> Result<SafetyChainReport, SafetyChainError> {
+    verify_chain_text(text, ingest_pins, source_pins, None, expected_head)
+}
+
+/// Verifies one range of a chain, as `praetore journal-export --safety
+/// --from-seq N` writes it: the first line is the **anchor**, the record
+/// just before the range (`chain_seq` N - 1), and the rest are the range.
+/// The anchor's key, hash and signature are checked and its signed
+/// position (`chain_seq`, `record_hash`, `high_water`) is where the range
+/// must continue; it is not counted. With `expected_anchor`, its
+/// `record_hash` must equal it: pass the head of the previous range (or of
+/// an anchored export) to chain the ranges. Every other check of
+/// [`verify_safety_chain`] applies, except that a `duplicate`, `conflict`
+/// or `late` record whose earlier record lies before the range is only
+/// checked against the anchor's high-water mark (counted in
+/// `unchecked_references`).
+pub fn verify_safety_chain_range(
+    text: &str,
+    ingest_pins: &[VerifiedPublicKey],
+    source_pins: Option<&SourcePins>,
+    expected_anchor: Option<&str>,
+    expected_head: Option<&str>,
+) -> Result<SafetyChainReport, SafetyChainError> {
+    let (anchor_line, rest) = text.split_once('\n').ok_or(SafetyChainError::Empty)?;
+    let anchor = SafetyRecord::from_json(anchor_line)
+        .map_err(|error| SafetyChainError::Malformed { line: 0, error })?;
+    anchor
+        .verify(ingest_pins)
+        .map_err(|error| SafetyChainError::Record { line: 0, error })?;
+    if let Some(expected) = expected_anchor
+        && expected != anchor.record_hash
+    {
+        return Err(SafetyChainError::BrokenChain {
+            line: anchor.payload.chain_seq,
+            reason: "the anchor is not the expected record".into(),
+        });
+    }
+    verify_chain_text(rest, ingest_pins, source_pins, Some(&anchor), expected_head)
+}
+
+fn verify_chain_text(
+    text: &str,
+    ingest_pins: &[VerifiedPublicKey],
+    source_pins: Option<&SourcePins>,
+    anchor: Option<&SafetyRecord>,
+    expected_head: Option<&str>,
+) -> Result<SafetyChainReport, SafetyChainError> {
     if text.len() > MAX_SAFETY_CHAIN_BYTES {
         return Err(SafetyChainError::TooLarge);
     }
@@ -1945,9 +2000,38 @@ pub fn verify_safety_chain(
     let mut must_follow: Option<u64> = None;
     let mut high_water = 0u64;
     let mut line = 0u64;
+    // Everything at or below the anchor's high-water mark happened before
+    // the range: references to it cannot be checked here.
+    let mut anchor_high_water = 0u64;
+    if let Some(anchor) = anchor {
+        let payload = &anchor.payload;
+        report = Some(SafetyChainReport {
+            chain: payload.chain.clone(),
+            tenant_id: payload.tenant_id,
+            entries: 0,
+            head: anchor.record_hash.clone(),
+            high_water: payload.high_water.unwrap_or(0),
+            counts: SafetyCounts::default(),
+            source_signatures_verified: source_pins.is_some(),
+            signed_by: BTreeMap::new(),
+            anchor: Some(anchor.record_hash.clone()),
+            range_start: Some(payload.chain_seq + 1),
+            unchecked_references: 0,
+        });
+        prev = anchor.record_hash.clone();
+        high_water = payload.high_water.unwrap_or(0);
+        anchor_high_water = high_water;
+        line = payload.chain_seq + 1;
+        if payload.status == SafetyRecordStatus::Loss
+            && payload.reason.as_deref() == Some(LossReason::SourceSeqGap.as_str())
+        {
+            must_follow = Some(high_water + 1);
+        }
+    }
+    let first_line = line;
     let mut rest = text;
     while !rest.is_empty() {
-        if line as usize >= MAX_SAFETY_CHAIN_ENTRIES {
+        if (line - first_line) as usize >= MAX_SAFETY_CHAIN_ENTRIES {
             return Err(SafetyChainError::TooLarge);
         }
         let (current, tail) = rest.split_once('\n').ok_or(SafetyChainError::Malformed {
@@ -1974,6 +2058,9 @@ pub fn verify_safety_chain(
             counts: SafetyCounts::default(),
             source_signatures_verified: source_pins.is_some(),
             signed_by: BTreeMap::new(),
+            anchor: None,
+            range_start: None,
+            unchecked_references: 0,
         });
         if payload.chain != summary.chain {
             return Err(broken("chain differs from the first record"));
@@ -2086,7 +2173,9 @@ pub fn verify_safety_chain(
                 let lost = loss_ranges
                     .iter()
                     .any(|&(from, to)| (from..=to).contains(&seq));
-                if !lost || first_events.contains_key(&seq) {
+                if !lost && seq <= anchor_high_water && !first_events.contains_key(&seq) {
+                    summary.unchecked_references += 1;
+                } else if !lost || first_events.contains_key(&seq) {
                     return Err(inconsistent(format!(
                         "late event {seq} does not fill a lost source_seq"
                     )));
@@ -2099,25 +2188,36 @@ pub fn verify_safety_chain(
                     return Err(SafetyChainError::WrongChain { line });
                 }
                 let seq = event_seq.unwrap_or_default();
-                let Some((first_hash, first_record)) = first_events.get(&seq) else {
-                    return Err(inconsistent(format!(
-                        "{} of source_seq {seq}, which has no earlier event",
-                        payload.status.as_str()
-                    )));
+                let same = match first_events.get(&seq) {
+                    // The first event lies before the range.
+                    None if seq <= anchor_high_water => {
+                        summary.unchecked_references += 1;
+                        payload.status == S::Duplicate
+                    }
+                    None => {
+                        return Err(inconsistent(format!(
+                            "{} of source_seq {seq}, which has no earlier event",
+                            payload.status.as_str()
+                        )));
+                    }
+                    Some((first_hash, first_record)) => {
+                        if payload.original_record_hash.as_deref() != Some(first_record) {
+                            return Err(inconsistent(
+                                "original_record_hash is not the first record of its source_seq"
+                                    .into(),
+                            ));
+                        }
+                        let same = *first_hash == event_hash;
+                        if same != (payload.status == S::Duplicate) {
+                            return Err(inconsistent(format!(
+                                "{} with {} event hash",
+                                payload.status.as_str(),
+                                if same { "the same" } else { "a different" }
+                            )));
+                        }
+                        same
+                    }
                 };
-                if payload.original_record_hash.as_deref() != Some(first_record) {
-                    return Err(inconsistent(
-                        "original_record_hash is not the first record of its source_seq".into(),
-                    ));
-                }
-                let same = *first_hash == event_hash;
-                if same != (payload.status == S::Duplicate) {
-                    return Err(inconsistent(format!(
-                        "{} with {} event hash",
-                        payload.status.as_str(),
-                        if same { "the same" } else { "a different" }
-                    )));
-                }
                 if same {
                     counts.duplicate += 1;
                 } else {
@@ -2139,6 +2239,9 @@ pub fn verify_safety_chain(
         line += 1;
     }
     let report = report.ok_or(SafetyChainError::Empty)?;
+    if report.entries == 0 {
+        return Err(SafetyChainError::Empty);
+    }
     if let Some(next) = must_follow {
         return Err(SafetyChainError::SequenceInconsistent {
             line,

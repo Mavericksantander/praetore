@@ -283,3 +283,103 @@ pub fn read_safety_chain(
     }
     Ok(rows.iter().map(|row| row.get(0)).collect())
 }
+
+/// One range of a chain for `praetore journal-export --safety --from-seq`:
+/// the anchor (the record at `from_seq - 1`, absent when `from_seq` is 0)
+/// and the records from `from_seq`, at most `max_records` of them and at
+/// most `max_bytes` in total (anchor included). A range never ends right
+/// after a `source_seq` gap loss record: the event that revealed the gap
+/// goes in the same range, even one record over `max_records`. `next_from_seq` is where the next range starts,
+/// or `None` at the end of the chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafetyChainRange {
+    pub anchor: Option<String>,
+    pub records: Vec<String>,
+    pub next_from_seq: Option<u64>,
+}
+
+pub fn read_safety_chain_range(
+    client: &mut Client,
+    tenant_id: Uuid,
+    chain: &str,
+    from_seq: u64,
+    max_records: usize,
+    max_bytes: usize,
+) -> Result<SafetyChainRange, SafetyStoreError> {
+    let mut transaction = client
+        .build_transaction()
+        .read_only(true)
+        .isolation_level(postgres::IsolationLevel::RepeatableRead)
+        .start()?;
+    set_tenant_context(&mut transaction, tenant_id)?;
+    let start = from_seq.saturating_sub(1) as i64;
+    // The anchor, the range and one record more (to know whether the
+    // chain continues, and to finish a gap loss record's pair).
+    let limit = (max_records.min(MAX_SAFETY_CHAIN_ENTRIES) + 3) as i64;
+    let rows = transaction.query(
+        "SELECT chain_seq, status, record_json FROM praetore.safety_records \
+         WHERE tenant_id = $1 AND chain = $2 AND chain_seq >= $3 \
+         ORDER BY chain_seq LIMIT $4",
+        &[&tenant_id, &chain, &start, &limit],
+    )?;
+    transaction.commit()?;
+    let mut rows = rows.iter().map(|row| {
+        (
+            row.get::<_, i64>(0) as u64,
+            row.get::<_, String>(1),
+            row.get::<_, String>(2),
+        )
+    });
+    let mut bytes = 0;
+    let anchor = if from_seq == 0 {
+        None
+    } else {
+        match rows.next() {
+            Some((seq, _, json)) if seq == from_seq - 1 => {
+                bytes += json.len() + 1;
+                Some(json)
+            }
+            _ => {
+                return Err(SafetyStoreError::Record {
+                    chain: chain.to_owned(),
+                    error: SafetyRecordError::Invalid(format!(
+                        "no record at chain_seq {} to anchor the range",
+                        from_seq - 1
+                    )),
+                });
+            }
+        }
+    };
+    let rows: Vec<(u64, String, String)> = rows.collect();
+    let mut taken = 0;
+    while taken < rows.len()
+        && taken < max_records.min(MAX_SAFETY_CHAIN_ENTRIES)
+        && bytes + rows[taken].2.len() < max_bytes
+    {
+        bytes += rows[taken].2.len() + 1;
+        taken += 1;
+    }
+    // Do not end on a gap loss record: take its event too (one record over
+    // `max_records` if needed), or leave the loss record for the next range
+    // when the size limit does not allow it.
+    if taken > 0 && taken < rows.len() && is_gap_loss(&rows[taken - 1]) {
+        if bytes + rows[taken].2.len() < max_bytes {
+            taken += 1;
+        } else {
+            taken -= 1;
+        }
+    }
+    if taken == 0 && !rows.is_empty() {
+        return Err(SafetyStoreError::TooLarge);
+    }
+    let next_from_seq = rows.get(taken).map(|row| row.0);
+    Ok(SafetyChainRange {
+        anchor,
+        records: rows.into_iter().take(taken).map(|row| row.2).collect(),
+        next_from_seq,
+    })
+}
+
+fn is_gap_loss(row: &(u64, String, String)) -> bool {
+    row.1 == "loss" && row.2.contains("\"reason\":\"source_seq_gap\"")
+}

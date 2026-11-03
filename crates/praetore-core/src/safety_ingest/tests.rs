@@ -1014,3 +1014,63 @@ fn the_high_water_is_signed_and_checked_by_the_verifier() {
     extra.high_water = Some(0);
     assert!(ingest_key().sign_record(extra).is_err());
 }
+
+#[test]
+fn a_chain_verifies_in_ranges_each_anchored_on_the_previous_one() {
+    let mut harness = Harness::new();
+    for seq in [1, 2, 5, 2, 3, 6, 7] {
+        harness.ingest(&wire(&event(seq, "safety:halt")));
+    }
+    // A conflict for seq 1, after its first event.
+    harness.ingest(&wire(&event(1, "safety:stop_all")));
+    let all = lines(harness.chain("executor-1"));
+    let full = verify_safety_chain(&all.concat(), &[ingest_pin()], Some(&pins()), None).unwrap();
+    // Cut after every position: [0, cut) is a plain export, then one range
+    // from `cut` whose anchor is record cut - 1.
+    for cut in 1..all.len() {
+        let first = all[..cut].concat();
+        let head = match verify_safety_chain(&first, &[ingest_pin()], Some(&pins()), None) {
+            Ok(report) => report.head,
+            // A plain export never ends right after a gap loss record.
+            Err(SafetyChainError::SequenceInconsistent { .. }) => continue,
+            Err(error) => panic!("cut {cut}: {error}"),
+        };
+        let range = all[cut - 1..].concat();
+        let report = verify_safety_chain_range(
+            &range,
+            &[ingest_pin()],
+            Some(&pins()),
+            Some(&head),
+            Some(&full.head),
+        )
+        .unwrap_or_else(|error| panic!("cut {cut}: {error}"));
+        assert_eq!(report.anchor.as_deref(), Some(head.as_str()));
+        assert_eq!(report.range_start, Some(cut as u64));
+        assert_eq!(report.entries, (all.len() - cut) as u64);
+        assert_eq!(report.high_water, full.high_water);
+        assert_eq!(report.head, full.head);
+        // The wrong anchor is refused.
+        assert!(
+            verify_safety_chain_range(&range, &[ingest_pin()], None, Some(&full.head), None)
+                .is_err()
+                || head == full.head
+        );
+    }
+    // The range that starts after `loss 3..=4` and `accepted 5` holds
+    // `duplicate 2` and `late 3`, whose earlier records are before it.
+    let range = all[3..].concat();
+    let report =
+        verify_safety_chain_range(&range, &[ingest_pin()], None, None, Some(&full.head)).unwrap();
+    assert!(report.unchecked_references >= 2, "{report:?}");
+    // An edited anchor fails.
+    let mut edited = all[3..].to_vec();
+    edited[0] = edited[0].replacen("\"chain_seq\":3", "\"chain_seq\":4", 1);
+    assert!(
+        verify_safety_chain_range(&edited.concat(), &[ingest_pin()], None, None, None).is_err()
+    );
+    // A range with only its anchor is empty.
+    assert!(matches!(
+        verify_safety_chain_range(&all[2], &[ingest_pin()], None, None, None),
+        Err(SafetyChainError::Empty)
+    ));
+}
