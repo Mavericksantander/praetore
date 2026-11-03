@@ -88,6 +88,12 @@ pub const MAX_SAFETY_CHAIN_ENTRIES: usize = 200_000;
 pub const MAX_SOURCE_PINS: usize = 256;
 /// Default of [`IngestorConfig::max_seq_jump`].
 pub const DEFAULT_MAX_SEQ_JUMP: u64 = 1_000_000;
+
+/// The largest accepted step of `source_epoch` above an existing chain's
+/// epoch. Independent of `max_seq_jump`: a source's epoch also advances on
+/// starts that send nothing (a crash loop), so a small seq limit must not
+/// lock a source out. The first event of a chain may carry any epoch.
+pub const MAX_EPOCH_JUMP: u64 = 1_000_000_000;
 /// Default of [`IngestorConfig::max_clock_skew_seconds`].
 pub const DEFAULT_MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 
@@ -345,7 +351,7 @@ pub enum RejectReason {
     /// unattributed chain; the source chain does not change.
     StaleEpoch,
     /// A verified event whose `source_epoch` is more than
-    /// [`IngestorConfig::max_seq_jump`] above its chain's current epoch.
+    /// [`MAX_EPOCH_JUMP`] above its chain's current epoch.
     EpochJumpTooLarge,
 }
 
@@ -1798,8 +1804,15 @@ impl SafetyIngestor {
     /// input that does not verify above the rate of individual `rejected`
     /// records, is not recorded and comes back as
     /// [`PreparedRecords::suppressed`] (to count with
-    /// [`FloodControl::count`]). The rate is checked after the signature, so
-    /// only the holder of a source key spends that source's budget.
+    /// [`FloodControl::count`]). Only a verified event that can advance its
+    /// chain (a new `source_seq` above the high-water mark, or the start of
+    /// a newer epoch, within the jump limits) spends its source's budget, so
+    /// only the holder of a source key spends it. Everything else (inputs
+    /// that do not verify, and verified events at or below the high-water
+    /// mark, of an older epoch or beyond a jump limit, which anyone can
+    /// replay from an export) shares the budget of `rejected` records and
+    /// is counted as `rejected_suppressed` above it. A genuine `late` event
+    /// competes with that traffic.
     pub fn prepare_limited<L: EventLookup>(
         &self,
         input: &[u8],
@@ -1810,11 +1823,12 @@ impl SafetyIngestor {
     ) -> Result<PreparedRecords, IngestError<L::Error>> {
         let authenticated = self.authenticate(input);
         let suppressed = match &authenticated {
-            Ok(event) => (!flood.admit_event(&event.source_id, elapsed)).then(|| Suppressed {
-                reason: LossReason::RateLimited,
-                source_id: Some(event.source_id.clone()),
-            }),
-            Err(_) => (!flood.admit_rejected(elapsed)).then_some(Suppressed {
+            Ok(event) if self.advances(event) => (!flood.admit_event(&event.source_id, elapsed))
+                .then(|| Suppressed {
+                    reason: LossReason::RateLimited,
+                    source_id: Some(event.source_id.clone()),
+                }),
+            _ => (!flood.admit_rejected(elapsed)).then_some(Suppressed {
                 reason: LossReason::RejectedSuppressed,
                 source_id: None,
             }),
@@ -1823,6 +1837,24 @@ impl SafetyIngestor {
             return Ok(self.suppressed(suppressed));
         }
         self.prepare_authenticated(input, authenticated, now, lookup)
+    }
+
+    /// Whether `event` can advance its chain: the checks of
+    /// [`Self::prepare`] that need no storage.
+    fn advances(&self, event: &SafetyEvent) -> bool {
+        let head = self.head(&event.source_id);
+        let epoch = event.source_epoch;
+        let high_water = if epoch > head.epoch {
+            if self.heads.contains_key(&event.source_id) && epoch - head.epoch > MAX_EPOCH_JUMP {
+                return false;
+            }
+            0
+        } else if epoch == head.epoch {
+            head.high_water
+        } else {
+            return false;
+        };
+        event.source_seq > high_water && event.source_seq - high_water <= self.max_seq_jump
     }
 
     fn suppressed(&self, suppressed: Suppressed) -> PreparedRecords {
@@ -1879,7 +1911,7 @@ impl SafetyIngestor {
                 ),
             );
         }
-        if epoch - head.epoch > self.max_seq_jump {
+        if self.heads.contains_key(&chain) && epoch - head.epoch > MAX_EPOCH_JUMP {
             return reject(
                 RejectReason::EpochJumpTooLarge,
                 format!(
@@ -1887,7 +1919,7 @@ impl SafetyIngestor {
                      maximum step is {}",
                     epoch - head.epoch,
                     head.epoch,
-                    self.max_seq_jump
+                    MAX_EPOCH_JUMP
                 ),
             );
         }
@@ -2424,7 +2456,7 @@ fn verify_chain_text(
                                 high_water + 1
                             )));
                         }
-                        counts.lost_events += to - from + 1;
+                        counts.lost_events = counts.lost_events.saturating_add(to - from + 1);
                         loss_ranges.push((from, to));
                         high_water = to;
                         must_follow = Some(to + 1);
@@ -2433,11 +2465,12 @@ fn verify_chain_text(
                         if !unattributed {
                             return Err(SafetyChainError::WrongChain { line });
                         }
-                        counts.dropped_messages += dropped;
-                        *counts
+                        counts.dropped_messages = counts.dropped_messages.saturating_add(dropped);
+                        let by_reason = counts
                             .dropped_by_reason
                             .entry(payload.reason.clone().unwrap_or_default())
-                            .or_default() += dropped;
+                            .or_default();
+                        *by_reason = by_reason.saturating_add(dropped);
                     }
                     _ => return Err(broken("loss record with a wrong shape")),
                 }

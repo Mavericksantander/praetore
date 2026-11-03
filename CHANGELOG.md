@@ -15,12 +15,14 @@
     `set_heads`; `IngestorConfig::heads` is removed), and `commit` now
     returns an error unless the records extend the current head.
   - New `rejected` reasons `seq_jump_too_large`, `stale_epoch` and
-    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP`); an
+    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP` and a
+    fixed epoch step of 10^9); an
     event far from the ingester's clock carries `clock_skew_seconds`
     (`PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS`). A chain head signed by an
     unregistered ingestion key fails closed; previous keys of a rotation are
     listed in `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE`.
-  - Rate limits per source and for inputs that do not verify
+  - Rate limits per source (spent only by events that can advance the
+    chain) and for every other input, replays included
     (`PRAETORE_SAFETY_SOURCE_RATE`/`_BURST`,
     `PRAETORE_SAFETY_REJECTED_RATE`/`_BURST`), and on Linux a sender user id
     check (`PRAETORE_SAFETY_ALLOWED_UIDS`, `SCM_CREDENTIALS`; refused at
@@ -37,7 +39,7 @@
     per tenant, registered by the schema owner). Row-level security on
     `safety_records` follows the registered role instead of the
     `praetore.tenant_id` setting, and the insert trigger accepts only
-    records signed by the tenant's registered key. The ingester and the
+    records naming the tenant's registered key. The ingester and the
     exporter check the registration at startup. A documented manual
     rollback of 0016 and 0017 (`docs/rollback/g1-safety-records.sql`) is
     tested in CI.

@@ -1159,16 +1159,20 @@ fn a_restarted_source_starts_a_new_epoch_whose_seq_starts_at_one() {
     assert_eq!(stale[0].payload().reason.as_deref(), Some("stale_epoch"));
     assert_eq!(harness.ingestor.head("executor-1"), before);
     // An epoch too far ahead is rejected too.
-    let far = harness.ingest(&epoch(3 + DEFAULT_MAX_SEQ_JUMP + 1, 1));
+    // (MAX_EPOCH_JUMP, not max_seq_jump: crash loops advance the epoch.)
+    let near = harness.ingest(&epoch(3 + DEFAULT_MAX_SEQ_JUMP + 1, 1));
+    assert_eq!(status_strs(&near), ["accepted"]);
+    let current = 3 + DEFAULT_MAX_SEQ_JUMP + 1;
+    let far = harness.ingest(&epoch(current + MAX_EPOCH_JUMP + 1, 1));
     assert_eq!(
         far[0].payload().reason.as_deref(),
         Some("epoch_jump_too_large")
     );
     let report = harness.verify("executor-1").unwrap();
-    assert_eq!(report.counts.epochs, 3);
-    assert_eq!(report.source_epoch, 3);
-    assert_eq!(report.high_water, 4);
-    assert_eq!(report.counts.accepted, 6);
+    assert_eq!(report.counts.epochs, 4);
+    assert_eq!(report.source_epoch, current);
+    assert_eq!(report.high_water, 1);
+    assert_eq!(report.counts.accepted, 7);
     assert_eq!(report.counts.conflict, 0);
     // A record whose epoch goes back fails verification even when signed.
     let lines = lines(harness.chain("executor-1"));
@@ -1205,22 +1209,28 @@ fn a_flood_is_bounded_and_every_suppressed_message_is_counted_in_a_signed_record
         }
         harness.store(prepared).len()
     };
-    // 1000 garbage datagrams, 1000 events of one source and 1000 replays of
-    // its first event, all within the same instant.
+    // 1000 garbage datagrams, then the source's first 10 events, 1000
+    // replays of its first event (anyone can take one from an export) and
+    // its next 990 events, all within the same instant.
     let mut stored = 0;
     for _ in 0..1000 {
         stored += send(&mut harness, &mut flood, b"garbage");
     }
-    for seq in 1..=1000 {
+    for seq in 1..=10 {
         stored += send(&mut harness, &mut flood, &wire(&event(seq, "safety:halt")));
     }
     let replay = wire(&event(1, "safety:halt"));
     for _ in 0..1000 {
         stored += send(&mut harness, &mut flood, &replay);
     }
+    for seq in 11..=1000 {
+        stored += send(&mut harness, &mut flood, &wire(&event(seq, "safety:halt")));
+    }
     // 5 rejected records and 20 events: the chains stay bounded. The
-    // replays spend the source's budget too (they are verified events).
+    // replays share the budget of rejected inputs, so they did not take the
+    // source's: its whole burst went to its own events 1..=20.
     assert_eq!(stored, 5 + 20);
+    assert_eq!(harness.ingestor.head("executor-1").high_water, 20);
     let pending = flood.take_pending();
     let counted: BTreeMap<&str, u64> = pending
         .iter()
@@ -1228,7 +1238,7 @@ fn a_flood_is_bounded_and_every_suppressed_message_is_counted_in_a_signed_record
         .collect();
     assert_eq!(
         counted,
-        BTreeMap::from([("rate_limited", 1980), ("rejected_suppressed", 995)])
+        BTreeMap::from([("rate_limited", 980), ("rejected_suppressed", 1995)])
     );
     for count in &pending {
         let prepared = harness
@@ -1245,15 +1255,15 @@ fn a_flood_is_bounded_and_every_suppressed_message_is_counted_in_a_signed_record
     )
     .unwrap();
     assert_eq!(unattributed.counts.rejected, 5);
-    assert_eq!(unattributed.counts.dropped_by_reason["rate_limited"], 1980);
+    assert_eq!(unattributed.counts.dropped_by_reason["rate_limited"], 980);
     assert_eq!(
         unattributed.counts.dropped_by_reason["rejected_suppressed"],
-        995
+        1995
     );
     assert!(
         harness
             .chain(UNATTRIBUTED_CHAIN)
-            .contains("\"detail\":\"executor-1=1980\"")
+            .contains("\"detail\":\"executor-1=980\"")
     );
     // Later, within the rate: the source chain shows the rate-limited
     // events as a gap, and the replay is counted as a duplicate.

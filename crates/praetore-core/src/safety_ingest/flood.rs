@@ -57,11 +57,21 @@ impl Bucket {
     }
 
     fn take(&mut self, rate: u64, burst: u64, now: Duration) -> bool {
-        // A clock that goes back refills nothing.
-        let elapsed = now.saturating_sub(self.last);
-        self.last = self.last.max(now);
-        let refill = (elapsed.as_micros().min(u64::MAX as u128) as u64).saturating_mul(rate) / 1000;
-        self.millitokens = self.millitokens.saturating_add(refill).min(burst * 1000);
+        // A clock that goes back refills nothing. `last` advances only by the
+        // time converted into whole millitokens, so frequent calls lose no
+        // refill to rounding.
+        let elapsed = now.saturating_sub(self.last).as_nanos();
+        let refill = elapsed.saturating_mul(u128::from(rate)) / 1_000_000;
+        let capacity = burst * 1000;
+        let filled = u128::from(self.millitokens).saturating_add(refill);
+        if filled >= u128::from(capacity) {
+            self.millitokens = capacity;
+            self.last = self.last.max(now);
+        } else {
+            self.millitokens = filled as u64;
+            let used = refill * 1_000_000 / u128::from(rate);
+            self.last += Duration::from_nanos(used.min(u128::from(u64::MAX)) as u64);
+        }
         if self.millitokens >= 1000 {
             self.millitokens -= 1000;
             true
@@ -139,7 +149,8 @@ impl FloodControl {
         let (total, sources) = self.pending.entry(reason).or_default();
         *total = total.saturating_add(count);
         if let Some(source) = source_id {
-            *sources.entry(source.to_owned()).or_default() += count;
+            let per_source = sources.entry(source.to_owned()).or_default();
+            *per_source = per_source.saturating_add(count);
         }
     }
 
@@ -196,6 +207,22 @@ pub struct PendingCount {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frequent_takes_lose_no_refill_to_rounding() {
+        // 10 per second, asked every 50 µs: one token every 100 ms.
+        let mut bucket = super::Bucket::full(1, super::Duration::ZERO);
+        let mut now = super::Duration::ZERO;
+        let mut taken = 0;
+        for _ in 0..20_000 {
+            if bucket.take(10, 1, now) {
+                taken += 1;
+            }
+            now += super::Duration::from_micros(50);
+        }
+        // One second: the initial token and 10 refills (±1).
+        assert!((10..=11).contains(&taken), "{taken}");
+    }
+
     use super::*;
 
     const LIMITS: FloodLimits = FloodLimits {

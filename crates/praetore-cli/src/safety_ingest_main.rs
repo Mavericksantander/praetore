@@ -730,7 +730,13 @@ fn run() -> Result<()> {
     loop {
         match receiver.recv_timeout(POLL) {
             Ok(message) => worker.handle(&message),
-            Err(mpsc::RecvTimeoutError::Timeout) => worker.flush_dropped(),
+            // Counts are written at most once per COUNT_INTERVAL (and
+            // when stopping), however bursty the traffic.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if worker.last_count.elapsed() >= COUNT_INTERVAL {
+                    worker.flush_dropped();
+                }
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }

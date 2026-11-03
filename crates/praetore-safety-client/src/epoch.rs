@@ -81,11 +81,17 @@ impl EpochFile {
         let mut temporary_name = name.to_os_string();
         temporary_name.push(".tmp");
         let temporary = directory.join(temporary_name);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temporary)?;
+        // A temporary left by an interrupted start is removed (a symlink is
+        // removed, not followed); create_new (O_EXCL) never follows one
+        // either. Owner-only.
+        match fs::remove_file(&temporary) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(format!("{epoch}\n").as_bytes())?;
         file.sync_all()?;
         drop(file);

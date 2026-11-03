@@ -108,8 +108,10 @@ una fuente reiniciada que vuelve a `source_seq` 1 registra `accepted` (no
 pérdida `1..=seq-1` de ese epoch. Lo que la fuente no envió al final del
 epoch anterior no es visible. `duplicate`, `conflict` y `late` se buscan
 dentro del epoch. Un evento de un epoch menor se registra como `rejected`
-(`stale_epoch`) en `_unattributed`; uno más de `PRAETORE_SAFETY_MAX_SEQ_JUMP`
-por encima, como `rejected` (`epoch_jump_too_large`). Ninguno de los dos
+(`stale_epoch`) en `_unattributed`; uno más de 10^9 por
+encima del epoch de una cadena existente, como `rejected`
+(`epoch_jump_too_large`; el primer evento de una cadena puede traer
+cualquier epoch). Ninguno de los dos
 cambia la cadena de la fuente.
 
 | `status` | Cadena | Significado y campos |

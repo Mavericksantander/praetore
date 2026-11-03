@@ -522,19 +522,26 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_SOURCE_RATE`, `PRAETORE_SAFETY_SOURCE_BURST` | verified events recorded per second for one source (default 100), and the burst after a quiet period (default 1000), 1 to 1000000. Events above it are not recorded; they are counted in a signed `loss` record (`rate_limited`, `detail` names the sources), and the source's chain shows them as a `source_seq` gap when its next event is recorded |
 | `PRAETORE_SAFETY_REJECTED_RATE`, `PRAETORE_SAFETY_REJECTED_BURST` | individual `rejected` records per second for all inputs that do not verify (default 10, burst 100); the rest are counted (`rejected_suppressed`) |
 | `PRAETORE_SAFETY_ALLOWED_UIDS` | optional, Linux only: comma-separated user ids allowed to send (at most 32). The ingester turns on `SO_PASSCRED` and reads each datagram's `SCM_CREDENTIALS`; a datagram from another user id is not read and is counted (`peer_refused`). On any other platform setting it makes startup fail: there the socket permissions (`0600`, or `0660` with `PRAETORE_SAFETY_SOCKET_GROUP`) are the only check of who may send |
-| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark, and of `source_epoch` above a chain's epoch (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`, `epoch_jump_too_large`) on `_unattributed` and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed`; so is one whose `source_epoch` is more than 10^9 above its existing chain's epoch (`epoch_jump_too_large`, a fixed bound: the epoch also advances on starts that send nothing, and the first event of a chain may carry any epoch) and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
 
 ### Floods
 
 A local process that can write to the socket can send as fast as it likes.
-The ingester bounds what that costs: rates are checked after the
-signature, so only a source key's holder spends that source's budget; an
-exact duplicate of a recorded event (a replayed datagram) creates no record;
+The ingester bounds what that costs. Only a verified event that can advance
+its chain (a new `source_seq` above the high-water mark, or the start of a
+newer epoch, within the jump limits) spends its source's budget, so only a
+source key's holder spends it. Every other input, including verified events
+that anyone can replay from an export (at or below the high-water mark, of
+an older epoch, or beyond a jump limit), shares the budget of `rejected`
+records (`PRAETORE_SAFETY_REJECTED_RATE`): a replay flood therefore grows
+`_unattributed` no faster than garbage does, and a genuine `late` event
+competes with that traffic. An exact duplicate of a recorded event creates
+no record;
 and everything not recorded one by one (rate limited, suppressed rejections,
 exact duplicates, refused peers, a full queue, the database down) is added
 to a signed count on `_unattributed` (`loss`, with `reason` and `dropped`),
-written at most once per second and reason, when the ingester is idle and
-when it stops. `praetore-verify safety-journal` reports the counts as
+written at most once per second (one record per reason) and when the
+ingester stops. `praetore-verify safety-journal` reports the counts as
 `dropped_by_reason`. None of this touches the executors: the client sends
 one non-blocking datagram and never waits, so an executor's failsafe runs
 whatever the ingester does.
@@ -555,8 +562,10 @@ starts at 1 in each epoch. A source persists its epoch with
 `EpochFile::start` reads the file (a missing file is epoch 0), adds one,
 writes the new value to `<file>.tmp`, `fsync`s it, renames it over the file
 and `fsync`s the directory. The file holds the decimal epoch and a newline,
-for example `42`. Keep it on persistent storage, owned by the source, one
-file per `source_id`. If it cannot be read, holds anything else, or cannot be
+for example `42`. Keep it on persistent storage, one file per `source_id`,
+in a directory that only the source's user can write (the file and its
+temporary are created owner-only, and a leftover temporary is replaced
+without following links). If it cannot be read, holds anything else, or cannot be
 written, `start` fails and the source must not report: falling back to 1
 would make the ingester record every event as `rejected` (`stale_epoch`).
 Restoring the file from an old backup has the same effect until the epoch
@@ -606,7 +615,10 @@ VALUES ('praetore_safety_t1', '<tenant uuid>', '<ingestion key id>');
 Row-level security on `safety_records` shows and accepts only the rows of
 the tenant the session's login role (`session_user`) is registered for; the
 `praetore.tenant_id` setting no longer matters for this table. The insert
-trigger accepts only records signed by the registered key. A tenant has one
+trigger accepts only records that name the registered key (`key_id`); it does
+not check the signature, which the ingester checks when it reads the heads
+(a row with a bad signature makes it refuse to start) and the verifier
+checks on export. A tenant has one
 role and one key, and a key is registered for one tenant: registering one
 key for two tenants is refused. The ingester and `praetore journal-export
 --safety` check the registration before reading or writing and refuse a
@@ -701,7 +713,12 @@ with `--range --expected-anchor <head of the previous range>`; the last
 range's head is the chain's head. A range never ends between a gap loss
 record and the event that revealed it. `duplicate`, `conflict` and `late`
 records whose earlier record is in an earlier range are reported as
-`unchecked_references`: verify the earlier ranges to cover them.
+`unchecked_references`, and **range verification does not check them**:
+verifying each range alone does not prove that such a `late` seq was really
+lost or that the referenced record (`original_record_hash`) exists and
+matches. Only a whole-chain verification checks those references; when a
+chain is too large for one, treat a non-zero `unchecked_references` as
+unverified.
 
 ```sh
 praetore journal-export --safety --tenant <uuid> --source executor-1 \
