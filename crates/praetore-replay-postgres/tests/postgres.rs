@@ -3071,10 +3071,12 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             .get(0);
         let policies = client
             .query(
-                // The policies 0008 creates (0016 adds one on safety_records).
+                // The policies 0008 creates (0016 and 0017 add theirs on
+                // safety_records and safety_ingest_tenants).
                 "SELECT p.oid FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
-                 WHERE n.nspname = 'praetore' AND c.relname <> 'safety_records' \
+                 WHERE n.nspname = 'praetore' \
+                   AND c.relname NOT IN ('safety_records', 'safety_ingest_tenants') \
                  ORDER BY c.relname",
                 &[],
             )
