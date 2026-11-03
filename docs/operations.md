@@ -572,8 +572,9 @@ afresh.
 Records of the first G1 format (`schema_version` 1, before source epochs)
 cannot be read by this version, and an ingester whose tenant holds them
 refuses to start. They only exist on databases that ran an unreleased
-build: export and verify those chains with that build, then move them out
-of `praetore.safety_records` as the table owner before upgrading.
+build: export and verify those chains with that build, then remove the G1
+storage with the manual rollback below and let the upgraded runner apply
+0016 and 0017 again.
 
 The runtime-role relaxations (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
 `PRAETORE_SCHEMA_OWNER`, `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`, ...)
@@ -645,6 +646,35 @@ signed. A chain whose last record is signed by a key that is neither the
 current one nor listed there makes the ingester refuse to start: a key
 change must be registered, and a row signed by an unknown key is never
 continued.
+
+### Rolling back the safety-record storage (0016 and 0017)
+
+The migration runner is forward-only. To remove the G1 storage (for example
+to downgrade to a release without it, or to start over after an unreleased
+format), the schema owner runs
+[`docs/rollback/g1-safety-records.sql`](rollback/g1-safety-records.sql) with
+every ingester stopped:
+
+```sh
+# 1. Export and verify every chain of every tenant first.
+# 2. Then, as the praetore schema owner:
+psql "$OWNER_URL" -v ON_ERROR_STOP=1 \
+  -c "SET praetore.rollback_confirm = 'destroy-safety-records'" \
+  -f docs/rollback/g1-safety-records.sql
+```
+
+In one transaction it drops `praetore.safety_records` (with its triggers and
+policies), `praetore.safety_ingest_tenants` and the two trigger functions,
+revokes what 0016 granted `praetore_safety_ingest` in this database, and
+deletes the `0016_safety_records` and `0017_safety_records_followups` rows of
+`praetore.schema_migrations`. It destroys every safety record, so without
+the confirmation setting it refuses to run while the table holds any. The
+group role is cluster-wide and is not dropped (`DROP ROLE
+praetore_safety_ingest` once no database uses it). Afterwards
+`apply_migrations` applies 0016 and 0017 again, and the tenant
+registrations must be inserted again. The test
+`postgres_safety_manual_rollback_removes_0016_and_0017_and_they_apply_again`
+runs this script against a scratch database in CI.
 
 ### Export and verification
 

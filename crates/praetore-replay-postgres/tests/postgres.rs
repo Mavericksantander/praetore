@@ -7382,6 +7382,90 @@ mod g1_safety {
         assert_eq!(epochs, expected);
     }
 
+    /// The manual rollback of 0016 and 0017 documented in
+    /// docs/operations.md.
+    const ROLLBACK: &str = include_str!("../../../docs/rollback/g1-safety-records.sql");
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_manual_rollback_removes_0016_and_0017_and_they_apply_again() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut ingestor = ingestor(TENANT_A);
+        ingest(&mut ingestor, &mut store, &event(1, "safety:halt"));
+        drop(store);
+        let mut owner = scratch.connect();
+        // Records exist: it refuses without the confirmation and changes
+        // nothing.
+        let error = owner.batch_execute(ROLLBACK).unwrap_err();
+        assert!(database_error(&error).contains("holds records"), "{error}");
+        owner.batch_execute("ROLLBACK").unwrap();
+        let count: i64 = owner
+            .query_one("SELECT count(*) FROM praetore.safety_records", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 1);
+        owner
+            .batch_execute("SET praetore.rollback_confirm = 'destroy-safety-records'")
+            .unwrap();
+        owner.batch_execute(ROLLBACK).unwrap();
+        let remaining: Vec<String> = owner
+            .query(
+                "SELECT version FROM praetore.schema_migrations \
+                 WHERE version LIKE '001%' ORDER BY version",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert!(
+            !remaining
+                .iter()
+                .any(|v| v.starts_with("0016") || v.starts_with("0017")),
+            "{remaining:?}"
+        );
+        let row = owner
+            .query_one(
+                "SELECT pg_catalog.to_regclass('praetore.safety_records') IS NULL, \
+                        pg_catalog.to_regclass('praetore.safety_ingest_tenants') IS NULL, \
+                        NOT EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
+                                    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+                                    WHERE n.nspname = 'praetore' \
+                                      AND p.proname IN ('check_safety_record_link', \
+                                                        'reject_safety_record_mutation')), \
+                        NOT pg_catalog.has_schema_privilege('praetore_safety_ingest', \
+                                                            'praetore', 'USAGE')",
+                &[],
+            )
+            .unwrap();
+        for index in 0..4 {
+            assert!(
+                row.get::<_, bool>(index),
+                "column {index} after the rollback"
+            );
+        }
+        // The runner applies both again, and ingestion works.
+        drop(owner);
+        let mut owner = scratch.connect();
+        praetore_replay_postgres::apply_migrations(&mut owner).unwrap();
+        register(
+            &scratch,
+            &ingest_role.name,
+            TENANT_A,
+            &ingest_key().key_id(),
+        );
+        let mut client = connect_scratch_as(&scratch, &ingest_role.name);
+        verify_safety_ingest_role_with(&mut client, &Default::default()).unwrap();
+        praetore_replay_postgres::verify_schema_current(&mut client).unwrap();
+        let mut store = PostgresSafetyStore::from_client(client);
+        let mut ingestor = self::ingestor(TENANT_A);
+        ingest(&mut ingestor, &mut store, &event(1, "safety:halt"));
+        let text = chain_text(store.client(), TENANT_A, "executor-1");
+        assert_eq!(text.lines().count(), 1);
+    }
+
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_chain_exports_in_ranges_that_chain_to_the_full_head() {
