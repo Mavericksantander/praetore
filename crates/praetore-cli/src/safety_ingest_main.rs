@@ -575,16 +575,23 @@ fn bind_socket(socket: &Path, group: Option<u32>) -> Result<(UnixDatagram, (u64,
         log(format!("removing the stale socket {}", socket.display()));
         std::fs::remove_file(socket)?;
     }
-    // Created 0600 (umask 0177): no window in which others could connect.
-    let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o177));
-    let bound = UnixDatagram::bind(socket);
-    rustix::process::umask(previous);
-    let listener = bound.map_err(|error| format!("bind {}: {error}", socket.display()))?;
+    // Bound inside a private directory (0700) next to the socket, given its
+    // mode and group there, then renamed into place: there is no window in
+    // which others could connect, and the process umask (shared by every
+    // thread) is never changed.
+    let private = PrivateBindDir::create(socket)?;
+    let staged = private.0.join("s");
+    let listener = UnixDatagram::bind(&staged)
+        .map_err(|error| format!("bind {}: {error}", socket.display()))?;
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
     if let Some(gid) = group {
-        rustix::fs::chown(socket, None, Some(rustix::fs::Gid::from_raw(gid)))
+        rustix::fs::chown(&staged, None, Some(rustix::fs::Gid::from_raw(gid)))
             .map_err(|error| format!("chown {} to gid {gid}: {error}", socket.display()))?;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o660))?;
     }
+    std::fs::rename(&staged, socket)
+        .map_err(|error| format!("rename the socket to {}: {error}", socket.display()))?;
+    drop(private);
     let metadata = std::fs::symlink_metadata(socket)?;
     if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
         return Err(format!("{} is not the socket this process bound", socket.display()).into());
@@ -592,6 +599,38 @@ fn bind_socket(socket: &Path, group: Option<u32>) -> Result<(UnixDatagram, (u64,
     let _ = rustix::net::sockopt::set_socket_recv_buffer_size(&listener, RECEIVE_BUFFER_BYTES);
     listener.set_read_timeout(Some(POLL))?;
     Ok((listener, (metadata.dev(), metadata.ino())))
+}
+
+/// A directory only this user can enter, next to the socket, removed on
+/// drop (with whatever is still in it).
+struct PrivateBindDir(PathBuf);
+
+impl PrivateBindDir {
+    fn create(socket: &Path) -> Result<Self> {
+        let parent = match socket.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let path = parent.join(format!(".bind-{}", std::process::id()));
+        // A leftover of a crashed start of this pid: removed without
+        // following links.
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path)?,
+            Ok(_) => std::fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+            .create(&path)
+            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for PrivateBindDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Prints the public key of a secret key file (read as a private file).
@@ -1108,11 +1147,6 @@ impl Worker<'_> {
 mod tests {
     use super::*;
 
-    /// bind_socket sets the process umask while it binds and restores it:
-    /// two tests binding at once could restore it under each other, so
-    /// they take this lock.
-    static SOCKETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     struct Dir(PathBuf);
 
     impl Dir {
@@ -1133,9 +1167,6 @@ mod tests {
 
     #[test]
     fn the_socket_is_created_owner_only_or_with_its_group() {
-        let _serial = SOCKETS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = Dir::new("mode", 0o700);
         let socket = dir.0.join("s");
         let (listener, _) = bind_socket(&socket, None).unwrap();
@@ -1180,9 +1211,6 @@ mod tests {
 
     #[test]
     fn an_unsafe_socket_path_is_refused() {
-        let _serial = SOCKETS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Not a socket: never replaced.
         let dir = Dir::new("file", 0o700);
         let socket = dir.0.join("s");
