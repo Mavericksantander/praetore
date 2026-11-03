@@ -7203,6 +7203,7 @@ mod g1_safety {
                 .unwrap(),
             sources,
             heads: BTreeMap::new(),
+            max_seq_jump: praetore_core::safety_ingest::DEFAULT_MAX_SEQ_JUMP,
         })
         .unwrap()
     }

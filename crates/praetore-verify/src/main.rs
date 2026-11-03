@@ -828,6 +828,20 @@ fn verify_safety_journal(
         "ingest_key_ids".into(),
         serde_json::to_value(&report.signed_by).map_err(|_| CliError { code: "INTERNAL" })?,
     );
+    let mut warnings = Vec::new();
+    if let Some(count) = report.counts.rejected_by_reason.get("seq_jump_too_large") {
+        // A verified event that was too far ahead of its chain: a source
+        // bug or a compromised source key. It did not move the chain.
+        warnings.push(serde_json::Value::String(format!(
+            "seq_jump_too_large: {count} verified events were too far ahead of their chain"
+        )));
+    }
+    for warning in &warnings {
+        if let Some(text) = warning.as_str() {
+            eprintln!("safety-journal: warning: {text}");
+        }
+    }
+    details.insert("warnings".into(), serde_json::Value::Array(warnings));
     details.insert(
         "verification_scope".into(),
         serde_json::Value::String("post_hoc_safety_records_integrity".into()),

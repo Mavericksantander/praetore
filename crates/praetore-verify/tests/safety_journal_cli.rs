@@ -4,8 +4,8 @@
 use praetore_core::{
     ActionClass, EvidenceAttesterKey, Policy, SafetyNamespaceKey, SafetyNamespaceManifest,
     safety_ingest::{
-        IngestorConfig, LossReason, MemoryLookup, SafetyEventDraft, SafetyIngestKey,
-        SafetyIngestor, SafetySourceKey, SourcePins,
+        DEFAULT_MAX_SEQ_JUMP, IngestorConfig, LossReason, MemoryLookup, SafetyEventDraft,
+        SafetyIngestKey, SafetyIngestor, SafetySourceKey, SourcePins,
     },
 };
 use serde_json::Value;
@@ -79,6 +79,7 @@ fn chains() -> (String, String) {
             .unwrap(),
         sources,
         heads: BTreeMap::new(),
+        max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
     })
     .unwrap();
     let mut lookup = MemoryLookup::default();

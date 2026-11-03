@@ -86,6 +86,8 @@ pub const MAX_SAFETY_CHAIN_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SAFETY_CHAIN_ENTRIES: usize = 200_000;
 /// Most pinned sources.
 pub const MAX_SOURCE_PINS: usize = 256;
+/// Default of [`IngestorConfig::max_seq_jump`].
+pub const DEFAULT_MAX_SEQ_JUMP: u64 = 1_000_000;
 
 /// The chain of everything that cannot be attributed to a pinned source:
 /// `rejected` records and losses inside the ingester (a full queue, the
@@ -324,6 +326,11 @@ pub enum RejectReason {
     KeyMismatch,
     /// The signature does not verify under the pinned key.
     SignatureInvalid,
+    /// A verified event whose `source_seq` is more than
+    /// [`IngestorConfig::max_seq_jump`] above its chain's high-water mark.
+    /// It is recorded on the unattributed chain, so it cannot move the
+    /// source chain's high-water mark.
+    SeqJumpTooLarge,
 }
 
 impl RejectReason {
@@ -335,6 +342,7 @@ impl RejectReason {
             Self::UnknownSource => "unknown_source",
             Self::KeyMismatch => "key_mismatch",
             Self::SignatureInvalid => "signature_invalid",
+            Self::SeqJumpTooLarge => "seq_jump_too_large",
         }
     }
 
@@ -346,6 +354,7 @@ impl RejectReason {
             Self::UnknownSource,
             Self::KeyMismatch,
             Self::SignatureInvalid,
+            Self::SeqJumpTooLarge,
         ]
         .into_iter()
         .find(|reason| reason.as_str() == text)
@@ -1268,6 +1277,8 @@ pub enum IngestSetupError {
     InvalidHead { chain: String, reason: String },
     #[error("no source is pinned")]
     NoSources,
+    #[error("max_seq_jump must be between 1 and 2^53 - 1")]
+    InvalidMaxSeqJump,
 }
 
 /// Why one input produced no record.
@@ -1297,6 +1308,7 @@ pub struct SafetyIngestor {
     manifest: SafetyNamespaceManifest,
     sources: SourcePins,
     heads: BTreeMap<String, ChainHead>,
+    max_seq_jump: u64,
 }
 
 impl std::fmt::Debug for SafetyIngestor {
@@ -1322,6 +1334,14 @@ pub struct IngestorConfig {
     pub sources: SourcePins,
     /// The last head of every chain in storage.
     pub heads: BTreeMap<String, ChainHead>,
+    /// The largest accepted step of `source_seq` above a chain's high-water
+    /// mark (at least 1; [`DEFAULT_MAX_SEQ_JUMP`] by default). A verified
+    /// event further ahead is recorded as `rejected`
+    /// ([`RejectReason::SeqJumpTooLarge`]) on the unattributed chain and
+    /// does not move the high-water mark, so one event (a source bug, or a
+    /// compromised source key) cannot push the chain to the end of the
+    /// `source_seq` range.
+    pub max_seq_jump: u64,
 }
 
 impl SafetyIngestor {
@@ -1336,6 +1356,9 @@ impl SafetyIngestor {
             .map_err(IngestSetupError::Manifest)?;
         if config.sources.is_empty() {
             return Err(IngestSetupError::NoSources);
+        }
+        if config.max_seq_jump == 0 || config.max_seq_jump > MAX_SAFE_INTEGER {
+            return Err(IngestSetupError::InvalidMaxSeqJump);
         }
         let ingest_pin = config
             .ingest_key
@@ -1369,6 +1392,7 @@ impl SafetyIngestor {
             manifest: config.manifest,
             sources: config.sources,
             heads: BTreeMap::new(),
+            max_seq_jump: config.max_seq_jump,
         };
         ingestor.set_heads(config.heads)?;
         Ok(ingestor)
@@ -1537,6 +1561,9 @@ impl SafetyIngestor {
     ///
     /// * an input that does not parse or verify: one `rejected` record on
     ///   the unattributed chain (never dropped);
+    /// * a verified event more than `max_seq_jump` above the high-water
+    ///   mark: one `rejected` record (`seq_jump_too_large`) on the
+    ///   unattributed chain; the source chain does not change;
     /// * an event whose `source_seq` is above the next expected one: a
     ///   `loss` record for the missing range, then the event record;
     /// * an event whose `source_seq` was already recorded: `duplicate` (same
@@ -1573,6 +1600,21 @@ impl SafetyIngestor {
             ),
         };
         let seq = event.source_seq;
+        if seq - head.high_water.min(seq) > self.max_seq_jump {
+            let rejection = EventRejection::new(
+                RejectReason::SeqJumpTooLarge,
+                format!(
+                    "source {chain}: source_seq {seq} is {} above the high-water mark {}; the \
+                     maximum step is {}",
+                    seq - head.high_water,
+                    head.high_water,
+                    self.max_seq_jump
+                ),
+            );
+            return self
+                .prepare_rejected(input, &rejection, &now)
+                .map_err(IngestError::Record);
+        }
         let expected = head.high_water.saturating_add(1);
         let mut payloads = Vec::with_capacity(2);
         let (status, original) = if seq >= expected {
@@ -1669,6 +1711,9 @@ pub struct SafetyCounts {
     pub conflict: u64,
     pub late: u64,
     pub rejected: u64,
+    /// `rejected` records by reason (for example `seq_jump_too_large`: a
+    /// verified event that was too far ahead of its chain).
+    pub rejected_by_reason: BTreeMap<String, u64>,
     /// Loss records.
     pub loss: u64,
     /// `source_seq` values covered by gap loss records.
@@ -1924,6 +1969,10 @@ pub fn verify_safety_chain(
                     return Err(SafetyChainError::WrongChain { line });
                 }
                 counts.rejected += 1;
+                *counts
+                    .rejected_by_reason
+                    .entry(payload.reason.clone().unwrap_or_default())
+                    .or_default() += 1;
             }
             S::Loss => {
                 counts.loss += 1;

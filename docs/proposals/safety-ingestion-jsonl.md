@@ -96,7 +96,7 @@ exige la llave de ingesta (a diferencia del link sin clave de
 | `late` | fuente | `source_seq` que antes se registró como perdido |
 | `loss` (`source_seq_gap`) | fuente | `lost_from..=lost_to` nunca llegaron; va justo antes del evento que reveló el hueco |
 | `loss` (`queue_overflow`, `storage_error`) | `_unattributed` | `dropped` mensajes no se leyeron (cola llena) o no se pudieron guardar (base caída) |
-| `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`), `detail` y `raw` |
+| `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`, `seq_jump_too_large`), `detail` y `raw`. `seq_jump_too_large` es un evento verificado cuyo `source_seq` está más de `PRAETORE_SAFETY_MAX_SEQ_JUMP` por encima del high-water de su cadena: queda aquí y la cadena de la fuente no cambia |
 
 Todo registro con evento lleva `event` (el evento completo, con su firma),
 `event_hash`, `name_class` (`declared`, `undeclared`, `invalid_name`) y

@@ -35,6 +35,7 @@
 //! | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id","public_key"}` per line |
 //! | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own database role (TLS `verify-full` unless loopback) |
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
+//! | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` |
 //!
 //! The runtime-role relaxations of the gateway (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
 //! `PRAETORE_SCHEMA_OWNER`, ...) apply to the ingester's role check too.
@@ -66,8 +67,8 @@ use std::{
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
-        ChainHead, IngestorConfig, LossReason, MAX_SAFETY_EVENT_BYTES, PreparedRecords,
-        SafetyIngestKey, SafetyIngestor, SafetyRecordStatus, SourcePins,
+        ChainHead, DEFAULT_MAX_SEQ_JUMP, IngestorConfig, LossReason, MAX_SAFETY_EVENT_BYTES,
+        PreparedRecords, SafetyIngestKey, SafetyIngestor, SafetyRecordStatus, SourcePins,
     },
 };
 use praetore_replay_postgres::{
@@ -92,6 +93,8 @@ const RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const MAX_QUEUE_CAPACITY: usize = 4096;
 const POLL: Duration = Duration::from_millis(200);
+/// 2^53 - 1, the largest `source_seq`.
+const MAX_SAFE_SEQ: u64 = (1 << 53) - 1;
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -138,6 +141,7 @@ struct Config {
     sources: SourcePins,
     database: DatabaseConnector,
     queue_capacity: usize,
+    max_seq_jump: u64,
     role_options: RuntimeRoleOptions,
 }
 
@@ -273,6 +277,14 @@ fn load_config() -> Result<Config> {
                 "PRAETORE_SAFETY_QUEUE_CAPACITY must be between 1 and {MAX_QUEUE_CAPACITY}"
             ))?,
     };
+    let max_seq_jump = match var("PRAETORE_SAFETY_MAX_SEQ_JUMP") {
+        None => DEFAULT_MAX_SEQ_JUMP,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|jump| (1..=MAX_SAFE_SEQ).contains(jump))
+            .ok_or("PRAETORE_SAFETY_MAX_SEQ_JUMP must be between 1 and 2^53 - 1")?,
+    };
     let role_options = RuntimeRoleOptions::from_config(|name| std::env::var(name).ok())?;
     Ok(Config {
         socket,
@@ -285,6 +297,7 @@ fn load_config() -> Result<Config> {
         sources,
         database,
         queue_capacity,
+        max_seq_jump,
         role_options,
     })
 }
@@ -303,6 +316,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
         attester_pin: config.attester_pin,
         sources: config.sources,
         heads: BTreeMap::new(),
+        max_seq_jump: config.max_seq_jump,
     })?;
     Ok((
         ingestor,

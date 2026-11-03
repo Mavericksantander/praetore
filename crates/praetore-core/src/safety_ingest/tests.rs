@@ -61,6 +61,7 @@ fn config() -> IngestorConfig {
         attester_pin: attester_pin(),
         sources: pins(),
         heads: BTreeMap::new(),
+        max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
     }
 }
 
@@ -854,4 +855,80 @@ fn chains_do_not_mix_and_source_pins_are_enforced() {
     );
     let without_newline = harness.chain("executor-1").trim_end();
     assert!(verify_safety_chain(without_newline, &[ingest_pin()], None, None).is_err());
+}
+
+#[test]
+fn a_source_seq_too_far_ahead_is_rejected_and_does_not_move_the_high_water() {
+    let mut harness = Harness::new();
+    assert_eq!(
+        harness.statuses(&wire(&event(1, "safety:halt"))),
+        [SafetyRecordStatus::Accepted]
+    );
+    // One signed event at the end of the range (2^53 - 1).
+    let records = harness.ingest(&wire(&event(MAX_SAFE_INTEGER, "safety:halt")));
+    assert_eq!(records.len(), 1);
+    let rejected = records[0].payload();
+    assert_eq!(rejected.status, SafetyRecordStatus::Rejected);
+    assert_eq!(rejected.chain, UNATTRIBUTED_CHAIN);
+    assert_eq!(rejected.reason.as_deref(), Some("seq_jump_too_large"));
+    assert!(
+        rejected
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("high-water mark 1")
+    );
+    assert_eq!(harness.ingestor.head("executor-1").high_water, 1);
+    // The chain keeps working: the next event is accepted, with no loss.
+    assert_eq!(
+        harness.statuses(&wire(&event(2, "safety:halt"))),
+        [SafetyRecordStatus::Accepted]
+    );
+    let source = harness.verify("executor-1").unwrap();
+    assert_eq!(source.high_water, 2);
+    assert_eq!(source.counts.accepted, 2);
+    assert_eq!(source.counts.loss, 0);
+    let unattributed = harness.verify(UNATTRIBUTED_CHAIN).unwrap();
+    assert_eq!(unattributed.counts.rejected, 1);
+    assert_eq!(
+        unattributed.counts.rejected_by_reason,
+        BTreeMap::from([("seq_jump_too_large".to_owned(), 1)])
+    );
+}
+
+#[test]
+fn a_jump_up_to_the_maximum_is_a_loss_and_one_more_is_rejected() {
+    let mut harness = Harness::new();
+    harness.ingestor = SafetyIngestor::new(IngestorConfig {
+        max_seq_jump: 10,
+        ..config()
+    })
+    .unwrap();
+    // From high-water 0, source_seq 10 is a step of 10: allowed.
+    assert_eq!(
+        harness.statuses(&wire(&event(10, "safety:halt"))),
+        [SafetyRecordStatus::Loss, SafetyRecordStatus::Accepted]
+    );
+    // From 10, 21 is a step of 11: refused.
+    assert_eq!(
+        harness.statuses(&wire(&event(21, "safety:halt"))),
+        [SafetyRecordStatus::Rejected]
+    );
+    assert_eq!(harness.ingestor.head("executor-1").high_water, 10);
+    assert_eq!(
+        harness.statuses(&wire(&event(20, "safety:halt"))),
+        [SafetyRecordStatus::Loss, SafetyRecordStatus::Accepted]
+    );
+    harness.verify("executor-1").unwrap();
+    harness.verify(UNATTRIBUTED_CHAIN).unwrap();
+    for jump in [0, MAX_SAFE_INTEGER + 1] {
+        assert_eq!(
+            SafetyIngestor::new(IngestorConfig {
+                max_seq_jump: jump,
+                ..config()
+            })
+            .unwrap_err(),
+            IngestSetupError::InvalidMaxSeqJump
+        );
+    }
 }
