@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 use praetore_core::safety_ingest::{
     MAX_SAFETY_EVENT_BYTES, SafetyEvent, SafetyIngestKey, SafetyRecord, SafetySourceKey,
-    escape_bytes, verify_safety_chain,
+    escape_bytes, verify_safety_chain, verify_safety_chain_range,
 };
 
 fuzz_target!(|input: &[u8]| {
@@ -44,4 +44,5 @@ fuzz_target!(|input: &[u8]| {
         .public_key()
         .expect("fixed key");
     let _ = verify_safety_chain(text, std::slice::from_ref(&pin), None, None);
+    let _ = verify_safety_chain_range(text, std::slice::from_ref(&pin), None, None, None);
 });

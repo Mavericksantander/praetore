@@ -17,18 +17,26 @@
 //! next event the ingester receives from the same source shows a gap in
 //! `source_seq`, which it records as a signed loss record.
 //!
+//! Every run of the source has its own `source_epoch`, persisted by
+//! [`EpochFile::start`] before the first event: `source_seq` starts at 1 in
+//! each epoch, and a source that cannot persist its epoch must not report
+//! (the call fails; it never falls back to epoch 1).
+//!
 //! The transport is local only (v1). Reporting over the network (HTTP with
 //! mutual TLS) is future work.
 //!
 //! ```no_run
 //! use praetore_core::{SafetyEventDraft, SafetySourceKey};
-//! use praetore_safety_client::SafetyClient;
+//! use praetore_safety_client::{EpochFile, SafetyClient};
 //!
 //! let key = SafetySourceKey::generate();
+//! // Once per start of the source, before the first event.
+//! let epoch = EpochFile::new("/var/lib/executor-1/safety-epoch").start().unwrap();
 //! let client = SafetyClient::new("/run/praetore-safety/ingest.sock").unwrap();
 //! let event = key
 //!     .sign_event(SafetyEventDraft {
 //!         source_id: "executor-1".into(),
+//!         source_epoch: epoch,
 //!         source_seq: 1,
 //!         action: "safety:halt".into(),
 //!         occurred_at: time::OffsetDateTime::now_utc(),
@@ -40,6 +48,10 @@
 //! ```
 
 #![cfg(unix)]
+
+mod epoch;
+
+pub use epoch::EpochFile;
 
 use std::{
     io,

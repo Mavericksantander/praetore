@@ -1,4 +1,4 @@
-# Ingesta post-hoc de acciones de seguridad (G1, SAF-09.5): formato v1
+# Ingesta post-hoc de acciones de seguridad (G1, SAF-09.5): formato v2
 
 **Estado: implementado** (rama `feat/g1-safety-ingestion`, 2-nov-2026),
 transporte v1 local (socket Unix). Los límites de "Qué NO prueba" siguen
@@ -46,10 +46,15 @@ saltarlo.
 
 Un objeto JSON con exactamente:
 
-- `schema_version`: `1`.
+- `schema_version`: `2` (la versión 1, sin `source_epoch`, se rechaza).
 - `source_id`: 1 a 64 bytes de `a-z 0-9 . _ -`, empieza con letra o dígito.
 - `source_key_id`: `hex(SHA-256("PRAETORE_SAFETY_SOURCE_KEY_V1\0ed25519\0" || clave pública))`.
-- `source_seq`: entero de 1 a 2^53 - 1, monótono por fuente, sin huecos.
+- `source_epoch`: entero de 1 a 2^53 - 1, la ejecución de la fuente. Sube
+  en cada arranque de la fuente (`praetore_safety_client::EpochFile`, que lo
+  guarda con `fsync` antes del primer evento y falla cerrado si no puede:
+  nunca vuelve a 1).
+- `source_seq`: entero de 1 a 2^53 - 1, monótono dentro de un epoch, sin
+  huecos; empieza en 1 en cada epoch.
 - `action`: el nombre crudo. Se registra aunque no sea un nombre válido.
 - `occurred_at`: RFC 3339 en UTC, **reloj de la fuente**.
 - `params` (opcional, nunca vacío): hasta 16 claves `[a-z0-9_]{1,64}`, cada
@@ -69,10 +74,19 @@ canónica, así que dos codificaciones del mismo evento tienen el mismo hash.
 ## Registro (lo que guarda el ingestor)
 
 Cada registro es el JSON canónico (claves ordenadas, sin espacios) de un
-objeto con `schema_version` (1), `record_id`, `tenant_id`, `chain`,
+objeto con `schema_version` (2), `record_id`, `tenant_id`, `chain`,
 `chain_seq`, `prev_record_hash`, `recorded_at` (RFC 3339 UTC, reloj del
 ingestor), `status`, `key_id` (la llave de ingesta), `record_hash`,
-`signature` y los campos opcionales que exige su `status` (abajo). El payload
+`signature` y los campos opcionales que exige su `status` (abajo). En una
+cadena de fuente, cada registro firma además `high_water`: el high-water de
+`source_seq` después de él. El ingester reanuda desde ese valor firmado (la
+columna `high_water` de la tabla debe coincidir; lo exige el trigger) y el
+verificador comprueba que coincide con el que calcula. En `_unattributed` no
+va. Cada registro de una cadena de fuente firma también `source_epoch`, el
+epoch de su segmento (en un registro con evento, el del evento); la columna
+`source_epoch` debe coincidir (trigger, migración 0017). Un evento verificado con `occurred_at` a más de
+`PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` del reloj del ingester lleva
+`clock_skew_seconds` (`occurred_at - recorded_at`). El payload
 es todo salvo `record_hash` y `signature`, en JSON canónico; `record_hash =
 hex(SHA-256("PRAETORE_SAFETY_RECORD_V1\0" || payload))` y `signature =
 hex(Ed25519("PRAETORE_SAFETY_RECORD_V1\0" || payload))`. Cualquier otra
@@ -86,17 +100,32 @@ primero). Como ambos campos están **dentro del payload firmado**, reencadenar
 exige la llave de ingesta (a diferencia del link sin clave de
 `journal-chain-jsonl.md`).
 
+**Epochs (segmentos).** Una cadena de fuente es una secuencia de segmentos,
+uno por `source_epoch`, en orden creciente. Un evento con un epoch mayor que
+el de la cadena abre un segmento nuevo: su high-water empieza en 0, así que
+una fuente reiniciada que vuelve a `source_seq` 1 registra `accepted` (no
+`conflict`), y un primer evento con `source_seq` > 1 registra antes la
+pérdida `1..=seq-1` de ese epoch. Lo que la fuente no envió al final del
+epoch anterior no es visible. `duplicate`, `conflict` y `late` se buscan
+dentro del epoch. Un evento de un epoch menor se registra como `rejected`
+(`stale_epoch`) en `_unattributed`; uno más de 10^9 por
+encima del epoch de una cadena existente, como `rejected`
+(`epoch_jump_too_large`; el primer evento de una cadena puede traer
+cualquier epoch). Ninguno de los dos
+cambia la cadena de la fuente.
+
 | `status` | Cadena | Significado y campos |
 | --- | --- | --- |
 | `accepted` | fuente | evento verificado, `source_seq` siguiente, nombre declarado en el manifiesto |
 | `undeclared` | fuente | igual, nombre válido pero no declarado |
 | `invalid_name` | fuente | igual, `action` falla `SafetyActionName::parse`; `reason` es el código (`empty`, `too_long`, `not_printable_ascii`, `missing_prefix`, `invalid_name_start`) y `detail` el error escapado |
-| `duplicate` | fuente | `source_seq` ya registrado con el **mismo** `event_hash`; `original_record_hash` apunta al primero |
+| `duplicate` | fuente | `source_seq` ya registrado con el **mismo** `event_hash`; `original_record_hash` apunta al primero. El ingestor ya no lo escribe (ver "Duplicados"); el verificador lo sigue aceptando |
 | `conflict` | fuente | `source_seq` ya registrado con **otro** `event_hash`; `original_record_hash` apunta al primero |
 | `late` | fuente | `source_seq` que antes se registró como perdido |
 | `loss` (`source_seq_gap`) | fuente | `lost_from..=lost_to` nunca llegaron; va justo antes del evento que reveló el hueco |
 | `loss` (`queue_overflow`, `storage_error`) | `_unattributed` | `dropped` mensajes no se leyeron (cola llena) o no se pudieron guardar (base caída) |
-| `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`), `detail` y `raw` |
+| `loss` (`rate_limited`, `rejected_suppressed`, `duplicate`, `peer_refused`) | `_unattributed` | conteo firmado de `dropped` mensajes que no se registraron uno por uno: eventos verificados sobre el límite de su fuente, entradas inválidas sobre el límite de `rejected`, duplicados exactos y datagramas de un uid no permitido (solo Linux). `detail` nombra las fuentes cuando se conocen |
+| `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`, `seq_jump_too_large`, `stale_epoch`, `epoch_jump_too_large`), `detail` y `raw`. `seq_jump_too_large` es un evento verificado cuyo `source_seq` está más de `PRAETORE_SAFETY_MAX_SEQ_JUMP` por encima del high-water de su cadena: queda aquí y la cadena de la fuente no cambia |
 
 Todo registro con evento lleva `event` (el evento completo, con su firma),
 `event_hash`, `name_class` (`declared`, `undeclared`, `invalid_name`) y
@@ -106,11 +135,22 @@ imprimible: `\\` para la barra invertida y `\xNN` para cualquier otro byte),
 `len`, `sha256` de la entrada completa y `truncated`. Nada se descarta en
 silencio: lo que no verifica se guarda como `rejected`.
 
-**Duplicados (decisión).** Un reenvío del mismo evento no es idempotente:
-se guarda como `duplicate`, para que un replay sea visible en la cadena. No
-mueve el `source_seq` esperado. Un evento distinto con un `source_seq` ya
-usado se guarda como `conflict` (dos eventos firmados por la misma fuente
-con la misma posición: un error o una llave comprometida).
+**Duplicados (decisión, cambiada).** La primera versión guardaba cada
+reenvío del mismo evento como `duplicate`, para que un replay fuera visible
+en la cadena; un replay de datagramas capturados podía entonces hacer
+crecer la cadena sin límite. Ahora un duplicado exacto (mismo `event_hash`
+que el primer evento de su `source_epoch` y `source_seq`) no crea registro:
+se cuenta en el registro firmado de conteo (`loss`, `duplicate`) de
+`_unattributed`, por fuente, y no mueve el `source_seq` esperado. Un evento
+distinto con un `source_seq` ya usado se guarda como `conflict` (dos eventos
+firmados por la misma fuente con la misma posición: un error o una llave
+comprometida).
+
+**Inundación.** Los límites por fuente (después de verificar la firma) y
+para entradas inválidas acotan cuántos registros individuales crea una
+inundación; lo demás va a conteos firmados, uno por motivo y por segundo
+como mucho. Un evento limitado por tasa aparece en la cadena de su fuente
+como hueco (`loss`, `source_seq_gap`) cuando se registra el siguiente.
 
 ## Export
 
@@ -130,7 +170,10 @@ Para cada línea, en orden, fail-closed:
 3. `chain` y `tenant_id` son los de la primera línea; `chain_seq` es el
    número de línea; `prev_record_hash` es el `record_hash` anterior;
    `record_id` no se repite.
-4. Continuidad de `source_seq` (cadena de fuente): cada `accepted`,
+4. Epochs (cadena de fuente): `source_epoch` nunca baja; cuando sube empieza
+   un segmento nuevo (high-water 0, sin referencias a segmentos anteriores),
+   y no puede subir entre un `loss` y el evento que lo sigue.
+   Continuidad de `source_seq` dentro del segmento: cada `accepted`,
    `undeclared` o `invalid_name` es el siguiente; un hueco solo puede estar
    cubierto por un `loss` que empieza en el siguiente y al que sigue el
    evento que lo reveló; `duplicate`/`conflict` nombran al primer registro de
@@ -138,11 +181,14 @@ Para cada línea, en orden, fail-closed:
    perdido que no tenía evento. La cadena `_unattributed` solo tiene
    `rejected` y pérdidas internas.
 5. Con `--source-pins`, la firma de cada evento contra la llave de su fuente.
-6. Con `--expected-head`, el head es igual a ese valor.
+6. Con `--expected-head`, el head es igual a ese valor. Sin él, el
+   verificador advierte (`head_not_anchored`, en stderr y en
+   `details.warnings`) que un prefijo truncado también verifica.
 
 Reporta la cantidad de `accepted`, `undeclared`, `invalid_name`,
 `duplicate`, `conflict`, `late`, `rejected`, `loss`, eventos perdidos y
-mensajes descartados. Códigos: `SAFETY_CHAIN_FAIL`, `SAFETY_SEQUENCE_FAIL`,
+mensajes descartados, más la cantidad de epochs, el epoch final y su
+high-water. Códigos: `SAFETY_CHAIN_FAIL`, `SAFETY_SEQUENCE_FAIL`,
 `EVIDENCE_FAIL`, `AUTH_FAIL`, `SAFETY_EVENT_SIGNATURE_INVALID`,
 `JOURNAL_HEAD_MISMATCH`, `INVALID_REQUEST`, `INPUT_TOO_LARGE`.
 
@@ -163,8 +209,10 @@ fuente. No prueba:
   `--expected-head` con un head anclado fuera del control del operador lo
   detecta. Con la llave de ingesta se puede rehacer una cadena entera.
 - **Integridad de `_unattributed`.** Cualquiera con acceso al socket puede
-  llenarla de `rejected`; los permisos del socket (0600, o 0660 con un grupo)
-  lo limitan.
+  enviar basura: los permisos del socket (0600, o 0660 con un grupo) y, en
+  Linux, `PRAETORE_SAFETY_ALLOWED_UIDS` lo limitan, y los límites de tasa
+  acotan cuántos `rejected` individuales crea (el resto se cuenta). En macOS
+  no hay verificación del uid del emisor: solo los permisos del socket.
 
 ## Futuro
 

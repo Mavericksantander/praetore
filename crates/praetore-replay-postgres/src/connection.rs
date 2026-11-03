@@ -905,8 +905,9 @@ fn can_write_safety_records(
 
 /// For the safety ingester's role: a member of `praetore_runtime`, or the
 /// `praetore` tables on which it holds a privilege beyond SELECT on
-/// `schema_migrations` and SELECT and INSERT on `safety_records`, column
-/// privileges included (up to ten).
+/// `schema_migrations` and `safety_ingest_tenants` (whose row-level
+/// security shows only its own registration) and SELECT and INSERT on
+/// `safety_records`, column privileges included (up to ten).
 fn safety_ingest_excess(
     transaction: &mut postgres::Transaction<'_>,
     role: &str,
@@ -930,6 +931,10 @@ fn safety_ingest_excess(
                                'UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
                            WHEN 'schema_migrations' THEN pg_catalog.has_table_privilege($1, c.oid, \
                                'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                           WHEN 'safety_ingest_tenants' THEN pg_catalog.has_table_privilege($1, c.oid, \
+                               'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                                OR pg_catalog.has_any_column_privilege($1, c.oid, \
+                                    'INSERT, UPDATE, REFERENCES') \
                            ELSE pg_catalog.has_table_privilege($1, c.oid, \
                                     'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
                                 OR pg_catalog.has_any_column_privilege($1, c.oid, \
@@ -1291,7 +1296,8 @@ fn unexpected_grants(
          ingest_allowed(kind, rel, privilege) AS (VALUES \
              ('n', '', 'USAGE'), \
              ('r', 'schema_migrations', 'SELECT'), \
-             ('r', 'safety_records', 'SELECT'), ('r', 'safety_records', 'INSERT')), \
+             ('r', 'safety_records', 'SELECT'), ('r', 'safety_records', 'INSERT'), \
+             ('r', 'safety_ingest_tenants', 'SELECT')), \
          observe_allowed(rel, col) AS (VALUES \
              ('execution_journal', 'tenant_id'), ('execution_journal', 'agent_id'), \
              ('execution_journal', 'request_id'), ('execution_journal', 'request_digest'), \

@@ -4,8 +4,8 @@
 use praetore_core::{
     ActionClass, EvidenceAttesterKey, Policy, SafetyNamespaceKey, SafetyNamespaceManifest,
     safety_ingest::{
-        IngestorConfig, LossReason, MemoryLookup, SafetyEventDraft, SafetyIngestKey,
-        SafetyIngestor, SafetySourceKey, SourcePins,
+        DEFAULT_MAX_SEQ_JUMP, IngestorConfig, LossReason, MemoryLookup, SafetyEventDraft,
+        SafetyIngestKey, SafetyIngestor, SafetySourceKey, SourcePins,
     },
 };
 use serde_json::Value;
@@ -78,7 +78,8 @@ fn chains() -> (String, String) {
             .public_key()
             .unwrap(),
         sources,
-        heads: BTreeMap::new(),
+        max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
+        max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     })
     .unwrap();
     let mut lookup = MemoryLookup::default();
@@ -87,6 +88,7 @@ fn chains() -> (String, String) {
         source_key()
             .sign_event(SafetyEventDraft {
                 source_id: "executor-1".into(),
+                source_epoch: 1,
                 source_seq: seq,
                 action: action.into(),
                 occurred_at: now(),
@@ -108,7 +110,7 @@ fn chains() -> (String, String) {
     let mut store = |prepared: praetore_core::safety_ingest::PreparedRecords,
                      ingestor: &mut SafetyIngestor,
                      lookup: &mut MemoryLookup| {
-        ingestor.commit(&prepared);
+        ingestor.commit(&prepared).unwrap();
         for record in &prepared.records {
             lookup.record(record);
             let text = texts.entry(prepared.chain.clone()).or_default();
@@ -188,7 +190,9 @@ fn a_source_chain_verifies_and_reports_every_status() {
         ("invalid_name", 1),
         ("loss", 1),
         ("lost_events", 2),
-        ("duplicate", 1),
+        // The resent event 6 is an exact duplicate: counted by the
+        // ingester, not stored.
+        ("duplicate", 0),
         ("conflict", 1),
         ("rejected", 0),
     ] {
@@ -326,5 +330,46 @@ fn a_tampered_chain_fails_with_a_code() {
             "AB"
         ]))["code"],
         "USAGE"
+    );
+}
+
+#[test]
+fn without_an_expected_head_the_verifier_warns_that_a_prefix_also_verifies() {
+    let dir = Dir::new();
+    let (source, _) = chains();
+    let journal = dir.write("source.jsonl", &source);
+    let (ingest, _) = pin_files(&dir);
+    let warnings = |output: &Output| -> Vec<String> {
+        assert!(output.status.success());
+        summary(output)["details"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| warning.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let output = verify(&["--journal", &journal, "--ingest-pin", &ingest]);
+    let found = warnings(&output);
+    assert!(
+        found.iter().any(|w| w.starts_with("head_not_anchored")),
+        "{found:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("head_not_anchored"));
+    let head = summary(&output)["details"]["head"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let output = verify(&[
+        "--journal",
+        &journal,
+        "--ingest-pin",
+        &ingest,
+        "--expected-head",
+        &head,
+    ]);
+    assert!(
+        !warnings(&output)
+            .iter()
+            .any(|w| w.starts_with("head_not_anchored"))
     );
 }

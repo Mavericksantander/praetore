@@ -514,9 +514,76 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_MANIFEST_FILE` | the signed safety namespace manifest (`praetore policy safety-manifest`), canonical file form |
 | `PRAETORE_SAFETY_NAMESPACE_PIN_FILE` | the namespace public key the manifest must verify under |
 | `PRAETORE_SAFETY_ATTESTER_PIN_FILE` | the gateway's evidence attester public key, only to refuse it as another role's key |
+| `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` | optional: the previous ingestion public keys of a registered rotation, one 64-hex key per line (at most 16). A chain whose last record is signed by any other key makes the ingester refuse to start |
 | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id":"executor-1","public_key":"<64 hex>"}` per line, at most 256 sources, no key twice |
 | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own role; the file form is read as an owner-only secret file. TLS `verify-full` is required unless the host is loopback or a Unix socket |
 | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096); when full, messages are dropped and recorded as a `queue_overflow` loss |
+| `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` (the source's clock) differs from the ingester's clock by more than this many seconds (default 300) keeps its status and carries the signed field `clock_skew_seconds` (`occurred_at - recorded_at`); `praetore-verify safety-journal` counts them as `clock_skew` |
+| `PRAETORE_SAFETY_SOURCE_RATE`, `PRAETORE_SAFETY_SOURCE_BURST` | verified events recorded per second for one source (default 100), and the burst after a quiet period (default 1000), 1 to 1000000. Events above it are not recorded; they are counted in a signed `loss` record (`rate_limited`, `detail` names the sources), and the source's chain shows them as a `source_seq` gap when its next event is recorded |
+| `PRAETORE_SAFETY_REJECTED_RATE`, `PRAETORE_SAFETY_REJECTED_BURST` | individual `rejected` records per second for all inputs that do not verify (default 10, burst 100); the rest are counted (`rejected_suppressed`) |
+| `PRAETORE_SAFETY_ALLOWED_UIDS` | optional, Linux only: comma-separated user ids allowed to send (at most 32). The ingester turns on `SO_PASSCRED` and reads each datagram's `SCM_CREDENTIALS`; a datagram from another user id is not read and is counted (`peer_refused`). On any other platform setting it makes startup fail: there the socket permissions (`0600`, or `0660` with `PRAETORE_SAFETY_SOCKET_GROUP`) are the only check of who may send |
+| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed`; so is one whose `source_epoch` is more than 10^9 above its existing chain's epoch (`epoch_jump_too_large`, a fixed bound: the epoch also advances on starts that send nothing, and the first event of a chain may carry any epoch) and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+
+### Floods
+
+A local process that can write to the socket can send as fast as it likes.
+The ingester bounds what that costs. Only a verified event that can advance
+its chain (a new `source_seq` above the high-water mark, or the start of a
+newer epoch, within the jump limits) spends its source's budget, so only a
+source key's holder spends it. Every other input, including verified events
+that anyone can replay from an export (at or below the high-water mark, of
+an older epoch, or beyond a jump limit), shares the budget of `rejected`
+records (`PRAETORE_SAFETY_REJECTED_RATE`): a replay flood therefore grows
+`_unattributed` no faster than garbage does, and a genuine `late` event
+competes with that traffic. An exact duplicate of a recorded event creates
+no record;
+and everything not recorded one by one (rate limited, suppressed rejections,
+exact duplicates, refused peers, a full queue, the database down) is added
+to a signed count on `_unattributed` (`loss`, with `reason` and `dropped`),
+written at most once per second (one record per reason) and when the
+ingester stops. `praetore-verify safety-journal` reports the counts as
+`dropped_by_reason`. None of this touches the executors: the client sends
+one non-blocking datagram and never waits, so an executor's failsafe runs
+whatever the ingester does.
+
+**Exact duplicates (change to the G1 decision).** G1 first recorded every
+resent event as a `duplicate` record, to keep replays visible. A replay of
+captured datagrams could then grow a chain without bound, so an exact
+duplicate is now only counted (`duplicate` in the signed counts, per
+source). A different event with a used `source_seq` is still a `conflict`
+record. Chains written before the change may hold `duplicate` records, and
+the verifier still checks them.
+
+### Source epochs
+
+Every event carries `source_epoch`, the run of its source, and `source_seq`
+starts at 1 in each epoch. A source persists its epoch with
+`praetore_safety_client::EpochFile`: once per start, before the first event,
+`EpochFile::start` reads the file (a missing file is epoch 0), adds one,
+writes the new value to `<file>.tmp`, `fsync`s it, renames it over the file
+and `fsync`s the directory. The file holds the decimal epoch and a newline,
+for example `42`. Keep it on persistent storage, one file per `source_id`,
+in a directory that only the source's user can write (the file and its
+temporary are created owner-only, and a leftover temporary is replaced
+without following links). If it cannot be read, holds anything else, or cannot be
+written, `start` fails and the source must not report: falling back to 1
+would make the ingester record every event as `rejected` (`stale_epoch`).
+Restoring the file from an old backup has the same effect until the epoch
+passes the chain's again; set it to at least the epoch that
+`praetore-verify safety-journal` reports (`source_epoch`).
+
+An event of a newer epoch starts a new segment of the source's chain (a gap
+from `source_seq` 1 is recorded as a loss of that epoch); an older epoch is
+`rejected` (`stale_epoch`) on `_unattributed`. Events that a source did not
+send before it stopped are not visible as a gap: the next epoch starts
+afresh.
+
+Records of the first G1 format (`schema_version` 1, before source epochs)
+cannot be read by this version, and an ingester whose tenant holds them
+refuses to start. They only exist on databases that ran an unreleased
+build: export and verify those chains with that build, then remove the G1
+storage with the manual rollback below and let the upgraded runner apply
+0016 and 0017 again.
 
 The runtime-role relaxations (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
 `PRAETORE_SCHEMA_OWNER`, `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`, ...)
@@ -531,17 +598,41 @@ Migration 0016 grants the NOLOGIN group `praetore_safety_ingest`:
 | schema `praetore` | `USAGE` |
 | `schema_migrations` | `SELECT` (startup schema check) |
 | `safety_records` | `SELECT`, `INSERT` |
+| `safety_ingest_tenants` | `SELECT` (migration 0017; row-level security shows only its own row) |
 
-Create the ingester's login role as a member of that group only, for
-example `CREATE ROLE praetore_safety LOGIN PASSWORD '...' IN ROLE
-praetore_safety_ingest;`. `verify_safety_ingest_role_with` refuses, at
+Create one login role per tenant, each a member of that group only, for
+example `CREATE ROLE praetore_safety_t1 LOGIN PASSWORD '...' IN ROLE
+praetore_safety_ingest;`, and register it as the schema owner with its
+tenant and the id of its ingestion key (`praetore-safety-ingest doctor`
+prints the key id, and the exact statement when the role is not
+registered):
+
+```sql
+INSERT INTO praetore.safety_ingest_tenants (role_name, tenant_id, ingest_key_id)
+VALUES ('praetore_safety_t1', '<tenant uuid>', '<ingestion key id>');
+```
+
+Row-level security on `safety_records` shows and accepts only the rows of
+the tenant the session's login role (`session_user`) is registered for; the
+`praetore.tenant_id` setting no longer matters for this table. The insert
+trigger accepts only records that name the registered key (`key_id`); it does
+not check the signature, which the ingester checks when it reads the heads
+(a row with a bad signature makes it refuse to start) and the verifier
+checks on export. A tenant has one
+role and one key, and a key is registered for one tenant: registering one
+key for two tenants is refused. The ingester and `praetore journal-export
+--safety` check the registration before reading or writing and refuse a
+role registered for another tenant (or, for the ingester, another key).
+When rotating the ingestion key, update the row first (`UPDATE
+praetore.safety_ingest_tenants SET ingest_key_id = '<new key id>' WHERE
+role_name = '...'`), then restart the ingester with the new key. `verify_safety_ingest_role_with` refuses, at
 startup, a role that is privileged, owns or can create in `praetore`, is a
 member of `praetore_runtime`, or holds any privilege on another `praetore`
 table (column privileges included), plus the database-wide checks of the
 runtime role. The gateway's runtime role gets nothing on `safety_records`,
-and `verify_runtime_role` refuses one that can insert into it. Exports read
-with any role that may select from the table, for example the ingester's
-(`PRAETORE_SAFETY_DATABASE_URL`).
+and `verify_runtime_role` refuses one that can insert into it. Export with
+the tenant's registered role (`PRAETORE_SAFETY_DATABASE_URL`); any other
+role sees no rows.
 
 ### Keys
 
@@ -559,8 +650,47 @@ compromised source key lets its holder sign any event for that source:
 remove its pin, restart the ingester and treat that source's later records
 as untrusted. After rotating the ingestion key, records keep the old key's
 signature (the table is append-only): pin both keys when exporting and
-verifying (`--ingest-pin` is repeatable); the ingester logs a chain whose
-last record is signed by another key.
+verifying (`--ingest-pin` is repeatable). To rotate, list the old public
+key in `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` (one 64-hex key per line),
+update the tenant's `safety_ingest_tenants` row to the new key id, and start the ingester with the new key: each chain continues under the new
+key, and the ingester logs every chain whose last record the previous key
+signed. A chain whose last record is signed by a key that is neither the
+current one nor listed there makes the ingester refuse to start: a key
+change must be registered, and a row signed by an unknown key is never
+continued.
+
+### Rolling back the safety-record storage (0016 and 0017)
+
+The migration runner is forward-only. To remove the G1 storage (for example
+to downgrade to a release without it, or to start over after an unreleased
+format), the schema owner runs
+[`docs/rollback/g1-safety-records.sql`](rollback/g1-safety-records.sql) with
+every ingester stopped:
+
+```sh
+# 1. Export and verify every chain of every tenant first.
+# 2. Then, as the praetore schema owner:
+psql "$OWNER_URL" -v ON_ERROR_STOP=1 \
+  -c "SET praetore.rollback_confirm = 'destroy-safety-records'" \
+  -f docs/rollback/g1-safety-records.sql
+```
+
+In one transaction it drops `praetore.safety_records` (with its triggers and
+policies), `praetore.safety_ingest_tenants` and the two trigger functions,
+revokes what 0016 granted `praetore_safety_ingest` in this database, and
+deletes the `0016_safety_records` and `0017_safety_records_followups` rows of
+`praetore.schema_migrations`. It destroys every safety record, so without
+the confirmation setting it refuses to run while the table holds any. The
+table has `FORCE ROW LEVEL SECURITY`, so an owner without superuser or
+`BYPASSRLS` would see no rows; the script lifts it first, inside the same
+transaction, so the check counts every record. The test runs it as such an
+owner. The
+group role is cluster-wide and is not dropped (`DROP ROLE
+praetore_safety_ingest` once no database uses it). Afterwards
+`apply_migrations` applies 0016 and 0017 again, and the tenant
+registrations must be inserted again. The test
+`postgres_safety_manual_rollback_removes_0016_and_0017_and_they_apply_again`
+runs this script against a scratch database in CI.
 
 ### Export and verification
 
@@ -574,6 +704,30 @@ praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin ingest.pu
 Export `_unattributed` too (`--source _unattributed`): it holds the
 `rejected` inputs and the losses inside the ingester. Anchor heads outside
 the operator's control to detect truncation (SAF-13).
+
+A whole-chain export holds at most 200000 records and 64 MiB. Export a
+longer chain in ranges: `--from-seq 0 --limit N` writes the first range and
+prints `next_from_seq`; each later range (`--from-seq <next_from_seq>`)
+starts with its anchor, the record just before it. Verify each later range
+with `--range --expected-anchor <head of the previous range>`; the last
+range's head is the chain's head. A range never ends between a gap loss
+record and the event that revealed it. `duplicate`, `conflict` and `late`
+records whose earlier record is in an earlier range are reported as
+`unchecked_references`, and **range verification does not check them**:
+verifying each range alone does not prove that such a `late` seq was really
+lost or that the referenced record (`original_record_hash`) exists and
+matches. Only a whole-chain verification checks those references; when a
+chain is too large for one, treat a non-zero `unchecked_references` as
+unverified.
+
+```sh
+praetore journal-export --safety --tenant <uuid> --source executor-1 \
+  --ingest-pin ingest.pub --from-seq 0 --limit 50000 --output part-0.jsonl
+praetore journal-export --safety --tenant <uuid> --source executor-1 \
+  --ingest-pin ingest.pub --from-seq <next_from_seq> --output part-1.jsonl
+praetore-verify safety-journal --journal part-1.jsonl --ingest-pin ingest.pub \
+  --range --expected-anchor <head of part-0> --format json
+```
 
 ## Offline evidence and authority verification
 

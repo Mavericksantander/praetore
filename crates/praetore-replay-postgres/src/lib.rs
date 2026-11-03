@@ -32,7 +32,10 @@ pub use observability::{
     ExecutionFilters, ExecutionPage, ExecutionTransition, ObservedExecution,
     PostgresObservabilityReader,
 };
-pub use safety::{PostgresSafetyStore, SafetyStoreError, StoredHead, read_safety_chain};
+pub use safety::{
+    PostgresSafetyStore, SafetyChainRange, SafetyStoreError, StoredHead, read_safety_chain,
+    read_safety_chain_range,
+};
 
 pub struct PostgresReplayGuard {
     client: Mutex<Client>,

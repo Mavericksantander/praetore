@@ -63,7 +63,7 @@ pub const SAFETY_SOURCE_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_SAFETY_SOURCE_KEY_V1\0
 pub const SAFETY_INGEST_KEY_ID_DOMAIN: &[u8] = b"PRAETORE_SAFETY_INGEST_KEY_V1\0ed25519\0";
 
 /// The only event and record schema version this crate writes and accepts.
-pub const SAFETY_INGEST_SCHEMA_VERSION: u8 = 1;
+pub const SAFETY_INGEST_SCHEMA_VERSION: u8 = 2;
 /// Largest message (one event) the ingester reads.
 pub const MAX_SAFETY_EVENT_BYTES: usize = 8 * 1024;
 /// Longest source id, in bytes.
@@ -86,6 +86,16 @@ pub const MAX_SAFETY_CHAIN_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SAFETY_CHAIN_ENTRIES: usize = 200_000;
 /// Most pinned sources.
 pub const MAX_SOURCE_PINS: usize = 256;
+/// Default of [`IngestorConfig::max_seq_jump`].
+pub const DEFAULT_MAX_SEQ_JUMP: u64 = 1_000_000;
+
+/// The largest accepted step of `source_epoch` above an existing chain's
+/// epoch. Independent of `max_seq_jump`: a source's epoch also advances on
+/// starts that send nothing (a crash loop), so a small seq limit must not
+/// lock a source out. The first event of a chain may carry any epoch.
+pub const MAX_EPOCH_JUMP: u64 = 1_000_000_000;
+/// Default of [`IngestorConfig::max_clock_skew_seconds`].
+pub const DEFAULT_MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 
 /// The chain of everything that cannot be attributed to a pinned source:
 /// `rejected` records and losses inside the ingester (a full queue, the
@@ -261,6 +271,11 @@ pub enum ParamValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafetyEventDraft {
     pub source_id: String,
+    /// The source's run: at least 1, and larger after every restart of the
+    /// source (`praetore_safety_client::EpochFile` persists it). A new
+    /// epoch starts a new segment of the chain, whose `source_seq` starts
+    /// at 1 again.
+    pub source_epoch: u64,
     /// Monotonic per source, starting at 1. The ingester records a gap as a
     /// signed loss record.
     pub source_seq: u64,
@@ -272,10 +287,10 @@ pub struct SafetyEventDraft {
     pub params: BTreeMap<String, ParamValue>,
 }
 
-/// A signed post-hoc safety event (schema version 1).
+/// A signed post-hoc safety event (schema version 2).
 ///
-/// Its JSON object has exactly `schema_version` (1), `source_id`,
-/// `source_key_id`, `source_seq`, `action`, `occurred_at` (RFC 3339 UTC),
+/// Its JSON object has exactly `schema_version` (2), `source_id`,
+/// `source_key_id`, `source_epoch`, `source_seq`, `action`, `occurred_at` (RFC 3339 UTC),
 /// `params` (optional, never empty), `post_hoc` (`true`) and `signature`:
 /// `hex(Ed25519(SAFETY_EVENT_DOMAIN || canonical JSON of every other
 /// field))` by the source key. The wire encoding may be any JSON encoding of
@@ -286,6 +301,7 @@ pub struct SafetyEvent {
     schema_version: u8,
     source_id: String,
     source_key_id: String,
+    source_epoch: u64,
     source_seq: u64,
     action: String,
     occurred_at: String,
@@ -300,6 +316,7 @@ struct EventSigningPayload<'a> {
     schema_version: u8,
     source_id: &'a str,
     source_key_id: &'a str,
+    source_epoch: u64,
     source_seq: u64,
     action: &'a str,
     occurred_at: &'a str,
@@ -324,6 +341,18 @@ pub enum RejectReason {
     KeyMismatch,
     /// The signature does not verify under the pinned key.
     SignatureInvalid,
+    /// A verified event whose `source_seq` is more than
+    /// [`IngestorConfig::max_seq_jump`] above its chain's high-water mark.
+    /// It is recorded on the unattributed chain, so it cannot move the
+    /// source chain's high-water mark.
+    SeqJumpTooLarge,
+    /// A verified event of an epoch older than its chain's current one (a
+    /// source that went back to an earlier run). Recorded on the
+    /// unattributed chain; the source chain does not change.
+    StaleEpoch,
+    /// A verified event whose `source_epoch` is more than
+    /// [`MAX_EPOCH_JUMP`] above its chain's current epoch.
+    EpochJumpTooLarge,
 }
 
 impl RejectReason {
@@ -335,6 +364,9 @@ impl RejectReason {
             Self::UnknownSource => "unknown_source",
             Self::KeyMismatch => "key_mismatch",
             Self::SignatureInvalid => "signature_invalid",
+            Self::SeqJumpTooLarge => "seq_jump_too_large",
+            Self::StaleEpoch => "stale_epoch",
+            Self::EpochJumpTooLarge => "epoch_jump_too_large",
         }
     }
 
@@ -346,6 +378,9 @@ impl RejectReason {
             Self::UnknownSource,
             Self::KeyMismatch,
             Self::SignatureInvalid,
+            Self::SeqJumpTooLarge,
+            Self::StaleEpoch,
+            Self::EpochJumpTooLarge,
         ]
         .into_iter()
         .find(|reason| reason.as_str() == text)
@@ -386,6 +421,7 @@ impl SafetySourceKey {
             schema_version: SAFETY_INGEST_SCHEMA_VERSION,
             source_id: draft.source_id,
             source_key_id: self.key_id(),
+            source_epoch: draft.source_epoch,
             source_seq: draft.source_seq,
             action: draft.action,
             occurred_at,
@@ -443,6 +479,9 @@ impl SafetyEvent {
         if !is_lower_hex(&self.source_key_id, 64) {
             return Err(malformed("source_key_id"));
         }
+        if self.source_epoch == 0 || self.source_epoch > MAX_SAFE_INTEGER {
+            return Err(malformed("source_epoch"));
+        }
         if self.source_seq == 0 || self.source_seq > MAX_SAFE_INTEGER {
             return Err(malformed("source_seq"));
         }
@@ -486,6 +525,7 @@ impl SafetyEvent {
             schema_version: self.schema_version,
             source_id: &self.source_id,
             source_key_id: &self.source_key_id,
+            source_epoch: self.source_epoch,
             source_seq: self.source_seq,
             action: &self.action,
             occurred_at: &self.occurred_at,
@@ -539,6 +579,10 @@ impl SafetyEvent {
 
     pub fn source_seq(&self) -> u64 {
         self.source_seq
+    }
+
+    pub fn source_epoch(&self) -> u64 {
+        self.source_epoch
     }
 
     /// The raw action name, exactly as sent.
@@ -748,8 +792,9 @@ const NAME_ERROR_CODES: [&str; 5] = [
     "invalid_name_start",
 ];
 
-/// Why events were lost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Why events were lost, or why messages were counted instead of recorded
+/// one by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum LossReason {
     /// `source_seq` jumped: the events `lost_from..=lost_to` never arrived.
     SourceSeqGap,
@@ -759,6 +804,20 @@ pub enum LossReason {
     /// The database was unavailable: `dropped` messages could not be stored
     /// (unattributed).
     StorageError,
+    /// Verified events above their source's rate limit, not recorded
+    /// (unattributed; `detail` names the sources). The source chain shows
+    /// them as a `source_seq` gap when its next event is recorded.
+    RateLimited,
+    /// Inputs that did not verify, above the rate of individual `rejected`
+    /// records (unattributed).
+    RejectedSuppressed,
+    /// Exact duplicates (an event already recorded with the same event
+    /// hash): counted, never stored again (unattributed; `detail` names the
+    /// sources).
+    Duplicate,
+    /// Datagrams from a process whose user id is not allowed, not read
+    /// (unattributed; Linux only).
+    PeerRefused,
 }
 
 impl LossReason {
@@ -767,13 +826,25 @@ impl LossReason {
             Self::SourceSeqGap => "source_seq_gap",
             Self::QueueOverflow => "queue_overflow",
             Self::StorageError => "storage_error",
+            Self::RateLimited => "rate_limited",
+            Self::RejectedSuppressed => "rejected_suppressed",
+            Self::Duplicate => "duplicate",
+            Self::PeerRefused => "peer_refused",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        [Self::SourceSeqGap, Self::QueueOverflow, Self::StorageError]
-            .into_iter()
-            .find(|reason| reason.as_str() == text)
+        [
+            Self::SourceSeqGap,
+            Self::QueueOverflow,
+            Self::StorageError,
+            Self::RateLimited,
+            Self::RejectedSuppressed,
+            Self::Duplicate,
+            Self::PeerRefused,
+        ]
+        .into_iter()
+        .find(|reason| reason.as_str() == text)
     }
 }
 
@@ -845,6 +916,24 @@ pub struct SafetyRecordPayload {
     pub dropped: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<RawInput>,
+    /// For a record with an event: `occurred_at - recorded_at` in seconds,
+    /// present only when its magnitude is above the ingester's
+    /// `max_clock_skew_seconds` (an event dated in the future or long ago
+    /// by the source's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_skew_seconds: Option<i64>,
+    /// On a source chain: the `source_seq` high-water mark after this
+    /// record (every `source_seq` up to it is an event or covered by a loss
+    /// record). Signed, so an ingester resumes from the last signed record
+    /// and not from an unsigned column. Absent on the unattributed chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_water: Option<u64>,
+    /// On a source chain: the source epoch of the chain segment this
+    /// record belongs to (the event's `source_epoch` for a record with an
+    /// event). `high_water` counts `source_seq` within this epoch. Absent on
+    /// the unattributed chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch: Option<u64>,
     /// The ingestion key id.
     pub key_id: String,
 }
@@ -881,6 +970,21 @@ fn invalid(message: impl Into<String>) -> SafetyRecordError {
 }
 
 impl SafetyRecordPayload {
+    /// The high-water mark after a record of this status on a source chain,
+    /// given the one before it.
+    fn high_water_after(&self, previous: u64) -> u64 {
+        match self.status {
+            SafetyRecordStatus::Accepted
+            | SafetyRecordStatus::Undeclared
+            | SafetyRecordStatus::InvalidName => self
+                .event
+                .as_ref()
+                .map_or(previous, |event| event.source_seq),
+            SafetyRecordStatus::Loss => self.lost_to.unwrap_or(previous),
+            _ => previous,
+        }
+    }
+
     fn canonical_bytes(&self) -> Result<Vec<u8>, SafetyRecordError> {
         canonical_json(self).map_err(|error| invalid(format!("cannot encode: {error}")))
     }
@@ -918,6 +1022,16 @@ impl SafetyRecordPayload {
             return Err(invalid("detail is not bounded escaped text"));
         }
         let unattributed = self.chain == UNATTRIBUTED_CHAIN;
+        match self.high_water {
+            None if unattributed => {}
+            Some(high_water) if !unattributed && high_water <= MAX_SAFE_INTEGER => {}
+            _ => return Err(invalid("wrong high_water for the chain")),
+        }
+        match self.source_epoch {
+            None if unattributed => {}
+            Some(epoch) if !unattributed && (1..=MAX_SAFE_INTEGER).contains(&epoch) => {}
+            _ => return Err(invalid("wrong source_epoch for the chain")),
+        }
         let has = |present: bool, field: &str| -> Result<(), SafetyRecordError> {
             if present {
                 Ok(())
@@ -936,6 +1050,10 @@ impl SafetyRecordPayload {
                 .validate()
                 .map_err(|error| invalid(format!("event: {error}")))?;
             has(!unattributed && event.source_id == self.chain, "chain")?;
+            has(
+                self.source_epoch == Some(event.source_epoch),
+                "source_epoch",
+            )?;
             has(
                 self.event_hash.as_deref() == Some(&event.event_hash()),
                 "event_hash",
@@ -985,8 +1103,14 @@ impl SafetyRecordPayload {
             if let Some(reason) = &self.reason {
                 has(NAME_ERROR_CODES.contains(&reason.as_str()), "reason")?;
             }
+            has(
+                self.clock_skew_seconds
+                    .is_none_or(|skew| skew != 0 && skew.unsigned_abs() <= MAX_SAFE_INTEGER),
+                "clock_skew_seconds",
+            )?;
             return Ok(());
         }
+        has(self.clock_skew_seconds.is_none(), "clock_skew_seconds")?;
         has(
             self.event.is_none()
                 && self.event_hash.is_none()
@@ -1027,7 +1151,14 @@ impl SafetyRecordPayload {
                             _ => return Err(invalid("loss record with a wrong range")),
                         }
                     }
-                    Some(LossReason::QueueOverflow | LossReason::StorageError) => {
+                    Some(
+                        LossReason::QueueOverflow
+                        | LossReason::StorageError
+                        | LossReason::RateLimited
+                        | LossReason::RejectedSuppressed
+                        | LossReason::Duplicate
+                        | LossReason::PeerRefused,
+                    ) => {
                         has(unattributed, "chain")?;
                         has(
                             self.lost_from.is_none() && self.lost_to.is_none(),
@@ -1167,23 +1298,14 @@ impl SafetyRecord {
     }
 
     /// The chain position after this record: what the next record of the
-    /// chain links to, and the `source_seq` high-water mark.
-    fn next_head(&self, previous_high_water: u64) -> ChainHead {
-        let payload = &self.payload;
-        let high_water = match payload.status {
-            SafetyRecordStatus::Accepted
-            | SafetyRecordStatus::Undeclared
-            | SafetyRecordStatus::InvalidName => payload
-                .event
-                .as_ref()
-                .map_or(previous_high_water, |event| event.source_seq),
-            SafetyRecordStatus::Loss => payload.lost_to.unwrap_or(previous_high_water),
-            _ => previous_high_water,
-        };
+    /// chain links to, and the signed `source_seq` high-water mark (0 on the
+    /// unattributed chain).
+    pub fn next_head(&self) -> ChainHead {
         ChainHead {
-            next_chain_seq: payload.chain_seq + 1,
+            next_chain_seq: self.payload.chain_seq + 1,
             prev_record_hash: self.record_hash.clone(),
-            high_water,
+            high_water: self.payload.high_water.unwrap_or(0),
+            epoch: self.payload.source_epoch.unwrap_or(0),
         }
     }
 }
@@ -1191,14 +1313,17 @@ impl SafetyRecord {
 // ---------------------------------------------------------------------------
 // Ingestion.
 
-/// The position of one chain: the next `chain_seq`, the hash it links to
-/// and the `source_seq` high-water mark (every `source_seq` up to it is
-/// recorded as an event or covered by a loss record).
+/// The position of one chain: the next `chain_seq`, the hash it links to,
+/// the current source epoch (0 before the first record of a source chain,
+/// and always 0 on the unattributed chain) and the `source_seq` high-water
+/// mark within that epoch (every `source_seq` up to it is recorded as an
+/// event or covered by a loss record).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainHead {
     pub next_chain_seq: u64,
     pub prev_record_hash: String,
     pub high_water: u64,
+    pub epoch: u64,
 }
 
 impl Default for ChainHead {
@@ -1207,14 +1332,15 @@ impl Default for ChainHead {
             next_chain_seq: 0,
             prev_record_hash: GENESIS_HASH.to_owned(),
             high_water: 0,
+            epoch: 0,
         }
     }
 }
 
 impl ChainHead {
-    /// The head after `record`, given the head before it.
+    /// The head after `record`.
     pub fn after(&self, record: &SafetyRecord) -> Self {
-        record.next_head(self.high_water)
+        record.next_head()
     }
 }
 
@@ -1229,11 +1355,12 @@ pub struct EventRef {
 pub trait EventLookup {
     type Error;
     /// The first event record (`accepted`, `undeclared`, `invalid_name` or
-    /// `late`) of `chain` with `source_seq`, if any.
+    /// `late`) of `chain` with `source_epoch` and `source_seq`, if any.
     fn first_event(
         &mut self,
         tenant_id: Uuid,
         chain: &str,
+        source_epoch: u64,
         source_seq: u64,
     ) -> Result<Option<EventRef>, Self::Error>;
 }
@@ -1248,6 +1375,18 @@ pub struct PreparedRecords {
     /// so that the ingester can resume from the last record of a chain).
     pub high_waters: Vec<u64>,
     pub head: ChainHead,
+    /// The input was counted instead of recorded (no records): an exact
+    /// duplicate, or above a rate limit. Add it to
+    /// [`FloodControl::count`] so that it is recorded in a signed count.
+    pub suppressed: Option<Suppressed>,
+}
+
+/// An input counted instead of recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suppressed {
+    pub reason: LossReason,
+    /// The verified source, if any.
+    pub source_id: Option<String>,
 }
 
 /// Why the ingester could not be configured.
@@ -1268,6 +1407,8 @@ pub enum IngestSetupError {
     InvalidHead { chain: String, reason: String },
     #[error("no source is pinned")]
     NoSources,
+    #[error("max_seq_jump must be between 1 and 2^53 - 1")]
+    InvalidMaxSeqJump,
 }
 
 /// Why one input produced no record.
@@ -1297,6 +1438,8 @@ pub struct SafetyIngestor {
     manifest: SafetyNamespaceManifest,
     sources: SourcePins,
     heads: BTreeMap<String, ChainHead>,
+    max_seq_jump: u64,
+    max_clock_skew_seconds: u64,
 }
 
 impl std::fmt::Debug for SafetyIngestor {
@@ -1320,8 +1463,18 @@ pub struct IngestorConfig {
     /// ingestion key cannot be it.
     pub attester_pin: VerifiedPublicKey,
     pub sources: SourcePins,
-    /// The last head of every chain in storage.
-    pub heads: BTreeMap<String, ChainHead>,
+    /// The largest accepted step of `source_seq` above a chain's high-water
+    /// mark (at least 1; [`DEFAULT_MAX_SEQ_JUMP`] by default). A verified
+    /// event further ahead is recorded as `rejected`
+    /// ([`RejectReason::SeqJumpTooLarge`]) on the unattributed chain and
+    /// does not move the high-water mark, so one event (a source bug, or a
+    /// compromised source key) cannot push the chain to the end of the
+    /// `source_seq` range.
+    pub max_seq_jump: u64,
+    /// The largest `|occurred_at - recorded_at|`, in seconds, recorded
+    /// without a mark ([`DEFAULT_MAX_CLOCK_SKEW_SECONDS`] by default). Above
+    /// it the record keeps its status and carries `clock_skew_seconds`.
+    pub max_clock_skew_seconds: u64,
 }
 
 impl SafetyIngestor {
@@ -1336,6 +1489,9 @@ impl SafetyIngestor {
             .map_err(IngestSetupError::Manifest)?;
         if config.sources.is_empty() {
             return Err(IngestSetupError::NoSources);
+        }
+        if config.max_seq_jump == 0 || config.max_seq_jump > MAX_SAFE_INTEGER {
+            return Err(IngestSetupError::InvalidMaxSeqJump);
         }
         let ingest_pin = config
             .ingest_key
@@ -1362,34 +1518,55 @@ impl SafetyIngestor {
                 })?;
             }
         }
-        let mut ingestor = Self {
+        let ingestor = Self {
             key_id: config.ingest_key.key_id(),
             key: config.ingest_key,
             tenant_id: config.tenant_id,
             manifest: config.manifest,
             sources: config.sources,
             heads: BTreeMap::new(),
+            max_seq_jump: config.max_seq_jump,
+            max_clock_skew_seconds: config.max_clock_skew_seconds,
         };
-        ingestor.set_heads(config.heads)?;
         Ok(ingestor)
     }
 
-    /// Replaces every chain head, for example after reading them again from
-    /// storage once the database is reachable again.
-    pub fn set_heads(
+    /// Replaces every chain head with the position after the last stored
+    /// record of each chain (at startup, and after reading storage again
+    /// once the database is reachable). Each record must be of this
+    /// ingester's tenant and verify under this ingestion key or one of
+    /// `previous_pins` (a registered key rotation), and appear once per
+    /// chain: a head is always derived from a signed record, never set
+    /// directly. Nothing changes on error.
+    pub fn resume_heads(
         &mut self,
-        heads: BTreeMap<String, ChainHead>,
+        last_records: impl IntoIterator<Item = SafetyRecord>,
+        previous_pins: &[VerifiedPublicKey],
     ) -> Result<(), IngestSetupError> {
-        for (chain, head) in &heads {
-            let bad = |reason: &str| IngestSetupError::InvalidHead {
+        let mut pins = vec![
+            self.key
+                .public_key()
+                .map_err(|_| IngestSetupError::InvalidHead {
+                    chain: String::new(),
+                    reason: "the ingestion key has no public key".into(),
+                })?,
+        ];
+        pins.extend_from_slice(previous_pins);
+        let mut heads = BTreeMap::new();
+        for record in last_records {
+            let chain = record.payload.chain.clone();
+            let bad = |reason: String| IngestSetupError::InvalidHead {
                 chain: chain.clone(),
-                reason: reason.into(),
+                reason,
             };
-            if !is_valid_chain(chain) {
-                return Err(bad("invalid chain name"));
+            if record.payload.tenant_id != self.tenant_id {
+                return Err(bad("the record is of another tenant".into()));
             }
-            if !is_lower_hex(&head.prev_record_hash, 64) || head.high_water > MAX_SAFE_INTEGER {
-                return Err(bad("invalid head"));
+            record
+                .verify(&pins)
+                .map_err(|error| bad(error.to_string()))?;
+            if heads.insert(chain.clone(), record.next_head()).is_some() {
+                return Err(bad("two last records".into()));
             }
         }
         self.heads = heads;
@@ -1417,12 +1594,47 @@ impl SafetyIngestor {
         self.heads.get(chain).cloned().unwrap_or_default()
     }
 
-    /// Applies records once they are stored.
-    pub fn commit(&mut self, prepared: &PreparedRecords) {
-        self.heads
-            .insert(prepared.chain.clone(), prepared.head.clone());
+    /// Applies records once they are stored. Fails, and changes nothing,
+    /// unless `prepared` was prepared by this ingester on the current head
+    /// of its chain and its records extend it one by one up to
+    /// `prepared.head`: records prepared earlier, committed twice or edited
+    /// cannot move a head. A suppressed input (no records) is a no-op.
+    pub fn commit(&mut self, prepared: &PreparedRecords) -> Result<(), CommitError> {
+        let mut head = self.head(&prepared.chain);
+        for record in &prepared.records {
+            let payload = &record.payload;
+            if payload.chain != prepared.chain
+                || payload.tenant_id != self.tenant_id
+                || payload.key_id != self.key_id
+                || payload.chain_seq != head.next_chain_seq
+                || payload.prev_record_hash != head.prev_record_hash
+                || record.recomputed_hash().ok().as_deref() != Some(record.record_hash.as_str())
+            {
+                return Err(CommitError {
+                    chain: prepared.chain.clone(),
+                });
+            }
+            head = record.next_head();
+        }
+        if head != prepared.head {
+            return Err(CommitError {
+                chain: prepared.chain.clone(),
+            });
+        }
+        self.heads.insert(prepared.chain.clone(), head);
+        Ok(())
     }
+}
 
+/// [`SafetyIngestor::commit`] refused records that do not extend the
+/// current head of their chain.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("safety chain {chain}: the records do not extend the current head; read the heads again")]
+pub struct CommitError {
+    pub chain: String,
+}
+
+impl SafetyIngestor {
     fn payload(
         &self,
         chain: &str,
@@ -1450,6 +1662,9 @@ impl SafetyIngestor {
             lost_to: None,
             dropped: None,
             raw: None,
+            clock_skew_seconds: None,
+            high_water: None,
+            source_epoch: None,
             key_id: self.key_id.clone(),
         }
     }
@@ -1469,6 +1684,9 @@ impl SafetyIngestor {
         for mut payload in payloads {
             payload.chain_seq = head.next_chain_seq;
             payload.prev_record_hash = head.prev_record_hash.clone();
+            let source_chain = chain != UNATTRIBUTED_CHAIN;
+            payload.high_water = source_chain.then(|| payload.high_water_after(head.high_water));
+            payload.source_epoch = source_chain.then_some(head.epoch);
             let record = self.key.sign_record(payload)?;
             head = head.after(&record);
             high_waters.push(head.high_water);
@@ -1479,6 +1697,7 @@ impl SafetyIngestor {
             records,
             high_waters,
             head,
+            suppressed: None,
         })
     }
 
@@ -1489,6 +1708,19 @@ impl SafetyIngestor {
         &self,
         reason: LossReason,
         dropped: u64,
+        now: OffsetDateTime,
+    ) -> Result<PreparedRecords, SafetyRecordError> {
+        self.prepare_count(reason, dropped, None, now)
+    }
+
+    /// A signed count of `count` messages not recorded one by one, with an
+    /// optional detail (for example the sources concerned), on the
+    /// unattributed chain.
+    pub fn prepare_count(
+        &self,
+        reason: LossReason,
+        dropped: u64,
+        detail: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<PreparedRecords, SafetyRecordError> {
         if reason == LossReason::SourceSeqGap {
@@ -1503,6 +1735,7 @@ impl SafetyIngestor {
         );
         payload.reason = Some(reason.as_str().into());
         payload.dropped = Some(dropped.min(MAX_SAFE_INTEGER));
+        payload.detail = detail.map(bounded_detail);
         self.sign_all(UNATTRIBUTED_CHAIN, vec![payload], head)
     }
 
@@ -1523,6 +1756,16 @@ impl SafetyIngestor {
         self.sign_all(UNATTRIBUTED_CHAIN, vec![payload], head)
     }
 
+    /// `occurred_at - now` in whole seconds when its magnitude is above
+    /// `max_clock_skew_seconds`.
+    fn clock_skew(&self, record: &SafetyRecordPayload, now: OffsetDateTime) -> Option<i64> {
+        let occurred =
+            OffsetDateTime::parse(record.event.as_ref()?.occurred_at(), &Rfc3339).ok()?;
+        let skew = (occurred - now).whole_seconds();
+        (skew.unsigned_abs() > self.max_clock_skew_seconds)
+            .then_some(skew.clamp(-(MAX_SAFE_INTEGER as i64), MAX_SAFE_INTEGER as i64))
+    }
+
     /// Parses `input` and verifies it against the pinned source key.
     pub fn authenticate(&self, input: &[u8]) -> Result<SafetyEvent, EventRejection> {
         let event = SafetyEvent::parse(input)?;
@@ -1537,6 +1780,9 @@ impl SafetyIngestor {
     ///
     /// * an input that does not parse or verify: one `rejected` record on
     ///   the unattributed chain (never dropped);
+    /// * a verified event more than `max_seq_jump` above the high-water
+    ///   mark: one `rejected` record (`seq_jump_too_large`) on the
+    ///   unattributed chain; the source chain does not change;
     /// * an event whose `source_seq` is above the next expected one: a
     ///   `loss` record for the missing range, then the event record;
     /// * an event whose `source_seq` was already recorded: `duplicate` (same
@@ -1550,8 +1796,87 @@ impl SafetyIngestor {
         now: OffsetDateTime,
         lookup: &mut L,
     ) -> Result<PreparedRecords, IngestError<L::Error>> {
+        self.prepare_authenticated(input, self.authenticate(input), now, lookup)
+    }
+
+    /// [`Self::prepare`] behind `flood`'s rate limits, at `elapsed` on a
+    /// monotonic clock: a verified event above its source's rate, or an
+    /// input that does not verify above the rate of individual `rejected`
+    /// records, is not recorded and comes back as
+    /// [`PreparedRecords::suppressed`] (to count with
+    /// [`FloodControl::count`]). Only a verified event that can advance its
+    /// chain (a new `source_seq` above the high-water mark, or the start of
+    /// a newer epoch, within the jump limits) spends its source's budget, so
+    /// only the holder of a source key spends it. Everything else (inputs
+    /// that do not verify, and verified events at or below the high-water
+    /// mark, of an older epoch or beyond a jump limit, which anyone can
+    /// replay from an export) shares the budget of `rejected` records and
+    /// is counted as `rejected_suppressed` above it. A genuine `late` event
+    /// competes with that traffic.
+    pub fn prepare_limited<L: EventLookup>(
+        &self,
+        input: &[u8],
+        now: OffsetDateTime,
+        elapsed: std::time::Duration,
+        lookup: &mut L,
+        flood: &mut FloodControl,
+    ) -> Result<PreparedRecords, IngestError<L::Error>> {
+        let authenticated = self.authenticate(input);
+        let suppressed = match &authenticated {
+            Ok(event) if self.advances(event) => (!flood.admit_event(&event.source_id, elapsed))
+                .then(|| Suppressed {
+                    reason: LossReason::RateLimited,
+                    source_id: Some(event.source_id.clone()),
+                }),
+            _ => (!flood.admit_rejected(elapsed)).then_some(Suppressed {
+                reason: LossReason::RejectedSuppressed,
+                source_id: None,
+            }),
+        };
+        if let Some(suppressed) = suppressed {
+            return Ok(self.suppressed(suppressed));
+        }
+        self.prepare_authenticated(input, authenticated, now, lookup)
+    }
+
+    /// Whether `event` can advance its chain: the checks of
+    /// [`Self::prepare`] that need no storage.
+    fn advances(&self, event: &SafetyEvent) -> bool {
+        let head = self.head(&event.source_id);
+        let epoch = event.source_epoch;
+        let high_water = if epoch > head.epoch {
+            if self.heads.contains_key(&event.source_id) && epoch - head.epoch > MAX_EPOCH_JUMP {
+                return false;
+            }
+            0
+        } else if epoch == head.epoch {
+            head.high_water
+        } else {
+            return false;
+        };
+        event.source_seq > high_water && event.source_seq - high_water <= self.max_seq_jump
+    }
+
+    fn suppressed(&self, suppressed: Suppressed) -> PreparedRecords {
+        PreparedRecords {
+            chain: UNATTRIBUTED_CHAIN.to_owned(),
+            records: Vec::new(),
+            high_waters: Vec::new(),
+            head: self.head(UNATTRIBUTED_CHAIN),
+            suppressed: Some(suppressed),
+        }
+    }
+
+    fn prepare_authenticated<L: EventLookup>(
+        &self,
+        input: &[u8],
+        authenticated: Result<SafetyEvent, EventRejection>,
+        now: OffsetDateTime,
+        lookup: &mut L,
+    ) -> Result<PreparedRecords, IngestError<L::Error>> {
+        let now_instant = now;
         let now = Self::now_text(now).map_err(IngestError::Record)?;
-        let event = match self.authenticate(input) {
+        let event = match authenticated {
             Ok(event) => event,
             Err(rejection) => {
                 return self
@@ -1572,7 +1897,55 @@ impl SafetyIngestor {
                 Some(bounded_detail(&error.to_string())),
             ),
         };
+        let epoch = event.source_epoch;
+        let reject = |reason, detail: String| {
+            self.prepare_rejected(input, &EventRejection::new(reason, detail), &now)
+                .map_err(IngestError::Record)
+        };
+        if epoch < head.epoch {
+            return reject(
+                RejectReason::StaleEpoch,
+                format!(
+                    "source {chain}: source_epoch {epoch} is older than the chain's epoch {}",
+                    head.epoch
+                ),
+            );
+        }
+        if self.heads.contains_key(&chain) && epoch - head.epoch > MAX_EPOCH_JUMP {
+            return reject(
+                RejectReason::EpochJumpTooLarge,
+                format!(
+                    "source {chain}: source_epoch {epoch} is {} above the chain's epoch {}; the \
+                     maximum step is {}",
+                    epoch - head.epoch,
+                    head.epoch,
+                    MAX_EPOCH_JUMP
+                ),
+            );
+        }
+        // A new epoch (a restarted source) starts a new segment: its
+        // source_seq starts again at 1.
+        let mut head = head;
+        if epoch > head.epoch {
+            head.epoch = epoch;
+            head.high_water = 0;
+        }
         let seq = event.source_seq;
+        if seq - head.high_water.min(seq) > self.max_seq_jump {
+            let rejection = EventRejection::new(
+                RejectReason::SeqJumpTooLarge,
+                format!(
+                    "source {chain}: source_seq {seq} is {} above the high-water mark {}; the \
+                     maximum step is {}",
+                    seq - head.high_water,
+                    head.high_water,
+                    self.max_seq_jump
+                ),
+            );
+            return self
+                .prepare_rejected(input, &rejection, &now)
+                .map_err(IngestError::Record);
+        }
         let expected = head.high_water.saturating_add(1);
         let mut payloads = Vec::with_capacity(2);
         let (status, original) = if seq >= expected {
@@ -1592,11 +1965,16 @@ impl SafetyIngestor {
         } else {
             let event_hash = event.event_hash();
             match lookup
-                .first_event(self.tenant_id, &chain, seq)
+                .first_event(self.tenant_id, &chain, epoch, seq)
                 .map_err(IngestError::Lookup)?
             {
+                // An exact duplicate is counted, not stored again: a replay
+                // of a captured datagram cannot grow the chain.
                 Some(first) if first.event_hash == event_hash => {
-                    (SafetyRecordStatus::Duplicate, Some(first.record_hash))
+                    return Ok(self.suppressed(Suppressed {
+                        reason: LossReason::Duplicate,
+                        source_id: Some(chain),
+                    }));
                 }
                 Some(first) => (SafetyRecordStatus::Conflict, Some(first.record_hash)),
                 None => (SafetyRecordStatus::Late, None),
@@ -1610,6 +1988,7 @@ impl SafetyIngestor {
         record.reason = name_reason;
         record.detail = name_detail;
         record.original_record_hash = original;
+        record.clock_skew_seconds = self.clock_skew(&record, now_instant);
         payloads.push(record);
         self.sign_all(&chain, payloads, head)
             .map_err(IngestError::Record)
@@ -1620,7 +1999,7 @@ impl SafetyIngestor {
 /// the verifier's own bookkeeping).
 #[derive(Debug, Default)]
 pub struct MemoryLookup {
-    first: HashMap<(Uuid, String, u64), EventRef>,
+    first: HashMap<(Uuid, String, u64, u64), EventRef>,
 }
 
 impl MemoryLookup {
@@ -1631,7 +2010,12 @@ impl MemoryLookup {
         }
         if let (Some(event), Some(event_hash)) = (&payload.event, &payload.event_hash) {
             self.first
-                .entry((payload.tenant_id, payload.chain.clone(), event.source_seq))
+                .entry((
+                    payload.tenant_id,
+                    payload.chain.clone(),
+                    event.source_epoch,
+                    event.source_seq,
+                ))
                 .or_insert_with(|| EventRef {
                     event_hash: event_hash.clone(),
                     record_hash: record.record_hash.clone(),
@@ -1647,11 +2031,12 @@ impl EventLookup for MemoryLookup {
         &mut self,
         tenant_id: Uuid,
         chain: &str,
+        source_epoch: u64,
         source_seq: u64,
     ) -> Result<Option<EventRef>, Self::Error> {
         Ok(self
             .first
-            .get(&(tenant_id, chain.to_owned(), source_seq))
+            .get(&(tenant_id, chain.to_owned(), source_epoch, source_seq))
             .cloned())
     }
 }
@@ -1669,12 +2054,24 @@ pub struct SafetyCounts {
     pub conflict: u64,
     pub late: u64,
     pub rejected: u64,
+    /// `rejected` records by reason (for example `seq_jump_too_large`: a
+    /// verified event that was too far ahead of its chain).
+    pub rejected_by_reason: BTreeMap<String, u64>,
     /// Loss records.
     pub loss: u64,
     /// `source_seq` values covered by gap loss records.
     pub lost_events: u64,
-    /// Messages dropped inside the ingester (unattributed loss records).
+    /// Messages not recorded one by one (unattributed loss records):
+    /// dropped inside the ingester, rate limited, suppressed rejections and
+    /// exact duplicates, from peers refused.
     pub dropped_messages: u64,
+    /// `dropped_messages` by reason.
+    pub dropped_by_reason: BTreeMap<String, u64>,
+    /// Event records marked with `clock_skew_seconds`.
+    pub clock_skew: u64,
+    /// Source epochs (chain segments) on a source chain: each is a run of
+    /// the source whose `source_seq` starts again at 1.
+    pub epochs: u64,
 }
 
 /// Result of [`verify_safety_chain`].
@@ -1686,13 +2083,24 @@ pub struct SafetyChainReport {
     /// `record_hash` of the last record.
     pub head: String,
     /// Every `source_seq` up to this value is an event or covered by a
-    /// loss record (0 for the unattributed chain).
+    /// loss record (0 for the unattributed chain), within `source_epoch`.
     pub high_water: u64,
+    /// The epoch of the last segment (0 for the unattributed chain).
+    pub source_epoch: u64,
     pub counts: SafetyCounts,
     /// Whether every event's signature was checked against a source pin.
     pub source_signatures_verified: bool,
     /// Records per ingestion key id.
     pub signed_by: BTreeMap<String, u64>,
+    /// For a range ([`verify_safety_chain_range`]): the `record_hash` of
+    /// the anchor (the record just before the range).
+    pub anchor: Option<String>,
+    /// For a range: the `chain_seq` of its first record.
+    pub range_start: Option<u64>,
+    /// For a range: `duplicate`, `conflict` and `late` records whose
+    /// earlier record lies before the range, so they were checked only
+    /// against the anchor's high-water mark.
+    pub unchecked_references: u64,
 }
 
 /// Why an exported chain was not accepted. Every variant is a failure.
@@ -1834,6 +2242,52 @@ pub fn verify_safety_chain(
     source_pins: Option<&SourcePins>,
     expected_head: Option<&str>,
 ) -> Result<SafetyChainReport, SafetyChainError> {
+    verify_chain_text(text, ingest_pins, source_pins, None, expected_head)
+}
+
+/// Verifies one range of a chain, as `praetore journal-export --safety
+/// --from-seq N` writes it: the first line is the **anchor**, the record
+/// just before the range (`chain_seq` N - 1), and the rest are the range.
+/// The anchor's key, hash and signature are checked and its signed
+/// position (`chain_seq`, `record_hash`, `high_water`) is where the range
+/// must continue; it is not counted. With `expected_anchor`, its
+/// `record_hash` must equal it: pass the head of the previous range (or of
+/// an anchored export) to chain the ranges. Every other check of
+/// [`verify_safety_chain`] applies, except that a `duplicate`, `conflict`
+/// or `late` record whose earlier record lies before the range is only
+/// checked against the anchor's high-water mark (counted in
+/// `unchecked_references`).
+pub fn verify_safety_chain_range(
+    text: &str,
+    ingest_pins: &[VerifiedPublicKey],
+    source_pins: Option<&SourcePins>,
+    expected_anchor: Option<&str>,
+    expected_head: Option<&str>,
+) -> Result<SafetyChainReport, SafetyChainError> {
+    let (anchor_line, rest) = text.split_once('\n').ok_or(SafetyChainError::Empty)?;
+    let anchor = SafetyRecord::from_json(anchor_line)
+        .map_err(|error| SafetyChainError::Malformed { line: 0, error })?;
+    anchor
+        .verify(ingest_pins)
+        .map_err(|error| SafetyChainError::Record { line: 0, error })?;
+    if let Some(expected) = expected_anchor
+        && expected != anchor.record_hash
+    {
+        return Err(SafetyChainError::BrokenChain {
+            line: anchor.payload.chain_seq,
+            reason: "the anchor is not the expected record".into(),
+        });
+    }
+    verify_chain_text(rest, ingest_pins, source_pins, Some(&anchor), expected_head)
+}
+
+fn verify_chain_text(
+    text: &str,
+    ingest_pins: &[VerifiedPublicKey],
+    source_pins: Option<&SourcePins>,
+    anchor: Option<&SafetyRecord>,
+    expected_head: Option<&str>,
+) -> Result<SafetyChainReport, SafetyChainError> {
     if text.len() > MAX_SAFETY_CHAIN_BYTES {
         return Err(SafetyChainError::TooLarge);
     }
@@ -1846,9 +2300,41 @@ pub fn verify_safety_chain(
     let mut must_follow: Option<u64> = None;
     let mut high_water = 0u64;
     let mut line = 0u64;
+    // Everything at or below the anchor's high-water mark happened before
+    // the range: references to it cannot be checked here.
+    let mut anchor_high_water = 0u64;
+    let mut epoch = 0u64;
+    if let Some(anchor) = anchor {
+        let payload = &anchor.payload;
+        report = Some(SafetyChainReport {
+            chain: payload.chain.clone(),
+            tenant_id: payload.tenant_id,
+            entries: 0,
+            head: anchor.record_hash.clone(),
+            high_water: payload.high_water.unwrap_or(0),
+            source_epoch: payload.source_epoch.unwrap_or(0),
+            counts: SafetyCounts::default(),
+            source_signatures_verified: source_pins.is_some(),
+            signed_by: BTreeMap::new(),
+            anchor: Some(anchor.record_hash.clone()),
+            range_start: Some(payload.chain_seq + 1),
+            unchecked_references: 0,
+        });
+        prev = anchor.record_hash.clone();
+        high_water = payload.high_water.unwrap_or(0);
+        anchor_high_water = high_water;
+        epoch = payload.source_epoch.unwrap_or(0);
+        line = payload.chain_seq + 1;
+        if payload.status == SafetyRecordStatus::Loss
+            && payload.reason.as_deref() == Some(LossReason::SourceSeqGap.as_str())
+        {
+            must_follow = Some(high_water + 1);
+        }
+    }
+    let first_line = line;
     let mut rest = text;
     while !rest.is_empty() {
-        if line as usize >= MAX_SAFETY_CHAIN_ENTRIES {
+        if (line - first_line) as usize >= MAX_SAFETY_CHAIN_ENTRIES {
             return Err(SafetyChainError::TooLarge);
         }
         let (current, tail) = rest.split_once('\n').ok_or(SafetyChainError::Malformed {
@@ -1872,9 +2358,13 @@ pub fn verify_safety_chain(
             entries: 0,
             head: String::new(),
             high_water: 0,
+            source_epoch: 0,
             counts: SafetyCounts::default(),
             source_signatures_verified: source_pins.is_some(),
             signed_by: BTreeMap::new(),
+            anchor: None,
+            range_start: None,
+            unchecked_references: 0,
         });
         if payload.chain != summary.chain {
             return Err(broken("chain differs from the first record"));
@@ -1894,6 +2384,27 @@ pub fn verify_safety_chain(
         let unattributed = summary.chain == UNATTRIBUTED_CHAIN;
         let counts = &mut summary.counts;
         let inconsistent = |reason: String| SafetyChainError::SequenceInconsistent { line, reason };
+        // A new source epoch starts a new segment: source_seq starts again
+        // at 1 and earlier events cannot be referenced.
+        let record_epoch = payload.source_epoch.unwrap_or(0);
+        if record_epoch < epoch {
+            return Err(inconsistent(format!(
+                "source_epoch {record_epoch} after epoch {epoch}"
+            )));
+        }
+        if record_epoch > epoch {
+            if must_follow.is_some() {
+                return Err(inconsistent(
+                    "a new source_epoch before the event that follows a loss record".into(),
+                ));
+            }
+            epoch = record_epoch;
+            high_water = 0;
+            anchor_high_water = 0;
+            first_events.clear();
+            loss_ranges.clear();
+            counts.epochs += 1;
+        }
         if let Some(next) = must_follow.take() {
             let follows = payload.status.is_first_event()
                 && payload.status != SafetyRecordStatus::Late
@@ -1915,6 +2426,9 @@ pub fn verify_safety_chain(
                 .verify(pin)
                 .map_err(|rejection| SafetyChainError::EventSignature { line, rejection })?;
         }
+        if payload.clock_skew_seconds.is_some() {
+            counts.clock_skew += 1;
+        }
         let event_seq = payload.event.as_ref().map(|event| event.source_seq);
         let event_hash = payload.event_hash.clone().unwrap_or_default();
         use SafetyRecordStatus as S;
@@ -1924,6 +2438,10 @@ pub fn verify_safety_chain(
                     return Err(SafetyChainError::WrongChain { line });
                 }
                 counts.rejected += 1;
+                *counts
+                    .rejected_by_reason
+                    .entry(payload.reason.clone().unwrap_or_default())
+                    .or_default() += 1;
             }
             S::Loss => {
                 counts.loss += 1;
@@ -1938,7 +2456,7 @@ pub fn verify_safety_chain(
                                 high_water + 1
                             )));
                         }
-                        counts.lost_events += to - from + 1;
+                        counts.lost_events = counts.lost_events.saturating_add(to - from + 1);
                         loss_ranges.push((from, to));
                         high_water = to;
                         must_follow = Some(to + 1);
@@ -1947,7 +2465,12 @@ pub fn verify_safety_chain(
                         if !unattributed {
                             return Err(SafetyChainError::WrongChain { line });
                         }
-                        counts.dropped_messages += dropped;
+                        counts.dropped_messages = counts.dropped_messages.saturating_add(dropped);
+                        let by_reason = counts
+                            .dropped_by_reason
+                            .entry(payload.reason.clone().unwrap_or_default())
+                            .or_default();
+                        *by_reason = by_reason.saturating_add(dropped);
                     }
                     _ => return Err(broken("loss record with a wrong shape")),
                 }
@@ -1980,7 +2503,9 @@ pub fn verify_safety_chain(
                 let lost = loss_ranges
                     .iter()
                     .any(|&(from, to)| (from..=to).contains(&seq));
-                if !lost || first_events.contains_key(&seq) {
+                if !lost && seq <= anchor_high_water && !first_events.contains_key(&seq) {
+                    summary.unchecked_references += 1;
+                } else if !lost || first_events.contains_key(&seq) {
                     return Err(inconsistent(format!(
                         "late event {seq} does not fill a lost source_seq"
                     )));
@@ -1993,25 +2518,36 @@ pub fn verify_safety_chain(
                     return Err(SafetyChainError::WrongChain { line });
                 }
                 let seq = event_seq.unwrap_or_default();
-                let Some((first_hash, first_record)) = first_events.get(&seq) else {
-                    return Err(inconsistent(format!(
-                        "{} of source_seq {seq}, which has no earlier event",
-                        payload.status.as_str()
-                    )));
+                let same = match first_events.get(&seq) {
+                    // The first event lies before the range.
+                    None if seq <= anchor_high_water => {
+                        summary.unchecked_references += 1;
+                        payload.status == S::Duplicate
+                    }
+                    None => {
+                        return Err(inconsistent(format!(
+                            "{} of source_seq {seq}, which has no earlier event",
+                            payload.status.as_str()
+                        )));
+                    }
+                    Some((first_hash, first_record)) => {
+                        if payload.original_record_hash.as_deref() != Some(first_record) {
+                            return Err(inconsistent(
+                                "original_record_hash is not the first record of its source_seq"
+                                    .into(),
+                            ));
+                        }
+                        let same = *first_hash == event_hash;
+                        if same != (payload.status == S::Duplicate) {
+                            return Err(inconsistent(format!(
+                                "{} with {} event hash",
+                                payload.status.as_str(),
+                                if same { "the same" } else { "a different" }
+                            )));
+                        }
+                        same
+                    }
                 };
-                if payload.original_record_hash.as_deref() != Some(first_record) {
-                    return Err(inconsistent(
-                        "original_record_hash is not the first record of its source_seq".into(),
-                    ));
-                }
-                let same = *first_hash == event_hash;
-                if same != (payload.status == S::Duplicate) {
-                    return Err(inconsistent(format!(
-                        "{} with {} event hash",
-                        payload.status.as_str(),
-                        if same { "the same" } else { "a different" }
-                    )));
-                }
                 if same {
                     counts.duplicate += 1;
                 } else {
@@ -2019,14 +2555,24 @@ pub fn verify_safety_chain(
                 }
             }
         }
+        if !unattributed && payload.high_water != Some(high_water) {
+            return Err(inconsistent(format!(
+                "the signed high_water is {:?}, not {high_water}",
+                payload.high_water
+            )));
+        }
         *summary.signed_by.entry(payload.key_id.clone()).or_default() += 1;
         summary.entries += 1;
         summary.high_water = high_water;
+        summary.source_epoch = epoch;
         prev = record.record_hash.clone();
         summary.head = prev.clone();
         line += 1;
     }
     let report = report.ok_or(SafetyChainError::Empty)?;
+    if report.entries == 0 {
+        return Err(SafetyChainError::Empty);
+    }
     if let Some(next) = must_follow {
         return Err(SafetyChainError::SequenceInconsistent {
             line,
@@ -2042,6 +2588,13 @@ pub fn verify_safety_chain(
     }
     Ok(report)
 }
+
+mod flood;
+
+pub use flood::{
+    DEFAULT_FLOOD_LIMITS, FloodControl, FloodLimits, InvalidFloodLimits, MAX_FLOOD_LIMIT,
+    PendingCount,
+};
 
 #[cfg(test)]
 mod tests;

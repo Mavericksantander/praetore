@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+- **Post-hoc safety ingestion: format 2 and hardening (G1 follow-ups).**
+  Changes the unreleased G1 format and behavior; records written by an
+  earlier build of `main` (format 1) cannot be read and must be exported and
+  removed first (`docs/operations.md`, "Source epochs").
+  - Format 2: every event signs `source_epoch`, the source's run (persisted
+    by `praetore_safety_client::EpochFile`, which fails closed instead of
+    starting again from 1); `source_seq` starts at 1 in each epoch and a
+    chain is a sequence of segments, one per epoch. Every record of a source
+    chain signs `high_water` and `source_epoch`; the ingester resumes from
+    the last signed record only (`SafetyIngestor::resume_heads`, replacing
+    `set_heads`; `IngestorConfig::heads` is removed), and `commit` now
+    returns an error unless the records extend the current head.
+  - New `rejected` reasons `seq_jump_too_large`, `stale_epoch` and
+    `epoch_jump_too_large` (bounded by `PRAETORE_SAFETY_MAX_SEQ_JUMP` and a
+    fixed epoch step of 10^9); an
+    event far from the ingester's clock carries `clock_skew_seconds`
+    (`PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS`). A chain head signed by an
+    unregistered ingestion key fails closed; previous keys of a rotation are
+    listed in `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE`.
+  - Rate limits per source (spent only by events that can advance the
+    chain) and for every other input, replays included
+    (`PRAETORE_SAFETY_SOURCE_RATE`/`_BURST`,
+    `PRAETORE_SAFETY_REJECTED_RATE`/`_BURST`), and on Linux a sender user id
+    check (`PRAETORE_SAFETY_ALLOWED_UIDS`, `SCM_CREDENTIALS`; refused at
+    startup on other platforms). What is not recorded one by one is added to
+    signed counts on `_unattributed` (`loss` reasons `rate_limited`,
+    `rejected_suppressed`, `duplicate`, `peer_refused`). **Decision
+    change:** an exact duplicate no longer creates a `duplicate` record; it
+    is counted (a `conflict` is still recorded, and the verifier still
+    accepts `duplicate` records).
+  - Migration `0017_safety_records_followups`: the `source_epoch` column,
+    `record_id` unique per tenant, the columns checked against the signed
+    `high_water` and `source_epoch`, and the tenant registry
+    `praetore.safety_ingest_tenants` (one login role and one ingestion key
+    per tenant, registered by the schema owner). Row-level security on
+    `safety_records` follows the registered role instead of the
+    `praetore.tenant_id` setting, and the insert trigger accepts only
+    records naming the tenant's registered key. The ingester and the
+    exporter check the registration at startup. A documented manual
+    rollback of 0016 and 0017 (`docs/rollback/g1-safety-records.sql`) is
+    tested in CI.
+  - `praetore journal-export --safety --from-seq N [--limit M]` exports a
+    chain in ranges, each anchored on the record before it, and
+    `praetore-verify safety-journal --range [--expected-anchor HEX]`
+    verifies one. Without `--expected-head` the verifier now warns
+    (`head_not_anchored`). It reports epochs and `dropped_by_reason`.
+  - CI runs every ignored PostgreSQL test one by one
+    (`scripts/postgres-ignored-tests.sh`) and every G1 end-to-end test.
+
 - **Walkthrough demo.** `make demo` (or `cargo run --locked -p praetore-core
   --example demo`) runs three decisions of a simulated agent (allowed, denied
   by a policy rule, outside its authority), exports the signed receipts as a
