@@ -75,8 +75,19 @@ fn event(seq: u64, action: &str) -> SafetyEvent {
 }
 
 fn event_by(key: &SafetySourceKey, source: &str, seq: u64, action: &str) -> SafetyEvent {
+    event_in(key, source, 1, seq, action)
+}
+
+fn event_in(
+    key: &SafetySourceKey,
+    source: &str,
+    epoch: u64,
+    seq: u64,
+    action: &str,
+) -> SafetyEvent {
     key.sign_event(SafetyEventDraft {
         source_id: source.into(),
+        source_epoch: epoch,
         source_seq: seq,
         action: action.into(),
         occurred_at: now() - time::Duration::seconds(5),
@@ -221,7 +232,14 @@ fn event_hash_does_not_depend_on_the_wire_encoding() {
             Value::from("Executor"),
             RejectReason::Malformed,
         ),
-        ("schema_version", Value::from(2), RejectReason::Malformed),
+        // Version 1 had no source_epoch.
+        ("schema_version", Value::from(1), RejectReason::Malformed),
+        ("source_epoch", Value::from(0), RejectReason::Malformed),
+        (
+            "source_epoch",
+            Value::from(1u64 << 53),
+            RejectReason::Malformed,
+        ),
     ] {
         let mut altered: Value = serde_json::from_slice(&wire(&event)).unwrap();
         altered[field] = replacement;
@@ -938,6 +956,7 @@ fn event_at(seq: u64, occurred_at: OffsetDateTime) -> SafetyEvent {
     source_key()
         .sign_event(SafetyEventDraft {
             source_id: "executor-1".into(),
+            source_epoch: 1,
             source_seq: seq,
             action: "safety:halt".into(),
             occurred_at,
@@ -1073,4 +1092,67 @@ fn a_chain_verifies_in_ranges_each_anchored_on_the_previous_one() {
         verify_safety_chain_range(&all[2], &[ingest_pin()], None, None, None),
         Err(SafetyChainError::Empty)
     ));
+}
+
+#[test]
+fn a_restarted_source_starts_a_new_epoch_whose_seq_starts_at_one() {
+    let mut harness = Harness::new();
+    let epoch = |epoch, seq| {
+        wire(&event_in(
+            &source_key(),
+            "executor-1",
+            epoch,
+            seq,
+            "safety:halt",
+        ))
+    };
+    for seq in 1..=3 {
+        harness.ingest(&epoch(1, seq));
+    }
+    // The source restarts: its sequence returns to 1 in epoch 2. Without
+    // the epoch every new event would be a conflict.
+    let restarted = harness.ingest(&epoch(2, 1));
+    assert_eq!(status_strs(&restarted), ["accepted"]);
+    harness.ingest(&epoch(2, 2));
+    // A duplicate within epoch 2 is a duplicate of epoch 2's event, not a
+    // conflict with epoch 1's.
+    let duplicate = harness.ingest(&epoch(2, 2));
+    assert_eq!(status_strs(&duplicate), ["duplicate"]);
+    // A gap in the new epoch counts from 1 of that epoch.
+    let restarted = harness.ingest(&epoch(3, 4));
+    assert_eq!(status_strs(&restarted), ["loss", "accepted"]);
+    assert_eq!(restarted[0].payload().lost_from, Some(1));
+    assert_eq!(restarted[0].payload().source_epoch, Some(3));
+    // An event of an older epoch is rejected on the unattributed chain and
+    // the source chain does not move.
+    let before = harness.ingestor.head("executor-1");
+    let stale = harness.ingest(&epoch(2, 3));
+    assert_eq!(stale[0].payload().chain, UNATTRIBUTED_CHAIN);
+    assert_eq!(stale[0].payload().reason.as_deref(), Some("stale_epoch"));
+    assert_eq!(harness.ingestor.head("executor-1"), before);
+    // An epoch too far ahead is rejected too.
+    let far = harness.ingest(&epoch(3 + DEFAULT_MAX_SEQ_JUMP + 1, 1));
+    assert_eq!(
+        far[0].payload().reason.as_deref(),
+        Some("epoch_jump_too_large")
+    );
+    let report = harness.verify("executor-1").unwrap();
+    assert_eq!(report.counts.epochs, 3);
+    assert_eq!(report.source_epoch, 3);
+    assert_eq!(report.high_water, 4);
+    assert_eq!(report.counts.accepted, 6);
+    assert_eq!(report.counts.duplicate, 1);
+    assert_eq!(report.counts.conflict, 0);
+    // A record whose epoch goes back fails verification even when signed.
+    let lines = lines(harness.chain("executor-1"));
+    let mut reordered = lines.clone();
+    reordered.swap(2, 3);
+    assert!(verify_safety_chain(&reordered.concat(), &[ingest_pin()], None, None).is_err());
+}
+
+fn status_strs(records: &[SafetyRecord]) -> Vec<&'static str> {
+    records
+        .iter()
+        .map(|record| record.payload().status.as_str())
+        .collect()
 }

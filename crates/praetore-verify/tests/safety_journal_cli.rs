@@ -89,6 +89,7 @@ fn chains() -> (String, String) {
         source_key()
             .sign_event(SafetyEventDraft {
                 source_id: "executor-1".into(),
+                source_epoch: 1,
                 source_seq: seq,
                 action: action.into(),
                 occurred_at: now(),

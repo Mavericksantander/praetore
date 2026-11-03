@@ -7219,6 +7219,7 @@ mod g1_safety {
         source_key()
             .sign_event(SafetyEventDraft {
                 source_id: "executor-1".into(),
+                source_epoch: 1,
                 source_seq: seq,
                 action: action.into(),
                 occurred_at: test_now(),
@@ -7265,6 +7266,102 @@ mod g1_safety {
             .batch_execute(&format!("GRANT praetore_safety_ingest TO {}", ingest.name))
             .unwrap();
         (scratch, ingest, runtime)
+    }
+
+    fn event_in(epoch: u64, seq: u64) -> Vec<u8> {
+        source_key()
+            .sign_event(SafetyEventDraft {
+                source_id: "executor-1".into(),
+                source_epoch: epoch,
+                source_seq: seq,
+                action: "safety:halt".into(),
+                occurred_at: test_now(),
+                params: BTreeMap::new(),
+            })
+            .unwrap()
+            .to_wire()
+            .unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_source_restart_starts_a_new_epoch_from_seq_one() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let mut ingestor = ingestor(TENANT_A);
+        for seq in 1..=3 {
+            ingest(&mut ingestor, &mut store, &event_in(1, seq));
+        }
+        // The ingester restarts too: it resumes from the signed head.
+        let pin = ingest_key().public_key().unwrap();
+        let heads = store
+            .load_heads(TENANT_A, std::slice::from_ref(&pin))
+            .unwrap();
+        assert_eq!(heads["executor-1"].head.epoch, 1);
+        assert_eq!(heads["executor-1"].head.high_water, 3);
+        let mut restarted = self::ingestor(TENANT_A);
+        restarted
+            .set_heads(
+                heads
+                    .into_iter()
+                    .map(|(chain, h)| (chain, h.head))
+                    .collect(),
+            )
+            .unwrap();
+        // The source restarted: epoch 2, source_seq back to 1.
+        let status = |prepared: &PreparedRecords| {
+            prepared
+                .records
+                .iter()
+                .map(|record| record.payload().status.as_str())
+                .collect::<Vec<_>>()
+        };
+        let prepared = ingest(&mut restarted, &mut store, &event_in(2, 1));
+        assert_eq!(status(&prepared), ["accepted"]);
+        let prepared = ingest(&mut restarted, &mut store, &event_in(2, 2));
+        assert_eq!(status(&prepared), ["accepted"]);
+        // Duplicates are looked up within the epoch (the store's index).
+        let prepared = ingest(&mut restarted, &mut store, &event_in(2, 2));
+        assert_eq!(status(&prepared), ["duplicate"]);
+        let prepared = ingest(&mut restarted, &mut store, &event_in(1, 4));
+        assert_eq!(prepared.chain, "_unattributed");
+        assert_eq!(
+            prepared.records[0].payload().reason.as_deref(),
+            Some("stale_epoch")
+        );
+        let text = chain_text(store.client(), TENANT_A, "executor-1");
+        let report = verify_safety_chain(&text, std::slice::from_ref(&pin), None, None).unwrap();
+        assert_eq!(report.counts.epochs, 2);
+        assert_eq!(report.counts.accepted, 5);
+        assert_eq!(report.counts.duplicate, 1);
+        assert_eq!(report.counts.conflict, 0);
+        assert_eq!((report.source_epoch, report.high_water), (2, 2));
+        // The column is the signed epoch (NULL on the unattributed chain).
+        let epochs: Vec<(String, Option<i64>)> = scratch
+            .connect()
+            .query(
+                "SELECT chain, source_epoch FROM praetore.safety_records \
+                 ORDER BY chain, chain_seq",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        let expected: Vec<(String, Option<i64>)> = [
+            ("_unattributed", None),
+            ("executor-1", Some(1)),
+            ("executor-1", Some(1)),
+            ("executor-1", Some(1)),
+            ("executor-1", Some(2)),
+            ("executor-1", Some(2)),
+            ("executor-1", Some(2)),
+        ]
+        .into_iter()
+        .map(|(chain, epoch)| (chain.to_owned(), epoch))
+        .collect();
+        assert_eq!(epochs, expected);
     }
 
     #[test]

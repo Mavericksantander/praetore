@@ -1,4 +1,4 @@
-# Ingesta post-hoc de acciones de seguridad (G1, SAF-09.5): formato v1
+# Ingesta post-hoc de acciones de seguridad (G1, SAF-09.5): formato v2
 
 **Estado: implementado** (rama `feat/g1-safety-ingestion`, 2-nov-2026),
 transporte v1 local (socket Unix). Los límites de "Qué NO prueba" siguen
@@ -46,10 +46,15 @@ saltarlo.
 
 Un objeto JSON con exactamente:
 
-- `schema_version`: `1`.
+- `schema_version`: `2` (la versión 1, sin `source_epoch`, se rechaza).
 - `source_id`: 1 a 64 bytes de `a-z 0-9 . _ -`, empieza con letra o dígito.
 - `source_key_id`: `hex(SHA-256("PRAETORE_SAFETY_SOURCE_KEY_V1\0ed25519\0" || clave pública))`.
-- `source_seq`: entero de 1 a 2^53 - 1, monótono por fuente, sin huecos.
+- `source_epoch`: entero de 1 a 2^53 - 1, la ejecución de la fuente. Sube
+  en cada arranque de la fuente (`praetore_safety_client::EpochFile`, que lo
+  guarda con `fsync` antes del primer evento y falla cerrado si no puede:
+  nunca vuelve a 1).
+- `source_seq`: entero de 1 a 2^53 - 1, monótono dentro de un epoch, sin
+  huecos; empieza en 1 en cada epoch.
 - `action`: el nombre crudo. Se registra aunque no sea un nombre válido.
 - `occurred_at`: RFC 3339 en UTC, **reloj de la fuente**.
 - `params` (opcional, nunca vacío): hasta 16 claves `[a-z0-9_]{1,64}`, cada
@@ -69,7 +74,7 @@ canónica, así que dos codificaciones del mismo evento tienen el mismo hash.
 ## Registro (lo que guarda el ingestor)
 
 Cada registro es el JSON canónico (claves ordenadas, sin espacios) de un
-objeto con `schema_version` (1), `record_id`, `tenant_id`, `chain`,
+objeto con `schema_version` (2), `record_id`, `tenant_id`, `chain`,
 `chain_seq`, `prev_record_hash`, `recorded_at` (RFC 3339 UTC, reloj del
 ingestor), `status`, `key_id` (la llave de ingesta), `record_hash`,
 `signature` y los campos opcionales que exige su `status` (abajo). En una
@@ -77,7 +82,9 @@ cadena de fuente, cada registro firma además `high_water`: el high-water de
 `source_seq` después de él. El ingester reanuda desde ese valor firmado (la
 columna `high_water` de la tabla debe coincidir; lo exige el trigger) y el
 verificador comprueba que coincide con el que calcula. En `_unattributed` no
-va. Un evento verificado con `occurred_at` a más de
+va. Cada registro de una cadena de fuente firma también `source_epoch`, el
+epoch de su segmento (en un registro con evento, el del evento); la columna
+`source_epoch` debe coincidir (trigger, migración 0017). Un evento verificado con `occurred_at` a más de
 `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` del reloj del ingester lleva
 `clock_skew_seconds` (`occurred_at - recorded_at`). El payload
 es todo salvo `record_hash` y `signature`, en JSON canónico; `record_hash =
@@ -93,6 +100,18 @@ primero). Como ambos campos están **dentro del payload firmado**, reencadenar
 exige la llave de ingesta (a diferencia del link sin clave de
 `journal-chain-jsonl.md`).
 
+**Epochs (segmentos).** Una cadena de fuente es una secuencia de segmentos,
+uno por `source_epoch`, en orden creciente. Un evento con un epoch mayor que
+el de la cadena abre un segmento nuevo: su high-water empieza en 0, así que
+una fuente reiniciada que vuelve a `source_seq` 1 registra `accepted` (no
+`conflict`), y un primer evento con `source_seq` > 1 registra antes la
+pérdida `1..=seq-1` de ese epoch. Lo que la fuente no envió al final del
+epoch anterior no es visible. `duplicate`, `conflict` y `late` se buscan
+dentro del epoch. Un evento de un epoch menor se registra como `rejected`
+(`stale_epoch`) en `_unattributed`; uno más de `PRAETORE_SAFETY_MAX_SEQ_JUMP`
+por encima, como `rejected` (`epoch_jump_too_large`). Ninguno de los dos
+cambia la cadena de la fuente.
+
 | `status` | Cadena | Significado y campos |
 | --- | --- | --- |
 | `accepted` | fuente | evento verificado, `source_seq` siguiente, nombre declarado en el manifiesto |
@@ -103,7 +122,7 @@ exige la llave de ingesta (a diferencia del link sin clave de
 | `late` | fuente | `source_seq` que antes se registró como perdido |
 | `loss` (`source_seq_gap`) | fuente | `lost_from..=lost_to` nunca llegaron; va justo antes del evento que reveló el hueco |
 | `loss` (`queue_overflow`, `storage_error`) | `_unattributed` | `dropped` mensajes no se leyeron (cola llena) o no se pudieron guardar (base caída) |
-| `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`, `seq_jump_too_large`), `detail` y `raw`. `seq_jump_too_large` es un evento verificado cuyo `source_seq` está más de `PRAETORE_SAFETY_MAX_SEQ_JUMP` por encima del high-water de su cadena: queda aquí y la cadena de la fuente no cambia |
+| `rejected` | `_unattributed` | entrada que no verificó; `reason` (`too_large`, `malformed`, `not_post_hoc`, `unknown_source`, `key_mismatch`, `signature_invalid`, `seq_jump_too_large`, `stale_epoch`, `epoch_jump_too_large`), `detail` y `raw`. `seq_jump_too_large` es un evento verificado cuyo `source_seq` está más de `PRAETORE_SAFETY_MAX_SEQ_JUMP` por encima del high-water de su cadena: queda aquí y la cadena de la fuente no cambia |
 
 Todo registro con evento lleva `event` (el evento completo, con su firma),
 `event_hash`, `name_class` (`declared`, `undeclared`, `invalid_name`) y
@@ -137,7 +156,10 @@ Para cada línea, en orden, fail-closed:
 3. `chain` y `tenant_id` son los de la primera línea; `chain_seq` es el
    número de línea; `prev_record_hash` es el `record_hash` anterior;
    `record_id` no se repite.
-4. Continuidad de `source_seq` (cadena de fuente): cada `accepted`,
+4. Epochs (cadena de fuente): `source_epoch` nunca baja; cuando sube empieza
+   un segmento nuevo (high-water 0, sin referencias a segmentos anteriores),
+   y no puede subir entre un `loss` y el evento que lo sigue.
+   Continuidad de `source_seq` dentro del segmento: cada `accepted`,
    `undeclared` o `invalid_name` es el siguiente; un hueco solo puede estar
    cubierto por un `loss` que empieza en el siguiente y al que sigue el
    evento que lo reveló; `duplicate`/`conflict` nombran al primer registro de
@@ -149,7 +171,8 @@ Para cada línea, en orden, fail-closed:
 
 Reporta la cantidad de `accepted`, `undeclared`, `invalid_name`,
 `duplicate`, `conflict`, `late`, `rejected`, `loss`, eventos perdidos y
-mensajes descartados. Códigos: `SAFETY_CHAIN_FAIL`, `SAFETY_SEQUENCE_FAIL`,
+mensajes descartados, más la cantidad de epochs, el epoch final y su
+high-water. Códigos: `SAFETY_CHAIN_FAIL`, `SAFETY_SEQUENCE_FAIL`,
 `EVIDENCE_FAIL`, `AUTH_FAIL`, `SAFETY_EVENT_SIGNATURE_INVALID`,
 `JOURNAL_HEAD_MISMATCH`, `INVALID_REQUEST`, `INPUT_TOO_LARGE`.
 

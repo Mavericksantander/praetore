@@ -61,6 +61,7 @@ fn event(seq: u64, padding: usize) -> SafetyEvent {
     }
     key.sign_event(SafetyEventDraft {
         source_id: "executor-1".into(),
+        source_epoch: 1,
         source_seq: seq,
         action: "safety:halt".into(),
         occurred_at: time::OffsetDateTime::now_utc(),

@@ -839,6 +839,7 @@ fn verify_safety_journal(
     details.insert("entries".into(), json(report.entries.into()));
     details.insert("head".into(), json(report.head.clone().into()));
     details.insert("high_water".into(), json(report.high_water.into()));
+    details.insert("source_epoch".into(), json(report.source_epoch.into()));
     details.insert(
         "counts".into(),
         serde_json::to_value(&report.counts).map_err(|_| CliError { code: "INTERNAL" })?,

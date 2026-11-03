@@ -238,6 +238,7 @@ pub fn run(args: SafetyExportArgs) -> CliResult<()> {
             "entries": report.entries,
             "head": report.head,
             "high_water": report.high_water,
+            "source_epoch": report.source_epoch,
             "counts": report.counts,
             "source_signatures_verified": report.source_signatures_verified,
             "range_start": report.range_start,

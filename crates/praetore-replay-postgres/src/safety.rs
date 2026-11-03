@@ -203,8 +203,8 @@ impl PostgresSafetyStore {
             transaction.execute(
                 "INSERT INTO praetore.safety_records \
                  (tenant_id, chain, chain_seq, record_id, status, source_seq, event_hash, \
-                  high_water, prev_record_hash, record_hash, record_json) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                  high_water, prev_record_hash, record_hash, record_json, source_epoch) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
                 &[
                     &payload.tenant_id,
                     &payload.chain,
@@ -220,6 +220,7 @@ impl PostgresSafetyStore {
                     &payload.prev_record_hash,
                     &record.record_hash(),
                     &json,
+                    &payload.source_epoch.map(|epoch| epoch as i64),
                 ],
             )?;
         }
@@ -238,6 +239,7 @@ impl EventLookup for PostgresSafetyStore {
         &mut self,
         tenant_id: Uuid,
         chain: &str,
+        source_epoch: u64,
         source_seq: u64,
     ) -> Result<Option<EventRef>, Self::Error> {
         let mut transaction = self.client.build_transaction().read_only(true).start()?;
@@ -245,10 +247,15 @@ impl EventLookup for PostgresSafetyStore {
         let row = transaction.query_opt(
             "SELECT event_hash::pg_catalog.text, record_hash::pg_catalog.text \
              FROM praetore.safety_records \
-             WHERE tenant_id = $1 AND chain = $2 AND source_seq = $3 \
+             WHERE tenant_id = $1 AND chain = $2 AND source_epoch = $3 AND source_seq = $4 \
                AND status IN ('accepted', 'undeclared', 'invalid_name', 'late') \
              ORDER BY chain_seq LIMIT 1",
-            &[&tenant_id, &chain, &(source_seq as i64)],
+            &[
+                &tenant_id,
+                &chain,
+                &(source_epoch as i64),
+                &(source_seq as i64),
+            ],
         )?;
         transaction.commit()?;
         Ok(row.map(|row| EventRef {

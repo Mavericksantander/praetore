@@ -519,7 +519,35 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own role; the file form is read as an owner-only secret file. TLS `verify-full` is required unless the host is loopback or a Unix socket |
 | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096); when full, messages are dropped and recorded as a `queue_overflow` loss |
 | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` (the source's clock) differs from the ingester's clock by more than this many seconds (default 300) keeps its status and carries the signed field `clock_skew_seconds` (`occurred_at - recorded_at`); `praetore-verify safety-journal` counts them as `clock_skew` |
-| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+| `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark, and of `source_epoch` above a chain's epoch (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`, `epoch_jump_too_large`) on `_unattributed` and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
+
+### Source epochs
+
+Every event carries `source_epoch`, the run of its source, and `source_seq`
+starts at 1 in each epoch. A source persists its epoch with
+`praetore_safety_client::EpochFile`: once per start, before the first event,
+`EpochFile::start` reads the file (a missing file is epoch 0), adds one,
+writes the new value to `<file>.tmp`, `fsync`s it, renames it over the file
+and `fsync`s the directory. The file holds the decimal epoch and a newline,
+for example `42`. Keep it on persistent storage, owned by the source, one
+file per `source_id`. If it cannot be read, holds anything else, or cannot be
+written, `start` fails and the source must not report: falling back to 1
+would make the ingester record every event as `rejected` (`stale_epoch`).
+Restoring the file from an old backup has the same effect until the epoch
+passes the chain's again; set it to at least the epoch that
+`praetore-verify safety-journal` reports (`source_epoch`).
+
+An event of a newer epoch starts a new segment of the source's chain (a gap
+from `source_seq` 1 is recorded as a loss of that epoch); an older epoch is
+`rejected` (`stale_epoch`) on `_unattributed`. Events that a source did not
+send before it stopped are not visible as a gap: the next epoch starts
+afresh.
+
+Records of the first G1 format (`schema_version` 1, before source epochs)
+cannot be read by this version, and an ingester whose tenant holds them
+refuses to start. They only exist on databases that ran an unreleased
+build: export and verify those chains with that build, then move them out
+of `praetore.safety_records` as the table owner before upgrading.
 
 The runtime-role relaxations (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
 `PRAETORE_SCHEMA_OWNER`, `PRAETORE_TRUSTED_SECURITY_DEFINER_FUNCTIONS`, ...)

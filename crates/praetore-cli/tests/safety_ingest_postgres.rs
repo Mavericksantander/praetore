@@ -338,6 +338,7 @@ fn event(seq: u64, action: &str) -> SafetyEvent {
     source_key()
         .sign_event(SafetyEventDraft {
             source_id: "executor-1".into(),
+            source_epoch: 1,
             source_seq: seq,
             action: action.into(),
             occurred_at: time::OffsetDateTime::now_utc(),
@@ -468,6 +469,7 @@ fn postgres_safety_ingest_end_to_end() {
     let stranger = SafetySourceKey::from_secret_bytes(&[0x75; 32])
         .sign_event(SafetyEventDraft {
             source_id: "executor-9".into(),
+            source_epoch: 1,
             source_seq: 1,
             action: "safety:halt".into(),
             occurred_at: time::OffsetDateTime::now_utc(),
