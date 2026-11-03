@@ -179,7 +179,9 @@ Para cada línea, en orden, fail-closed:
    perdido que no tenía evento. La cadena `_unattributed` solo tiene
    `rejected` y pérdidas internas.
 5. Con `--source-pins`, la firma de cada evento contra la llave de su fuente.
-6. Con `--expected-head`, el head es igual a ese valor.
+6. Con `--expected-head`, el head es igual a ese valor. Sin él, el
+   verificador advierte (`head_not_anchored`, en stderr y en
+   `details.warnings`) que un prefijo truncado también verifica.
 
 Reporta la cantidad de `accepted`, `undeclared`, `invalid_name`,
 `duplicate`, `conflict`, `late`, `rejected`, `loss`, eventos perdidos y

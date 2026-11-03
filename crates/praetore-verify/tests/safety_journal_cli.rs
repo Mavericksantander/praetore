@@ -333,3 +333,44 @@ fn a_tampered_chain_fails_with_a_code() {
         "USAGE"
     );
 }
+
+#[test]
+fn without_an_expected_head_the_verifier_warns_that_a_prefix_also_verifies() {
+    let dir = Dir::new();
+    let (source, _) = chains();
+    let journal = dir.write("source.jsonl", &source);
+    let (ingest, _) = pin_files(&dir);
+    let warnings = |output: &Output| -> Vec<String> {
+        assert!(output.status.success());
+        summary(output)["details"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|warning| warning.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let output = verify(&["--journal", &journal, "--ingest-pin", &ingest]);
+    let found = warnings(&output);
+    assert!(
+        found.iter().any(|w| w.starts_with("head_not_anchored")),
+        "{found:?}"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("head_not_anchored"));
+    let head = summary(&output)["details"]["head"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let output = verify(&[
+        "--journal",
+        &journal,
+        "--ingest-pin",
+        &ingest,
+        "--expected-head",
+        &head,
+    ]);
+    assert!(
+        !warnings(&output)
+            .iter()
+            .any(|w| w.starts_with("head_not_anchored"))
+    );
+}
