@@ -1614,6 +1614,10 @@ impl SafetyIngestor {
     /// of its chain and its records extend it one by one up to
     /// `prepared.head`: records prepared earlier, committed twice or edited
     /// cannot move a head. A suppressed input (no records) is a no-op.
+    ///
+    /// Public because the ingester binary (`praetore-cli`) calls it after
+    /// its database write; the continuity check above is what keeps it
+    /// safe to call from outside this crate.
     pub fn commit(&mut self, prepared: &PreparedRecords) -> Result<(), CommitError> {
         let mut head = self.head(&prepared.chain);
         for record in &prepared.records {
@@ -1805,6 +1809,13 @@ impl SafetyIngestor {
     ///   lost: `late`;
     /// * otherwise the event record: `accepted` (declared name),
     ///   `undeclared` or `invalid_name`.
+    ///
+    /// Without rate limits: a long-running ingester uses
+    /// [`Self::prepare_limited`]. Public for the tests of the storage and
+    /// verifier crates and for callers that bound their input another way;
+    /// it takes `&self` and changes nothing (only [`Self::commit`] moves a
+    /// head, and it checks continuity), so calling it cannot corrupt the
+    /// ingester's state.
     pub fn prepare<L: EventLookup>(
         &self,
         input: &[u8],
