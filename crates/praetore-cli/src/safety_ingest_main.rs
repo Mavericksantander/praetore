@@ -35,6 +35,7 @@
 //! | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id","public_key"}` per line |
 //! | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own database role (TLS `verify-full` unless loopback) |
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
+//! | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` differs from the ingester's clock by more than this (default 300) keeps its status and carries `clock_skew_seconds` |
 //! | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` |
 //!
 //! The runtime-role relaxations of the gateway (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,
@@ -67,8 +68,9 @@ use std::{
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
-        ChainHead, DEFAULT_MAX_SEQ_JUMP, IngestorConfig, LossReason, MAX_SAFETY_EVENT_BYTES,
-        PreparedRecords, SafetyIngestKey, SafetyIngestor, SafetyRecordStatus, SourcePins,
+        ChainHead, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP, IngestorConfig,
+        LossReason, MAX_SAFETY_EVENT_BYTES, PreparedRecords, SafetyIngestKey, SafetyIngestor,
+        SafetyRecordStatus, SourcePins,
     },
 };
 use praetore_replay_postgres::{
@@ -142,6 +144,7 @@ struct Config {
     database: DatabaseConnector,
     queue_capacity: usize,
     max_seq_jump: u64,
+    max_clock_skew_seconds: u64,
     role_options: RuntimeRoleOptions,
 }
 
@@ -285,6 +288,14 @@ fn load_config() -> Result<Config> {
             .filter(|jump| (1..=MAX_SAFE_SEQ).contains(jump))
             .ok_or("PRAETORE_SAFETY_MAX_SEQ_JUMP must be between 1 and 2^53 - 1")?,
     };
+    let max_clock_skew_seconds = match var("PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS") {
+        None => DEFAULT_MAX_CLOCK_SKEW_SECONDS,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds <= MAX_SAFE_SEQ)
+            .ok_or("PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS must be a number of seconds")?,
+    };
     let role_options = RuntimeRoleOptions::from_config(|name| std::env::var(name).ok())?;
     Ok(Config {
         socket,
@@ -298,6 +309,7 @@ fn load_config() -> Result<Config> {
         database,
         queue_capacity,
         max_seq_jump,
+        max_clock_skew_seconds,
         role_options,
     })
 }
@@ -317,6 +329,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
         sources: config.sources,
         heads: BTreeMap::new(),
         max_seq_jump: config.max_seq_jump,
+        max_clock_skew_seconds: config.max_clock_skew_seconds,
     })?;
     Ok((
         ingestor,

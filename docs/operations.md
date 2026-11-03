@@ -517,6 +517,7 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id":"executor-1","public_key":"<64 hex>"}` per line, at most 256 sources, no key twice |
 | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own role; the file form is read as an owner-only secret file. TLS `verify-full` is required unless the host is loopback or a Unix socket |
 | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096); when full, messages are dropped and recorded as a `queue_overflow` loss |
+| `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` (the source's clock) differs from the ingester's clock by more than this many seconds (default 300) keeps its status and carries the signed field `clock_skew_seconds` (`occurred_at - recorded_at`); `praetore-verify safety-journal` counts them as `clock_skew` |
 | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1). A verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` and does not move the source chain; `praetore-verify safety-journal` on `_unattributed` reports it as a warning |
 
 The runtime-role relaxations (`PRAETORE_RUNTIME_ALLOW_SETTINGS`,

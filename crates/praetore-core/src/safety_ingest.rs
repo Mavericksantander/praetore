@@ -88,6 +88,8 @@ pub const MAX_SAFETY_CHAIN_ENTRIES: usize = 200_000;
 pub const MAX_SOURCE_PINS: usize = 256;
 /// Default of [`IngestorConfig::max_seq_jump`].
 pub const DEFAULT_MAX_SEQ_JUMP: u64 = 1_000_000;
+/// Default of [`IngestorConfig::max_clock_skew_seconds`].
+pub const DEFAULT_MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 
 /// The chain of everything that cannot be attributed to a pinned source:
 /// `rejected` records and losses inside the ingester (a full queue, the
@@ -854,6 +856,12 @@ pub struct SafetyRecordPayload {
     pub dropped: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<RawInput>,
+    /// For a record with an event: `occurred_at - recorded_at` in seconds,
+    /// present only when its magnitude is above the ingester's
+    /// `max_clock_skew_seconds` (an event dated in the future or long ago
+    /// by the source's clock).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_skew_seconds: Option<i64>,
     /// The ingestion key id.
     pub key_id: String,
 }
@@ -994,8 +1002,14 @@ impl SafetyRecordPayload {
             if let Some(reason) = &self.reason {
                 has(NAME_ERROR_CODES.contains(&reason.as_str()), "reason")?;
             }
+            has(
+                self.clock_skew_seconds
+                    .is_none_or(|skew| skew != 0 && skew.unsigned_abs() <= MAX_SAFE_INTEGER),
+                "clock_skew_seconds",
+            )?;
             return Ok(());
         }
+        has(self.clock_skew_seconds.is_none(), "clock_skew_seconds")?;
         has(
             self.event.is_none()
                 && self.event_hash.is_none()
@@ -1309,6 +1323,7 @@ pub struct SafetyIngestor {
     sources: SourcePins,
     heads: BTreeMap<String, ChainHead>,
     max_seq_jump: u64,
+    max_clock_skew_seconds: u64,
 }
 
 impl std::fmt::Debug for SafetyIngestor {
@@ -1342,6 +1357,10 @@ pub struct IngestorConfig {
     /// compromised source key) cannot push the chain to the end of the
     /// `source_seq` range.
     pub max_seq_jump: u64,
+    /// The largest `|occurred_at - recorded_at|`, in seconds, recorded
+    /// without a mark ([`DEFAULT_MAX_CLOCK_SKEW_SECONDS`] by default). Above
+    /// it the record keeps its status and carries `clock_skew_seconds`.
+    pub max_clock_skew_seconds: u64,
 }
 
 impl SafetyIngestor {
@@ -1393,6 +1412,7 @@ impl SafetyIngestor {
             sources: config.sources,
             heads: BTreeMap::new(),
             max_seq_jump: config.max_seq_jump,
+            max_clock_skew_seconds: config.max_clock_skew_seconds,
         };
         ingestor.set_heads(config.heads)?;
         Ok(ingestor)
@@ -1474,6 +1494,7 @@ impl SafetyIngestor {
             lost_to: None,
             dropped: None,
             raw: None,
+            clock_skew_seconds: None,
             key_id: self.key_id.clone(),
         }
     }
@@ -1547,6 +1568,16 @@ impl SafetyIngestor {
         self.sign_all(UNATTRIBUTED_CHAIN, vec![payload], head)
     }
 
+    /// `occurred_at - now` in whole seconds when its magnitude is above
+    /// `max_clock_skew_seconds`.
+    fn clock_skew(&self, record: &SafetyRecordPayload, now: OffsetDateTime) -> Option<i64> {
+        let occurred =
+            OffsetDateTime::parse(record.event.as_ref()?.occurred_at(), &Rfc3339).ok()?;
+        let skew = (occurred - now).whole_seconds();
+        (skew.unsigned_abs() > self.max_clock_skew_seconds)
+            .then_some(skew.clamp(-(MAX_SAFE_INTEGER as i64), MAX_SAFE_INTEGER as i64))
+    }
+
     /// Parses `input` and verifies it against the pinned source key.
     pub fn authenticate(&self, input: &[u8]) -> Result<SafetyEvent, EventRejection> {
         let event = SafetyEvent::parse(input)?;
@@ -1577,6 +1608,7 @@ impl SafetyIngestor {
         now: OffsetDateTime,
         lookup: &mut L,
     ) -> Result<PreparedRecords, IngestError<L::Error>> {
+        let now_instant = now;
         let now = Self::now_text(now).map_err(IngestError::Record)?;
         let event = match self.authenticate(input) {
             Ok(event) => event,
@@ -1652,6 +1684,7 @@ impl SafetyIngestor {
         record.reason = name_reason;
         record.detail = name_detail;
         record.original_record_hash = original;
+        record.clock_skew_seconds = self.clock_skew(&record, now_instant);
         payloads.push(record);
         self.sign_all(&chain, payloads, head)
             .map_err(IngestError::Record)
@@ -1720,6 +1753,8 @@ pub struct SafetyCounts {
     pub lost_events: u64,
     /// Messages dropped inside the ingester (unattributed loss records).
     pub dropped_messages: u64,
+    /// Event records marked with `clock_skew_seconds`.
+    pub clock_skew: u64,
 }
 
 /// Result of [`verify_safety_chain`].
@@ -1959,6 +1994,9 @@ pub fn verify_safety_chain(
             event
                 .verify(pin)
                 .map_err(|rejection| SafetyChainError::EventSignature { line, rejection })?;
+        }
+        if payload.clock_skew_seconds.is_some() {
+            counts.clock_skew += 1;
         }
         let event_seq = payload.event.as_ref().map(|event| event.source_seq);
         let event_hash = payload.event_hash.clone().unwrap_or_default();

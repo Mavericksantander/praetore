@@ -80,6 +80,7 @@ fn chains() -> (String, String) {
         sources,
         heads: BTreeMap::new(),
         max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
+        max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     })
     .unwrap();
     let mut lookup = MemoryLookup::default();

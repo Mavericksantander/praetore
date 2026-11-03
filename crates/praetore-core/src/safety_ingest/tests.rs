@@ -62,6 +62,7 @@ fn config() -> IngestorConfig {
         sources: pins(),
         heads: BTreeMap::new(),
         max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
+        max_clock_skew_seconds: DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     }
 }
 
@@ -931,4 +932,43 @@ fn a_jump_up_to_the_maximum_is_a_loss_and_one_more_is_rejected() {
             IngestSetupError::InvalidMaxSeqJump
         );
     }
+}
+
+fn event_at(seq: u64, occurred_at: OffsetDateTime) -> SafetyEvent {
+    source_key()
+        .sign_event(SafetyEventDraft {
+            source_id: "executor-1".into(),
+            source_seq: seq,
+            action: "safety:halt".into(),
+            occurred_at,
+            params: BTreeMap::new(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn an_event_far_from_the_ingester_clock_is_marked_with_its_skew() {
+    let mut harness = Harness::new();
+    // Within the default 300 s: no mark.
+    let near = harness.ingest(&wire(&event_at(1, now() - time::Duration::seconds(299))));
+    assert_eq!(near[0].payload().clock_skew_seconds, None);
+    // An hour in the future and in 1970: marked, status unchanged.
+    let future = harness.ingest(&wire(&event_at(2, now() + time::Duration::hours(1))));
+    assert_eq!(future[0].payload().status, SafetyRecordStatus::Accepted);
+    assert_eq!(future[0].payload().clock_skew_seconds, Some(3600));
+    let epoch = harness.ingest(&wire(&event_at(3, OffsetDateTime::UNIX_EPOCH)));
+    assert_eq!(
+        epoch[0].payload().clock_skew_seconds,
+        Some(-now().unix_timestamp())
+    );
+    let report = harness.verify("executor-1").unwrap();
+    assert_eq!(report.counts.clock_skew, 2);
+    assert_eq!(report.counts.accepted, 3);
+    // The mark is signed: removing it breaks the record.
+    let mut payload = future[0].payload().clone();
+    payload.clock_skew_seconds = None;
+    assert_ne!(
+        ingest_key().sign_record(payload).unwrap().record_hash(),
+        future[0].record_hash()
+    );
 }
