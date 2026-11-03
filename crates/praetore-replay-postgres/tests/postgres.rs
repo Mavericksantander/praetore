@@ -7655,6 +7655,39 @@ mod g1_safety {
             "a second ingester got the lock"
         );
         assert!(other.try_lock_tenant(TENANT_B).unwrap());
+        // The refused one can name the holder.
+        let holder_pid: i32 = store
+            .client()
+            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let holders = other.tenant_lock_holders(TENANT_A).unwrap();
+        assert_eq!(holders.len(), 1, "{holders:?}");
+        assert!(
+            holders[0].starts_with(&format!("pid {holder_pid}, role {}", ingest_role.name)),
+            "{holders:?}"
+        );
+        assert!(store.tenant_lock_holders(TENANT_A).unwrap().is_empty());
+        // Known limitation: any role of the database can take a tenant's
+        // lock; the holder is then named, whoever it is.
+        let tenant_c = Uuid::from_u128(0xc);
+        let mut squatter = connect_scratch_as(&scratch, &runtime.name);
+        assert!(
+            squatter
+                .query_one(
+                    "SELECT pg_catalog.pg_try_advisory_lock(1396786757, pg_catalog.hashtext($1))",
+                    &[&tenant_c.to_string()],
+                )
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        assert!(!other.try_lock_tenant(tenant_c).unwrap());
+        let holders = other.tenant_lock_holders(tenant_c).unwrap();
+        assert!(
+            holders.len() == 1 && holders[0].contains(&format!("role {}", runtime.name)),
+            "{holders:?}"
+        );
+        drop(squatter);
 
         let mut first = ingestor(TENANT_A);
         for input in [

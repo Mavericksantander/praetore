@@ -198,6 +198,39 @@ impl PostgresSafetyStore {
             .get(0))
     }
 
+    /// The sessions holding the lock of `tenant_id` (see
+    /// [`Self::try_lock_tenant`]): `pid`, login role, `application_name`
+    /// and start time, as `pg_stat_activity` shows them to this role. The
+    /// lock needs no privilege, so any role of the database can hold it
+    /// (a known limitation): this tells the operator whom to stop.
+    pub fn tenant_lock_holders(
+        &mut self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<String>, SafetyStoreError> {
+        let rows = self.client.query(
+            "SELECT l.pid, coalesce(a.usename::text, '?'), coalesce(a.application_name, ''), \
+                    coalesce(a.backend_start::text, '?') \
+             FROM pg_catalog.pg_locks l \
+             LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid \
+             WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 \
+               AND l.classid = $1::bigint::oid \
+               AND l.objid = ((pg_catalog.hashtext($2)::bigint + 4294967296) % 4294967296)::oid \
+               AND l.pid <> pg_catalog.pg_backend_pid() \
+             ORDER BY l.pid",
+            &[&i64::from(SAFETY_LOCK_CLASS), &tenant_id.to_string()],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let pid: i32 = row.get(0);
+                let user: String = row.get(1);
+                let application: String = row.get(2);
+                let started: String = row.get(3);
+                format!("pid {pid}, role {user}, application {application:?}, since {started}")
+            })
+            .collect())
+    }
+
     /// The last record of every chain of `tenant_id`. Each must parse, and
     /// its key id, hash and signature must verify under one of
     /// `ingest_pins` (the current ingestion key and the previous ones of a

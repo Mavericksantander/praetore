@@ -500,8 +500,20 @@ fn open_store(
     let mut store = PostgresSafetyStore::from_client(client);
     store.check_registration(ingestor.tenant_id(), Some(ingestor.key_id()))?;
     if !store.try_lock_tenant(ingestor.tenant_id())? {
+        // Any role of the database can take this lock (a known
+        // limitation): name the holder so the operator can stop it.
+        let holders = store
+            .tenant_lock_holders(ingestor.tenant_id())
+            .map(|holders| {
+                if holders.is_empty() {
+                    "holder not visible".to_owned()
+                } else {
+                    holders.join("; ")
+                }
+            })
+            .unwrap_or_else(|error| format!("holder unknown: {error}"));
         return Err(format!(
-            "another praetore-safety-ingest holds the lock of tenant {}; refusing to start",
+            "another session holds the lock of tenant {} ({holders}); refusing to start",
             ingestor.tenant_id()
         )
         .into());

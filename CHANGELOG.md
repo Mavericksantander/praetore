@@ -49,6 +49,11 @@
     `praetore-verify safety-journal --range [--expected-anchor HEX]`
     verifies one. Without `--expected-head` the verifier now warns
     (`head_not_anchored`). It reports epochs and `dropped_by_reason`.
+  - **Known limitation:** the per-tenant advisory lock needs no privilege,
+    so any role of the database can hold a tenant's lock and keep its
+    ingester from starting (denial of service only). The refusal and
+    `praetore-safety-ingest doctor` name the holding session. A lock that
+    only the tenant's registered role can take is planned for v0.3.3.
   - CI runs every ignored PostgreSQL test one by one
     (`scripts/postgres-ignored-tests.sh`) and every G1 end-to-end test.
 

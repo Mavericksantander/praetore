@@ -483,6 +483,15 @@ record shows and what it does not, and
 - Run one ingester per tenant, on the host of the executors it serves
   (transport v1 is a local Unix datagram socket). A second ingester for the
   same tenant refuses to start (PostgreSQL advisory lock per tenant).
+- **Known limitation (until v0.3.3): any role of the database can take a
+  tenant's lock.** A PostgreSQL advisory lock needs no privilege, so a
+  session of another tenant's ingester, of the gateway or of any other login
+  can hold the lock of tenant A, and A's ingester then refuses to start (a
+  denial of service; it cannot read or write A's records). The refusal, and
+  `praetore-safety-ingest doctor`, name the holder (`pid`, login role,
+  `application_name` and start time, from `pg_locks` and
+  `pg_stat_activity`). Stop it with `SELECT pg_terminate_backend(<pid>)` as
+  a role allowed to, and find out why that role took the lock.
 - Give it its own OS user. The socket directory must be owned by that user
   and not writable by others; the socket is created `0600`, or `0660` with
   `PRAETORE_SAFETY_SOCKET_GROUP=<gid>` for executors in that group (then the
