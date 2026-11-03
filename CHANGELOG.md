@@ -23,9 +23,13 @@ checksums only; nothing is published to crates.io.
   writable by that group. A member of the group can then remove or replace
   the socket (executors would report to another process, and those events
   would be lost; it cannot sign records) or entries the ingester creates
-  there at startup (which then fails). Give the directory the sticky bit
-  (`chmod 1770`) or keep it writable by the ingester's user only
-  (`docs/operations.md`, "Deployment").
+  there at startup (which then fails). By replacing the temporary entry
+  the ingester binds in (`.bind-<pid>`) with a symbolic link, a member can
+  also make the `chmod`/`chown` of that startup apply to another file of the
+  ingester's user, for example its signing key (which would then be
+  readable by the group). Give the directory the sticky bit (`chmod 1770`)
+  or keep it writable by the ingester's user only (`docs/operations.md`,
+  "Deployment").
 
 ### Changes
 
