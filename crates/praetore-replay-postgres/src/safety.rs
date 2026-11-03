@@ -125,6 +125,9 @@ pub struct StoredHead {
     pub head: ChainHead,
     /// The ingestion key id of the last record.
     pub key_id: String,
+    /// The last record itself: [`praetore_core::safety_ingest::SafetyIngestor::resume_heads`]
+    /// derives the head from it again.
+    pub record: SafetyRecord,
 }
 
 /// `praetore.safety_records` through one connection.
@@ -250,7 +253,14 @@ impl PostgresSafetyStore {
                     ),
                 });
             }
-            heads.insert(chain, StoredHead { head, key_id });
+            heads.insert(
+                chain,
+                StoredHead {
+                    head,
+                    key_id,
+                    record,
+                },
+            );
         }
         Ok(heads)
     }

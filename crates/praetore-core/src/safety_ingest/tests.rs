@@ -60,7 +60,6 @@ fn config() -> IngestorConfig {
         namespace_pin: namespace_key().public_key().unwrap(),
         attester_pin: attester_pin(),
         sources: pins(),
-        heads: BTreeMap::new(),
         max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
         max_clock_skew_seconds: DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     }
@@ -118,7 +117,7 @@ impl Harness {
     }
 
     fn store(&mut self, prepared: PreparedRecords) -> Vec<SafetyRecord> {
-        self.ingestor.commit(&prepared);
+        self.ingestor.commit(&prepared).unwrap();
         let text = self.chains.entry(prepared.chain.clone()).or_default();
         for record in &prepared.records {
             self.lookup.record(record);
@@ -1286,4 +1285,62 @@ fn a_flood_is_bounded_and_every_suppressed_message_is_counted_in_a_signed_record
         Some(LossReason::Duplicate)
     );
     harness.verify("executor-1").unwrap();
+}
+
+#[test]
+fn heads_come_only_from_signed_records_and_commit_only_extends_the_current_head() {
+    let mut harness = Harness::new();
+    let first = harness.ingest(&wire(&event(1, "safety:halt")));
+    let prepared = harness
+        .ingestor
+        .prepare(&wire(&event(2, "safety:halt")), now(), &mut harness.lookup)
+        .unwrap();
+    // Committing twice, or records prepared on an older head, is refused.
+    harness.ingestor.commit(&prepared).unwrap();
+    assert!(harness.ingestor.commit(&prepared).is_err());
+    let stale = harness
+        .ingestor
+        .prepare(&wire(&event(3, "safety:halt")), now(), &mut harness.lookup)
+        .unwrap();
+    let newer = harness
+        .ingestor
+        .prepare(&wire(&event(3, "safety:halt")), now(), &mut harness.lookup)
+        .unwrap();
+    harness.ingestor.commit(&newer).unwrap();
+    assert!(harness.ingestor.commit(&stale).is_err());
+    // A head claimed past the records is refused.
+    let mut forged = harness
+        .ingestor
+        .prepare(&wire(&event(4, "safety:halt")), now(), &mut harness.lookup)
+        .unwrap();
+    forged.head.high_water = 1000;
+    let before = harness.ingestor.head("executor-1");
+    assert!(harness.ingestor.commit(&forged).is_err());
+    assert_eq!(harness.ingestor.head("executor-1"), before);
+
+    // resume_heads: from the last signed records only.
+    let mut resumed = SafetyIngestor::new(config()).unwrap();
+    resumed
+        .resume_heads([newer.records[0].clone()], &[])
+        .unwrap();
+    assert_eq!(resumed.head("executor-1"), before);
+    // Signed by another key (not listed as previous), of another tenant,
+    // or two for one chain: refused, and nothing changes.
+    let other_key = SafetyIngestKey::from_secret_bytes(&[0x55; 32]);
+    let mut payload = newer.records[0].payload().clone();
+    payload.key_id = other_key.key_id();
+    let foreign = other_key.sign_record(payload).unwrap();
+    assert!(resumed.resume_heads([foreign.clone()], &[]).is_err());
+    resumed
+        .resume_heads([foreign], &[other_key.public_key().unwrap()])
+        .unwrap();
+    let mut payload = first[0].payload().clone();
+    payload.tenant_id = Uuid::from_u128(0xdead);
+    let other_tenant = ingest_key().sign_record(payload).unwrap();
+    assert!(resumed.resume_heads([other_tenant], &[]).is_err());
+    assert!(
+        resumed
+            .resume_heads([first[0].clone(), newer.records[0].clone()], &[])
+            .is_err()
+    );
 }

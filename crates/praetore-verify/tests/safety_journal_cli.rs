@@ -78,7 +78,6 @@ fn chains() -> (String, String) {
             .public_key()
             .unwrap(),
         sources,
-        heads: BTreeMap::new(),
         max_seq_jump: DEFAULT_MAX_SEQ_JUMP,
         max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
     })
@@ -111,7 +110,7 @@ fn chains() -> (String, String) {
     let mut store = |prepared: praetore_core::safety_ingest::PreparedRecords,
                      ingestor: &mut SafetyIngestor,
                      lookup: &mut MemoryLookup| {
-        ingestor.commit(&prepared);
+        ingestor.commit(&prepared).unwrap();
         for record in &prepared.records {
             lookup.record(record);
             let text = texts.entry(prepared.chain.clone()).or_default();

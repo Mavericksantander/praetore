@@ -50,7 +50,6 @@
 mod secret_file;
 
 use std::{
-    collections::BTreeMap,
     io::Read,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -69,10 +68,10 @@ use std::{
 use praetore_core::{
     SafetyNamespaceManifest, VerifiedPublicKey,
     safety_ingest::{
-        ChainHead, DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP,
-        FloodControl, FloodLimits, IngestorConfig, LossReason, MAX_FLOOD_LIMIT,
-        MAX_SAFETY_EVENT_BYTES, PreparedRecords, SafetyIngestKey, SafetyIngestor,
-        SafetyRecordStatus, SourcePins,
+        DEFAULT_FLOOD_LIMITS, DEFAULT_MAX_CLOCK_SKEW_SECONDS, DEFAULT_MAX_SEQ_JUMP, FloodControl,
+        FloodLimits, IngestorConfig, LossReason, MAX_FLOOD_LIMIT, MAX_SAFETY_EVENT_BYTES,
+        PreparedRecords, SafetyIngestKey, SafetyIngestor, SafetyRecord, SafetyRecordStatus,
+        SourcePins,
     },
 };
 use praetore_replay_postgres::{
@@ -437,7 +436,6 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
         namespace_pin: config.namespace_pin,
         attester_pin: config.attester_pin,
         sources: config.sources,
-        heads: BTreeMap::new(),
         max_seq_jump: config.max_seq_jump,
         max_clock_skew_seconds: config.max_clock_skew_seconds,
     })?;
@@ -455,6 +453,13 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
             role_options: config.role_options,
         },
     ))
+}
+
+impl Runtime {
+    /// The previous ingestion keys of a registered rotation.
+    fn previous_pins(&self) -> &[VerifiedPublicKey] {
+        &self.head_pins[1..]
+    }
 }
 
 struct Runtime {
@@ -476,7 +481,7 @@ struct Runtime {
 fn open_store(
     runtime: &Runtime,
     ingestor: &SafetyIngestor,
-) -> Result<(PostgresSafetyStore, BTreeMap<String, ChainHead>)> {
+) -> Result<(PostgresSafetyStore, Vec<SafetyRecord>)> {
     let mut client = runtime.database.connect()?;
     verify_safety_ingest_role_with(&mut client, &runtime.role_options)?;
     verify_schema_current(&mut client)?;
@@ -489,7 +494,7 @@ fn open_store(
         )
         .into());
     }
-    let mut heads = BTreeMap::new();
+    let mut heads = Vec::new();
     for (chain, stored) in store.load_heads(ingestor.tenant_id(), &runtime.head_pins)? {
         if stored.key_id != ingestor.key_id() {
             log(format!(
@@ -498,7 +503,7 @@ fn open_store(
                 stored.key_id
             ));
         }
-        heads.insert(chain, stored.head);
+        heads.push(stored.record);
     }
     Ok((store, heads))
 }
@@ -681,7 +686,7 @@ fn doctor() -> Result<()> {
 fn run() -> Result<()> {
     let (mut ingestor, runtime) = build_ingestor(load_config()?)?;
     let (store, heads) = open_store(&runtime, &ingestor)?;
-    ingestor.set_heads(heads)?;
+    ingestor.resume_heads(heads, runtime.previous_pins())?;
     let (listener, identity) = bind_socket(&runtime.socket, runtime.socket_gid)?;
     log(format!(
         "listening on {} (tenant {}, ingestion key {}, {} sources, manifest policy {} v{}, \
@@ -948,10 +953,16 @@ impl Worker<'_> {
             return false;
         };
         match store.store(self.ingestor.tenant_id(), prepared) {
-            Ok(()) => {
-                self.ingestor.commit(prepared);
-                true
-            }
+            Ok(()) => match self.ingestor.commit(prepared) {
+                Ok(()) => true,
+                // Stored, but not on the head this ingester holds: read the
+                // heads again from the database.
+                Err(error) => {
+                    log(format!("{error}"));
+                    self.after_failure();
+                    true
+                }
+            },
             Err(error) => {
                 log(format!("storing failed: {error}"));
                 self.after_failure();
@@ -973,12 +984,12 @@ impl Worker<'_> {
         } else if let Some(store) = self.store.as_mut() {
             match store.load_heads(self.ingestor.tenant_id(), &self.runtime.head_pins) {
                 Ok(heads) => {
-                    let _ = self.ingestor.set_heads(
-                        heads
-                            .into_iter()
-                            .map(|(chain, stored)| (chain, stored.head))
-                            .collect(),
-                    );
+                    if let Err(error) = self.ingestor.resume_heads(
+                        heads.into_values().map(|stored| stored.record),
+                        self.runtime.previous_pins(),
+                    ) {
+                        log(format!("the stored chain heads were refused: {error}"));
+                    }
                 }
                 Err(error) => log(format!("reading the chain heads failed: {error}")),
             }
@@ -988,7 +999,11 @@ impl Worker<'_> {
     fn reconnect(&mut self) {
         match open_store(self.runtime, &self.ingestor) {
             Ok((store, heads)) => {
-                if self.ingestor.set_heads(heads).is_ok() {
+                if self
+                    .ingestor
+                    .resume_heads(heads, self.runtime.previous_pins())
+                    .is_ok()
+                {
                     log("database connection restored");
                     self.store = Some(store);
                 }

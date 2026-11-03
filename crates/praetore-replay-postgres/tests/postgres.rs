@@ -7208,7 +7208,6 @@ mod g1_safety {
                 .public_key()
                 .unwrap(),
             sources,
-            heads: BTreeMap::new(),
             max_seq_jump: praetore_core::safety_ingest::DEFAULT_MAX_SEQ_JUMP,
             max_clock_skew_seconds: praetore_core::safety_ingest::DEFAULT_MAX_CLOCK_SKEW_SECONDS,
         })
@@ -7237,7 +7236,7 @@ mod g1_safety {
     ) -> PreparedRecords {
         let prepared = ingestor.prepare(input, test_now(), store).unwrap();
         store.store(ingestor.tenant_id(), &prepared).unwrap();
-        ingestor.commit(&prepared);
+        ingestor.commit(&prepared).unwrap();
         prepared
     }
 
@@ -7317,12 +7316,7 @@ mod g1_safety {
         assert_eq!(heads["executor-1"].head.high_water, 3);
         let mut restarted = self::ingestor(TENANT_A);
         restarted
-            .set_heads(
-                heads
-                    .into_iter()
-                    .map(|(chain, h)| (chain, h.head))
-                    .collect(),
-            )
+            .resume_heads(heads.into_values().map(|stored| stored.record), &[])
             .unwrap();
         // The source restarted: epoch 2, source_seq back to 1.
         let status = |prepared: &PreparedRecords| {
@@ -7558,7 +7552,7 @@ mod g1_safety {
         assert!(error.contains("do not match record_json"), "{error}");
         prepared.high_waters = vec![2];
         store.store(TENANT_A, &prepared).unwrap();
-        ingestor.commit(&prepared);
+        ingestor.commit(&prepared).unwrap();
         let pin = ingest_key().public_key().unwrap();
         let heads = store
             .load_heads(TENANT_A, std::slice::from_ref(&pin))
@@ -7615,8 +7609,11 @@ mod g1_safety {
             .unwrap();
         assert_eq!(heads["executor-1"].key_id, old.key_id());
         let mut resumed = ingestor(TENANT_A);
+        let last: Vec<_> = heads.into_values().map(|stored| stored.record).collect();
+        // The ingester itself also refuses a head signed by an unlisted key.
+        assert!(resumed.resume_heads(last.clone(), &[]).is_err());
         resumed
-            .set_heads(heads.into_iter().map(|(c, h)| (c, h.head)).collect())
+            .resume_heads(last, std::slice::from_ref(&old_pin))
             .unwrap();
         ingest(&mut resumed, &mut store, &event(2, "safety:halt"));
         let text = chain_text(store.client(), TENANT_A, "executor-1");
@@ -7666,12 +7663,7 @@ mod g1_safety {
         assert_eq!(heads["_unattributed"].head, first.head("_unattributed"));
         let mut resumed = ingestor(TENANT_A);
         resumed
-            .set_heads(
-                heads
-                    .into_iter()
-                    .map(|(chain, stored)| (chain, stored.head))
-                    .collect(),
-            )
+            .resume_heads(heads.into_values().map(|stored| stored.record), &[])
             .unwrap();
         let duplicate = ingest(&mut resumed, &mut store, &event(2, "safety:freeze"));
         assert!(duplicate.records.is_empty());
@@ -7770,8 +7762,12 @@ mod g1_safety {
         same_id.records[0] = SafetyIngestKey::from_secret_bytes(&[0x36; 32])
             .sign_record(payload)
             .unwrap();
+        // A re-signed record has another hash: its head follows it (commit
+        // refuses a head that the records do not lead to).
+        assert!(b.commit(&same_id).is_err());
+        same_id.head = same_id.records[0].next_head();
         store_b.store(TENANT_B, &same_id).unwrap();
-        b.commit(&same_id);
+        b.commit(&same_id).unwrap();
         // A's role cannot write B's rows, even a first record (chain_seq 0,
         // so the link check alone would pass) signed by B's key.
         let genesis = ingestor_with(TENANT_B, SafetyIngestKey::from_secret_bytes(&[0x36; 32]))
@@ -7796,7 +7792,7 @@ mod g1_safety {
         // The next record extends the chain; inserting it again is refused,
         // and so is a record (validly signed) that skips a chain position.
         store.store(TENANT_A, &foreign).unwrap();
-        a.commit(&foreign);
+        a.commit(&foreign).unwrap();
         let error = store.store(TENANT_A, &foreign).unwrap_err().to_string();
         assert!(error.contains("duplicate key"), "{error}");
         let mut skipping = a

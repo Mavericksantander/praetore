@@ -1457,8 +1457,6 @@ pub struct IngestorConfig {
     /// ingestion key cannot be it.
     pub attester_pin: VerifiedPublicKey,
     pub sources: SourcePins,
-    /// The last head of every chain in storage.
-    pub heads: BTreeMap<String, ChainHead>,
     /// The largest accepted step of `source_seq` above a chain's high-water
     /// mark (at least 1; [`DEFAULT_MAX_SEQ_JUMP`] by default). A verified
     /// event further ahead is recorded as `rejected`
@@ -1514,7 +1512,7 @@ impl SafetyIngestor {
                 })?;
             }
         }
-        let mut ingestor = Self {
+        let ingestor = Self {
             key_id: config.ingest_key.key_id(),
             key: config.ingest_key,
             tenant_id: config.tenant_id,
@@ -1524,29 +1522,45 @@ impl SafetyIngestor {
             max_seq_jump: config.max_seq_jump,
             max_clock_skew_seconds: config.max_clock_skew_seconds,
         };
-        ingestor.set_heads(config.heads)?;
         Ok(ingestor)
     }
 
-    /// Replaces every chain head, for example after reading them again from
-    /// storage once the database is reachable again.
-    pub fn set_heads(
+    /// Replaces every chain head with the position after the last stored
+    /// record of each chain (at startup, and after reading storage again
+    /// once the database is reachable). Each record must be of this
+    /// ingester's tenant and verify under this ingestion key or one of
+    /// `previous_pins` (a registered key rotation), and appear once per
+    /// chain: a head is always derived from a signed record, never set
+    /// directly. Nothing changes on error.
+    pub fn resume_heads(
         &mut self,
-        heads: BTreeMap<String, ChainHead>,
+        last_records: impl IntoIterator<Item = SafetyRecord>,
+        previous_pins: &[VerifiedPublicKey],
     ) -> Result<(), IngestSetupError> {
-        for (chain, head) in &heads {
-            let bad = |reason: &str| IngestSetupError::InvalidHead {
+        let mut pins = vec![
+            self.key
+                .public_key()
+                .map_err(|_| IngestSetupError::InvalidHead {
+                    chain: String::new(),
+                    reason: "the ingestion key has no public key".into(),
+                })?,
+        ];
+        pins.extend_from_slice(previous_pins);
+        let mut heads = BTreeMap::new();
+        for record in last_records {
+            let chain = record.payload.chain.clone();
+            let bad = |reason: String| IngestSetupError::InvalidHead {
                 chain: chain.clone(),
-                reason: reason.into(),
+                reason,
             };
-            if !is_valid_chain(chain) {
-                return Err(bad("invalid chain name"));
+            if record.payload.tenant_id != self.tenant_id {
+                return Err(bad("the record is of another tenant".into()));
             }
-            if !is_lower_hex(&head.prev_record_hash, 64)
-                || head.high_water > MAX_SAFE_INTEGER
-                || head.epoch > MAX_SAFE_INTEGER
-            {
-                return Err(bad("invalid head"));
+            record
+                .verify(&pins)
+                .map_err(|error| bad(error.to_string()))?;
+            if heads.insert(chain.clone(), record.next_head()).is_some() {
+                return Err(bad("two last records".into()));
             }
         }
         self.heads = heads;
@@ -1574,12 +1588,47 @@ impl SafetyIngestor {
         self.heads.get(chain).cloned().unwrap_or_default()
     }
 
-    /// Applies records once they are stored.
-    pub fn commit(&mut self, prepared: &PreparedRecords) {
-        self.heads
-            .insert(prepared.chain.clone(), prepared.head.clone());
+    /// Applies records once they are stored. Fails, and changes nothing,
+    /// unless `prepared` was prepared by this ingester on the current head
+    /// of its chain and its records extend it one by one up to
+    /// `prepared.head`: records prepared earlier, committed twice or edited
+    /// cannot move a head. A suppressed input (no records) is a no-op.
+    pub fn commit(&mut self, prepared: &PreparedRecords) -> Result<(), CommitError> {
+        let mut head = self.head(&prepared.chain);
+        for record in &prepared.records {
+            let payload = &record.payload;
+            if payload.chain != prepared.chain
+                || payload.tenant_id != self.tenant_id
+                || payload.key_id != self.key_id
+                || payload.chain_seq != head.next_chain_seq
+                || payload.prev_record_hash != head.prev_record_hash
+                || record.recomputed_hash().ok().as_deref() != Some(record.record_hash.as_str())
+            {
+                return Err(CommitError {
+                    chain: prepared.chain.clone(),
+                });
+            }
+            head = record.next_head();
+        }
+        if head != prepared.head {
+            return Err(CommitError {
+                chain: prepared.chain.clone(),
+            });
+        }
+        self.heads.insert(prepared.chain.clone(), head);
+        Ok(())
     }
+}
 
+/// [`SafetyIngestor::commit`] refused records that do not extend the
+/// current head of their chain.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("safety chain {chain}: the records do not extend the current head; read the heads again")]
+pub struct CommitError {
+    pub chain: String,
+}
+
+impl SafetyIngestor {
     fn payload(
         &self,
         chain: &str,
