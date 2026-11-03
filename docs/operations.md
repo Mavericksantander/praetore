@@ -514,6 +514,7 @@ record shows and what it does not, and
 | `PRAETORE_SAFETY_MANIFEST_FILE` | the signed safety namespace manifest (`praetore policy safety-manifest`), canonical file form |
 | `PRAETORE_SAFETY_NAMESPACE_PIN_FILE` | the namespace public key the manifest must verify under |
 | `PRAETORE_SAFETY_ATTESTER_PIN_FILE` | the gateway's evidence attester public key, only to refuse it as another role's key |
+| `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` | optional: the previous ingestion public keys of a registered rotation, one 64-hex key per line (at most 16). A chain whose last record is signed by any other key makes the ingester refuse to start |
 | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id":"executor-1","public_key":"<64 hex>"}` per line, at most 256 sources, no key twice |
 | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own role; the file form is read as an owner-only secret file. TLS `verify-full` is required unless the host is loopback or a Unix socket |
 | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096); when full, messages are dropped and recorded as a `queue_overflow` loss |
@@ -561,8 +562,14 @@ compromised source key lets its holder sign any event for that source:
 remove its pin, restart the ingester and treat that source's later records
 as untrusted. After rotating the ingestion key, records keep the old key's
 signature (the table is append-only): pin both keys when exporting and
-verifying (`--ingest-pin` is repeatable); the ingester logs a chain whose
-last record is signed by another key.
+verifying (`--ingest-pin` is repeatable). To rotate, list the old public
+key in `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` (one 64-hex key per line)
+and start the ingester with the new key: each chain continues under the new
+key, and the ingester logs every chain whose last record the previous key
+signed. A chain whose last record is signed by a key that is neither the
+current one nor listed there makes the ingester refuse to start: a key
+change must be registered, and a row signed by an unknown key is never
+continued.
 
 ### Export and verification
 

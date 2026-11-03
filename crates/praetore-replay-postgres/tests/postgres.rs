@@ -7184,6 +7184,10 @@ mod g1_safety {
     }
 
     fn ingestor(tenant: Uuid) -> SafetyIngestor {
+        ingestor_with(tenant, ingest_key())
+    }
+
+    fn ingestor_with(tenant: Uuid, key: SafetyIngestKey) -> SafetyIngestor {
         let namespace = SafetyNamespaceKey::from_secret_bytes(&[0x33; 32]);
         let policy =
             Policy::new_v2("ops", 1, vec![]).with_action_class("safety:halt", ActionClass::Safety);
@@ -7194,7 +7198,7 @@ mod g1_safety {
             .insert("executor-1", source_key().public_key().unwrap())
             .unwrap();
         SafetyIngestor::new(IngestorConfig {
-            ingest_key: ingest_key(),
+            ingest_key: key,
             tenant_id: tenant,
             manifest,
             namespace_pin: namespace.public_key().unwrap(),
@@ -7263,6 +7267,41 @@ mod g1_safety {
 
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_head_signed_by_an_unregistered_key_fails_closed() {
+        let (scratch, ingest_role, _runtime) = scratch_with_roles();
+        let mut store =
+            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
+        let old_key = SafetyIngestKey::from_secret_bytes(&[0x35; 32]);
+        let old_pin = old_key.public_key().unwrap();
+        let mut old = ingestor_with(TENANT_A, old_key);
+        ingest(&mut old, &mut store, &event(1, "safety:halt"));
+        let new_pin = ingest_key().public_key().unwrap();
+        // The key changed and the old one is not registered: fail closed.
+        match store.load_heads(TENANT_A, std::slice::from_ref(&new_pin)) {
+            Err(praetore_replay_postgres::SafetyStoreError::UnpinnedHead { chain, key_id }) => {
+                assert_eq!(chain, "executor-1");
+                assert_eq!(key_id, old.key_id());
+            }
+            other => panic!("an unregistered key change was accepted: {other:?}"),
+        }
+        // Registered as the previous key: the chain continues under the new one.
+        let heads = store
+            .load_heads(TENANT_A, &[new_pin.clone(), old_pin.clone()])
+            .unwrap();
+        assert_eq!(heads["executor-1"].key_id, old.key_id());
+        let mut resumed = ingestor(TENANT_A);
+        resumed
+            .set_heads(heads.into_iter().map(|(c, h)| (c, h.head)).collect())
+            .unwrap();
+        ingest(&mut resumed, &mut store, &event(2, "safety:halt"));
+        let text = chain_text(store.client(), TENANT_A, "executor-1");
+        let report = verify_safety_chain(&text, &[new_pin, old_pin], None, None).unwrap();
+        assert_eq!(report.signed_by.len(), 2);
+        assert_eq!(report.high_water, 2);
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_records_are_chained_append_only_and_tenant_isolated() {
         let (scratch, ingest_role, runtime) = scratch_with_roles();
         let mut admin = scratch.connect();
@@ -7295,7 +7334,9 @@ mod g1_safety {
         // The duplicate lookup reads storage: a fresh ingester resumes from
         // the stored heads and still sees seq 1 and 2.
         let pin = ingest_key().public_key().unwrap();
-        let heads = store.load_heads(TENANT_A, &pin).unwrap();
+        let heads = store
+            .load_heads(TENANT_A, std::slice::from_ref(&pin))
+            .unwrap();
         assert_eq!(heads["executor-1"].head, first.head("executor-1"));
         assert_eq!(heads["_unattributed"].head, first.head("_unattributed"));
         let mut resumed = ingestor(TENANT_A);

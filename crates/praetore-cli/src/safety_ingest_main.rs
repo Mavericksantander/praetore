@@ -32,6 +32,7 @@
 //! | `PRAETORE_SAFETY_MANIFEST_FILE` | the safety namespace manifest (`praetore policy safety-manifest`) |
 //! | `PRAETORE_SAFETY_NAMESPACE_PIN_FILE` | the namespace public key (64 hex) |
 //! | `PRAETORE_SAFETY_ATTESTER_PIN_FILE` | the gateway's evidence attester public key (64 hex), only to refuse sharing it |
+//! | `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` | optional: previous ingestion public keys (64 hex each, one per line, at most 16), the registered rotation. A chain whose last record is signed by any other key makes the ingester refuse to start |
 //! | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id","public_key"}` per line |
 //! | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own database role (TLS `verify-full` unless loopback) |
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
@@ -140,6 +141,7 @@ struct Config {
     manifest: SafetyNamespaceManifest,
     namespace_pin: VerifiedPublicKey,
     attester_pin: VerifiedPublicKey,
+    previous_ingest_pins: Vec<VerifiedPublicKey>,
     sources: SourcePins,
     database: DatabaseConnector,
     queue_capacity: usize,
@@ -191,6 +193,28 @@ fn read_pin(variable: &str, what: &str) -> Result<VerifiedPublicKey> {
         .map_err(|_| format!("{what} is not a valid Ed25519 public key"))?)
 }
 
+/// The previous ingestion public keys: one 64-hex key per line.
+fn read_previous_pins(path: &Path) -> Result<Vec<VerifiedPublicKey>> {
+    const MAX_PREVIOUS_PINS: usize = 16;
+    let what = "the previous ingestion pins";
+    let text = String::from_utf8(read_bounded(path, MAX_PIN_FILE_BYTES * 17, what)?)
+        .map_err(|_| format!("{what} are not UTF-8"))?;
+    let mut pins: Vec<VerifiedPublicKey> = Vec::new();
+    for line in text.lines() {
+        let bytes = hex32(line.as_bytes(), what)?;
+        let pin = VerifiedPublicKey::from_bytes(&bytes)
+            .map_err(|_| format!("{what}: not a valid Ed25519 public key"))?;
+        if pins.iter().any(|known| known.as_bytes() == pin.as_bytes()) {
+            return Err(format!("{what}: a key is repeated").into());
+        }
+        pins.push(pin);
+    }
+    if pins.is_empty() || pins.len() > MAX_PREVIOUS_PINS {
+        return Err(format!("{what}: between 1 and {MAX_PREVIOUS_PINS} keys").into());
+    }
+    Ok(pins)
+}
+
 fn read_secret(path: &Path, what: &str) -> Result<Vec<u8>> {
     secret_file::read_private_file(path, MAX_KEY_FILE_BYTES.max(MAX_URL_FILE_BYTES))
         .map_err(|error| format!("{what} {} {error}", path.display()).into())
@@ -240,6 +264,10 @@ fn load_config() -> Result<Config> {
         .map_err(|error| format!("the safety namespace manifest: {error}"))?;
     let namespace_pin = read_pin("PRAETORE_SAFETY_NAMESPACE_PIN_FILE", "the namespace pin")?;
     let attester_pin = read_pin("PRAETORE_SAFETY_ATTESTER_PIN_FILE", "the attester pin")?;
+    let previous_ingest_pins = match var("PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE") {
+        None => Vec::new(),
+        Some(path) => read_previous_pins(Path::new(&path))?,
+    };
     let pins_path = PathBuf::from(required("PRAETORE_SAFETY_SOURCE_PINS_FILE")?);
     let pins_text = String::from_utf8(read_bounded(
         &pins_path,
@@ -305,6 +333,7 @@ fn load_config() -> Result<Config> {
         manifest,
         namespace_pin,
         attester_pin,
+        previous_ingest_pins,
         sources,
         database,
         queue_capacity,
@@ -320,6 +349,17 @@ fn load_config() -> Result<Config> {
 /// Verifies the manifest and the distinct keys (no flag skips either).
 fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
     let ingest_pin = config.ingest_key.public_key()?;
+    if config
+        .previous_ingest_pins
+        .iter()
+        .any(|pin| pin.as_bytes() == ingest_pin.as_bytes())
+    {
+        return Err(
+            "PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE lists the current ingestion key".into(),
+        );
+    }
+    let mut head_pins = vec![ingest_pin.clone()];
+    head_pins.extend(config.previous_ingest_pins);
     let ingestor = SafetyIngestor::new(IngestorConfig {
         ingest_key: config.ingest_key,
         tenant_id: config.tenant_id,
@@ -335,6 +375,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
         ingestor,
         Runtime {
             ingest_pin,
+            head_pins,
             socket: config.socket,
             socket_gid: config.socket_gid,
             database: config.database,
@@ -346,6 +387,9 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
 
 struct Runtime {
     ingest_pin: VerifiedPublicKey,
+    /// The current ingestion key, then the previous ones: a chain head must
+    /// be signed by one of them.
+    head_pins: Vec<VerifiedPublicKey>,
     socket: PathBuf,
     socket_gid: Option<u32>,
     database: DatabaseConnector,
@@ -371,11 +415,11 @@ fn open_store(
         .into());
     }
     let mut heads = BTreeMap::new();
-    for (chain, stored) in store.load_heads(ingestor.tenant_id(), &runtime.ingest_pin)? {
+    for (chain, stored) in store.load_heads(ingestor.tenant_id(), &runtime.head_pins)? {
         if stored.key_id != ingestor.key_id() {
             log(format!(
-                "warning: the last record of chain {chain} is signed by ingestion key {}, \
-                 not by this key; the chain continues under this key (pin both to verify it)",
+                "the last record of chain {chain} is signed by the previous ingestion key {}; \
+                 the chain continues under this key (pin both to verify it)",
                 stored.key_id
             ));
         }
@@ -762,7 +806,7 @@ impl Worker<'_> {
             self.store = None;
             self.reconnect();
         } else if let Some(store) = self.store.as_mut() {
-            match store.load_heads(self.ingestor.tenant_id(), &self.runtime.ingest_pin) {
+            match store.load_heads(self.ingestor.tenant_id(), &self.runtime.head_pins) {
                 Ok(heads) => {
                     let _ = self.ingestor.set_heads(
                         heads

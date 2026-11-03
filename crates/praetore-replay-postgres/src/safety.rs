@@ -30,10 +30,17 @@ pub enum SafetyStoreError {
         chain: String,
         error: SafetyRecordError,
     },
-    /// The stored head of a chain is signed by the configured ingestion
-    /// key but its signature does not verify.
+    /// The stored head of a chain names one of the given ingestion keys
+    /// but its hash or signature does not verify.
     HeadSignature {
         chain: String,
+    },
+    /// The stored head of a chain is signed by an ingestion key that is
+    /// neither the current one nor a configured previous one: a key change
+    /// that was not registered, or a row written by someone else.
+    UnpinnedHead {
+        chain: String,
+        key_id: String,
     },
     /// Too many records for one export.
     TooLarge,
@@ -54,8 +61,14 @@ impl std::fmt::Display for SafetyStoreError {
             Self::Record { chain, error } => write!(f, "safety chain {chain}: {error}"),
             Self::HeadSignature { chain } => write!(
                 f,
-                "safety chain {chain}: the last record names this ingestion key but its \
+                "safety chain {chain}: the last record names a pinned ingestion key but its \
                  signature does not verify"
+            ),
+            Self::UnpinnedHead { chain, key_id } => write!(
+                f,
+                "safety chain {chain}: the last record is signed by ingestion key {key_id}, \
+                 which is neither this key nor a configured previous key \
+                 (PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE); refusing to continue the chain"
             ),
             Self::TooLarge => write!(f, "too many safety records for one export"),
         }
@@ -105,15 +118,15 @@ impl PostgresSafetyStore {
             .get(0))
     }
 
-    /// The last record of every chain of `tenant_id`. Each must parse and
-    /// its `record_hash` must match; one signed by `ingest_pin`'s key id must
-    /// verify under it (a head signed by another key id, for example before
-    /// a key rotation, is returned with that key id for the caller to
-    /// report).
+    /// The last record of every chain of `tenant_id`. Each must parse, and
+    /// its key id, hash and signature must verify under one of
+    /// `ingest_pins` (the current ingestion key and the previous ones of a
+    /// registered rotation). A head signed by any other key fails closed
+    /// ([`SafetyStoreError::UnpinnedHead`]).
     pub fn load_heads(
         &mut self,
         tenant_id: Uuid,
-        ingest_pin: &VerifiedPublicKey,
+        ingest_pins: &[VerifiedPublicKey],
     ) -> Result<BTreeMap<String, StoredHead>, SafetyStoreError> {
         let mut transaction = self
             .client
@@ -129,7 +142,6 @@ impl PostgresSafetyStore {
             &[&tenant_id],
         )?;
         transaction.commit()?;
-        let own_key_id = safety_ingest_key_id(ingest_pin);
         let mut heads = BTreeMap::new();
         for row in rows {
             let chain: String = row.get(0);
@@ -140,14 +152,14 @@ impl PostgresSafetyStore {
                     chain: chain.clone(),
                     error,
                 })?;
-            if record.recomputed_hash().ok().as_deref() != Some(record.record_hash()) {
-                return Err(SafetyStoreError::Record {
-                    chain,
-                    error: SafetyRecordError::HashMismatch,
-                });
-            }
             let key_id = record.payload().key_id.clone();
-            if key_id == own_key_id && record.verify(std::slice::from_ref(ingest_pin)).is_err() {
+            if !ingest_pins
+                .iter()
+                .any(|pin| safety_ingest_key_id(pin) == key_id)
+            {
+                return Err(SafetyStoreError::UnpinnedHead { chain, key_id });
+            }
+            if record.verify(ingest_pins).is_err() {
                 return Err(SafetyStoreError::HeadSignature { chain });
             }
             heads.insert(
