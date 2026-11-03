@@ -7357,7 +7357,7 @@ mod g1_safety {
             .connect()
             .query(
                 "SELECT chain, source_epoch FROM praetore.safety_records \
-                 ORDER BY chain, chain_seq",
+                 ORDER BY chain COLLATE \"C\", chain_seq",
                 &[],
             )
             .unwrap()
