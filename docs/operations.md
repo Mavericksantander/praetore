@@ -567,8 +567,11 @@ for example `42`. Keep it on persistent storage, one file per `source_id`,
 in a directory that only the source's user can write (the file and its
 temporary are created owner-only, and a leftover temporary is replaced
 without following links). If it cannot be read, holds anything else, or cannot be
-written, `start` fails and the source must not report: falling back to 1
-would make the ingester record every event as `rejected` (`stale_epoch`).
+written, `start` fails and the source must not report during that run:
+falling back to 1 would make the ingester record every event as `rejected`
+(`stale_epoch`). The failure must not stop or delay the executor either:
+log it, alert the operator, and run without reporting (the crate example of
+`praetore-safety-client` shows the pattern; never `unwrap` it).
 Restoring the file from an old backup has the same effect until the epoch
 passes the chain's again; set it to at least the epoch that
 `praetore-verify safety-journal` reports (`source_epoch`).

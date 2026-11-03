@@ -64,6 +64,13 @@ impl EpochFile {
     }
 
     /// Persists and returns the epoch of this run: the stored one plus one.
+    ///
+    /// # Errors
+    ///
+    /// Any failure to read, write or persist the file. The caller must then
+    /// not report during this run (see the crate example): never `unwrap`
+    /// it in an executor, and never fall back to a guessed epoch. Reporting
+    /// is off, the executor and its failsafe are not affected.
     pub fn start(&self) -> io::Result<u64> {
         let epoch = self
             .current()?
