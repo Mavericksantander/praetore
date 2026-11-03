@@ -20,6 +20,13 @@
 
 BEGIN;
 
+-- safety_records has FORCE ROW LEVEL SECURITY: an owner that is not a
+-- superuser (or BYPASSRLS) would see no row at all and the check below
+-- would pass on a full table. Lifted inside this transaction (and only
+-- possible for the owner), so the owner sees every row; the table is
+-- dropped below either way.
+ALTER TABLE praetore.safety_records NO FORCE ROW LEVEL SECURITY;
+
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM praetore.safety_records)

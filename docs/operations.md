@@ -669,6 +669,10 @@ revokes what 0016 granted `praetore_safety_ingest` in this database, and
 deletes the `0016_safety_records` and `0017_safety_records_followups` rows of
 `praetore.schema_migrations`. It destroys every safety record, so without
 the confirmation setting it refuses to run while the table holds any. The
+table has `FORCE ROW LEVEL SECURITY`, so an owner without superuser or
+`BYPASSRLS` would see no rows; the script lifts it first, inside the same
+transaction, so the check counts every record. The test runs it as such an
+owner. The
 group role is cluster-wide and is not dropped (`DROP ROLE
 praetore_safety_ingest` once no database uses it). Afterwards
 `apply_migrations` applies 0016 and 0017 again, and the tenant

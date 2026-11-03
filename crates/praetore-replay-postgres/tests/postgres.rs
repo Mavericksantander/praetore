@@ -7391,17 +7391,30 @@ mod g1_safety {
         let mut ingestor = ingestor(TENANT_A);
         ingest(&mut ingestor, &mut store, &event(1, "safety:halt"));
         drop(store);
-        let mut owner = scratch.connect();
+        // As an owner without superuser or BYPASSRLS (a managed database):
+        // FORCE ROW LEVEL SECURITY must not hide the records from the check.
+        let owner_role = TestRole::create("LOGIN NOSUPERUSER NOBYPASSRLS");
+        scratch
+            .connect()
+            .batch_execute(&format!(
+                "{} GRANT CREATE ON DATABASE {} TO {};",
+                transfer_praetore_ownership(&owner_role.name),
+                scratch.name,
+                owner_role.name
+            ))
+            .unwrap();
+        let mut owner = connect_scratch_as(&scratch, &owner_role.name);
         // Records exist: it refuses without the confirmation and changes
         // nothing.
         let error = owner.batch_execute(ROLLBACK).unwrap_err();
         assert!(database_error(&error).contains("holds records"), "{error}");
         owner.batch_execute("ROLLBACK").unwrap();
-        let count: i64 = owner
+        let count: i64 = scratch
+            .connect()
             .query_one("SELECT count(*) FROM praetore.safety_records", &[])
             .unwrap()
             .get(0);
-        assert_eq!(count, 1);
+        assert_eq!(count, 1, "the superuser still sees the record");
         owner
             .batch_execute("SET praetore.rollback_confirm = 'destroy-safety-records'")
             .unwrap();
@@ -7443,9 +7456,8 @@ mod g1_safety {
             );
         }
         // The runner applies both again, and ingestion works.
-        drop(owner);
-        let mut owner = scratch.connect();
         praetore_replay_postgres::apply_migrations(&mut owner).unwrap();
+        drop(owner);
         register(
             &scratch,
             &ingest_role.name,
