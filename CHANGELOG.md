@@ -1,11 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.3.3 - 2026-11-03
+
+Closes the two known limitations of v0.3.2 in the post-hoc safety ingestion
+(G1) for AI-enabled systems: R7, the tenant lock of `praetore-safety-ingest`
+can only be taken by the tenant's registered role (#97, migration 0019), and
+L95-1, the socket is set up without following symbolic links (#98). Breaking:
+the socket directory needs the sticky bit when it is writable by group or
+others. GitHub release with checksums only; nothing is published to
+crates.io.
 
 ### Breaking
 
 - **`praetore-safety-ingest` refuses a socket directory writable by group or
-  others without the sticky bit (L95-1),** also with
+  others without the sticky bit (L95-1, #98),** also with
   `PRAETORE_SAFETY_SOCKET_GROUP`. Before, a group-writable directory (for
   example `0770`) was accepted with a socket group; now the ingester does
   not start. Action: `chmod 1770 <dir>` (with a socket group) or
@@ -13,7 +21,7 @@
 
 ### Fixed
 
-- **L95-1: socket mode and group without following symbolic links.**
+- **L95-1 (#98): socket mode and group without following symbolic links.**
   `praetore-safety-ingest` opens the socket directory with `O_DIRECTORY |
   O_NOFOLLOW`, checks owner and mode on that descriptor, creates and opens
   its private bind directory relative to it, sets the socket's group with
@@ -26,8 +34,8 @@
   entry is checked first, in a directory only the ingester's user can
   write.
 
-- **R7: the tenant lock of `praetore-safety-ingest` can only be taken by
-  the tenant's registered role.** It is now a row lock (`FOR UPDATE
+- **R7 (#97, migration 0019): the tenant lock of `praetore-safety-ingest`
+  can only be taken by the tenant's registered role.** It is now a row lock (`FOR UPDATE
   NOWAIT`) on the ingester's own row of `praetore.safety_ingest_tenants`,
   on a second connection, instead of a PostgreSQL advisory lock that any
   login could hold. Migration 0019 adds the `lock_anchor` column, the only
