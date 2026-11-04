@@ -526,7 +526,10 @@ record shows and what it does not, and
   300): the ingester commits the lock's transaction and takes the lock again
   in a new one (`COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so the
   transaction id it holds (which holds back VACUUM and freezing) is never
-  older than one interval. Watch it with `age(backend_xid)` of the
+  older than one interval. Keep the interval at 300 s or less: with a
+  higher value (up to the allowed 86400 s) the ingester keeps one
+  transaction id open for that whole time, which holds back VACUUM and
+  freezing in the whole database just as long. Watch it with `age(backend_xid)` of the
   ingester's `idle in transaction` session in `pg_stat_activity`. The lock
   session sets `idle_in_transaction_session_timeout = 0` for itself; keep a
   server `transaction_timeout` (PostgreSQL 17) above the interval. A pooler
@@ -551,23 +554,23 @@ record shows and what it does not, and
   `lock_timeout = '5s'`, so it fails instead of waiting behind a running
   ingester); the test
   `postgres_safety_row_lock_migration_rolls_back_and_applies_again` runs it.
-- **Known limitation (until v0.3.3): a group-writable socket directory.**
-  With `PRAETORE_SAFETY_SOCKET_GROUP` the directory may be writable by that
-  group, and a member can then remove or replace the socket (executors
-  would report to another process and those events would be lost; it cannot
-  sign records) or the entries the ingester creates there at startup. By
-  replacing the temporary entry the ingester binds in (`.bind-<pid>`) with a
-  symbolic link, a member can also make the `chmod`/`chown` of that startup
-  apply to another file of the ingester's user, for example its signing key
-  (which would then be readable by the group). Give the directory the sticky
-  bit (`chmod 1770`), so that only the owner of an entry can remove or rename
-  it, or keep it writable by the ingester's user only.
-- Give it its own OS user. The socket directory must be owned by that user
-  and not writable by others; the socket is created `0600`, or `0660` with
-  `PRAETORE_SAFETY_SOCKET_GROUP=<gid>` for executors in that group (then the
-  directory may be group-writable but not world-writable). An existing
-  non-socket entry at the path is never replaced; a stale socket nobody
-  listens on is.
+- Give it its own OS user. The socket directory must be a directory (not a
+  symbolic link), owned by that user, and not writable by group or others
+  unless it has the sticky bit (`chmod 0700`, or `chmod 1770` with
+  `PRAETORE_SAFETY_SOCKET_GROUP=<gid>` for executors in that group); since
+  v0.3.3 a group- or world-writable directory without the sticky bit makes
+  the ingester refuse to start, with or without a socket group (L95-1).
+  The socket is created `0600`, or `0660` with that group. The ingester
+  opens the directory with `O_DIRECTORY | O_NOFOLLOW` and checks it on that
+  descriptor, binds in a private `0700` directory (`.bind-<pid>`) created
+  and opened relative to it, and sets the group (`fchownat` with
+  `AT_SYMLINK_NOFOLLOW`) and the mode on the staged entry relative to the
+  private directory's descriptor, after checking that the entry is its own
+  socket and before renaming it into place without replacing an existing
+  entry (`RENAME_NOREPLACE` on Linux, `RENAME_EXCL` on macOS). On Linux `fchmodat` takes no
+  `AT_SYMLINK_NOFOLLOW`, so the mode is set on that checked entry in a
+  directory only the ingester's user can write. An existing non-socket entry
+  at the path is never replaced; a stale socket nobody listens on is.
 - The ingester never migrates. Apply migrations (0016 creates
   `praetore.safety_records` and the `praetore_safety_ingest` group) with the
   owner role first, as for the gateway; the ingester checks that the schema
@@ -588,7 +591,7 @@ record shows and what it does not, and
 | --- | --- |
 | `PRAETORE_SAFETY_SOCKET` | absolute socket path |
 | `PRAETORE_SAFETY_SOCKET_GROUP` | optional numeric gid for a `0660` socket |
-| `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` | how often the tenant lock is renewed (default 300, 1 to 86400); a failed renewal stops writing until the lock is taken again, and the ingester keeps running and retries |
+| `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` | how often the tenant lock is renewed (default 300, 1 to 86400); a failed renewal stops writing until the lock is taken again, and the ingester keeps running and retries. Recommended: 300 or less, since a transaction id stays open for up to one interval (with 86400, a whole day) and holds back VACUUM and freezing that long |
 | `PRAETORE_SAFETY_TENANT_ID` | the tenant of every record |
 | `PRAETORE_SAFETY_INGEST_KEY_FILE` | the ingestion key, 64 lowercase hex characters; read with `O_NOFOLLOW`, owner-only, at most 128 bytes (a key in the environment is refused) |
 | `PRAETORE_SAFETY_MANIFEST_FILE` | the signed safety namespace manifest (`praetore policy safety-manifest`), canonical file form |

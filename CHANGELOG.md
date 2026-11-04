@@ -2,7 +2,29 @@
 
 ## Unreleased
 
+### Breaking
+
+- **`praetore-safety-ingest` refuses a socket directory writable by group or
+  others without the sticky bit (L95-1),** also with
+  `PRAETORE_SAFETY_SOCKET_GROUP`. Before, a group-writable directory (for
+  example `0770`) was accepted with a socket group; now the ingester does
+  not start. Action: `chmod 1770 <dir>` (with a socket group) or
+  `chmod 0700 <dir>`.
+
 ### Fixed
+
+- **L95-1: socket mode and group without following symbolic links.**
+  `praetore-safety-ingest` opens the socket directory with `O_DIRECTORY |
+  O_NOFOLLOW`, checks owner and mode on that descriptor, creates and opens
+  its private bind directory relative to it, sets the socket's group with
+  `fchownat(AT_SYMLINK_NOFOLLOW)` and its mode relative to the private
+  directory's descriptor after checking the entry is its own socket, and
+  renames it into place without replacing an existing entry
+  (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+  macOS). On Linux the mode is set with `fchmodat` without
+  `AT_SYMLINK_NOFOLLOW` (`fchmodat2`, Linux 6.6 and later, is not used); the
+  entry is checked first, in a directory only the ingester's user can
+  write.
 
 - **R7: the tenant lock of `praetore-safety-ingest` can only be taken by
   the tenant's registered role.** It is now a row lock (`FOR UPDATE
