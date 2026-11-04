@@ -1173,7 +1173,7 @@ name = "praetore-gateway-service"
 version = "0.3.3"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ed25519-dalek",
  "hex",
  "hyper",
