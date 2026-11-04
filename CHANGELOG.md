@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Breaking
+
+- **`praetore-safety-ingest` refuses a socket directory writable by group or
+  others without the sticky bit (L95-1),** also with
+  `PRAETORE_SAFETY_SOCKET_GROUP`. Before, a group-writable directory (for
+  example `0770`) was accepted with a socket group; now the ingester does
+  not start. Action: `chmod 1770 <dir>` (with a socket group) or
+  `chmod 0700 <dir>`.
+
 ### Fixed
 
 - **L95-1: socket mode and group without following symbolic links.**
@@ -10,13 +19,12 @@
   its private bind directory relative to it, sets the socket's group with
   `fchownat(AT_SYMLINK_NOFOLLOW)` and its mode relative to the private
   directory's descriptor after checking the entry is its own socket, and
-  renames it with `renameat`. A socket directory writable by group or others
-  without the sticky bit is now refused, also with
-  `PRAETORE_SAFETY_SOCKET_GROUP` (before, a group-writable one was
-  accepted): use `chmod 1770` or `0700`. On Linux the mode is set with
-  `fchmodat` without `AT_SYMLINK_NOFOLLOW`, which the kernel interface used
-  does not offer; the entry is checked first, in a directory only the
-  ingester's user can write.
+  renames it into place without replacing an existing entry
+  (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+  macOS). On Linux the mode is set with `fchmodat` without
+  `AT_SYMLINK_NOFOLLOW` (`fchmodat2`, Linux 6.6 and later, is not used); the
+  entry is checked first, in a directory only the ingester's user can
+  write.
 
 ## 0.3.2 - 2026-11-03
 

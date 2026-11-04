@@ -661,7 +661,7 @@ fn bind_socket(socket: &Path, group: Option<u32>) -> Result<(UnixDatagram, (u64,
     if private.socket()? != bound {
         return Err(format!("{} was replaced while binding", socket.display()).into());
     }
-    rustix::fs::renameat(&private.fd, STAGED, &directory.fd, &directory.name)
+    rename_no_replace(&private.fd, &directory.fd, &directory.name)
         .map_err(|error| format!("rename the socket to {}: {error}", socket.display()))?;
     drop(private);
     let metadata = directory
@@ -685,6 +685,28 @@ fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
 #[allow(clippy::unnecessary_cast)]
 fn stat_mode(stat: &rustix::fs::Stat) -> u32 {
     stat.st_mode as u32
+}
+
+/// Moves the staged socket to `name` in `directory`, refusing to replace
+/// an entry that appeared there since the stale socket was removed (for
+/// example a second ingester of the same user starting at the same time):
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+/// Apple platforms. Elsewhere a plain `renameat`, which replaces.
+fn rename_no_replace(
+    private: &rustix::fd::OwnedFd,
+    directory: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+) -> rustix::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    return rustix::fs::renameat_with(
+        private,
+        STAGED,
+        directory,
+        name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    return rustix::fs::renameat(private, STAGED, directory, name);
 }
 
 /// The name of the socket inside [`PrivateBindDir`].
@@ -1425,6 +1447,20 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("s")]);
+    }
+
+    /// The final rename never replaces an entry that appeared at the
+    /// socket's name after the checks (RENAME_NOREPLACE).
+    #[test]
+    fn the_rename_does_not_replace_an_existing_entry() {
+        let dir = Dir::new("noreplace", 0o700);
+        let directory = SocketDir::open(&dir.0.join("s")).unwrap();
+        let private = PrivateBindDir::create(&directory).unwrap();
+        let _listener = UnixDatagram::bind(private.path.join(STAGED)).unwrap();
+        std::fs::write(dir.0.join("s"), b"keep").unwrap();
+        let error = rename_no_replace(&private.fd, &directory.fd, &directory.name).unwrap_err();
+        assert_eq!(error, rustix::io::Errno::EXIST);
+        assert_eq!(std::fs::read(dir.0.join("s")).unwrap(), b"keep");
     }
 
     /// L95-1: a symbolic link planted where the ingester works never gets

@@ -535,7 +535,8 @@ record shows and what it does not, and
   and opened relative to it, and sets the group (`fchownat` with
   `AT_SYMLINK_NOFOLLOW`) and the mode on the staged entry relative to the
   private directory's descriptor, after checking that the entry is its own
-  socket and before renaming it into place. On Linux `fchmodat` takes no
+  socket and before renaming it into place without replacing an existing
+  entry (`RENAME_NOREPLACE` on Linux, `RENAME_EXCL` on macOS). On Linux `fchmodat` takes no
   `AT_SYMLINK_NOFOLLOW`, so the mode is set on that checked entry in a
   directory only the ingester's user can write. An existing non-socket entry
   at the path is never replaced; a stale socket nobody listens on is.
