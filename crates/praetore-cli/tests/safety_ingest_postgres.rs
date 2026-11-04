@@ -779,9 +779,12 @@ fn postgres_safety_ingest_refuses_to_start_on_a_bad_manifest_or_a_shared_key() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // The refusal names the holding session.
+    // The refusal names the role (the only one that can hold the lock)
+    // and lists its other sessions.
     assert!(
-        stderr.contains("holds the lock") && stderr.contains("(pid ") && stderr.contains(", role "),
+        stderr.contains("holds the lock")
+            && stderr.contains("only role ")
+            && stderr.contains("other sessions of this role: pid "),
         "{stderr}"
     );
     // So does doctor.
@@ -793,7 +796,7 @@ fn postgres_safety_ingest_refuses_to_start_on_a_bad_manifest_or_a_shared_key() {
     let report = String::from_utf8_lossy(&doctor.stdout);
     assert!(!doctor.status.success());
     assert!(
-        report.contains("holds the lock") && report.contains("(pid "),
+        report.contains("holds the lock") && report.contains("sessions of this role: pid "),
         "{report}"
     );
     first.stop();

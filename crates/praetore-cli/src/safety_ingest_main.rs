@@ -76,8 +76,8 @@ use praetore_core::{
     },
 };
 use praetore_replay_postgres::{
-    DatabaseConnector, PostgresSafetyStore, RuntimeRoleOptions, verify_safety_ingest_role_with,
-    verify_schema_current,
+    DatabaseConnector, PostgresSafetyStore, RuntimeRoleOptions, SafetyStoreError, TenantLock,
+    verify_safety_ingest_role_with, verify_schema_current,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -488,36 +488,49 @@ struct Runtime {
     role_options: RuntimeRoleOptions,
 }
 
-/// Connects, checks the role and the schema, takes the tenant lock and
-/// loads the chain heads.
+/// The store of the running ingester and the tenant lock that lets it
+/// write: one cannot be held without the other.
+struct LockedStore {
+    store: PostgresSafetyStore,
+    lock: TenantLock,
+}
+
+impl LockedStore {
+    /// `false` once either connection is gone (one round trip on the lock's).
+    fn is_open(&mut self) -> bool {
+        self.lock.is_held() && !self.store.client().is_closed()
+    }
+}
+
+/// Connects, checks the role and the schema, takes the tenant lock (on a
+/// second connection, migration 0019) and loads the chain heads.
 fn open_store(
     runtime: &Runtime,
     ingestor: &SafetyIngestor,
-) -> Result<(PostgresSafetyStore, Vec<SafetyRecord>)> {
+) -> Result<(LockedStore, Vec<SafetyRecord>)> {
     let mut client = runtime.database.connect()?;
     verify_safety_ingest_role_with(&mut client, &runtime.role_options)?;
     verify_schema_current(&mut client)?;
     let mut store = PostgresSafetyStore::from_client(client);
     store.check_registration(ingestor.tenant_id(), Some(ingestor.key_id()))?;
-    if !store.try_lock_tenant(ingestor.tenant_id())? {
-        // Any role of the database can take this lock (a known
-        // limitation): name the holder so the operator can stop it.
-        let holders = store
-            .tenant_lock_holders(ingestor.tenant_id())
-            .map(|holders| {
-                if holders.is_empty() {
-                    "holder not visible".to_owned()
-                } else {
-                    holders.join("; ")
-                }
-            })
-            .unwrap_or_else(|error| format!("holder unknown: {error}"));
-        return Err(format!(
-            "another session holds the lock of tenant {} ({holders}); refusing to start",
-            ingestor.tenant_id()
-        )
-        .into());
-    }
+    let lock = match TenantLock::acquire(runtime.database.connect()?, ingestor.tenant_id()) {
+        Ok(lock) => lock,
+        Err(error @ SafetyStoreError::LockBusy { .. }) => {
+            // Only this login role (or the schema owner) can hold it: name
+            // the role's other sessions so the operator can stop the holder.
+            let sessions = TenantLock::other_sessions(store.client())
+                .map(|sessions| {
+                    if sessions.is_empty() {
+                        "no other session of this role is visible".to_owned()
+                    } else {
+                        format!("other sessions of this role: {}", sessions.join("; "))
+                    }
+                })
+                .unwrap_or_else(|error| format!("sessions unknown: {error}"));
+            return Err(format!("{error} ({sessions})").into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut heads = Vec::new();
     for (chain, stored) in store.load_heads(ingestor.tenant_id(), &runtime.head_pins)? {
         if stored.key_id != ingestor.key_id() {
@@ -529,7 +542,7 @@ fn open_store(
         }
         heads.push(stored.record);
     }
-    Ok((store, heads))
+    Ok((LockedStore { store, lock }, heads))
 }
 
 /// The socket directory must be a real directory owned by this user and
@@ -956,7 +969,7 @@ fn read_socket(
 
 struct Worker<'a> {
     ingestor: SafetyIngestor,
-    store: Option<PostgresSafetyStore>,
+    store: Option<LockedStore>,
     runtime: &'a Runtime,
     overflow: &'a AtomicU64,
     refused: &'a AtomicU64,
@@ -971,7 +984,7 @@ impl Worker<'_> {
         if self.last_count.elapsed() >= COUNT_INTERVAL {
             self.flush_dropped();
         }
-        let Some(store) = self.store.as_mut() else {
+        let Some(store) = self.store.as_mut().map(|locked| &mut locked.store) else {
             self.storage_dropped += 1;
             self.reconnect();
             return;
@@ -1018,10 +1031,18 @@ impl Worker<'_> {
     }
 
     fn persist(&mut self, prepared: &PreparedRecords) -> bool {
-        let Some(store) = self.store.as_mut() else {
+        let Some(locked) = self.store.as_mut() else {
             return false;
         };
-        match store.store(self.ingestor.tenant_id(), prepared) {
+        if !locked.lock.is_held() {
+            // Without the lock another ingester may be writing: stop and
+            // take it again.
+            log("the tenant lock connection is closed; reconnecting");
+            self.store = None;
+            self.reconnect();
+            return false;
+        }
+        match locked.store.store(self.ingestor.tenant_id(), prepared) {
             Ok(()) => match self.ingestor.commit(prepared) {
                 Ok(()) => true,
                 // Stored, but not on the head this ingester holds: read the
@@ -1043,15 +1064,15 @@ impl Worker<'_> {
     /// After a storage error: reconnect when the connection is gone, and
     /// read the heads again either way (the database is the truth).
     fn after_failure(&mut self) {
-        let closed = self
-            .store
-            .as_mut()
-            .is_none_or(|store| store.client().is_closed());
+        let closed = self.store.as_mut().is_none_or(|locked| !locked.is_open());
         if closed {
             self.store = None;
             self.reconnect();
-        } else if let Some(store) = self.store.as_mut() {
-            match store.load_heads(self.ingestor.tenant_id(), &self.runtime.head_pins) {
+        } else if let Some(locked) = self.store.as_mut() {
+            match locked
+                .store
+                .load_heads(self.ingestor.tenant_id(), &self.runtime.head_pins)
+            {
                 Ok(heads) => {
                     if let Err(error) = self.ingestor.resume_heads(
                         heads.into_values().map(|stored| stored.record),

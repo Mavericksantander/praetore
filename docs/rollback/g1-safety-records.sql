@@ -61,6 +61,6 @@ $$;
 
 DELETE FROM praetore.schema_migrations
 WHERE version IN ('0016_safety_records', '0017_safety_records_followups',
-                  '0018_safety_audit_and_role_oids');
+                  '0018_safety_audit_and_role_oids', '0019_safety_ingest_row_lock');
 
 COMMIT;

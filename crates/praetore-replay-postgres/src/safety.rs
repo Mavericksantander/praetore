@@ -60,6 +60,17 @@ pub enum SafetyStoreError {
         role: String,
         tenant: Uuid,
     },
+    /// The login role cannot lock `tenant`'s registration: it is not the
+    /// role registered for that tenant (see [`TenantLock`]).
+    LockNotRegistered {
+        role: String,
+        tenant: Uuid,
+    },
+    /// Another session holds the lock of `tenant`.
+    LockBusy {
+        role: String,
+        tenant: Uuid,
+    },
 }
 
 impl std::fmt::Display for SafetyStoreError {
@@ -92,6 +103,17 @@ impl std::fmt::Display for SafetyStoreError {
                 "audit role {role} is not registered for tenant {tenant}; the schema owner \
                  registers it once: INSERT INTO praetore.safety_audit_tenants (role_oid, \
                  tenant_id) VALUES ('{role}'::regrole, '{tenant}')"
+            ),
+            Self::LockNotRegistered { role, tenant } => write!(
+                f,
+                "database role {role} cannot lock tenant {tenant}: it is not the role \
+                 registered for that tenant in praetore.safety_ingest_tenants (or the \
+                 migrations are not at 0019); refusing to start"
+            ),
+            Self::LockBusy { role, tenant } => write!(
+                f,
+                "another session holds the lock of tenant {tenant} (only role {role} or \
+                 the schema owner can); refusing to start"
             ),
             Self::Registration {
                 role,
@@ -236,52 +258,6 @@ impl PostgresSafetyStore {
         })
     }
 
-    /// Takes the session advisory lock of `tenant_id`'s safety chains, so
-    /// that a second ingester for the same tenant refuses to start. Held
-    /// until the connection closes. `false` when another session holds it.
-    pub fn try_lock_tenant(&mut self, tenant_id: Uuid) -> Result<bool, SafetyStoreError> {
-        Ok(self
-            .client
-            .query_one(
-                "SELECT pg_catalog.pg_try_advisory_lock($1, pg_catalog.hashtext($2))",
-                &[&SAFETY_LOCK_CLASS, &tenant_id.to_string()],
-            )?
-            .get(0))
-    }
-
-    /// The sessions holding the lock of `tenant_id` (see
-    /// [`Self::try_lock_tenant`]): `pid`, login role, `application_name`
-    /// and start time, as `pg_stat_activity` shows them to this role. The
-    /// lock needs no privilege, so any role of the database can hold it
-    /// (a known limitation): this tells the operator whom to stop.
-    pub fn tenant_lock_holders(
-        &mut self,
-        tenant_id: Uuid,
-    ) -> Result<Vec<String>, SafetyStoreError> {
-        let rows = self.client.query(
-            "SELECT l.pid, coalesce(a.usename::text, '?'), coalesce(a.application_name, ''), \
-                    coalesce(a.backend_start::text, '?') \
-             FROM pg_catalog.pg_locks l \
-             LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid \
-             WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 \
-               AND l.classid = $1::bigint::oid \
-               AND l.objid = ((pg_catalog.hashtext($2)::bigint + 4294967296) % 4294967296)::oid \
-               AND l.pid <> pg_catalog.pg_backend_pid() \
-             ORDER BY l.pid",
-            &[&i64::from(SAFETY_LOCK_CLASS), &tenant_id.to_string()],
-        )?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let pid: i32 = row.get(0);
-                let user: String = row.get(1);
-                let application: String = row.get(2);
-                let started: String = row.get(3);
-                format!("pid {pid}, role {user}, application {application:?}, since {started}")
-            })
-            .collect())
-    }
-
     /// The last record of every chain of `tenant_id`. Each must parse, and
     /// its key id, hash and signature must verify under one of
     /// `ingest_pins` (the current ingestion key and the previous ones of a
@@ -400,8 +376,104 @@ impl PostgresSafetyStore {
     }
 }
 
-/// `classid` of the advisory lock that serializes ingesters of a tenant.
-const SAFETY_LOCK_CLASS: i32 = 0x5341_4645; // "SAFE"
+/// How long [`TenantLock::is_held`] waits for the server.
+const LOCK_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The exclusive lock of one tenant's safety chains, so that a second
+/// ingester for the tenant refuses to start (migration 0019).
+///
+/// It is a row lock (`FOR UPDATE NOWAIT`) on the login role's own
+/// registration in `praetore.safety_ingest_tenants`, held by an open
+/// transaction on a connection of its own: row-level security shows that
+/// row only to the registered role (by the OID of `SESSION_USER`), so
+/// another role, or the role of another tenant, cannot take it. Released
+/// when this value is dropped or the connection closes.
+pub struct TenantLock {
+    client: Client,
+    tenant_id: Uuid,
+}
+
+impl TenantLock {
+    /// Takes the lock of `tenant_id` on `client`, a connection used for
+    /// nothing else. Fails closed: [`SafetyStoreError::LockNotRegistered`]
+    /// when the login role cannot lock that tenant's registration (not
+    /// registered, registered for another tenant, or no privilege), and
+    /// [`SafetyStoreError::LockBusy`] when another session holds it.
+    pub fn acquire(mut client: Client, tenant_id: Uuid) -> Result<Self, SafetyStoreError> {
+        let role: String = client
+            .query_one("SELECT SESSION_USER::pg_catalog.text", &[])?
+            .get(0);
+        // An idle transaction is the lock: a server-wide timeout must not end it.
+        client.batch_execute("SET idle_in_transaction_session_timeout = 0; BEGIN")?;
+        let locked = client.query(
+            "SELECT t.tenant_id FROM praetore.safety_ingest_tenants t \
+             WHERE t.tenant_id = $1 \
+               AND t.role_oid OPERATOR(pg_catalog.=) \
+                   (SELECT r.oid FROM pg_catalog.pg_roles r \
+                    WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER) \
+             FOR UPDATE NOWAIT",
+            &[&tenant_id],
+        );
+        match locked {
+            Ok(rows) if rows.len() == 1 => Ok(Self { client, tenant_id }),
+            Ok(_) => Err(SafetyStoreError::LockNotRegistered {
+                role,
+                tenant: tenant_id,
+            }),
+            Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+                Err(SafetyStoreError::LockBusy {
+                    role,
+                    tenant: tenant_id,
+                })
+            }
+            Err(error)
+                if error.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) =>
+            {
+                Err(SafetyStoreError::LockNotRegistered {
+                    role,
+                    tenant: tenant_id,
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// Whether the lock is still held: one round trip on its connection
+    /// (`false` once that connection is gone, for example terminated). The
+    /// holder must stop writing until it takes the lock again.
+    pub fn is_held(&mut self) -> bool {
+        self.client.is_valid(LOCK_CHECK_TIMEOUT).is_ok()
+    }
+
+    /// The other sessions of this login role (`pid`, `application_name`
+    /// and start time, from `pg_stat_activity`): only this role (or the
+    /// table owner) can hold the lock, so after a
+    /// [`SafetyStoreError::LockBusy`] one of them holds it.
+    pub fn other_sessions(client: &mut Client) -> Result<Vec<String>, SafetyStoreError> {
+        let rows = client.query(
+            "SELECT a.pid, coalesce(a.application_name, ''), \
+                    coalesce(a.backend_start::text, '?') \
+             FROM pg_catalog.pg_stat_activity a \
+             WHERE a.usename OPERATOR(pg_catalog.=) SESSION_USER \
+               AND a.pid <> pg_catalog.pg_backend_pid() \
+             ORDER BY a.pid",
+            &[],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let pid: i32 = row.get(0);
+                let application: String = row.get(1);
+                let started: String = row.get(2);
+                format!("pid {pid}, application {application:?}, since {started}")
+            })
+            .collect())
+    }
+}
 
 impl EventLookup for PostgresSafetyStore {
     type Error = postgres::Error;

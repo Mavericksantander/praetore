@@ -3071,7 +3071,7 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             .get(0);
         let policies = client
             .query(
-                // The policies 0008 creates (0016 to 0018 add theirs on
+                // The policies 0008 creates (0016 to 0019 add theirs on
                 // the safety tables).
                 "SELECT p.oid FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -3100,7 +3100,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0015_storage_records",
             "0016_safety_records",
             "0017_safety_records_followups",
-            "0018_safety_audit_and_role_oids"
+            "0018_safety_audit_and_role_oids",
+            "0019_safety_ingest_row_lock"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -6945,7 +6946,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0015_storage_records",
             "0016_safety_records",
             "0017_safety_records_followups",
-            "0018_safety_audit_and_role_oids"
+            "0018_safety_audit_and_role_oids",
+            "0019_safety_ingest_row_lock"
         ]
     );
     assert!(again.is_empty());
@@ -7198,7 +7200,8 @@ mod g1_safety {
         },
     };
     use praetore_replay_postgres::{
-        PostgresSafetyStore, RuntimeRoleError, read_safety_chain, verify_safety_ingest_role_with,
+        PostgresSafetyStore, RuntimeRoleError, SafetyStoreError, TenantLock, read_safety_chain,
+        verify_safety_ingest_role_with,
     };
     use std::collections::BTreeMap;
 
@@ -7615,9 +7618,9 @@ mod g1_safety {
             .map(|row| row.get(0))
             .collect();
         assert!(
-            !remaining
+            !remaining.iter().any(|v| ["0016", "0017", "0018", "0019"]
                 .iter()
-                .any(|v| ["0016", "0017", "0018"].iter().any(|p| v.starts_with(p))),
+                .any(|p| v.starts_with(p))),
             "{remaining:?}"
         );
         let row = owner
@@ -7824,6 +7827,225 @@ mod g1_safety {
         assert_eq!(report.high_water, 2);
     }
 
+    /// The error of a refused [`TenantLock::acquire`].
+    fn lock_error(scratch: &ScratchDatabase, role: &str, tenant: Uuid) -> SafetyStoreError {
+        match TenantLock::acquire(connect_scratch_as(scratch, role), tenant) {
+            Ok(_) => panic!("role {role} took the lock of tenant {tenant}"),
+            Err(error) => error,
+        }
+    }
+
+    /// R7: only the role registered for a tenant takes that tenant's lock.
+    /// Two tenants, each with its own ingest role, a member of
+    /// praetore_safety_ingest that is not registered, the runtime role and
+    /// a plain login role; none of them is a superuser or BYPASSRLS.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_tenant_lock_is_taken_only_by_the_registered_role() {
+        let (scratch, role_a, runtime) = scratch_with_roles();
+        let role_b = TestRole::create("LOGIN NOBYPASSRLS");
+        let unregistered = TestRole::create("LOGIN NOBYPASSRLS");
+        let stranger = TestRole::create("LOGIN NOBYPASSRLS");
+        let key_b = SafetyIngestKey::from_secret_bytes(&[0x52; 32]);
+        scratch
+            .connect()
+            .batch_execute(&format!(
+                "GRANT praetore_safety_ingest TO {}, {}",
+                role_b.name, unregistered.name
+            ))
+            .unwrap();
+        register(&scratch, &role_b.name, TENANT_B, &key_b.key_id());
+        for role in [&role_a, &role_b, &unregistered, &stranger, &runtime] {
+            let flags: (bool, bool) = {
+                let row = scratch
+                    .connect()
+                    .query_one(
+                        "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = $1",
+                        &[&role.name],
+                    )
+                    .unwrap();
+                (row.get(0), row.get(1))
+            };
+            assert_eq!(
+                flags,
+                (false, false),
+                "{} must be subject to RLS",
+                role.name
+            );
+        }
+        // The migrations' grants, UPDATE of lock_anchor included, pass the
+        // ingest role check.
+        verify_safety_ingest_role_with(
+            &mut connect_scratch_as(&scratch, &role_a.name),
+            &Default::default(),
+        )
+        .unwrap();
+
+        // Each registered role takes its own tenant's lock, both at once.
+        let lock_a = TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A)
+            .expect("role A locks tenant A");
+        let lock_b = TenantLock::acquire(connect_scratch_as(&scratch, &role_b.name), TENANT_B)
+            .expect("role B locks tenant B");
+        let (mut lock_a, mut lock_b) = (lock_a, lock_b);
+        assert!(lock_a.is_held() && lock_b.is_held());
+        assert_eq!(lock_a.tenant_id(), TENANT_A);
+        // A second session of the same role is refused while it is held.
+        let error = lock_error(&scratch, &role_a.name, TENANT_A);
+        assert!(
+            matches!(&error, SafetyStoreError::LockBusy { tenant, .. } if *tenant == TENANT_A),
+            "{error}"
+        );
+        drop(lock_a);
+        drop(lock_b);
+
+        // With no lock held, every other role fails closed for both
+        // tenants: the role of the other tenant, an unregistered member of
+        // the group, the runtime role and a role with no grant at all.
+        for (role, tenant) in [
+            (&role_b, TENANT_A),
+            (&role_a, TENANT_B),
+            (&unregistered, TENANT_A),
+            (&unregistered, TENANT_B),
+            (&runtime, TENANT_A),
+            (&stranger, TENANT_B),
+        ] {
+            let error = lock_error(&scratch, &role.name, tenant);
+            assert!(
+                matches!(&error, SafetyStoreError::LockNotRegistered { tenant: t, .. } if *t == tenant),
+                "{} on {tenant}: {error}",
+                role.name
+            );
+        }
+
+        // The old squat no longer blocks anyone: the advisory lock that
+        // v0.3.2 took, held by the runtime role, is ignored.
+        let mut squatter = connect_scratch_as(&scratch, &runtime.name);
+        assert!(
+            squatter
+                .query_one(
+                    "SELECT pg_catalog.pg_try_advisory_lock(1396786757, pg_catalog.hashtext($1))",
+                    &[&TENANT_A.to_string()],
+                )
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        // Nor can another role lock or change the registration rows
+        // directly.
+        for role in [&role_b, &unregistered, &runtime, &stranger] {
+            let mut client = connect_scratch_as(&scratch, &role.name);
+            let mut transaction = client.transaction().unwrap();
+            match transaction.query(
+                "SELECT tenant_id FROM praetore.safety_ingest_tenants \
+                 WHERE tenant_id = $1 FOR UPDATE NOWAIT",
+                &[&TENANT_A],
+            ) {
+                Ok(rows) => assert!(rows.is_empty(), "{} locked tenant A's row", role.name),
+                Err(error) => assert_eq!(
+                    error.code(),
+                    Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+                    "{}: {error}",
+                    role.name
+                ),
+            }
+        }
+        let lock_a = TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A)
+            .expect("the advisory squat does not block tenant A");
+        // The registered role itself can lock its row but never change it
+        // (WITH CHECK (false)), not even the lock column.
+        let mut client = connect_scratch_as(&scratch, &role_b.name);
+        let error = client
+            .execute(
+                "UPDATE praetore.safety_ingest_tenants SET lock_anchor = false",
+                &[],
+            )
+            .unwrap_err();
+        assert!(
+            database_error(&error).contains("row-level security"),
+            "{error}"
+        );
+        // The busy error names the holder's role; the other sessions of
+        // that role are listed for the operator.
+        let mut probe = connect_scratch_as(&scratch, &role_a.name);
+        let sessions = TenantLock::other_sessions(&mut probe).unwrap();
+        assert!(!sessions.is_empty(), "the lock session is visible");
+        drop(lock_a);
+        drop(squatter);
+    }
+
+    /// R7: the lock goes with its connection, so a dead holder does not
+    /// keep the tenant locked, and `is_held` turns false.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_tenant_lock_is_released_with_its_connection() {
+        let (scratch, role_a, _runtime) = scratch_with_roles();
+        let mut lock =
+            TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A).unwrap();
+        let pid: i32 = scratch
+            .connect()
+            .query_one(
+                "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
+                 AND state = 'idle in transaction'",
+                &[&role_a.name],
+            )
+            .unwrap()
+            .get(0);
+        // Terminated as an operator would, by a superuser.
+        scratch
+            .connect()
+            .execute("SELECT pg_terminate_backend($1)", &[&pid])
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let relock = loop {
+            match TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A) {
+                Ok(relock) => break relock,
+                Err(SafetyStoreError::LockBusy { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        let mut relock = relock;
+        assert!(relock.is_held());
+        assert!(!lock.is_held(), "the terminated lock still reports held");
+    }
+
+    /// Migration 0019 is reversible: its manual rollback removes the
+    /// column, policy and grant, and the migration applies again.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_row_lock_migration_rolls_back_and_applies_again() {
+        const ROLLBACK_0019: &str =
+            include_str!("../../../docs/rollback/0019-safety-ingest-row-lock.sql");
+        let (scratch, role_a, _runtime) = scratch_with_roles();
+        let mut admin = scratch.connect();
+        admin.batch_execute(ROLLBACK_0019).unwrap();
+        let state = |admin: &mut postgres::Client| -> (bool, bool, bool) {
+            let row = admin
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = \
+                                    'praetore.safety_ingest_tenants'::regclass \
+                                    AND attname = 'lock_anchor' AND NOT attisdropped), \
+                            EXISTS (SELECT 1 FROM pg_policy WHERE polname = 'lock_own_registration'), \
+                            EXISTS (SELECT 1 FROM praetore.schema_migrations \
+                                    WHERE version = '0019_safety_ingest_row_lock')",
+                    &[],
+                )
+                .unwrap();
+            (row.get(0), row.get(1), row.get(2))
+        };
+        assert_eq!(state(&mut admin), (false, false, false));
+        // Without 0019 the lock fails closed (no UPDATE privilege).
+        let error = lock_error(&scratch, &role_a.name, TENANT_A);
+        assert!(
+            matches!(error, SafetyStoreError::LockNotRegistered { .. }),
+            "{error}"
+        );
+        let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+        assert_eq!(applied, vec!["0019_safety_ingest_row_lock"]);
+        assert_eq!(state(&mut admin), (true, true, true));
+        TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A).unwrap();
+    }
+
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_safety_records_are_chained_append_only_and_tenant_isolated() {
@@ -7834,47 +8056,9 @@ mod g1_safety {
             .expect("the migrations' own grants are accepted for the ingester");
         praetore_replay_postgres::verify_schema_current(&mut client).unwrap();
         let mut store = PostgresSafetyStore::from_client(client);
-        assert!(store.try_lock_tenant(TENANT_A).unwrap());
-        let mut other =
-            PostgresSafetyStore::from_client(connect_scratch_as(&scratch, &ingest_role.name));
-        assert!(
-            !other.try_lock_tenant(TENANT_A).unwrap(),
-            "a second ingester got the lock"
-        );
-        assert!(other.try_lock_tenant(TENANT_B).unwrap());
-        // The refused one can name the holder.
-        let holder_pid: i32 = store
-            .client()
-            .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
-            .unwrap()
-            .get(0);
-        let holders = other.tenant_lock_holders(TENANT_A).unwrap();
-        assert_eq!(holders.len(), 1, "{holders:?}");
-        assert!(
-            holders[0].starts_with(&format!("pid {holder_pid}, role {}", ingest_role.name)),
-            "{holders:?}"
-        );
-        assert!(store.tenant_lock_holders(TENANT_A).unwrap().is_empty());
-        // Known limitation: any role of the database can take a tenant's
-        // lock; the holder is then named, whoever it is.
-        let tenant_c = Uuid::from_u128(0xc);
-        let mut squatter = connect_scratch_as(&scratch, &runtime.name);
-        assert!(
-            squatter
-                .query_one(
-                    "SELECT pg_catalog.pg_try_advisory_lock(1396786757, pg_catalog.hashtext($1))",
-                    &[&tenant_c.to_string()],
-                )
-                .unwrap()
-                .get::<_, bool>(0)
-        );
-        assert!(!other.try_lock_tenant(tenant_c).unwrap());
-        let holders = other.tenant_lock_holders(tenant_c).unwrap();
-        assert!(
-            holders.len() == 1 && holders[0].contains(&format!("role {}", runtime.name)),
-            "{holders:?}"
-        );
-        drop(squatter);
+        // The tenant lock (R7) has its own tests below.
+        let _lock =
+            TenantLock::acquire(connect_scratch_as(&scratch, &ingest_role.name), TENANT_A).unwrap();
 
         let mut first = ingestor(TENANT_A);
         for input in [

@@ -513,16 +513,29 @@ record shows and what it does not, and
 
 - Run one ingester per tenant, on the host of the executors it serves
   (transport v1 is a local Unix datagram socket). A second ingester for the
-  same tenant refuses to start (PostgreSQL advisory lock per tenant).
-- **Known limitation (until v0.3.3): any role of the database can take a
-  tenant's lock.** A PostgreSQL advisory lock needs no privilege, so a
-  session of another tenant's ingester, of the gateway or of any other login
-  can hold the lock of tenant A, and A's ingester then refuses to start (a
-  denial of service; it cannot read or write A's records). The refusal, and
-  `praetore-safety-ingest doctor`, name the holder (`pid`, login role,
-  `application_name` and start time, from `pg_locks` and
-  `pg_stat_activity`). Stop it with `SELECT pg_terminate_backend(<pid>)` as
-  a role allowed to, and find out why that role took the lock.
+  same tenant refuses to start: the tenant lock (migration 0019) is a row
+  lock (`SELECT ... FOR UPDATE NOWAIT`) on the ingester's own registration
+  in `praetore.safety_ingest_tenants`, held by an open transaction on a
+  second connection. Row-level security shows that row only to the login
+  role registered for the tenant, so the role of another tenant, the
+  gateway's role or any other login cannot take it; they fail closed with
+  "cannot lock tenant". The table owner is not subject to that policy and
+  can still lock or change the row. The ingester checks the lock connection
+  before each write and reconnects (taking the lock again) when it is gone.
+  The lock session sets `idle_in_transaction_session_timeout = 0` for
+  itself; a pooler in transaction mode between the ingester and PostgreSQL
+  would break the lock, so connect directly. Each ingester uses two
+  connections.
+- When the lock is busy, the refusal and `praetore-safety-ingest doctor`
+  name the role and list its other sessions (`pid`, `application_name`,
+  start time from `pg_stat_activity`): one of them holds the lock (or the
+  schema owner does). Before v0.3.3 the lock was a PostgreSQL advisory lock
+  that any role could take (R7); stop every v0.3.2 ingester before
+  applying 0019, since the two locks do not exclude each other. To undo
+  0019 alone, the schema owner runs
+  [`docs/rollback/0019-safety-ingest-row-lock.sql`](rollback/0019-safety-ingest-row-lock.sql)
+  with every ingester stopped (no record is touched); the test
+  `postgres_safety_row_lock_migration_rolls_back_and_applies_again` runs it.
 - **Known limitation (until v0.3.3): a group-writable socket directory.**
   With `PRAETORE_SAFETY_SOCKET_GROUP` the directory may be writable by that
   group, and a member can then remove or replace the socket (executors
@@ -721,7 +734,7 @@ current one nor listed there makes the ingester refuse to start: a key
 change must be registered, and a row signed by an unknown key is never
 continued.
 
-### Rolling back the safety-record storage (0016 to 0018)
+### Rolling back the safety-record storage (0016 to 0019)
 
 The migration runner is forward-only. To remove the G1 storage (for example
 to downgrade to a release without it, or to start over after an unreleased
@@ -742,7 +755,7 @@ policies), `praetore.safety_ingest_tenants`, `praetore.safety_audit_tenants`
 and the two trigger functions, revokes what 0016 and 0018 granted
 `praetore_safety_ingest` and `praetore_safety_audit` in this database, and
 deletes the `0016_safety_records`, `0017_safety_records_followups` and
-`0018_safety_audit_and_role_oids` rows of `praetore.schema_migrations`. It destroys every safety record, so without
+`0018_safety_audit_and_role_oids` and `0019_safety_ingest_row_lock` rows of `praetore.schema_migrations`. It destroys every safety record, so without
 the confirmation setting it refuses to run while the table holds any. The
 table has `FORCE ROW LEVEL SECURITY`, so an owner without superuser or
 `BYPASSRLS` would see no rows; the script lifts it first, inside the same
