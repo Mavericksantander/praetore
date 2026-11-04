@@ -52,10 +52,7 @@ mod secret_file;
 
 use std::{
     io::Read,
-    os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
-        net::UnixDatagram,
-    },
+    os::unix::{fs::MetadataExt, net::UnixDatagram},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -532,52 +529,90 @@ fn open_store(
     Ok((store, heads))
 }
 
-/// The socket directory must be a real directory owned by this user and
-/// not writable by others (nor by the group, unless a group is configured).
-/// An existing entry at the path must be a socket nobody listens on.
-fn check_socket_path(socket: &Path, group: Option<u32>) -> Result<bool> {
-    let directory = socket
-        .parent()
-        .ok_or("PRAETORE_SAFETY_SOCKET has no parent directory")?;
-    let metadata = std::fs::symlink_metadata(directory)
-        .map_err(|error| format!("socket directory {}: {error}", directory.display()))?;
-    if !metadata.file_type().is_dir() {
-        return Err(format!(
-            "socket directory {} is not a directory (or is a symlink)",
-            directory.display()
+/// The directory of the socket, opened without following a symbolic link
+/// (`O_DIRECTORY | O_NOFOLLOW`) and checked on that descriptor: owned by
+/// this user, and not writable by group or others unless it has the sticky
+/// bit (then only the owner of an entry can rename or remove it). Every
+/// later step works relative to this descriptor.
+struct SocketDir {
+    fd: rustix::fd::OwnedFd,
+    path: PathBuf,
+    /// The socket's file name in the directory.
+    name: std::ffi::OsString,
+}
+
+impl SocketDir {
+    fn open(socket: &Path) -> Result<Self> {
+        let name = socket
+            .file_name()
+            .ok_or("PRAETORE_SAFETY_SOCKET has no file name")?
+            .to_owned();
+        let path = match socket.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_owned(),
+            _ => PathBuf::from("."),
+        };
+        let fd = rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
         )
-        .into());
+        .map_err(|error| {
+            format!(
+                "socket directory {}: {error} (it must be a directory, not a symlink)",
+                path.display()
+            )
+        })?;
+        let stat = rustix::fs::fstat(&fd)?;
+        if stat.st_uid != rustix::process::geteuid().as_raw() {
+            return Err(format!(
+                "socket directory {} is not owned by this user",
+                path.display()
+            )
+            .into());
+        }
+        let mode = stat_mode(&stat);
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            return Err(format!(
+                "socket directory {} is writable by group or others without the sticky bit \
+                 (mode {:o}); use chmod 1770 or 0700",
+                path.display(),
+                mode & 0o7777
+            )
+            .into());
+        }
+        Ok(Self { fd, path, name })
     }
-    if metadata.uid() != rustix::process::geteuid().as_raw() {
-        return Err(format!(
-            "socket directory {} is not owned by this user",
-            directory.display()
-        )
-        .into());
+
+    /// The entry at the socket's name, not following a symbolic link.
+    fn entry(&self, name: &std::ffi::OsStr) -> rustix::io::Result<rustix::fs::Stat> {
+        rustix::fs::statat(&self.fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
     }
-    let mode = metadata.permissions().mode();
-    let forbidden = if group.is_some() { 0o002 } else { 0o022 };
-    if mode & forbidden != 0 {
-        return Err(format!(
-            "socket directory {} is writable by {} (mode {:o})",
-            directory.display(),
-            if group.is_some() {
-                "others"
-            } else {
-                "group or others"
-            },
-            mode & 0o777
-        )
-        .into());
-    }
-    match std::fs::symlink_metadata(socket) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+}
+
+/// Checks the socket's directory ([`SocketDir::open`]); an existing entry at
+/// the path must be a socket nobody listens on (`true`: a stale one).
+fn check_socket_path(socket: &Path) -> Result<bool> {
+    let directory = SocketDir::open(socket)?;
+    check_existing(&directory, socket)
+}
+
+fn check_existing(directory: &SocketDir, socket: &Path) -> Result<bool> {
+    match directory.entry(&directory.name) {
+        Err(rustix::io::Errno::NOENT) => Ok(false),
         Err(error) => Err(format!("socket {}: {error}", socket.display()).into()),
-        Ok(existing) if !existing.file_type().is_socket() => Err(format!(
-            "{} exists and is not a socket; refusing to replace it",
-            socket.display()
-        )
-        .into()),
+        Ok(existing)
+            if rustix::fs::FileType::from_raw_mode(existing.st_mode)
+                != rustix::fs::FileType::Socket =>
+        {
+            Err(format!(
+                "{} exists and is not a socket; refusing to replace it",
+                socket.display()
+            )
+            .into())
+        }
         Ok(_) => {
             let probe = UnixDatagram::unbound()?;
             probe.set_nonblocking(true)?;
@@ -595,65 +630,178 @@ fn check_socket_path(socket: &Path, group: Option<u32>) -> Result<bool> {
 }
 
 fn bind_socket(socket: &Path, group: Option<u32>) -> Result<(UnixDatagram, (u64, u64))> {
-    if check_socket_path(socket, group)? {
+    let directory = SocketDir::open(socket)?;
+    if check_existing(&directory, socket)? {
         log(format!("removing the stale socket {}", socket.display()));
-        std::fs::remove_file(socket)?;
+        rustix::fs::unlinkat(&directory.fd, &directory.name, rustix::fs::AtFlags::empty())?;
     }
     // Bound inside a private directory (0700) next to the socket, given its
     // mode and group there, then renamed into place: there is no window in
     // which others could connect, and the process umask (shared by every
-    // thread) is never changed.
-    let private = PrivateBindDir::create(socket)?;
-    let staged = private.0.join("s");
+    // thread) is never changed. Mode and group are set relative to the
+    // private directory's descriptor, on an entry checked to be this
+    // socket, never through a path that could hold a symbolic link.
+    let private = PrivateBindDir::create(&directory)?;
+    let staged = private.path.join(STAGED);
     let listener = UnixDatagram::bind(&staged)
         .map_err(|error| format!("bind {}: {error}", socket.display()))?;
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+    let bound = private.socket()?;
+    let mode = if group.is_some() { 0o660 } else { 0o600 };
     if let Some(gid) = group {
-        rustix::fs::chown(&staged, None, Some(rustix::fs::Gid::from_raw(gid)))
-            .map_err(|error| format!("chown {} to gid {gid}: {error}", socket.display()))?;
-        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o660))?;
+        rustix::fs::chownat(
+            &private.fd,
+            STAGED,
+            None,
+            Some(rustix::fs::Gid::from_raw(gid)),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| format!("chown {} to gid {gid}: {error}", socket.display()))?;
     }
-    std::fs::rename(&staged, socket)
+    private.chmod(mode)?;
+    if private.socket()? != bound {
+        return Err(format!("{} was replaced while binding", socket.display()).into());
+    }
+    rename_no_replace(&private.fd, &directory.fd, &directory.name)
         .map_err(|error| format!("rename the socket to {}: {error}", socket.display()))?;
     drop(private);
-    let metadata = std::fs::symlink_metadata(socket)?;
-    if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
+    let metadata = directory
+        .entry(&directory.name)
+        .map_err(|error| format!("socket {}: {error}", socket.display()))?;
+    if stat_identity(&metadata) != bound || stat_mode(&metadata) & 0o7777 != mode {
         return Err(format!("{} is not the socket this process bound", socket.display()).into());
     }
     let _ = rustix::net::sockopt::set_socket_recv_buffer_size(&listener, RECEIVE_BUFFER_BYTES);
     listener.set_read_timeout(Some(POLL))?;
-    Ok((listener, (metadata.dev(), metadata.ino())))
+    Ok((listener, bound))
 }
 
-/// A directory only this user can enter, next to the socket, removed on
-/// drop (with whatever is still in it).
-struct PrivateBindDir(PathBuf);
+/// `(st_dev, st_ino)`: their types differ between platforms.
+#[allow(clippy::unnecessary_cast)]
+fn stat_identity(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino as u64)
+}
+
+/// `st_mode` (a `u16` on macOS).
+#[allow(clippy::unnecessary_cast)]
+fn stat_mode(stat: &rustix::fs::Stat) -> u32 {
+    stat.st_mode as u32
+}
+
+/// Moves the staged socket to `name` in `directory`, refusing to replace
+/// an entry that appeared there since the stale socket was removed (for
+/// example a second ingester of the same user starting at the same time):
+/// `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on
+/// Apple platforms. Elsewhere a plain `renameat`, which replaces.
+fn rename_no_replace(
+    private: &rustix::fd::OwnedFd,
+    directory: &rustix::fd::OwnedFd,
+    name: &std::ffi::OsStr,
+) -> rustix::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    return rustix::fs::renameat_with(
+        private,
+        STAGED,
+        directory,
+        name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    return rustix::fs::renameat(private, STAGED, directory, name);
+}
+
+/// The name of the socket inside [`PrivateBindDir`].
+const STAGED: &str = "s";
+
+/// A directory only this user can enter, next to the socket, created and
+/// opened relative to the socket directory's descriptor (`O_NOFOLLOW`) and
+/// checked on its own descriptor; removed on drop (with whatever is still
+/// in it).
+struct PrivateBindDir {
+    fd: rustix::fd::OwnedFd,
+    path: PathBuf,
+}
 
 impl PrivateBindDir {
-    fn create(socket: &Path) -> Result<Self> {
-        let parent = match socket.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let path = parent.join(format!(".bind-{}", std::process::id()));
+    fn create(directory: &SocketDir) -> Result<Self> {
+        let name = format!(".bind-{}", std::process::id());
+        let path = directory.path.join(&name);
         // A leftover of a crashed start of this pid: removed without
         // following links.
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path)?,
-            Ok(_) => std::fs::remove_file(&path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        match directory.entry(name.as_ref()) {
+            Ok(stat)
+                if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Directory =>
+            {
+                std::fs::remove_dir_all(&path)?
+            }
+            Ok(_) => rustix::fs::unlinkat(&directory.fd, &name, rustix::fs::AtFlags::empty())?,
+            Err(rustix::io::Errno::NOENT) => {}
             Err(error) => return Err(error.into()),
         }
-        std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
-            .create(&path)
+        rustix::fs::mkdirat(&directory.fd, &name, rustix::fs::Mode::from_raw_mode(0o700))
             .map_err(|error| format!("create {}: {error}", path.display()))?;
-        Ok(Self(path))
+        let fd = rustix::fs::openat(
+            &directory.fd,
+            &name,
+            rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+        let private = Self { fd, path };
+        let stat = rustix::fs::fstat(&private.fd)?;
+        if stat.st_uid != rustix::process::geteuid().as_raw() || stat_mode(&stat) & 0o7777 != 0o700
+        {
+            return Err(format!(
+                "{} is not the private directory this process created",
+                private.path.display()
+            )
+            .into());
+        }
+        Ok(private)
+    }
+
+    /// `(dev, ino)` of the staged entry, which must be a socket owned by
+    /// this user (not following a symbolic link).
+    fn socket(&self) -> Result<(u64, u64)> {
+        let stat = rustix::fs::statat(&self.fd, STAGED, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Socket
+            || stat.st_uid != rustix::process::geteuid().as_raw()
+        {
+            return Err(format!(
+                "{} is not the socket this process bound",
+                self.path.join(STAGED).display()
+            )
+            .into());
+        }
+        Ok(stat_identity(&stat))
+    }
+
+    /// Sets the staged socket's mode relative to this directory's
+    /// descriptor. Where the kernel supports it, with
+    /// `AT_SYMLINK_NOFOLLOW`; on Linux (whose `fchmodat` has no flags) the
+    /// entry was just checked to be this process's socket, in a directory
+    /// only this user can write, so nothing else can put a link there.
+    fn chmod(&self, mode: u32) -> Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let flags = rustix::fs::AtFlags::empty();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let flags = rustix::fs::AtFlags::SYMLINK_NOFOLLOW;
+        rustix::fs::chmodat(
+            &self.fd,
+            STAGED,
+            rustix::fs::Mode::from_raw_mode(mode as _),
+            flags,
+        )
+        .map_err(|error| format!("chmod {}: {error}", self.path.join(STAGED).display()).into())
     }
 }
 
 impl Drop for PrivateBindDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -685,7 +833,6 @@ fn doctor() -> Result<()> {
         }
     };
     let socket = config.socket.clone();
-    let group = config.socket_gid;
     match build_ingestor(config) {
         Ok((ingestor, runtime)) => {
             report(
@@ -721,7 +868,7 @@ fn doctor() -> Result<()> {
         }
         Err(error) => report(false, format!("{error}")),
     }
-    match check_socket_path(&socket, group) {
+    match check_socket_path(&socket) {
         Ok(stale) => report(
             true,
             format!(
@@ -1170,6 +1317,7 @@ impl Worker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     struct Dir(PathBuf);
 
@@ -1250,17 +1398,132 @@ mod tests {
         std::fs::remove_file(&socket).unwrap();
         std::os::unix::fs::symlink("/tmp", &socket).unwrap();
         assert!(bind_socket(&socket, None).is_err());
-        // A directory writable by group or others.
-        let open = Dir::new("open", 0o777);
         assert!(
-            bind_socket(&open.0.join("s"), None)
-                .unwrap_err()
-                .to_string()
-                .contains("writable")
+            std::fs::symlink_metadata(&socket)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
-        let group = Dir::new("group", 0o770);
-        assert!(bind_socket(&group.0.join("s"), None).is_err());
-        let gid = std::fs::metadata(&group.0).unwrap().gid();
-        assert!(bind_socket(&group.0.join("s"), Some(gid)).is_ok());
+    }
+
+    /// L95-1: a directory writable by group or others is refused unless it
+    /// has the sticky bit, with or without a socket group.
+    #[test]
+    fn a_writable_directory_without_the_sticky_bit_is_refused() {
+        for (name, mode) in [("open", 0o777), ("group", 0o770), ("others", 0o702)] {
+            let dir = Dir::new(name, mode);
+            let gid = std::fs::metadata(&dir.0).unwrap().gid();
+            for group in [None, Some(gid)] {
+                let error = bind_socket(&dir.0.join("s"), group)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains("without the sticky bit"),
+                    "{mode:o}: {error}"
+                );
+                assert!(check_socket_path(&dir.0.join("s")).is_err());
+            }
+            // Nothing was created in it.
+            assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0, "{mode:o}");
+        }
+    }
+
+    /// L95-1: with the sticky bit, a group-writable directory is accepted,
+    /// and the socket gets its mode and group.
+    #[test]
+    fn a_sticky_group_writable_directory_is_accepted() {
+        let dir = Dir::new("sticky", 0o1770);
+        let socket = dir.0.join("s");
+        let gid = std::fs::metadata(&dir.0).unwrap().gid();
+        let (_listener, identity) = bind_socket(&socket, Some(gid)).unwrap();
+        let metadata = std::fs::symlink_metadata(&socket).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o660);
+        assert_eq!(metadata.gid(), gid);
+        assert_eq!(identity, (metadata.dev(), metadata.ino()));
+        // No staging directory is left behind.
+        let names: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("s")]);
+    }
+
+    /// The final rename never replaces an entry that appeared at the
+    /// socket's name after the checks (RENAME_NOREPLACE).
+    #[test]
+    fn the_rename_does_not_replace_an_existing_entry() {
+        let dir = Dir::new("noreplace", 0o700);
+        let directory = SocketDir::open(&dir.0.join("s")).unwrap();
+        let private = PrivateBindDir::create(&directory).unwrap();
+        let _listener = UnixDatagram::bind(private.path.join(STAGED)).unwrap();
+        std::fs::write(dir.0.join("s"), b"keep").unwrap();
+        let error = rename_no_replace(&private.fd, &directory.fd, &directory.name).unwrap_err();
+        assert_eq!(error, rustix::io::Errno::EXIST);
+        assert_eq!(std::fs::read(dir.0.join("s")).unwrap(), b"keep");
+    }
+
+    /// L95-1: a symbolic link planted where the ingester works never gets
+    /// the socket's mode or group, and the start fails closed: as the
+    /// directory itself, as the private bind directory, and as the staged
+    /// entry inside it.
+    #[test]
+    fn a_planted_symlink_is_never_followed() {
+        let victim_dir = Dir::new("victim", 0o700);
+        let victim = victim_dir.0.join("key");
+        std::fs::write(&victim, b"secret").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let victim_before = std::fs::metadata(&victim).unwrap();
+        let gid = victim_before.gid();
+        let unchanged = || {
+            let now = std::fs::metadata(&victim).unwrap();
+            assert_eq!(now.permissions().mode() & 0o7777, 0o600);
+            assert_eq!(now.gid(), victim_before.gid());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"secret");
+        };
+
+        // The socket directory is a symlink to another directory.
+        let base = Dir::new("linkdir", 0o700);
+        let real = base.0.join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = base.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = bind_socket(&link.join("s"), Some(gid))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a symlink"), "{error}");
+        assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+
+        // The private bind directory's name is a symlink to the victim's
+        // directory: it is removed as a link, never followed.
+        let dir = Dir::new("planted", 0o700);
+        let private = dir.0.join(format!(".bind-{}", std::process::id()));
+        std::os::unix::fs::symlink(&victim_dir.0, &private).unwrap();
+        let (listener, _) = bind_socket(&dir.0.join("s"), Some(gid)).unwrap();
+        drop(listener);
+        unchanged();
+        assert!(victim.exists(), "the link target was not touched");
+
+        // The staged entry is a symlink to the victim (as a hostile
+        // process of the same directory would plant it): the checks on the
+        // private directory's descriptor refuse it before any chmod.
+        let private_dir =
+            PrivateBindDir::create(&SocketDir::open(&dir.0.join("t")).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, private_dir.path.join(STAGED)).unwrap();
+        let error = private_dir.socket().unwrap_err().to_string();
+        assert!(error.contains("is not the socket"), "{error}");
+        // chown with AT_SYMLINK_NOFOLLOW changes the link, not its target.
+        rustix::fs::chownat(
+            &private_dir.fd,
+            STAGED,
+            None,
+            Some(rustix::fs::Gid::from_raw(gid)),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        unchanged();
+        drop(private_dir);
+        unchanged();
     }
 }
