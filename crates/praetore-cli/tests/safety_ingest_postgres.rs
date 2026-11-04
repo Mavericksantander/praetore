@@ -1101,3 +1101,81 @@ fn postgres_safety_ingest_checks_the_sender_uid() {
     assert_eq!(scratch.count("executor-1"), 1);
     assert_eq!(dropped_by_reason(&scratch)["peer_refused"], 3);
 }
+
+/// M97-1: the ingester renews its tenant lock every
+/// `PRAETORE_SAFETY_LOCK_RENEW_SECONDS`. When another session takes the
+/// lock at a renewal, the ingester keeps running but writes nothing; once
+/// the lock is free again it takes it back and writes again.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_safety_ingest_stops_writing_when_the_lock_renewal_fails() {
+    let scratch = Scratch::create();
+    let files = Files::new();
+    let mut ingester = Ingester::start(
+        &files,
+        &scratch,
+        &[("PRAETORE_SAFETY_LOCK_RENEW_SECONDS", "1")],
+    );
+    let client = SafetyClient::new(files.socket()).unwrap();
+    send(&client, &event(1, "safety:halt").to_wire().unwrap()).unwrap();
+    scratch.wait_for("executor-1", 1);
+
+    // The schema owner queues for the registration row; the ingester's
+    // next renewal commits, the owner gets the row, and the renewal fails.
+    let admin_url = scratch.admin.clone();
+    let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = thread::spawn(move || {
+        let mut owner = postgres::Client::connect(&admin_url, postgres::NoTls).unwrap();
+        let mut transaction = owner.transaction().unwrap();
+        transaction
+            .query(
+                "SELECT 1 FROM praetore.safety_ingest_tenants WHERE tenant_id = $1 FOR UPDATE",
+                &[&TENANT],
+            )
+            .unwrap();
+        taken_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        transaction.commit().unwrap();
+    });
+    taken_rx.recv_timeout(Duration::from_secs(15)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !ingester.log().contains("renewing the tenant lock failed") {
+        assert!(Instant::now() < deadline, "{}", ingester.log());
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        ingester.log().contains("holds the lock"),
+        "{}",
+        ingester.log()
+    );
+    // Nothing is written while another session holds the lock.
+    for seq in 2..=3 {
+        send(&client, &event(seq, "safety:halt").to_wire().unwrap()).unwrap();
+        thread::sleep(Duration::from_millis(300));
+    }
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(scratch.count("executor-1"), 1, "{}", ingester.log());
+    assert!(
+        ingester.child.try_wait().unwrap().is_none(),
+        "the ingester keeps running"
+    );
+
+    // Released: it takes the lock again and writes again.
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seq = 4;
+    while scratch.count("executor-1") <= 1 {
+        assert!(Instant::now() < deadline, "{}", ingester.log());
+        send(&client, &event(seq, "safety:halt").to_wire().unwrap()).unwrap();
+        seq += 1;
+        thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        ingester.log().contains("database connection restored"),
+        "{}",
+        ingester.log()
+    );
+    ingester.stop();
+}

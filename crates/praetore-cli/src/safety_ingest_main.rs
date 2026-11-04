@@ -35,6 +35,7 @@
 //! | `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` | optional: previous ingestion public keys (64 hex each, one per line, at most 16), the registered rotation. A chain whose last record is signed by any other key makes the ingester refuse to start |
 //! | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id","public_key"}` per line |
 //! | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own database role (TLS `verify-full` unless loopback) |
+//! | `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` | how often the tenant lock's transaction is ended and the lock taken again (default 300, 1 to 86400). A renewal that finds the lock taken, or fails, stops writing until the lock is taken again; the ingester keeps running and retries |
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
 //! | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` differs from the ingester's clock by more than this (default 300) keeps its status and carries `clock_skew_seconds` |
 //! | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` |
@@ -103,6 +104,9 @@ const MAX_SAFE_SEQ: u64 = (1 << 53) - 1;
 /// often (and when the ingester is idle or stops), so that a flood adds
 /// about one record per reason per interval.
 const COUNT_INTERVAL: Duration = Duration::from_secs(1);
+/// Default interval of the tenant lock's renewal (M97-1).
+const DEFAULT_LOCK_RENEW: Duration = Duration::from_secs(300);
+const MAX_LOCK_RENEW_SECONDS: u64 = 86_400;
 const MAX_ALLOWED_UIDS: usize = 32;
 
 fn main() {
@@ -150,6 +154,7 @@ struct Config {
     previous_ingest_pins: Vec<VerifiedPublicKey>,
     sources: SourcePins,
     database: DatabaseConnector,
+    lock_renew: Duration,
     queue_capacity: usize,
     max_seq_jump: u64,
     max_epoch_jump: u64,
@@ -307,6 +312,17 @@ fn load_config() -> Result<Config> {
     let database = DatabaseConnector::from_url(&url)
         .map_err(|error| format!("PRAETORE_SAFETY_DATABASE_URL: {error}"))?
         .connect_timeout(Duration::from_secs(3));
+    let lock_renew = match var("PRAETORE_SAFETY_LOCK_RENEW_SECONDS") {
+        None => DEFAULT_LOCK_RENEW,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (1..=MAX_LOCK_RENEW_SECONDS).contains(seconds))
+            .map(Duration::from_secs)
+            .ok_or(format!(
+                "PRAETORE_SAFETY_LOCK_RENEW_SECONDS must be between 1 and {MAX_LOCK_RENEW_SECONDS}"
+            ))?,
+    };
     let queue_capacity = match var("PRAETORE_SAFETY_QUEUE_CAPACITY") {
         None => DEFAULT_QUEUE_CAPACITY,
         Some(value) => value
@@ -391,6 +407,7 @@ fn load_config() -> Result<Config> {
         previous_ingest_pins,
         sources,
         database,
+        lock_renew,
         queue_capacity,
         max_seq_jump,
         max_epoch_jump,
@@ -459,6 +476,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
             socket: config.socket,
             socket_gid: config.socket_gid,
             database: config.database,
+            lock_renew: config.lock_renew,
             queue_capacity: config.queue_capacity,
             flood: config.flood,
             allowed_uids: config.allowed_uids,
@@ -482,6 +500,7 @@ struct Runtime {
     socket: PathBuf,
     socket_gid: Option<u32>,
     database: DatabaseConnector,
+    lock_renew: Duration,
     queue_capacity: usize,
     flood: FloodLimits,
     allowed_uids: Option<Vec<u32>>,
@@ -804,6 +823,7 @@ fn run() -> Result<()> {
         last_count: started,
     };
     loop {
+        worker.renew_lock_when_due();
         match receiver.recv_timeout(POLL) {
             Ok(message) => worker.handle(&message),
             // Counts are written at most once per COUNT_INTERVAL (and
@@ -1058,6 +1078,27 @@ impl Worker<'_> {
                 self.after_failure();
                 false
             }
+        }
+    }
+
+    /// Renews the tenant lock once `lock_renew` has passed since it was
+    /// taken (M97-1). If the renewal fails (another session took the lock,
+    /// or the connection is gone), both connections are dropped: nothing
+    /// is written until [`Self::reconnect`] takes the lock again, and the
+    /// messages meanwhile are counted as dropped.
+    fn renew_lock_when_due(&mut self) {
+        let Some(locked) = self.store.as_mut() else {
+            return;
+        };
+        if locked.lock.renewed_at().elapsed() < self.runtime.lock_renew {
+            return;
+        }
+        if let Err(error) = locked.lock.renew() {
+            log(format!(
+                "renewing the tenant lock failed: {error}; not writing until the lock is \
+                 taken again"
+            ));
+            self.store = None;
         }
     }
 

@@ -8009,6 +8009,127 @@ mod g1_safety {
         assert!(!lock.is_held(), "the terminated lock still reports held");
     }
 
+    /// M97-1: renewing ends the lock's transaction and takes the lock in a
+    /// new one, so its transaction id changes and the old one is gone; the
+    /// idle lock session holds no snapshot older than its own xid. A
+    /// session waiting for the row when the lock is renewed gets it, and
+    /// the renewal then fails with LockBusy.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_safety_tenant_lock_renewal_releases_its_xid_and_can_lose_the_lock() {
+        let (scratch, role_a, _runtime) = scratch_with_roles();
+        let mut lock =
+            TenantLock::acquire(connect_scratch_as(&scratch, &role_a.name), TENANT_A).unwrap();
+        let mut admin = scratch.connect();
+        let pid: i32 = admin
+            .query_one(
+                "SELECT pid FROM pg_stat_activity WHERE usename = $1 \
+                 AND state = 'idle in transaction'",
+                &[&role_a.name],
+            )
+            .unwrap()
+            .get(0);
+        let lock_session =
+            |admin: &mut postgres::Client| -> (Option<String>, Option<String>, String) {
+                let row = admin
+                    .query_one(
+                        "SELECT backend_xid::text, backend_xmin::text, state FROM pg_stat_activity \
+                     WHERE pid = $1",
+                        &[&pid],
+                    )
+                    .unwrap();
+                (row.get(0), row.get(1), row.get(2))
+            };
+        let (xid_1, xmin_1, state) = lock_session(&mut admin);
+        let xid_1 = xid_1.expect("the row lock assigns a transaction id");
+        assert_eq!(state, "idle in transaction");
+        println!("lock session: backend_xid {xid_1}, backend_xmin {xmin_1:?}");
+        // Between renewals the session holds its own transaction id and no
+        // older snapshot: the horizon it holds back is its own xid, for at
+        // most one renewal interval.
+        assert!(
+            xmin_1.is_none() || xmin_1.as_deref() == Some(xid_1.as_str()),
+            "the lock session holds an older snapshot: {xmin_1:?}"
+        );
+        let before = lock.renewed_at();
+        lock.renew().unwrap();
+        assert!(lock.renewed_at() > before);
+        let (xid_2, xmin_2, _) = lock_session(&mut admin);
+        let xid_2 = xid_2.expect("the renewed lock has a transaction id");
+        assert_ne!(xid_1, xid_2, "the renewal ends the old transaction");
+        println!("after renew: backend_xid {xid_2}, backend_xmin {xmin_2:?}");
+        assert!(xmin_2.is_none() || xmin_2.as_deref() == Some(xid_2.as_str()));
+        let old_open: bool = admin
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE backend_xid::text = $1)",
+                &[&xid_1],
+            )
+            .unwrap()
+            .get(0);
+        assert!(!old_open, "no session still holds transaction id {xid_1}");
+        // Still exclusive after a renewal.
+        assert!(matches!(
+            lock_error(&scratch, &role_a.name, TENANT_A),
+            SafetyStoreError::LockBusy { .. }
+        ));
+
+        // The schema owner queues for the row (as any holder that waits
+        // would); the renewal's COMMIT hands it the row and the renewal
+        // finds it taken.
+        let admin_url = scratch.url();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let waiter = std::thread::spawn(move || {
+            let mut owner = postgres::Client::connect(&admin_url, postgres::NoTls).unwrap();
+            let mut transaction = owner.transaction().unwrap();
+            transaction
+                .query(
+                    "SELECT 1 FROM praetore.safety_ingest_tenants WHERE tenant_id = $1 FOR UPDATE",
+                    &[&TENANT_A],
+                )
+                .unwrap();
+            taken_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            transaction.commit().unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: bool = admin
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE wait_event_type = 'Lock' AND datname = current_database())",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            if waiting {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the owner never waited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let renewed_before = lock.renewed_at();
+        let error = lock.renew().unwrap_err();
+        assert!(
+            matches!(&error, SafetyStoreError::LockBusy { tenant, .. } if *tenant == TENANT_A),
+            "{error}"
+        );
+        assert_eq!(lock.renewed_at(), renewed_before);
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        // The losing session holds nothing: no open transaction.
+        let (xid, _, state) = lock_session(&mut admin);
+        assert_eq!((xid, state.as_str()), (None, "idle"));
+        // Once the other holder ends, the lock can be taken again.
+        release_tx.send(()).unwrap();
+        waiter.join().unwrap();
+        lock.renew().unwrap();
+    }
+
     /// Migration 0019 is reversible: its manual rollback removes the
     /// column, policy and grant, and the migration applies again.
     #[test]

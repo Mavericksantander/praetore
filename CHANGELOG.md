@@ -13,8 +13,12 @@
   the session's own registration with `WITH CHECK (false)`, so the row can
   be locked but not changed. Another tenant's role, an unregistered role or
   a role with no grant fails closed. The ingester checks the lock before
-  each write and reconnects when it is gone. Reversible with
-  `docs/rollback/0019-safety-ingest-row-lock.sql`. Stop v0.3.2 ingesters
+  each write and renews it every `PRAETORE_SAFETY_LOCK_RENEW_SECONDS`
+  (default 300: `COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so its
+  transaction id is never older than one interval. If the lock is lost or
+  a renewal finds it taken, the ingester keeps running, writes nothing and
+  retries until it takes the lock again. Reversible with
+  `docs/rollback/0019-safety-ingest-row-lock.sql` (it sets `lock_timeout`). Stop v0.3.2 ingesters
   before migrating: the old and new locks do not exclude each other.
 
 ## 0.3.2 - 2026-11-03

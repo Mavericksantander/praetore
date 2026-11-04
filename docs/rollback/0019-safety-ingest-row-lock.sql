@@ -10,6 +10,11 @@
 
 BEGIN;
 
+-- DROP COLUMN needs ACCESS EXCLUSIVE on the table: a running ingester holds
+-- a row lock there, so fail after 5 s instead of waiting (and queueing every
+-- other session behind this one).
+SET LOCAL lock_timeout = '5s';
+
 REVOKE UPDATE (lock_anchor) ON praetore.safety_ingest_tenants FROM praetore_safety_ingest;
 DROP POLICY lock_own_registration ON praetore.safety_ingest_tenants;
 ALTER TABLE praetore.safety_ingest_tenants DROP COLUMN lock_anchor;

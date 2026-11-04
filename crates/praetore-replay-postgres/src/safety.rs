@@ -112,8 +112,8 @@ impl std::fmt::Display for SafetyStoreError {
             ),
             Self::LockBusy { role, tenant } => write!(
                 f,
-                "another session holds the lock of tenant {tenant} (only role {role} or \
-                 the schema owner can); refusing to start"
+                "another session holds the lock of tenant {tenant} (only role {role}, the \
+                 schema owner, a superuser or a BYPASSRLS role can); not writing"
             ),
             Self::Registration {
                 role,
@@ -376,6 +376,52 @@ impl PostgresSafetyStore {
     }
 }
 
+/// `BEGIN` and the row lock of `role`'s registration for `tenant_id` (see
+/// [`TenantLock`]); on an error the transaction is rolled back.
+fn lock_registration(
+    client: &mut Client,
+    tenant_id: Uuid,
+    role: &str,
+) -> Result<(), SafetyStoreError> {
+    client.batch_execute("BEGIN")?;
+    let locked = client.query(
+        "SELECT t.tenant_id FROM praetore.safety_ingest_tenants t \
+         WHERE t.tenant_id = $1 \
+           AND t.role_oid OPERATOR(pg_catalog.=) \
+               (SELECT r.oid FROM pg_catalog.pg_roles r \
+                WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER) \
+         FOR UPDATE NOWAIT",
+        &[&tenant_id],
+    );
+    let refused = |busy: bool| {
+        let role = role.to_owned();
+        if busy {
+            SafetyStoreError::LockBusy {
+                role,
+                tenant: tenant_id,
+            }
+        } else {
+            SafetyStoreError::LockNotRegistered {
+                role,
+                tenant: tenant_id,
+            }
+        }
+    };
+    let error = match locked {
+        Ok(rows) if rows.len() == 1 => return Ok(()),
+        Ok(_) => refused(false),
+        Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
+            refused(true)
+        }
+        Err(error) if error.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) => {
+            refused(false)
+        }
+        Err(error) => error.into(),
+    };
+    let _ = client.batch_execute("ROLLBACK");
+    Err(error)
+}
+
 /// How long [`TenantLock::is_held`] waits for the server.
 const LOCK_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -391,6 +437,8 @@ const LOCK_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 pub struct TenantLock {
     client: Client,
     tenant_id: Uuid,
+    role: String,
+    renewed_at: std::time::Instant,
 }
 
 impl TenantLock {
@@ -403,39 +451,34 @@ impl TenantLock {
         let role: String = client
             .query_one("SELECT SESSION_USER::pg_catalog.text", &[])?
             .get(0);
-        // An idle transaction is the lock: a server-wide timeout must not end it.
-        client.batch_execute("SET idle_in_transaction_session_timeout = 0; BEGIN")?;
-        let locked = client.query(
-            "SELECT t.tenant_id FROM praetore.safety_ingest_tenants t \
-             WHERE t.tenant_id = $1 \
-               AND t.role_oid OPERATOR(pg_catalog.=) \
-                   (SELECT r.oid FROM pg_catalog.pg_roles r \
-                    WHERE r.rolname OPERATOR(pg_catalog.=) SESSION_USER) \
-             FOR UPDATE NOWAIT",
-            &[&tenant_id],
-        );
-        match locked {
-            Ok(rows) if rows.len() == 1 => Ok(Self { client, tenant_id }),
-            Ok(_) => Err(SafetyStoreError::LockNotRegistered {
-                role,
-                tenant: tenant_id,
-            }),
-            Err(error) if error.code() == Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE) => {
-                Err(SafetyStoreError::LockBusy {
-                    role,
-                    tenant: tenant_id,
-                })
-            }
-            Err(error)
-                if error.code() == Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE) =>
-            {
-                Err(SafetyStoreError::LockNotRegistered {
-                    role,
-                    tenant: tenant_id,
-                })
-            }
-            Err(error) => Err(error.into()),
-        }
+        // An idle transaction holds the lock between renewals: a
+        // server-wide idle timeout must not end it.
+        client.batch_execute("SET idle_in_transaction_session_timeout = 0")?;
+        lock_registration(&mut client, tenant_id, &role)?;
+        Ok(Self {
+            client,
+            tenant_id,
+            role,
+            renewed_at: std::time::Instant::now(),
+        })
+    }
+
+    /// Ends the transaction that holds the lock and takes it again in a
+    /// new one (`COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so that no
+    /// transaction id stays open longer than the renewal interval (VACUUM
+    /// and freezing are held back only that long). Between the two another
+    /// session may take it: then [`SafetyStoreError::LockBusy`], and the
+    /// holder must stop writing until it takes the lock again.
+    pub fn renew(&mut self) -> Result<(), SafetyStoreError> {
+        self.client.batch_execute("COMMIT")?;
+        lock_registration(&mut self.client, self.tenant_id, &self.role)?;
+        self.renewed_at = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// When the lock was last taken or renewed.
+    pub fn renewed_at(&self) -> std::time::Instant {
+        self.renewed_at
     }
 
     pub fn tenant_id(&self) -> Uuid {

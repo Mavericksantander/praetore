@@ -522,10 +522,23 @@ record shows and what it does not, and
   "cannot lock tenant". The table owner is not subject to that policy and
   can still lock or change the row. The ingester checks the lock connection
   before each write and reconnects (taking the lock again) when it is gone.
-  The lock session sets `idle_in_transaction_session_timeout = 0` for
-  itself; a pooler in transaction mode between the ingester and PostgreSQL
-  would break the lock, so connect directly. Each ingester uses two
-  connections.
+  The lock is renewed every `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` (default
+  300): the ingester commits the lock's transaction and takes the lock again
+  in a new one (`COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so the
+  transaction id it holds (which holds back VACUUM and freezing) is never
+  older than one interval. Watch it with `age(backend_xid)` of the
+  ingester's `idle in transaction` session in `pg_stat_activity`. The lock
+  session sets `idle_in_transaction_session_timeout = 0` for itself; keep a
+  server `transaction_timeout` (PostgreSQL 17) above the interval. A pooler
+  in transaction mode between the ingester and PostgreSQL would break the
+  lock, so connect directly. Each ingester uses two connections.
+- **If the lock is lost** (a renewal finds it taken, or its connection is
+  gone), the ingester keeps running: it stops writing, counts the messages
+  it receives meanwhile as dropped (a signed loss record once it writes
+  again), and retries taking the lock, logging each attempt. Executors are
+  not affected. The lock excludes a second ingester; the integrity of a
+  chain does not depend on it (the insert trigger refuses a record that
+  does not extend its chain, and the ingester then reads the heads again).
 - When the lock is busy, the refusal and `praetore-safety-ingest doctor`
   name the role and list its other sessions (`pid`, `application_name`,
   start time from `pg_stat_activity`): one of them holds the lock (or the
@@ -534,7 +547,9 @@ record shows and what it does not, and
   applying 0019, since the two locks do not exclude each other. To undo
   0019 alone, the schema owner runs
   [`docs/rollback/0019-safety-ingest-row-lock.sql`](rollback/0019-safety-ingest-row-lock.sql)
-  with every ingester stopped (no record is touched); the test
+  with every ingester stopped (no record is touched; it sets
+  `lock_timeout = '5s'`, so it fails instead of waiting behind a running
+  ingester); the test
   `postgres_safety_row_lock_migration_rolls_back_and_applies_again` runs it.
 - **Known limitation (until v0.3.3): a group-writable socket directory.**
   With `PRAETORE_SAFETY_SOCKET_GROUP` the directory may be writable by that
@@ -573,6 +588,7 @@ record shows and what it does not, and
 | --- | --- |
 | `PRAETORE_SAFETY_SOCKET` | absolute socket path |
 | `PRAETORE_SAFETY_SOCKET_GROUP` | optional numeric gid for a `0660` socket |
+| `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` | how often the tenant lock is renewed (default 300, 1 to 86400); a failed renewal stops writing until the lock is taken again, and the ingester keeps running and retries |
 | `PRAETORE_SAFETY_TENANT_ID` | the tenant of every record |
 | `PRAETORE_SAFETY_INGEST_KEY_FILE` | the ingestion key, 64 lowercase hex characters; read with `O_NOFOLLOW`, owner-only, at most 128 bytes (a key in the environment is refused) |
 | `PRAETORE_SAFETY_MANIFEST_FILE` | the signed safety namespace manifest (`praetore policy safety-manifest`), canonical file form |
