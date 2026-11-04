@@ -26,6 +26,23 @@
   entry is checked first, in a directory only the ingester's user can
   write.
 
+- **R7: the tenant lock of `praetore-safety-ingest` can only be taken by
+  the tenant's registered role.** It is now a row lock (`FOR UPDATE
+  NOWAIT`) on the ingester's own row of `praetore.safety_ingest_tenants`,
+  on a second connection, instead of a PostgreSQL advisory lock that any
+  login could hold. Migration 0019 adds the `lock_anchor` column, the only
+  one `praetore_safety_ingest` may UPDATE, and an UPDATE policy limited to
+  the session's own registration with `WITH CHECK (false)`, so the row can
+  be locked but not changed. Another tenant's role, an unregistered role or
+  a role with no grant fails closed. The ingester checks the lock before
+  each write and renews it every `PRAETORE_SAFETY_LOCK_RENEW_SECONDS`
+  (default 300: `COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so its
+  transaction id is never older than one interval. If the lock is lost or
+  a renewal finds it taken, the ingester keeps running, writes nothing and
+  retries until it takes the lock again. Reversible with
+  `docs/rollback/0019-safety-ingest-row-lock.sql` (it sets `lock_timeout`). Stop v0.3.2 ingesters
+  before migrating: the old and new locks do not exclude each other.
+
 ## 0.3.2 - 2026-11-03
 
 Post-hoc ingestion of safety actions that executors of AI-enabled systems

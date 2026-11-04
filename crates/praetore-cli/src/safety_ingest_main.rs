@@ -35,6 +35,7 @@
 //! | `PRAETORE_SAFETY_PREVIOUS_INGEST_PINS_FILE` | optional: previous ingestion public keys (64 hex each, one per line, at most 16), the registered rotation. A chain whose last record is signed by any other key makes the ingester refuse to start |
 //! | `PRAETORE_SAFETY_SOURCE_PINS_FILE` | JSONL, one `{"source_id","public_key"}` per line |
 //! | `PRAETORE_SAFETY_DATABASE_URL` or `PRAETORE_SAFETY_DATABASE_URL_FILE` | the ingester's own database role (TLS `verify-full` unless loopback) |
+//! | `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` | how often the tenant lock's transaction is ended and the lock taken again (default 300, 1 to 86400). A renewal that finds the lock taken, or fails, stops writing until the lock is taken again; the ingester keeps running and retries |
 //! | `PRAETORE_SAFETY_QUEUE_CAPACITY` | messages buffered between the socket and the database (default 256, 1 to 4096) |
 //! | `PRAETORE_SAFETY_MAX_CLOCK_SKEW_SECONDS` | an event whose `occurred_at` differs from the ingester's clock by more than this (default 300) keeps its status and carries `clock_skew_seconds` |
 //! | `PRAETORE_SAFETY_MAX_SEQ_JUMP` | largest accepted step of `source_seq` above a chain's high-water mark (default 1000000, 1 to 2^53 - 1); a verified event further ahead is recorded as `rejected` (`seq_jump_too_large`) on `_unattributed` |
@@ -73,8 +74,8 @@ use praetore_core::{
     },
 };
 use praetore_replay_postgres::{
-    DatabaseConnector, PostgresSafetyStore, RuntimeRoleOptions, verify_safety_ingest_role_with,
-    verify_schema_current,
+    DatabaseConnector, PostgresSafetyStore, RuntimeRoleOptions, SafetyStoreError, TenantLock,
+    verify_safety_ingest_role_with, verify_schema_current,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -100,6 +101,9 @@ const MAX_SAFE_SEQ: u64 = (1 << 53) - 1;
 /// often (and when the ingester is idle or stops), so that a flood adds
 /// about one record per reason per interval.
 const COUNT_INTERVAL: Duration = Duration::from_secs(1);
+/// Default interval of the tenant lock's renewal (M97-1).
+const DEFAULT_LOCK_RENEW: Duration = Duration::from_secs(300);
+const MAX_LOCK_RENEW_SECONDS: u64 = 86_400;
 const MAX_ALLOWED_UIDS: usize = 32;
 
 fn main() {
@@ -147,6 +151,7 @@ struct Config {
     previous_ingest_pins: Vec<VerifiedPublicKey>,
     sources: SourcePins,
     database: DatabaseConnector,
+    lock_renew: Duration,
     queue_capacity: usize,
     max_seq_jump: u64,
     max_epoch_jump: u64,
@@ -304,6 +309,17 @@ fn load_config() -> Result<Config> {
     let database = DatabaseConnector::from_url(&url)
         .map_err(|error| format!("PRAETORE_SAFETY_DATABASE_URL: {error}"))?
         .connect_timeout(Duration::from_secs(3));
+    let lock_renew = match var("PRAETORE_SAFETY_LOCK_RENEW_SECONDS") {
+        None => DEFAULT_LOCK_RENEW,
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (1..=MAX_LOCK_RENEW_SECONDS).contains(seconds))
+            .map(Duration::from_secs)
+            .ok_or(format!(
+                "PRAETORE_SAFETY_LOCK_RENEW_SECONDS must be between 1 and {MAX_LOCK_RENEW_SECONDS}"
+            ))?,
+    };
     let queue_capacity = match var("PRAETORE_SAFETY_QUEUE_CAPACITY") {
         None => DEFAULT_QUEUE_CAPACITY,
         Some(value) => value
@@ -388,6 +404,7 @@ fn load_config() -> Result<Config> {
         previous_ingest_pins,
         sources,
         database,
+        lock_renew,
         queue_capacity,
         max_seq_jump,
         max_epoch_jump,
@@ -456,6 +473,7 @@ fn build_ingestor(config: Config) -> Result<(SafetyIngestor, Runtime)> {
             socket: config.socket,
             socket_gid: config.socket_gid,
             database: config.database,
+            lock_renew: config.lock_renew,
             queue_capacity: config.queue_capacity,
             flood: config.flood,
             allowed_uids: config.allowed_uids,
@@ -479,42 +497,56 @@ struct Runtime {
     socket: PathBuf,
     socket_gid: Option<u32>,
     database: DatabaseConnector,
+    lock_renew: Duration,
     queue_capacity: usize,
     flood: FloodLimits,
     allowed_uids: Option<Vec<u32>>,
     role_options: RuntimeRoleOptions,
 }
 
-/// Connects, checks the role and the schema, takes the tenant lock and
-/// loads the chain heads.
+/// The store of the running ingester and the tenant lock that lets it
+/// write: one cannot be held without the other.
+struct LockedStore {
+    store: PostgresSafetyStore,
+    lock: TenantLock,
+}
+
+impl LockedStore {
+    /// `false` once either connection is gone (one round trip on the lock's).
+    fn is_open(&mut self) -> bool {
+        self.lock.is_held() && !self.store.client().is_closed()
+    }
+}
+
+/// Connects, checks the role and the schema, takes the tenant lock (on a
+/// second connection, migration 0019) and loads the chain heads.
 fn open_store(
     runtime: &Runtime,
     ingestor: &SafetyIngestor,
-) -> Result<(PostgresSafetyStore, Vec<SafetyRecord>)> {
+) -> Result<(LockedStore, Vec<SafetyRecord>)> {
     let mut client = runtime.database.connect()?;
     verify_safety_ingest_role_with(&mut client, &runtime.role_options)?;
     verify_schema_current(&mut client)?;
     let mut store = PostgresSafetyStore::from_client(client);
     store.check_registration(ingestor.tenant_id(), Some(ingestor.key_id()))?;
-    if !store.try_lock_tenant(ingestor.tenant_id())? {
-        // Any role of the database can take this lock (a known
-        // limitation): name the holder so the operator can stop it.
-        let holders = store
-            .tenant_lock_holders(ingestor.tenant_id())
-            .map(|holders| {
-                if holders.is_empty() {
-                    "holder not visible".to_owned()
-                } else {
-                    holders.join("; ")
-                }
-            })
-            .unwrap_or_else(|error| format!("holder unknown: {error}"));
-        return Err(format!(
-            "another session holds the lock of tenant {} ({holders}); refusing to start",
-            ingestor.tenant_id()
-        )
-        .into());
-    }
+    let lock = match TenantLock::acquire(runtime.database.connect()?, ingestor.tenant_id()) {
+        Ok(lock) => lock,
+        Err(error @ SafetyStoreError::LockBusy { .. }) => {
+            // Only this login role (or the schema owner) can hold it: name
+            // the role's other sessions so the operator can stop the holder.
+            let sessions = TenantLock::other_sessions(store.client())
+                .map(|sessions| {
+                    if sessions.is_empty() {
+                        "no other session of this role is visible".to_owned()
+                    } else {
+                        format!("other sessions of this role: {}", sessions.join("; "))
+                    }
+                })
+                .unwrap_or_else(|error| format!("sessions unknown: {error}"));
+            return Err(format!("{error} ({sessions})").into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut heads = Vec::new();
     for (chain, stored) in store.load_heads(ingestor.tenant_id(), &runtime.head_pins)? {
         if stored.key_id != ingestor.key_id() {
@@ -526,7 +558,7 @@ fn open_store(
         }
         heads.push(stored.record);
     }
-    Ok((store, heads))
+    Ok((LockedStore { store, lock }, heads))
 }
 
 /// The directory of the socket, opened without following a symbolic link
@@ -938,6 +970,7 @@ fn run() -> Result<()> {
         last_count: started,
     };
     loop {
+        worker.renew_lock_when_due();
         match receiver.recv_timeout(POLL) {
             Ok(message) => worker.handle(&message),
             // Counts are written at most once per COUNT_INTERVAL (and
@@ -1103,7 +1136,7 @@ fn read_socket(
 
 struct Worker<'a> {
     ingestor: SafetyIngestor,
-    store: Option<PostgresSafetyStore>,
+    store: Option<LockedStore>,
     runtime: &'a Runtime,
     overflow: &'a AtomicU64,
     refused: &'a AtomicU64,
@@ -1118,7 +1151,7 @@ impl Worker<'_> {
         if self.last_count.elapsed() >= COUNT_INTERVAL {
             self.flush_dropped();
         }
-        let Some(store) = self.store.as_mut() else {
+        let Some(store) = self.store.as_mut().map(|locked| &mut locked.store) else {
             self.storage_dropped += 1;
             self.reconnect();
             return;
@@ -1165,10 +1198,18 @@ impl Worker<'_> {
     }
 
     fn persist(&mut self, prepared: &PreparedRecords) -> bool {
-        let Some(store) = self.store.as_mut() else {
+        let Some(locked) = self.store.as_mut() else {
             return false;
         };
-        match store.store(self.ingestor.tenant_id(), prepared) {
+        if !locked.lock.is_held() {
+            // Without the lock another ingester may be writing: stop and
+            // take it again.
+            log("the tenant lock connection is closed; reconnecting");
+            self.store = None;
+            self.reconnect();
+            return false;
+        }
+        match locked.store.store(self.ingestor.tenant_id(), prepared) {
             Ok(()) => match self.ingestor.commit(prepared) {
                 Ok(()) => true,
                 // Stored, but not on the head this ingester holds: read the
@@ -1187,18 +1228,39 @@ impl Worker<'_> {
         }
     }
 
+    /// Renews the tenant lock once `lock_renew` has passed since it was
+    /// taken (M97-1). If the renewal fails (another session took the lock,
+    /// or the connection is gone), both connections are dropped: nothing
+    /// is written until [`Self::reconnect`] takes the lock again, and the
+    /// messages meanwhile are counted as dropped.
+    fn renew_lock_when_due(&mut self) {
+        let Some(locked) = self.store.as_mut() else {
+            return;
+        };
+        if locked.lock.renewed_at().elapsed() < self.runtime.lock_renew {
+            return;
+        }
+        if let Err(error) = locked.lock.renew() {
+            log(format!(
+                "renewing the tenant lock failed: {error}; not writing until the lock is \
+                 taken again"
+            ));
+            self.store = None;
+        }
+    }
+
     /// After a storage error: reconnect when the connection is gone, and
     /// read the heads again either way (the database is the truth).
     fn after_failure(&mut self) {
-        let closed = self
-            .store
-            .as_mut()
-            .is_none_or(|store| store.client().is_closed());
+        let closed = self.store.as_mut().is_none_or(|locked| !locked.is_open());
         if closed {
             self.store = None;
             self.reconnect();
-        } else if let Some(store) = self.store.as_mut() {
-            match store.load_heads(self.ingestor.tenant_id(), &self.runtime.head_pins) {
+        } else if let Some(locked) = self.store.as_mut() {
+            match locked
+                .store
+                .load_heads(self.ingestor.tenant_id(), &self.runtime.head_pins)
+            {
                 Ok(heads) => {
                     if let Err(error) = self.ingestor.resume_heads(
                         heads.into_values().map(|stored| stored.record),

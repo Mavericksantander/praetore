@@ -34,8 +34,8 @@ pub use observability::{
     PostgresObservabilityReader,
 };
 pub use safety::{
-    PostgresSafetyStore, SafetyChainRange, SafetyStoreError, StoredHead, read_safety_chain,
-    read_safety_chain_range,
+    PostgresSafetyStore, SafetyChainRange, SafetyStoreError, StoredHead, TenantLock,
+    read_safety_chain, read_safety_chain_range,
 };
 
 pub struct PostgresReplayGuard {

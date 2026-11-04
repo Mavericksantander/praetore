@@ -513,16 +513,47 @@ record shows and what it does not, and
 
 - Run one ingester per tenant, on the host of the executors it serves
   (transport v1 is a local Unix datagram socket). A second ingester for the
-  same tenant refuses to start (PostgreSQL advisory lock per tenant).
-- **Known limitation (until v0.3.3): any role of the database can take a
-  tenant's lock.** A PostgreSQL advisory lock needs no privilege, so a
-  session of another tenant's ingester, of the gateway or of any other login
-  can hold the lock of tenant A, and A's ingester then refuses to start (a
-  denial of service; it cannot read or write A's records). The refusal, and
-  `praetore-safety-ingest doctor`, name the holder (`pid`, login role,
-  `application_name` and start time, from `pg_locks` and
-  `pg_stat_activity`). Stop it with `SELECT pg_terminate_backend(<pid>)` as
-  a role allowed to, and find out why that role took the lock.
+  same tenant refuses to start: the tenant lock (migration 0019) is a row
+  lock (`SELECT ... FOR UPDATE NOWAIT`) on the ingester's own registration
+  in `praetore.safety_ingest_tenants`, held by an open transaction on a
+  second connection. Row-level security shows that row only to the login
+  role registered for the tenant, so the role of another tenant, the
+  gateway's role or any other login cannot take it; they fail closed with
+  "cannot lock tenant". The table owner is not subject to that policy and
+  can still lock or change the row. The ingester checks the lock connection
+  before each write and reconnects (taking the lock again) when it is gone.
+  The lock is renewed every `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` (default
+  300): the ingester commits the lock's transaction and takes the lock again
+  in a new one (`COMMIT; BEGIN; SELECT ... FOR UPDATE NOWAIT`), so the
+  transaction id it holds (which holds back VACUUM and freezing) is never
+  older than one interval. Keep the interval at 300 s or less: with a
+  higher value (up to the allowed 86400 s) the ingester keeps one
+  transaction id open for that whole time, which holds back VACUUM and
+  freezing in the whole database just as long. Watch it with `age(backend_xid)` of the
+  ingester's `idle in transaction` session in `pg_stat_activity`. The lock
+  session sets `idle_in_transaction_session_timeout = 0` for itself; keep a
+  server `transaction_timeout` (PostgreSQL 17) above the interval. A pooler
+  in transaction mode between the ingester and PostgreSQL would break the
+  lock, so connect directly. Each ingester uses two connections.
+- **If the lock is lost** (a renewal finds it taken, or its connection is
+  gone), the ingester keeps running: it stops writing, counts the messages
+  it receives meanwhile as dropped (a signed loss record once it writes
+  again), and retries taking the lock, logging each attempt. Executors are
+  not affected. The lock excludes a second ingester; the integrity of a
+  chain does not depend on it (the insert trigger refuses a record that
+  does not extend its chain, and the ingester then reads the heads again).
+- When the lock is busy, the refusal and `praetore-safety-ingest doctor`
+  name the role and list its other sessions (`pid`, `application_name`,
+  start time from `pg_stat_activity`): one of them holds the lock (or the
+  schema owner does). Before v0.3.3 the lock was a PostgreSQL advisory lock
+  that any role could take (R7); stop every v0.3.2 ingester before
+  applying 0019, since the two locks do not exclude each other. To undo
+  0019 alone, the schema owner runs
+  [`docs/rollback/0019-safety-ingest-row-lock.sql`](rollback/0019-safety-ingest-row-lock.sql)
+  with every ingester stopped (no record is touched; it sets
+  `lock_timeout = '5s'`, so it fails instead of waiting behind a running
+  ingester); the test
+  `postgres_safety_row_lock_migration_rolls_back_and_applies_again` runs it.
 - Give it its own OS user. The socket directory must be a directory (not a
   symbolic link), owned by that user, and not writable by group or others
   unless it has the sticky bit (`chmod 0700`, or `chmod 1770` with
@@ -560,6 +591,7 @@ record shows and what it does not, and
 | --- | --- |
 | `PRAETORE_SAFETY_SOCKET` | absolute socket path |
 | `PRAETORE_SAFETY_SOCKET_GROUP` | optional numeric gid for a `0660` socket |
+| `PRAETORE_SAFETY_LOCK_RENEW_SECONDS` | how often the tenant lock is renewed (default 300, 1 to 86400); a failed renewal stops writing until the lock is taken again, and the ingester keeps running and retries. Recommended: 300 or less, since a transaction id stays open for up to one interval (with 86400, a whole day) and holds back VACUUM and freezing that long |
 | `PRAETORE_SAFETY_TENANT_ID` | the tenant of every record |
 | `PRAETORE_SAFETY_INGEST_KEY_FILE` | the ingestion key, 64 lowercase hex characters; read with `O_NOFOLLOW`, owner-only, at most 128 bytes (a key in the environment is refused) |
 | `PRAETORE_SAFETY_MANIFEST_FILE` | the signed safety namespace manifest (`praetore policy safety-manifest`), canonical file form |
@@ -721,7 +753,7 @@ current one nor listed there makes the ingester refuse to start: a key
 change must be registered, and a row signed by an unknown key is never
 continued.
 
-### Rolling back the safety-record storage (0016 to 0018)
+### Rolling back the safety-record storage (0016 to 0019)
 
 The migration runner is forward-only. To remove the G1 storage (for example
 to downgrade to a release without it, or to start over after an unreleased
@@ -742,7 +774,7 @@ policies), `praetore.safety_ingest_tenants`, `praetore.safety_audit_tenants`
 and the two trigger functions, revokes what 0016 and 0018 granted
 `praetore_safety_ingest` and `praetore_safety_audit` in this database, and
 deletes the `0016_safety_records`, `0017_safety_records_followups` and
-`0018_safety_audit_and_role_oids` rows of `praetore.schema_migrations`. It destroys every safety record, so without
+`0018_safety_audit_and_role_oids` and `0019_safety_ingest_row_lock` rows of `praetore.schema_migrations`. It destroys every safety record, so without
 the confirmation setting it refuses to run while the table holds any. The
 table has `FORCE ROW LEVEL SECURITY`, so an owner without superuser or
 `BYPASSRLS` would see no rows; the script lifts it first, inside the same

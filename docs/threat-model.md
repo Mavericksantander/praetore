@@ -344,7 +344,7 @@ What it does not show:
   can fill the unattributed chain with `rejected` records.
 
 Row-level security uses the same `tenant_isolation` policy as the journal.
-One ingester serves one tenant (advisory lock per tenant). Like the
+One ingester serves one tenant (a row lock on its own registration, that only the registered role can take, migration 0019). Like the
 gateway, it sets the tenant context itself: RLS keeps each transaction to
 the tenant it names, but does not stop a compromised ingester from naming
 another tenant.

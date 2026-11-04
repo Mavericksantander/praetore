@@ -975,7 +975,8 @@ fn can_write_safety_records(
 /// For the safety ingester's role: a member of `praetore_runtime`, or the
 /// `praetore` tables on which it holds a privilege beyond SELECT on
 /// `schema_migrations` and `safety_ingest_tenants` (whose row-level
-/// security shows only its own registration) and SELECT and INSERT on
+/// security shows only its own registration; plus UPDATE of its
+/// `lock_anchor` column, for the tenant row lock of 0019) and SELECT and INSERT on
 /// `safety_records`, column privileges included (up to ten).
 fn safety_ingest_excess(
     transaction: &mut postgres::Transaction<'_>,
@@ -1003,7 +1004,14 @@ fn safety_ingest_excess(
                            WHEN 'safety_ingest_tenants' THEN pg_catalog.has_table_privilege($1, c.oid, \
                                'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
                                 OR pg_catalog.has_any_column_privilege($1, c.oid, \
-                                    'INSERT, UPDATE, REFERENCES') \
+                                    'INSERT, REFERENCES') \
+                                OR EXISTS (SELECT 1 FROM pg_catalog.pg_attribute att \
+                                    WHERE att.attrelid OPERATOR(pg_catalog.=) c.oid \
+                                      AND att.attnum OPERATOR(pg_catalog.>) 0 \
+                                      AND NOT att.attisdropped \
+                                      AND att.attname OPERATOR(pg_catalog.<>) 'lock_anchor' \
+                                      AND pg_catalog.has_column_privilege($1, c.oid, att.attnum, \
+                                          'UPDATE')) \
                            ELSE pg_catalog.has_table_privilege($1, c.oid, \
                                     'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
                                 OR pg_catalog.has_any_column_privilege($1, c.oid, \
@@ -1306,7 +1314,8 @@ fn unsafe_runtime_setting(
 /// `human_approval_expirations`; SELECT on `storage_records` (0015);
 /// `praetore_safety_ingest`'s grants from 0016 (schema USAGE, SELECT on
 /// `schema_migrations`, SELECT and INSERT on `safety_records`, SELECT on
-/// `safety_ingest_tenants` (0017)); `praetore_safety_audit`'s from 0018
+/// `safety_ingest_tenants` (0017), UPDATE of `safety_ingest_tenants.lock_anchor`
+/// (0019)); `praetore_safety_audit`'s from 0018
 /// (schema USAGE, SELECT on `schema_migrations`, `safety_records` and
 /// `safety_audit_tenants`);
 /// UPDATE of `execution_status`,
@@ -1370,11 +1379,12 @@ fn unexpected_grants(
              ('c', 'execution_journal', 'output_json', 'UPDATE'), \
              ('c', 'execution_journal', 'not_dispatched_reason', 'UPDATE'), \
              ('c', 'execution_journal', 'updated_at', 'UPDATE')), \
-         ingest_allowed(kind, rel, privilege) AS (VALUES \
-             ('n', '', 'USAGE'), \
-             ('r', 'schema_migrations', 'SELECT'), \
-             ('r', 'safety_records', 'SELECT'), ('r', 'safety_records', 'INSERT'), \
-             ('r', 'safety_ingest_tenants', 'SELECT')), \
+         ingest_allowed(kind, rel, col, privilege) AS (VALUES \
+             ('n', '', '', 'USAGE'), \
+             ('r', 'schema_migrations', '', 'SELECT'), \
+             ('r', 'safety_records', '', 'SELECT'), ('r', 'safety_records', '', 'INSERT'), \
+             ('r', 'safety_ingest_tenants', '', 'SELECT'), \
+             ('c', 'safety_ingest_tenants', 'lock_anchor', 'UPDATE')), \
          audit_allowed(kind, rel, privilege) AS (VALUES \
              ('n', '', 'USAGE'), \
              ('r', 'schema_migrations', 'SELECT'), \
@@ -1416,7 +1426,7 @@ fn unexpected_grants(
                      AND EXISTS (SELECT 1 FROM ingest_allowed ia \
                                  WHERE ia.kind OPERATOR(pg_catalog.=) e.kind \
                                    AND ia.rel OPERATOR(pg_catalog.=) e.rel \
-                                   AND e.col OPERATOR(pg_catalog.=) '' \
+                                   AND ia.col OPERATOR(pg_catalog.=) e.col \
                                    AND ia.privilege OPERATOR(pg_catalog.=) e.privilege)) \
                  OR (grantee.rolname OPERATOR(pg_catalog.=) 'praetore_safety_audit' \
                      AND NOT e.grantable \
