@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **L95-1: socket mode and group without following symbolic links.**
+  `praetore-safety-ingest` opens the socket directory with `O_DIRECTORY |
+  O_NOFOLLOW`, checks owner and mode on that descriptor, creates and opens
+  its private bind directory relative to it, sets the socket's group with
+  `fchownat(AT_SYMLINK_NOFOLLOW)` and its mode relative to the private
+  directory's descriptor after checking the entry is its own socket, and
+  renames it with `renameat`. A socket directory writable by group or others
+  without the sticky bit is now refused, also with
+  `PRAETORE_SAFETY_SOCKET_GROUP` (before, a group-writable one was
+  accepted): use `chmod 1770` or `0700`. On Linux the mode is set with
+  `fchmodat` without `AT_SYMLINK_NOFOLLOW`, which the kernel interface used
+  does not offer; the entry is checked first, in a directory only the
+  ingester's user can write.
+
 ## 0.3.2 - 2026-11-03
 
 Post-hoc ingestion of safety actions that executors of AI-enabled systems
