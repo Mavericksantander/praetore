@@ -984,9 +984,10 @@ The signature proves that `SHA256SUMS` was produced by this repository's
 (check the signed tag with `git verify-tag`). The macOS binaries are not
 signed or notarized.
 
-CI runs the same check with `scripts/verify-release-signature.sh`. On a tag it
-checks the release it just published, and a failure fails the run, although
-that release is already published. On every other run it checks the latest
-published release, with retries, and a failure is only a warning. It runs in
-the workflow it verifies, so it does not replace a check made outside this
-repository's CI.
+CI runs the same check with `scripts/verify-release-signature.sh`, with
+retries. On a tag it checks the release it just published, and any failure fails
+the run, although that release is already published. On every other run it
+checks the latest published release: a refused signature fails the run, and a
+check that could not be completed, such as after a network failure, is only a
+warning. It runs in the workflow it verifies, so it does not replace a check
+made outside this repository's CI.
