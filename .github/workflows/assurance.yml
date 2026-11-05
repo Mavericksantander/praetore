@@ -498,7 +498,7 @@ jobs:
       - run: cargo cyclonedx --manifest-path crates/praetore-safety-client/Cargo.toml --format json --all
       - run: cargo cyclonedx --manifest-path fuzz/Cargo.toml --format json --all
       - run: find crates fuzz -name '*.cdx.json' -print
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cyclonedx-sbom
           path: |
@@ -562,7 +562,7 @@ jobs:
           cd mcp-assets
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
           cat "${name}.tar.gz.sha256"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mcp-${{ matrix.target }}
           path: |
@@ -624,7 +624,7 @@ jobs:
             echo "error: a changed SHA256SUMS verified"
             exit 1
           fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: release-assets-${{ github.ref_name }}
@@ -670,7 +670,7 @@ jobs:
         run: |
           cosign sign-blob --yes --bundle release-assets/SHA256SUMS.sigstore.json \
             release-assets/SHA256SUMS
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-signature-${{ github.ref_name }}
           path: release-assets/SHA256SUMS.sigstore.json
