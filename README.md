@@ -5,8 +5,8 @@
 [![Python](https://img.shields.io/badge/Python-bindings-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-replay%20adapter-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-**Deterministic authorization and governance primitives for autonomous and
-AI-enabled systems.**
+**Deterministic authorization and governance primitives for AI-enabled
+systems.**
 
 PRÆTORE Core is a Rust library for evaluating signed authorization requests
 against declarative policy and delegated authority. It keeps identity,
@@ -362,7 +362,7 @@ From the workspace `Cargo.toml` and each crate's `Cargo.toml`:
 
 | Crate | Purpose |
 | --- | --- |
-| [`praetore-core`](crates/praetore-core) | Authorization and governance core for autonomous agents. |
+| [`praetore-core`](crates/praetore-core) | Authorization and governance core for AI agents. |
 | [`praetore-receipt`](crates/praetore-receipt) | Signed gateway receipts and execution attestations, without server dependencies. |
 | [`praetore-verify`](crates/praetore-verify) | Offline evidence verifier CLI (`praetore-verify`). |
 | [`praetore-python`](crates/praetore-python) | Verify-only Python bindings (PyO3 extension `_core`). |
@@ -644,10 +644,10 @@ The following are **open pull requests, not merged** and not available on
   sandbox.
 * An accreditation, or a guarantee that a deployment is protected.
 
-**Application domains.** Beyond AI coding agents, defense and autonomy is an
-application domain for deterministic governance: non-lethal autonomous
-systems whose decisions are governed by policy and leave auditable evidence.
-This describes a direction, not a current capability or engagement.
+**Application domains.** Beyond AI coding agents, AI-enabled systems are an
+application domain for deterministic governance: systems whose decisions are
+governed by policy and leave auditable evidence. This describes a direction,
+not a current capability or engagement.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain
@@ -680,6 +680,7 @@ is not a production deployment or an external-agent integration.
 * [Policy language and evaluation semantics](docs/policy-language.md)
 * [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
 * [Threat model and residual risks](docs/threat-model.md)
+* [Limitations and responsible use](docs/limitations-and-responsible-use.md)
 * [Mandatory tool gateway integration pattern](docs/tool-gateway-integration.md)
 * [Reference gateway crate](crates/praetore-gateway)
 * [Local PostgreSQL CLI demo](crates/praetore-cli/README.md)
