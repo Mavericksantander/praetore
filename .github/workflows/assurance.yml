@@ -580,6 +580,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - run: scripts/test-release-checksums.sh
+      - run: scripts/test-verify-release-signature.sh
       - run: scripts/test-release-notes.sh
       - name: Release notes exist for the tag
         if: startsWith(github.ref, 'refs/tags/v')
@@ -724,3 +725,41 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag \
             --title "PRÆTORE $GITHUB_REF_NAME" --notes-file release-notes.md \
             "${prerelease[@]}" release-assets/*
+
+  release-signature:
+    name: Release signature (cosign verify-blob)
+    # On a tag, verifies the release this run just published. On every other
+    # run, verifies the latest published release so the check is exercised before
+    # a tag needs it (release-publish is skipped there). A refused signature
+    # always fails. A check that could not be completed (exit status 3, such as a
+    # network failure) fails on a tag and is only a warning elsewhere, so that an
+    # outage does not block unrelated changes.
+    needs: release-publish
+    if: >-
+      !cancelled() && (needs.release-publish.result == 'success' ||
+      (needs.release-publish.result == 'skipped' && !startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+        with:
+          cosign-release: v2.4.1
+      - name: Verify SHA256SUMS.sigstore.json of the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            scripts/verify-release-signature.sh "$GITHUB_REF_NAME"
+            exit
+          fi
+          status=0
+          scripts/verify-release-signature.sh --latest || status=$?
+          if [[ "$status" -eq 3 ]]; then
+            echo "::warning title=Release signature inconclusive::the check could not be completed (see the log); this does not block"
+            exit 0
+          fi
+          exit "$status"
