@@ -5,8 +5,8 @@
 [![Python](https://img.shields.io/badge/Python-bindings-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-replay%20adapter-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
-**Deterministic authorization and governance primitives for autonomous and
-AI-enabled systems.**
+**Deterministic authorization and governance primitives for AI-enabled
+systems.**
 
 PRÆTORE Core is a Rust library for evaluating signed authorization requests
 against declarative policy and delegated authority. It keeps identity,
@@ -644,10 +644,10 @@ The following are **open pull requests, not merged** and not available on
   sandbox.
 * An accreditation, or a guarantee that a deployment is protected.
 
-**Application domains.** Beyond AI coding agents, defense and autonomy is an
-application domain for deterministic governance: non-lethal autonomous
-systems whose decisions are governed by policy and leave auditable evidence.
-This describes a direction, not a current capability or engagement.
+**Application domains.** Beyond AI coding agents, AI-enabled systems are an
+application domain for deterministic governance: systems whose decisions are
+governed by policy and leave auditable evidence. This describes a direction,
+not a current capability or engagement.
 
 Trust anchors, key custody, freshness source, replay storage, host hardening,
 and the atomic relationship between authorization and action execution remain

@@ -1,12 +1,15 @@
 # Limitations and responsible use / Limitaciones y uso responsable
 
 PRÆTORE provides deterministic authorization and governance primitives for
-autonomous and AI-enabled systems. This page says what those primitives do not
+AI-enabled systems. This page says what those primitives do not
 do, and how to use them without overstating what they show. It is a summary:
 the [README](../README.md#limitations) and the
 [threat model](threat-model.md#guarantees-and-non-guarantees) have the details.
 
 ## Limitations
+
+Readiness for real deployments has not been established. PRÆTORE is under
+active development and has not been independently audited or accredited.
 
 **What is decided.**
 
@@ -26,17 +29,22 @@ the [README](../README.md#limitations) and the
 
 **What is recorded.**
 
-- A receipt shows that a decision was recorded and signed. It does not show
-  that the decision was right, and it does not independently confirm that the
+- A receipt verified against a pinned attester key shows that the holder of
+  that key recorded a decision. It does not show that the key or the host were
+  not compromised, or that the decision was right, and it does not independently confirm that the
   action ran: `executed` and `confirmed` record what the dispatcher adapter
   reported.
-- A third party cannot prove that no receipt was deleted from the journal
-  unless the journal's head was anchored outside the producer's control.
+- A third party cannot prove that no receipt was deleted from the journal.
+  Nothing signs or publishes the journal's sequence or head. External anchoring
+  of the head is only a proposal, and an anchor would cover only up to that
+  head.
 - Safety actions are outside the authorization path. The executor of an
   AI-enabled system runs them without waiting for PRÆTORE, which can only
   record them afterwards. That record does not approve or stop anything, and
-  under a flood messages can be dropped: they then show up as signed counts or
-  sequence gaps, not as individual records.
+  it does not show that every action was reported: an executor can stay silent,
+  and an event the client drops is visible only as a gap once a later event of
+  that source arrives, so the last events before a source stops are invisible.
+  Messages dropped inside the ingester appear as signed counts.
 
 **What has been tested.**
 
@@ -44,9 +52,11 @@ the [README](../README.md#limitations) and the
   bugs.
 - Not every flow has been exercised on every platform; see
   [Not verified](../README.md#not-verified).
-- Passing CI or a past review is not an assessment of a deployment. Trust
-  anchors, key custody, the time source, replay storage and host hardening
-  remain the deployment's responsibility.
+- Passing CI is not an assessment of a deployment, and earlier reviews did not
+  cover the current candidate or deployment-specific adapters. Trust anchors,
+  key custody, the time source, replay storage, host hardening and the atomic
+  relationship between authorization and action execution remain the
+  deployment's responsibility.
 
 ## Responsible use
 
@@ -63,7 +73,7 @@ the [README](../README.md#limitations) and the
 - **Describe the evidence accurately.** Do not present a receipt, a verifier
   result or this project's documents as a statement that an AI-enabled system
   is correct, compliant or free of risk.
-- **Tell people what applies to them.** Laws and duties on AI, on automated
+- **Check what applies to you.** Laws and duties on AI, on automated
   decisions and on the data in a journal depend on the deployment; PRÆTORE does
   not determine or meet them for you.
 
