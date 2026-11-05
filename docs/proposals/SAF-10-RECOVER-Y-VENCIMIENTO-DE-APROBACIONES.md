@@ -3,7 +3,7 @@
 Estado: **propuesta, solo documento.** No contiene código de producción. Base: `main` local en `3db7b5e`; `origin/main` está en `a797bea`, 22 commits adelante, y en esa revisión tampoco hay un evento de vencimiento persistido (ver §2).
 Nombre: sigue la convención `SAF-NN-…` de `SAF-09-safety-actions-break-glass.md`. El número SAF-10 es provisional y lo confirma el CTO.
 Contexto: nota interna de investigación `org/praetore/research/10-semantica-decisiones-recover-approval.md`, del 29-oct-2026 (workspace PRÆTOR, fuera del repo).
-Alcance: semántica de decisión y evidencia. Para autonomía física aplica solo al nivel de misión y modo (no al lazo rápido) y solo a la plataforma no armada.
+Alcance: semántica de decisión y evidencia. Para AI-enabled systems aplica solo al nivel de misión y modo (no al lazo rápido).
 
 ## 1. Decisiones
 
