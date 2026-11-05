@@ -681,3 +681,33 @@ jobs:
           gh release create "$GITHUB_REF_NAME" --verify-tag \
             --title "PRÆTORE $GITHUB_REF_NAME" --notes-file release-notes.md \
             "${prerelease[@]}" release-assets/*
+
+  release-signature:
+    name: Release signature (cosign verify-blob)
+    # On a tag, verifies the release this run just published. On every other
+    # run, verifies the latest published release, so the check is exercised
+    # before a tag needs it (release-publish is skipped there).
+    needs: release-publish
+    if: >-
+      !cancelled() && (needs.release-publish.result == 'success' ||
+      (needs.release-publish.result == 'skipped' && !startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+      - name: Verify SHA256SUMS.sigstore.json of the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+          fi
+          scripts/verify-release-signature.sh "$tag"

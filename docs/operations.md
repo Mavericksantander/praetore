@@ -983,3 +983,9 @@ The signature proves that `SHA256SUMS` was produced by this repository's
 (`--certificate-github-workflow-sha`); it does not prove who pushed the tag
 (check the signed tag with `git verify-tag`). The macOS binaries are not
 signed or notarized.
+
+CI runs the same check with `scripts/verify-release-signature.sh`: on a tag,
+against the release it just published; on every other run, against the latest
+published release, so that a change that breaks verification shows up before
+the next tag. It runs in the workflow it verifies, so it does not replace a
+check made outside this repository's CI.
