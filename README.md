@@ -362,7 +362,7 @@ From the workspace `Cargo.toml` and each crate's `Cargo.toml`:
 
 | Crate | Purpose |
 | --- | --- |
-| [`praetore-core`](crates/praetore-core) | Authorization and governance core for autonomous agents. |
+| [`praetore-core`](crates/praetore-core) | Authorization and governance core for AI agents. |
 | [`praetore-receipt`](crates/praetore-receipt) | Signed gateway receipts and execution attestations, without server dependencies. |
 | [`praetore-verify`](crates/praetore-verify) | Offline evidence verifier CLI (`praetore-verify`). |
 | [`praetore-python`](crates/praetore-python) | Verify-only Python bindings (PyO3 extension `_core`). |

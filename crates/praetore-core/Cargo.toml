@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-description = "Trusted authorization and governance core for autonomous agents."
+description = "Trusted authorization and governance core for AI agents."
 
 [lib]
 name = "praetore_core"
