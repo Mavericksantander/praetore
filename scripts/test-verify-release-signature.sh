@@ -19,7 +19,7 @@ case "$*" in
     [[ "$*" == *commits/refs/tags/v9.9.9* ]] || { echo "bad ref: $*" >&2; exit 1; }
     echo 1111111111111111111111111111111111111111 ;;
   "release download"*)
-    dir=${*##*--dir }; dir=${dir%% *}
+    args="$*"; dir=${args##*--dir }; dir=${dir%% *}
     echo asset > "$dir/asset"
     (cd "$dir" && { sha256sum asset 2>/dev/null || shasum -a 256 asset; } > SHA256SUMS)
     [[ "${STUB_GH:-}" == bad_checksum ]] && echo changed > "$dir/asset"
