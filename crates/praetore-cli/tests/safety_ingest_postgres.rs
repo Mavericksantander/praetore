@@ -936,9 +936,29 @@ fn dropped_by_reason(scratch: &Scratch) -> BTreeMap<String, i64> {
     counts
 }
 
+/// Sends `bytes` until the socket takes them. Unlike an executor, which never
+/// retries, a test phase can wait out a full socket buffer to know exactly
+/// how many messages it delivered.
+fn deliver(client: &SafetyClient, bytes: &[u8], deadline: Instant) {
+    while let Err(error) = send(client, bytes) {
+        assert!(
+            matches!(error, SendError::QueueFull) && Instant::now() < deadline,
+            "not delivered: {error}"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The flood has two phases, so that neither result depends on how the
+/// ingester's threads and the sender happen to interleave. In one flood,
+/// whatever arrives while the queue is full is dropped before it can be
+/// verified, so how many events reach the rate limiter is a race: the queue
+/// can stay full of garbage until the end, leaving only `queue_overflow` and
+/// `rejected_suppressed` (seen in CI on a slow runner).
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_safety_ingest_flood_is_bounded_and_counted() {
+    const PHASE_LIMIT: Duration = Duration::from_secs(30);
     let scratch = Scratch::create();
     let files = Files::new();
     let ingester = Ingester::start(
@@ -952,6 +972,42 @@ fn postgres_safety_ingest_flood_is_bounded_and_counted() {
         ],
     );
     let client = SafetyClient::new(files.socket()).unwrap();
+    let started = Instant::now();
+    // Wait until every message the ingester received is accounted for:
+    // stored as a record, or in a signed count. Every record but a loss
+    // stands for one message: a replay of an event the queue dropped
+    // arrives after the chain moved on and is recorded as `late`.
+    let accounted = |scratch: &Scratch| {
+        let records: i64 = scratch
+            .admin()
+            .query_one(
+                "SELECT count(*) FROM praetore.safety_records WHERE status <> 'loss'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        records + dropped_by_reason(scratch).values().sum::<i64>()
+    };
+    let wait_for_accounting = |sent: i64, deadline: Instant| {
+        while accounted(&scratch) < sent {
+            assert!(
+                Instant::now() < deadline,
+                "{} of {sent} messages accounted for: {:?}\n{}",
+                accounted(&scratch),
+                dropped_by_reason(&scratch),
+                ingester.log()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    // Phase 1, the queue overflows. The worker blocks on its first write, so
+    // it holds one message and the queue the next 256, and nothing else fits.
+    let mut blocker_connection = scratch.admin();
+    let mut blocker = blocker_connection.transaction().unwrap();
+    blocker
+        .batch_execute("LOCK TABLE praetore.safety_records IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
     // A flood: garbage, events of one source and replays of its first
     // event. Every send returns at once (send() asserts the bound), and a
     // full socket buffer or queue only drops: the executor never waits.
@@ -971,45 +1027,39 @@ fn postgres_safety_ingest_flood_is_bounded_and_counted() {
     }
     let client_dropped = (garbage + events + replays) as i64 - sent;
     assert_eq!(client_dropped as u64, client.dropped());
-    // Wait until every message the ingester received is accounted for:
-    // stored as a record, or in a signed count. Every record but a loss
-    // stands for one message: a replay of an event the queue dropped
-    // arrives after the chain moved on and is recorded as `late`.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let accounted = |scratch: &Scratch| {
-        let records: i64 = scratch
-            .admin()
-            .query_one(
-                "SELECT count(*) FROM praetore.safety_records WHERE status <> 'loss'",
-                &[],
-            )
-            .unwrap()
-            .get(0);
-        records + dropped_by_reason(scratch).values().sum::<i64>()
-    };
-    while accounted(&scratch) < sent {
-        assert!(
-            Instant::now() < deadline,
-            "{} of {sent} messages accounted for: {:?}\n{}",
-            accounted(&scratch),
-            dropped_by_reason(&scratch),
-            ingester.log()
-        );
-        thread::sleep(Duration::from_millis(100));
+    // The sends above may all have outrun the reader into a full socket
+    // buffer. These are all delivered: more than the worker, the queue and
+    // the socket buffer hold, so the reader has found the queue full.
+    let delivered_garbage = 2000;
+    let deadline = Instant::now() + PHASE_LIMIT;
+    for _ in 0..delivered_garbage {
+        deliver(&client, b"garbage", deadline);
     }
+    sent += delivered_garbage;
+    blocker.rollback().unwrap();
+    wait_for_accounting(sent, Instant::now() + PHASE_LIMIT);
+
+    // Phase 2, the rate limit. The queue is empty and these fit in it, so
+    // all of them reach the limiter, and more of them than it can admit:
+    // PHASE_LIMIT gives at most 10 + 30 tokens.
+    let deadline = Instant::now() + PHASE_LIMIT;
+    let limited_events = 64;
+    for seq in 1..=limited_events {
+        deliver(
+            &client,
+            &event(events + seq, "safety:halt").to_wire().unwrap(),
+            deadline,
+        );
+    }
+    sent += limited_events as i64;
+    wait_for_accounting(sent, deadline);
+
     let log = ingester.stop();
     assert_eq!(accounted(&scratch), sent, "{log}");
-    // Bounded: a few seconds of the rate limits, plus about one count
-    // record per reason per second.
-    let total: i64 = scratch
-        .admin()
-        .query_one("SELECT count(*) FROM praetore.safety_records", &[])
-        .unwrap()
-        .get(0);
-    assert!(total < 100, "{total} records for {sent} messages");
     // Individual records stay within the rate limits (bursts of 5 and 10,
-    // one per second after that); the rest is in signed counts, including
-    // what the full queue dropped.
+    // one per second after that), however long this run took; the rest is in
+    // signed counts.
+    let seconds = started.elapsed().as_secs() as i64 + 1;
     let dropped = dropped_by_reason(&scratch);
     let rows = |status: &str| -> i64 {
         scratch
@@ -1022,18 +1072,30 @@ fn postgres_safety_ingest_flood_is_bounded_and_counted() {
             .get(0)
     };
     assert!(
-        rows("rejected") <= 5 + 30,
-        "{} rejected records",
+        rows("rejected") <= 5 + seconds,
+        "{} rejected records in {seconds} s",
         rows("rejected")
     );
     assert!(
-        rows("accepted") <= 10 + 30,
-        "{} accepted records",
+        rows("accepted") <= 10 + seconds,
+        "{} accepted records in {seconds} s",
         rows("accepted")
     );
-    for reason in ["rejected_suppressed", "rate_limited"] {
+    for reason in ["queue_overflow", "rejected_suppressed", "rate_limited"] {
         assert!(dropped.get(reason).copied().unwrap_or(0) > 0, "{dropped:?}");
     }
+    // Bounded: those records, at most one gap record per accepted event, and
+    // about one count record per reason per second.
+    let total: i64 = scratch
+        .admin()
+        .query_one("SELECT count(*) FROM praetore.safety_records", &[])
+        .unwrap()
+        .get(0);
+    let bound = (5 + seconds) + 2 * (10 + seconds) + 3 * (seconds + 2);
+    assert!(
+        total <= bound,
+        "{total} records for {sent} messages in {seconds} s (at most {bound})"
+    );
     // Both chains verify.
     for chain in ["executor-1", "_unattributed"] {
         let out = files.path(&format!("flood-{chain}.jsonl"));
