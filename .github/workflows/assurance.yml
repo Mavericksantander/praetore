@@ -568,6 +568,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: scripts/test-release-checksums.sh
+      - run: scripts/test-verify-release-signature.sh
       - run: scripts/test-release-notes.sh
       - name: Release notes exist for the tag
         if: startsWith(github.ref, 'refs/tags/v')
@@ -684,9 +685,11 @@ jobs:
 
   release-signature:
     name: Release signature (cosign verify-blob)
-    # On a tag, verifies the release this run just published. On every other
-    # run, verifies the latest published release, so the check is exercised
-    # before a tag needs it (release-publish is skipped there).
+    # On a tag, verifies the release this run just published, and blocks. On
+    # every other run, verifies the latest published release so the check is
+    # exercised before a tag needs it (release-publish is skipped there); a
+    # failure is only a warning, so that an outage or a past release does not
+    # block unrelated changes.
     needs: release-publish
     if: >-
       !cancelled() && (needs.release-publish.result == 'success' ||
@@ -706,8 +709,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName)
+            scripts/verify-release-signature.sh "$GITHUB_REF_NAME"
+            exit
           fi
-          scripts/verify-release-signature.sh "$tag"
+          status=0
+          scripts/verify-release-signature.sh --latest || status=$?
+          case "$status" in
+            0) ;;
+            3) echo "::warning title=Release signature inconclusive::the check could not be completed (see the log); this does not block" ;;
+            *) echo "::warning title=Release signature refused::verification of the latest published release FAILED (see the log); investigate. This does not block a PR, and blocks on a tag" ;;
+          esac
