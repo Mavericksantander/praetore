@@ -43,7 +43,7 @@ absence of defects.
 | The safety ingester's role is separate from the gateway's, and `safety_records` is append-only under tenant RLS | `verify_safety_ingest_role_with`, `verify_runtime_role`, migration 0016 triggers and policy | `g1_safety::postgres_safety_records_are_chained_append_only_and_tenant_isolated`, `g1_safety::postgres_safety_ingest_role_is_separate_from_the_runtime_role` | `replay-postgres` |
 | Rust tests, lint, format, patch hygiene | workspace CI workflow | workspace test suite; Clippy `-D warnings`; workspace and fuzz rustfmt; `git diff --check` | `rust` |
 | Software inventory | CycloneDX Cargo integration | SBOMs for all workspace packages and standalone fuzz package uploaded as CI artifacts | `sbom` |
-| Release binary integrity | verifier and `praetore-mcp` (Linux x86_64, macOS arm64/x86_64) build and checksum job on every run; artifact kept on tags | `SHA256SUMS` over the three `praetore-mcp` archives and `praetore-verify`; `scripts/test-release-checksums.sh`; Sigstore keyless signature `SHA256SUMS.sigstore.json` and GitHub Release on tags | `mcp-binaries`, `release-integrity`, `release-publish` |
+| Release binary integrity | verifier and `praetore-mcp` (Linux x86_64, macOS arm64/x86_64) build and checksum job on every run; artifact kept on tags | `SHA256SUMS` over the three `praetore-mcp` archives and `praetore-verify`; `scripts/test-release-checksums.sh`; Sigstore keyless signature `SHA256SUMS.sigstore.json` and GitHub Release on tags | `mcp-binaries`, `release-integrity`, `release-sign`, `release-publish` |
 
 ## Scope limitations
 
