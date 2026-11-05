@@ -51,14 +51,14 @@ jobs:
       # libFuzzer writes new inputs only to the first one.
       CORPUS_DIR: fuzz/corpus-cache/path_prefix
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
       - run: cargo +nightly install cargo-fuzz --locked
       - run: cargo +nightly check --manifest-path fuzz/Cargo.toml --locked
       - name: Restore corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CORPUS_DIR }}
           key: fuzz-corpus-path_prefix-${{ github.run_id }}-${{ github.run_attempt }}
@@ -101,13 +101,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Save corpus
         if: ${{ !cancelled() }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ env.CORPUS_DIR }}
           key: fuzz-corpus-path_prefix-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fuzz-crash-path_prefix-${{ github.run_id }}
           path: |
