@@ -62,7 +62,7 @@ case "${STUB_COSIGN:-}" in
   refuses) echo "Error: invalid signature when validating ASN.1 encoded signature" >&2; exit 1 ;;
 esac
 if [[ "$blob" != SHA256SUMS ]]; then
-  echo "Error: invalid signature when validating ASN.1 encoded signature" >&2; exit 1
+  echo "Error: error verifying bundle: matching bundle to payload: bundle=x payload=y" >&2; exit 1
 fi
 if [[ "$identity" != *refs/tags/* || "$issuer" != *githubusercontent* ]]; then
   echo "Error: none of the expected identities matched what was in the certificate" >&2; exit 1

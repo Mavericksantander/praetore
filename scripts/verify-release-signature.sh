@@ -119,7 +119,7 @@ must_verify SHA256SUMS "$identity" "$issuer" "$repo" "$commit"
 
 cp SHA256SUMS tampered
 echo "0000  extra" >> tampered
-must_refuse "changed SHA256SUMS" "invalid signature when validating" \
+must_refuse "changed SHA256SUMS" "matching bundle to payload" \
   tampered "$identity" "$issuer" "$repo" "$commit"
 must_refuse "another identity" "none of the expected identities matched" \
   SHA256SUMS "${workflow}@refs/heads/main" "$issuer" "$repo" "$commit"
