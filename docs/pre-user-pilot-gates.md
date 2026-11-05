@@ -77,6 +77,4 @@ For each target deployment, retain evidence for every applicable item:
 Do not enable authorization if any required pin is missing, expired, or
 mismatched; the policy digest is not approved; replay storage is unavailable,
 full, inconsistent, or rolled back; the clock is unhealthy; evidence cannot be
-verified; or the application would fall back to Development mode. Do not treat
-a green CI run, this checklist, or the independent code review as a military
-certification or accreditation.
+verified; or the application would fall back to Development mode.
