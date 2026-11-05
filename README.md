@@ -680,6 +680,7 @@ is not a production deployment or an external-agent integration.
 * [Policy language and evaluation semantics](docs/policy-language.md)
 * [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
 * [Threat model and residual risks](docs/threat-model.md)
+* [Limitations and responsible use](docs/limitations-and-responsible-use.md)
 * [Mandatory tool gateway integration pattern](docs/tool-gateway-integration.md)
 * [Reference gateway crate](crates/praetore-gateway)
 * [Local PostgreSQL CLI demo](crates/praetore-cli/README.md)
