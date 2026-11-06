@@ -23,7 +23,7 @@ path = "src/sandbox_supervisor_main.rs"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64 = "0.22"
+base64 = "0.23"
 ed25519-dalek = "2"
 hex = "0.4.3"
 hyper = { version = "1", features = ["http1", "server"] }
