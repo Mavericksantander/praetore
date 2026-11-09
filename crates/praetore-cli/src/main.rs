@@ -3468,6 +3468,93 @@ mod tests {
         }
     }
 
+    /// T2, real PostgreSQL over HTTP: `fs:delete_file` under an Allow rule
+    /// is executed by the gateway itself. The file is gone, the receipt is
+    /// `confirmed` with a signed attestation that verifies, the journal row
+    /// is `allowed` / `confirmed`, and nothing else under the root or
+    /// outside it changes. Deleting the same path again is refused before
+    /// dispatch (`file_not_found`).
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t2_allow_delete_executes_in_the_gateway() {
+        let mut fx = SandboxFixture::new();
+        // Same fixture policy, with the delete rule turned into Allow.
+        let mut policy = sandbox_policy();
+        let rule = policy
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "approve-delete")
+            .unwrap();
+        rule.effect = PolicyEffect::Allow;
+        fs::write(
+            fx.directory.join(POLICY_FILE),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+        fx.policy = load_policy(&fx.directory).unwrap();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::write(fx.root.join("borrar.txt"), "x").unwrap();
+        fs::write(fx.root.join("queda.txt"), "keep").unwrap();
+        let before = fx.tree();
+        let http = HttpSandbox::start(&fx);
+
+        let response = http
+            .client
+            .post(format!("{}/v1/execute", http.base))
+            .bearer_auth(&http.agent_token)
+            .json(&fx.delete("borrar.txt"))
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.headers()["praetore-executed-by"], "gateway");
+        let receipt: praetore_gateway::GatewayReceipt = response.json().unwrap();
+        assert_eq!(
+            receipt.authorization,
+            praetore_gateway::AuthorizationStatus::Allowed
+        );
+        assert_eq!(
+            receipt.execution,
+            praetore_gateway::ExecutionStatus::Confirmed
+        );
+        assert_eq!(
+            receipt.execution_attestation.execution,
+            praetore_gateway::ExecutionStatus::Confirmed
+        );
+        assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
+        assert_eq!(receipt.output.as_ref().unwrap()["path"], "borrar.txt");
+        fx.verify(&receipt);
+        assert!(fs::symlink_metadata(fx.root.join("borrar.txt")).is_err());
+        let mut expected = before;
+        expected.remove(&fx.root.join("borrar.txt"));
+        assert_eq!(fx.tree(), expected, "only the deleted file is gone");
+        assert!(fx.outside_untouched());
+        assert_eq!(
+            fx.journal(receipt.evidence.request_id),
+            ("allowed".into(), "confirmed".into())
+        );
+        assert_eq!(fx.journal_reason(receipt.evidence.request_id), None);
+
+        // The file is gone: a second delete is refused before dispatch.
+        assert_http_refused(
+            &fx,
+            &http,
+            &fx.delete("borrar.txt"),
+            "file_not_found",
+            "allowed",
+            "delete again",
+        );
+        drop(http);
+        let counts = fx.journal_counts();
+        println!("journal counts: {counts:?}");
+        assert_eq!(
+            counts,
+            vec![
+                ("allowed".into(), "confirmed".into(), 1),
+                ("allowed".into(), "not_dispatched".into(), 1),
+            ]
+        );
+    }
+
     /// T22, real PostgreSQL over HTTP: every `..` form, including `..`
     /// alone, is refused with 403 for write and delete, and the place the
     /// path would resolve to (next to the root, or the sibling outside
@@ -3769,8 +3856,8 @@ mod tests {
         );
     }
 
-    /// Real PostgreSQL over HTTP, with the sandbox dispatcher: a delete held
-    /// for approval whose window closes is never executed. After the window
+    /// T7, real PostgreSQL over HTTP, with the sandbox dispatcher: a delete
+    /// held for approval whose window closes is never executed. After the window
     /// (at most 30 s locally, the freshness lease) the status reports
     /// `expired`, a correctly signed approval gets 410 `approval_expired`
     /// with the id of the signed expiration receipt, the dispatch gets 409
@@ -3778,7 +3865,7 @@ mod tests {
     /// `requires_approval` / `not_dispatched`. Uses the real clock.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
-    fn postgres_sandbox_http_approval_expiry_never_executes() {
+    fn postgres_sandbox_http_t7_approval_expiry_never_executes() {
         let fx = SandboxFixture::new();
         fs::write(fx.root.join("expira.txt"), "keep").unwrap();
         let http = HttpSandbox::start(&fx);

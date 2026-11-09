@@ -529,8 +529,10 @@ jobs:
             # Deterministic symlink swaps: while held, and after approval.
             tests::postgres_sandbox_symlink_swapped_in_while_held_is_refused
             tests::postgres_sandbox_symlink_swapped_in_after_approval_is_refused_at_dispatch
-            # Approval expiry with the sandbox (waits out the 30 s window).
-            tests::postgres_sandbox_http_approval_expiry_never_executes
+            # T2: delete under an Allow rule, executed by the gateway.
+            tests::postgres_sandbox_http_t2_allow_delete_executes_in_the_gateway
+            # T7: approval expiry with the sandbox (waits out the 30 s window).
+            tests::postgres_sandbox_http_t7_approval_expiry_never_executes
             # T22 to T26 over HTTP: 403 and the real destination unchanged.
             tests::postgres_sandbox_http_t22_dot_dot_escapes_are_refused_with_403
             tests::postgres_sandbox_http_t23_backslash_paths_are_refused_with_403
