@@ -1810,4 +1810,154 @@ mod tests {
                 .is_dir()
         );
     }
+
+    /// T-013 race between the gateway's preflight and the dispatch, on the
+    /// final path component. The gateway runs `preflight` when it records a
+    /// request and `dispatch` afterwards; here, while one thread keeps
+    /// swapping the regular file `f` with `f.link` (a symlink to a file
+    /// outside the root, atomic exchange), every action is preflighted and,
+    /// when the preflight passes, dispatched. A preflight that passed on the
+    /// regular file and a dispatch that then met the symlink is the window
+    /// this test exercises. After every step the outside directory must be
+    /// unchanged. Bounded by `PRAETORE_RACE_MILLIS` (default 1500 ms).
+    ///
+    /// Why a unit test and not a PostgreSQL end-to-end test: the window is
+    /// between two filesystem calls of this process, and the sandbox crate
+    /// has (on purpose) no test hook to stop inside it, so an end-to-end
+    /// test could only repeat and hope, with database latency outside the
+    /// window. The deterministic cases (a symlink swapped in while an action
+    /// is held, and after its approval) are end-to-end tests with
+    /// PostgreSQL in `praetore-cli`.
+    #[test]
+    fn race_final_component_swapped_for_outside_symlink_after_preflight_never_escapes() {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let dirs = dirs();
+        std::fs::write(dirs.outside.join("victim"), "original").unwrap();
+        std::fs::write(dirs.root.join("f"), "inside").unwrap();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        // Created after open: `open` only accepts a clean root.
+        symlink(dirs.outside.join("victim"), dirs.root.join("f.link")).unwrap();
+        let baseline = snapshot(&dirs.outside);
+        let budget = Duration::from_millis(
+            std::env::var("PRAETORE_RACE_MILLIS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1500),
+        );
+        let stop = AtomicBool::new(false);
+        let (file_path, link_path) = (dirs.root.join("f"), dirs.root.join("f.link"));
+        let is_link = |path: &Path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        };
+        let outcome = std::thread::scope(|scope| {
+            // Stops the swapper even if this thread panics, so the scope
+            // cannot wait forever.
+            struct StopOnDrop<'a>(&'a AtomicBool);
+            impl Drop for StopOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Relaxed);
+                }
+            }
+            let swapper = scope.spawn(|| {
+                let mut swaps = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    if renameat_with(CWD, &file_path, CWD, &link_path, RenameFlags::EXCHANGE)
+                        .is_ok()
+                    {
+                        swaps += 1;
+                    }
+                    // A write renamed over the symlink, or a delete removed
+                    // the file: put the missing entry back.
+                    if !is_link(&file_path) && !is_link(&link_path) {
+                        let _ = std::fs::remove_file(&link_path);
+                        symlink(dirs.outside.join("victim"), &link_path).unwrap();
+                    }
+                    for slot in [&file_path, &link_path] {
+                        if std::fs::symlink_metadata(slot).is_err() {
+                            let _ = std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(slot);
+                        }
+                    }
+                }
+                swaps
+            });
+            let guard = StopOnDrop(&stop);
+            let started = Instant::now();
+            let mut refused = std::collections::BTreeMap::<&'static str, u64>::new();
+            let (mut ok, mut raced, mut iterations, mut n) = (0u64, 0u64, 0u64, 20_000u128);
+            let mut escape = None;
+            'race: while started.elapsed() < budget && iterations < 20_000 {
+                let content = format!("inside-{iterations}");
+                for action in [write("f", &content), delete("f"), write("f", &content)] {
+                    n += 1;
+                    match d.preflight(&action) {
+                        Err(refusal) => *refused.entry(refusal.reason()).or_default() += 1,
+                        Ok(()) => match run(&d, n, &action) {
+                            Ok(_) => ok += 1,
+                            Err(_) => {
+                                raced += 1;
+                                let reason = d.not_applied_reason(key(n)).unwrap_or("unrecorded");
+                                *refused.entry(reason).or_default() += 1;
+                            }
+                        },
+                    }
+                    let now = snapshot(&dirs.outside);
+                    if now != baseline {
+                        escape = Some(format!(
+                            "iteration {iterations}: {} changed the outside directory: {:?}",
+                            action.action_type,
+                            now.iter()
+                                .map(|(name, (_, content))| {
+                                    format!("{name}={}", String::from_utf8_lossy(content))
+                                })
+                                .collect::<Vec<_>>()
+                        ));
+                        break 'race;
+                    }
+                }
+                iterations += 1;
+            }
+            drop(guard);
+            (
+                swapper.join().unwrap(),
+                ok,
+                raced,
+                refused,
+                iterations,
+                escape,
+            )
+        });
+        let (swaps, ok, raced, refused, iterations, escape) = outcome;
+        eprintln!(
+            "preflight/dispatch race: iterations={iterations} swaps={swaps} ok={ok} \
+             refused_after_preflight={raced} refused={refused:?} escape={escape:?} \
+             path_resolution={:?}",
+            d.path_resolution()
+        );
+        assert!(escape.is_none(), "{}", escape.unwrap_or_default());
+        let expected = [
+            "symlink_not_allowed",
+            "file_not_found",
+            "not_a_regular_file",
+        ];
+        assert!(
+            refused.keys().all(|reason| expected.contains(reason)),
+            "unexpected refusal reasons: {refused:?}"
+        );
+        assert!(swaps > 0 && ok > 0, "race not exercised");
+        assert!(
+            refused
+                .get("symlink_not_allowed")
+                .is_some_and(|count| *count > 0),
+            "no action was refused for the swapped-in symlink: {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dirs.outside.join("victim")).unwrap(),
+            "original"
+        );
+    }
 }

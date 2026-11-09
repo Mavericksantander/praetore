@@ -70,6 +70,26 @@ jobs:
         run: |
           cargo test --locked -p praetore-sandbox-fs -- --nocapture
           cargo test --locked -p praetore-gateway --lib -- --nocapture sandbox::tests::race sandbox::tests::require_openat2
+      # T-013: the symlink races through the gateway's dispatcher, one at a
+      # time with --exact; each must report "1 passed". The preflight then
+      # dispatch race is a unit test on purpose: its window lies between two
+      # filesystem calls of one process and the sandbox crate has no test
+      # hook to stop there (see the test's comment). The deterministic swaps
+      # run against PostgreSQL in the replay-postgres job.
+      - name: T-013 dispatcher symlink race tests (exact names, openat2 required)
+        env:
+          PRAETORE_REQUIRE_OPENAT2: "1"
+        run: |
+          set -euo pipefail
+          for name in \
+            sandbox::tests::race_intermediate_directory_swapped_for_outside_symlink_never_escapes \
+            sandbox::tests::race_final_component_swapped_for_outside_symlink_after_preflight_never_escapes; do
+            echo "::group::$name"
+            output="$(cargo test --locked -p praetore-gateway --lib -- --exact "$name" --nocapture 2>&1)" || { echo "$output"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          done
       - run: cargo run --locked --package praetore-core --example high_assurance
       - name: Walkthrough demo (docs/DEMO.md; in-memory replay guard, fixed lease)
         run: make demo demo-verify
@@ -481,6 +501,61 @@ jobs:
         env:
           PRAETORE_TEST_APD_RESTART_PHASE: after
         run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_apd_and_migrations_survive_restart
+      # T-013: the gateway runs the allowed effects in the sandbox. Last in
+      # the job, after the restart steps, because these tests create login
+      # roles and journal rows. One test at a time with --exact; each must
+      # report "1 passed", and every ignored test of the two binaries must be
+      # run by a step of this job.
+      - name: T-013 sandbox gateway end to end against PostgreSQL (CLI gateway and HTTP)
+        run: |
+          set -euo pipefail
+          run_exact() {
+            local package="$1" bin="$2" name="$3"
+            echo "::group::$name"
+            output="$(cargo test -p "$package" --locked --bin "$bin" -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; echo "::error::$name failed"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          }
+          cli=(
+            # Approval flow through the CLI's gateway (waits out the 30 s window).
+            tests::postgres_approval_dispatches_once_and_rejection_is_final
+            # Sandbox: allow, deny, outside the allowlist, escapes, size.
+            tests::postgres_sandbox_allow_deny_and_escape
+            # Sandbox: approve, reject, exec refused, single dispatch.
+            tests::postgres_sandbox_approval_executes_once_in_the_gateway
+            # HTTP: exec-mode refusal, 403, approval, gateway down, database down.
+            tests::postgres_sandbox_http_cooperative_refusal_and_gateway_down
+            # Deterministic symlink swaps: while held, and after approval.
+            tests::postgres_sandbox_symlink_swapped_in_while_held_is_refused
+            tests::postgres_sandbox_symlink_swapped_in_after_approval_is_refused_at_dispatch
+            # Approval expiry with the sandbox (waits out the 30 s window).
+            tests::postgres_sandbox_http_approval_expiry_never_executes
+            # T22 to T26 over HTTP: 403 and the real destination unchanged.
+            tests::postgres_sandbox_http_t22_dot_dot_escapes_are_refused_with_403
+            tests::postgres_sandbox_http_t23_backslash_paths_are_refused_with_403
+            tests::postgres_sandbox_http_t24_absolute_paths_are_refused_with_403
+            tests::postgres_sandbox_http_t25_symlinks_are_refused_with_403
+            tests::postgres_sandbox_http_t26_nul_in_path_is_refused_with_403
+          )
+          gateway_service=(
+            tests::production_refuses_a_privileged_runtime_role_and_local_demo_warns
+          )
+          for name in "${cli[@]}"; do run_exact praetore-cli praetore "$name"; done
+          for name in "${gateway_service[@]}"; do run_exact praetore-gateway-service praetore-gateway-demo "$name"; done
+          # A new ignored test must be added to a step, not skipped silently.
+          # postgres_find_pending_agent_ignores_hostile_search_path runs in
+          # the journal-export step.
+          listed="$(cargo test -q -p praetore-cli --locked --bin praetore -- --ignored --list 2>/dev/null | sed -n 's/^\(tests::.*\): test$/\1/p')"
+          for name in $listed; do
+            [ "$name" = tests::postgres_find_pending_agent_ignores_hostile_search_path ] && continue
+            printf '%s\n' "${cli[@]}" | grep -qxF "$name" || { echo "::error::ignored test $name is not run by any step"; exit 1; }
+          done
+          listed="$(cargo test -q -p praetore-gateway-service --locked --bin praetore-gateway-demo -- --ignored --list 2>/dev/null | sed -n 's/: test$//p')"
+          for name in $listed; do
+            printf '%s\n' "${gateway_service[@]}" | grep -qxF "$name" || { echo "::error::ignored test $name is not run by any step"; exit 1; }
+          done
+          echo "ran ${#cli[@]} praetore-cli and ${#gateway_service[@]} praetore-gateway-service tests"
 
   sbom:
     name: CycloneDX SBOM
