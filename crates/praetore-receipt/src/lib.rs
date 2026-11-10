@@ -346,6 +346,10 @@ impl ExecutionAttestation {
     /// Signs an execution observation. Used by the gateway; verifiers only
     /// need [`GatewayReceipt::verify_execution_attestation`].
     ///
+    /// `observed_at` is the time the caller observed the outcome, read from
+    /// its trusted clock (the gateway passes the engine's clock, not the
+    /// host's). It is signed in UTC.
+    ///
     /// Only available with the `signing` feature (off by default), so offline
     /// verifiers cannot mint attestations that bypass the gateway's state
     /// machine.
@@ -354,6 +358,7 @@ impl ExecutionAttestation {
         evidence: &Evidence,
         authorization: AuthorizationStatus,
         outcome: &AttestedOutcome,
+        observed_at: OffsetDateTime,
         signer: &dyn ExecutionAttestationSigner,
     ) -> Result<Self, ExecutionAttestationError> {
         let key_id = signer.key_id();
@@ -383,7 +388,8 @@ impl ExecutionAttestation {
             return Err(ExecutionAttestationError::InvalidPayload);
         }
 
-        let observed_at = OffsetDateTime::now_utc()
+        let observed_at = observed_at
+            .to_offset(time::UtcOffset::UTC)
             .format(&Rfc3339)
             .map_err(|_| ExecutionAttestationError::InvalidPayload)?;
         let policy_digest = evidence

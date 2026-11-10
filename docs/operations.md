@@ -316,6 +316,26 @@ rolled back. The tests
 `postgres_failure_class_migration_rolls_back_and_applies_again` apply it,
 check the previous rules are back and apply 0020 again.
 
+Migration `0021_journal_insert_rules` adds BEFORE INSERT triggers. A new
+`execution_journal` row must start as `authorized` (`allowed`) or
+`not_dispatched` (`requires_approval`, `denied`), with no output, no
+`not_dispatched_reason` and no failure class; every later state is reached
+through the UPDATE rules of 0012, 0013 and 0020. A new
+`execution_attestations` row is accepted only for the journal row's current
+state, with the same reason and failure class, and its JSON must name the
+same tenant, agent, request, evidence, authorization and state. The journal
+row must be visible to the inserting role (row level security). These are
+defense in depth for code paths that skip the gateway; they do not verify
+signatures and do not constrain the schema owner or a superuser. Rows
+written before 0021 are not checked. To undo 0021 alone, the schema owner
+runs [`docs/rollback/0021-journal-insert-rules.sql`](rollback/0021-journal-insert-rules.sql)
+with every gateway stopped; it refuses to run if 0021 is not recorded or a
+newer migration is. Roll back 0021 before 0020: the 0020 rollback refuses to
+run while 0021 is recorded. The tests
+`postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes` and
+`postgres_journal_insert_rules_migration_rolls_back_and_applies_again` cover
+the rules (as a login member of `praetore_runtime`) and the rollback.
+
 #### TLS
 
 Every connection (gateway, CLI, `praetore-observe`) validates its URL before

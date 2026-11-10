@@ -660,6 +660,57 @@ pub enum ReconciliationReport {
     Unknown,
 }
 
+/// A human decision for [`ExecutionJournal::record_human_approval`], with
+/// what must be written in the same transaction. Built only by
+/// [`HumanDecisionRecord::approve`] and [`HumanDecisionRecord::reject`]: an
+/// approval never carries a close, and a rejection always carries its signed
+/// `approval_rejected` close for the same request.
+#[derive(Debug, Clone, Copy)]
+pub struct HumanDecisionRecord<'a> {
+    decision: &'a HumanApprovalDecision,
+    rejection_close: Option<&'a ExecutionAttestation>,
+}
+
+impl<'a> HumanDecisionRecord<'a> {
+    /// `None` unless the decision approves.
+    pub fn approve(decision: &'a HumanApprovalDecision) -> Option<Self> {
+        (decision.outcome == HumanApprovalOutcome::Approve).then_some(Self {
+            decision,
+            rejection_close: None,
+        })
+    }
+
+    /// `None` unless the decision rejects and `close` is a `not_dispatched`
+    /// attestation with the reason `approval_rejected` for the decision's
+    /// tenant, agent and request. The journal still checks the close against
+    /// the stored evidence ([`ExecutionAttestation::validate_binding`]).
+    pub fn reject(
+        decision: &'a HumanApprovalDecision,
+        close: &'a ExecutionAttestation,
+    ) -> Option<Self> {
+        let challenge = &decision.challenge;
+        (decision.outcome == HumanApprovalOutcome::Reject
+            && close.execution == ExecutionStatus::NotDispatched
+            && close.not_dispatched_reason == Some(NotDispatchedReason::ApprovalRejected)
+            && close.tenant_id == Some(challenge.tenant_id)
+            && close.agent_id == challenge.agent_id
+            && close.request_id == challenge.request_id)
+            .then_some(Self {
+                decision,
+                rejection_close: Some(close),
+            })
+    }
+
+    pub fn decision(&self) -> &'a HumanApprovalDecision {
+        self.decision
+    }
+
+    /// The signed close of a rejection; `None` for an approval.
+    pub fn rejection_close(&self) -> Option<&'a ExecutionAttestation> {
+        self.rejection_close
+    }
+}
+
 /// The journal is a security boundary, not merely a logging callback.
 ///
 /// `AtomicAuthorizationCommit` must atomically persist the replay claim and
@@ -702,14 +753,17 @@ pub trait ExecutionJournal: AtomicAuthorizationCommit + Send + Sync {
 
     /// Stores the decision. `Approve` moves `NotDispatched` to
     /// `ApprovedPendingDispatch` in the same transaction and never to
-    /// `Dispatched`. `now` is the engine's trusted clock; the decision is
+    /// `Dispatched`. `Reject` closes the held `NotDispatched` request with
+    /// the signed `approval_rejected` attestation it carries, in the same
+    /// transaction: the decision and the close are written together or not
+    /// at all. `now` is the engine's trusted clock; the decision is
     /// rejected when `expires_at <= now`. Must fail with
     /// `ApprovalAlreadyRecorded` when an approval expiration is already
     /// stored for the key.
     fn record_human_approval(
         &self,
         key: ExecutionKey,
-        decision: &HumanApprovalDecision,
+        record: HumanDecisionRecord<'_>,
         now: OffsetDateTime,
     ) -> Result<(), JournalError>;
 
@@ -1062,10 +1116,17 @@ impl Gateway {
         authorization: AuthorizationStatus,
         outcome: &AttestedOutcome,
     ) -> Result<ExecutionAttestation, GatewayError> {
+        // Signed with the engine's trusted clock, like approval expirations;
+        // when it is unavailable nothing is signed (fail closed).
+        let observed_at = self
+            .engine
+            .trusted_now()
+            .map_err(GatewayError::Authorization)?;
         Ok(ExecutionAttestation::create(
             evidence,
             authorization,
             outcome,
+            observed_at,
             self.execution_attester.as_ref(),
         )?)
     }
@@ -1171,8 +1232,10 @@ impl Gateway {
 
     /// Idempotent repair: closes a rejected or expired held request with its
     /// signed final reason when an earlier close did not complete (for
-    /// example a crash between the decision and the close, or a row written
-    /// before migration 0020). Returns the closing receipt when it closed.
+    /// example a crash between the expiration receipt and the close, a
+    /// rejection recorded by an earlier release, which closed it in a
+    /// second transaction, or a row written before migration 0020). Returns
+    /// the closing receipt when it closed.
     fn close_decided_hold(
         &self,
         record: &ExecutionRecord,
@@ -1395,17 +1458,34 @@ impl Gateway {
             .engine
             .trusted_now()
             .map_err(GatewayError::Authorization)?;
-        self.journal.record_human_approval(key, &decision, now)?;
-        record.human_approval = Some(decision.clone());
 
         match decision.outcome {
             HumanApprovalOutcome::Approve => {
+                let write = HumanDecisionRecord::approve(&decision)
+                    .ok_or(GatewayError::Journal(JournalError::InvalidRecord))?;
+                self.journal.record_human_approval(key, write, now)?;
                 Ok(HumanApprovalResult::ApprovedPendingDispatch { decision })
             }
             HumanApprovalOutcome::Reject => {
-                // Final: the signed reason says a human rejected it.
-                let receipt =
-                    self.close_not_dispatched(record, NotDispatchedReason::ApprovalRejected)?;
+                // Final: the signed reason says a human rejected it. It is
+                // signed first and written with the decision in one
+                // transaction, so a recorded rejection is always closed.
+                let close = self.create_execution_attestation(
+                    &record.evidence,
+                    record.authorization,
+                    &AttestedOutcome::NotDispatched(Some(NotDispatchedReason::ApprovalRejected)),
+                )?;
+                let write = HumanDecisionRecord::reject(&decision, &close)
+                    .ok_or(GatewayError::Journal(JournalError::InvalidRecord))?;
+                self.journal.record_human_approval(key, write, now)?;
+                record.execution = ExecutionStatus::NotDispatched;
+                let receipt = Self::receipt(
+                    record.evidence,
+                    record.authorization,
+                    record.execution,
+                    None,
+                    close,
+                );
                 Ok(HumanApprovalResult::Rejected {
                     decision,
                     receipt: Box::new(receipt),

@@ -15,6 +15,35 @@
   only, with no guarantee about who performs an effect:
   `praetore init --dev-cooperative-exec` or
   `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` (local-demo adapter).
+- **`ExecutionJournal::record_human_approval` takes a `HumanDecisionRecord`
+  (T-015).** A rejection now carries its signed `approval_rejected` close and
+  the journal writes the decision and the close in one transaction; an
+  approval carries no close. Action: custom journal implementations write
+  both, or neither, as `PostgresExecutionJournal` does.
+- **`ExecutionAttestation::create` takes `observed_at` (T-015, `signing`
+  feature).** Callers pass the time from their trusted clock; the gateway
+  passes the engine's clock.
+
+### Changed
+
+- **Migration `0021_journal_insert_rules` (T-015).** The execution journal
+  accepts on INSERT only the initial states the gateway writes (`authorized`
+  for `allowed`, `not_dispatched` otherwise, with no output, reason or
+  failure class), and an execution attestation only for the journal row's
+  current state, with the same reason, failure class and signed identity.
+  Rows written before 0021 are not rewritten. Manual rollback:
+  `docs/rollback/0021-journal-insert-rules.sql`; the 0020 rollback now
+  refuses to run while 0021 is applied.
+- **Execution attestations are timestamped with the engine's trusted clock
+  (T-015).** `observed_at` used the host clock; it now uses the same clock
+  as approval expirations. When that clock is unavailable the gateway signs
+  nothing and returns an error; an execution already dispatched stays
+  `dispatched` until `reconcile` closes it.
+- **A human rejection and its signed close commit together (T-015).** Before,
+  the decision and the `approval_rejected` close were two transactions, and
+  a failure between them returned an error although the rejection was
+  recorded (the next read repaired it). The repair stays for rows written
+  by earlier releases.
 
 ## 0.3.3 - 2026-11-03
 

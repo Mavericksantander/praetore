@@ -6,8 +6,8 @@ use praetore_core::{
 use praetore_gateway::{
     ApprovalChallenge, ApprovalExpiredReceipt, AuthorizationStatus, ExecutionAttestation,
     ExecutionFailure, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
-    HumanApprovalDecision, HumanApprovalOutcome, JournalError, NotDispatchedReason, RefusalCode,
-    action_digest, authority_tenant_id,
+    HumanApprovalDecision, HumanApprovalOutcome, HumanDecisionRecord, JournalError,
+    NotDispatchedReason, RefusalCode, action_digest, authority_tenant_id,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -256,9 +256,14 @@ impl ExecutionJournal for PostgresExecutionJournal {
     fn record_human_approval(
         &self,
         key: ExecutionKey,
-        decision: &HumanApprovalDecision,
+        record: HumanDecisionRecord<'_>,
         now: time::OffsetDateTime,
     ) -> Result<(), JournalError> {
+        let decision = record.decision();
+        let rejection_close = record
+            .rejection_close()
+            .map(|close| serialize_attestation(close).map(|json| (close, json)))
+            .transpose()?;
         let decision_json =
             serde_json::to_value(decision).map_err(|_| JournalError::InvalidRecord)?;
         let expires_at = time::OffsetDateTime::parse(
@@ -325,6 +330,16 @@ impl ExecutionJournal for PostgresExecutionJournal {
         {
             return Err(JournalError::InvalidRecord);
         }
+        if let Some((close, _)) = &rejection_close {
+            close
+                .validate_binding(
+                    &evidence,
+                    authorization,
+                    ExecutionStatus::NotDispatched,
+                    None,
+                )
+                .map_err(|_| JournalError::InvalidRecord)?;
+        }
 
         transaction
             .execute(
@@ -356,7 +371,32 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 }
             })?;
 
-        if decision.outcome == HumanApprovalOutcome::Approve {
+        if let Some((_, close_json)) = &rejection_close {
+            // A rejection closes the held request in the same transaction,
+            // with its signed reason (0020's trigger requires the reject
+            // decision inserted above).
+            let changed = transaction
+                .execute(
+                    "UPDATE praetore.execution_journal \
+                         SET not_dispatched_reason = 'approval_rejected', \
+                             updated_at = clock_timestamp() \
+                         WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                           AND authorization_status = 'requires_approval' \
+                           AND execution_status = 'not_dispatched' \
+                           AND not_dispatched_reason IS NULL",
+                    &[&key.tenant_id, &key.agent_id, &key.request_id],
+                )
+                .map_err(|_| JournalError::Unavailable)?;
+            if changed != 1 {
+                return Err(JournalError::InvalidTransition);
+            }
+            insert_execution_attestation(
+                &mut transaction,
+                key,
+                ExecutionStatus::NotDispatched,
+                close_json,
+            )?;
+        } else if decision.outcome == HumanApprovalOutcome::Approve {
             // Approval never dispatches: it only records the pending state.
             let changed = transaction
                 .execute(
