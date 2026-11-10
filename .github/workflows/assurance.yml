@@ -488,7 +488,12 @@ jobs:
       # rows. One test at a time with --exact; each must report "1 passed",
       # and every ignored test of the two binaries must be run by a step of
       # this job. The 0020 up/down test runs in the ignored-tests script.
+      # The gateway's variable (sandbox::REQUIRE_OPENAT2_ENV): the CLI's
+      # gateway opens the sandbox requiring openat2, as on Linux hosts, and
+      # fails instead of falling back to the portable walk.
       - name: T-013 signed final states end to end against PostgreSQL (CLI gateway, HTTP, praetore-verify)
+        env:
+          PRAETORE_SANDBOX_REQUIRE_OPENAT2: "1"
         run: |
           set -euo pipefail
           # T17, T20, T7b and S1 run target/debug/praetore-verify; T21 runs
