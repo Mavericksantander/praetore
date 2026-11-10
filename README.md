@@ -559,12 +559,19 @@ cargo test -p praetore-gateway --test enforcement human_approval
   gateway itself performs `fs:write_file` / `fs:delete_file` through
   `praetore_gateway::sandbox::SandboxDispatcher` (Unix only), so for those
   actions `executed` / `confirmed` record an effect the gateway performed.
-  The `praetore-exec-mode: gateway` header that this mode requires is an
-  unverifiable declaration by the client: it only lets the gateway refuse
-  clients that do not make it, and it cannot stop a client from also
+  By default, with or without `sandbox_root`, the local HTTP API and
+  `praetore-gateway-demo` refuse cooperative execution (a client that
+  performs an authorized effect itself): every execution-path request must
+  carry `praetore-exec-mode: gateway`, and `/status` never answers
+  `approved` for an approved action. That header is an unverifiable
+  declaration by the client: it only lets the gateway refuse clients that do
+  not make it, it enables nothing, and it cannot stop a client from also
   performing the effect itself. That still requires OS-level isolation (the
-  agent must have no write access to the sandbox root). Other actions and
-  adapters are unchanged.
+  agent must have no write access to the sandbox root). Cooperative
+  execution is available only behind an explicit development flag
+  (`praetore init --dev-cooperative-exec`, or
+  `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` with the local-demo adapter),
+  a mode that gives no guarantee about who performs an effect.
 - **A third party cannot prove that no receipt was deleted from the
   journal.** Each receipt is signed on its own; nothing signs or publishes
   the journal's sequence or head. The hash-linked export

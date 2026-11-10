@@ -234,6 +234,14 @@ No `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER` or `CREATE` is granted. All
 tables carry `tenant_id` and use forced row-level security keyed on the
 transaction-local `praetore.tenant_id` setting.
 
+Clients of `praetore-gateway-demo` must send `praetore-exec-mode: gateway`
+on every execution-path request, with every adapter: without it they get 409
+`exec_mode_gateway_required` (see
+[tool-gateway-integration.md](tool-gateway-integration.md#execution-mode)).
+`PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` turns that off for the `local-demo`
+adapter only; it is a development mode that gives no guarantee about who
+performs an effect.
+
 With `PRAETORE_GATEWAY_ADAPTER=http` or `sandbox`, `praetore-gateway-demo`
 verifies at startup (before serving) that the runtime connection's session and
 current role meet these rules and that the schema is current, and refuses to

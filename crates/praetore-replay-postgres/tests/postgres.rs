@@ -7091,6 +7091,10 @@ fn postgres_g7_safety_action_is_refused_before_the_engine_with_the_journal_down(
                 .method("POST")
                 .uri("/v1/execute")
                 .header("content-type", "application/json")
+                .header(
+                    praetore_gateway::http_api::EXEC_MODE_HEADER,
+                    praetore_gateway::http_api::EXEC_MODE_GATEWAY,
+                )
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let started = std::time::Instant::now();

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- **Cooperative execution is refused by default (T-013).** The local HTTP
+  API (`praetore run`) and `praetore-gateway-demo`, with every adapter and
+  with or without `sandbox_root`, require `praetore-exec-mode: gateway` on
+  every execution-path request and never answer `approved` on `/status`
+  for an approved action. Before, this applied only with `sandbox_root`, and
+  `praetore-gateway-demo` never applied it. `http_api::HttpOptions` now has
+  `exec_mode: ExecMode` instead of `gateway_executes_effects: bool`. Action:
+  clients send the header (the `praetore` CLI already does). Development
+  only, with no guarantee about who performs an effect:
+  `praetore init --dev-cooperative-exec` or
+  `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` (local-demo adapter).
+
 ## 0.3.3 - 2026-11-03
 
 Closes the two known limitations of v0.3.2 in the post-hoc safety ingestion
