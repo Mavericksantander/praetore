@@ -211,42 +211,74 @@ struct ApiState {
     options: HttpOptions,
 }
 
+/// Who may perform an authorized effect, as the HTTP API enforces it.
+///
+/// Only the server configuration selects the mode. The client's
+/// [`EXEC_MODE_HEADER`] never selects or enables one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExecMode {
+    /// The default. Cooperative execution is refused: every
+    /// execution-path request must carry [`EXEC_MODE_HEADER`] with the
+    /// exact value `gateway`, or it gets 409 `exec_mode_gateway_required`
+    /// before anything is evaluated or journaled, and `/status` of an
+    /// approved action answers 409 `cooperative_exec_rejected` instead of
+    /// `approved`, so a polling agent is never told to run the effect
+    /// itself. This holds whatever the dispatcher is, with or without a
+    /// sandbox.
+    #[default]
+    GatewayOnly,
+    /// [`Self::GatewayOnly`], and the configured dispatcher performs the
+    /// effects itself (for example the filesystem
+    /// [`crate::sandbox::SandboxDispatcher`]): receipts of effects it
+    /// performed also carry the header `praetore-executed-by: gateway`.
+    GatewayEffects,
+    /// Development only, and it gives no guarantee about who performs the
+    /// effect. The [`EXEC_MODE_HEADER`] is ignored and `/status` answers
+    /// `approved` for an approved action, so a client may perform it
+    /// itself, outside PRÆTORE. Selected only by an explicit development
+    /// flag of the server (`praetore init --dev-cooperative-exec`,
+    /// `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1`).
+    DevelopmentCooperative,
+}
+
+impl ExecMode {
+    fn refuses_cooperative(self) -> bool {
+        !matches!(self, Self::DevelopmentCooperative)
+    }
+}
+
 /// Transport options for [`router_with_options`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HttpOptions {
-    /// Set when the configured dispatcher performs the effects itself (for
-    /// example the filesystem [`crate::sandbox::SandboxDispatcher`]). The API
-    /// then requires [`EXEC_MODE_HEADER`] on every execution-path endpoint,
-    /// and `/status` of an approved action answers 409
-    /// `cooperative_exec_rejected` instead of `approved`, so a polling agent
-    /// never runs the effect itself. Receipts of effects performed by the
-    /// gateway carry the header `praetore-executed-by: gateway`.
+    /// See [`ExecMode`]. The default refuses cooperative execution.
     ///
-    /// This option never changes who executes, what is authorized, or what
-    /// is journaled: it only refuses requests earlier.
-    pub gateway_executes_effects: bool,
+    /// The mode never changes who executes, what is authorized, or what is
+    /// journaled: it only refuses requests earlier.
+    pub exec_mode: ExecMode,
 }
 
 const EXECUTED_BY_HEADER: &str = "praetore-executed-by";
 
 /// Request header a client must send, with the exact value `gateway`, on
 /// every execution-path request (`POST /v1/execute`, approval challenge,
-/// approval decision, dispatch and `/status`) when
-/// [`HttpOptions::gateway_executes_effects`] is set. It is an unverifiable
-/// declaration by the client that it will not perform the effect itself; it
-/// grants nothing. It is checked only after caller authentication.
+/// approval decision, dispatch and `/status`) unless the server runs in
+/// [`ExecMode::DevelopmentCooperative`]. It is an unverifiable declaration
+/// by the client that it will not perform the effect itself; it grants
+/// nothing and selects no mode. It is checked only after caller
+/// authentication.
 pub const EXEC_MODE_HEADER: &str = "praetore-exec-mode";
 pub const EXEC_MODE_GATEWAY: &str = "gateway";
 const MAX_EXEC_MODE_BYTES: usize = 16;
 
-/// Fail-closed check of [`EXEC_MODE_HEADER`]. Without gateway-executed
-/// effects the header is ignored (unchanged behaviour). Otherwise exactly
-/// one header with the exact value `gateway` (at most 16 bytes) is accepted;
+/// Fail-closed check of [`EXEC_MODE_HEADER`]. Only in
+/// [`ExecMode::DevelopmentCooperative`] is the header ignored. Otherwise
+/// exactly one header with the exact value `gateway` (at most 16 bytes) is
+/// accepted;
 /// a missing, repeated, oversized, `cooperative` or any other value is
 /// refused with 409 `exec_mode_gateway_required` before the gateway is
 /// called, so nothing is evaluated, journaled, approved or executed.
 fn exec_mode_accepted(options: HttpOptions, headers: &HeaderMap) -> bool {
-    if !options.gateway_executes_effects {
+    if !options.exec_mode.refuses_cooperative() {
         return true;
     }
     let mut values = headers.get_all(EXEC_MODE_HEADER).iter();
@@ -263,7 +295,7 @@ fn exec_mode_refused() -> Response {
 }
 
 fn executed_by_gateway(options: HttpOptions, execution: crate::ExecutionStatus) -> bool {
-    options.gateway_executes_effects
+    options.exec_mode == ExecMode::GatewayEffects
         && matches!(
             execution,
             crate::ExecutionStatus::Executed | crate::ExecutionStatus::Confirmed
@@ -799,10 +831,11 @@ async fn approval_status(
         request_id,
     };
     match tokio::task::spawn_blocking(move || gateway.approval_state(key)).await {
-        // With gateway-executed effects an approved action is never handed
-        // to the client to run, whether or not it was dispatched yet.
+        // Unless the server runs the development cooperative mode, an
+        // approved action is never handed to the client to run, whether or
+        // not it was dispatched yet.
         Ok(Ok(state))
-            if options.gateway_executes_effects
+            if options.exec_mode.refuses_cooperative()
                 && state.resolution == crate::ApprovalResolution::Approved =>
         {
             with_executed_by(
@@ -1020,28 +1053,40 @@ mod tests {
         map
     }
 
+    /// Cooperative execution is refused by default (no option set, no
+    /// sandbox) and with gateway-executed effects; only the server's
+    /// development mode accepts it. No header value selects a mode.
     #[test]
-    fn exec_mode_header_is_validated_strictly_only_with_gateway_effects() {
-        let on = HttpOptions {
-            gateway_executes_effects: true,
+    fn exec_mode_header_is_validated_strictly_unless_the_development_mode_is_set() {
+        let default = HttpOptions::default();
+        assert_eq!(default.exec_mode, ExecMode::GatewayOnly);
+        let effects = HttpOptions {
+            exec_mode: ExecMode::GatewayEffects,
         };
-        assert!(exec_mode_accepted(on, &exec_headers(&[b"gateway"])));
-        for bad in [
-            &[][..],
-            &[&b"cooperative"[..]][..],
-            &[&b"Gateway"[..]][..],
-            &[&b"gateway "[..]][..],
-            &[&b""[..]][..],
-            &[&b"gatewaygatewaygateway"[..]][..],
-            &[&b"gateway"[..], &b"gateway"[..]][..],
-            &[&b"gateway"[..], &b"cooperative"[..]][..],
-        ] {
-            assert!(!exec_mode_accepted(on, &exec_headers(bad)), "{bad:?}");
+        for on in [default, effects] {
+            assert!(exec_mode_accepted(on, &exec_headers(&[b"gateway"])));
+            for bad in [
+                &[][..],
+                &[&b"cooperative"[..]][..],
+                &[&b"Gateway"[..]][..],
+                &[&b"gateway "[..]][..],
+                &[&b""[..]][..],
+                &[&b"gatewaygatewaygateway"[..]][..],
+                &[&b"gateway"[..], &b"gateway"[..]][..],
+                &[&b"gateway"[..], &b"cooperative"[..]][..],
+            ] {
+                assert!(!exec_mode_accepted(on, &exec_headers(bad)), "{bad:?}");
+            }
         }
-        let off = HttpOptions::default();
-        assert!(exec_mode_accepted(off, &exec_headers(&[])));
         assert_eq!(exec_mode_refused().status(), StatusCode::CONFLICT);
-        assert!(exec_mode_accepted(off, &exec_headers(&[b"cooperative"])));
+        let development = HttpOptions {
+            exec_mode: ExecMode::DevelopmentCooperative,
+        };
+        assert!(exec_mode_accepted(development, &exec_headers(&[])));
+        assert!(exec_mode_accepted(
+            development,
+            &exec_headers(&[b"cooperative"])
+        ));
     }
 
     #[test]

@@ -11,6 +11,7 @@ use praetore_gateway_service::{
     api_auth::select_api_auth,
     approver_bindings::{parse_approver_bindings, single_approver},
     chrony_clock::ChronyClock,
+    exec_mode::{DEV_COOPERATIVE_EXEC_ENV, DEV_COOPERATIVE_EXEC_WARNING, select_http_options},
     file_freshness::{DemoFreshnessProvider, FileFreshnessLimits, FileFreshnessProvider},
 };
 use praetore_replay_postgres::{DatabaseConnector, PostgresExecutionJournal, PostgresReplayGuard};
@@ -552,6 +553,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("PRAETORE_GATEWAY_ADAPTER must be sandbox, http, or local-demo".into());
         }
     };
+    // Cooperative execution is refused by default with every adapter; only
+    // the local-demo adapter accepts the explicit development flag.
+    let http_options = select_http_options(
+        adapter_setup.production_adapter,
+        env::var(DEV_COOPERATIVE_EXEC_ENV).ok().as_deref(),
+    )?;
+    if http_options.exec_mode == http_api::ExecMode::DevelopmentCooperative {
+        tracing::warn!("{DEV_COOPERATIVE_EXEC_WARNING}");
+    }
     let approval_verifiers = approval_verifiers(adapter_setup.tenant_issuer_bindings.as_ref())?;
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL").ok();
     let database = prepare_database(
@@ -615,7 +625,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = runtime.block_on(tokio::net::TcpListener::bind(&address))?;
     tracing::info!(%address, "PRÆTORE local demo gateway listening");
     let served = runtime.block_on(
-        axum::serve(listener, http_api::router(Arc::clone(&gateway), api_auth)).into_future(),
+        axum::serve(
+            listener,
+            http_api::router_with_options(Arc::clone(&gateway), api_auth, http_options),
+        )
+        .into_future(),
     );
     drop(runtime);
     drop(gateway);

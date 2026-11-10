@@ -366,6 +366,7 @@ async fn post(gateway: Gateway, body: &Value) -> (StatusCode, Value, StdDuration
         .method("POST")
         .uri("/v1/execute")
         .header("content-type", "application/json")
+        .header(http_api::EXEC_MODE_HEADER, http_api::EXEC_MODE_GATEWAY)
         .body(Body::from(body.to_string()))
         .unwrap();
     let started = Instant::now();
@@ -511,6 +512,7 @@ async fn post_raw(gateway: Gateway, body: &Value) -> (StatusCode, Vec<(String, V
         .method("POST")
         .uri("/v1/execute")
         .header("content-type", "application/json")
+        .header(http_api::EXEC_MODE_HEADER, http_api::EXEC_MODE_GATEWAY)
         .body(Body::from(body.to_string()))
         .unwrap();
     let response = app.oneshot(request).await.unwrap();

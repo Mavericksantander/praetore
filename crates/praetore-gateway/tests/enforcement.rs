@@ -940,6 +940,8 @@ fn http_body_request(method: &str, uri: &str, body: String) -> Request<Body> {
         .method(method)
         .uri(uri)
         .header("content-type", "application/json")
+        // Required by default: the API refuses cooperative execution.
+        .header(http_api::EXEC_MODE_HEADER, http_api::EXEC_MODE_GATEWAY)
         .body(Body::from(body))
         .unwrap()
 }
@@ -2360,13 +2362,51 @@ async fn http_conflicts_and_status_report_the_resolution() {
         assert_eq!((status, body), (StatusCode::CONFLICT, conflict));
         let (status, body) =
             json_response(&app, "GET", &format!("{path}/status"), String::new()).await;
-        assert_eq!(
-            (status, body),
-            (
-                StatusCode::OK,
-                json!({"resolution": expected, "execution": execution})
+        if outcome == HumanApprovalOutcome::Approve {
+            // By default an approved action is never handed to the client
+            // to run: 409 instead of `approved`.
+            assert_eq!(
+                (status, body),
+                (
+                    StatusCode::CONFLICT,
+                    json!({
+                        "code": "cooperative_exec_rejected",
+                        "resolution": expected,
+                        "execution": execution
+                    })
+                )
+            );
+            // Only the server's development mode answers `approved`.
+            let development = http_api::router_with_options(
+                gateway.clone(),
+                http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+                http_api::HttpOptions {
+                    exec_mode: http_api::ExecMode::DevelopmentCooperative,
+                },
+            );
+            let (status, body) = json_response(
+                &development,
+                "GET",
+                &format!("{path}/status"),
+                String::new(),
             )
-        );
+            .await;
+            assert_eq!(
+                (status, body),
+                (
+                    StatusCode::OK,
+                    json!({"resolution": expected, "execution": execution})
+                )
+            );
+        } else {
+            assert_eq!(
+                (status, body),
+                (
+                    StatusCode::OK,
+                    json!({"resolution": expected, "execution": execution})
+                )
+            );
+        }
 
         let other_tenant = format!(
             "/v1/approvals/{}/{}/{}/status",
@@ -3551,7 +3591,8 @@ async fn authed(
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header(http_api::EXEC_MODE_HEADER, http_api::EXEC_MODE_GATEWAY);
     if let Some(token) = token {
         builder = builder.header("authorization", format!("Bearer {token}"));
     }
@@ -4116,6 +4157,66 @@ fn preflight_refusal_before_approval_keeps_the_decision_unconsumed() {
     gateway.resolve_human_approval(decision).unwrap();
 }
 
+/// T19 (without PostgreSQL): the default router, with no sandbox and no
+/// gateway-executed effects, refuses cooperative execution before anything
+/// is evaluated or journaled; only the server's development mode accepts a
+/// request without the declaration. No header value enables the mode.
+#[tokio::test]
+async fn default_router_refuses_cooperative_exec_without_a_sandbox() {
+    let send = |app: axum::Router, modes: Vec<&'static str>, body: String| async move {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/v1/execute")
+            .header("content-type", "application/json");
+        for mode in modes {
+            builder = builder.header(http_api::EXEC_MODE_HEADER, mode);
+        }
+        let response = app
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 262_144).await.unwrap();
+        (
+            status,
+            serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+        )
+    };
+    let (gateway, request, tool, journal, _) = approval_fixture();
+    let gateway = Arc::new(gateway);
+    let request_json = serde_json::to_string(&request).unwrap();
+    let app = http_api::router(
+        gateway.clone(),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
+    for modes in [
+        vec![],
+        vec!["cooperative"],
+        vec!["gateway", "cooperative"],
+        vec!["gateway,cooperative"],
+    ] {
+        let (status, body) = send(app.clone(), modes.clone(), request_json.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{modes:?}");
+        assert_eq!(body["code"], "exec_mode_gateway_required", "{modes:?}");
+    }
+    assert!(journal.entries.lock().unwrap().is_empty());
+    assert_eq!(tool.invocations(), 0);
+
+    // T19b: the development mode accepts the request without the header.
+    let development = http_api::router_with_options(
+        gateway,
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+        http_api::HttpOptions {
+            exec_mode: http_api::ExecMode::DevelopmentCooperative,
+        },
+    );
+    let (status, body) = send(development, vec![], request_json).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["authorization"], "requires_approval");
+    assert_eq!(journal.entries.lock().unwrap().len(), 1);
+    assert_eq!(tool.invocations(), 0);
+}
+
 /// With gateway-executed effects, `praetore-exec-mode` is checked only after
 /// caller authentication (it never substitutes for a credential), it can only
 /// refuse, and an agent never gets a plain `approved` answer to act on.
@@ -4127,7 +4228,7 @@ async fn exec_mode_header_runs_after_auth_and_never_changes_who_executes() {
         gateway.clone(),
         http_api::ApiAuth::required(api_credentials()),
         http_api::HttpOptions {
-            gateway_executes_effects: true,
+            exec_mode: http_api::ExecMode::GatewayEffects,
         },
     );
     let send =
