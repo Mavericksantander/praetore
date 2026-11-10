@@ -46,6 +46,9 @@ pub enum Classified {
     Ambiguous {
         reason: String,
         candidates: Vec<ToolCall>,
+        /// Some part of the line (a segment between bare `\r`) could not be
+        /// parsed, so `candidates` may miss a reading.
+        unparsed: bool,
     },
 }
 
@@ -205,6 +208,7 @@ pub fn classify(line: &[u8]) -> Classified {
         // SDK) and Node's readline end a line at `\r`, `\n` or `\r\n`, while
         // JSON treats `\r` as whitespace. Collect what such a reader sees.
         let mut candidates = Vec::new();
+        let mut unparsed = false;
         let segments: Vec<&str> = body.split('\r').collect();
         for segment in &segments {
             match classify_text(segment) {
@@ -221,7 +225,8 @@ pub fn classify(line: &[u8]) -> Classified {
                         push_unique(&mut candidates, Some(call));
                     }
                 }
-                Classified::Passthrough | Classified::Unparseable(_) => {}
+                Classified::Passthrough => {}
+                Classified::Unparseable(_) => unparsed = true,
             }
         }
         if let Classified::ToolCall(call) = classify_text(body) {
@@ -233,6 +238,7 @@ pub fn classify(line: &[u8]) -> Classified {
                 segments.len()
             ),
             candidates,
+            unparsed,
         };
     }
     classify_text(body)
@@ -250,7 +256,11 @@ fn classify_text(text: &str) -> Classified {
         JsonValue::Object(_) => match check_message(&value) {
             Ok(Some(call)) => Classified::ToolCall(call),
             Ok(None) => Classified::Passthrough,
-            Err(Ambiguity { reason, candidates }) => Classified::Ambiguous { reason, candidates },
+            Err(Ambiguity { reason, candidates }) => Classified::Ambiguous {
+                reason,
+                candidates,
+                unparsed: false,
+            },
         },
         JsonValue::Array(elements) => {
             let mut items = Vec::new();
@@ -287,7 +297,11 @@ fn classify_text(text: &str) -> Classified {
                 }
             }
             if let Some(reason) = ambiguous {
-                Classified::Ambiguous { reason, candidates }
+                Classified::Ambiguous {
+                    reason,
+                    candidates,
+                    unparsed: false,
+                }
             } else if items.iter().any(|item| item.call.is_some()) {
                 Classified::Batch(items)
             } else {
@@ -490,9 +504,92 @@ fn forward_unchanged(raw: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str) {
+/// SHA-256 and length of a client line, to find it again in a capture.
+fn fingerprint(raw: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "sha256 {}, {} bytes",
+        hex::encode(Sha256::digest(raw)),
+        raw.len()
+    )
+}
+
+/// Whether a line this proxy cannot parse might name a `safety*` tool for
+/// a more lenient parser (G7): the text, or any string literal in it read
+/// with JSON escapes decoded (lone surrogates become U+FFFD), contains
+/// `safety` in any ASCII case. Deliberately broad: it only applies to lines
+/// that are already malformed.
+pub fn may_name_safety_tool(raw: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    contains_safety(&text) || string_literals(&text).iter().any(|s| contains_safety(s))
+}
+
+fn contains_safety(text: &str) -> bool {
+    text.as_bytes()
+        .windows(6)
+        .any(|window| window.eq_ignore_ascii_case(b"safety"))
+}
+
+/// Every `"..."` literal in `text`, decoded leniently: unknown escapes are
+/// kept as the escaped character, an unterminated literal runs to the end.
+fn string_literals(text: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut units: Vec<u16> = Vec::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => match chars.next() {
+                    Some('u') => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        match u16::from_str_radix(&hex, 16) {
+                            Ok(unit) if hex.len() == 4 => units.push(unit),
+                            _ => units.extend(hex.encode_utf16()),
+                        }
+                    }
+                    Some('n') => units.push(u16::from(b'\n')),
+                    Some('t') => units.push(u16::from(b'\t')),
+                    Some('r') => units.push(u16::from(b'\r')),
+                    Some('b') => units.push(0x08),
+                    Some('f') => units.push(0x0c),
+                    Some(other) => {
+                        let mut buffer = [0; 2];
+                        units.extend_from_slice(other.encode_utf16(&mut buffer));
+                    }
+                    None => break,
+                },
+                other => {
+                    let mut buffer = [0; 2];
+                    units.extend_from_slice(other.encode_utf16(&mut buffer));
+                }
+            }
+        }
+        literals.push(String::from_utf16_lossy(&units));
+    }
+    literals
+}
+
+/// Refuses a malformed line that may name a `safety*` tool, in both modes
+/// (G7): it cannot be checked against the declared Safety actions.
+fn refuse_safety_unparseable(out: &mut Outcome, mode: Mode, what: &str, reason: &str, raw: &[u8]) {
     out.warnings.push(format!(
-        "praetore-mcp: REFUSED {what} client line in enforce mode ({reason}); it could hide a tools/call"
+        "praetore-mcp: REFUSED {what} client line that may name a safety* tool ({reason}; {}); not forwarded ({})",
+        fingerprint(raw),
+        mode.as_str()
+    ));
+    out.to_client = Some(line(&parse_error_response(&format!(
+        "praetore-mcp: {what} message that may name a safety* tool was not forwarded"
+    ))));
+}
+
+fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str, raw: &[u8]) {
+    out.warnings.push(format!(
+        "praetore-mcp: REFUSED {what} client line in enforce mode ({reason}; {}); it could hide a tools/call",
+        fingerprint(raw)
     ));
     out.to_client = Some(line(&parse_error_response(&format!(
         "praetore-mcp (enforce): {what} message was not forwarded"
@@ -520,12 +617,33 @@ pub fn handle_client_line(
     let mut out = Outcome::default();
     match classify(raw) {
         Classified::Passthrough => out.to_server = Some(forward_unchanged(raw)),
+        // A line this proxy cannot parse is never forwarded silently: it is
+        // refused if it may name a safety* tool (G7), refused in enforce,
+        // and forwarded in observe with a warning that identifies it.
+        Classified::Unparseable(reason) if may_name_safety_tool(raw) => {
+            refuse_safety_unparseable(&mut out, mode, "an unparseable", &reason, raw);
+        }
         Classified::Unparseable(reason) => match mode {
-            Mode::Observe => out.to_server = Some(forward_unchanged(raw)),
-            Mode::Enforce => refuse_unparseable(&mut out, "an unparseable", &reason),
+            Mode::Observe => {
+                out.warnings.push(format!(
+                    "praetore-mcp: WARNING unparseable client line ({reason}; {}); forwarded unchanged WITHOUT a receipt (observe)",
+                    fingerprint(raw)
+                ));
+                out.to_server = Some(forward_unchanged(raw));
+            }
+            Mode::Enforce => refuse_unparseable(&mut out, "an unparseable", &reason, raw),
         },
-        Classified::Ambiguous { reason, candidates } => match mode {
-            Mode::Enforce => refuse_unparseable(&mut out, "an ambiguous", &reason),
+        Classified::Ambiguous {
+            reason,
+            unparsed: true,
+            ..
+        } if may_name_safety_tool(raw) => {
+            refuse_safety_unparseable(&mut out, mode, "an ambiguous", &reason, raw);
+        }
+        Classified::Ambiguous {
+            reason, candidates, ..
+        } => match mode {
+            Mode::Enforce => refuse_unparseable(&mut out, "an ambiguous", &reason, raw),
             Mode::Observe => {
                 out.warnings.push(format!(
                     "praetore-mcp: WARNING ambiguous client line ({reason}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
@@ -796,17 +914,153 @@ mod tests {
         assert!(out.warnings[0].contains("could NOT be written"));
     }
 
+    /// Test 24d: observe forwards an unparseable line, but never silently:
+    /// the warning names the reason, the SHA-256 and the length.
     #[test]
-    fn unparseable_lines_refused_in_enforce_forwarded_in_observe() {
+    fn unparseable_lines_refused_in_enforce_forwarded_with_warning_in_observe() {
         let raw = b"{\"method\":\"tools/call\",\n";
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(raw));
         let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
         let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
         assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
+        assert!(out.to_client.is_none());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let warning = &out.warnings[0];
+        assert!(warning.contains("unparseable client line"), "{warning}");
+        assert!(warning.contains("WITHOUT a receipt (observe)"), "{warning}");
+        assert!(
+            warning.contains(&format!("sha256 {digest}, {} bytes", raw.len())),
+            "{warning}"
+        );
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
         assert!(out.to_server.is_none());
         let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
         assert_eq!(reply["error"]["code"], -32700);
         assert_eq!(reply["id"], Value::Null);
+        assert!(out.warnings[0].contains(&digest), "{:?}", out.warnings);
+        assert!(eval.calls.is_empty());
+    }
+
+    fn nested_call(name: &str, depth: usize) -> Vec<u8> {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/call\",\"params\":{{\"name\":\"{name}\",\"arguments\":{{\"a\":{}1{}}}}}}}",
+            "[".repeat(depth),
+            "]".repeat(depth)
+        )
+        .into_bytes()
+    }
+
+    /// Hallazgo 11: JSON that other parsers accept and this one rejects.
+    /// For an ordinary tool, observe forwards with a warning and enforce
+    /// refuses; the evaluator is never called (no reading to evaluate).
+    #[test]
+    fn lenient_json_for_an_ordinary_tool_warns_in_observe_and_is_refused_in_enforce() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "duplicate key",
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/a","path":"/b"}}}"#.to_vec(),
+            ),
+            (
+                "lone surrogate",
+                br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"\ud800"}}}"#.to_vec(),
+            ),
+            ("200 levels of nesting", nested_call("write_file", 200)),
+        ];
+        for (label, raw) in cases {
+            assert!(
+                matches!(classify(&raw), Classified::Unparseable(_)),
+                "{label}"
+            );
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
+            let out = handle_client_line(&raw, Mode::Observe, "fs", &mut eval);
+            assert_eq!(
+                out.to_server.as_deref().map(|b| &b[..raw.len()]),
+                Some(&raw[..]),
+                "{label}"
+            );
+            assert!(out.to_client.is_none(), "{label}");
+            assert_eq!(out.warnings.len(), 1, "{label}: {:?}", out.warnings);
+            assert!(
+                out.warnings[0].contains("WARNING unparseable client line")
+                    && out.warnings[0].contains(&format!("{} bytes", raw.len())),
+                "{label}: {:?}",
+                out.warnings
+            );
+            let out = handle_client_line(&raw, Mode::Enforce, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{label}");
+            assert!(out.to_client.is_some(), "{label}");
+            assert!(eval.calls.is_empty(), "{label}");
+        }
+    }
+
+    /// Hallazgo 11 / G7: a malformed line that may name a `safety*` tool is
+    /// refused in both modes, never forwarded, and never evaluated.
+    #[test]
+    fn lenient_json_naming_a_safety_tool_is_refused_in_both_modes() {
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "undeclared safety:halt with a duplicate key",
+                br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"safety:halt","arguments":{"x":1,"x":2}}}"#.to_vec(),
+            ),
+            (
+                "duplicate name, safety reading first",
+                br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"safety:halt","name":"echo"}}"#.to_vec(),
+            ),
+            (
+                "escaped name and a lone surrogate",
+                br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"\u0053AFETY:halt","arguments":{"p":"\ud800"}}}"#.to_vec(),
+            ),
+            ("200 levels of nesting", nested_call("Safety:stop_all", 200)),
+            (
+                "not JSON at all",
+                b"{method: 'tools/call', params: {name: 'safety:halt'}}".to_vec(),
+            ),
+        ];
+        for (label, raw) in cases {
+            assert!(may_name_safety_tool(&raw), "{label}");
+            for mode in [Mode::Observe, Mode::Enforce] {
+                let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+                let out = handle_client_line(&raw, mode, "fs", &mut eval);
+                assert!(out.to_server.is_none(), "{label} ({})", mode.as_str());
+                let reply: Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32700, "{label}");
+                assert!(
+                    out.warnings[0].contains("may name a safety* tool"),
+                    "{label}: {:?}",
+                    out.warnings
+                );
+                assert!(eval.calls.is_empty(), "{label}");
+            }
+        }
+    }
+
+    /// A bare-CR line whose segments do not all parse, naming a safety tool
+    /// in a segment that does not parse, is refused in observe too.
+    #[test]
+    fn ambiguous_line_with_an_unparsed_safety_segment_is_refused_in_observe() {
+        let raw = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\r{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"safety:halt\",\"name\":\"x\"}}\n";
+        assert!(matches!(
+            classify(raw),
+            Classified::Ambiguous { unparsed: true, .. }
+        ));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert!(out.to_server.is_none());
+        assert!(out.to_client.is_some());
+        assert!(eval.calls.is_empty());
+    }
+
+    #[test]
+    fn string_literals_decode_escapes_leniently() {
+        assert_eq!(
+            string_literals(r#"{"a":"\u0073afety","b":"x\ud800y","c":"unterminated"#),
+            ["a", "safety", "b", "x\u{fffd}y", "c", "unterminated"]
+        );
+        assert!(!may_name_safety_tool(
+            br#"{"name":"write_file","x":1,"x":2}"#
+        ));
+        assert!(may_name_safety_tool(br#"{"name":"\u0073\u0061fety:halt"}"#));
     }
 
     #[test]
