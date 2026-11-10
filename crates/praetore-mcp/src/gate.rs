@@ -1223,8 +1223,8 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
     }
 }
 
-/// Append-only JSONL journal: `receipts/<UTC date>.jsonl`, one canonical
-/// evidence document per line, fsynced after each write.
+/// Hash-linked JSONL journal: `receipts/<UTC date>.jsonl`, one chained
+/// entry per line (see [`crate::journal`]), fsynced after each write.
 pub struct Journal {
     dir: PathBuf,
 }
@@ -1247,18 +1247,22 @@ impl Journal {
     pub fn append(&self, evidence: &Evidence) -> Result<PathBuf, String> {
         #[cfg(test)]
         tests::JOURNAL_APPENDS.with(|appends| appends.set(appends.get() + 1));
-        let mut line = evidence
+        let evidence_json = evidence
             .to_json()
             .map_err(|e| format!("cannot serialize evidence: {e}"))?;
-        line.push('\n');
         store::ensure_dir(&self.dir, false)?;
-        let path = self.path_for(OffsetDateTime::now_utc());
+        // Held until the entry is on disk: the position read below must
+        // still be the end of the journal when the line is written.
+        let _lock = crate::journal::JournalLock::acquire(&self.dir)?;
+        let (path, position) =
+            crate::journal::next_append(&self.dir, self.path_for(OffsetDateTime::now_utc()))?;
         if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(format!(
                 "{} is a symlink; refusing to append",
                 path.display()
             ));
         }
+        let line = crate::journal::chained_line(&position, &evidence_json);
         append_line(&path, line.as_bytes())
             .map_err(|e| format!("cannot append to {}: {e}", path.display()))?;
         Ok(path)
@@ -1267,17 +1271,31 @@ impl Journal {
 
 fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut options = fs::OpenOptions::new();
-    options.append(true).create(true);
+    options.append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(crate::journal::nofollow_flag());
     }
-    let mut file = options.open(path)?;
-    // One write per line keeps concurrent wrappers (one per server) from
-    // interleaving within a line on local filesystems with O_APPEND.
+    // Creating the daily file adds an entry to the directory: fsync the
+    // directory too, or a crash could lose the file with its receipts.
+    let (mut file, created) = match options.open(path) {
+        Ok(file) => (file, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (options.create_new(true).open(path)?, true)
+        }
+        Err(error) => return Err(error),
+    };
+    // One write per line; the journal lock keeps concurrent wrappers (one
+    // per server) from interleaving.
     file.write_all(bytes)?;
-    file.sync_data()
+    file.sync_data()?;
+    if created && let Some(dir) = path.parent() {
+        crate::fsutil::sync_dir(dir)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2583,6 +2601,59 @@ mod tests {
                 .unwrap_err()
                 .contains("symlink")
         );
+    }
+
+    /// Concurrent appends: wrappers append concurrently (one per server); the
+    /// journal lock keeps their entries one chain, with no position used
+    /// twice.
+    #[test]
+    fn concurrent_writers_append_one_unbroken_chain() {
+        let (_temp, root) = canonical_tempdir();
+        let home = Home::new(root.join("home"));
+        store::init(&home).unwrap();
+        let writers: Vec<_> = (0..4)
+            .map(|writer| {
+                let home = Home::new(home.root.clone());
+                std::thread::spawn(move || {
+                    let gate = Gate::load(&home, Mode::Observe).unwrap();
+                    for n in 0..10 {
+                        let params = json!({"name": "echo", "arguments": {"w": writer, "n": n}});
+                        let evidence = gate.evaluate_evidence("s", &params).unwrap();
+                        gate.journal.append(&evidence).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let report = crate::receipts::verify_journal(&home, None).unwrap();
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!((report.ok, report.chained, report.unchained), (40, 40, 0));
+        assert_eq!(report.head.unwrap().seq, 40);
+    }
+
+    /// Directory sync: the directory fsync used after creating, renaming or removing a
+    /// file works on a directory and reports an error for a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn directory_fsync_succeeds_and_reports_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        crate::fsutil::sync_dir(temp.path()).unwrap();
+        assert!(crate::fsutil::sync_dir(&temp.path().join("missing")).is_err());
+        // A new daily file is created and the directory synced with it.
+        let path = temp.path().join("2026-01-01.jsonl");
+        append_line(&path, b"x\n").unwrap();
+        append_line(&path, b"y\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            // The daily file is opened with O_NOFOLLOW.
+            let link = temp.path().join("2026-01-02.jsonl");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(append_line(&link, b"z\n").is_err());
+            assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
+        }
     }
 
     #[test]

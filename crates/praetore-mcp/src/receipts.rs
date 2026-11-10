@@ -2,6 +2,7 @@
 //! delegated to `praetore-core` (`Evidence::from_json` integrity,
 //! `verify_attester_signature`, `verify_agent_intent`, issuer pins).
 
+use crate::journal::{self, ChainCheck, Position};
 use crate::{
     gate::MODE_CONTEXT_KEY,
     store::{self, AUDIENCE, Home},
@@ -18,19 +19,8 @@ pub struct JournalLine {
 
 /// All journal lines in file-name (date) order, then line order.
 pub fn read_journal(home: &Home) -> Result<Vec<JournalLine>, String> {
-    let dir = home.receipts_dir();
-    let mut files: Vec<PathBuf> = match fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
-            .collect(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
-    };
-    files.sort();
     let mut lines = Vec::new();
-    for file in files {
+    for file in journal::journal_files(&home.receipts_dir())? {
         let text = fs::read_to_string(&file)
             .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
         for (index, line) in text.lines().enumerate() {
@@ -82,8 +72,8 @@ pub fn render_table(lines: &[JournalLine], tail: usize) -> String {
         "TIME (UTC)", "MODE", "SERVER", "TOOL", "DECISION", "RULE", "EVIDENCE ID"
     );
     for line in &lines[start..] {
-        match Evidence::from_json(&line.text) {
-            Ok(evidence) => {
+        match journal::parse_line(&line.text) {
+            Ok(journal::Entry { evidence, .. }) => {
                 let time = evidence
                     .decided_at
                     .as_deref()
@@ -141,6 +131,15 @@ pub struct VerifyReport {
     pub total: usize,
     pub ok: usize,
     pub failures: Vec<String>,
+    /// Entries written before the journal was chained (bare evidence lines).
+    pub unchained: u64,
+    /// Chained entries.
+    pub chained: u64,
+    /// Position after the last chained entry: `seq` is the next sequence
+    /// number (the last entry's `seq` + 1, not a count of the entries
+    /// present, see `chained`) and `prev` the link to keep somewhere the
+    /// journal's writers cannot change and pass back as `expected_head`.
+    pub head: Option<Position>,
     pub by_mode: BTreeMap<String, usize>,
     pub by_decision: BTreeMap<&'static str, usize>,
 }
@@ -151,7 +150,17 @@ pub fn verify_line(
     attester: &VerifiedPublicKey,
     issuer_pins: &[TrustedAuthorityIssuer],
 ) -> Result<Evidence, String> {
-    let evidence = Evidence::from_json(text).map_err(|e| format!("{}: {e}", e.code()))?;
+    let evidence = journal::parse_line(text)?.evidence;
+    verify_evidence(&evidence, attester, issuer_pins)?;
+    Ok(evidence)
+}
+
+/// Verifies one parsed receipt against the local pins.
+fn verify_evidence(
+    evidence: &Evidence,
+    attester: &VerifiedPublicKey,
+    issuer_pins: &[TrustedAuthorityIssuer],
+) -> Result<(), String> {
     if !evidence.is_high_assurance_shape() {
         return Err("not HighAssurance (v2) evidence".into());
     }
@@ -184,35 +193,71 @@ pub fn verify_line(
     if evidence.intent_v2.as_ref().map(|i| i.audience.as_str()) != Some(AUDIENCE) {
         return Err("intent audience is not praetore-mcp".into());
     }
-    match mode_of(&evidence) {
-        Some("observe" | "enforce") => {}
-        _ => return Err(format!("missing or invalid {MODE_CONTEXT_KEY}")),
+    match mode_of(evidence) {
+        Some("observe" | "enforce") => Ok(()),
+        _ => Err(format!("missing or invalid {MODE_CONTEXT_KEY}")),
     }
-    Ok(evidence)
 }
 
-pub fn verify_journal(home: &Home) -> Result<VerifyReport, String> {
+/// Verifies every receipt and the order of the journal: no entry removed,
+/// duplicated or reordered between the first and the last chained entry.
+/// Entries removed at the end are only detected with `expected_head`.
+pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<VerifyReport, String> {
+    let expected_head = expected_head
+        .map(|text| {
+            praetore_core::journal_chain::ChainLink::from_hex(text)
+                .ok_or("--expected-head must be 64 lowercase hex characters")
+        })
+        .transpose()?;
     let attester = store::read_attester_pin(&home.attester_pin())?;
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     let mut report = VerifyReport::default();
+    let mut chain = ChainCheck::default();
     for line in read_journal(home)? {
         report.total += 1;
-        match verify_line(&line.text, &attester, &pins) {
-            Ok(evidence) => {
+        let at = format!("{}:{}", line.file.display(), line.line_number);
+        let entry = match journal::parse_line(&line.text) {
+            Ok(entry) => entry,
+            Err(error) => {
+                chain.push_unreadable();
+                report.failures.push(format!("FAIL {at}: {error}"));
+                continue;
+            }
+        };
+        let order = chain.push(&entry);
+        match verify_evidence(&entry.evidence, &attester, &pins) {
+            Ok(()) if order.is_none() => {
                 report.ok += 1;
                 *report
                     .by_mode
-                    .entry(mode_of(&evidence).unwrap_or("?").to_owned())
+                    .entry(mode_of(&entry.evidence).unwrap_or("?").to_owned())
                     .or_default() += 1;
                 *report
                     .by_decision
-                    .entry(decision_label(evidence.decision.outcome))
+                    .entry(decision_label(entry.evidence.decision.outcome))
                     .or_default() += 1;
             }
-            Err(error) => report.failures.push(format!(
-                "FAIL {}:{}: {error}",
-                line.file.display(),
-                line.line_number
+            Ok(()) => {}
+            Err(error) => report.failures.push(format!("FAIL {at}: {error}")),
+        }
+        if let Some(problem) = order {
+            report
+                .failures
+                .push(format!("FAIL {at}: journal order: {problem}"));
+        }
+    }
+    report.chained = chain.chained;
+    report.unchained = chain.unchained;
+    report.head = chain.head();
+    if let Some(expected) = expected_head {
+        match report.head {
+            Some(head) if head.prev == expected => {}
+            Some(head) => report.failures.push(format!(
+                "FAIL journal head {} ({} chained entries present, next seq {}) does not match the expected head {expected}: entries were removed or added",
+                head.prev, report.chained, head.seq
+            )),
+            None => report.failures.push(format!(
+                "FAIL journal has no verifiable head; expected {expected}"
             )),
         }
     }

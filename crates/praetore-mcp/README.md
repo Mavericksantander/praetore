@@ -2,9 +2,12 @@
 
 `praetore-mcp` is a local **stdio MCP proxy**. It sits between an MCP client
 (Claude Desktop, Cursor, VS Code) and any existing stdio MCP server. Every
-`tools/call` the client sends is evaluated by the PRÆTORE HighAssurance engine,
-and the result is written as a signed evidence receipt that a third party can
-check offline with `praetore-verify`. It needs no PostgreSQL, no server and no
+`tools/call` the client sends that praetore-mcp can parse is evaluated by the
+PRÆTORE HighAssurance engine, and the result is written as a signed evidence
+receipt that a third party can check offline with `praetore-verify`. A client
+line it cannot parse gets no receipt: it is refused in enforce, and in
+observe it is forwarded with a stderr warning that identifies it (SHA-256 and
+length), or refused if it may name a `safety*` tool (see Message handling). It needs no PostgreSQL, no server and no
 Rust code.
 
 * **observe** (default): every call that the policy classifies is
@@ -193,10 +196,29 @@ symlink) is processed once.
 
 ## What a receipt is
 
-Each `tools/call` produces one JSON line in
-`DIR/receipts/<UTC date>.jsonl`. The journal is append-only and is fsynced
-after every line. Each line is a complete PRÆTORE HighAssurance (`v2`)
-`Evidence` document:
+Each evaluated `tools/call` produces one JSON line in
+`DIR/receipts/<UTC date>.jsonl`, fsynced after every line (and the directory
+when a new daily file is created). Each line is
+`{"seq":N,"prev":"<64 hex>","evidence":{...}}`, the line format of
+`praetore_core::journal_chain` (see
+[`docs/proposals/journal-chain-jsonl.md`](../../docs/proposals/journal-chain-jsonl.md)):
+`seq` counts from 0 across all daily files and `prev` is the hash link of the
+previous entry. `praetore-mcp verify` reports an entry that was removed,
+duplicated or reordered before the last one, and prints the head (entry
+count and last link). Entries removed at the end of the journal leave a
+valid shorter chain: they are only detected with `verify --expected-head`
+against a head kept where the wrapped servers cannot write. Without that,
+the journal shows what is in it, not that nothing is missing. Lines written
+by earlier versions (a bare evidence document) still verify, are counted as
+unchained, and may only come before the first chained entry. Concurrent
+wrappers serialize appends with a lock file (`receipts/.journal.lock`,
+`flock`, on Linux and macOS). If the last line is incomplete (an
+interrupted write), nothing more is appended: enforce refuses calls and
+observe warns until the journal is checked. A daily file that starts at
+`seq` 0 (and has at most 4096 entries) also verifies with `praetore-verify
+journal --journal FILE --attester-pin attester-public-key.hex`, with the same
+head. Each `evidence` is a complete
+PRÆTORE HighAssurance (`v2`) `Evidence` document:
 
 * `action`: `action_type` `mcp.tools/call`, `target` = server name,
   `capability` `mcp:tools/call`, and `parameters`
@@ -226,7 +248,9 @@ formats `praetore-verify` reads:
 
 ```sh
 D=~/.praetore/mcp
-sed -n 1p "$D"/receipts/2026-10-30.jsonl > /tmp/receipt.json
+# The receipt is the "evidence" member of the journal line, byte for byte.
+sed -n 1p "$D"/receipts/2026-10-30.jsonl |
+  sed -e 's/^{"seq":[0-9]*,"prev":"[0-9a-f]*","evidence"://' -e 's/}$//' > /tmp/receipt.json
 praetore-verify evidence \
   --evidence /tmp/receipt.json \
   --attester-pin "$D"/attester-public-key.hex \
@@ -513,8 +537,9 @@ Things to know:
     if a message-level or `params` key is a case variant of `method`,
     `params`, `id`, `jsonrpc`, `name` or `arguments`. In observe, both the
     exact-key and the Go (case-folded, last-wins) readings are recorded.
-* Client lines over 32 MiB are refused in enforce. In observe they are
-  forwarded unchecked, with a warning.
+* Client lines over 32 MiB are refused in both modes, with a stderr
+  warning: they are not parsed, so they cannot be checked for a `safety*`
+  tool (G7).
 * If the home cannot be loaded when `wrap` starts (not initialized, or
   missing or invalid keys, pins, authority or policy), **both modes refuse
   every `tools/call` (fail closed)** and gate the remaining traffic as
@@ -525,9 +550,23 @@ Things to know:
   a loud stderr warning and no receipt.** Exceptions (G7): an unclassified
   action type and any `safety*` tool name that is not exactly a declared
   Safety action are refused in observe as well, even when the name would
-  fail validation or the line is ambiguous. Unparseable lines are still
-  forwarded unchanged in observe. If a receipt cannot be written,
+  fail validation or the line is ambiguous. If a receipt cannot be written,
   enforce refuses the call; observe forwards it and warns.
+* Client lines that praetore-mcp cannot parse (not UTF-8, not JSON, a
+  duplicate key, a lone UTF-16 surrogate escape, nesting deeper than 128)
+  are never forwarded silently. Other parsers may accept them, so they are
+  handled without a receipt:
+  * a line that may name a `safety*` tool (the text, or any string in it
+    with JSON escapes decoded, contains `safety` in any ASCII case) is
+    **refused in both modes**, even for a declared Safety action, because it
+    cannot be checked against the policy (G7). The client gets JSON-RPC error
+    `-32700`;
+  * any other such line is refused in enforce, and forwarded in observe with
+    a stderr warning that gives the parse error, the SHA-256 and the length
+    of the line.
+
+  The same `safety*` rule applies to a line with bare `\r` separators when
+  one of its parts cannot be parsed.
 
 ## Trust model
 
@@ -604,4 +643,5 @@ Things to know:
 | `issuer-pins.jsonl` | issuer pin (`praetore-verify --issuer-pins`) |
 | `attester-public-key.hex` | attester public key (`praetore-verify --attester-pin`) |
 | `policy.json` | v2 policy |
-| `receipts/YYYY-MM-DD.jsonl` | append-only evidence journal |
+| `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
+| `receipts/.journal.lock` | lock held while one entry is appended |

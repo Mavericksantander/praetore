@@ -46,7 +46,7 @@ tool of `filesystem`. Then:
 
 ```sh
 praetore-mcp receipts --tail 5   # one ALLOW, one DENY deny-write
-praetore-mcp verify              # OK N receipts: N verified, 0 failed
+praetore-mcp verify              # OK N receipts: N verified, 0 failed; prints the journal head
 ```
 
 The evidence id in the chat matches the `EVIDENCE ID` column. To undo:
@@ -65,7 +65,9 @@ Read these before relying on anything above.
    `praetore-mcp receipts` showed no receipt at all, because no `tools/call`
    was sent. If the agent has another route to the same resource, a `deny`
    rule does not close it. How to check: if an action happened and there is
-   no receipt for it, it did not go through `praetore-mcp`.
+   no receipt for it, it did not go through `praetore-mcp`, or (observe only)
+   `praetore-mcp` could not parse the line and forwarded it with a stderr
+   warning that names its SHA-256.
 2. **The keys are LOCAL/DEV keys for one machine.** `init` creates three
    Ed25519 keys under `~/.praetore/mcp/keys/` (0600). There is no PKI, no key
    rotation, no hardware key storage and no revocation. Anyone who can read
@@ -129,6 +131,8 @@ Read these before relying on anything above.
 | `praetore-mcp wrap --help` fails with `unexpected argument "--help"` | A build up to `9735974`, before per-command help ([#49](https://github.com/Mavericksantander/praetore/pull/49)) | Reinstall (see the README's Install section), or use `praetore-mcp --help`, which lists every option. |
 | `another praetore-mcp policy command is running (lock …)` | A previous `policy` command was interrupted | If no other `policy` command is running, delete `~/.praetore/mcp/policy.json.lock`. |
 | `verify` prints `FAIL` | A journal line was edited, or the trust files do not match the keys that signed it | Do not trust that receipt. Check that `--dir` is the home that wrote it. Re-labeling observe as enforce is detected on purpose. |
+| `verify` prints `FAIL ... journal order` | An entry was removed, duplicated or reordered, or a daily file is missing | Do not trust the journal as complete. Compare with a copy or a head kept elsewhere (`verify --expected-head HEX`). |
+| Every call is refused in enforce with `does not end with a newline` | The last journal line is incomplete (an interrupted write, a full disk) | Run `praetore-mcp verify`, keep a copy of the journal, and remove the incomplete last line by hand. |
 | About a year after `init`, every call is refused in enforce mode | The authority from `init` is valid for 364 days | Run `init` in a new `--dir` and `install` again. |
 
 Where to look:

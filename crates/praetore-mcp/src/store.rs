@@ -264,6 +264,10 @@ fn write_new(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.sync_all())
+        .and_then(|()| match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => crate::fsutil::sync_dir(dir),
+            _ => Ok(()),
+        })
         .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
@@ -289,6 +293,13 @@ pub fn ensure_dir(path: &Path, allow_symlink: bool) -> Result<(), String> {
             }
             builder
                 .create(path)
+                .and_then(|()| match path.parent() {
+                    // The new directory is an entry of its parent.
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        crate::fsutil::sync_dir(parent)
+                    }
+                    _ => Ok(()),
+                })
                 .map_err(|e| format!("cannot create {}: {e}", path.display()))
         }
         Err(error) => Err(format!("cannot stat {}: {error}", path.display())),

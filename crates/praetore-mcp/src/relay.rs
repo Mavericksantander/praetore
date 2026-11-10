@@ -297,24 +297,14 @@ pub fn run(options: WrapOptions) -> i32 {
             match read_line_limited(&mut reader, &mut buf, MAX_CLIENT_LINE_BYTES) {
                 Ok(LineRead::Eof) | Err(_) => break,
                 Ok(LineRead::TooLong) => {
-                    let result = match mode {
-                        Mode::Observe => {
-                            eprintln!(
-                                "praetore-mcp: WARNING client message over {MAX_CLIENT_LINE_BYTES} bytes forwarded unchecked (observe mode)"
-                            );
-                            child_stdin
-                                .write_all(&buf)
-                                .and_then(|()| drain_line(&mut reader, Some(&mut child_stdin)))
-                                .and_then(|()| child_stdin.flush())
-                        }
-                        Mode::Enforce => {
-                            eprintln!(
-                                "praetore-mcp: REFUSED client message over {MAX_CLIENT_LINE_BYTES} bytes (enforce mode)"
-                            );
-                            drain_line(&mut reader, None)
-                        }
-                    };
-                    if result.is_err() {
+                    // Too long to parse, so it can be neither evaluated nor
+                    // checked for a safety* tool name (G7): refused in both
+                    // modes, never forwarded unchecked.
+                    eprintln!(
+                        "praetore-mcp: REFUSED client message over {MAX_CLIENT_LINE_BYTES} bytes ({}); it cannot be checked",
+                        mode.as_str()
+                    );
+                    if drain_line(&mut reader, None).is_err() {
                         break;
                     }
                 }
