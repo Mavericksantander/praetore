@@ -137,6 +137,62 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
             )
 
 
+
+class GatewayReceiptFinalityTests(unittest.TestCase):
+    """T-015: a receipt can verify and still describe a state that a later
+    receipt for the same request changes."""
+
+    KEY_ID = "test-execution-attester-v1"
+    CASES = [
+        ("receipt-v2-awaiting-approval.json", False, "awaiting_approval_or_legacy"),
+        ("receipt-v2-outcome-unknown.json", False, "outcome_unknown"),
+        ("receipt-v3-approval-rejected.json", True, None),
+        ("receipt-v3-approval-expired.json", True, None),
+        ("receipt-v3-crash-recovered.json", True, None),
+        ("receipt-v2-confirmed.json", True, None),
+        ("receipt-v1-confirmed.json", True, None),
+    ]
+
+    def setUp(self) -> None:
+        self.pin = (FIXTURES / "execution-attester-public-key.hex").read_text(
+            encoding="ascii"
+        ).strip()
+        self.evidence_pin = (
+            FIXTURES / "receipt-evidence-attester-public-key.hex"
+        ).read_text(encoding="ascii").strip()
+
+    def args(self, receipt: str):
+        return (receipt, self.pin, self.KEY_ID, self.evidence_pin)
+
+    def test_finality_of_each_committed_receipt(self) -> None:
+        for name, final, reason in self.CASES:
+            with self.subTest(name=name):
+                receipt = (FIXTURES / name).read_text(encoding="utf-8")
+                self.assertTrue(praetore.verify_gateway_receipt(*self.args(receipt)))
+                self.assertEqual(
+                    praetore.gateway_receipt_finality(*self.args(receipt)),
+                    (final, reason),
+                )
+                self.assertEqual(
+                    praetore.verify_final_gateway_receipt(*self.args(receipt)), final
+                )
+
+    def test_unverifiable_receipts_have_no_finality(self) -> None:
+        receipt = (FIXTURES / "receipt-v3-approval-rejected.json").read_text(
+            encoding="utf-8"
+        )
+        tampered = receipt.replace('"approval_rejected"', '"approval_expired"', 1)
+        self.assertNotEqual(tampered, receipt)
+        for candidate, pin in [
+            (tampered, self.pin),
+            (receipt, "00" * 32),
+            ("{", self.pin),
+        ]:
+            with self.subTest(pin=pin[:4]):
+                args = (candidate, pin, self.KEY_ID, self.evidence_pin)
+                self.assertIsNone(praetore.gateway_receipt_finality(*args))
+                self.assertFalse(praetore.verify_final_gateway_receipt(*args))
+
 class LegacyEvidenceVerificationTests(unittest.TestCase):
     """Receipts whose evidence predates ``decided_by`` (schema v1-v3) keep
     verifying unchanged; current fixtures carry evidence schema v4."""

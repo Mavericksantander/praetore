@@ -664,3 +664,86 @@ fn failure_classification_parsing_is_strict() {
         assert_eq!(serde_json::to_string(&failure).unwrap(), valid);
     }
 }
+
+/// T-015 finding 1 (option A): `non_final_reason` over every combination of
+/// signed authorization, execution and reason, including ones a verified
+/// receipt never carries. Only the pending approval shape and
+/// `outcome_unknown` (plus the intermediate states) are not final.
+#[test]
+fn non_final_reason_covers_every_signed_state() {
+    use praetore_receipt::{
+        AuthorizationStatus as A, ExecutionStatus as E, NonFinalReason as N,
+        NotDispatchedReason as R,
+    };
+    let mut receipt: GatewayReceipt =
+        serde_json::from_str(&fixture("receipt-v2-confirmed.json")).unwrap();
+    let reasons = [
+        None,
+        Some(R::ApprovalExpired),
+        Some(R::ApprovalRejected),
+        Some(R::DispatchFailed),
+        Some(R::CrashRecovered),
+        Some(R::DispatchRefused),
+    ];
+    let executions = [
+        E::NotDispatched,
+        E::Authorized,
+        E::ApprovedPendingDispatch,
+        E::Dispatched,
+        E::Executed,
+        E::Confirmed,
+        E::OutcomeUnknown,
+        E::Failed,
+    ];
+    let mut not_final = 0;
+    for authorization in [A::Allowed, A::RequiresApproval, A::Denied] {
+        for execution in executions {
+            for reason in reasons {
+                receipt.execution_attestation.authorization = authorization;
+                receipt.execution_attestation.execution = execution;
+                receipt.execution_attestation.not_dispatched_reason = reason;
+                let expected = match (authorization, execution, reason) {
+                    (A::RequiresApproval, E::NotDispatched, None) => {
+                        Some(N::AwaitingApprovalOrLegacy)
+                    }
+                    (_, E::OutcomeUnknown, _) => Some(N::OutcomeUnknown),
+                    (_, E::Authorized | E::ApprovedPendingDispatch | E::Dispatched, _) => {
+                        Some(N::Intermediate)
+                    }
+                    _ => None,
+                };
+                let case = format!("{authorization:?} {execution:?} {reason:?}");
+                assert_eq!(receipt.non_final_reason(), expected, "{case}");
+                assert_eq!(receipt.is_final(), expected.is_none(), "{case}");
+                not_final += usize::from(expected.is_some());
+            }
+        }
+    }
+    // 1 pending shape, 3 x 6 outcome_unknown, 3 x 3 x 6 intermediate.
+    assert_eq!(not_final, 1 + 18 + 54);
+    assert_eq!(
+        N::AwaitingApprovalOrLegacy.as_str(),
+        "awaiting_approval_or_legacy"
+    );
+    assert_eq!(N::OutcomeUnknown.as_str(), "outcome_unknown");
+    assert_eq!(N::Intermediate.as_str(), "intermediate");
+}
+
+/// The committed finality fixtures verify, and only the pending approval
+/// and `outcome_unknown` receipts are not final.
+#[test]
+fn committed_receipts_report_their_finality() {
+    for (name, is_final) in [
+        ("receipt-v2-awaiting-approval.json", false),
+        ("receipt-v2-outcome-unknown.json", false),
+        ("receipt-v3-approval-rejected.json", true),
+        ("receipt-v3-approval-expired.json", true),
+        ("receipt-v3-crash-recovered.json", true),
+        ("receipt-v2-confirmed.json", true),
+        ("receipt-v1-confirmed.json", true),
+    ] {
+        let receipt =
+            verify_gateway_receipt_json(&fixture(name), &key(), KEY_ID, &evidence_key()).unwrap();
+        assert_eq!(receipt.is_final(), is_final, "{name}");
+    }
+}

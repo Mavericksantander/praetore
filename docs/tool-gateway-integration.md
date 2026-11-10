@@ -629,6 +629,10 @@ The HTTP flow is:
 
 1. `POST /v1/execute` returns `202 Accepted` and a receipt with
    `authorization = requires_approval`; the action remains `NotDispatched`.
+   This receipt is not final: the request may still be approved and
+   executed. `praetore-verify receipt` reports it with `final: false` and
+   `non_final_reason: awaiting_approval_or_legacy`, and `--require-final`
+   refuses it (see docs/operations.md).
 2. `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}` returns
    `{"challenge": ApprovalChallenge, "action": Action}`. The challenge is
    derived from the pending execution's stored evidence and binds the tenant,

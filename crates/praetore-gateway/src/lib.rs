@@ -122,7 +122,7 @@ use uuid::Uuid;
 
 pub use praetore_receipt::{
     AttestedOutcome, AuthorizationStatus, ExecutionAttestation, ExecutionAttestationError,
-    ExecutionAttestationSigner, ExecutionFailure, ExecutionStatus, GatewayReceipt,
+    ExecutionAttestationSigner, ExecutionFailure, ExecutionStatus, GatewayReceipt, NonFinalReason,
     NotDispatchedReason, RefusalCode, action_digest, verify_gateway_receipt_json,
 };
 

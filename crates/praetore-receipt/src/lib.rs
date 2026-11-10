@@ -45,8 +45,17 @@ pub enum AuthorizationStatus {
     Denied,
 }
 
-/// Final gateway-side state. `Dispatched` means the gateway durably committed
-/// to invoking the adapter; it does not prove a remote system received a call.
+/// Gateway-side execution state. `Dispatched` means the gateway durably
+/// committed to invoking the adapter; it does not prove a remote system
+/// received a call.
+///
+/// Not every state a receipt can carry is final: see
+/// [`GatewayReceipt::non_final_reason`]. `NotDispatched` on a
+/// `requires_approval` receipt without a `not_dispatched_reason` is the
+/// receipt returned while the approval is pending (or one written before
+/// signed closing reasons existed), and `OutcomeUnknown` may later be
+/// resolved by reconciliation. Later receipts for the same request can
+/// record a different state.
 ///
 /// `ApprovedPendingDispatch` exists only for `RequiresApproval`: a human
 /// approved, and no dispatch has been claimed yet. Like `Authorized`, it is
@@ -610,7 +619,69 @@ pub struct GatewayReceipt {
     pub execution_attestation: ExecutionAttestation,
 }
 
+/// Why a receipt does not describe a final state of its request. Returned
+/// by [`GatewayReceipt::non_final_reason`]. Read from the signed
+/// attestation; the signed format is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonFinalReason {
+    /// `requires_approval`, `not_dispatched`, no `not_dispatched_reason`:
+    /// the receipt returned while a human approval is pending. Receipts
+    /// written before signed closing reasons (`approval_rejected`,
+    /// `approval_expired`) existed have the same shape and cannot be told
+    /// apart, so they are reported the same way. The request may still be
+    /// approved and executed.
+    AwaitingApprovalOrLegacy,
+    /// `outcome_unknown`: reconciliation may later record `executed`,
+    /// `confirmed` or `failed`.
+    OutcomeUnknown,
+    /// `authorized`, `approved_pending_dispatch` or `dispatched`:
+    /// intermediate states that a verified receipt never carries.
+    Intermediate,
+}
+
+impl NonFinalReason {
+    /// Stable code: the `non_final_reason` value of `praetore-verify
+    /// receipt` and of the Python binding.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AwaitingApprovalOrLegacy => "awaiting_approval_or_legacy",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Intermediate => "intermediate",
+        }
+    }
+}
+
 impl GatewayReceipt {
+    /// `None` when the signed state of this receipt is final: no later
+    /// receipt for the same request can record another state. Otherwise
+    /// the reason it is not. Read from the signed attestation, so it is
+    /// meaningful only for a receipt that verified (for example one
+    /// returned by [`verify_gateway_receipt_json`]).
+    pub fn non_final_reason(&self) -> Option<NonFinalReason> {
+        let attestation = &self.execution_attestation;
+        match attestation.execution {
+            ExecutionStatus::NotDispatched => (attestation.authorization
+                == AuthorizationStatus::RequiresApproval
+                && attestation.not_dispatched_reason.is_none())
+            .then_some(NonFinalReason::AwaitingApprovalOrLegacy),
+            ExecutionStatus::OutcomeUnknown => Some(NonFinalReason::OutcomeUnknown),
+            ExecutionStatus::Authorized
+            | ExecutionStatus::ApprovedPendingDispatch
+            | ExecutionStatus::Dispatched => Some(NonFinalReason::Intermediate),
+            ExecutionStatus::Executed | ExecutionStatus::Confirmed | ExecutionStatus::Failed => {
+                None
+            }
+        }
+    }
+
+    /// Whether the signed state of this receipt is final (see
+    /// [`Self::non_final_reason`]). A pending approval receipt verifies but
+    /// is not final: it must not be read as "this request was never
+    /// dispatched".
+    pub fn is_final(&self) -> bool {
+        self.non_final_reason().is_none()
+    }
+
     /// Verifies the execution attestation against the pinned execution key
     /// and, because the attestation binds the evidence `context_hash` (which
     /// excludes the evidence signature), also the evidence

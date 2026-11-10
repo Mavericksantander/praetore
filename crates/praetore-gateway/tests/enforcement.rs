@@ -3147,6 +3147,126 @@ mod apd {
         assert_eq!(tool.invocations(), 0);
     }
 
+    /// The receipt the journal holds for `key`, as the gateway returns it.
+    fn stored_receipt(
+        journal: &MemoryJournal,
+        key: ExecutionKey,
+    ) -> praetore_gateway::GatewayReceipt {
+        let record = journal.get(key).unwrap().unwrap();
+        praetore_gateway::GatewayReceipt {
+            evidence: record.evidence,
+            authorization: record.authorization,
+            execution: record.execution,
+            output: record.output,
+            execution_attestation: record.execution_attestation.unwrap(),
+        }
+    }
+
+    /// T-015 finding 1 (option A): one committed receipt per finality case,
+    /// read by praetore-verify and the Python package. Regenerated only with
+    /// `UPDATE_FINALITY_RECEIPT_FIXTURES=1` (the older fixtures are left
+    /// untouched); by default the committed files must verify and report
+    /// the expected finality.
+    #[test]
+    fn finality_receipt_fixtures_for_external_verifiers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/praetore-python/tests/fixtures");
+        let key_id = "test-execution-attester-v1";
+        let public_key = execution_attester_public_key();
+        let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap();
+        if std::env::var_os("UPDATE_FINALITY_RECEIPT_FIXTURES").is_some() {
+            // The 202 receipt of a held request.
+            let (_, key, _, journal, _, _) = clocked_fixture();
+            let awaiting = stored_receipt(&journal, key);
+            // Rejected by a human (signed approval_rejected).
+            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+            let decision = human_approval_decision(
+                gateway.approval_challenge(key).unwrap(),
+                HumanApprovalOutcome::Reject,
+                &approver_key,
+            );
+            let HumanApprovalResult::Rejected {
+                receipt: rejected, ..
+            } = gateway.resolve_human_approval(decision).unwrap()
+            else {
+                panic!("a rejection returns its receipt");
+            };
+            // Approved, claimed after the window (signed approval_expired).
+            let (gateway, key, _, journal, approver_key, clock) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            *clock.lock().unwrap() += Duration::seconds(21);
+            assert!(gateway.dispatch_approved(key).is_err());
+            let expired = stored_receipt(&journal, key);
+            // Approved, dispatched, adapter outcome unknown.
+            let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            tool.fail_after_write.store(true, Ordering::SeqCst);
+            let _ = gateway.dispatch_approved(key);
+            let unknown = stored_receipt(&journal, key);
+            for (name, receipt) in [
+                ("receipt-v2-awaiting-approval.json", &awaiting),
+                ("receipt-v3-approval-rejected.json", &*rejected),
+                ("receipt-v3-approval-expired.json", &expired),
+                ("receipt-v2-outcome-unknown.json", &unknown),
+            ] {
+                std::fs::write(dir.join(name), serde_json::to_string(receipt).unwrap()).unwrap();
+            }
+        }
+        for (name, schema, execution, reason, non_final) in [
+            (
+                "receipt-v2-awaiting-approval.json",
+                2,
+                ExecutionStatus::NotDispatched,
+                None,
+                Some(praetore_gateway::NonFinalReason::AwaitingApprovalOrLegacy),
+            ),
+            (
+                "receipt-v3-approval-rejected.json",
+                3,
+                ExecutionStatus::NotDispatched,
+                Some(NotDispatchedReason::ApprovalRejected),
+                None,
+            ),
+            (
+                "receipt-v3-approval-expired.json",
+                3,
+                ExecutionStatus::NotDispatched,
+                Some(NotDispatchedReason::ApprovalExpired),
+                None,
+            ),
+            (
+                "receipt-v2-outcome-unknown.json",
+                2,
+                ExecutionStatus::OutcomeUnknown,
+                None,
+                Some(praetore_gateway::NonFinalReason::OutcomeUnknown),
+            ),
+        ] {
+            let json = std::fs::read_to_string(dir.join(name)).unwrap();
+            let receipt = praetore_gateway::verify_gateway_receipt_json(
+                &json,
+                &public_key,
+                key_id,
+                &evidence_key,
+            )
+            .unwrap();
+            assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+            assert_eq!(
+                receipt.execution_attestation.schema_version, schema,
+                "{name}"
+            );
+            assert_eq!(receipt.execution, execution, "{name}");
+            assert_eq!(
+                receipt.execution_attestation.not_dispatched_reason, reason,
+                "{name}"
+            );
+            assert_eq!(receipt.non_final_reason(), non_final, "{name}");
+            assert_eq!(receipt.is_final(), non_final.is_none(), "{name}");
+        }
+    }
+
     #[test]
     fn engine_clock_expiry_before_claim_closes_as_approval_expired() {
         let (gateway, key, tool, journal, approver_key, clock) = clocked_fixture();

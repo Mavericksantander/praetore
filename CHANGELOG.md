@@ -24,6 +24,19 @@
   feature).** Callers pass the time from their trusted clock; the gateway
   passes the engine's clock.
 
+### Added
+
+- **Receipt finality in the verifiers (T-015).** `praetore-verify receipt`
+  reports `final` and `non_final_reason`: the receipt returned while a human
+  approval is pending (`requires_approval`, `not_dispatched`, no signed
+  reason; older receipts with that shape too) is reported as
+  `awaiting_approval_or_legacy`, and `outcome_unknown` as `outcome_unknown`,
+  because a later receipt for the same request can record another state.
+  `--require-final` fails with `RECEIPT_NOT_FINAL` for them. Rust:
+  `GatewayReceipt::is_final()` and `non_final_reason()`; Python:
+  `verify_final_gateway_receipt` and `gateway_receipt_finality`. The signed
+  format and the result of signature verification are unchanged.
+
 ### Changed
 
 - **Migration `0021_journal_insert_rules` (T-015).** The execution journal

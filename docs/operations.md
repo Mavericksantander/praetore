@@ -988,6 +988,29 @@ it as `details.failure` (null when absent). `failed` attestations signed
 before this field existed (v2) carry no classification. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
 
+A receipt that verifies is not always final: a later receipt for the same
+request can record another state. The verifier reports `details.final` and
+`details.non_final_reason`, read from the signed attestation (the signed
+format is unchanged):
+
+| Signed state | `final` | `non_final_reason` |
+|---|---|---|
+| `requires_approval`, `not_dispatched`, no `not_dispatched_reason` | `false` | `awaiting_approval_or_legacy` |
+| `outcome_unknown` | `false` | `outcome_unknown` |
+| any other state a receipt carries | `true` | `null` |
+
+`awaiting_approval_or_legacy` is the receipt returned with `202 Accepted`
+while a human approval is pending: the request may still be approved and
+executed, so it does not show that the action was never dispatched. Receipts
+signed before rejection and expiry carried a signed reason have the same
+shape and are reported the same way. `outcome_unknown` may later be resolved
+by reconciliation. With `--require-final` such a receipt fails with
+`RECEIPT_NOT_FINAL` (exit 1; the reason is written to stderr). A receipt whose
+signatures do not verify fails with its own code first. In Rust,
+`GatewayReceipt::is_final()` and `GatewayReceipt::non_final_reason()` apply
+the same rule; the Python package exposes `verify_final_gateway_receipt` and
+`gateway_receipt_finality`.
+
 `praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin
 ingest.pub [--source-pins sources.jsonl] [--expected-head HEX] --format json`
 verifies one exported chain of post-hoc safety records (G1; see

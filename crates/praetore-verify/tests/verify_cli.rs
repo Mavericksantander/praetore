@@ -579,8 +579,12 @@ fn receipt_fixture(name: &str) -> std::path::PathBuf {
 }
 
 fn run_receipt(receipt: &Path) -> Output {
-    run(&[
-        "receipt".into(),
+    run_receipt_with(receipt, &[])
+}
+
+fn run_receipt_with(receipt: &Path, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "receipt".to_string(),
         "--receipt".into(),
         receipt.to_string_lossy().into_owned(),
         "--execution-pin".into(),
@@ -595,7 +599,100 @@ fn run_receipt(receipt: &Path) -> Output {
             .into_owned(),
         "--format".into(),
         "json".into(),
-    ])
+    ];
+    args.extend(extra.iter().map(|flag| flag.to_string()));
+    run(&args)
+}
+
+/// T-015 finding 1 (option A): every committed receipt, with the finality
+/// the verifier reports for it.
+const FINALITY: [(&str, bool, Option<&str>); 6] = [
+    (
+        "receipt-v2-awaiting-approval.json",
+        false,
+        Some("awaiting_approval_or_legacy"),
+    ),
+    (
+        "receipt-v2-outcome-unknown.json",
+        false,
+        Some("outcome_unknown"),
+    ),
+    ("receipt-v3-approval-rejected.json", true, None),
+    ("receipt-v3-approval-expired.json", true, None),
+    ("receipt-v3-crash-recovered.json", true, None),
+    ("receipt-v2-confirmed.json", true, None),
+];
+
+#[test]
+fn receipt_command_reports_whether_the_signed_state_is_final() {
+    for (name, is_final, reason) in FINALITY {
+        let output = run_receipt(&receipt_fixture(name));
+        assert!(
+            output.status.success(),
+            "{name}: a non-final receipt still verifies"
+        );
+        let summary = json_output(&output);
+        assert_eq!(summary["code"], "OK", "{name}");
+        assert_eq!(summary["details"]["final"], is_final, "{name}");
+        assert_eq!(
+            summary["details"]["non_final_reason"],
+            reason.map_or(Value::Null, |reason| Value::String(reason.into())),
+            "{name}"
+        );
+    }
+    // The 202 receipt reads `not_dispatched` with no reason: only `final`
+    // tells it apart from a closed request.
+    let summary = json_output(&run_receipt(&receipt_fixture(
+        "receipt-v2-awaiting-approval.json",
+    )));
+    assert_eq!(summary["details"]["execution"], "not_dispatched");
+    assert_eq!(summary["details"]["not_dispatched_reason"], Value::Null);
+}
+
+#[test]
+fn receipt_command_require_final_refuses_states_that_can_still_change() {
+    for (name, is_final, _) in FINALITY {
+        let output = run_receipt_with(&receipt_fixture(name), &["--require-final"]);
+        assert_eq!(output.status.success(), is_final, "{name}");
+        let summary = json_output(&output);
+        if is_final {
+            assert_eq!(summary["code"], "OK", "{name}");
+            assert_eq!(summary["details"]["final"], true, "{name}");
+        } else {
+            assert_eq!(summary["ok"], false, "{name}");
+            assert_eq!(summary["code"], "RECEIPT_NOT_FINAL", "{name}");
+        }
+    }
+    // A forged receipt is still refused for its signature, not for finality.
+    let awaiting =
+        fs::read_to_string(receipt_fixture("receipt-v2-awaiting-approval.json")).unwrap();
+    let forged = awaiting.replacen("\"not_dispatched\"", "\"failed\"", 1);
+    assert_ne!(forged, awaiting);
+    let path = std::env::temp_dir().join(format!("praetore-receipt-final-{}.json", Uuid::new_v4()));
+    fs::write(&path, forged).unwrap();
+    let output = run_receipt_with(&path, &["--require-final"]);
+    let _ = fs::remove_file(&path);
+    assert!(!output.status.success());
+    assert_ne!(json_output(&output)["code"], "RECEIPT_NOT_FINAL");
+    assert_ne!(json_output(&output)["code"], "OK");
+    // Given twice, or to another command, the flag is a usage error.
+    let twice = run_receipt_with(
+        &receipt_fixture("receipt-v2-confirmed.json"),
+        &["--require-final", "--require-final"],
+    );
+    assert!(!twice.status.success());
+    assert_eq!(json_output(&twice)["code"], "USAGE");
+    let elsewhere = run(&[
+        "policy-digest".into(),
+        "--policy".into(),
+        receipt_fixture("receipt-v2-confirmed.json")
+            .to_string_lossy()
+            .into_owned(),
+        "--require-final".into(),
+        "--format".into(),
+        "json".into(),
+    ]);
+    assert!(!elsewhere.status.success());
 }
 
 #[test]
