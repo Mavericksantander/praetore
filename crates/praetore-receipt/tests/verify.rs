@@ -754,7 +754,7 @@ fn committed_receipts_report_their_finality() {
     }
 }
 
-/// T-016 (finding 1, option B): the 202 receipt of a held request is signed
+/// T-016: the 202 receipt of a held request is signed
 /// as schema v5 `awaiting_approval`, verifies, and is never final.
 #[test]
 fn accepts_the_v5_awaiting_approval_receipt_as_not_final() {
@@ -779,7 +779,7 @@ fn accepts_the_v5_awaiting_approval_receipt_as_not_final() {
     assert!(!receipt.is_final());
 }
 
-/// T-016 (finding 1, option B): schema v5 carries exactly one shape. A
+/// T-016: schema v5 carries exactly one shape. A
 /// signed v5 receipt with a reason, an output, a failure or another
 /// authorization, `awaiting_approval` under another schema, or v5 under
 /// another state is refused even with a valid signature.
@@ -862,7 +862,7 @@ fn rejects_every_other_v5_shape_even_when_signed() {
     assert!(verify_gateway_receipt_json(&json, &public, KEY_ID, &evidence_key()).is_ok());
 }
 
-/// T-016 (finding 15): an approval claimed after its window is closed with
+/// T-016: an approval claimed after its window is closed with
 /// the signed reason `approved_claim_expired` (schema v3), and is final.
 #[test]
 fn accepts_the_approved_claim_expired_close_as_final() {

@@ -3184,7 +3184,7 @@ mod apd {
         }
     }
 
-    /// T-016 (finding 1, option B), end to end: the 202 receipt of a held
+    /// T-016, end to end: the 202 receipt of a held
     /// request is signed as schema v5 `awaiting_approval`. Saved and checked
     /// again after the request was approved and executed, it still verifies
     /// only as `awaiting_approval`, not final, and cannot be presented as a
@@ -3257,7 +3257,7 @@ mod apd {
         ));
     }
 
-    /// T-016 (finding 1, option B): only a held request can be signed as
+    /// T-016: only a held request can be signed as
     /// awaiting approval.
     #[test]
     fn awaiting_approval_is_signed_only_for_requires_approval() {
@@ -3287,7 +3287,7 @@ mod apd {
         assert_eq!(signed.execution, AttestedExecution::AwaitingApproval);
     }
 
-    /// T-016 (finding 1, option B): a held request whose stored attestation
+    /// T-016: a held request whose stored attestation
     /// is the pre-v5 `not_dispatched` shape (written by an older release)
     /// is signed again as `awaiting_approval` when the gateway reads it; the
     /// stored attestation is not rewritten.
@@ -3315,7 +3315,7 @@ mod apd {
         );
     }
 
-    /// T-016 (finding 15): the journal refuses a new `approval_expired` close
+    /// T-016: the journal refuses a new `approval_expired` close
     /// of an approved request (0022); the approved request claimed too late
     /// is closed as `approved_claim_expired`.
     #[test]

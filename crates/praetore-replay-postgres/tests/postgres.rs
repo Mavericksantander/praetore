@@ -2317,7 +2317,7 @@ const APD_CHECKS: [(&str, &str); 6] = [
     ),
     (
         "praetore.execution_journal",
-        "execution_journal_not_dispatched_reason_v3",
+        "execution_journal_not_dispatched_reason_v4",
     ),
     (
         "praetore.execution_journal_events",
@@ -2329,13 +2329,13 @@ const APD_CHECKS: [(&str, &str); 6] = [
     ),
     (
         "praetore.execution_attestations",
-        "execution_attestations_not_dispatched_reason_v3",
+        "execution_attestations_not_dispatched_reason_v4",
     ),
 ];
 
 /// Fails unless every CHECK added by 0010 (reason CHECKs as replaced by
-/// 0013 and 0020) exists, the replaced constraints are gone, and only the
-/// latest (0020, v4) transition trigger is installed.
+/// 0013, 0020 and 0022) exists, the replaced constraints are gone, and only
+/// the latest (0022, v5) transition trigger is installed.
 fn assert_0010_schema_present(client: &mut Client) {
     for (table, name) in APD_CHECKS {
         let found: i64 = client
@@ -2379,6 +2379,15 @@ fn assert_0010_schema_present(client: &mut Client) {
             "praetore.execution_attestations",
             "execution_attestations_not_dispatched_reason_v2",
         ),
+        // Replaced by 0022.
+        (
+            "praetore.execution_journal",
+            "execution_journal_not_dispatched_reason_v3",
+        ),
+        (
+            "praetore.execution_attestations",
+            "execution_attestations_not_dispatched_reason_v3",
+        ),
     ] {
         let found: i64 = client
             .query_one(
@@ -2401,7 +2410,7 @@ fn assert_0010_schema_present(client: &mut Client) {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(triggers, vec!["execution_journal_transition_v4".to_owned()]);
+    assert_eq!(triggers, vec!["execution_journal_transition_v5".to_owned()]);
     let recorded: i64 = client
         .query_one("SELECT count(*) FROM praetore.schema_migrations", &[])
         .unwrap()
@@ -9692,7 +9701,7 @@ fn refused_with(result: Result<u64, postgres::Error>, expected: &str, case: &str
     assert!(message.contains(expected), "{case}: {error}: {message}");
 }
 
-/// T-016 (finding 1, option B) against real PostgreSQL, end to end: the 202
+/// T-016 against real PostgreSQL, end to end: the 202
 /// receipt is signed and stored as schema v5 `awaiting_approval` while the
 /// journal row stays `not_dispatched` with no reason. Saved, approved and
 /// executed, the saved receipt still verifies only as `awaiting_approval`,
@@ -9765,7 +9774,7 @@ fn postgres_saved_202_receipt_stays_awaiting_approval_after_execution() {
     assert!(verify(&relabelled.replace("\"schema_version\":5", "\"schema_version\":2")).is_err());
 }
 
-/// T-016 (finding 1, option B), migration 0022: an `awaiting_approval`
+/// T-016, migration 0022: an `awaiting_approval`
 /// attestation is accepted only for a held row (requires_approval,
 /// not_dispatched, no reason, no decision, no expiration receipt) and with
 /// schema v5. It is refused after an approve or reject decision, after the
@@ -9975,7 +9984,7 @@ fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
     );
 }
 
-/// T-016 (finding 15), migration 0022: the transition trigger closes an
+/// T-016, migration 0022: the transition trigger closes an
 /// approved_pending_dispatch row as `approved_claim_expired` only with an
 /// approve decision, refuses a new `approval_expired` close of it, and
 /// never writes `approved_claim_expired` in place on a held row. A row that
