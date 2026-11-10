@@ -18,10 +18,10 @@ use praetore_core::{
 };
 use praetore_gateway::{
     ActionDispatcher, ApprovalError, AuthorizationStatus, DispatchError, DispatchReport,
-    ExecutionAttestationError, ExecutionAttestationSigner, ExecutionJournal, ExecutionKey,
-    ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
+    ExecutionAttestationError, ExecutionAttestationSigner, ExecutionFailure, ExecutionJournal,
+    ExecutionKey, ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
     HumanApprovalOutcome, HumanApprovalResult, HumanApprovalVerifier, JournalError,
-    NotDispatchedReason, ReconciliationReport, authority_tenant_id,
+    NotDispatchedReason, ReconciliationReport, RefusalCode, authority_tenant_id,
 };
 use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
@@ -574,7 +574,31 @@ impl ExecutionJournal for MemoryJournal {
             {
                 ExecutionStatus::NotDispatched
             }
-            (AuthorizationStatus::RequiresApproval, Some(_)) => {
+            // 0020: a held request closes in place once rejected or expired.
+            (
+                AuthorizationStatus::RequiresApproval,
+                Some(NotDispatchedReason::ApprovalRejected),
+            ) if entry.execution == ExecutionStatus::NotDispatched
+                && entry
+                    .human_approval
+                    .as_ref()
+                    .is_some_and(|decision| decision.outcome == HumanApprovalOutcome::Reject)
+                && entry.approval_expiration.is_none()
+                && !closed =>
+            {
+                ExecutionStatus::NotDispatched
+            }
+            (AuthorizationStatus::RequiresApproval, Some(NotDispatchedReason::ApprovalExpired))
+                if entry.execution == ExecutionStatus::NotDispatched
+                    && entry.human_approval.is_none()
+                    && entry.approval_expiration.is_some()
+                    && !closed =>
+            {
+                ExecutionStatus::NotDispatched
+            }
+            (AuthorizationStatus::RequiresApproval, Some(_))
+                if entry.execution != ExecutionStatus::NotDispatched =>
+            {
                 ExecutionStatus::ApprovedPendingDispatch
             }
             _ => return Err(JournalError::InvalidTransition),
@@ -714,6 +738,13 @@ struct LocalSetTool {
     reconciliation_unknown: AtomicBool,
     refuse_preflight: AtomicBool,
     refuse_transient: AtomicBool,
+    /// Refuse at dispatch time, after the preflight passed, with the
+    /// guarantee that nothing was written (DispatchError::NotApplied).
+    refuse_at_dispatch: AtomicBool,
+    /// Write a partial value, then report that the attempted effect failed
+    /// (DispatchError::EffectFailed): the adapter cannot prove that nothing
+    /// changed.
+    effect_failed_at_dispatch: AtomicBool,
     preflights: AtomicUsize,
 }
 
@@ -742,41 +773,59 @@ impl ActionDispatcher for LocalSetTool {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         self.execution_keys
             .lock()
-            .map_err(|_| DispatchError)?
+            .map_err(|_| DispatchError::Ambiguous)?
             .push(execution_key);
         if action.action_type != "local:set_value"
             || action.target.as_deref() != Some("local-state")
             || action.capability.as_deref() != Some("local:write")
         {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
-        let parameters = action.parameters.as_object().ok_or(DispatchError)?;
+        let parameters = action
+            .parameters
+            .as_object()
+            .ok_or(DispatchError::Ambiguous)?;
         if parameters.len() != 2 {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let parameter_key = parameters
             .get("key")
             .and_then(Value::as_str)
-            .ok_or(DispatchError)?;
-        let value = parameters.get("value").ok_or(DispatchError)?.clone();
+            .ok_or(DispatchError::Ambiguous)?;
+        let value = parameters
+            .get("value")
+            .ok_or(DispatchError::Ambiguous)?
+            .clone();
+        if self.refuse_at_dispatch.load(Ordering::SeqCst) {
+            return Err(DispatchError::NotApplied(
+                praetore_gateway::DispatchRefused::terminal("test_refused_at_dispatch"),
+            ));
+        }
+        if self.effect_failed_at_dispatch.load(Ordering::SeqCst) {
+            self.values
+                .lock()
+                .map_err(|_| DispatchError::Ambiguous)?
+                .insert(parameter_key.to_owned(), json!("partial"));
+            return Err(DispatchError::EffectFailed("test_effect_failed"));
+        }
 
         self.values
             .lock()
-            .map_err(|_| DispatchError)?
+            .map_err(|_| DispatchError::Ambiguous)?
             .insert(parameter_key.to_owned(), value.clone());
         let output = json!({"key": parameter_key, "value": value});
         self.outcomes
             .lock()
-            .map_err(|_| DispatchError)?
+            .map_err(|_| DispatchError::Ambiguous)?
             .insert(execution_key, output.clone());
 
         if self.fail_after_write.swap(false, Ordering::SeqCst) {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
 
-        let observed = self.value(parameter_key).ok_or(DispatchError)?;
+        let observed = self.value(parameter_key).ok_or(DispatchError::Ambiguous)?;
         if observed != value {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         Ok(DispatchReport::Confirmed(
             json!({"key": parameter_key, "value": observed}),
@@ -1383,6 +1432,21 @@ fn rejected_human_approval_is_persisted_without_dispatch() {
     };
 
     assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    // Final, with its own signed reason (0020), distinct from expiry.
+    assert_eq!(
+        receipt.execution_attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalRejected)
+    );
+    receipt
+        .verify_with_test_evidence_attester(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    assert_eq!(
+        gateway.approval_state(key).unwrap().not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalRejected)
+    );
     assert_eq!(tool.value("mode"), None);
     assert_eq!(tool.invocations(), 0);
     assert_eq!(
@@ -1429,6 +1493,17 @@ fn expired_human_rejection_uses_the_engine_clock() {
     let record = journal.get(key).unwrap().unwrap();
     assert_eq!(record.execution, ExecutionStatus::NotDispatched);
     assert!(record.human_approval.is_none());
+    assert!(record.approval_expiration.is_some());
+    // Final, with its own signed reason (0020), distinct from a rejection.
+    let attestation = record.execution_attestation.unwrap();
+    assert_eq!(
+        attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalExpired)
+    );
+    assert_eq!(
+        gateway.approval_state(key).unwrap().not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalExpired)
+    );
     assert_eq!(tool.invocations(), 0);
 }
 
@@ -2325,6 +2400,8 @@ async fn http_conflicts_and_status_report_the_resolution() {
         ),
         (HumanApprovalOutcome::Reject, "rejected", "not_dispatched"),
     ] {
+        let closed_reason =
+            (outcome == HumanApprovalOutcome::Reject).then_some("approval_rejected");
         let (gateway, request, _, _, approver_key) = approval_fixture();
         let gateway = Arc::new(gateway);
         let key = pending_key(&gateway, request);
@@ -2363,6 +2440,8 @@ async fn http_conflicts_and_status_report_the_resolution() {
         let (status, body) =
             json_response(&app, "GET", &format!("{path}/status"), String::new()).await;
         if outcome == HumanApprovalOutcome::Approve {
+            // Approved is not closed: no `not_dispatched_reason`.
+            assert_eq!(closed_reason, None);
             // By default an approved action is never handed to the client
             // to run: 409 instead of `approved`.
             assert_eq!(
@@ -2399,13 +2478,12 @@ async fn http_conflicts_and_status_report_the_resolution() {
                 )
             );
         } else {
-            assert_eq!(
-                (status, body),
-                (
-                    StatusCode::OK,
-                    json!({"resolution": expected, "execution": execution})
-                )
-            );
+            // A rejection is final, with its own signed reason (0020).
+            let mut status_body = json!({"resolution": expected, "execution": execution});
+            if let Some(reason) = closed_reason {
+                status_body["not_dispatched_reason"] = json!(reason);
+            }
+            assert_eq!((status, body), (StatusCode::OK, status_body));
         }
 
         let other_tenant = format!(
@@ -4129,10 +4207,91 @@ fn claim_dispatch_refuses_an_approved_action_the_adapter_no_longer_admits() {
     assert_eq!(tool.invocations(), 0);
 }
 
-/// Preflight refusals at submission and at approval never invoke the
-/// adapter and never consume the decision.
+/// A terminal preflight refusal while a request is held (at the challenge or
+/// at the approval) closes it for good with a signed `dispatch_refused`
+/// reason. The decision is never recorded, the adapter is never invoked, and
+/// the request stays closed after the adapter would admit the action again.
 #[test]
-fn preflight_refusal_before_approval_keeps_the_decision_unconsumed() {
+fn terminal_preflight_refusal_while_held_closes_the_request_for_good() {
+    for at_challenge in [true, false] {
+        let (gateway, request, tool, journal, approver_key) = approval_fixture();
+        let pending = gateway.execute(request).unwrap();
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        let challenge = gateway.approval_challenge(key).unwrap();
+        let decision =
+            human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
+        tool.refuse_preflight.store(true, Ordering::SeqCst);
+        let error = if at_challenge {
+            gateway.approval_challenge(key).unwrap_err()
+        } else {
+            gateway
+                .resolve_human_approval(decision.clone())
+                .unwrap_err()
+        };
+        assert!(
+            matches!(
+                error,
+                GatewayError::DispatchRefused {
+                    reason: "test_refusal",
+                    transient: false,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        let receipt = refused_receipt(error);
+        assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(NotDispatchedReason::DispatchRefused)
+        );
+        receipt
+            .verify_with_test_evidence_attester(
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
+        let state = gateway.approval_state(key).unwrap();
+        assert_eq!(
+            state.resolution,
+            praetore_gateway::ApprovalResolution::NotDispatched
+        );
+        assert_eq!(
+            state.not_dispatched_reason,
+            Some(NotDispatchedReason::DispatchRefused)
+        );
+
+        // The adapter would admit the action again: still closed.
+        tool.refuse_preflight.store(false, Ordering::SeqCst);
+        assert!(matches!(
+            gateway.approval_challenge(key),
+            Err(GatewayError::Approval(ApprovalError::NotPending))
+        ));
+        assert!(matches!(
+            gateway.resolve_human_approval(decision.clone()),
+            Err(GatewayError::Approval(ApprovalError::NotPending))
+        ));
+        assert!(
+            journal
+                .record_human_approval(key, &decision, FixedClock::try_new(NOW).unwrap().now())
+                .is_err()
+        );
+        assert!(gateway.dispatch_approved(key).is_err());
+        assert!(journal.get(key).unwrap().unwrap().human_approval.is_none());
+        assert_eq!(tool.invocations(), 0);
+    }
+}
+
+/// A transient preflight refusal while held closes nothing: the request
+/// stays pending and the same decision is accepted once the adapter admits
+/// the action again.
+#[test]
+fn transient_preflight_refusal_while_held_keeps_the_decision_unconsumed() {
     let (gateway, request, tool, journal, approver_key) = approval_fixture();
     let pending = gateway.execute(request).unwrap();
     let key = ExecutionKey {
@@ -4141,19 +4300,31 @@ fn preflight_refusal_before_approval_keeps_the_decision_unconsumed() {
         request_id: pending.evidence.request_id,
     };
     let challenge = gateway.approval_challenge(key).unwrap();
-    tool.refuse_preflight.store(true, Ordering::SeqCst);
+    tool.refuse_transient.store(true, Ordering::SeqCst);
     assert!(matches!(
         gateway.approval_challenge(key),
-        Err(GatewayError::DispatchRefused { .. })
+        Err(GatewayError::DispatchRefused {
+            transient: true,
+            receipt: None,
+            ..
+        })
     ));
     let decision = human_approval_decision(challenge, HumanApprovalOutcome::Approve, &approver_key);
     assert!(matches!(
         gateway.resolve_human_approval(decision.clone()),
-        Err(GatewayError::DispatchRefused { .. })
+        Err(GatewayError::DispatchRefused {
+            transient: true,
+            receipt: None,
+            ..
+        })
     ));
     assert!(journal.get(key).unwrap().unwrap().human_approval.is_none());
+    assert_eq!(
+        gateway.approval_state(key).unwrap().resolution,
+        praetore_gateway::ApprovalResolution::Pending
+    );
     assert_eq!(tool.invocations(), 0);
-    tool.refuse_preflight.store(false, Ordering::SeqCst);
+    tool.refuse_transient.store(false, Ordering::SeqCst);
     gateway.resolve_human_approval(decision).unwrap();
 }
 
@@ -4894,4 +5065,241 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
         .expect("classify")
         .into_mission()
         .expect("mission action")
+}
+
+/// S1: a refusal the adapter reports at dispatch time with the guarantee that
+/// nothing changed (`DispatchError::NotApplied`) is recorded as the signed
+/// terminal state `failed`, never `outcome_unknown`, for an allowed action and
+/// for an approved one. It is returned as `DispatchRefused` with that receipt
+/// and never retried.
+#[test]
+fn refusal_before_effect_at_dispatch_is_a_signed_terminal_failed_state() {
+    // Allowed.
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    fixture
+        .tool
+        .refuse_at_dispatch
+        .store(true, Ordering::SeqCst);
+    let error = fixture
+        .gateway
+        .execute(fixture.request.clone())
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            GatewayError::DispatchRefused {
+                reason: "test_refused_at_dispatch",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let receipt = refused_receipt(error);
+    assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
+    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(receipt.output, None);
+    assert_eq!(
+        receipt.execution_attestation.execution,
+        ExecutionStatus::Failed
+    );
+    // D-B1: the refusal reason is signed, as `no_effect`, in schema v4.
+    assert_eq!(receipt.execution_attestation.schema_version, 4);
+    assert_eq!(
+        receipt.execution_attestation.failure,
+        Some(ExecutionFailure::NoEffect {
+            reason: RefusalCode::new("test_refused_at_dispatch").unwrap()
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(&receipt.execution_attestation).unwrap()["failure"],
+        json!({"class": "no_effect", "reason": "test_refused_at_dispatch"})
+    );
+    receipt
+        .verify_with_test_evidence_attester(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *receipt.evidence.agent.id.as_uuid(),
+        request_id: receipt.evidence.request_id,
+    };
+    assert_eq!(
+        fixture.journal.entry(key).unwrap().states,
+        vec![ExecutionStatus::Dispatched, ExecutionStatus::Failed]
+    );
+    assert_eq!(fixture.tool.value("mode"), None);
+    // Final: reconciliation keeps it, and the request cannot be replayed.
+    fixture
+        .tool
+        .refuse_at_dispatch
+        .store(false, Ordering::SeqCst);
+    assert_eq!(
+        fixture.gateway.reconcile(key).unwrap().execution,
+        ExecutionStatus::Failed
+    );
+    assert!(fixture.gateway.execute(fixture.request).is_err());
+    assert_eq!(fixture.tool.invocations(), 1);
+
+    // Approved.
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    tool.refuse_at_dispatch.store(true, Ordering::SeqCst);
+    let receipt = refused_receipt(gateway.dispatch_approved(key).unwrap_err());
+    assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(
+        receipt.execution_attestation.failure,
+        Some(ExecutionFailure::NoEffect {
+            reason: RefusalCode::new("test_refused_at_dispatch").unwrap()
+        })
+    );
+    receipt
+        .verify_with_test_evidence_attester(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    assert_eq!(
+        journal.entry(key).unwrap().states,
+        vec![
+            ExecutionStatus::ApprovedPendingDispatch,
+            ExecutionStatus::Dispatched,
+            ExecutionStatus::Failed
+        ]
+    );
+    tool.refuse_at_dispatch.store(false, Ordering::SeqCst);
+    assert!(gateway.dispatch_approved(key).is_err(), "never retried");
+    assert_eq!(tool.invocations(), 1);
+    assert_eq!(tool.value("mode"), None);
+}
+
+/// D-B1: an effect that was attempted and failed (the adapter cannot prove
+/// that nothing changed) is the signed terminal state `failed` with the class
+/// `effect_failed`, for an allowed action and for an approved one. It is
+/// returned as `GatewayError::EffectFailed` with that receipt, verifies, and
+/// is never retried.
+#[test]
+fn effect_failed_at_dispatch_is_a_signed_failed_state_with_class_effect_failed() {
+    fn effect_failed_receipt(error: GatewayError) -> praetore_gateway::GatewayReceipt {
+        match error {
+            GatewayError::EffectFailed {
+                reason: "test_effect_failed",
+                receipt,
+                ..
+            } => *receipt,
+            other => panic!("expected EffectFailed with a receipt, got {other:?}"),
+        }
+    }
+    fn assert_effect_failed(receipt: &praetore_gateway::GatewayReceipt) {
+        assert_eq!(receipt.execution, ExecutionStatus::Failed);
+        assert_eq!(receipt.output, None);
+        assert_eq!(receipt.execution_attestation.schema_version, 4);
+        assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
+        assert_eq!(
+            receipt.execution_attestation.failure,
+            Some(ExecutionFailure::EffectFailed)
+        );
+        assert_eq!(
+            serde_json::to_value(&receipt.execution_attestation).unwrap()["failure"],
+            json!({"class": "effect_failed"})
+        );
+        receipt
+            .verify_with_test_evidence_attester(
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
+    }
+
+    // Allowed.
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    fixture
+        .tool
+        .effect_failed_at_dispatch
+        .store(true, Ordering::SeqCst);
+    let receipt = effect_failed_receipt(
+        fixture
+            .gateway
+            .execute(fixture.request.clone())
+            .unwrap_err(),
+    );
+    assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
+    assert_effect_failed(&receipt);
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *receipt.evidence.agent.id.as_uuid(),
+        request_id: receipt.evidence.request_id,
+    };
+    assert_eq!(
+        fixture.journal.entry(key).unwrap().states,
+        vec![ExecutionStatus::Dispatched, ExecutionStatus::Failed]
+    );
+    // The residue is visible: the effect really was attempted.
+    assert_eq!(fixture.tool.value("mode"), Some(json!("partial")));
+    fixture
+        .tool
+        .effect_failed_at_dispatch
+        .store(false, Ordering::SeqCst);
+    let reconciled = fixture.gateway.reconcile(key).unwrap();
+    assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+    assert_eq!(
+        reconciled.execution_attestation.failure,
+        Some(ExecutionFailure::EffectFailed)
+    );
+    assert!(fixture.gateway.execute(fixture.request).is_err());
+    assert_eq!(fixture.tool.invocations(), 1);
+
+    // Approved.
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let pending = gateway.execute(request).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    gateway.resolve_human_approval(decision).unwrap();
+    tool.effect_failed_at_dispatch.store(true, Ordering::SeqCst);
+    let receipt = effect_failed_receipt(gateway.dispatch_approved(key).unwrap_err());
+    assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+    assert_effect_failed(&receipt);
+    assert_eq!(
+        journal.entry(key).unwrap().states,
+        vec![
+            ExecutionStatus::ApprovedPendingDispatch,
+            ExecutionStatus::Dispatched,
+            ExecutionStatus::Failed
+        ]
+    );
+    tool.effect_failed_at_dispatch
+        .store(false, Ordering::SeqCst);
+    assert!(gateway.dispatch_approved(key).is_err(), "never retried");
+    assert_eq!(tool.invocations(), 1);
+}
+
+/// An ambiguous adapter error still becomes `outcome_unknown`: only a
+/// refusal with the not-applied guarantee is final.
+#[test]
+fn ambiguous_dispatch_error_still_becomes_outcome_unknown() {
+    let fixture = fixture(Some(PolicyEffect::Allow), false);
+    fixture.tool.fail_after_write.store(true, Ordering::SeqCst);
+    let receipt = fixture.gateway.execute(fixture.request).unwrap();
+    assert_eq!(receipt.execution, ExecutionStatus::OutcomeUnknown);
 }

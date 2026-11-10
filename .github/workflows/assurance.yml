@@ -532,9 +532,21 @@ jobs:
       # is refused by default without sandbox_root, through the CLI's gateway
       # and through praetore-gateway-demo (its exec_mode_postgres test target,
       # which is guarded the same way).
+      # Also the PR-B tests: signed final states (refusal before the effect,
+      # challenge refusal, rejection, expiry), verified with praetore-verify,
+      # and the signed failure class of `failed` (no_effect, effect_failed);
+      # the 0020 up/down tests run in the ignored-tests script.
+      # The gateway's variable (sandbox::REQUIRE_OPENAT2_ENV): the CLI's
+      # gateway opens the sandbox requiring openat2, as on Linux hosts, and
+      # fails instead of falling back to the portable walk.
       - name: T-013 sandbox gateway end to end against PostgreSQL (CLI gateway and HTTP)
+        env:
+          PRAETORE_SANDBOX_REQUIRE_OPENAT2: "1"
         run: |
           set -euo pipefail
+          # T17, T20, T7b, S1 and D-B1 run target/debug/praetore-verify; T21
+          # and D-B1 case B run target/debug/praetore.
+          cargo build -p praetore-cli -p praetore-verify --locked
           run_exact() {
             local package="$1" bin="$2" name="$3"
             echo "::group::$name"
@@ -573,6 +585,22 @@ jobs:
             tests::postgres_sandbox_http_t24_absolute_paths_are_refused_with_403
             tests::postgres_sandbox_http_t25_symlinks_are_refused_with_403
             tests::postgres_sandbox_http_t26_nul_in_path_is_refused_with_403
+            # S1: refused before the effect after the last preflight: signed
+            # failed, class no_effect with its reason (D-B1 case A).
+            tests::postgres_t013b_refusal_before_effect_is_a_signed_failed_state
+            # D-B1 case B: `praetore run` under RLIMIT_FSIZE; the write fails
+            # after the temporary file: signed failed, class effect_failed.
+            tests::postgres_t013b_effect_failed_after_the_temporary_write_is_signed_effect_failed
+            # Challenge refusal is a signed final state, also once the file returns.
+            tests::postgres_t013b_challenge_refusal_is_final_even_if_the_file_returns
+            # T20: rejected and expired, distinct non-null signed reasons (waits 30 s).
+            tests::postgres_t013b_t20_rejected_and_expired_have_distinct_signed_reasons
+            # T7b: approved, then expired before the dispatch (waits 30 s).
+            tests::postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approval_expired
+            # T17: tampered final state and wrong pin refused by praetore-verify.
+            tests::postgres_t013b_t17_tampered_final_state_fails_praetore_verify
+            # T21: CLI stderr for an allowed action refused before the effect.
+            tests::postgres_t013b_t21_cli_stderr_reports_allowed_refusal_without_deny
             # T19: no sandbox_root, no flag: cooperative execution refused.
             tests::postgres_t019_cooperative_exec_is_refused_without_sandbox_root
             # T19b: only the development flag enables it (no guarantee).

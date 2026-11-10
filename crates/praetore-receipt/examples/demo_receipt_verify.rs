@@ -25,7 +25,7 @@ use praetore_core::{
     engine::{AuthorizationEngine, Clock, FixedClock},
 };
 use praetore_receipt::{
-    AuthorizationStatus, ExecutionAttestation, ExecutionAttestationError,
+    AttestedOutcome, AuthorizationStatus, ExecutionAttestation, ExecutionAttestationError,
     ExecutionAttestationSigner, ExecutionStatus, GatewayReceipt, verify_gateway_receipt_json,
 };
 use time::Duration;
@@ -173,9 +173,7 @@ fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
     let execution_attestation = ExecutionAttestation::create(
         &evidence,
         AuthorizationStatus::Allowed,
-        ExecutionStatus::Executed,
-        Some(&output),
-        None,
+        &AttestedOutcome::Executed(output.clone()),
         &signer,
     )?;
     let receipt = GatewayReceipt {

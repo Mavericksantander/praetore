@@ -675,6 +675,23 @@ The HTTP flow is:
    way with `crash_recovered`. There is no re-dispatch: a closed approval
    cannot be claimed again; submit a new request.
 
+   A held request also ends in a signed final state with a non-null reason:
+   a rejection closes it with `approval_rejected`, an expired window with
+   `approval_expired`, and an adapter refusal at the challenge or at the
+   approval with `dispatch_refused` (a transient refusal leaves it pending).
+   None of them can be approved afterwards. A dispatch that ends in the
+   signed terminal state `failed` always carries a signed `failure`
+   classification (attestation schema v4, and the journal columns
+   `failure_class` and `failure_reason`). When the adapter refuses at
+   dispatch time and proves that nothing changed (`DispatchError::NotApplied`),
+   the class is `no_effect` with the adapter's refusal code as `reason`, and
+   the response is 403 `action_not_dispatchable` with that receipt. When the
+   adapter attempted the effect and it failed (`DispatchError::EffectFailed`),
+   or the adapter cannot prove that nothing changed, the class is
+   `effect_failed` (the target may hold a partial residue) and the response
+   is 502 `action_effect_failed` with that receipt. Only an ambiguous adapter
+   error (`DispatchError::Ambiguous`) becomes `outcome_unknown`.
+
 `GET .../status` returns `{"resolution", "execution", "not_dispatched_reason"?}`.
 `resolution` is `pending`, `approved` (awaiting dispatch or dispatched),
 `rejected`, `expired` (window closed without a decision) or `not_dispatched`

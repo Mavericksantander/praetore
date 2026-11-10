@@ -5,8 +5,9 @@ use praetore_core::{
 };
 use praetore_gateway::{
     ApprovalChallenge, ApprovalExpiredReceipt, AuthorizationStatus, ExecutionAttestation,
-    ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus, HumanApprovalDecision,
-    HumanApprovalOutcome, JournalError, NotDispatchedReason, action_digest, authority_tenant_id,
+    ExecutionFailure, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
+    HumanApprovalDecision, HumanApprovalOutcome, JournalError, NotDispatchedReason, RefusalCode,
+    action_digest, authority_tenant_id,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -128,7 +129,8 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
                       WHERE hx.tenant_id = execution_journal.tenant_id \
                         AND hx.agent_id = execution_journal.agent_id \
                         AND hx.request_id = execution_journal.request_id), \
-                     execution_journal.not_dispatched_reason \
+                     execution_journal.not_dispatched_reason, \
+                     execution_journal.failure_class, execution_journal.failure_reason \
                      FROM praetore.execution_journal \
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 FOR UPDATE",
                     &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -288,10 +290,16 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let evidence = Evidence::from_json(&row.get::<_, String>(2))
             .map_err(|_| JournalError::InvalidRecord)?;
         let stored_action_digest: String = row.get(3);
-        if row.get::<_, Option<String>>(4).is_some() {
+        match row.get::<_, Option<String>>(4).as_deref() {
+            None => {}
+            // Closed after a decision or an expiration (0020): the outcome
+            // was already recorded.
+            Some("approval_rejected" | "approval_expired") => {
+                return Err(JournalError::ApprovalAlreadyRecorded);
+            }
             // Closed without dispatch (for example dispatch_refused): no
             // decision may ever be recorded for it.
-            return Err(JournalError::InvalidTransition);
+            Some(_) => return Err(JournalError::InvalidTransition),
         }
         if transaction
             .query_opt(
@@ -564,6 +572,11 @@ impl ExecutionJournal for PostgresExecutionJournal {
         if !is_terminal(execution) {
             return Err(JournalError::InvalidTransition);
         }
+        // Every new `failed` row carries its signed classification (D-B1).
+        if (execution == ExecutionStatus::Failed) != attestation.failure.is_some() {
+            return Err(JournalError::InvalidRecord);
+        }
+        let (failure_class, failure_reason) = failure_as_db(attestation.failure.as_ref());
         let output_json = output
             .map(serde_json::to_string)
             .transpose()
@@ -631,7 +644,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
         transaction
             .execute(
                 "UPDATE praetore.execution_journal \
-                 SET execution_status = $4, output_json = $5, updated_at = clock_timestamp() \
+                 SET execution_status = $4, output_json = $5, failure_class = $6, \
+                     failure_reason = $7, updated_at = clock_timestamp() \
                  WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                 &[
                     &key.tenant_id,
@@ -639,6 +653,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
                     &key.request_id,
                     &execution_as_db(execution),
                     &output_json,
+                    &failure_class,
+                    &failure_reason,
                 ],
             )
             .map_err(|_| JournalError::Unavailable)?;
@@ -656,8 +672,9 @@ impl ExecutionJournal for PostgresExecutionJournal {
         output: Option<&Value>,
         attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError> {
-        if attestation.not_dispatched_reason.is_some() {
-            // Only mark_not_dispatched_attested writes a closing reason.
+        if attestation.not_dispatched_reason.is_some() || attestation.failure.is_some() {
+            // Only mark_not_dispatched_attested writes a closing reason, and
+            // only record_terminal_attested a failure class.
             return Err(JournalError::InvalidTransition);
         }
         let attestation_json =
@@ -756,7 +773,8 @@ impl ExecutionJournal for PostgresExecutionJournal {
                   WHERE hx.tenant_id = execution_journal.tenant_id \
                     AND hx.agent_id = execution_journal.agent_id \
                     AND hx.request_id = execution_journal.request_id), \
-                 execution_journal.not_dispatched_reason \
+                 execution_journal.not_dispatched_reason, \
+                     execution_journal.failure_class, execution_journal.failure_reason \
                  FROM praetore.execution_journal \
                  WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -804,19 +822,24 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let evidence =
             Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
         // Allowed closes from Authorized without a reason or with
-        // dispatch_refused; RequiresApproval closes from
-        // ApprovedPendingDispatch with a reason, or, only with
-        // dispatch_refused, from a still undecided NotDispatched.
-        let refused =
-            attestation.not_dispatched_reason == Some(NotDispatchedReason::DispatchRefused);
-        let from = match (authorization, reason) {
-            (AuthorizationStatus::Allowed, None) => ExecutionStatus::Authorized,
-            (AuthorizationStatus::Allowed, Some(_)) if refused => ExecutionStatus::Authorized,
-            (AuthorizationStatus::RequiresApproval, Some(_))
-                if refused && current == ExecutionStatus::NotDispatched =>
-            {
-                ExecutionStatus::NotDispatched
+        // dispatch_refused. RequiresApproval closes from
+        // ApprovedPendingDispatch with a reason, or in place from a held
+        // NotDispatched: dispatch_refused while undecided, approval_rejected
+        // after a reject decision, approval_expired after the expiration
+        // receipt (0020).
+        let from = match (authorization, attestation.not_dispatched_reason) {
+            (AuthorizationStatus::Allowed, None)
+            | (AuthorizationStatus::Allowed, Some(NotDispatchedReason::DispatchRefused)) => {
+                ExecutionStatus::Authorized
             }
+            (
+                AuthorizationStatus::RequiresApproval,
+                Some(NotDispatchedReason::ApprovalRejected),
+            ) => ExecutionStatus::NotDispatched,
+            (
+                AuthorizationStatus::RequiresApproval,
+                Some(NotDispatchedReason::DispatchRefused | NotDispatchedReason::ApprovalExpired),
+            ) if current == ExecutionStatus::NotDispatched => ExecutionStatus::NotDispatched,
             (AuthorizationStatus::RequiresApproval, Some(_)) => {
                 ExecutionStatus::ApprovedPendingDispatch
             }
@@ -832,22 +855,35 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::InvalidRecord)?;
 
         let row_reason: Option<String> = row.get(3);
-        let undecided_close = from == ExecutionStatus::NotDispatched && row_reason.is_none();
-        if undecided_close
-            && transaction
-                .query_opt(
-                    "SELECT 1 FROM praetore.human_approvals \
-                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
-                     UNION ALL SELECT 1 FROM praetore.human_approval_expirations \
-                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+        let held_close = from == ExecutionStatus::NotDispatched && row_reason.is_none();
+        if held_close {
+            let decisions = transaction
+                .query_one(
+                    "SELECT \
+                       EXISTS (SELECT 1 FROM praetore.human_approvals \
+                               WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                                 AND outcome = 'reject'), \
+                       EXISTS (SELECT 1 FROM praetore.human_approvals \
+                               WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                                 AND outcome = 'approve'), \
+                       EXISTS (SELECT 1 FROM praetore.human_approval_expirations \
+                               WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3)",
                     &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
-                .map_err(|_| JournalError::Unavailable)?
-                .is_some()
-        {
-            return Err(JournalError::InvalidTransition);
+                .map_err(|_| JournalError::Unavailable)?;
+            let (rejected, approved, expired): (bool, bool, bool) =
+                (decisions.get(0), decisions.get(1), decisions.get(2));
+            let allowed = match attestation.not_dispatched_reason {
+                Some(NotDispatchedReason::DispatchRefused) => !rejected && !approved && !expired,
+                Some(NotDispatchedReason::ApprovalRejected) => rejected && !expired,
+                Some(NotDispatchedReason::ApprovalExpired) => expired && !rejected && !approved,
+                _ => false,
+            };
+            if !allowed {
+                return Err(JournalError::InvalidTransition);
+            }
         }
-        if current == ExecutionStatus::NotDispatched && !undecided_close {
+        if current == ExecutionStatus::NotDispatched && !held_close {
             let existing = transaction
                 .query_opt(
                     "SELECT attestation_json FROM praetore.execution_attestations \
@@ -943,7 +979,8 @@ fn verify_authorization_pair(
               WHERE hx.tenant_id = execution_journal.tenant_id \
                 AND hx.agent_id = execution_journal.agent_id \
                 AND hx.request_id = execution_journal.request_id), \
-             execution_journal.not_dispatched_reason \
+             execution_journal.not_dispatched_reason, \
+                     execution_journal.failure_class, execution_journal.failure_reason \
              FROM praetore.execution_journal \
              WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
             &[&key.tenant_id, &key.agent_id, &key.request_id],
@@ -1093,6 +1130,7 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
         .map(|value| serde_json::from_value(value).map_err(|_| JournalError::InvalidRecord))
         .transpose()?;
     let not_dispatched_reason: Option<String> = row.get(9);
+    let failure = parse_failure(row.get(10), row.get(11))?;
     validate_evidence(key, &evidence, authorization)?;
     if execution == ExecutionStatus::ApprovedPendingDispatch
         && (authorization != AuthorizationStatus::RequiresApproval
@@ -1110,6 +1148,14 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
             .as_ref()
             .and_then(|attestation: &ExecutionAttestation| attestation.not_dispatched_reason)
             .map(not_dispatched_reason_as_db)
+    {
+        return Err(JournalError::InvalidRecord);
+    }
+    // The journal's failure class is the one its attestation signs.
+    if failure.as_ref()
+        != execution_attestation
+            .as_ref()
+            .and_then(|attestation: &ExecutionAttestation| attestation.failure.as_ref())
     {
         return Err(JournalError::InvalidRecord);
     }
@@ -1140,9 +1186,33 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
 fn not_dispatched_reason_as_db(reason: NotDispatchedReason) -> &'static str {
     match reason {
         NotDispatchedReason::ApprovalExpired => "approval_expired",
+        NotDispatchedReason::ApprovalRejected => "approval_rejected",
         NotDispatchedReason::DispatchFailed => "dispatch_failed",
         NotDispatchedReason::CrashRecovered => "crash_recovered",
         NotDispatchedReason::DispatchRefused => "dispatch_refused",
+    }
+}
+
+/// `(failure_class, failure_reason)` columns of a failure classification.
+fn failure_as_db(failure: Option<&ExecutionFailure>) -> (Option<&'static str>, Option<&str>) {
+    match failure {
+        None => (None, None),
+        Some(ExecutionFailure::NoEffect { reason }) => (Some("no_effect"), Some(reason.as_str())),
+        Some(ExecutionFailure::EffectFailed) => (Some("effect_failed"), None),
+    }
+}
+
+fn parse_failure(
+    class: Option<String>,
+    reason: Option<String>,
+) -> Result<Option<ExecutionFailure>, JournalError> {
+    match (class.as_deref(), reason) {
+        (None, None) => Ok(None),
+        (Some("effect_failed"), None) => Ok(Some(ExecutionFailure::EffectFailed)),
+        (Some("no_effect"), Some(reason)) => Ok(Some(ExecutionFailure::NoEffect {
+            reason: RefusalCode::new(&reason).ok_or(JournalError::InvalidRecord)?,
+        })),
+        _ => Err(JournalError::InvalidRecord),
     }
 }
 
@@ -1167,8 +1237,8 @@ fn insert_execution_attestation(
         .execute(
             "INSERT INTO praetore.execution_attestations \
              (attestation_id, tenant_id, agent_id, request_id, execution_status, \
-              attestation_json, not_dispatched_reason) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+              attestation_json, not_dispatched_reason, failure_class, failure_reason) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[
                 &uuid::Uuid::new_v4(),
                 &key.tenant_id,
@@ -1178,6 +1248,14 @@ fn insert_execution_attestation(
                 attestation,
                 &attestation
                     .get("not_dispatched_reason")
+                    .and_then(Value::as_str),
+                &attestation
+                    .get("failure")
+                    .and_then(|failure| failure.get("class"))
+                    .and_then(Value::as_str),
+                &attestation
+                    .get("failure")
+                    .and_then(|failure| failure.get("reason"))
                     .and_then(Value::as_str),
             ],
         )

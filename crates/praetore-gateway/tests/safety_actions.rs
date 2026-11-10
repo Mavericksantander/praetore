@@ -200,7 +200,7 @@ impl ActionDispatcher for CountingDispatcher {
         _: &str,
     ) -> Result<DispatchReport, DispatchError> {
         self.0.hit();
-        Err(DispatchError)
+        Err(DispatchError::Ambiguous)
     }
 }
 

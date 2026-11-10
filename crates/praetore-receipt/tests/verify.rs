@@ -486,3 +486,181 @@ fn verify_execution_attestation_also_requires_a_valid_evidence_signature() {
         );
     }
 }
+
+/// D-B1: a v4 receipt is a `failed` execution with its signed failure class.
+/// Re-signs the v2 confirmed fixture as `failed`, with `failure` set to
+/// `failure` (omitted when `None`) and the given schema version.
+fn failed_receipt(
+    schema_version: u8,
+    execution: &str,
+    failure: Option<serde_json::Value>,
+) -> (String, VerifiedPublicKey) {
+    resigned(|receipt| {
+        receipt["execution"] = execution.into();
+        receipt.as_object_mut().unwrap().remove("output");
+        let attestation = &mut receipt["execution_attestation"];
+        attestation["schema_version"] = schema_version.into();
+        attestation["execution"] = execution.into();
+        attestation["output_digest"] = serde_json::Value::Null;
+        if let Some(failure) = failure {
+            attestation["failure"] = failure;
+        }
+    })
+}
+
+fn verify_with(
+    json: &str,
+    public: &VerifiedPublicKey,
+) -> Result<GatewayReceipt, ExecutionAttestationError> {
+    verify_gateway_receipt_json(json, public, KEY_ID, &evidence_key())
+}
+
+#[test]
+fn accepts_v4_failed_receipts_with_their_signed_failure_class() {
+    use praetore_receipt::{ExecutionFailure, RefusalCode};
+
+    let (json, public) = failed_receipt(
+        4,
+        "failed",
+        Some(serde_json::json!({"class": "no_effect", "reason": "symlink_not_allowed"})),
+    );
+    let receipt = verify_with(&json, &public).unwrap();
+    assert_eq!(receipt.execution_attestation.schema_version, 4);
+    assert_eq!(
+        receipt.execution_attestation.failure,
+        Some(ExecutionFailure::NoEffect {
+            reason: RefusalCode::new("symlink_not_allowed").unwrap()
+        })
+    );
+
+    let (json, public) = failed_receipt(
+        4,
+        "failed",
+        Some(serde_json::json!({"class": "effect_failed"})),
+    );
+    let receipt = verify_with(&json, &public).unwrap();
+    assert_eq!(
+        receipt.execution_attestation.failure,
+        Some(ExecutionFailure::EffectFailed)
+    );
+
+    // History: a `failed` v2 attestation signed before the field existed
+    // still verifies, without a class.
+    let (json, public) = failed_receipt(2, "failed", None);
+    assert_eq!(
+        verify_with(&json, &public)
+            .unwrap()
+            .execution_attestation
+            .failure,
+        None
+    );
+}
+
+#[test]
+fn rejects_a_changed_failure_class_or_reason_after_signing() {
+    let (json, public) = failed_receipt(
+        4,
+        "failed",
+        Some(serde_json::json!({"class": "effect_failed"})),
+    );
+    // Relabelling an attempted effect as one that changed nothing.
+    let relabelled = with_attestation(&json, |attestation| {
+        attestation["failure"] =
+            serde_json::json!({"class": "no_effect", "reason": "symlink_not_allowed"});
+    });
+    assert_eq!(
+        verify_with(&relabelled, &public).map(|_| ()),
+        Err(ExecutionAttestationError::InvalidSignature)
+    );
+    let (json, public) = failed_receipt(
+        4,
+        "failed",
+        Some(serde_json::json!({"class": "no_effect", "reason": "symlink_not_allowed"})),
+    );
+    let other_reason = with_attestation(&json, |attestation| {
+        attestation["failure"]["reason"] = "file_unavailable".into();
+    });
+    assert_eq!(
+        verify_with(&other_reason, &public).map(|_| ()),
+        Err(ExecutionAttestationError::InvalidSignature)
+    );
+}
+
+#[test]
+fn rejects_illegal_failure_shapes_even_when_signed() {
+    let cases: [(u8, &str, Option<serde_json::Value>); 9] = [
+        // v4 `failed` without its class.
+        (4, "failed", None),
+        // A class on any other state, or under another schema version.
+        (
+            4,
+            "outcome_unknown",
+            Some(serde_json::json!({"class": "effect_failed"})),
+        ),
+        (
+            4,
+            "not_dispatched",
+            Some(serde_json::json!({"class": "effect_failed"})),
+        ),
+        (
+            2,
+            "failed",
+            Some(serde_json::json!({"class": "effect_failed"})),
+        ),
+        (
+            3,
+            "failed",
+            Some(serde_json::json!({"class": "effect_failed"})),
+        ),
+        // Unknown class, missing or invalid reason, reason on effect_failed.
+        (4, "failed", Some(serde_json::json!({"class": "partial"}))),
+        (4, "failed", Some(serde_json::json!({"class": "no_effect"}))),
+        (
+            4,
+            "failed",
+            Some(serde_json::json!({"class": "no_effect", "reason": "Not A Code"})),
+        ),
+        (
+            4,
+            "failed",
+            Some(serde_json::json!({"class": "effect_failed", "reason": "file_unavailable"})),
+        ),
+    ];
+    for (schema_version, execution, failure) in cases {
+        let label = format!("v{schema_version} {execution} {failure:?}");
+        let (json, public) = failed_receipt(schema_version, execution, failure);
+        assert_eq!(
+            verify_with(&json, &public).map(|_| ()),
+            Err(ExecutionAttestationError::InvalidPayload),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn failure_classification_parsing_is_strict() {
+    use praetore_receipt::ExecutionFailure;
+    for invalid in [
+        r#"{"class":"effect_failed","reason":"file_unavailable"}"#,
+        r#"{"class":"effect_failed","reason":null}"#,
+        r#"{"class":"effect_failed","extra":1}"#,
+        r#"{"class":"no_effect"}"#,
+        r#"{"class":"no_effect","reason":null}"#,
+        r#"{"class":"no_effect","reason":""}"#,
+        r#"{"class":"no_effect","reason":"symlink_not_allowed","extra":1}"#,
+        r#"{"class":"partial"}"#,
+        r#"{"reason":"symlink_not_allowed"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ExecutionFailure>(invalid).is_err(),
+            "{invalid}"
+        );
+    }
+    for valid in [
+        r#"{"class":"effect_failed"}"#,
+        r#"{"class":"no_effect","reason":"symlink_not_allowed"}"#,
+    ] {
+        let failure: ExecutionFailure = serde_json::from_str(valid).unwrap();
+        assert_eq!(serde_json::to_string(&failure).unwrap(), valid);
+    }
+}

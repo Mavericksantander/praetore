@@ -1319,7 +1319,8 @@ fn unsafe_runtime_setting(
 /// (schema USAGE, SELECT on `schema_migrations`, `safety_records` and
 /// `safety_audit_tenants`);
 /// UPDATE of `execution_status`,
-/// `output_json`, `not_dispatched_reason` and `updated_at`); the
+/// `output_json`, `not_dispatched_reason`, `failure_class`,
+/// `failure_reason` (0020) and `updated_at`); the
 /// documented `praetore_observe` shape exactly (schema USAGE; column SELECT
 /// on the ten `execution_journal` and seven `execution_journal_events`
 /// columns of docs/observability-mvp.md); and PUBLIC EXECUTE on functions
@@ -1378,6 +1379,8 @@ fn unexpected_grants(
              ('c', 'execution_journal', 'execution_status', 'UPDATE'), \
              ('c', 'execution_journal', 'output_json', 'UPDATE'), \
              ('c', 'execution_journal', 'not_dispatched_reason', 'UPDATE'), \
+             ('c', 'execution_journal', 'failure_class', 'UPDATE'), \
+             ('c', 'execution_journal', 'failure_reason', 'UPDATE'), \
              ('c', 'execution_journal', 'updated_at', 'UPDATE')), \
          ingest_allowed(kind, rel, col, privilege) AS (VALUES \
              ('n', '', '', 'USAGE'), \

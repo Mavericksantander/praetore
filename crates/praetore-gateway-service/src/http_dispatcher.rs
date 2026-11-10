@@ -149,27 +149,28 @@ impl ActionDispatcher for HttpActionDispatcher {
         action: &Action,
         expected_digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
-        if action_digest(action).map_err(|_| DispatchError)? != expected_digest {
-            return Err(DispatchError);
+        if action_digest(action).map_err(|_| DispatchError::Ambiguous)? != expected_digest {
+            return Err(DispatchError::Ambiguous);
         }
-        let tenant_id = authority_tenant_id(authority).ok_or(DispatchError)?;
+        let tenant_id = authority_tenant_id(authority).ok_or(DispatchError::Ambiguous)?;
         if key.tenant_id != tenant_id {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let route = self
             .routes
             .get(&(
                 tenant_id,
                 action.action_type.clone(),
-                action.target.clone().ok_or(DispatchError)?,
+                action.target.clone().ok_or(DispatchError::Ambiguous)?,
             ))
-            .ok_or(DispatchError)?;
+            .ok_or(DispatchError::Ambiguous)?;
         if action.capability.as_deref() != Some(route.capability.as_str()) {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
-        let request_body = serde_json::to_vec(&action.parameters).map_err(|_| DispatchError)?;
+        let request_body =
+            serde_json::to_vec(&action.parameters).map_err(|_| DispatchError::Ambiguous)?;
         if request_body.len() > MAX_ACTION_BYTES {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
 
         let idempotency_key = format!("{tenant_id}:{}:{}", key.agent_id, key.request_id);
@@ -183,13 +184,13 @@ impl ActionDispatcher for HttpActionDispatcher {
             request = request.header(AUTHORIZATION, authorization.clone());
         }
 
-        let mut response = request.send().map_err(|_| DispatchError)?;
+        let mut response = request.send().map_err(|_| DispatchError::Ambiguous)?;
         if !response.status().is_success()
             || response
                 .content_length()
                 .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
         {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let status = response.status();
         let mut response_body = Vec::new();
@@ -197,9 +198,9 @@ impl ActionDispatcher for HttpActionDispatcher {
             .by_ref()
             .take((MAX_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut response_body)
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         if response_body.len() > MAX_RESPONSE_BYTES {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
 
         let body = if response_body.is_empty() {
@@ -207,9 +208,9 @@ impl ActionDispatcher for HttpActionDispatcher {
         } else {
             match serde_json::from_slice(&response_body) {
                 Ok(body) => body,
-                Err(_) => {
-                    Value::String(String::from_utf8(response_body).map_err(|_| DispatchError)?)
-                }
+                Err(_) => Value::String(
+                    String::from_utf8(response_body).map_err(|_| DispatchError::Ambiguous)?,
+                ),
             }
         };
         Ok(DispatchReport::Executed(json!({
@@ -431,7 +432,7 @@ mod tests {
                 &matching_action,
                 &action_digest(&matching_action).unwrap(),
             ),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
         let mut changed_action = action();
         changed_action.capability = Some("orders:admin".into());
@@ -447,7 +448,7 @@ mod tests {
                 &changed_action,
                 &digest,
             ),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
         let unconfigured = Action::new(
             "orders:delete",
@@ -467,7 +468,7 @@ mod tests {
                 &unconfigured,
                 &action_digest(&unconfigured).unwrap(),
             ),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
     }
 
@@ -555,7 +556,7 @@ mod tests {
         };
         assert_eq!(
             dispatcher.dispatch(key, &authority(None), &action, &digest),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
 
         let tenant = Uuid::from_u128(10).to_string();
@@ -568,7 +569,7 @@ mod tests {
             ));
         assert_eq!(
             dispatcher.dispatch(key, &duplicate_tenant, &action, &digest),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
     }
 }

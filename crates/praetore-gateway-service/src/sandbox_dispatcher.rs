@@ -96,17 +96,17 @@ impl SandboxActionDispatcher {
                 .content_length()
                 .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
         {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let mut body = Vec::new();
         response
             .take((MAX_RESPONSE_BYTES + 1) as u64)
             .read_to_end(&mut body)
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         if body.len() > MAX_RESPONSE_BYTES {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
-        serde_json::from_slice(&body).map_err(|_| DispatchError)
+        serde_json::from_slice(&body).map_err(|_| DispatchError::Ambiguous)
     }
 
     fn execution_url(&self, key: ExecutionKey) -> Result<Url, DispatchError> {
@@ -116,7 +116,7 @@ impl SandboxActionDispatcher {
                 "v1/executions/{}/{}/{}",
                 key.tenant_id, key.agent_id, key.request_id
             ))
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         Ok(url)
     }
 }
@@ -130,9 +130,9 @@ impl ActionDispatcher for SandboxActionDispatcher {
         expected_digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
         if authority_tenant_id(authority) != Some(key.tenant_id)
-            || action_digest(action).map_err(|_| DispatchError)? != expected_digest
+            || action_digest(action).map_err(|_| DispatchError::Ambiguous)? != expected_digest
         {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let request = DispatchRequest {
             schema_version: 1,
@@ -141,16 +141,17 @@ impl ActionDispatcher for SandboxActionDispatcher {
             action,
             action_digest: expected_digest,
         };
-        let body = serde_json::to_vec(&request).map_err(|_| DispatchError)?;
+        let body = serde_json::to_vec(&request).map_err(|_| DispatchError::Ambiguous)?;
         if body.len() > MAX_REQUEST_BYTES {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let url = self
             .endpoint
             .join("v1/executions")
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         let idempotency_key = format!("{}:{}:{}", key.tenant_id, key.agent_id, key.request_id);
-        let idempotency_key = HeaderValue::from_str(&idempotency_key).map_err(|_| DispatchError)?;
+        let idempotency_key =
+            HeaderValue::from_str(&idempotency_key).map_err(|_| DispatchError::Ambiguous)?;
         let response = self
             .client
             .post(url)
@@ -158,9 +159,9 @@ impl ActionDispatcher for SandboxActionDispatcher {
             .header(CONTENT_TYPE, "application/json")
             .body(body)
             .send()
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         let value = Self::bounded_json(response)?;
-        serde_json::from_value(value).map_err(|_| DispatchError)
+        serde_json::from_value(value).map_err(|_| DispatchError::Ambiguous)
     }
 
     fn reconcile(

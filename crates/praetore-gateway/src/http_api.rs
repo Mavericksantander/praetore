@@ -419,12 +419,15 @@ struct ErrorResponse {
     /// approved action, which the gateway (never the client) performs.
     #[serde(skip_serializing_if = "Option::is_none")]
     execution: Option<crate::ExecutionStatus>,
-    /// Only on `action_not_dispatchable` / `dispatch_temporarily_refused`:
-    /// the adapter's stable refusal code.
+    /// Only on `action_not_dispatchable` / `dispatch_temporarily_refused` /
+    /// `action_effect_failed`: the adapter's stable code.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
-    /// Only on `action_not_dispatchable` when the refusal closed the
-    /// execution: its signed `not_dispatched` / `dispatch_refused` receipt.
+    /// On `action_not_dispatchable` when the refusal closed the execution:
+    /// its signed `not_dispatched` / `dispatch_refused` receipt, or its
+    /// signed `failed` receipt with the class `no_effect`. Always on
+    /// `action_effect_failed`: the signed `failed` receipt with the class
+    /// `effect_failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     receipt: Option<Box<crate::GatewayReceipt>>,
 }
@@ -1001,6 +1004,22 @@ fn gateway_error_response(error: GatewayError) -> Response {
             )
                 .into_response()
         }
+        // The adapter attempted the effect and it failed: not a refusal, and
+        // the target may hold a residue. Never retried.
+        GatewayError::EffectFailed {
+            reason, receipt, ..
+        } => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                code: "action_effect_failed",
+                resolution: None,
+                expiration_receipt_id: None,
+                execution: None,
+                reason: Some(reason),
+                receipt: Some(receipt),
+            }),
+        )
+            .into_response(),
         GatewayError::ExecutionNotFound(_) => {
             error_response(StatusCode::NOT_FOUND, "execution_not_found")
         }

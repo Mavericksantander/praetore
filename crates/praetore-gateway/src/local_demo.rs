@@ -43,29 +43,32 @@ impl ActionDispatcher for LocalDemoDispatcher {
             || action.capability.as_deref() != Some("demo:write")
             || action.target.as_deref() != Some("demo-state")
         {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
-        let parameters = action.parameters.as_object().ok_or(DispatchError)?;
+        let parameters = action
+            .parameters
+            .as_object()
+            .ok_or(DispatchError::Ambiguous)?;
         if parameters.len() != 2 {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         let name = parameters
             .get("key")
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty() && name.len() <= 128)
-            .ok_or(DispatchError)?;
+            .ok_or(DispatchError::Ambiguous)?;
         let value = parameters
             .get("value")
             .and_then(Value::as_str)
             .filter(|value| value.len() <= 1024)
-            .ok_or(DispatchError)?;
+            .ok_or(DispatchError::Ambiguous)?;
 
-        let mut state = self.state.lock().map_err(|_| DispatchError)?;
+        let mut state = self.state.lock().map_err(|_| DispatchError::Ambiguous)?;
         if let Some((existing_digest, output)) = state.executions.get(&key) {
             if existing_digest == action_digest {
                 return Ok(DispatchReport::Confirmed(output.clone()));
             }
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
 
         let output = json!({"key": name, "value": value});
@@ -165,7 +168,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             dispatcher.dispatch(key, &authority(), &action, "different-digest"),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
         assert_eq!(dispatcher.value("mode").as_deref(), Some("safe"));
     }
@@ -188,7 +191,7 @@ mod tests {
                 &invalid,
                 &crate::action_digest(&invalid).unwrap(),
             ),
-            Err(DispatchError)
+            Err(DispatchError::Ambiguous)
         );
         assert_eq!(dispatcher.value("mode"), None);
     }
