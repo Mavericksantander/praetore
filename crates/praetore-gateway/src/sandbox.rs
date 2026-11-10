@@ -482,24 +482,30 @@ impl ActionDispatcher for SandboxDispatcher {
         if action.action_type == "demo:set_value" {
             return match &self.demo {
                 Some(demo) => demo.dispatch(key, authority, action, action_digest),
-                None => Err(DispatchError),
+                None => Err(DispatchError::Ambiguous),
             };
         }
         if crate::action_digest(action).map_or(true, |digest| digest != action_digest) {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         // The lock serializes sandbox effects and makes key reuse idempotent.
-        let mut records = self.records.lock().map_err(|_| DispatchError)?;
+        let mut records = self.records.lock().map_err(|_| DispatchError::Ambiguous)?;
         if let Some((digest, output)) = records.executions.get(&key) {
             return if digest == action_digest {
                 Ok(DispatchReport::Confirmed(output.clone()))
             } else {
-                Err(DispatchError)
+                Err(DispatchError::Ambiguous)
             };
         }
-        if records.not_applied.contains_key(&key) {
+        if let Some((digest, reason)) = records.not_applied.get(&key) {
             // A key is dispatched at most once by the gateway; never retry.
-            return Err(DispatchError);
+            // The same action again reports the recorded refusal, as nothing
+            // was or is done for it.
+            return Err(if digest == action_digest {
+                DispatchError::NotApplied(DispatchRefused::terminal(reason))
+            } else {
+                DispatchError::Ambiguous
+            });
         }
         let result = match self.parse(action) {
             Ok(op) => self.perform(&op),
@@ -521,7 +527,9 @@ impl ActionDispatcher for SandboxDispatcher {
                 records
                     .not_applied
                     .insert(key, (action_digest.to_owned(), reason));
-                Err(DispatchError)
+                // Nothing changed at the target: a signed terminal state,
+                // not an ambiguous one.
+                Err(DispatchError::NotApplied(DispatchRefused::terminal(reason)))
             }
         }
     }
@@ -875,6 +883,12 @@ mod tests {
         Authority::new(AgentId::new(), "sandbox-test", vec![])
     }
 
+    /// The dispatch was refused with the guarantee that nothing changed at
+    /// the target, and the refusal is terminal.
+    fn not_applied(result: Result<DispatchReport, DispatchError>) -> bool {
+        matches!(result, Err(DispatchError::NotApplied(refusal)) if !refusal.is_transient())
+    }
+
     fn run(
         d: &SandboxDispatcher,
         n: u128,
@@ -933,10 +947,13 @@ mod tests {
     fn dot_dot_traversal_is_refused() {
         let dirs = dirs();
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
-        for path in ["../outside/x", "a/../../outside/x", "..", "./x", "sub/./x"] {
+        for (n, path) in ["../outside/x", "a/../../outside/x", "..", "./x", "sub/./x"]
+            .into_iter()
+            .enumerate()
+        {
             let action = write(path, "x");
             assert!(d.preflight(&action).is_err(), "{path}");
-            assert_eq!(run(&d, 10, &action), Err(DispatchError), "{path}");
+            assert!(not_applied(run(&d, 100 + n as u128, &action)), "{path}");
         }
         assert!(outside_is_empty(&dirs));
     }
@@ -945,11 +962,14 @@ mod tests {
     fn absolute_path_is_refused_even_when_inside_root() {
         let dirs = dirs();
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
-        for path in [
+        for (n, path) in [
             dirs.outside.join("x").display().to_string(),
             dirs.root.join("x").display().to_string(),
             "/etc/passwd".into(),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert_eq!(
                 d.preflight(&write(&path, "x")),
                 Err(DispatchRefused::terminal("absolute_path"))
@@ -958,7 +978,7 @@ mod tests {
                 d.preflight(&delete(&path)),
                 Err(DispatchRefused::terminal("absolute_path"))
             );
-            assert_eq!(run(&d, 11, &write(&path, "x")), Err(DispatchError));
+            assert!(not_applied(run(&d, 110 + n as u128, &write(&path, "x"))));
         }
         assert!(outside_is_empty(&dirs));
         assert!(!dirs.root.join("x").exists());
@@ -987,12 +1007,9 @@ mod tests {
             Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         // Even bypassing preflight, dispatch refuses (O_NOFOLLOW / lstat).
-        assert_eq!(run(&d, 20, &write("link.txt", "pwned")), Err(DispatchError));
-        assert_eq!(
-            run(&d, 21, &write("dangling.txt", "pwned")),
-            Err(DispatchError)
-        );
-        assert_eq!(run(&d, 22, &delete("link.txt")), Err(DispatchError));
+        assert!(not_applied(run(&d, 20, &write("link.txt", "pwned"))));
+        assert!(not_applied(run(&d, 21, &write("dangling.txt", "pwned"))));
+        assert!(not_applied(run(&d, 22, &delete("link.txt"))));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
         assert!(!dirs.outside.join("new.txt").exists());
         assert!(
@@ -1011,7 +1028,10 @@ mod tests {
         symlink(&dirs.outside, dirs.root.join("escape")).unwrap();
         std::fs::create_dir(dirs.root.join("real")).unwrap();
         symlink(&dirs.outside, dirs.root.join("real/deeper")).unwrap();
-        for path in ["escape/x.txt", "escape/victim.txt", "real/deeper/x.txt"] {
+        for (n, path) in ["escape/x.txt", "escape/victim.txt", "real/deeper/x.txt"]
+            .into_iter()
+            .enumerate()
+        {
             assert_eq!(
                 d.preflight(&write(path, "pwned")),
                 Err(DispatchRefused::terminal(
@@ -1019,9 +1039,8 @@ mod tests {
                 )),
                 "{path}"
             );
-            assert_eq!(
-                run(&d, 30, &write(path, "pwned")),
-                Err(DispatchError),
+            assert!(
+                not_applied(run(&d, 300 + n as u128, &write(path, "pwned"))),
                 "{path}"
             );
         }
@@ -1031,10 +1050,7 @@ mod tests {
                 "symlink_or_non_directory_in_path"
             ))
         );
-        assert_eq!(
-            run(&d, 31, &delete("escape/victim.txt")),
-            Err(DispatchError)
-        );
+        assert!(not_applied(run(&d, 31, &delete("escape/victim.txt"))));
         assert_eq!(
             std::fs::read_to_string(dirs.outside.join("victim.txt")).unwrap(),
             "original"
@@ -1061,7 +1077,7 @@ mod tests {
             d.preflight(&write("a\0b", "x")),
             Err(DispatchRefused::terminal("invalid_path_character"))
         );
-        assert_eq!(run(&d, 40, &write("", "x")), Err(DispatchError));
+        assert!(not_applied(run(&d, 40, &write("", "x"))));
         assert_eq!(std::fs::read_dir(&dirs.root).unwrap().count(), 0);
     }
 
@@ -1078,7 +1094,7 @@ mod tests {
             d.preflight(&big),
             Err(DispatchRefused::terminal("content_too_large"))
         );
-        assert_eq!(run(&d, 50, &big), Err(DispatchError));
+        assert!(not_applied(run(&d, 50, &big)));
         assert!(!dirs.root.join("big.txt").exists());
         let default = SandboxDispatcher::open(&dirs.root).unwrap();
         let huge = write("huge.txt", &"x".repeat(DEFAULT_MAX_CONTENT_BYTES + 1));
@@ -1117,7 +1133,7 @@ mod tests {
                 d.preflight(&write("hard.txt", "pwned")),
                 Err(DispatchRefused::terminal("hard_link_not_allowed"))
             );
-            assert_eq!(run(&d, 60, &write("hard.txt", "pwned")), Err(DispatchError));
+            assert!(not_applied(run(&d, 60, &write("hard.txt", "pwned"))));
             assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
         }
         std::fs::create_dir(dirs.root.join("dir")).unwrap();
@@ -1136,7 +1152,7 @@ mod tests {
                 d.preflight(&write("fifo", "x")),
                 Err(DispatchRefused::terminal("not_a_regular_file"))
             );
-            assert_eq!(run(&d, 61, &write("fifo", "x")), Err(DispatchError));
+            assert!(not_applied(run(&d, 61, &write("fifo", "x"))));
         }
         assert_eq!(
             d.preflight(&write("missing/x.txt", "x")),
@@ -1159,7 +1175,7 @@ mod tests {
             d.preflight(&exec),
             Err(DispatchRefused::terminal("action_not_in_sandbox_allowlist"))
         );
-        assert_eq!(run(&d, 70, &exec), Err(DispatchError));
+        assert!(not_applied(run(&d, 70, &exec)));
         let demo = Action::new(
             "demo:set_value",
             Some("demo-state".into()),
@@ -1303,8 +1319,8 @@ mod tests {
             d.preflight(&write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
-        assert_eq!(run(&d, 110, &write("a.txt", "x")), Err(DispatchError));
-        assert_eq!(run(&d, 111, &delete("keep.txt")), Err(DispatchError));
+        assert!(not_applied(run(&d, 110, &write("a.txt", "x"))));
+        assert!(not_applied(run(&d, 111, &delete("keep.txt"))));
         std::fs::remove_dir(&dirs.root).unwrap();
         // Path replaced by a symlink to the original directory.
         symlink(&moved, &dirs.root).unwrap();
@@ -1312,7 +1328,7 @@ mod tests {
             d.preflight(&write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
-        assert_eq!(run(&d, 112, &write("a.txt", "x")), Err(DispatchError));
+        assert!(not_applied(run(&d, 112, &write("a.txt", "x"))));
         assert!(!moved.join("a.txt").exists());
         assert!(moved.join("keep.txt").exists());
         // The failed dispatches are known not to have changed anything.
@@ -1325,7 +1341,7 @@ mod tests {
         // Never retried for the same key.
         std::fs::remove_file(&dirs.root).unwrap();
         std::fs::rename(&moved, &dirs.root).unwrap();
-        assert_eq!(run(&d, 112, &action), Err(DispatchError));
+        assert!(not_applied(run(&d, 112, &action)));
         assert!(!dirs.root.join("a.txt").exists());
         // Back in place: works again for a new key.
         assert!(matches!(
@@ -1370,9 +1386,8 @@ mod tests {
             .enumerate()
         {
             assert!(d.preflight(&delete(path)).is_err(), "{path}");
-            assert_eq!(
-                run(&d, 120 + n as u128, &delete(path)),
-                Err(DispatchError),
+            assert!(
+                not_applied(run(&d, 120 + n as u128, &delete(path))),
                 "{path}"
             );
         }
@@ -1401,7 +1416,7 @@ mod tests {
                 d.preflight(&delete("sock")),
                 Err(DispatchRefused::terminal("not_a_regular_file"))
             );
-            assert_eq!(run(&d, 130, &write("sock", "x")), Err(DispatchError));
+            assert!(not_applied(run(&d, 130, &write("sock", "x"))));
             assert!(std::fs::symlink_metadata(dirs.root.join("sock")).is_ok());
         }
     }
@@ -1486,7 +1501,7 @@ mod tests {
             d.preflight(&write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_insecure"))
         );
-        assert_eq!(run(&d, 400, &write("a.txt", "x")), Err(DispatchError));
+        assert!(not_applied(run(&d, 400, &write("a.txt", "x"))));
         assert!(!dirs.root.join("a.txt").exists());
         std::fs::set_permissions(&dirs.root, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
@@ -1524,7 +1539,7 @@ mod tests {
             d.preflight(&write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_insecure"))
         );
-        assert_eq!(run(&d, 410, &write("a.txt", "x")), Err(DispatchError));
+        assert!(not_applied(run(&d, 410, &write("a.txt", "x"))));
         assert!(!dirs.root.join("a.txt").exists());
         chmod(&["-N"]);
         assert!(SandboxDispatcher::open(&dirs.root).is_ok());

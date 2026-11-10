@@ -816,9 +816,22 @@ pub enum DispatchReport {
     Confirmed(Value),
 }
 
+/// Why [`ActionDispatcher::dispatch`] returned no report. The two cases
+/// lead to different journal states, so an adapter must not report
+/// `NotApplied` unless it holds the guarantee below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("tool adapter returned an ambiguous failure")]
-pub struct DispatchError;
+pub enum DispatchError {
+    /// The adapter cannot tell whether the effect happened. Recorded as
+    /// `outcome_unknown`; only reconciliation can close it.
+    #[error("tool adapter returned an ambiguous failure")]
+    Ambiguous,
+    /// The adapter established that it changed nothing at the target (for
+    /// example the path changed between the preflight and the effect, and
+    /// the effect was refused). Recorded as the signed terminal state
+    /// `failed`, never `outcome_unknown`, and never retried.
+    #[error("adapter refused the action before any effect: {0}")]
+    NotApplied(DispatchRefused),
+}
 
 #[derive(Debug, Error)]
 pub enum GatewayError {
@@ -1028,8 +1041,10 @@ impl Gateway {
         )?)
     }
 
-    /// Closes `ApprovedPendingDispatch` as `NotDispatched` with a signed
-    /// reason. Never invokes the adapter.
+    /// Closes `ApprovedPendingDispatch`, or a held `NotDispatched` request,
+    /// as `NotDispatched` with a signed reason. Never invokes the adapter.
+    /// When a concurrent caller already closed it with the same reason, that
+    /// first signed close is returned instead (idempotent).
     fn close_not_dispatched(
         &self,
         mut record: ExecutionRecord,
@@ -1043,8 +1058,22 @@ impl Gateway {
             Some(reason),
             self.execution_attester.as_ref(),
         )?;
-        self.journal
-            .mark_not_dispatched_attested(record.key, &attestation)?;
+        if let Err(error) = self
+            .journal
+            .mark_not_dispatched_attested(record.key, &attestation)
+        {
+            let JournalError::InvalidTransition = error else {
+                return Err(error.into());
+            };
+            let mut current = self
+                .journal
+                .get(record.key)?
+                .ok_or(GatewayError::ExecutionNotFound(record.key))?;
+            if Self::closed_reason(&current) != Some(reason) {
+                return Err(error.into());
+            }
+            return self.attest_record(&mut current);
+        }
         record.execution = ExecutionStatus::NotDispatched;
         Ok(Self::receipt(
             record.evidence,
@@ -1071,15 +1100,61 @@ impl Gateway {
         }
     }
 
-    fn preflight(&self, key: ExecutionKey, action: &Action) -> Result<(), GatewayError> {
-        self.dispatcher
-            .preflight(action)
-            .map_err(|refusal| GatewayError::DispatchRefused {
-                key,
-                reason: refusal.reason(),
-                transient: refusal.is_transient(),
-                receipt: None,
-            })
+    /// Adapter preflight for a held request that has no decision yet. A
+    /// terminal refusal closes it for good as `NotDispatched` with the signed
+    /// reason `dispatch_refused`: the approval can never proceed afterwards,
+    /// even if the target later becomes admissible again (the agent must
+    /// submit a new request). A transient refusal leaves it pending.
+    fn preflight_held(&self, record: &ExecutionRecord) -> Result<(), GatewayError> {
+        let Err(refusal) = self.dispatcher.preflight(&record.evidence.action) else {
+            return Ok(());
+        };
+        let receipt = if refusal.is_transient() {
+            None
+        } else {
+            Some(Box::new(self.close_not_dispatched(
+                record.clone(),
+                NotDispatchedReason::DispatchRefused,
+            )?))
+        };
+        Err(GatewayError::DispatchRefused {
+            key: record.key,
+            reason: refusal.reason(),
+            transient: refusal.is_transient(),
+            receipt,
+        })
+    }
+
+    /// The signed final reason a held request must carry once a human
+    /// rejected it or its window expired, if it does not carry one yet.
+    fn pending_close_reason(record: &ExecutionRecord) -> Option<NotDispatchedReason> {
+        if record.authorization != AuthorizationStatus::RequiresApproval
+            || record.execution != ExecutionStatus::NotDispatched
+            || Self::closed_reason(record).is_some()
+        {
+            return None;
+        }
+        match (&record.human_approval, &record.approval_expiration) {
+            (Some(decision), None) if decision.outcome == HumanApprovalOutcome::Reject => {
+                Some(NotDispatchedReason::ApprovalRejected)
+            }
+            (None, Some(_)) => Some(NotDispatchedReason::ApprovalExpired),
+            _ => None,
+        }
+    }
+
+    /// Idempotent repair: closes a rejected or expired held request with its
+    /// signed final reason when an earlier close did not complete (for
+    /// example a crash between the decision and the close, or a row written
+    /// before migration 0020). Returns the closing receipt when it closed.
+    fn close_decided_hold(
+        &self,
+        record: &ExecutionRecord,
+    ) -> Result<Option<GatewayReceipt>, GatewayError> {
+        match Self::pending_close_reason(record) {
+            Some(reason) => Ok(Some(self.close_not_dispatched(record.clone(), reason)?)),
+            None => Ok(None),
+        }
     }
 
     /// The signed reason of an execution closed without dispatch, if any.
@@ -1119,6 +1194,13 @@ impl Gateway {
             .journal
             .get(key)?
             .ok_or(GatewayError::ExecutionNotFound(key))?;
+        self.close_decided_hold(&record)?;
+        if record.authorization == AuthorizationStatus::RequiresApproval
+            && record.human_approval.is_none()
+            && record.approval_expiration.is_some()
+        {
+            return Err(ApprovalError::Expired.into());
+        }
         if record.authorization != AuthorizationStatus::RequiresApproval
             || record.execution != ExecutionStatus::NotDispatched
             || record.human_approval.is_some()
@@ -1127,7 +1209,7 @@ impl Gateway {
             return Err(ApprovalError::NotPending.into());
         }
         self.check_pending_approval_window(&record)?;
-        self.preflight(key, &record.evidence.action)?;
+        self.preflight_held(&record)?;
         Ok(ApprovalChallenge::from_evidence(
             &record.evidence,
             &record.action_digest,
@@ -1199,6 +1281,7 @@ impl Gateway {
         if record.human_approval.is_some() && record.approval_expiration.is_some() {
             return Err(GatewayError::Journal(JournalError::InvalidRecord));
         }
+        self.close_decided_hold(record)?;
         if record.approval_expiration.is_some() {
             return Ok(ApprovalResolution::Expired);
         }
@@ -1251,6 +1334,13 @@ impl Gateway {
             .journal
             .get(key)?
             .ok_or(GatewayError::ExecutionNotFound(key))?;
+        self.close_decided_hold(&record)?;
+        if record.authorization == AuthorizationStatus::RequiresApproval
+            && record.human_approval.is_none()
+            && record.approval_expiration.is_some()
+        {
+            return Err(ApprovalError::Expired.into());
+        }
         if record.authorization != AuthorizationStatus::RequiresApproval
             || record.execution != ExecutionStatus::NotDispatched
             || record.human_approval.is_some()
@@ -1270,8 +1360,9 @@ impl Gateway {
                 .validate_evidence_for_dispatch(&record.evidence)
                 .map_err(GatewayError::Authorization)?;
             // Refuse before the approval is consumed, so an action the
-            // adapter cannot perform is never recorded as dispatched.
-            self.preflight(key, &record.evidence.action)?;
+            // adapter cannot perform is never recorded as dispatched. A
+            // terminal refusal closes the request for good.
+            self.preflight_held(&record)?;
         }
         self.check_pending_approval_window(&record)?;
         let now = self
@@ -1286,7 +1377,9 @@ impl Gateway {
                 Ok(HumanApprovalResult::ApprovedPendingDispatch { decision })
             }
             HumanApprovalOutcome::Reject => {
-                let receipt = self.attest_record(&mut record)?;
+                // Final: the signed reason says a human rejected it.
+                let receipt =
+                    self.close_not_dispatched(record, NotDispatchedReason::ApprovalRejected)?;
                 Ok(HumanApprovalResult::Rejected {
                     decision,
                     receipt: Box::new(receipt),
@@ -1394,8 +1487,11 @@ impl Gateway {
     }
 
     /// Invokes the adapter once for a claimed execution and records the
-    /// attested outcome. Adapter errors become `OutcomeUnknown`; never
-    /// retries.
+    /// attested outcome. An ambiguous adapter error becomes `OutcomeUnknown`.
+    /// A refusal the adapter guarantees left the target unchanged
+    /// ([`DispatchError::NotApplied`]) is recorded as the signed terminal
+    /// state `Failed` and returned as [`GatewayError::DispatchRefused`] with
+    /// that receipt. Never retries.
     pub fn dispatch(&self, permit: DispatchPermit) -> Result<GatewayReceipt, GatewayError> {
         let DispatchPermit {
             key,
@@ -1403,15 +1499,20 @@ impl Gateway {
             authorization,
             action_digest,
         } = permit;
-        let (execution, output) = match self.dispatcher.dispatch(
+        let (execution, output, refused) = match self.dispatcher.dispatch(
             key,
             &evidence.authority,
             &evidence.action,
             &action_digest,
         ) {
-            Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output)),
-            Ok(DispatchReport::Confirmed(output)) => (ExecutionStatus::Confirmed, Some(output)),
-            Err(_) => (ExecutionStatus::OutcomeUnknown, None),
+            Ok(DispatchReport::Executed(output)) => (ExecutionStatus::Executed, Some(output), None),
+            Ok(DispatchReport::Confirmed(output)) => {
+                (ExecutionStatus::Confirmed, Some(output), None)
+            }
+            Err(DispatchError::NotApplied(refusal)) => {
+                (ExecutionStatus::Failed, None, Some(refusal))
+            }
+            Err(DispatchError::Ambiguous) => (ExecutionStatus::OutcomeUnknown, None, None),
         };
         let execution_attestation = self.create_execution_attestation(
             &evidence,
@@ -1422,13 +1523,24 @@ impl Gateway {
         self.journal
             .record_terminal_attested(key, execution, output.as_ref(), &execution_attestation)
             .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
-        Ok(Self::receipt(
+        let receipt = Self::receipt(
             evidence,
             authorization,
             execution,
             output,
             execution_attestation,
-        ))
+        );
+        match refused {
+            // Closed for good: the claim was consumed, so a transient
+            // adapter refusal is not offered again either.
+            Some(refusal) => Err(GatewayError::DispatchRefused {
+                key,
+                reason: refusal.reason(),
+                transient: false,
+                receipt: Some(Box::new(receipt)),
+            }),
+            None => Ok(receipt),
+        }
     }
 
     /// `pending_dispatch`, `claim_dispatch` and `dispatch` in sequence.
@@ -1443,11 +1555,14 @@ impl Gateway {
     /// signer failure is returned instead (fail closed, nothing dispatched).
     fn check_pending_approval_window(&self, record: &ExecutionRecord) -> Result<(), GatewayError> {
         if record.approval_expiration.is_some() {
+            self.close_decided_hold(record)?;
             return Err(ApprovalError::Expired.into());
         }
         match self.validate_approval_time_bounds(&record.evidence) {
             Err(GatewayError::Approval(ApprovalError::Expired)) => {
                 self.record_approval_expiration(record)?;
+                // Final: the signed reason says the window expired.
+                self.close_not_dispatched(record.clone(), NotDispatchedReason::ApprovalExpired)?;
                 Err(ApprovalError::Expired.into())
             }
             other => other,
@@ -1742,10 +1857,12 @@ impl Gateway {
                     }
                 }
             }
-            ExecutionStatus::NotDispatched
-            | ExecutionStatus::Executed
-            | ExecutionStatus::Confirmed
-            | ExecutionStatus::Failed => {}
+            ExecutionStatus::NotDispatched => {
+                if let Some(receipt) = self.close_decided_hold(&record)? {
+                    return Ok(receipt);
+                }
+            }
+            ExecutionStatus::Executed | ExecutionStatus::Confirmed | ExecutionStatus::Failed => {}
         }
 
         self.attest_record(&mut record)

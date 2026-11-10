@@ -288,10 +288,16 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let evidence = Evidence::from_json(&row.get::<_, String>(2))
             .map_err(|_| JournalError::InvalidRecord)?;
         let stored_action_digest: String = row.get(3);
-        if row.get::<_, Option<String>>(4).is_some() {
+        match row.get::<_, Option<String>>(4).as_deref() {
+            None => {}
+            // Closed after a decision or an expiration (0020): the outcome
+            // was already recorded.
+            Some("approval_rejected" | "approval_expired") => {
+                return Err(JournalError::ApprovalAlreadyRecorded);
+            }
             // Closed without dispatch (for example dispatch_refused): no
             // decision may ever be recorded for it.
-            return Err(JournalError::InvalidTransition);
+            Some(_) => return Err(JournalError::InvalidTransition),
         }
         if transaction
             .query_opt(
@@ -804,19 +810,24 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let evidence =
             Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
         // Allowed closes from Authorized without a reason or with
-        // dispatch_refused; RequiresApproval closes from
-        // ApprovedPendingDispatch with a reason, or, only with
-        // dispatch_refused, from a still undecided NotDispatched.
-        let refused =
-            attestation.not_dispatched_reason == Some(NotDispatchedReason::DispatchRefused);
-        let from = match (authorization, reason) {
-            (AuthorizationStatus::Allowed, None) => ExecutionStatus::Authorized,
-            (AuthorizationStatus::Allowed, Some(_)) if refused => ExecutionStatus::Authorized,
-            (AuthorizationStatus::RequiresApproval, Some(_))
-                if refused && current == ExecutionStatus::NotDispatched =>
-            {
-                ExecutionStatus::NotDispatched
+        // dispatch_refused. RequiresApproval closes from
+        // ApprovedPendingDispatch with a reason, or in place from a held
+        // NotDispatched: dispatch_refused while undecided, approval_rejected
+        // after a reject decision, approval_expired after the expiration
+        // receipt (0020).
+        let from = match (authorization, attestation.not_dispatched_reason) {
+            (AuthorizationStatus::Allowed, None)
+            | (AuthorizationStatus::Allowed, Some(NotDispatchedReason::DispatchRefused)) => {
+                ExecutionStatus::Authorized
             }
+            (
+                AuthorizationStatus::RequiresApproval,
+                Some(NotDispatchedReason::ApprovalRejected),
+            ) => ExecutionStatus::NotDispatched,
+            (
+                AuthorizationStatus::RequiresApproval,
+                Some(NotDispatchedReason::DispatchRefused | NotDispatchedReason::ApprovalExpired),
+            ) if current == ExecutionStatus::NotDispatched => ExecutionStatus::NotDispatched,
             (AuthorizationStatus::RequiresApproval, Some(_)) => {
                 ExecutionStatus::ApprovedPendingDispatch
             }
@@ -832,22 +843,35 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .map_err(|_| JournalError::InvalidRecord)?;
 
         let row_reason: Option<String> = row.get(3);
-        let undecided_close = from == ExecutionStatus::NotDispatched && row_reason.is_none();
-        if undecided_close
-            && transaction
-                .query_opt(
-                    "SELECT 1 FROM praetore.human_approvals \
-                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
-                     UNION ALL SELECT 1 FROM praetore.human_approval_expirations \
-                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+        let held_close = from == ExecutionStatus::NotDispatched && row_reason.is_none();
+        if held_close {
+            let decisions = transaction
+                .query_one(
+                    "SELECT \
+                       EXISTS (SELECT 1 FROM praetore.human_approvals \
+                               WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                                 AND outcome = 'reject'), \
+                       EXISTS (SELECT 1 FROM praetore.human_approvals \
+                               WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                                 AND outcome = 'approve'), \
+                       EXISTS (SELECT 1 FROM praetore.human_approval_expirations \
+                               WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3)",
                     &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
-                .map_err(|_| JournalError::Unavailable)?
-                .is_some()
-        {
-            return Err(JournalError::InvalidTransition);
+                .map_err(|_| JournalError::Unavailable)?;
+            let (rejected, approved, expired): (bool, bool, bool) =
+                (decisions.get(0), decisions.get(1), decisions.get(2));
+            let allowed = match attestation.not_dispatched_reason {
+                Some(NotDispatchedReason::DispatchRefused) => !rejected && !approved && !expired,
+                Some(NotDispatchedReason::ApprovalRejected) => rejected && !expired,
+                Some(NotDispatchedReason::ApprovalExpired) => expired && !rejected && !approved,
+                _ => false,
+            };
+            if !allowed {
+                return Err(JournalError::InvalidTransition);
+            }
         }
-        if current == ExecutionStatus::NotDispatched && !undecided_close {
+        if current == ExecutionStatus::NotDispatched && !held_close {
             let existing = transaction
                 .query_opt(
                     "SELECT attestation_json FROM praetore.execution_attestations \
@@ -1140,6 +1164,7 @@ pub(super) fn parse_record(key: ExecutionKey, row: Row) -> Result<ExecutionRecor
 fn not_dispatched_reason_as_db(reason: NotDispatchedReason) -> &'static str {
     match reason {
         NotDispatchedReason::ApprovalExpired => "approval_expired",
+        NotDispatchedReason::ApprovalRejected => "approval_rejected",
         NotDispatchedReason::DispatchFailed => "dispatch_failed",
         NotDispatchedReason::CrashRecovered => "crash_recovered",
         NotDispatchedReason::DispatchRefused => "dispatch_refused",

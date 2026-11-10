@@ -290,6 +290,20 @@ Migrations are forward-only, including `0013_dispatch_refused` and
 `0014_closed_execution_row_lock`. There is no down migration; rolling one
 back means restoring a backup taken before it was applied.
 
+Migration `0020_approval_close_reasons` adds the signed reason
+`approval_rejected` and lets a held approval (`not_dispatched` with no
+reason) close in place once it is rejected (`approval_rejected`, which needs
+the reject decision) or once its window expired (`approval_expired`, which
+needs the expiration receipt and no decision). Rows written before 0020 keep
+a null reason; the gateway closes them the first time it reads them, and
+signed attestations are never rewritten. To undo 0020 alone, the schema
+owner runs
+[`docs/rollback/0020-approval-close-reasons.sql`](rollback/0020-approval-close-reasons.sql)
+with every gateway stopped; it fails and changes nothing once a row uses
+`approval_rejected`. The test
+`postgres_approval_close_reasons_migration_rolls_back_and_applies_again`
+applies it, checks the 0013 rules are back and applies 0020 again.
+
 #### TLS
 
 Every connection (gateway, CLI, `praetore-observe`) validates its URL before
@@ -927,9 +941,10 @@ key; a missing or invalid evidence signature fails with
 lowercase hex characters; uppercase or mixed case is rejected. The execution attestation binds the
 evidence `context_hash`, which excludes that signature, so both checks are
 required. A v3 attestation carries
-`not_dispatched_reason` (`approval_expired`, `dispatch_failed` or
-`crash_recovered`); unknown reasons fail with `RECEIPT_INVALID`, a reason that
-does not match the signature fails with `RECEIPT_SIGNATURE_INVALID`. Like
+`not_dispatched_reason` (`approval_expired`, `approval_rejected`,
+`dispatch_failed`, `crash_recovered` or `dispatch_refused`); unknown reasons
+fail with `RECEIPT_INVALID`, a reason that does not match the signature fails
+with `RECEIPT_SIGNATURE_INVALID`. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
 
 `praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin

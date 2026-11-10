@@ -1,0 +1,57 @@
+-- Manual rollback of migration 0020 (approval_rejected and the in-place
+-- approval_expired close of a held approval) alone. Run it as the owner of
+-- the praetore schema with every gateway stopped:
+--
+--   psql "$OWNER_URL" -v ON_ERROR_STOP=1 -f docs/rollback/0020-approval-close-reasons.sql
+--
+-- No row is rewritten. It fails, and changes nothing, if a journal row or
+-- an attestation already uses 'approval_rejected': those rows are signed,
+-- and the 0013 vocabulary cannot hold them. Afterwards only a release
+-- without 0020 can run against the database, or `praetore migrate` applies
+-- 0020 again. Rows closed as 'approval_expired' in place stay valid under
+-- 0013.
+
+BEGIN;
+
+-- The constraint and trigger changes need ACCESS EXCLUSIVE on the tables:
+-- fail after 5 s instead of queueing every other session behind this one.
+SET LOCAL lock_timeout = '5s';
+
+DROP TRIGGER execution_journal_transition_v4 ON praetore.execution_journal;
+CREATE TRIGGER execution_journal_transition_v3
+BEFORE UPDATE ON praetore.execution_journal
+FOR EACH ROW EXECUTE FUNCTION praetore.validate_execution_journal_transition_v3();
+DROP FUNCTION praetore.validate_execution_journal_transition_v4();
+
+ALTER TABLE praetore.execution_journal
+    DROP CONSTRAINT execution_journal_not_dispatched_reason_v3;
+ALTER TABLE praetore.execution_journal
+    ADD CONSTRAINT execution_journal_not_dispatched_reason_v2 CHECK (
+        not_dispatched_reason IS NULL
+        OR (not_dispatched_reason IN (
+                'approval_expired', 'dispatch_failed', 'crash_recovered'
+            )
+            AND authorization_status = 'requires_approval'
+            AND execution_status = 'not_dispatched')
+        OR (not_dispatched_reason = 'dispatch_refused'
+            AND authorization_status IN ('allowed', 'requires_approval')
+            AND execution_status = 'not_dispatched')
+    );
+
+ALTER TABLE praetore.execution_attestations
+    DROP CONSTRAINT execution_attestations_not_dispatched_reason_v3;
+ALTER TABLE praetore.execution_attestations
+    ADD CONSTRAINT execution_attestations_not_dispatched_reason_v2 CHECK (
+        not_dispatched_reason IS NOT DISTINCT FROM
+            (attestation_json ->> 'not_dispatched_reason')
+        AND (not_dispatched_reason IS NULL
+            OR (not_dispatched_reason IN (
+                    'approval_expired', 'dispatch_failed', 'crash_recovered',
+                    'dispatch_refused'
+                )
+                AND execution_status = 'not_dispatched'))
+    );
+
+DELETE FROM praetore.schema_migrations WHERE version = '0020_approval_close_reasons';
+
+COMMIT;

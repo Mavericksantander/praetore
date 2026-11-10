@@ -481,6 +481,67 @@ jobs:
         env:
           PRAETORE_TEST_APD_RESTART_PHASE: after
         run: cargo test -p praetore-replay-postgres --locked --test postgres -- --ignored --exact postgres_apd_and_migrations_survive_restart
+      # T-013 PR-B: signed final states (refusal before the effect, challenge
+      # refusal, rejection, expiry) through the CLI's gateway against
+      # PostgreSQL, verified with praetore-verify. Last in the job, after the
+      # restart steps, because these tests create login roles and journal
+      # rows. One test at a time with --exact; each must report "1 passed",
+      # and every ignored test of the two binaries must be run by a step of
+      # this job. The 0020 up/down test runs in the ignored-tests script.
+      - name: T-013 signed final states end to end against PostgreSQL (CLI gateway, HTTP, praetore-verify)
+        run: |
+          set -euo pipefail
+          # T17, T20, T7b and S1 run target/debug/praetore-verify; T21 runs
+          # target/debug/praetore.
+          cargo build -p praetore-cli -p praetore-verify --locked
+          run_exact() {
+            local package="$1" bin="$2" name="$3"
+            echo "::group::$name"
+            output="$(cargo test -p "$package" --locked --bin "$bin" -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; echo "::error::$name failed"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          }
+          cli=(
+            # Approval flow through the CLI's gateway (waits out the 30 s window).
+            tests::postgres_approval_dispatches_once_and_rejection_is_final
+            # Sandbox: allow, deny, outside the allowlist, escapes.
+            tests::postgres_sandbox_allow_deny_and_escape
+            # Sandbox: approve, reject, exec refused, single dispatch, swaps.
+            tests::postgres_sandbox_approval_executes_once_in_the_gateway
+            # HTTP: exec-mode refusal, 403, approval, gateway down, database down.
+            tests::postgres_sandbox_http_cooperative_refusal_and_gateway_down
+            # S1: refused before the effect after the last preflight: signed failed.
+            tests::postgres_t013b_refusal_before_effect_is_a_signed_failed_state
+            # Challenge refusal is a signed final state, also once the file returns.
+            tests::postgres_t013b_challenge_refusal_is_final_even_if_the_file_returns
+            # T20: rejected and expired, distinct non-null signed reasons (waits 30 s).
+            tests::postgres_t013b_t20_rejected_and_expired_have_distinct_signed_reasons
+            # T7b: approved, then expired before the dispatch (waits 30 s).
+            tests::postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approval_expired
+            # T17: tampered final state and wrong pin refused by praetore-verify.
+            tests::postgres_t013b_t17_tampered_final_state_fails_praetore_verify
+            # T21: CLI stderr for an allowed action refused before the effect.
+            tests::postgres_t013b_t21_cli_stderr_reports_allowed_refusal_without_deny
+          )
+          gateway_service=(
+            tests::production_refuses_a_privileged_runtime_role_and_local_demo_warns
+          )
+          for name in "${cli[@]}"; do run_exact praetore-cli praetore "$name"; done
+          for name in "${gateway_service[@]}"; do run_exact praetore-gateway-service praetore-gateway-demo "$name"; done
+          # A new ignored test must be added to a step, not skipped silently.
+          # postgres_find_pending_agent_ignores_hostile_search_path runs in
+          # the journal-export step.
+          listed="$(cargo test -q -p praetore-cli --locked --bin praetore -- --ignored --list 2>/dev/null | sed -n 's/^\(tests::.*\): test$/\1/p')"
+          for name in $listed; do
+            [ "$name" = tests::postgres_find_pending_agent_ignores_hostile_search_path ] && continue
+            printf '%s\n' "${cli[@]}" | grep -qxF "$name" || { echo "::error::ignored test $name is not run by any step"; exit 1; }
+          done
+          listed="$(cargo test -q -p praetore-gateway-service --locked --bin praetore-gateway-demo -- --ignored --list 2>/dev/null | sed -n 's/: test$//p')"
+          for name in $listed; do
+            printf '%s\n' "${gateway_service[@]}" | grep -qxF "$name" || { echo "::error::ignored test $name is not run by any step"; exit 1; }
+          done
+          echo "ran ${#cli[@]} praetore-cli and ${#gateway_service[@]} praetore-gateway-service tests"
 
   sbom:
     name: CycloneDX SBOM

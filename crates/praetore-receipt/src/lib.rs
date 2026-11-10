@@ -71,8 +71,12 @@ pub enum ExecutionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotDispatchedReason {
-    /// The approval window closed before dispatch was claimed.
+    /// The approval window closed before dispatch was claimed: either the
+    /// approval was never decided (the signed expiration receipt exists), or
+    /// it was approved and the claim came too late.
     ApprovalExpired,
+    /// A human rejected the approval. Terminal: never dispatched.
+    ApprovalRejected,
     /// Revalidation before the claim failed for a reason other than expiry.
     DispatchFailed,
     /// Reconciliation found the approval unclaimed after a restart.

@@ -489,23 +489,26 @@ impl ActionDispatcher for PostgresTestAdapter {
         digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
-        let parameters = action.parameters.as_object().ok_or(DispatchError)?;
+        let parameters = action
+            .parameters
+            .as_object()
+            .ok_or(DispatchError::Ambiguous)?;
         let parameter_key = parameters
             .get("key")
             .and_then(Value::as_str)
-            .ok_or(DispatchError)?;
-        let value = parameters.get("value").ok_or(DispatchError)?;
+            .ok_or(DispatchError::Ambiguous)?;
+        let value = parameters.get("value").ok_or(DispatchError::Ambiguous)?;
         let output = json!({"key": parameter_key, "value": value});
 
-        let mut client = self.client.lock().map_err(|_| DispatchError)?;
-        let mut transaction = client.transaction().map_err(|_| DispatchError)?;
+        let mut client = self.client.lock().map_err(|_| DispatchError::Ambiguous)?;
+        let mut transaction = client.transaction().map_err(|_| DispatchError::Ambiguous)?;
         transaction
             .execute(
                 "INSERT INTO praetore_test_adapter.gateway_test_invocations \
                  (tenant_id, agent_id, request_id) VALUES ($1, $2, $3)",
                 &[&key.tenant_id, &key.agent_id, &key.request_id],
             )
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         let inserted = transaction
             .execute(
                 "INSERT INTO praetore_test_adapter.gateway_test_effects \
@@ -517,10 +520,10 @@ impl ActionDispatcher for PostgresTestAdapter {
                     &key.agent_id,
                     &key.request_id,
                     &digest,
-                    &serde_json::to_string(&output).map_err(|_| DispatchError)?,
+                    &serde_json::to_string(&output).map_err(|_| DispatchError::Ambiguous)?,
                 ],
             )
-            .map_err(|_| DispatchError)?;
+            .map_err(|_| DispatchError::Ambiguous)?;
         if inserted == 0 {
             let existing: String = transaction
                 .query_one(
@@ -528,26 +531,26 @@ impl ActionDispatcher for PostgresTestAdapter {
                      WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
                     &[&key.tenant_id, &key.agent_id, &key.request_id],
                 )
-                .map_err(|_| DispatchError)?
+                .map_err(|_| DispatchError::Ambiguous)?
                 .get(0);
             if existing != digest {
-                return Err(DispatchError);
+                return Err(DispatchError::Ambiguous);
             }
         }
-        transaction.commit().map_err(|_| DispatchError)?;
+        transaction.commit().map_err(|_| DispatchError::Ambiguous)?;
 
         if let Some(pid) = self.kill_backend_after_effect {
             let mut admin = connect_client();
             let terminated: bool = admin
                 .query_one("SELECT pg_terminate_backend($1)", &[&pid])
-                .map_err(|_| DispatchError)?
+                .map_err(|_| DispatchError::Ambiguous)?
                 .get(0);
             if !terminated {
-                return Err(DispatchError);
+                return Err(DispatchError::Ambiguous);
             }
         }
         if self.fail_after_effect.swap(false, Ordering::SeqCst) {
-            return Err(DispatchError);
+            return Err(DispatchError::Ambiguous);
         }
         Ok(DispatchReport::Confirmed(output))
     }
@@ -2291,7 +2294,7 @@ const APD_CHECKS: [(&str, &str); 6] = [
     ),
     (
         "praetore.execution_journal",
-        "execution_journal_not_dispatched_reason_v2",
+        "execution_journal_not_dispatched_reason_v3",
     ),
     (
         "praetore.execution_journal_events",
@@ -2303,13 +2306,13 @@ const APD_CHECKS: [(&str, &str); 6] = [
     ),
     (
         "praetore.execution_attestations",
-        "execution_attestations_not_dispatched_reason_v2",
+        "execution_attestations_not_dispatched_reason_v3",
     ),
 ];
 
 /// Fails unless every CHECK added by 0010 (reason CHECKs as replaced by
-/// 0013) exists, the replaced constraints are gone, and only the latest
-/// (0013, v3) transition trigger is installed.
+/// 0013 and 0020) exists, the replaced constraints are gone, and only the
+/// latest (0020, v4) transition trigger is installed.
 fn assert_0010_schema_present(client: &mut Client) {
     for (table, name) in APD_CHECKS {
         let found: i64 = client
@@ -2344,6 +2347,15 @@ fn assert_0010_schema_present(client: &mut Client) {
             "praetore.execution_attestations",
             "execution_attestations_not_dispatched_reason_v1",
         ),
+        // Replaced by 0020.
+        (
+            "praetore.execution_journal",
+            "execution_journal_not_dispatched_reason_v2",
+        ),
+        (
+            "praetore.execution_attestations",
+            "execution_attestations_not_dispatched_reason_v2",
+        ),
     ] {
         let found: i64 = client
             .query_one(
@@ -2366,7 +2378,7 @@ fn assert_0010_schema_present(client: &mut Client) {
         .iter()
         .map(|row| row.get(0))
         .collect();
-    assert_eq!(triggers, vec!["execution_journal_transition_v3".to_owned()]);
+    assert_eq!(triggers, vec!["execution_journal_transition_v4".to_owned()]);
     let recorded: i64 = client
         .query_one("SELECT count(*) FROM praetore.schema_migrations", &[])
         .unwrap()
@@ -3101,7 +3113,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0016_safety_records",
             "0017_safety_records_followups",
             "0018_safety_audit_and_role_oids",
-            "0019_safety_ingest_row_lock"
+            "0019_safety_ingest_row_lock",
+            "0020_approval_close_reasons"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -5937,11 +5950,14 @@ fn postgres_apd_parse_record_rejects_forged_apd_rows() {
             ],
         )
         .unwrap();
+    // Since 0020 the expired row carries the reason approval_expired; an
+    // APD row never has a reason (CHECK), so the forgery clears it.
     scratch
         .execute(
             &format!(
                 "UPDATE praetore.execution_journal \
-                 SET execution_status = 'approved_pending_dispatch' {where_key}"
+                 SET execution_status = 'approved_pending_dispatch', \
+                     not_dispatched_reason = NULL {where_key}"
             ),
             &[&expired.agent_id, &expired.request_id],
         )
@@ -6947,7 +6963,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0016_safety_records",
             "0017_safety_records_followups",
             "0018_safety_audit_and_role_oids",
-            "0019_safety_ingest_row_lock"
+            "0019_safety_ingest_row_lock",
+            "0020_approval_close_reasons"
         ]
     );
     assert!(again.is_empty());
@@ -7189,6 +7206,147 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
 
 // ---------------------------------------------------------------------------
 // G1 (SAF-09.5): post-hoc safety records (migration 0016).
+
+/// 0020 (DISC-1) up, down and up again against real PostgreSQL, in its own
+/// database. Up allows the signed reason `approval_rejected`; the documented
+/// rollback restores the 0013 trigger and constraints, after which a
+/// rejection cannot be closed with that reason; applying 0020 again closes
+/// it through the gateway's idempotent repair, and from then on the rollback
+/// refuses to run while such a row exists, leaving 0020 in place.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
+    const TEST: &str = "postgres_approval_close_reasons_migration_rolls_back_and_applies_again";
+    const ROLLBACK_0020: &str =
+        include_str!("../../../docs/rollback/0020-approval-close-reasons.sql");
+    if !in_own_scratch_database(TEST) {
+        return;
+    }
+    let state = || -> (String, bool, bool, bool) {
+        let row = connect_client()
+            .query_one(
+                "SELECT (SELECT string_agg(tgname, ',' ORDER BY tgname) FROM pg_trigger \
+                         WHERE tgrelid = 'praetore.execution_journal'::regclass \
+                           AND tgname LIKE 'execution_journal_transition_v%'), \
+                        EXISTS (SELECT 1 FROM pg_constraint \
+                                WHERE conname = 'execution_journal_not_dispatched_reason_v3'), \
+                        EXISTS (SELECT 1 FROM pg_constraint \
+                                WHERE conname = 'execution_attestations_not_dispatched_reason_v3'), \
+                        EXISTS (SELECT 1 FROM praetore.schema_migrations \
+                                WHERE version = '0020_approval_close_reasons')",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2), row.get(3))
+    };
+    let up = (
+        "execution_journal_transition_v4".to_owned(),
+        true,
+        true,
+        true,
+    );
+    let down = (
+        "execution_journal_transition_v3".to_owned(),
+        false,
+        false,
+        false,
+    );
+    let reject = |fixture: &PostgresApprovalFixture| {
+        let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        let mut decision = HumanApprovalDecision {
+            schema_version: 1,
+            approval_id: Uuid::new_v4(),
+            approver_key_id: "postgres-human-approver-v1".into(),
+            challenge: fixture.gateway.approval_challenge(key).unwrap(),
+            outcome: HumanApprovalOutcome::Reject,
+            signature: String::new(),
+        };
+        decision.signature = hex::encode(
+            fixture
+                .approver_key
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        (key, fixture.gateway.resolve_human_approval(decision))
+    };
+    let reason = |key: ExecutionKey| -> Option<String> {
+        connect_client()
+            .query_one(
+                "SELECT not_dispatched_reason FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap()
+            .get(0)
+    };
+
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    assert_eq!(state(), up);
+
+    // Down: the 0013 trigger and constraints are back.
+    connect_client().batch_execute(ROLLBACK_0020).unwrap();
+    assert_eq!(state(), down);
+    let reason_is_allowed = |table: &str, constraint: &str| -> bool {
+        let definition: String = connect_client()
+            .query_one(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+                 WHERE conname = $1 AND conrelid = $2::text::regclass",
+                &[&constraint, &table],
+            )
+            .unwrap()
+            .get(0);
+        definition.contains("approval_rejected")
+    };
+    assert!(!reason_is_allowed(
+        "praetore.execution_journal",
+        "execution_journal_not_dispatched_reason_v2"
+    ));
+    assert!(!reason_is_allowed(
+        "praetore.execution_attestations",
+        "execution_attestations_not_dispatched_reason_v2"
+    ));
+    // Without 0020 the decision is recorded but the close is refused.
+    let (key, result) = reject(&fixture);
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(reason(key), None);
+    assert_eq!(
+        database_rows_for_request("praetore.human_approvals", key.request_id),
+        1
+    );
+
+    // Up again: only 0020 is applied, and the schema is current.
+    let mut admin = connect_client();
+    let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    assert_eq!(applied, vec!["0020_approval_close_reasons"]);
+    praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    assert_eq!(state(), up);
+    assert!(reason_is_allowed(
+        "praetore.execution_journal",
+        "execution_journal_not_dispatched_reason_v3"
+    ));
+    // The idempotent repair closes the rejection left open while down.
+    assert_eq!(
+        fixture.gateway.approval_resolution(key).unwrap(),
+        praetore_gateway::ApprovalResolution::Rejected
+    );
+    assert_eq!(reason(key).as_deref(), Some("approval_rejected"));
+    let (key, result) = reject(&create_postgres_approval_gateway(Uuid::new_v4()));
+    assert!(matches!(result, Ok(HumanApprovalResult::Rejected { .. })));
+    assert_eq!(reason(key).as_deref(), Some("approval_rejected"));
+
+    // With such rows the rollback fails as a whole and 0020 stays.
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0020)
+        .expect_err("the rollback must refuse rows that need 0020");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state(), up);
+    assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
+}
 
 mod g1_safety {
     use super::*;
