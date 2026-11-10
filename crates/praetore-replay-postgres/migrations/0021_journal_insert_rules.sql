@@ -16,7 +16,9 @@
 --   * execution_attestations: an attestation is accepted only for the
 --     journal row's current state, with the same not_dispatched_reason and
 --     failure class, and its signed JSON names that same tenant, agent,
---     request, evidence, authorization and state. The gateway inserts each
+--     request, action digest, authorization and state. The journal's
+--     evidence_json is TEXT and is not parsed here: it may carry escapes
+--     such as \u0000 that PostgreSQL's JSON types refuse. The gateway inserts each
 --     attestation in the transaction that moves the row to that state, or
 --     while the row is in it, so every attestation it writes passes.
 --
@@ -69,7 +71,7 @@ BEGIN
     -- until this transaction ends.
     SELECT current_row.authorization_status, current_row.execution_status,
            current_row.not_dispatched_reason, current_row.failure_class,
-           current_row.failure_reason, current_row.evidence_json
+           current_row.failure_reason, current_row.action_digest
       INTO journal
       FROM praetore.execution_journal current_row
      WHERE current_row.tenant_id = NEW.tenant_id
@@ -91,8 +93,7 @@ BEGIN
         AND NEW.attestation_json ->> 'tenant_id' = NEW.tenant_id::text
         AND NEW.attestation_json ->> 'agent_id' = NEW.agent_id::text
         AND NEW.attestation_json ->> 'request_id' = NEW.request_id::text
-        AND NEW.attestation_json ->> 'evidence_id'
-            = (journal.evidence_json::jsonb ->> 'evidence_id'),
+        AND NEW.attestation_json ->> 'action_digest' = journal.action_digest,
         false) THEN
         RAISE EXCEPTION 'execution attestation does not match the journal state: % (journal %)',
             NEW.execution_status, journal.execution_status;

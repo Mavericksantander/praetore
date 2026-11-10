@@ -7731,7 +7731,9 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
                 &digest,
                 &authorization,
                 &execution,
-                &json!({ "evidence_id": request }).to_string(),
+                // A NUL escape, as a refused path can carry: the triggers
+                // must not parse evidence_json as JSON.
+                &json!({ "evidence_id": request, "path": "ok\u{0}/etc" }).to_string(),
             ],
         )?;
         transaction.commit()
@@ -7743,6 +7745,7 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
             "agent_id": agent,
             "request_id": request,
             "evidence_id": request,
+            "action_digest": digest,
             "authorization": authorization,
             "execution": execution,
         })
@@ -7910,7 +7913,7 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
     // Signed identity that names another request, authorization or tenant.
     for (case, field, value) in [
         ("other request", "request_id", json!(request(1))),
-        ("other evidence", "evidence_id", json!(Uuid::new_v4())),
+        ("other action", "action_digest", json!("b".repeat(64))),
         ("other authorization", "authorization", json!("allowed")),
         ("other tenant", "tenant_id", json!(other_tenant)),
         ("state in JSON", "execution", json!("executed")),
