@@ -518,12 +518,28 @@ Después, registrar el hook en `<proyecto>/.claude/settings.local.json`:
 
 ```json
 { "hooks": { "PreToolUse": [ { "matcher": "*", "hooks": [
-  { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/praetore-hook.sh" }
+  { "type": "command", "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/praetore-hook.sh",
+    "timeout": 30, "onFailure": "block" }
 ] } ] } }
 ```
 
-Luego reiniciar Claude Code. El wrapper niega todo si falta el binario o el
-estado. Para exportar los recibos de una sesión real y verificarlos:
+Luego reiniciar Claude Code. `"onFailure": "block"` (Claude Code 2.1.295 o
+posterior) es necesario: según la documentación de hooks, un hook que no
+arranca, termina con un código distinto de 0 y 2, se pasa del `timeout` o
+imprime JSON inválido es un error no bloqueante y la llamada sigue, salvo con
+`onFailure: "block"`. Con un `timeout` corto, un hook colgado bloquea en vez
+de esperar el valor por defecto (600 s). Con una versión anterior, la clave
+no existe y el wrapper es la única protección.
+
+El wrapper falla cerrado por su cuenta: niega la llamada (imprime la decisión
+`deny` y sale con 0) si falta `CLAUDE_PROJECT_DIR`, el binario o el estado, si
+el binario no arranca (126, 127), entra en pánico (101), muere por una señal
+(128 + n, por ejemplo 137) o sale con cualquier otro código distinto de 0, y
+si imprime algo que no es un objeto JSON. El binario además convierte un
+pánico durante la autorización en una negación. Lo que el wrapper no cubre
+(el propio `sh` no arranca, o el wrapper muere) lo cubre
+`onFailure: "block"`. No se probó en un Claude Code real: los tests
+(`tests_wrapper`) usan dobles del binario. Para exportar los recibos de una sesión real y verificarlos:
 
 ```sh
 <proyecto>/.claude/bin/praetore-claude-hook export <proyecto>/.claude/praetore <bundle>

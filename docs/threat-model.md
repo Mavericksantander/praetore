@@ -124,7 +124,9 @@ Trust boundaries are explicit:
 * With a loaded policy, a declared `Safety` action is answered before any
   evaluation, replay claim, journal write or signature, so an unavailable
   journal does not hold it. `praetore-mcp` forwards it to the wrapped server
-  without a receipt in both modes. Safety actions are recorded only after
+  without a receipt in both modes (a line that praetore-mcp cannot parse and
+  that may name a `safety*` tool is refused instead, because it cannot be
+  checked against the declared actions). Safety actions are recorded only after
   the fact, by the separate ingestion path (SAF-09.5, G1; see
   [Post-hoc safety ingestion (G1)](#post-hoc-safety-ingestion-g1)), never
   on the decision path.

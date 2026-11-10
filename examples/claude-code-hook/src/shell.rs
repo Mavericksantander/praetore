@@ -114,6 +114,17 @@ fn collect(words: &[Word], analysis: &mut Analysis) {
     }
 }
 
+/// Whether a shell argument makes the shell run a command string: `-c`
+/// alone or in a group of short options (`-lc`, `-ec`, `-xvc`), or fish's
+/// `--command`.
+fn runs_a_string(argument: &str) -> bool {
+    match argument.strip_prefix('-') {
+        Some(long) if long.starts_with('-') => long == "-command" || long.starts_with("-command="),
+        Some(short) => short.contains('c'),
+        None => false,
+    }
+}
+
 fn scan_segment(words: &[Word]) -> Result<bool, &'static str> {
     let command_word = words.iter().find(|w| !is_assignment(&w.text));
     let Some(command_word) = command_word else {
@@ -130,7 +141,7 @@ fn scan_segment(words: &[Word]) -> Result<bool, &'static str> {
         if name == "eval" {
             return Err("eval");
         }
-        if SHELLS.contains(&name) && words[index + 1..].iter().any(|w| w.text.starts_with("-c")) {
+        if SHELLS.contains(&name) && words[index + 1..].iter().any(|w| runs_a_string(&w.text)) {
             return Err("shell -c");
         }
     }
@@ -352,6 +363,14 @@ mod tests {
             "sudo $G push",
             "bash -c 'git push'",
             "sh -c \"git push\"",
+            // `-c` grouped with other short options, and fish's long form.
+            "bash -lc 'git push'",
+            "sh -ec 'git push'",
+            "bash -l -c 'git push'",
+            "zsh -xvc 'git push'",
+            "/bin/bash -cl 'git push'",
+            "fish --command 'git push'",
+            "fish --command='git push'",
             "eval git push",
             "cat <<EOF | sh\ngit push\nEOF",
             "diff <(git log) x",

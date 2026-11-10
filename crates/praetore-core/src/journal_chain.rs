@@ -242,6 +242,18 @@ impl fmt::Display for ChainError {
 impl std::error::Error for ChainError {}
 
 /// `SHA-256(LINK_DOMAIN || u64_be(seq) || prev_hex || context_hash || attester_signature)`.
+///
+/// The link of the receipt at position `seq` after `prev`: the `prev` of the
+/// next entry. Public so that other journals (praetore-mcp) chain receipts
+/// with the same function as this module's producer and verifier.
+pub fn receipt_link(
+    seq: u64,
+    prev: &ChainLink,
+    evidence: &Evidence,
+) -> Result<ChainLink, ChainError> {
+    link(seq, prev, evidence)
+}
+
 fn link(seq: u64, prev: &ChainLink, evidence: &Evidence) -> Result<ChainLink, ChainError> {
     let signature = evidence
         .attester_signature
