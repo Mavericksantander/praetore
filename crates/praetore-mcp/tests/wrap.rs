@@ -125,7 +125,7 @@ fn journal(home: &Home) -> Vec<Evidence> {
     receipts::read_journal(home)
         .unwrap()
         .iter()
-        .map(|l| Evidence::from_json(&l.text).unwrap())
+        .map(|l| praetore_mcp::journal::parse_line(&l.text).unwrap().evidence)
         .collect()
 }
 
@@ -1286,4 +1286,270 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
         .expect("classify")
         .into_mission()
         .expect("mission action")
+}
+
+/// Hallazgo 11, end to end in observe: lines the proxy cannot parse are
+/// never forwarded silently. An ordinary tool call with a duplicate key is
+/// forwarded with a warning; an undeclared `safety:halt` with a duplicate
+/// key is refused and never reaches the server.
+#[test]
+fn observe_warns_on_unparseable_lines_and_refuses_unparseable_safety_calls() {
+    let (_temp, home) = init_home();
+    write_policy_with_safety(&home);
+    let deep = format!(
+        r#"{{"jsonrpc":"2.0","id":"deep","method":"tools/call","params":{{"name":"echo","arguments":{{"a":{}1{}}}}}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let input = [
+        r#"{"jsonrpc":"2.0","id":"dup","method":"tools/call","params":{"name":"echo","arguments":{"x":1,"x":2}}}"#,
+        r#"{"jsonrpc":"2.0","id":"sur","method":"tools/call","params":{"name":"echo","arguments":{"p":"\ud800"}}}"#,
+        deep.as_str(),
+        r#"{"jsonrpc":"2.0","id":"halt","method":"tools/call","params":{"name":"safety:halt","arguments":{"x":1,"x":2}}}"#,
+        r#"{"jsonrpc":"2.0","id":"hold","method":"tools/call","params":{"name":"safety:hold","arguments":{"x":1,"x":2}}}"#,
+    ]
+    .map(|line| format!("{line}\n"))
+    .concat();
+    let (responses, stderr, out) = wrap_raw(&home, "observe", &input);
+    assert!(out.status.success(), "{stderr}");
+    // The duplicate-key echo reaches the server (it accepts the line).
+    assert_eq!(by_id(&responses, &json!("dup"))["result"]["isError"], false);
+    assert_eq!(
+        stderr.matches("WARNING unparseable client line").count(),
+        3,
+        "{stderr}"
+    );
+    // Neither safety line reaches the server, declared or not.
+    assert!(!stderr.contains("EXECUTED safety"), "{stderr}");
+    assert_eq!(
+        stderr.matches("may name a safety* tool").count(),
+        2,
+        "{stderr}"
+    );
+    let refusals = responses
+        .iter()
+        .filter(|r| {
+            r["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("may name a safety* tool"))
+        })
+        .count();
+    assert_eq!(refusals, 2, "{responses:?}");
+    // No reading was evaluated, so no receipt.
+    assert!(journal(&home).is_empty());
+}
+
+/// Three observe calls: a journal of three chained entries in one file.
+fn journal_of_three() -> (tempfile::TempDir, Home, PathBuf, Vec<String>) {
+    let (temp, home) = init_home();
+    let calls = (0..3)
+        .map(|n| json!({"jsonrpc":"2.0","id":n + 10,"method":"tools/call","params":{"name":"echo","arguments":{"n":n}}}))
+        .collect();
+    let (_, stderr, out) = wrap(&home, "observe", &session(calls));
+    assert!(out.status.success(), "{stderr}");
+    let lines = receipts::read_journal(&home).unwrap();
+    assert_eq!(lines.len(), 3);
+    let file = lines[0].file.clone();
+    let text = lines.iter().map(|l| l.text.clone()).collect();
+    (temp, home, file, text)
+}
+
+fn verify_output(home: &Home, extra: &[&str]) -> (Option<i32>, String) {
+    let mut args = vec!["verify", "--dir", home.root.to_str().unwrap()];
+    args.extend_from_slice(extra);
+    let out = run(&args, "");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    )
+}
+
+fn head_of(report: &str) -> String {
+    let start = report.find(" head ").unwrap() + " head ".len();
+    report[start..start + 64].to_owned()
+}
+
+/// Hallazgo 12: the journal is a hash chain. Every entry carries `seq` and
+/// `prev`, and `verify` reports a removed, duplicated or reordered entry,
+/// and (against a head kept elsewhere) entries removed at the end.
+#[test]
+fn verify_detects_removed_duplicated_reordered_and_truncated_entries() {
+    let (_temp, home, file, lines) = journal_of_three();
+    for (index, line) in lines.iter().enumerate() {
+        let value: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["seq"], index as u64, "{line}");
+        assert_eq!(value["prev"].as_str().unwrap().len(), 64);
+    }
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.contains("3 verified, 0 failed"), "{report}");
+    assert!(
+        report.contains("journal head: 3 chained entries"),
+        "{report}"
+    );
+    let head = head_of(&report);
+    let (code, report) = verify_output(&home, &["--expected-head", &head]);
+    assert_eq!(code, Some(0), "{report}");
+
+    let write = |kept: &[&String]| {
+        let text: String = kept.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(&file, text).unwrap();
+    };
+    let cases: [(&str, Vec<&String>); 4] = [
+        ("removed", vec![&lines[0], &lines[2]]),
+        (
+            "duplicated",
+            vec![&lines[0], &lines[1], &lines[1], &lines[2]],
+        ),
+        ("reordered", vec![&lines[0], &lines[2], &lines[1]]),
+        ("first removed", vec![&lines[1], &lines[2]]),
+    ];
+    for (label, kept) in cases {
+        write(&kept);
+        let (code, report) = verify_output(&home, &[]);
+        assert_eq!(code, Some(1), "{label}: {report}");
+        assert!(report.contains("journal order"), "{label}: {report}");
+    }
+    let (code, report) = {
+        write(&[&lines[0], &lines[1], &lines[1], &lines[2]]);
+        verify_output(&home, &[])
+    };
+    assert_eq!(code, Some(1));
+    assert!(report.contains("duplicate evidence_id"), "{report}");
+
+    // Removing the last entry leaves a valid shorter chain: only the head
+    // kept elsewhere shows it.
+    write(&[&lines[0], &lines[1]]);
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(0), "{report}");
+    let (code, report) = verify_output(&home, &["--expected-head", &head]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        report.contains("does not match the expected head"),
+        "{report}"
+    );
+
+    // An expected head that is not 64 lowercase hex is a usage error.
+    let (code, _) = verify_output(&home, &["--expected-head", &head.to_uppercase()]);
+    assert_ne!(code, Some(0));
+}
+
+/// A whole daily file removed from the middle of the journal breaks the
+/// chain, and new entries continue the chain from the newest file.
+#[test]
+fn chain_continues_across_daily_files_and_a_removed_file_is_detected() {
+    let (_temp, home, file, lines) = journal_of_three();
+    let dir = home.receipts_dir();
+    // Move the entries into three earlier daily files, one per file.
+    fs::remove_file(&file).unwrap();
+    for (index, line) in lines.iter().enumerate() {
+        fs::write(
+            dir.join(format!("2001-01-0{}.jsonl", index + 1)),
+            format!("{line}\n"),
+        )
+        .unwrap();
+    }
+    // A new entry goes after the last one (today's file), not at seq 0.
+    let call = json!({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"echo","arguments":{}}});
+    let (_, stderr, out) = wrap(&home, "observe", &session(vec![call]));
+    assert!(out.status.success(), "{stderr}");
+    let all = receipts::read_journal(&home).unwrap();
+    let last: Value = serde_json::from_str(&all.last().unwrap().text).unwrap();
+    assert_eq!(last["seq"], 3, "{last}");
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(
+        report.contains("journal head: 4 chained entries"),
+        "{report}"
+    );
+
+    fs::remove_file(dir.join("2001-01-02.jsonl")).unwrap();
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(report.contains("journal order"), "{report}");
+}
+
+/// Receipts written before the chain existed (bare evidence lines) still
+/// verify, are counted apart, and the chain starts after them.
+#[test]
+fn unchained_entries_from_earlier_versions_still_verify_before_the_chain() {
+    let (_temp, home, file, lines) = journal_of_three();
+    // Rewrite the first two entries in the earlier format.
+    let bare = |line: &String| {
+        let value: Value = serde_json::from_str(line).unwrap();
+        praetore_mcp::journal::parse_line(line).unwrap();
+        value["evidence"].to_string()
+    };
+    let legacy = format!("{}\n{}\n", bare(&lines[0]), bare(&lines[1]));
+    fs::remove_file(&file).unwrap();
+    fs::write(home.receipts_dir().join("2001-01-01.jsonl"), &legacy).unwrap();
+    let call = json!({"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"echo","arguments":{}}});
+    let (_, stderr, out) = wrap(&home, "observe", &session(vec![call]));
+    assert!(out.status.success(), "{stderr}");
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(report.contains("3 verified, 0 failed"), "{report}");
+    assert!(
+        report.contains("1 chained entries") && report.contains("2 unchained"),
+        "{report}"
+    );
+
+    // An unchained line after the chain started is reported.
+    let today = receipts::read_journal(&home)
+        .unwrap()
+        .last()
+        .unwrap()
+        .file
+        .clone();
+    let mut text = fs::read_to_string(&today).unwrap();
+    text.push_str(&format!("{}\n", bare(&lines[2])));
+    fs::write(&today, text).unwrap();
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        report.contains("unchained line after the chain started"),
+        "{report}"
+    );
+}
+
+/// An interrupted write (last line without a newline) stops further
+/// appends: enforce refuses the call instead of writing after a torn entry.
+#[test]
+fn torn_journal_tail_refuses_in_enforce() {
+    let (_temp, home, file, _) = journal_of_three();
+    let mut text = fs::read_to_string(&file).unwrap();
+    text.push_str("{\"seq\":3,\"prev\":");
+    fs::write(&file, text).unwrap();
+    let call = json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"echo","arguments":{}}});
+    let (responses, stderr, _) = wrap(&home, "enforce", &session(vec![call]));
+    assert_eq!(
+        by_id(&responses, &json!(9))["result"]["isError"],
+        true,
+        "{stderr}"
+    );
+    assert!(stderr.contains("does not end with a newline"), "{stderr}");
+    assert!(!stderr.contains("EXECUTED"), "{stderr}");
+}
+
+/// Hallazgo 11: a client line over 32 MiB is not parsed, so it cannot be
+/// checked for a `safety*` tool; it is refused in observe too, and the
+/// traffic after it still flows.
+#[test]
+fn oversized_lines_are_refused_in_observe_too() {
+    let (_temp, home) = init_home();
+    let filler = "x".repeat(praetore_mcp::relay::MAX_CLIENT_LINE_BYTES);
+    let big = format!(
+        r#"{{"jsonrpc":"2.0","id":"big","method":"tools/call","params":{{"arguments":{{"f":"{filler}"}},"name":"safety:halt"}}}}"#
+    );
+    let after = r#"{"jsonrpc":"2.0","id":"after","method":"tools/call","params":{"name":"echo","arguments":{}}}"#;
+    let (responses, stderr, out) = wrap_raw(&home, "observe", &format!("{big}\n{after}\n"));
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("REFUSED client message over"), "{stderr}");
+    assert!(!stderr.contains("EXECUTED safety"), "{stderr}");
+    assert!(stderr.contains("EXECUTED echo"), "{stderr}");
+    assert_eq!(
+        by_id(&responses, &json!("after"))["result"]["isError"],
+        false
+    );
+    assert!(responses.iter().all(|r| r["id"] != "big"));
 }

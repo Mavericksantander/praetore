@@ -23,7 +23,7 @@ Usage:
                          [--mode observe|enforce] [--dry-run] [--yes]
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
-  praetore-mcp verify    [--dir DIR]
+  praetore-mcp verify    [--dir DIR] [--expected-head HEX]
   praetore-mcp policy list   [--dir DIR]
   praetore-mcp policy check  [--dir DIR]
   praetore-mcp policy deny|require-approval|allow --id ID [--server NAME] [--tool NAME]
@@ -110,13 +110,24 @@ Prints the last N receipts of the journal as a table (default 20).
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --tail N    number of receipts to show";
 
-const VERIFY_HELP: &str = "Usage: praetore-mcp verify [--dir DIR]
+const VERIFY_HELP: &str = "Usage: praetore-mcp verify [--dir DIR] [--expected-head HEX]
 
 Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
-decision time, and the praetore.mode binding.
+decision time, and the praetore.mode binding. Checks the order of the
+journal too: each entry carries a sequence number and the hash link of the
+previous one, so an entry removed, duplicated or reordered before the last
+one is reported. Prints the head (entry count and last link).
 
-  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+  --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+  --expected-head HEX  head printed by an earlier run and kept somewhere the
+                       wrapped servers cannot write: the journal must end at
+                       it. Without it, entries removed at the end of the
+                       journal are not detected.
+
+Entries written by an earlier praetore-mcp version (unchained) are verified
+one by one and counted apart; they may only come before the first chained
+entry.
 
 Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
 cannot be read.";
@@ -518,9 +529,9 @@ fn cmd_receipts(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_verify(args: &[String]) -> Result<i32, String> {
-    let parsed = parse(args, &["--dir"], &[], false)?;
+    let parsed = parse(args, &["--dir", "--expected-head"], &[], false)?;
     let home = parsed.home()?;
-    let report = receipts::verify_journal(&home)?;
+    let report = receipts::verify_journal(&home, parsed.value("--expected-head"))?;
     for failure in &report.failures {
         println!("{failure}");
     }
@@ -549,10 +560,20 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         join(&report.by_decision)
     );
     println!(
-        "checked: integrity hash, attester signature ({}), agent intent signature, authority signature against {} at decision time, praetore.mode binding",
+        "checked: integrity hash, attester signature ({}), agent intent signature, authority signature against {} at decision time, praetore.mode binding, journal order (seq and hash link)",
         home.attester_pin().display(),
         home.issuer_pins().display()
     );
+    match report.head {
+        Some(head) => println!(
+            "journal head: {} chained entries, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
+            head.seq, head.prev, report.unchained
+        ),
+        None => println!(
+            "journal head: none ({} chained, {} unchained entries)",
+            report.chained, report.unchained
+        ),
+    }
     println!("observe receipts record a decision that was NOT enforced.");
     Ok(if report.failures.is_empty() { 0 } else { 1 })
 }

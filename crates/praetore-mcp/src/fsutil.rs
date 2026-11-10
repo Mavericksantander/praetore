@@ -21,6 +21,28 @@ pub fn create_new(path: &Path, mode: u32) -> io::Result<fs::File> {
     options.open(path)
 }
 
+/// fsyncs a directory, so that a file created, renamed or removed in it
+/// survives a crash. A no-op where directories cannot be opened (Windows).
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
+}
+
+/// The parent directory of `path` (`.` for a bare file name).
+fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
 /// The file to rewrite: `path` itself, or the final target if `path` is a
 /// symlink (dotfile managers), so the link is preserved.
 pub fn resolve_target(path: &Path) -> Result<PathBuf, String> {
@@ -74,6 +96,7 @@ fn write_backup(real: &Path, contents: &str) -> Result<PathBuf, String> {
             Ok(mut file) => {
                 file.write_all(contents.as_bytes())
                     .and_then(|()| file.sync_all())
+                    .and_then(|()| sync_dir(parent_of(&candidate)))
                     .map_err(|e| format!("cannot write backup {}: {e}", candidate.display()))?;
                 return Ok(candidate);
             }
@@ -129,7 +152,10 @@ pub fn write_with_backup(
         file.write_all(updated.as_bytes())?;
         file.sync_all()?;
         fs::set_permissions(&tmp, permissions)?;
-        fs::rename(&tmp, &real)
+        fs::rename(&tmp, &real)?;
+        // The rename is a directory change: without this fsync a crash can
+        // bring back the old file.
+        sync_dir(parent_of(&real))
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&tmp);
