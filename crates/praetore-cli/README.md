@@ -216,12 +216,26 @@ praetore approve ./praetore-local <request_id> --approver local-approver
 praetore dispatch ./praetore-local <request_id>
 ```
 
-In this mode every execution-path request must carry
-`praetore-exec-mode: gateway` (the CLI sends it), and `/status` answers 409
-`cooperative_exec_rejected` for approved actions instead of `approved`. The
-header is a declaration, not enforcement: give agents no write access to the
-sandbox root. See the `sandbox` module documentation for the confinement
-rules and residual risks.
+Every execution-path request must carry `praetore-exec-mode: gateway` (the
+CLI sends it), and `/status` answers 409 `cooperative_exec_rejected` for
+approved actions instead of `approved`. This is the default with or without
+`sandbox_root`: without the header, or with `cooperative`, a request gets 409
+`exec_mode_gateway_required` before anything is evaluated or journaled. The
+header is a declaration, not enforcement, and it enables nothing: give agents
+no write access to the sandbox root. See the `sandbox` module documentation
+for the confinement rules and residual risks.
+
+### Development cooperative mode (no guarantee)
+
+`praetore init <dir> --dev-cooperative-exec` (without `--sandbox-root`; the
+two are refused together) writes `"dev_cooperative_exec": true` to
+`config.json`. Then `run` accepts requests without the header and `/status`
+answers `approved` for an approved action, so an agent may perform the effect
+itself, outside the gateway. This mode is for development only and gives no
+guarantee about who performs an effect: the journal records what the agent
+was authorized to do, not what it did. `run` logs a warning and `doctor`
+prints `[warn] development cooperative mode ...`. Only the configuration
+selects the mode; no request header does.
 
 This command is a development/reference experience, not a production gateway,
 secure key custody system, external-agent integration, sandbox, or deployment

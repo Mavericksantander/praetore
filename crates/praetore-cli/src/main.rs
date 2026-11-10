@@ -69,7 +69,17 @@ struct LocalConfig {
     /// the in-memory `demo:set_value` adapter only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sandbox_root: Option<PathBuf>,
+    /// Development only (`praetore init --dev-cooperative-exec`): the HTTP
+    /// API accepts cooperative execution, where the agent may perform an
+    /// authorized effect itself. It gives no guarantee about who performs
+    /// the effect. Off by default and refused together with `sandbox_root`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dev_cooperative_exec: bool,
 }
+
+/// Warning printed by `run` and `doctor` when the development cooperative
+/// mode is configured.
+const DEV_COOPERATIVE_EXEC_WARNING: &str = "development cooperative mode (dev_cooperative_exec): the agent may perform authorized effects itself, outside the gateway; this mode gives no guarantee about who performs an effect; do not use it outside development";
 
 /// Public pin of the human approver key. The gateway only needs this pin; the
 /// private `approver.key` is used solely by `praetore approve` / `reject`.
@@ -169,6 +179,7 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             let directory = required_argument(&mut args, "directory")?;
             let mut port = 8080;
             let mut sandbox_root = None;
+            let mut dev_cooperative_exec = false;
             while let Some(argument) = args.next() {
                 match argument.as_str() {
                     "--port" => {
@@ -181,10 +192,18 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
                         sandbox_root =
                             Some(PathBuf::from(required_argument(&mut args, "sandbox root")?));
                     }
+                    "--dev-cooperative-exec" if !dev_cooperative_exec => {
+                        dev_cooperative_exec = true;
+                    }
                     _ => return Err(format!("unexpected argument: {argument}").into()),
                 }
             }
-            initialize_with_sandbox(Path::new(&directory), port, sandbox_root)
+            initialize_with_options(
+                Path::new(&directory),
+                port,
+                sandbox_root,
+                dev_cooperative_exec,
+            )
         }
         "doctor" => {
             let directory = required_argument(&mut args, "directory")?;
@@ -340,7 +359,8 @@ fn print_usage() {
         "PRÆTORE local PostgreSQL demo\n\
          \n\
          Commands:\n\
-           praetore init <directory> [--port <port>] [--sandbox-root <absolute dir>]\n\
+           praetore init <directory> [--port <port>] [--sandbox-root <absolute dir> | --dev-cooperative-exec]\n\
+             (--dev-cooperative-exec: development only, no guarantee; the agent may run effects itself)\n\
            praetore doctor <directory>\n\
            praetore run <directory> [--adopt-legacy-baseline]\n\
            praetore demo <directory> set <key> <value>\n\
@@ -365,13 +385,26 @@ fn initialize(directory: &Path, port: u16) -> Result<(), Box<dyn std::error::Err
     initialize_with_sandbox(directory, port, None)
 }
 
+#[cfg(test)]
 fn initialize_with_sandbox(
     directory: &Path,
     port: u16,
     sandbox_root: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    initialize_with_options(directory, port, sandbox_root, false)
+}
+
+fn initialize_with_options(
+    directory: &Path,
+    port: u16,
+    sandbox_root: Option<PathBuf>,
+    dev_cooperative_exec: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if port == 0 {
         return Err("port must be between 1 and 65535".into());
+    }
+    if dev_cooperative_exec && sandbox_root.is_some() {
+        return Err(DEV_COOPERATIVE_WITH_SANDBOX.into());
     }
     if let Some(root) = &sandbox_root {
         // Validate before creating anything (fail closed).
@@ -398,6 +431,7 @@ fn initialize_with_sandbox(
         tenant_id,
         port,
         sandbox_root,
+        dev_cooperative_exec,
     };
 
     write_private_file(
@@ -688,6 +722,14 @@ fn doctor(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         println!("[info] no sandbox_root configured; only demo:set_value is dispatched");
+    }
+    match config.as_ref().map(http_options) {
+        Some(Ok(options)) => println!("{}", exec_mode_notice(options.exec_mode)),
+        Some(Err(error)) => {
+            println!("[failed] {error}");
+            healthy = false;
+        }
+        None => {}
     }
 
     if let (Some(pin), Ok(secret)) = (issuer_pin.as_ref(), read_secret(directory, ISSUER_KEY_FILE))
@@ -1019,10 +1061,32 @@ fn build_dispatcher(
     })
 }
 
-fn http_options(config: &LocalConfig) -> http_api::HttpOptions {
-    http_api::HttpOptions {
-        gateway_executes_effects: config.sandbox_root.is_some(),
+/// The line `doctor` prints for the execution mode (`run` logs the same
+/// text): a warning for the development cooperative mode.
+fn exec_mode_notice(mode: http_api::ExecMode) -> String {
+    match mode {
+        http_api::ExecMode::DevelopmentCooperative => {
+            format!("[warn] {DEV_COOPERATIVE_EXEC_WARNING}")
+        }
+        http_api::ExecMode::GatewayOnly | http_api::ExecMode::GatewayEffects => {
+            "[ok] cooperative execution is refused (praetore-exec-mode: gateway required)".into()
+        }
     }
+}
+
+const DEV_COOPERATIVE_WITH_SANDBOX: &str = "--dev-cooperative-exec cannot be combined with sandbox_root: the gateway executes the sandbox effects";
+
+/// The HTTP API's execution mode. Cooperative execution is refused unless
+/// the configuration sets the development flag; a client header never
+/// changes it.
+fn http_options(config: &LocalConfig) -> Result<http_api::HttpOptions, Box<dyn std::error::Error>> {
+    let exec_mode = match (&config.sandbox_root, config.dev_cooperative_exec) {
+        (Some(_), true) => return Err(DEV_COOPERATIVE_WITH_SANDBOX.into()),
+        (Some(_), false) => http_api::ExecMode::GatewayEffects,
+        (None, true) => http_api::ExecMode::DevelopmentCooperative,
+        (None, false) => http_api::ExecMode::GatewayOnly,
+    };
+    Ok(http_api::HttpOptions { exec_mode })
 }
 
 fn read_api_token(directory: &Path, filename: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -1072,6 +1136,8 @@ fn run_gateway(
     adopt_legacy_baseline: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(directory)?;
+    // Fails before any database work on a conflicting configuration.
+    let options = http_options(&config)?;
     let database_url = env::var("PRAETORE_GATEWAY_DATABASE_URL")
         .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")?;
     let migration_url = env::var("PRAETORE_GATEWAY_MIGRATION_DATABASE_URL")
@@ -1125,7 +1191,12 @@ fn run_gateway(
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let options = http_options(&config);
+    match options.exec_mode {
+        http_api::ExecMode::DevelopmentCooperative => {
+            tracing::warn!("{DEV_COOPERATIVE_EXEC_WARNING}")
+        }
+        _ => tracing::info!("{}", exec_mode_notice(options.exec_mode)),
+    }
     // The gateway holds blocking PostgreSQL clients, whose drop must not run
     // on a runtime thread: if serving fails (for example, the port is in
     // use), the runtime (with any task holding a clone) is dropped first and
@@ -2342,7 +2413,10 @@ mod tests {
         initialize_with_sandbox(&directory, 8080, Some(root.clone())).unwrap();
         let config = load_config(&directory).unwrap();
         assert_eq!(config.sandbox_root.as_deref(), Some(root.as_path()));
-        assert!(http_options(&config).gateway_executes_effects);
+        assert_eq!(
+            http_options(&config).unwrap().exec_mode,
+            http_api::ExecMode::GatewayEffects
+        );
         assert!(build_dispatcher(&directory, &config).is_ok());
         fs::remove_dir(&root).unwrap();
         assert!(build_dispatcher(&directory, &config).is_err());
@@ -2354,7 +2428,11 @@ mod tests {
         ))
         .unwrap();
         assert!(legacy.sandbox_root.is_none());
-        assert!(!http_options(&legacy).gateway_executes_effects);
+        // Without sandbox_root cooperative execution is still refused.
+        assert_eq!(
+            http_options(&legacy).unwrap().exec_mode,
+            http_api::ExecMode::GatewayOnly
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -3009,7 +3087,7 @@ mod tests {
             .build()
             .unwrap();
         let port = fx.config.port;
-        let options = http_options(&fx.config);
+        let options = http_options(&fx.config).unwrap();
         let auth = local_api_auth(&fx.directory, &fx.config).unwrap();
         let agent_token = read_api_token(&fx.directory, AGENT_TOKEN_FILE).unwrap();
         let approver_token = read_api_token(&fx.directory, APPROVER_TOKEN_FILE).unwrap();
@@ -3288,15 +3366,31 @@ mod tests {
 
     impl HttpSandbox {
         fn start(fx: &SandboxFixture) -> Self {
-            let gateway = Arc::new(fx.gateway());
+            Self::serve(
+                &fx.directory,
+                &fx.config,
+                fx.gateway(),
+                http_api::ExecMode::GatewayEffects,
+            )
+        }
+
+        /// Serves `gateway` as `praetore run` does, with the HTTP options of
+        /// `config`, which must select `expected`.
+        fn serve(
+            directory: &Path,
+            config: &LocalConfig,
+            gateway: Gateway,
+            expected: http_api::ExecMode,
+        ) -> Self {
+            let gateway = Arc::new(gateway);
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .unwrap();
-            let port = fx.config.port;
-            let options = http_options(&fx.config);
-            assert!(options.gateway_executes_effects);
-            let auth = local_api_auth(&fx.directory, &fx.config).unwrap();
+            let port = config.port;
+            let options = http_options(config).unwrap();
+            assert_eq!(options.exec_mode, expected);
+            let auth = local_api_auth(directory, config).unwrap();
             let served = Arc::clone(&gateway);
             runtime.spawn(async move {
                 let _ = http_api::serve_local_with_options(port, served, auth, options).await;
@@ -3316,8 +3410,8 @@ mod tests {
                 _gateway: gateway,
                 client,
                 base,
-                agent_token: read_api_token(&fx.directory, AGENT_TOKEN_FILE).unwrap(),
-                approver_token: read_api_token(&fx.directory, APPROVER_TOKEN_FILE).unwrap(),
+                agent_token: read_api_token(directory, AGENT_TOKEN_FILE).unwrap(),
+                approver_token: read_api_token(directory, APPROVER_TOKEN_FILE).unwrap(),
             }
         }
 
@@ -3346,6 +3440,306 @@ mod tests {
                 receipt.evidence.request_id
             )
         }
+    }
+
+    /// A `praetore init` directory WITHOUT `sandbox_root` (only the
+    /// in-memory `demo:set_value` adapter), with `demo:set_value` held for
+    /// approval, served over HTTP against real PostgreSQL.
+    struct CooperativeFixture {
+        directory: PathBuf,
+        config: LocalConfig,
+        policy: Policy,
+        database_url: String,
+    }
+
+    impl Drop for CooperativeFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    impl CooperativeFixture {
+        fn new(dev_cooperative_exec: bool) -> Self {
+            let database_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+            apply_migrations(&database_url).unwrap();
+            let directory = temp_path("gw-coop");
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            initialize_with_options(&directory, port, None, dev_cooperative_exec).unwrap();
+            let mut policy = load_policy(&directory).unwrap();
+            policy.rules[0].effect = PolicyEffect::RequireApproval;
+            fs::write(
+                directory.join(POLICY_FILE),
+                serde_json::to_vec_pretty(&policy).unwrap(),
+            )
+            .unwrap();
+            let config = load_config(&directory).unwrap();
+            assert!(config.sandbox_root.is_none());
+            assert_eq!(config.dev_cooperative_exec, dev_cooperative_exec);
+            let policy = load_policy(&directory).unwrap();
+            Self {
+                directory,
+                config,
+                policy,
+                database_url,
+            }
+        }
+
+        fn serve(&self, expected: http_api::ExecMode) -> HttpSandbox {
+            let gateway = build_gateway(&self.directory, &self.config, &self.database_url).unwrap();
+            HttpSandbox::serve(&self.directory, &self.config, gateway, expected)
+        }
+
+        fn request(&self, value: &str) -> AuthorizationRequest {
+            build_demo_request(&self.directory, &self.config, &self.policy, "k", value).unwrap()
+        }
+
+        /// Journal rows of this fixture's tenant.
+        fn journal_rows(&self) -> i64 {
+            let mut client = connect_local_database(&self.database_url).unwrap();
+            let mut transaction = client.transaction().unwrap();
+            transaction
+                .query_one(
+                    "SELECT set_config('praetore.tenant_id', $1, true)",
+                    &[&self.config.tenant_id.to_string()],
+                )
+                .unwrap();
+            let count = transaction
+                .query_one(
+                    "SELECT count(*) FROM praetore.execution_journal WHERE tenant_id = $1",
+                    &[&self.config.tenant_id],
+                )
+                .unwrap()
+                .get(0);
+            transaction.commit().unwrap();
+            count
+        }
+
+        /// GET the approval challenge as the approver, sign `outcome` with
+        /// the local approver key, and POST the decision.
+        fn decide(&self, http: &HttpSandbox, path: &str) -> serde_json::Value {
+            let view = ApprovalChallengeView::from_json(
+                &http
+                    .client
+                    .get(path)
+                    .bearer_auth(&http.approver_token)
+                    .send()
+                    .unwrap()
+                    .text()
+                    .unwrap(),
+            )
+            .unwrap();
+            let approver =
+                SigningKey::from_bytes(&read_secret(&self.directory, APPROVER_KEY_FILE).unwrap());
+            let decision = sign_decision(
+                view.challenge,
+                LOCAL_APPROVER_ID,
+                HumanApprovalOutcome::Approve,
+                &approver,
+            )
+            .unwrap();
+            let response = http
+                .client
+                .post(path)
+                .bearer_auth(&http.approver_token)
+                .json(&decision)
+                .send()
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            response.json().unwrap()
+        }
+    }
+
+    /// A client WITHOUT the CLI's default `praetore-exec-mode: gateway`.
+    fn bare_client() -> reqwest::blocking::Client {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(StdDuration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// Sends `request` with exactly the `modes` exec-mode headers.
+    fn with_modes(
+        mut request: reqwest::blocking::RequestBuilder,
+        modes: &[&str],
+    ) -> reqwest::blocking::RequestBuilder {
+        for mode in modes {
+            request = request.header(http_api::EXEC_MODE_HEADER, *mode);
+        }
+        request
+    }
+
+    /// The declarations T19 refuses: none, `cooperative`, the
+    /// comma-joined value and a repeated header.
+    const REFUSED_MODES: [&[&str]; 4] = [
+        &[],
+        &["cooperative"],
+        &["gateway,cooperative"],
+        &["gateway", "cooperative"],
+    ];
+
+    /// T19, real PostgreSQL: `praetore init` WITHOUT `--sandbox-root` and
+    /// without the development flag. Cooperative execution is refused by
+    /// default: `POST /v1/execute` without the declaration, with
+    /// `cooperative` or with `gateway,cooperative` gets 409
+    /// `exec_mode_gateway_required` before anything is evaluated (no journal
+    /// row), and `/status` of an approved action never answers `approved`
+    /// for the agent to act on, before and after the gateway dispatch.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_t019_cooperative_exec_is_refused_without_sandbox_root() {
+        let fx = CooperativeFixture::new(false);
+        let http = fx.serve(http_api::ExecMode::GatewayOnly);
+        let bare = bare_client();
+        let url = format!("{}/v1/execute", http.base);
+
+        for modes in REFUSED_MODES {
+            let request = fx.request("refused");
+            let response = with_modes(bare.post(&url).bearer_auth(&http.agent_token), modes)
+                .json(&request)
+                .send()
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 409, "{modes:?}");
+            let body: serde_json::Value = response.json().unwrap();
+            assert_eq!(body["code"], "exec_mode_gateway_required", "{modes:?}");
+        }
+        assert_eq!(fx.journal_rows(), 0, "nothing evaluated or journaled");
+
+        // With the declaration the request is evaluated and held.
+        let (status, body) = http.execute(&fx.request("held"));
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(body["authorization"], "requires_approval");
+        assert_eq!(fx.journal_rows(), 1);
+        let held: praetore_gateway::GatewayReceipt = serde_json::from_value(body).unwrap();
+        let path = format!(
+            "{}/v1/approvals/{}/{}/{}",
+            http.base,
+            fx.config.tenant_id,
+            held.evidence.agent.id.as_uuid(),
+            held.evidence.request_id
+        );
+        for modes in REFUSED_MODES {
+            let response = with_modes(
+                bare.get(format!("{path}/status"))
+                    .bearer_auth(&http.agent_token),
+                modes,
+            )
+            .send()
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 409, "{modes:?}");
+        }
+        let resolved = fx.decide(&http, &path);
+        assert_eq!(resolved["status"], "approved_pending_dispatch");
+
+        let status = |client: &reqwest::blocking::Client, modes: &[&str]| {
+            let response = with_modes(
+                client
+                    .get(format!("{path}/status"))
+                    .bearer_auth(&http.agent_token),
+                modes,
+            )
+            .send()
+            .unwrap();
+            let code = response.status().as_u16();
+            (code, response.json::<serde_json::Value>().unwrap())
+        };
+        // Approved, not dispatched: never `approved` for the agent to act on.
+        let (code, body) = status(&http.client, &[]);
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "cooperative_exec_rejected");
+        assert_eq!(body["resolution"], "approved");
+        assert_eq!(body["execution"], "approved_pending_dispatch");
+        for modes in REFUSED_MODES {
+            let (code, body) = status(&bare, modes);
+            assert_eq!(code, 409, "{modes:?}");
+            assert_eq!(body["code"], "exec_mode_gateway_required", "{modes:?}");
+        }
+
+        // The gateway dispatches; /status still refuses to hand it over.
+        let response = http
+            .client
+            .post(format!("{path}/dispatch"))
+            .bearer_auth(&http.approver_token)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let (code, body) = status(&http.client, &[]);
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "cooperative_exec_rejected");
+        assert_ne!(body["execution"], "approved_pending_dispatch");
+        assert_eq!(fx.journal_rows(), 1);
+    }
+
+    /// T19b, real PostgreSQL: only the explicit development flag
+    /// (`praetore init --dev-cooperative-exec`) restores cooperative
+    /// execution: the declaration is ignored and `/status` of an approved
+    /// action answers `approved`, so the agent may run it itself. `doctor`
+    /// and `run` print the warning that this mode gives no guarantee, and
+    /// the flag is refused together with `sandbox_root`. Not coverage of the
+    /// default.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_t019b_development_flag_alone_enables_cooperative_exec() {
+        let fx = CooperativeFixture::new(true);
+        assert!(
+            exec_mode_notice(http_api::ExecMode::DevelopmentCooperative)
+                .starts_with("[warn] development cooperative mode")
+        );
+        assert!(DEV_COOPERATIVE_EXEC_WARNING.contains("gives no guarantee"));
+        let http = fx.serve(http_api::ExecMode::DevelopmentCooperative);
+        let bare = bare_client();
+        let url = format!("{}/v1/execute", http.base);
+
+        // Without any declaration, or with `cooperative`, the request is
+        // evaluated: the header grants and refuses nothing here.
+        let mut held = None;
+        for modes in [&[][..], &["cooperative"][..]] {
+            let response = with_modes(bare.post(&url).bearer_auth(&http.agent_token), modes)
+                .json(&fx.request("dev"))
+                .send()
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 202, "{modes:?}");
+            let receipt: praetore_gateway::GatewayReceipt = response.json().unwrap();
+            held = Some(receipt);
+        }
+        assert_eq!(fx.journal_rows(), 2);
+        let held = held.unwrap();
+        let path = format!(
+            "{}/v1/approvals/{}/{}/{}",
+            http.base,
+            fx.config.tenant_id,
+            held.evidence.agent.id.as_uuid(),
+            held.evidence.request_id
+        );
+        fx.decide(&http, &path);
+        let response = bare
+            .get(format!("{path}/status"))
+            .bearer_auth(&http.agent_token)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let body: serde_json::Value = response.json().unwrap();
+        assert_eq!(body["resolution"], "approved");
+        assert_eq!(body["execution"], "approved_pending_dispatch");
+        drop(http);
+
+        // The flag cannot be combined with a sandbox, at init or in an
+        // edited configuration.
+        let root = temp_path("coop-root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let other = temp_path("gw-coop-sandbox");
+        assert!(initialize_with_options(&other, 8080, Some(root.clone()), true).is_err());
+        assert!(!other.exists());
+        let mut edited: LocalConfig =
+            serde_json::from_slice(&fs::read(fx.directory.join(CONFIG_FILE)).unwrap()).unwrap();
+        edited.sandbox_root = Some(root.clone());
+        assert!(http_options(&edited).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// Submits `request` over HTTP and checks the explicit refusal before

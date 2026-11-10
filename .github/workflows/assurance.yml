@@ -528,7 +528,10 @@ jobs:
       # the job, after the restart steps, because these tests create login
       # roles and journal rows. One test at a time with --exact; each must
       # report "1 passed", and every ignored test of the two binaries must be
-      # run by a step of this job.
+      # run by a step of this job. T19 and T19b (PR-C): cooperative execution
+      # is refused by default without sandbox_root, through the CLI's gateway
+      # and through praetore-gateway-demo (its exec_mode_postgres test target,
+      # which is guarded the same way).
       - name: T-013 sandbox gateway end to end against PostgreSQL (CLI gateway and HTTP)
         run: |
           set -euo pipefail
@@ -536,6 +539,14 @@ jobs:
             local package="$1" bin="$2" name="$3"
             echo "::group::$name"
             output="$(cargo test -p "$package" --locked --bin "$bin" -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; echo "::error::$name failed"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          }
+          run_exact_test() {
+            local package="$1" target="$2" name="$3"
+            echo "::group::$name"
+            output="$(cargo test -p "$package" --locked --test "$target" -- --ignored --exact "$name" --nocapture 2>&1)" || { echo "$output"; echo "::error::$name failed"; exit 1; }
             echo "$output"
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
@@ -562,12 +573,22 @@ jobs:
             tests::postgres_sandbox_http_t24_absolute_paths_are_refused_with_403
             tests::postgres_sandbox_http_t25_symlinks_are_refused_with_403
             tests::postgres_sandbox_http_t26_nul_in_path_is_refused_with_403
+            # T19: no sandbox_root, no flag: cooperative execution refused.
+            tests::postgres_t019_cooperative_exec_is_refused_without_sandbox_root
+            # T19b: only the development flag enables it (no guarantee).
+            tests::postgres_t019b_development_flag_alone_enables_cooperative_exec
           )
           gateway_service=(
             tests::production_refuses_a_privileged_runtime_role_and_local_demo_warns
           )
+          # T19 and T19b through the praetore-gateway-demo binary.
+          gateway_service_exec_mode=(
+            postgres_gateway_service_t019_refuses_cooperative_exec_by_default
+            postgres_gateway_service_t019b_development_flag_alone_enables_cooperative_exec
+          )
           for name in "${cli[@]}"; do run_exact praetore-cli praetore "$name"; done
           for name in "${gateway_service[@]}"; do run_exact praetore-gateway-service praetore-gateway-demo "$name"; done
+          for name in "${gateway_service_exec_mode[@]}"; do run_exact_test praetore-gateway-service exec_mode_postgres "$name"; done
           # A new ignored test must be added to a step, not skipped silently.
           # postgres_find_pending_agent_ignores_hostile_search_path runs in
           # the journal-export step.
@@ -580,7 +601,11 @@ jobs:
           for name in $listed; do
             printf '%s\n' "${gateway_service[@]}" | grep -qxF "$name" || { echo "::error::ignored test $name is not run by any step"; exit 1; }
           done
-          echo "ran ${#cli[@]} praetore-cli and ${#gateway_service[@]} praetore-gateway-service tests"
+          listed="$(cargo test -q -p praetore-gateway-service --locked --test exec_mode_postgres -- --ignored --list 2>/dev/null | sed -n 's/: test$//p')"
+          for name in $listed; do
+            printf '%s\n' "${gateway_service_exec_mode[@]}" | grep -qxF "$name" || { echo "::error::ignored test $name is not run by any step"; exit 1; }
+          done
+          echo "ran ${#cli[@]} praetore-cli and $((${#gateway_service[@]} + ${#gateway_service_exec_mode[@]})) praetore-gateway-service tests"
 
   sbom:
     name: CycloneDX SBOM

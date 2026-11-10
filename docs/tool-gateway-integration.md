@@ -501,6 +501,29 @@ boundary; the production runner image, CRI handler, admission controls,
 Cilium policy, and KVM nodes must also be configured and tested by the
 operator.
 
+## Execution mode
+
+`http_api::router` and `router_with_options` refuse cooperative execution by
+default (`HttpOptions::default()`, `ExecMode::GatewayOnly`), whatever the
+dispatcher: every execution-path request (`POST /v1/execute`, approval
+challenge and decision, dispatch and `/status`) must carry exactly one
+`praetore-exec-mode: gateway` header after caller authentication, or it gets
+409 `exec_mode_gateway_required` before anything is evaluated or journaled,
+and `/status` of an approved action answers 409 `cooperative_exec_rejected`
+instead of `approved`. `ExecMode::GatewayEffects` does the same and adds
+`praetore-executed-by: gateway` to receipts of effects the dispatcher
+performed. The header is the client's declaration; it grants nothing and
+selects no mode.
+
+`ExecMode::DevelopmentCooperative` ignores the header and answers `approved`
+on `/status`, so a client may perform the effect itself. It is a development
+mode that gives no guarantee about who performs an effect. `praetore-gateway-demo`
+selects it only with the `local-demo` adapter and
+`PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1`, logs a warning at startup, refuses
+the flag with the `http` and `sandbox` adapters, and refuses any value other
+than `0` or `1`. The `http` and `sandbox` adapters run
+`ExecMode::GatewayEffects`, the `local-demo` adapter `ExecMode::GatewayOnly`.
+
 ## HTTP API authentication
 
 `http_api::router(gateway, auth)` takes an `ApiAuth`. With

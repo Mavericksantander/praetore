@@ -3,6 +3,7 @@
 pub mod api_auth;
 pub mod approver_bindings;
 pub mod chrony_clock;
+pub mod exec_mode;
 pub mod file_freshness;
 pub mod http_dispatcher;
 pub mod sandbox_dispatcher;
