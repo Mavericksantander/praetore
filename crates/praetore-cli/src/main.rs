@@ -2235,7 +2235,7 @@ mod tests {
         let pending = |value: &str| {
             let request = build_demo_request(&directory, &config, &policy, "k", value).unwrap();
             let receipt = gateway.execute(request).unwrap();
-            assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
+            assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
             let request_id = receipt.evidence.request_id;
             let agent_id = find_pending_agent(&database_url, config.tenant_id, request_id).unwrap();
             assert_eq!(agent_id, *receipt.evidence.agent.id.as_uuid());
@@ -2688,7 +2688,7 @@ mod tests {
             let receipt = gateway.execute(self.delete(path)).unwrap();
             assert_eq!(
                 receipt.execution,
-                praetore_gateway::AttestedExecution::NotDispatched
+                praetore_gateway::AttestedExecution::AwaitingApproval
             );
             self.verify(&receipt);
             praetore_gateway::ExecutionKey {
@@ -2937,7 +2937,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 receipt.execution,
-                praetore_gateway::AttestedExecution::NotDispatched
+                praetore_gateway::AttestedExecution::AwaitingApproval
             );
             fx.verify(&receipt);
             ExecutionKey {
@@ -4446,7 +4446,7 @@ mod tests {
             let receipt = gateway.execute(self.delete(path)).unwrap();
             assert_eq!(
                 receipt.execution,
-                praetore_gateway::AttestedExecution::NotDispatched
+                praetore_gateway::AttestedExecution::AwaitingApproval
             );
             assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
             self.verify(&receipt);
@@ -5150,10 +5150,11 @@ mod tests {
 
     /// T7b (real PostgreSQL): approved, then the window expires before the
     /// dispatch. The claim closes it with the signed reason
-    /// `approval_expired`; nothing is executed.
+    /// `approved_claim_expired` (a human approved it), not `approval_expired`
+    /// (window closed without a decision); nothing is executed.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
-    fn postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approval_expired() {
+    fn postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approved_claim_expired() {
         use praetore_gateway::{
             ApprovalError, ApprovalResolution, ExecutionStatus, GatewayError, NotDispatchedReason,
         };
@@ -5180,16 +5181,16 @@ mod tests {
         );
         assert_eq!(
             fx.closed_reason(key.request_id).as_deref(),
-            Some("approval_expired")
+            Some("approved_claim_expired")
         );
         let receipt = gateway.reconcile(key).unwrap();
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
-            Some(NotDispatchedReason::ApprovalExpired)
+            Some(NotDispatchedReason::ApprovedClaimExpired)
         );
         fx.verify(&receipt);
         let (reason, execution) = fx.verified_with_praetore_verify(&receipt);
-        assert_eq!(reason, "approval_expired");
+        assert_eq!(reason, "approved_claim_expired");
         assert_eq!(execution, "not_dispatched");
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),

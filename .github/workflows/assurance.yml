@@ -596,7 +596,7 @@ jobs:
             # T20: rejected and expired, distinct non-null signed reasons (waits 30 s).
             tests::postgres_t013b_t20_rejected_and_expired_have_distinct_signed_reasons
             # T7b: approved, then expired before the dispatch (waits 30 s).
-            tests::postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approval_expired
+            tests::postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approved_claim_expired
             # T17: tampered final state and wrong pin refused by praetore-verify.
             tests::postgres_t013b_t17_tampered_final_state_fails_praetore_verify
             # T21: CLI stderr for an allowed action refused before the effect.
