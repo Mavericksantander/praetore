@@ -628,11 +628,15 @@ delivery, or approval-key rotation.
 The HTTP flow is:
 
 1. `POST /v1/execute` returns `202 Accepted` and a receipt with
-   `authorization = requires_approval`; the action remains `NotDispatched`.
-   This receipt is not final: the request may still be approved and
-   executed. `praetore-verify receipt` reports it with `final: false` and
-   `non_final_reason: awaiting_approval_or_legacy`, and `--require-final`
-   refuses it (see docs/operations.md).
+   `authorization = requires_approval` and `execution = awaiting_approval`
+   (attestation schema v5); the action is not dispatched. This receipt is
+   not final: the request may still be approved and executed, and a saved
+   copy keeps saying `awaiting_approval` afterwards. `praetore-verify
+   receipt` reports it with `final: false` and
+   `non_final_reason: awaiting_approval`, and `--require-final` refuses it
+   (see docs/operations.md). Receipts written before schema v5 carried
+   `not_dispatched` with no reason and are reported as
+   `awaiting_approval_or_legacy`.
 2. `GET /v1/approvals/{tenant_id}/{agent_id}/{request_id}` returns
    `{"challenge": ApprovalChallenge, "action": Action}`. The challenge is
    derived from the pending execution's stored evidence and binds the tenant,
@@ -671,7 +675,9 @@ The HTTP flow is:
    gets 409. If the window closed first, or revalidation fails terminally
    (for example the authority was revoked), the execution is closed as
    `not_dispatched` with a signed attestation (schema version 3) whose
-   `not_dispatched_reason` is `approval_expired` or `dispatch_failed`.
+   `not_dispatched_reason` is `approved_claim_expired` (the window closed
+   before the claim) or `dispatch_failed`. Rows closed before migration 0022
+   carry `approval_expired` for the first case.
    Transient failures (trusted clock, freshness source or replay storage
    unavailable, HTTP 503) leave it `approved_pending_dispatch`, so the
    dispatch can be requested again while the window is open.

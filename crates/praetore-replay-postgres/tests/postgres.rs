@@ -14,7 +14,7 @@ use praetore_core::{
     },
 };
 use praetore_gateway::{
-    ActionDispatcher, DispatchError, DispatchReport, ExecutionAttestationError,
+    ActionDispatcher, AttestedExecution, DispatchError, DispatchReport, ExecutionAttestationError,
     ExecutionAttestationSigner, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
     Gateway, GatewayError, HumanApprovalDecision, HumanApprovalOutcome, HumanApprovalResult,
     HumanApprovalVerifier, JournalError, NotDispatchedReason, ReconciliationReport, action_digest,
@@ -1094,7 +1094,7 @@ fn postgres_gateway_authorizes_and_persists_one_effect() {
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     receipt
         .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
@@ -1278,7 +1278,7 @@ fn postgres_lost_commit_ack_is_verified_before_dispatch() {
         agent_id: *receipt.evidence.agent.id.as_uuid(),
         request_id: receipt.evidence.request_id,
     };
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(database_replay_claim_count(key), 1);
     assert_eq!(database_journal_count(key), 1);
     assert_eq!(database_effect_count(key), 1);
@@ -1510,7 +1510,7 @@ fn postgres_recovery_never_dispatches_authorized_or_ambiguous_rows() {
     };
     let recovered = create_gateway_for_fixture(&authorized, authorized.adapter.clone());
     let receipt = recovered.reconcile(authorized_key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
     assert_eq!(database_effect_count(authorized_key), 0);
     assert_eq!(authorized.adapter.invocation_count(), 0);
 
@@ -1525,7 +1525,7 @@ fn postgres_recovery_never_dispatches_authorized_or_ambiguous_rows() {
     journal.mark_dispatched(ambiguous_key).unwrap();
     let recovered = create_gateway_for_fixture(&ambiguous, ambiguous.adapter.clone());
     let receipt = recovered.reconcile(ambiguous_key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(receipt.execution, AttestedExecution::Failed);
     assert_eq!(database_effect_count(ambiguous_key), 0);
     assert_eq!(ambiguous.adapter.invocation_count(), 0);
 }
@@ -1553,7 +1553,7 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
         .store(true, Ordering::SeqCst);
     let gateway = create_gateway_for_fixture(&fixture, fixture.adapter.clone());
     let unresolved = gateway.reconcile(key).unwrap();
-    assert_eq!(unresolved.execution, ExecutionStatus::OutcomeUnknown);
+    assert_eq!(unresolved.execution, AttestedExecution::OutcomeUnknown);
     unresolved
         .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
@@ -1568,7 +1568,7 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
             .execution_attestation
             .unwrap()
             .execution,
-        ExecutionStatus::OutcomeUnknown
+        AttestedExecution::OutcomeUnknown
     );
     assert_eq!(database_effect_count(key), 1);
     assert_eq!(database_invocation_count(key), 1);
@@ -1578,7 +1578,7 @@ fn postgres_reconciliation_only_resolves_when_adapter_proves_outcome() {
         .reconciliation_unknown
         .store(false, Ordering::SeqCst);
     let resolved = gateway.reconcile(key).unwrap();
-    assert_eq!(resolved.execution, ExecutionStatus::Confirmed);
+    assert_eq!(resolved.execution, AttestedExecution::Confirmed);
     resolved
         .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
@@ -1632,7 +1632,7 @@ fn postgres_effect_survives_failed_terminal_write_and_is_reconciled_without_retr
 
     let recovered = create_gateway_for_fixture(&fixture, adapter.clone());
     let receipt = recovered.reconcile(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(adapter.invocation_count(), 1);
     assert_eq!(database_effect_count(key), 1);
     assert_eq!(database_invocation_count(key), 1);
@@ -1889,7 +1889,7 @@ fn postgres_human_approval_is_persisted_atomically_and_consumed_once() {
         ExecutionStatus::ApprovedPendingDispatch
     );
     let receipt = fixture.gateway.dispatch_approved(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 1);
 
     let record = connect_journal().get(key).unwrap().unwrap();
@@ -2011,7 +2011,10 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
             let authorized_gateway =
                 create_gateway_for_fixture(&authorized_fixture, authorized_fixture.adapter.clone());
             let authorized_receipt = authorized_gateway.reconcile(authorized_key).unwrap();
-            assert_eq!(authorized_receipt.execution, ExecutionStatus::NotDispatched);
+            assert_eq!(
+                authorized_receipt.execution,
+                AttestedExecution::NotDispatched
+            );
             assert_eq!(authorized_fixture.adapter.invocation_count(), 0);
 
             let dispatching_fixture = create_postgres_gateway(Uuid::new_v4());
@@ -2020,7 +2023,7 @@ fn postgres_journal_survives_server_restart_without_automatic_dispatch() {
                 dispatching_fixture.adapter.clone(),
             );
             let dispatching_receipt = dispatching_gateway.reconcile(dispatching_key).unwrap();
-            assert_eq!(dispatching_receipt.execution, ExecutionStatus::Failed);
+            assert_eq!(dispatching_receipt.execution, AttestedExecution::Failed);
             assert_eq!(dispatching_fixture.adapter.invocation_count(), 0);
             assert_eq!(database_effect_count(authorized_key), 0);
             assert_eq!(database_effect_count(dispatching_key), 0);
@@ -2531,8 +2534,8 @@ fn postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered() {
     drop(fixture.gateway);
 
     let receipt = recovering.reconcile(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
-    assert_ne!(receipt.execution, ExecutionStatus::OutcomeUnknown);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
+    assert_ne!(receipt.execution, AttestedExecution::OutcomeUnknown);
     assert_eq!(
         receipt.execution_attestation.not_dispatched_reason,
         Some(NotDispatchedReason::CrashRecovered)
@@ -2576,7 +2579,7 @@ fn postgres_apd_crash_between_approve_and_claim_closes_as_crash_recovered() {
     );
     // Reconcile is idempotent and still never dispatches.
     let again = recovering.reconcile(key).unwrap();
-    assert_eq!(again.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(again.execution, AttestedExecution::NotDispatched);
     // No re-dispatch after a crash: the old approval cannot be claimed or
     // replayed; only a new request can run the action.
     assert!(matches!(
@@ -2657,7 +2660,7 @@ fn postgres_apd_concurrent_claims_dispatch_exactly_once() {
 
 #[test]
 #[ignore = "requires a PostgreSQL service; run in assurance CI"]
-fn postgres_apd_expiry_before_claim_closes_as_approval_expired() {
+fn postgres_apd_expiry_before_claim_closes_as_approved_claim_expired() {
     let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let key = approved_pending(&fixture);
@@ -2682,11 +2685,11 @@ fn postgres_apd_expiry_before_claim_closes_as_approval_expired() {
     let attestation = record.execution_attestation.unwrap();
     assert_eq!(
         attestation.not_dispatched_reason,
-        Some(NotDispatchedReason::ApprovalExpired)
+        Some(NotDispatchedReason::ApprovedClaimExpired)
     );
     assert_eq!(
         database_not_dispatched_reason(key).as_deref(),
-        Some("approval_expired")
+        Some("approved_claim_expired")
     );
     assert!(
         !database_transitions(key)
@@ -2944,7 +2947,7 @@ fn postgres_apd_and_migrations_survive_restart() {
             let fixture = create_postgres_approval_gateway(Uuid::new_v4());
             let (recovering, adapter) = second_gateway(&fixture);
             let receipt = recovering.reconcile(key).unwrap();
-            assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
             assert_eq!(
                 receipt.execution_attestation.not_dispatched_reason,
                 Some(NotDispatchedReason::CrashRecovered)
@@ -3020,6 +3023,24 @@ fn in_own_scratch_database(test: &str) -> bool {
         String::from_utf8_lossy(&output.stderr)
     );
     false
+}
+
+/// Emulates a database written before migration 0022, so the rollbacks of
+/// older migrations can run under it: deletes every `awaiting_approval`
+/// attestation, the rows the 0022 rollback refuses. Superuser only: replica
+/// mode skips the attestation table's immutability trigger for this
+/// transaction. Test scratch databases only.
+fn forget_awaiting_approval_attestations() {
+    let mut client = connect_client();
+    let mut transaction = client.transaction().unwrap();
+    transaction
+        .batch_execute(
+            "SET LOCAL session_replication_role = replica; \
+             DELETE FROM praetore.execution_attestations \
+             WHERE execution_status = 'awaiting_approval'",
+        )
+        .unwrap();
+    transaction.commit().unwrap();
 }
 
 impl Drop for ScratchDatabase {
@@ -3143,7 +3164,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0018_safety_audit_and_role_oids",
             "0019_safety_ingest_row_lock",
             "0020_approval_close_reasons",
-            "0021_journal_insert_rules"
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -5825,7 +5847,7 @@ fn postgres_apd_lost_claim_acknowledgement_never_invokes_the_adapter() {
         ))
     ));
     let receipt = gateway.reconcile(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(receipt.execution, AttestedExecution::Failed);
     assert_eq!(adapter.invocation_count(), 0);
     assert_eq!(database_invocation_count(key), 0);
 }
@@ -6046,7 +6068,7 @@ fn crash_helper_reconcile() {
     let fixture = create_postgres_approval_gateway(Uuid::new_v4());
     let (gateway, adapter) = second_gateway(&fixture);
     let receipt = gateway.reconcile(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
     assert_eq!(
         receipt.execution_attestation.not_dispatched_reason,
         Some(NotDispatchedReason::CrashRecovered)
@@ -6507,7 +6529,7 @@ fn postgres_concurrent_human_approval_dispatches_exactly_once() {
             });
         let winners: Vec<_> = dispatches.iter().filter_map(|r| r.as_ref().ok()).collect();
         assert_eq!(winners.len(), 1, "race {race}: {dispatches:?}");
-        assert_eq!(winners[0].execution, ExecutionStatus::Confirmed);
+        assert_eq!(winners[0].execution, AttestedExecution::Confirmed);
         for result in &dispatches {
             if let Err(error) = result {
                 assert!(
@@ -6994,7 +7016,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0018_safety_audit_and_role_oids",
             "0019_safety_ingest_row_lock",
             "0020_approval_close_reasons",
-            "0021_journal_insert_rules"
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state"
         ]
     );
     assert!(again.is_empty());
@@ -7200,7 +7223,7 @@ fn postgres_g7_unclassified_action_commits_a_signed_deny() {
         receipt.evidence.decision.reason,
         praetore_core::UNCLASSIFIED_DENY_REASON
     );
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
     assert_eq!(database_journal_count(key), 1);
     assert_eq!(database_replay_claim_count(key), 1);
     assert_eq!(fixture.adapter.invocation_count(), 0);
@@ -7255,19 +7278,27 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         include_str!("../../../docs/rollback/0020-approval-close-reasons.sql");
     const ROLLBACK_0021: &str =
         include_str!("../../../docs/rollback/0021-journal-insert-rules.sql");
+    const ROLLBACK_0022: &str =
+        include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
     let state = || -> (String, bool, bool, bool) {
         let row = connect_client()
             .query_one(
-                "SELECT (SELECT string_agg(tgname, ',' ORDER BY tgname) FROM pg_trigger \
+                "SELECT (SELECT string_agg(CASE WHEN tgname IN ( \
+                                     'execution_journal_transition_v4', \
+                                     'execution_journal_transition_v5') \
+                                   THEN 'execution_journal_transition_v4+' ELSE tgname END, \
+                                   ',' ORDER BY tgname) FROM pg_trigger \
                          WHERE tgrelid = 'praetore.execution_journal'::regclass \
                            AND tgname LIKE 'execution_journal_transition_v%'), \
                         EXISTS (SELECT 1 FROM pg_constraint \
-                                WHERE conname = 'execution_journal_not_dispatched_reason_v3'), \
+                                WHERE conname IN ('execution_journal_not_dispatched_reason_v3', \
+                                                  'execution_journal_not_dispatched_reason_v4')), \
                         EXISTS (SELECT 1 FROM pg_constraint \
-                                WHERE conname = 'execution_attestations_not_dispatched_reason_v3'), \
+                                WHERE conname IN ('execution_attestations_not_dispatched_reason_v3', \
+                                                  'execution_attestations_not_dispatched_reason_v4')), \
                         EXISTS (SELECT 1 FROM praetore.schema_migrations \
                                 WHERE version = '0020_approval_close_reasons')",
                 &[],
@@ -7275,8 +7306,10 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             .unwrap();
         (row.get(0), row.get(1), row.get(2), row.get(3))
     };
+    // 0020 applied, with or without 0022 (which replaces its trigger and
+    // reason constraints with v5 and v4).
     let up = (
-        "execution_journal_transition_v4".to_owned(),
+        "execution_journal_transition_v4+".to_owned(),
         true,
         true,
         true,
@@ -7334,6 +7367,17 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     // (D-B1), so with 0020 rolled back it refuses to act at all.
     let key = hold(&fixture);
 
+    // The held request is signed `awaiting_approval` (0022): the 0022
+    // rollback refuses while that row exists and changes nothing.
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0022)
+        .expect_err("the 0022 rollback must refuse an awaiting_approval row");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state(), up);
+    // A database written before 0022 has no such row.
+    forget_awaiting_approval_attestations();
+    connect_client().batch_execute(ROLLBACK_0022).unwrap();
+
     // 0021 reads the 0020 columns: 0020 cannot be rolled back under it.
     let error = connect_client()
         .batch_execute(ROLLBACK_0020)
@@ -7373,13 +7417,17 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     assert_eq!(
         applied,
-        vec!["0020_approval_close_reasons", "0021_journal_insert_rules"]
+        vec![
+            "0020_approval_close_reasons",
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state"
+        ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(state(), up);
     assert!(reason_is_allowed(
         "praetore.execution_journal",
-        "execution_journal_not_dispatched_reason_v3"
+        "execution_journal_not_dispatched_reason_v4"
     ));
     // A decision recorded while down is closed by the idempotent repair;
     // otherwise the request is still held and is rejected now.
@@ -7401,6 +7449,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
 
     // With such rows the rollback fails as a whole and 0020 stays (0021 is
     // rolled back first, so only the row guard can refuse it).
+    forget_awaiting_approval_attestations();
+    connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     let error = connect_client()
         .batch_execute(ROLLBACK_0020)
@@ -7409,7 +7459,10 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), up);
     let mut admin = connect_client();
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-    assert_eq!(applied, vec!["0021_journal_insert_rules"]);
+    assert_eq!(
+        applied,
+        vec!["0021_journal_insert_rules", "0022_awaiting_approval_state"]
+    );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
 }
@@ -7429,6 +7482,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         include_str!("../../../docs/rollback/0020-approval-close-reasons.sql");
     const ROLLBACK_0021: &str =
         include_str!("../../../docs/rollback/0021-journal-insert-rules.sql");
+    const ROLLBACK_0022: &str =
+        include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
@@ -7483,11 +7538,12 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         .gateway
         .execute(confirmed.request.clone())
         .unwrap();
-    assert_eq!(confirmed_receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(confirmed_receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(confirmed_receipt.execution_attestation.failure, None);
     assert_eq!(state(), up);
 
     // Down (0021 first): the columns, their constraints and grant are gone.
+    connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     connect_client().batch_execute(ROLLBACK_0020).unwrap();
     assert_eq!(state(), down);
@@ -7497,7 +7553,11 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     assert_eq!(
         applied,
-        vec!["0020_approval_close_reasons", "0021_journal_insert_rules"]
+        vec![
+            "0020_approval_close_reasons",
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state"
+        ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(state(), up);
@@ -7517,7 +7577,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         }) => *receipt,
         other => panic!("expected a final refusal with a receipt, got {other:?}"),
     };
-    assert_eq!(no_effect.execution, ExecutionStatus::Failed);
+    assert_eq!(no_effect.execution, AttestedExecution::Failed);
     assert_eq!(no_effect.execution_attestation.schema_version, 4);
     let no_effect_key = key_of(&no_effect);
     let no_effect_columns = (
@@ -7547,7 +7607,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         }) => *receipt,
         other => panic!("expected EffectFailed with a receipt, got {other:?}"),
     };
-    assert_eq!(effect_failed.execution, ExecutionStatus::Failed);
+    assert_eq!(effect_failed.execution, AttestedExecution::Failed);
     assert_eq!(
         effect_failed.execution_attestation.failure,
         Some(praetore_gateway::ExecutionFailure::EffectFailed)
@@ -7565,7 +7625,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     // The persisted records parse and keep their class.
     for (fixture, receipt) in [(&refused, &no_effect), (&failed, &effect_failed)] {
         let reconciled = fixture.gateway.reconcile(key_of(receipt)).unwrap();
-        assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+        assert_eq!(reconciled.execution, AttestedExecution::Failed);
         assert_eq!(
             reconciled.execution_attestation.failure,
             receipt.execution_attestation.failure
@@ -7655,6 +7715,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
 
     // With classified rows the rollback fails as a whole and 0020 stays
     // (0021 is rolled back first, so only the row guard can refuse it).
+    connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     let error = connect_client()
         .batch_execute(ROLLBACK_0020)
@@ -7663,7 +7724,10 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), up);
     let mut admin = connect_client();
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-    assert_eq!(applied, vec!["0021_journal_insert_rules"]);
+    assert_eq!(
+        applied,
+        vec!["0021_journal_insert_rules", "0022_awaiting_approval_state"]
+    );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(
         columns("execution_journal", no_effect_key),
@@ -8042,6 +8106,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     const TEST: &str = "postgres_journal_insert_rules_migration_rolls_back_and_applies_again";
     const ROLLBACK_0021: &str =
         include_str!("../../../docs/rollback/0021-journal-insert-rules.sql");
+    const ROLLBACK_0022: &str =
+        include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
@@ -8050,7 +8116,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
             .query_one(
                 "SELECT (SELECT count(*) FROM pg_trigger \
                          WHERE tgname IN ('execution_journal_initial_state_v1', \
-                                          'execution_attestations_journal_state_v1')), \
+                                          'execution_attestations_journal_state_v1', \
+                                          'execution_attestations_journal_state_v2')), \
                         (SELECT count(*) FROM pg_proc p \
                          JOIN pg_namespace n ON n.oid = p.pronamespace \
                          WHERE n.nspname = 'praetore' \
@@ -8090,6 +8157,13 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), (2, 2, true));
     assert!(p1(&mut admin).is_err());
 
+    // 0022 is newer: the 0021 rollback refuses until it is rolled back.
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0021)
+        .expect_err("the 0021 rollback must refuse while 0022 is recorded");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state(), (2, 2, true));
+    connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     assert_eq!(state(), (0, 0, false));
     p1(&mut admin).expect("without 0021 the INSERT rules are gone");
@@ -8100,7 +8174,10 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     assert!(error.as_db_error().is_some(), "{error}");
 
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-    assert_eq!(applied, vec!["0021_journal_insert_rules"]);
+    assert_eq!(
+        applied,
+        vec!["0021_journal_insert_rules", "0022_awaiting_approval_state"]
+    );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(state(), (2, 2, true));
     assert!(p1(&mut admin).is_err());
@@ -9554,4 +9631,585 @@ mod g1_safety {
         verify_safety_ingest_role_with(&mut ingest, &options).unwrap();
         verify_runtime_role(&mut gateway).unwrap();
     }
+}
+
+fn held(fixture: &PostgresApprovalFixture) -> (ExecutionKey, praetore_gateway::GatewayReceipt) {
+    let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
+    let key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *pending.evidence.agent.id.as_uuid(),
+        request_id: pending.evidence.request_id,
+    };
+    (key, pending)
+}
+
+/// Stored attestations of `key`, as (execution_status, reason, schema).
+fn stored_attestations(key: ExecutionKey) -> Vec<(String, Option<String>, i64)> {
+    connect_client()
+        .query(
+            "SELECT execution_status, not_dispatched_reason, \
+                    (attestation_json ->> 'schema_version')::bigint \
+             FROM praetore.execution_attestations \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+             ORDER BY created_at, execution_status",
+            &[&key.tenant_id, &key.agent_id, &key.request_id],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect()
+}
+
+/// Inserts `json` as an attestation row of `key` in `execution`, as the
+/// owner (row level security does not hide the row; the triggers run).
+fn insert_raw_attestation(
+    key: ExecutionKey,
+    execution: &str,
+    json: &Value,
+) -> Result<u64, postgres::Error> {
+    connect_client().execute(
+        "INSERT INTO praetore.execution_attestations \
+         (attestation_id, tenant_id, agent_id, request_id, execution_status, \
+          attestation_json, not_dispatched_reason) \
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $6::jsonb ->> 'not_dispatched_reason')",
+        &[
+            &Uuid::new_v4(),
+            &key.tenant_id,
+            &key.agent_id,
+            &key.request_id,
+            &execution,
+            json,
+        ],
+    )
+}
+
+fn refused_with(result: Result<u64, postgres::Error>, expected: &str, case: &str) {
+    let error = result.expect_err(case);
+    let message = error
+        .as_db_error()
+        .map(|error| error.message().to_owned())
+        .unwrap_or_default();
+    assert!(message.contains(expected), "{case}: {error}: {message}");
+}
+
+/// T-016 (finding 1, option B) against real PostgreSQL, end to end: the 202
+/// receipt is signed and stored as schema v5 `awaiting_approval` while the
+/// journal row stays `not_dispatched` with no reason. Saved, approved and
+/// executed, the saved receipt still verifies only as `awaiting_approval`,
+/// not final; the journal returns the final `confirmed` attestation.
+#[test]
+#[ignore = "requires a PostgreSQL service; run in assurance CI"]
+fn postgres_saved_202_receipt_stays_awaiting_approval_after_execution() {
+    let fixture = create_postgres_approval_gateway(Uuid::new_v4());
+    let (key, pending) = held(&fixture);
+    assert_eq!(pending.execution, AttestedExecution::AwaitingApproval);
+    assert_eq!(pending.execution_attestation.schema_version, 5);
+    let saved = serde_json::to_string(&pending).unwrap();
+    let record = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(
+        record.execution_attestation.as_ref().unwrap().execution,
+        AttestedExecution::AwaitingApproval
+    );
+    assert_eq!(database_not_dispatched_reason(key), None);
+    assert_eq!(
+        stored_attestations(key),
+        vec![("awaiting_approval".to_owned(), None, 5)]
+    );
+
+    let public_key = execution_attester_public_key();
+    let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[83; 32])
+        .public_key()
+        .unwrap();
+    let verify = |json: &str| {
+        praetore_gateway::verify_gateway_receipt_json(
+            json,
+            &public_key,
+            "postgres-test-execution-attester-v1",
+            &evidence_key,
+        )
+    };
+    let check_saved = || {
+        let receipt = verify(&saved).unwrap();
+        assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
+        assert!(!receipt.is_final());
+    };
+    check_saved();
+
+    let decision = sign_approval(&fixture, key);
+    assert!(matches!(
+        fixture.gateway.resolve_human_approval(decision).unwrap(),
+        HumanApprovalResult::ApprovedPendingDispatch { .. }
+    ));
+    let done = fixture.gateway.dispatch_approved(key).unwrap();
+    assert_eq!(fixture.adapter.invocation_count(), 1);
+    assert!(
+        verify(&serde_json::to_string(&done).unwrap())
+            .unwrap()
+            .is_final()
+    );
+    let record = connect_journal().get(key).unwrap().unwrap();
+    assert_eq!(
+        record
+            .execution_attestation
+            .unwrap()
+            .execution
+            .journal_status(),
+        record.execution
+    );
+    assert_ne!(record.execution, ExecutionStatus::NotDispatched);
+
+    check_saved();
+    let relabelled = saved.replace("\"awaiting_approval\"", "\"not_dispatched\"");
+    assert!(verify(&relabelled).is_err());
+    assert!(verify(&relabelled.replace("\"schema_version\":5", "\"schema_version\":2")).is_err());
+}
+
+/// T-016 (finding 1, option B), migration 0022: an `awaiting_approval`
+/// attestation is accepted only for a held row (requires_approval,
+/// not_dispatched, no reason, no decision, no expiration receipt) and with
+/// schema v5. It is refused after an approve or reject decision, after the
+/// window expired, on an allowed row, and with another schema or a reason.
+/// A held row signed before v5 is signed again as `awaiting_approval` on
+/// read, next to its old attestation.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
+    const TEST: &str = "postgres_awaiting_approval_attestation_only_on_a_held_row";
+    if !in_own_scratch_database(TEST) {
+        return;
+    }
+    let mismatch = "does not match the journal state";
+    let clock = SharedClock::at_test_now();
+    let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let (held_key, pending) = held(&fixture);
+    let awaiting = serde_json::to_value(&pending.execution_attestation).unwrap();
+    let for_key = |key: ExecutionKey, edit: &dyn Fn(&mut Value)| {
+        let mut json = awaiting.clone();
+        json["agent_id"] = key.agent_id.to_string().into();
+        json["request_id"] = key.request_id.to_string().into();
+        edit(&mut json);
+        json
+    };
+
+    // Accepted on the held row (the gateway's own insert), and again once
+    // it is gone, as for a row written before 0022.
+    assert_eq!(
+        stored_attestations(held_key),
+        vec![("awaiting_approval".to_owned(), None, 5)]
+    );
+    forget_awaiting_approval_attestations();
+    assert_eq!(
+        insert_raw_attestation(held_key, "awaiting_approval", &awaiting).unwrap(),
+        1
+    );
+    forget_awaiting_approval_attestations();
+    // Refused with another schema or a reason, even on the held row.
+    for (case, edit) in [
+        (
+            "schema v2",
+            Box::new(|json: &mut Value| json["schema_version"] = 2.into())
+                as Box<dyn Fn(&mut Value)>,
+        ),
+        (
+            "schema v3",
+            Box::new(|json: &mut Value| json["schema_version"] = 3.into()),
+        ),
+        (
+            "reason",
+            Box::new(|json: &mut Value| json["not_dispatched_reason"] = "dispatch_refused".into()),
+        ),
+    ] {
+        refused_with(
+            insert_raw_attestation(held_key, "awaiting_approval", &for_key(held_key, &*edit)),
+            mismatch,
+            case,
+        );
+    }
+    // A pre-v5 attestation of the held shape (v2 not_dispatched, no reason)
+    // is still accepted, and the gateway signs `awaiting_approval` next to
+    // it when it reads the row.
+    let legacy = praetore_gateway::ExecutionAttestation::create(
+        &pending.evidence,
+        praetore_gateway::AuthorizationStatus::RequiresApproval,
+        &praetore_gateway::AttestedOutcome::NotDispatched(None),
+        test_now(),
+        execution_attester().as_ref(),
+    )
+    .unwrap();
+    connect_journal()
+        .record_attestation(held_key, ExecutionStatus::NotDispatched, None, &legacy)
+        .unwrap();
+    assert_eq!(
+        stored_attestations(held_key),
+        vec![("not_dispatched".to_owned(), None, 2)]
+    );
+    let read = fixture.gateway.reconcile(held_key).unwrap();
+    // A repeated request still finds its record (and does not run again).
+    assert!(matches!(
+        fixture.gateway.execute(fixture.request.clone()),
+        Err(GatewayError::Journal(JournalError::AlreadyRecorded))
+    ));
+    assert_eq!(read.execution, AttestedExecution::AwaitingApproval);
+    assert_eq!(read.execution_attestation.schema_version, 5);
+    let mut stored = stored_attestations(held_key);
+    stored.sort();
+    assert_eq!(
+        stored,
+        vec![
+            ("awaiting_approval".to_owned(), None, 5),
+            ("not_dispatched".to_owned(), None, 2)
+        ]
+    );
+    assert_eq!(
+        connect_journal()
+            .get(held_key)
+            .unwrap()
+            .unwrap()
+            .execution_attestation
+            .unwrap()
+            .execution,
+        AttestedExecution::AwaitingApproval
+    );
+
+    // After an approve decision (approved_pending_dispatch).
+    let clocked =
+        || create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let approved = approved_pending(&clocked());
+    refused_with(
+        insert_raw_attestation(approved, "awaiting_approval", &for_key(approved, &|_| {})),
+        mismatch,
+        "approved",
+    );
+    // After a reject decision (closed approval_rejected).
+    let reject_fixture = clocked();
+    let (rejected, _) = held(&reject_fixture);
+    let mut decision = sign_approval(&reject_fixture, rejected);
+    decision.outcome = HumanApprovalOutcome::Reject;
+    decision.signature = hex::encode(
+        reject_fixture
+            .approver_key
+            .sign(&decision.signing_message().unwrap())
+            .to_bytes(),
+    );
+    assert!(matches!(
+        reject_fixture.gateway.resolve_human_approval(decision),
+        Ok(HumanApprovalResult::Rejected { .. })
+    ));
+    refused_with(
+        insert_raw_attestation(rejected, "awaiting_approval", &for_key(rejected, &|_| {})),
+        mismatch,
+        "rejected",
+    );
+    // After the window expired without a decision (closed approval_expired).
+    let expire_fixture = clocked();
+    let (expired, _) = held(&expire_fixture);
+    *clock.0.lock().unwrap() += Duration::seconds(25);
+    assert_eq!(
+        expire_fixture.gateway.approval_resolution(expired).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+    assert_eq!(
+        database_not_dispatched_reason(expired).as_deref(),
+        Some("approval_expired")
+    );
+    refused_with(
+        insert_raw_attestation(expired, "awaiting_approval", &for_key(expired, &|_| {})),
+        mismatch,
+        "expired",
+    );
+    // A held row with a decision or an expiration receipt but no reason
+    // yet (a row closed before 0020, or a crash between the expiration
+    // receipt and the close): forced back to that shape with the triggers
+    // off, it still refuses `awaiting_approval`.
+    forget_awaiting_approval_attestations();
+    for (key, case) in [(rejected, "decided, no reason"), (expired, "expired, no reason")] {
+        let mut client = connect_client();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .batch_execute("SET LOCAL session_replication_role = replica")
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE praetore.execution_journal SET not_dispatched_reason = NULL \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(database_not_dispatched_reason(key), None);
+        refused_with(
+            insert_raw_attestation(key, "awaiting_approval", &for_key(key, &|_| {})),
+            mismatch,
+            case,
+        );
+    }
+    // On an allowed row.
+    let allowed_fixture = create_postgres_gateway(Uuid::new_v4());
+    let allowed = allowed_fixture
+        .gateway
+        .execute(allowed_fixture.request.clone())
+        .unwrap();
+    let allowed_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *allowed.evidence.agent.id.as_uuid(),
+        request_id: allowed.evidence.request_id,
+    };
+    let mut allowed_json = serde_json::to_value(&allowed.execution_attestation).unwrap();
+    allowed_json["execution"] = "awaiting_approval".into();
+    allowed_json["schema_version"] = 5.into();
+    allowed_json["output_digest"] = Value::Null;
+    refused_with(
+        insert_raw_attestation(allowed_key, "awaiting_approval", &allowed_json),
+        mismatch,
+        "allowed",
+    );
+    allowed_json["authorization"] = "requires_approval".into();
+    refused_with(
+        insert_raw_attestation(allowed_key, "awaiting_approval", &allowed_json),
+        mismatch,
+        "allowed row, JSON claiming requires_approval",
+    );
+}
+
+/// T-016 (finding 15), migration 0022: the transition trigger closes an
+/// approved_pending_dispatch row as `approved_claim_expired` only with an
+/// approve decision, refuses a new `approval_expired` close of it, and
+/// never writes `approved_claim_expired` in place on a held row. A row that
+/// expired without a decision still closes as `approval_expired`.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_approved_claim_expired_needs_an_approve_decision() {
+    const TEST: &str = "postgres_approved_claim_expired_needs_an_approve_decision";
+    if !in_own_scratch_database(TEST) {
+        return;
+    }
+    let close = |key: ExecutionKey, reason: &str| -> Result<u64, postgres::Error> {
+        connect_client().execute(
+            "UPDATE praetore.execution_journal \
+             SET execution_status = 'not_dispatched', not_dispatched_reason = $4 \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&key.tenant_id, &key.agent_id, &key.request_id, &reason],
+        )
+    };
+    let transition = "invalid execution journal state transition";
+    let fixture = || create_postgres_approval_gateway(Uuid::new_v4());
+
+    // Approved: approval_expired is refused, approved_claim_expired accepted.
+    let approved = approved_pending(&fixture());
+    refused_with(
+        close(approved, "approval_expired"),
+        transition,
+        "approval_expired on APD",
+    );
+    assert_eq!(close(approved, "approved_claim_expired").unwrap(), 1);
+
+    // An approved_pending_dispatch row without its approve decision (forced
+    // with the triggers off, as no gateway path can) cannot close as
+    // approved_claim_expired.
+    let (forced, _) = held(&fixture());
+    {
+        let mut client = connect_client();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .batch_execute("SET LOCAL session_replication_role = replica")
+            .unwrap();
+        transaction
+            .execute(
+                "UPDATE praetore.execution_journal \
+                 SET execution_status = 'approved_pending_dispatch' \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&forced.tenant_id, &forced.agent_id, &forced.request_id],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    refused_with(
+        close(forced, "approved_claim_expired"),
+        transition,
+        "approved_claim_expired without approve",
+    );
+    assert_eq!(close(forced, "crash_recovered").unwrap(), 1);
+
+    // Never in place on a held row, decided or not.
+    let (undecided, _) = held(&fixture());
+    refused_with(
+        close(undecided, "approved_claim_expired"),
+        "write-once",
+        "approved_claim_expired on a held row",
+    );
+    assert_eq!(database_not_dispatched_reason(undecided), None);
+
+    // The CHECK constraints admit the reason only on not_dispatched.
+    let error = connect_client()
+        .execute(
+            "UPDATE praetore.execution_journal SET not_dispatched_reason = 'approved_claim_expired' \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&undecided.tenant_id, &undecided.agent_id, &undecided.request_id],
+        )
+        .expect_err("in place on a held row");
+    assert!(error.as_db_error().is_some(), "{error}");
+
+    // Through the gateway: the late claim of an approval signs
+    // approved_claim_expired; an undecided expiry signs approval_expired.
+    let clock = SharedClock::at_test_now();
+    let clocked = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let lapsing = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let late = approved_pending(&clocked);
+    let (lapsed, _) = held(&lapsing);
+    *clock.0.lock().unwrap() += Duration::seconds(25);
+    assert!(clocked.gateway.dispatch_approved(late).is_err());
+    assert_eq!(
+        database_not_dispatched_reason(late).as_deref(),
+        Some("approved_claim_expired")
+    );
+    assert_eq!(
+        lapsing.gateway.approval_resolution(lapsed).unwrap(),
+        praetore_gateway::ApprovalResolution::Expired
+    );
+    assert_eq!(
+        database_not_dispatched_reason(lapsed).as_deref(),
+        Some("approval_expired")
+    );
+    assert_eq!(clocked.adapter.invocation_count(), 0);
+    assert_eq!(lapsing.adapter.invocation_count(), 0);
+}
+
+/// T-016: migration 0022 up, down and up again, in its own database. The
+/// documented rollback restores 0020's and 0021's triggers and constraints;
+/// it refuses to run twice, and it refuses (changing nothing) while an
+/// `awaiting_approval` attestation or an `approved_claim_expired` row
+/// exists.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
+    const TEST: &str = "postgres_awaiting_approval_migration_rolls_back_and_applies_again";
+    const ROLLBACK_0022: &str =
+        include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
+    if !in_own_scratch_database(TEST) {
+        return;
+    }
+    let state = || -> (String, String, Vec<String>, bool) {
+        let row = connect_client()
+            .query_one(
+                "SELECT (SELECT string_agg(tgname, ',' ORDER BY tgname) FROM pg_trigger \
+                         WHERE tgname LIKE 'execution_journal_transition_v%' \
+                            OR tgname LIKE 'execution_attestations_journal_state_v%'), \
+                        (SELECT string_agg(proname, ',' ORDER BY proname) FROM pg_proc p \
+                         JOIN pg_namespace n ON n.oid = p.pronamespace \
+                         WHERE n.nspname = 'praetore' \
+                           AND (proname LIKE 'validate_execution_journal_transition_v%' \
+                             OR proname LIKE 'validate_execution_attestation_insert_v%')), \
+                        (SELECT array_agg(conname::text ORDER BY conname) FROM pg_constraint \
+                         WHERE conname IN ( \
+                             'execution_attestations_execution_status_check', \
+                             'execution_attestations_execution_status_v2', \
+                             'execution_journal_not_dispatched_reason_v3', \
+                             'execution_journal_not_dispatched_reason_v4', \
+                             'execution_attestations_not_dispatched_reason_v3', \
+                             'execution_attestations_not_dispatched_reason_v4')), \
+                        EXISTS (SELECT 1 FROM praetore.schema_migrations \
+                                WHERE version = '0022_awaiting_approval_state')",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2), row.get(3))
+    };
+    let up = (
+        "execution_attestations_journal_state_v2,execution_journal_transition_v5".to_owned(),
+        vec![
+            "execution_attestations_execution_status_v2".to_owned(),
+            "execution_attestations_not_dispatched_reason_v4".to_owned(),
+            "execution_journal_not_dispatched_reason_v4".to_owned(),
+        ],
+        true,
+    );
+    let down = (
+        "execution_attestations_journal_state_v1,execution_journal_transition_v4".to_owned(),
+        vec![
+            "execution_attestations_execution_status_check".to_owned(),
+            "execution_attestations_not_dispatched_reason_v3".to_owned(),
+            "execution_journal_not_dispatched_reason_v3".to_owned(),
+        ],
+        false,
+    );
+    let mut admin = connect_client();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    let initial = state();
+    assert_eq!((&initial.0, &initial.2, initial.3), (&up.0, &up.1, up.2));
+    // 0022's functions are new; the ones it replaced stay for the rollback.
+    for function in [
+        "validate_execution_journal_transition_v5",
+        "validate_execution_attestation_insert_v2",
+        "validate_execution_journal_transition_v4",
+        "validate_execution_attestation_insert_v1",
+    ] {
+        assert!(initial.1.contains(function), "{function}: {}", initial.1);
+    }
+    let older_functions = initial.1.clone();
+
+    // Down with no v5 row: 0021's and 0020's rules are back.
+    connect_client().batch_execute(ROLLBACK_0022).unwrap();
+    let after_down = state();
+    assert_eq!(
+        (&after_down.0, &after_down.2, after_down.3),
+        (&down.0, &down.1, down.2)
+    );
+    assert!(!after_down.1.contains("transition_v5"));
+    assert!(!after_down.1.contains("insert_v2"));
+    let status_check: String = connect_client()
+        .query_one(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+             WHERE conname = 'execution_attestations_execution_status_check'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert!(
+        !status_check.contains("awaiting_approval"),
+        "{status_check}"
+    );
+    // Not recorded any more: a second run refuses and changes nothing.
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0022)
+        .expect_err("the rollback must refuse to run twice");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state().0, down.0);
+
+    // Up again: only 0022 is applied, and the schema is current.
+    let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    assert_eq!(applied, vec!["0022_awaiting_approval_state"]);
+    praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    assert_eq!(state().0, up.0);
+    assert_eq!(state().1, older_functions);
+    assert_eq!(state().2, up.1);
+
+    // A held request signed under 0022: the rollback refuses, as a whole.
+    let clock = SharedClock::at_test_now();
+    let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
+    let late = approved_pending(&fixture);
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0022)
+        .expect_err("the rollback must refuse an awaiting_approval attestation");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state().0, up.0);
+    assert_eq!(state().2, up.1);
+    assert!(state().3);
+
+    // An approved_claim_expired close, with no awaiting_approval row left:
+    // still refused.
+    *clock.0.lock().unwrap() += Duration::seconds(25);
+    assert!(fixture.gateway.dispatch_approved(late).is_err());
+    assert_eq!(
+        database_not_dispatched_reason(late).as_deref(),
+        Some("approved_claim_expired")
+    );
+    forget_awaiting_approval_attestations();
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0022)
+        .expect_err("the rollback must refuse an approved_claim_expired row");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state().0, up.0);
+    assert!(state().3);
+    assert_eq!(fixture.adapter.invocation_count(), 0);
 }

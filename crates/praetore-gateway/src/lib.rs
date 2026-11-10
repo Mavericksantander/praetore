@@ -121,9 +121,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 pub use praetore_receipt::{
-    AttestedOutcome, AuthorizationStatus, ExecutionAttestation, ExecutionAttestationError,
-    ExecutionAttestationSigner, ExecutionFailure, ExecutionStatus, GatewayReceipt, NonFinalReason,
-    NotDispatchedReason, RefusalCode, action_digest, verify_gateway_receipt_json,
+    AttestedExecution, AttestedOutcome, AuthorizationStatus, ExecutionAttestation,
+    ExecutionAttestationError, ExecutionAttestationSigner, ExecutionFailure, ExecutionStatus,
+    GatewayReceipt, NonFinalReason, NotDispatchedReason, RefusalCode, action_digest,
+    verify_gateway_receipt_json,
 };
 
 pub mod http_api;
@@ -690,7 +691,7 @@ impl<'a> HumanDecisionRecord<'a> {
     ) -> Option<Self> {
         let challenge = &decision.challenge;
         (decision.outcome == HumanApprovalOutcome::Reject
-            && close.execution == ExecutionStatus::NotDispatched
+            && close.execution == AttestedExecution::NotDispatched
             && close.not_dispatched_reason == Some(NotDispatchedReason::ApprovalRejected)
             && close.tenant_id == Some(challenge.tenant_id)
             && close.agent_id == challenge.agent_id
@@ -1165,23 +1166,22 @@ impl Gateway {
         Ok(Self::receipt(
             record.evidence,
             record.authorization,
-            record.execution,
             None,
             attestation,
         ))
     }
 
+    /// The receipt states exactly what its attestation signs.
     fn receipt(
         evidence: Evidence,
         authorization: AuthorizationStatus,
-        execution: ExecutionStatus,
         output: Option<Value>,
         execution_attestation: ExecutionAttestation,
     ) -> GatewayReceipt {
         GatewayReceipt {
             evidence,
             authorization,
-            execution,
+            execution: execution_attestation.execution,
             output,
             execution_attestation,
         }
@@ -1479,13 +1479,7 @@ impl Gateway {
                     .ok_or(GatewayError::Journal(JournalError::InvalidRecord))?;
                 self.journal.record_human_approval(key, write, now)?;
                 record.execution = ExecutionStatus::NotDispatched;
-                let receipt = Self::receipt(
-                    record.evidence,
-                    record.authorization,
-                    record.execution,
-                    None,
-                    close,
-                );
+                let receipt = Self::receipt(record.evidence, record.authorization, None, close);
                 Ok(HumanApprovalResult::Rejected {
                     decision,
                     receipt: Box::new(receipt),
@@ -1537,16 +1531,18 @@ impl Gateway {
             if is_transient_authorization_error(&error) {
                 return Err(GatewayError::Authorization(error));
             }
+            // Approved, claimed after the window: its own signed reason,
+            // distinct from a window that closed without a decision.
             let reason = match error {
                 PraetoreError::IntentInvalid
                 | PraetoreError::FreshnessCheckFailed(FreshnessError::Expired) => {
-                    NotDispatchedReason::ApprovalExpired
+                    NotDispatchedReason::ApprovedClaimExpired
                 }
                 _ => NotDispatchedReason::DispatchFailed,
             };
             self.close_not_dispatched(record, reason)?;
             return Err(match reason {
-                NotDispatchedReason::ApprovalExpired => ApprovalError::Expired.into(),
+                NotDispatchedReason::ApprovedClaimExpired => ApprovalError::Expired.into(),
                 _ => GatewayError::Authorization(error),
             });
         }
@@ -1585,7 +1581,7 @@ impl Gateway {
                 action_digest: record.action_digest,
             }),
             Err(JournalError::ApprovalExpired) => {
-                self.close_not_dispatched(record, NotDispatchedReason::ApprovalExpired)?;
+                self.close_not_dispatched(record, NotDispatchedReason::ApprovedClaimExpired)?;
                 Err(ApprovalError::Expired.into())
             }
             Err(error) => Err(error.into()),
@@ -1627,14 +1623,13 @@ impl Gateway {
         };
         let execution_attestation =
             self.create_execution_attestation(&evidence, authorization, &outcome)?;
-        let execution = outcome.execution();
+        let execution = outcome.execution().journal_status();
         self.journal
             .record_terminal_attested(key, execution, outcome.output(), &execution_attestation)
             .map_err(|_| GatewayError::OutcomeNotRecorded(key))?;
         let receipt = Self::receipt(
             evidence,
             authorization,
-            execution,
             outcome.into_output(),
             execution_attestation,
         );
@@ -1710,28 +1705,42 @@ impl Gateway {
             })
     }
 
+    /// A held request with no decision, no expiration and no closing reason:
+    /// its receipt is the signed `awaiting_approval` (schema v5).
+    fn is_awaiting_approval(record: &ExecutionRecord) -> bool {
+        record.authorization == AuthorizationStatus::RequiresApproval
+            && record.execution == ExecutionStatus::NotDispatched
+            && record.human_approval.is_none()
+            && record.approval_expiration.is_none()
+            && Self::closed_reason(record).is_none()
+    }
+
     fn attest_record(&self, record: &mut ExecutionRecord) -> Result<GatewayReceipt, GatewayError> {
+        let awaiting = Self::is_awaiting_approval(record);
         if let Some(attestation) = &record.execution_attestation
-            && attestation.execution == record.execution
+            && attestation.execution.journal_status() == record.execution
+            // A held request signed before schema v5 (`not_dispatched`, no
+            // reason) is signed again as awaiting approval below.
+            && (attestation.execution == AttestedExecution::AwaitingApproval) == awaiting
         {
             attestation
                 .validate_binding(
                     &record.evidence,
                     record.authorization,
-                    record.execution,
+                    attestation.execution,
                     record.output.as_ref(),
                 )
                 .map_err(|_| GatewayError::Journal(JournalError::InvalidRecord))?;
             return Ok(Self::receipt(
                 record.evidence.clone(),
                 record.authorization,
-                record.execution,
                 record.output.clone(),
                 attestation.clone(),
             ));
         }
 
         let outcome = match (record.execution, record.output.clone()) {
+            (ExecutionStatus::NotDispatched, None) if awaiting => AttestedOutcome::AwaitingApproval,
             (ExecutionStatus::NotDispatched, None) => AttestedOutcome::NotDispatched(None),
             (ExecutionStatus::Executed, Some(output)) => AttestedOutcome::Executed(output),
             (ExecutionStatus::Confirmed, Some(output)) => AttestedOutcome::Confirmed(output),
@@ -1753,7 +1762,6 @@ impl Gateway {
         Ok(Self::receipt(
             record.evidence.clone(),
             record.authorization,
-            record.execution,
             record.output.clone(),
             attestation,
         ))
@@ -1766,7 +1774,7 @@ impl Gateway {
     ) -> Result<GatewayReceipt, GatewayError> {
         let attestation =
             self.create_execution_attestation(&record.evidence, record.authorization, &outcome)?;
-        let execution = outcome.execution();
+        let execution = outcome.execution().journal_status();
         let output = outcome.into_output();
         self.journal
             .record_terminal_attested(record.key, execution, output.as_ref(), &attestation)
@@ -1777,7 +1785,6 @@ impl Gateway {
         Ok(Self::receipt(
             record.evidence.clone(),
             record.authorization,
-            execution,
             output,
             attestation,
         ))
@@ -1843,7 +1850,6 @@ impl Gateway {
             // signed `dispatch_refused` attestation says so. Never left as
             // outcome_unknown, and a held approval closed this way can never
             // be approved (the agent must submit a new request).
-            let execution = ExecutionStatus::NotDispatched;
             let attestation = self.create_execution_attestation(
                 &evidence,
                 authorization,
@@ -1858,7 +1864,6 @@ impl Gateway {
                 receipt: Some(Box::new(Self::receipt(
                     evidence,
                     authorization,
-                    execution,
                     None,
                     attestation,
                 ))),
@@ -1867,20 +1872,19 @@ impl Gateway {
 
         if authorization != AuthorizationStatus::Allowed {
             let execution = ExecutionStatus::NotDispatched;
-            let attestation = self.create_execution_attestation(
-                &evidence,
-                authorization,
-                &AttestedOutcome::NotDispatched(None),
-            )?;
+            // A held request is signed as awaiting approval (schema v5): its
+            // receipt never states that the action was not dispatched. A
+            // denial is final and stays `not_dispatched`.
+            let outcome = if authorization == AuthorizationStatus::RequiresApproval {
+                AttestedOutcome::AwaitingApproval
+            } else {
+                AttestedOutcome::NotDispatched(None)
+            };
+            let attestation =
+                self.create_execution_attestation(&evidence, authorization, &outcome)?;
             self.journal
                 .record_attestation(key, execution, None, &attestation)?;
-            return Ok(Self::receipt(
-                evidence,
-                authorization,
-                execution,
-                None,
-                attestation,
-            ));
+            return Ok(Self::receipt(evidence, authorization, None, attestation));
         }
 
         self.journal.mark_dispatched(key)?;
@@ -1937,7 +1941,6 @@ impl Gateway {
                 return Ok(Self::receipt(
                     record.evidence,
                     record.authorization,
-                    record.execution,
                     None,
                     execution_attestation,
                 ));

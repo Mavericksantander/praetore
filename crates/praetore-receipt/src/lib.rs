@@ -1,5 +1,5 @@
 //! Gateway receipts and their signed execution attestations (schema v1 to
-//! v4), with the signing and verification logic they need.
+//! v5), with the signing and verification logic they need.
 //!
 //! This crate has no server dependencies so offline verifiers
 //! (`praetore-verify`, the Python bindings) can use it. `praetore-gateway`
@@ -45,17 +45,10 @@ pub enum AuthorizationStatus {
     Denied,
 }
 
-/// Gateway-side execution state. `Dispatched` means the gateway durably
-/// committed to invoking the adapter; it does not prove a remote system
-/// received a call.
-///
-/// Not every state a receipt can carry is final: see
-/// [`GatewayReceipt::non_final_reason`]. `NotDispatched` on a
-/// `requires_approval` receipt without a `not_dispatched_reason` is the
-/// receipt returned while the approval is pending (or one written before
-/// signed closing reasons existed), and `OutcomeUnknown` may later be
-/// resolved by reconciliation. Later receipts for the same request can
-/// record a different state.
+/// Gateway-side execution state of a journal row. `Dispatched` means the
+/// gateway durably committed to invoking the adapter; it does not prove a
+/// remote system received a call. What a signed attestation (and its
+/// receipt) states is an [`AttestedExecution`], a separate type.
 ///
 /// `ApprovedPendingDispatch` exists only for `RequiresApproval`: a human
 /// approved, and no dispatch has been claimed yet. Like `Authorized`, it is
@@ -73,6 +66,53 @@ pub enum ExecutionStatus {
     Failed,
 }
 
+/// The execution state a signed [`ExecutionAttestation`] and its
+/// [`GatewayReceipt`] state. A separate type from the journal row's
+/// [`ExecutionStatus`]: `AwaitingApproval` is only ever signed, never a row
+/// state (its row is `NotDispatched`), and the intermediate row states
+/// (`authorized`, `approved_pending_dispatch`, `dispatched`) are never
+/// signed.
+///
+/// Not every state is final: see [`GatewayReceipt::non_final_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestedExecution {
+    NotDispatched,
+    /// Schema v5: the receipt returned while a human approval is pending.
+    /// Not final: the request may still be approved and executed, so it
+    /// never states that the action was not dispatched.
+    AwaitingApproval,
+    Executed,
+    Confirmed,
+    OutcomeUnknown,
+    Failed,
+}
+
+impl AttestedExecution {
+    /// The journal row state this attestation belongs to.
+    pub fn journal_status(self) -> ExecutionStatus {
+        match self {
+            Self::NotDispatched | Self::AwaitingApproval => ExecutionStatus::NotDispatched,
+            Self::Executed => ExecutionStatus::Executed,
+            Self::Confirmed => ExecutionStatus::Confirmed,
+            Self::OutcomeUnknown => ExecutionStatus::OutcomeUnknown,
+            Self::Failed => ExecutionStatus::Failed,
+        }
+    }
+
+    /// The serialized name (`"awaiting_approval"`, ...).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotDispatched => "not_dispatched",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Executed => "executed",
+            Self::Confirmed => "confirmed",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 /// Why an execution was closed as `NotDispatched` without ever reaching the
 /// adapter. Signed into the closing [`ExecutionAttestation`]. All reasons
 /// require `requires_approval`, except [`NotDispatchedReason::DispatchRefused`],
@@ -80,9 +120,10 @@ pub enum ExecutionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotDispatchedReason {
-    /// The approval window closed before dispatch was claimed: either the
-    /// approval was never decided (the signed expiration receipt exists), or
-    /// it was approved and the claim came too late.
+    /// The approval window closed without a decision (the signed
+    /// expiration receipt exists). Receipts signed before
+    /// [`Self::ApprovedClaimExpired`] existed also used it for an approval
+    /// claimed too late.
     ApprovalExpired,
     /// A human rejected the approval. Terminal: never dispatched.
     ApprovalRejected,
@@ -93,6 +134,9 @@ pub enum NotDispatchedReason {
     /// The adapter refused the action before any effect (its preflight
     /// check). Terminal: a held approval closed this way cannot be approved.
     DispatchRefused,
+    /// A human approved, and the dispatch was claimed after the approval
+    /// window closed. Terminal: never dispatched.
+    ApprovedClaimExpired,
 }
 
 impl NotDispatchedReason {
@@ -101,9 +145,9 @@ impl NotDispatchedReason {
     pub fn applies_to(
         self,
         authorization: AuthorizationStatus,
-        execution: ExecutionStatus,
+        execution: AttestedExecution,
     ) -> bool {
-        execution == ExecutionStatus::NotDispatched
+        execution == AttestedExecution::NotDispatched
             && match self {
                 Self::DispatchRefused => matches!(
                     authorization,
@@ -228,6 +272,8 @@ impl TryFrom<RawExecutionFailure> for ExecutionFailure {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttestedOutcome {
     NotDispatched(Option<NotDispatchedReason>),
+    /// Schema v5, `requires_approval` only: the approval is pending.
+    AwaitingApproval,
     Executed(Value),
     Confirmed(Value),
     OutcomeUnknown,
@@ -235,13 +281,14 @@ pub enum AttestedOutcome {
 }
 
 impl AttestedOutcome {
-    pub fn execution(&self) -> ExecutionStatus {
+    pub fn execution(&self) -> AttestedExecution {
         match self {
-            Self::NotDispatched(_) => ExecutionStatus::NotDispatched,
-            Self::Executed(_) => ExecutionStatus::Executed,
-            Self::Confirmed(_) => ExecutionStatus::Confirmed,
-            Self::OutcomeUnknown => ExecutionStatus::OutcomeUnknown,
-            Self::Failed(_) => ExecutionStatus::Failed,
+            Self::NotDispatched(_) => AttestedExecution::NotDispatched,
+            Self::AwaitingApproval => AttestedExecution::AwaitingApproval,
+            Self::Executed(_) => AttestedExecution::Executed,
+            Self::Confirmed(_) => AttestedExecution::Confirmed,
+            Self::OutcomeUnknown => AttestedExecution::OutcomeUnknown,
+            Self::Failed(_) => AttestedExecution::Failed,
         }
     }
 
@@ -312,7 +359,7 @@ pub struct ExecutionAttestation {
     pub request_id: Uuid,
     pub agent_id: Uuid,
     pub authorization: AuthorizationStatus,
-    pub execution: ExecutionStatus,
+    pub execution: AttestedExecution,
     pub policy_digest: String,
     pub evidence_hash: String,
     pub action_digest: String,
@@ -339,7 +386,7 @@ struct ExecutionAttestationPayload<'a> {
     request_id: Uuid,
     agent_id: Uuid,
     authorization: AuthorizationStatus,
-    execution: ExecutionStatus,
+    execution: AttestedExecution,
     policy_digest: &'a str,
     evidence_hash: &'a str,
     action_digest: &'a str,
@@ -385,10 +432,16 @@ impl ExecutionAttestation {
         {
             return Err(ExecutionAttestationError::InvalidPayload);
         }
-        let schema_version = match (not_dispatched_reason, failure) {
-            (Some(_), _) => 3,
-            (None, Some(_)) => 4,
-            (None, None) => 2,
+        if execution == AttestedExecution::AwaitingApproval
+            && authorization != AuthorizationStatus::RequiresApproval
+        {
+            return Err(ExecutionAttestationError::InvalidPayload);
+        }
+        let schema_version = match (execution, not_dispatched_reason, failure) {
+            (AttestedExecution::AwaitingApproval, _, _) => 5,
+            (_, Some(_), _) => 3,
+            (_, None, Some(_)) => 4,
+            (_, None, None) => 2,
         };
         if !evidence.verify_integrity()
             || !evidence.is_high_assurance_shape()
@@ -462,7 +515,7 @@ impl ExecutionAttestation {
         &self,
         evidence: &Evidence,
         authorization: AuthorizationStatus,
-        execution: ExecutionStatus,
+        execution: AttestedExecution,
         output: Option<&Value>,
         public_key: &praetore_core::VerifiedPublicKey,
         expected_key_id: &str,
@@ -501,7 +554,7 @@ impl ExecutionAttestation {
         &self,
         evidence: &Evidence,
         authorization: AuthorizationStatus,
-        execution: ExecutionStatus,
+        execution: AttestedExecution,
         output: Option<&Value>,
     ) -> Result<(), ExecutionAttestationError> {
         // A failure classification exists only on v4, and v4 only for
@@ -518,7 +571,9 @@ impl ExecutionAttestation {
                 | (2, Some(_), None, None)
                 | (3, Some(_), Some(_), None)
                 | (4, Some(_), None, Some(_))
-        ) || self.failure.is_some() && execution != ExecutionStatus::Failed
+                | (5, Some(_), None, None)
+        ) || (self.schema_version == 5) != (execution == AttestedExecution::AwaitingApproval)
+            || self.failure.is_some() && execution != AttestedExecution::Failed
             || self.schema_version >= 2
                 && self.tenant_id != authority_tenant_id(&evidence.authority)
             || self
@@ -534,26 +589,13 @@ impl ExecutionAttestation {
             || self.evidence_hash != evidence.context_hash
             || !evidence.verify_integrity()
             || authorization == AuthorizationStatus::Denied
-                && execution != ExecutionStatus::NotDispatched
-            || authorization == AuthorizationStatus::RequiresApproval
-                && !matches!(
-                    execution,
-                    ExecutionStatus::NotDispatched
-                        | ExecutionStatus::Executed
-                        | ExecutionStatus::Confirmed
-                        | ExecutionStatus::OutcomeUnknown
-                        | ExecutionStatus::Failed
-                )
-            || matches!(
-                execution,
-                ExecutionStatus::Authorized
-                    | ExecutionStatus::ApprovedPendingDispatch
-                    | ExecutionStatus::Dispatched
-            )
+                && execution != AttestedExecution::NotDispatched
+            || execution == AttestedExecution::AwaitingApproval
+                && authorization != AuthorizationStatus::RequiresApproval
             || output.is_some()
                 != matches!(
                     execution,
-                    ExecutionStatus::Executed | ExecutionStatus::Confirmed
+                    AttestedExecution::Executed | AttestedExecution::Confirmed
                 )
             || self.key_id.is_empty()
             || self.key_id.len() > 256
@@ -610,7 +652,7 @@ fn output_digest(output: &Value) -> Result<String, ExecutionAttestationError> {
 pub struct GatewayReceipt {
     pub evidence: Evidence,
     pub authorization: AuthorizationStatus,
-    pub execution: ExecutionStatus,
+    pub execution: AttestedExecution,
     /// Adapter output of an executed or confirmed action. JSON `null` is
     /// read as `None`, so the serialized form cannot tell "no output" from
     /// an adapter that returned `null`; verification resolves this from the
@@ -621,9 +663,12 @@ pub struct GatewayReceipt {
 
 /// Why a receipt does not describe a final state of its request. Returned
 /// by [`GatewayReceipt::non_final_reason`]. Read from the signed
-/// attestation; the signed format is unchanged.
+/// attestation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NonFinalReason {
+    /// `awaiting_approval` (schema v5): the gateway signed that a human
+    /// approval is pending. The request may still be approved and executed.
+    AwaitingApproval,
     /// `requires_approval`, `not_dispatched`, no `not_dispatched_reason`:
     /// the receipt returned while a human approval is pending. Receipts
     /// written before signed closing reasons (`approval_rejected`,
@@ -634,9 +679,6 @@ pub enum NonFinalReason {
     /// `outcome_unknown`: reconciliation may later record `executed`,
     /// `confirmed` or `failed`.
     OutcomeUnknown,
-    /// `authorized`, `approved_pending_dispatch` or `dispatched`:
-    /// intermediate states that a verified receipt never carries.
-    Intermediate,
 }
 
 impl NonFinalReason {
@@ -644,9 +686,9 @@ impl NonFinalReason {
     /// receipt` and of the Python binding.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AwaitingApproval => "awaiting_approval",
             Self::AwaitingApprovalOrLegacy => "awaiting_approval_or_legacy",
             Self::OutcomeUnknown => "outcome_unknown",
-            Self::Intermediate => "intermediate",
         }
     }
 }
@@ -660,17 +702,15 @@ impl GatewayReceipt {
     pub fn non_final_reason(&self) -> Option<NonFinalReason> {
         let attestation = &self.execution_attestation;
         match attestation.execution {
-            ExecutionStatus::NotDispatched => (attestation.authorization
+            AttestedExecution::AwaitingApproval => Some(NonFinalReason::AwaitingApproval),
+            AttestedExecution::NotDispatched => (attestation.authorization
                 == AuthorizationStatus::RequiresApproval
                 && attestation.not_dispatched_reason.is_none())
             .then_some(NonFinalReason::AwaitingApprovalOrLegacy),
-            ExecutionStatus::OutcomeUnknown => Some(NonFinalReason::OutcomeUnknown),
-            ExecutionStatus::Authorized
-            | ExecutionStatus::ApprovedPendingDispatch
-            | ExecutionStatus::Dispatched => Some(NonFinalReason::Intermediate),
-            ExecutionStatus::Executed | ExecutionStatus::Confirmed | ExecutionStatus::Failed => {
-                None
-            }
+            AttestedExecution::OutcomeUnknown => Some(NonFinalReason::OutcomeUnknown),
+            AttestedExecution::Executed
+            | AttestedExecution::Confirmed
+            | AttestedExecution::Failed => None,
         }
     }
 
@@ -698,7 +738,9 @@ impl GatewayReceipt {
         // action always has an output, so there it is the JSON value `null`,
         // whose digest the attestation signs; elsewhere it means no output.
         let output = match (&self.output, self.execution) {
-            (None, ExecutionStatus::Executed | ExecutionStatus::Confirmed) => Some(&Value::Null),
+            (None, AttestedExecution::Executed | AttestedExecution::Confirmed) => {
+                Some(&Value::Null)
+            }
             (output, _) => output.as_ref(),
         };
         self.execution_attestation.verify(
@@ -727,7 +769,7 @@ impl GatewayReceipt {
 }
 
 /// Parses a serialized [`GatewayReceipt`], verifies its execution
-/// attestation (schema v1 to v4) against a pinned execution key, and
+/// attestation (schema v1 to v5) against a pinned execution key, and
 /// verifies the evidence `attester_signature` against a pinned evidence
 /// attester key. A missing, malformed or foreign evidence signature fails
 /// with [`ExecutionAttestationError::InvalidEvidenceSignature`].

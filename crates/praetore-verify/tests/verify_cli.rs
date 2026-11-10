@@ -604,9 +604,15 @@ fn run_receipt_with(receipt: &Path, extra: &[&str]) -> Output {
     run(&args)
 }
 
-/// T-015 finding 1 (option A): every committed receipt, with the finality
-/// the verifier reports for it.
-const FINALITY: [(&str, bool, Option<&str>); 6] = [
+/// T-015 and T-016 (finding 1): every committed receipt, with the
+/// finality the verifier reports for it.
+const FINALITY: [(&str, bool, Option<&str>); 8] = [
+    (
+        "receipt-v5-awaiting-approval.json",
+        false,
+        Some("awaiting_approval"),
+    ),
+    ("receipt-v3-approved-claim-expired.json", true, None),
     (
         "receipt-v2-awaiting-approval.json",
         false,
@@ -640,13 +646,27 @@ fn receipt_command_reports_whether_the_signed_state_is_final() {
             "{name}"
         );
     }
-    // The 202 receipt reads `not_dispatched` with no reason: only `final`
+    // The 202 receipt written before schema v5 reads `not_dispatched` with
+    // no reason: only `final`
     // tells it apart from a closed request.
     let summary = json_output(&run_receipt(&receipt_fixture(
         "receipt-v2-awaiting-approval.json",
     )));
     assert_eq!(summary["details"]["execution"], "not_dispatched");
     assert_eq!(summary["details"]["not_dispatched_reason"], Value::Null);
+    // Since schema v5 the 202 receipt names its own state.
+    let summary = json_output(&run_receipt(&receipt_fixture(
+        "receipt-v5-awaiting-approval.json",
+    )));
+    assert_eq!(summary["details"]["execution"], "awaiting_approval");
+    assert_eq!(summary["details"]["schema_version"], 5);
+    let summary = json_output(&run_receipt(&receipt_fixture(
+        "receipt-v3-approved-claim-expired.json",
+    )));
+    assert_eq!(
+        summary["details"]["not_dispatched_reason"],
+        "approved_claim_expired"
+    );
 }
 
 #[test]

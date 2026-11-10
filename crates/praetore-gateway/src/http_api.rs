@@ -632,7 +632,7 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
         AuthorizationStatus::RequiresApproval => StatusCode::ACCEPTED,
         AuthorizationStatus::Denied => StatusCode::FORBIDDEN,
     };
-    let execution = receipt.execution;
+    let execution = receipt.execution.journal_status();
     if receipt.authorization == AuthorizationStatus::Denied {
         // Every DENY gets the same body, whether a policy rule, an engine
         // guard or an undeclared action type decided it: the client cannot
@@ -642,7 +642,7 @@ async fn execute(State(state): State<ApiState>, headers: HeaderMap, body: Bytes)
         let body = DeniedResponse {
             code: "authorization_denied",
             authorization: receipt.authorization,
-            execution,
+            execution: receipt.execution,
             evidence_id: receipt.evidence.evidence_id,
             request_id: receipt.evidence.request_id,
         };
@@ -686,7 +686,7 @@ fn reserved_safety_action(json: &str) -> Option<ReservedSafetyAction> {
 struct DeniedResponse {
     code: &'static str,
     authorization: AuthorizationStatus,
-    execution: crate::ExecutionStatus,
+    execution: crate::AttestedExecution,
     evidence_id: uuid::Uuid,
     request_id: uuid::Uuid,
 }
@@ -794,7 +794,7 @@ async fn dispatch_approved(
     };
     match tokio::task::spawn_blocking(move || gateway.dispatch_approved(key)).await {
         Ok(Ok(receipt)) => {
-            let execution = receipt.execution;
+            let execution = receipt.execution.journal_status();
             with_executed_by(
                 options,
                 execution,

@@ -248,10 +248,17 @@ fn rejects_v2_relabelled_as_v1_even_without_tenant() {
 /// Re-signs the v2 confirmed fixture with a fresh key after `edit`, and
 /// returns the receipt JSON plus the new public key.
 fn resigned(edit: impl FnOnce(&mut serde_json::Value)) -> (String, VerifiedPublicKey) {
+    resigned_from("receipt-v2-confirmed.json", edit)
+}
+
+/// Re-signs the fixture `name` with a fresh key after `edit`.
+fn resigned_from(
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> (String, VerifiedPublicKey) {
     use ed25519_dalek::Signer;
 
-    let mut receipt: serde_json::Value =
-        serde_json::from_str(&fixture("receipt-v2-confirmed.json")).unwrap();
+    let mut receipt: serde_json::Value = serde_json::from_str(&fixture(name)).unwrap();
     edit(&mut receipt);
     let attestation = receipt["execution_attestation"].as_object_mut().unwrap();
     attestation.remove("signature");
@@ -665,14 +672,14 @@ fn failure_classification_parsing_is_strict() {
     }
 }
 
-/// T-015 finding 1 (option A): `non_final_reason` over every combination of
-/// signed authorization, execution and reason, including ones a verified
-/// receipt never carries. Only the pending approval shape and
-/// `outcome_unknown` (plus the intermediate states) are not final.
+/// T-015 and T-016 (finding 1): `non_final_reason` over every combination of signed
+/// authorization, execution and reason, including ones a verified receipt
+/// never carries. Only `awaiting_approval` (v5), the older pending shape
+/// and `outcome_unknown` are not final.
 #[test]
 fn non_final_reason_covers_every_signed_state() {
     use praetore_receipt::{
-        AuthorizationStatus as A, ExecutionStatus as E, NonFinalReason as N,
+        AttestedExecution as E, AuthorizationStatus as A, NonFinalReason as N,
         NotDispatchedReason as R,
     };
     let mut receipt: GatewayReceipt =
@@ -684,12 +691,11 @@ fn non_final_reason_covers_every_signed_state() {
         Some(R::DispatchFailed),
         Some(R::CrashRecovered),
         Some(R::DispatchRefused),
+        Some(R::ApprovedClaimExpired),
     ];
     let executions = [
         E::NotDispatched,
-        E::Authorized,
-        E::ApprovedPendingDispatch,
-        E::Dispatched,
+        E::AwaitingApproval,
         E::Executed,
         E::Confirmed,
         E::OutcomeUnknown,
@@ -703,13 +709,11 @@ fn non_final_reason_covers_every_signed_state() {
                 receipt.execution_attestation.execution = execution;
                 receipt.execution_attestation.not_dispatched_reason = reason;
                 let expected = match (authorization, execution, reason) {
+                    (_, E::AwaitingApproval, _) => Some(N::AwaitingApproval),
                     (A::RequiresApproval, E::NotDispatched, None) => {
                         Some(N::AwaitingApprovalOrLegacy)
                     }
                     (_, E::OutcomeUnknown, _) => Some(N::OutcomeUnknown),
-                    (_, E::Authorized | E::ApprovedPendingDispatch | E::Dispatched, _) => {
-                        Some(N::Intermediate)
-                    }
                     _ => None,
                 };
                 let case = format!("{authorization:?} {execution:?} {reason:?}");
@@ -719,14 +723,14 @@ fn non_final_reason_covers_every_signed_state() {
             }
         }
     }
-    // 1 pending shape, 3 x 6 outcome_unknown, 3 x 3 x 6 intermediate.
-    assert_eq!(not_final, 1 + 18 + 54);
+    // 3 x 7 awaiting_approval, 1 older pending shape, 3 x 7 outcome_unknown.
+    assert_eq!(not_final, 21 + 1 + 21);
+    assert_eq!(N::AwaitingApproval.as_str(), "awaiting_approval");
     assert_eq!(
         N::AwaitingApprovalOrLegacy.as_str(),
         "awaiting_approval_or_legacy"
     );
     assert_eq!(N::OutcomeUnknown.as_str(), "outcome_unknown");
-    assert_eq!(N::Intermediate.as_str(), "intermediate");
 }
 
 /// The committed finality fixtures verify, and only the pending approval
@@ -734,6 +738,8 @@ fn non_final_reason_covers_every_signed_state() {
 #[test]
 fn committed_receipts_report_their_finality() {
     for (name, is_final) in [
+        ("receipt-v5-awaiting-approval.json", false),
+        ("receipt-v3-approved-claim-expired.json", true),
         ("receipt-v2-awaiting-approval.json", false),
         ("receipt-v2-outcome-unknown.json", false),
         ("receipt-v3-approval-rejected.json", true),
@@ -746,4 +752,132 @@ fn committed_receipts_report_their_finality() {
             verify_gateway_receipt_json(&fixture(name), &key(), KEY_ID, &evidence_key()).unwrap();
         assert_eq!(receipt.is_final(), is_final, "{name}");
     }
+}
+
+/// T-016 (finding 1, option B): the 202 receipt of a held request is signed
+/// as schema v5 `awaiting_approval`, verifies, and is never final.
+#[test]
+fn accepts_the_v5_awaiting_approval_receipt_as_not_final() {
+    use praetore_receipt::{AttestedExecution, AuthorizationStatus, NonFinalReason};
+    let receipt = verify_gateway_receipt_json(
+        &fixture("receipt-v5-awaiting-approval.json"),
+        &key(),
+        KEY_ID,
+        &evidence_key(),
+    )
+    .unwrap();
+    assert_eq!(receipt.execution_attestation.schema_version, 5);
+    assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+    assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
+    assert_eq!(receipt.output, None);
+    assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
+    assert_eq!(receipt.execution_attestation.failure, None);
+    assert_eq!(
+        receipt.non_final_reason(),
+        Some(NonFinalReason::AwaitingApproval)
+    );
+    assert!(!receipt.is_final());
+}
+
+/// T-016 (finding 1, option B): schema v5 carries exactly one shape. A
+/// signed v5 receipt with a reason, an output, a failure or another
+/// authorization, `awaiting_approval` under another schema, or v5 under
+/// another state is refused even with a valid signature.
+#[test]
+fn rejects_every_other_v5_shape_even_when_signed() {
+    let v5 = "receipt-v5-awaiting-approval.json";
+    let mut cases: Vec<(&str, Box<dyn FnOnce(&mut serde_json::Value)>)> = Vec::new();
+    for reason in [
+        "approval_expired",
+        "approval_rejected",
+        "dispatch_failed",
+        "crash_recovered",
+        "dispatch_refused",
+        "approved_claim_expired",
+    ] {
+        cases.push((
+            "reason",
+            Box::new(move |receipt| {
+                receipt["execution_attestation"]["not_dispatched_reason"] = reason.into();
+            }),
+        ));
+    }
+    cases.push((
+        "output",
+        Box::new(|receipt| {
+            receipt["output"] = serde_json::Value::Null;
+            receipt["execution_attestation"]["output_digest"] = null_output_digest().into();
+        }),
+    ));
+    for failure in [
+        serde_json::json!({"class": "effect_failed"}),
+        serde_json::json!({"class": "no_effect", "reason": "test_refused"}),
+    ] {
+        cases.push((
+            "failure",
+            Box::new(move |receipt| {
+                receipt["execution_attestation"]["failure"] = failure;
+            }),
+        ));
+    }
+    for authorization in ["allowed", "denied"] {
+        cases.push((
+            "authorization",
+            Box::new(move |receipt| {
+                receipt["authorization"] = authorization.into();
+                receipt["execution_attestation"]["authorization"] = authorization.into();
+            }),
+        ));
+    }
+    for schema in [1, 2, 3, 4] {
+        cases.push((
+            "older schema",
+            Box::new(move |receipt| {
+                receipt["execution_attestation"]["schema_version"] = schema.into();
+            }),
+        ));
+    }
+    for (execution, schema) in [("not_dispatched", 5), ("executed", 5)] {
+        cases.push((
+            "other state under v5",
+            Box::new(move |receipt| {
+                receipt["execution"] = execution.into();
+                receipt["execution_attestation"]["execution"] = execution.into();
+                receipt["execution_attestation"]["schema_version"] = schema.into();
+            }),
+        ));
+    }
+    for (name, edit) in cases {
+        let (json, public) = resigned_from(v5, edit);
+        assert_eq!(
+            verify_gateway_receipt_json(&json, &public, KEY_ID, &evidence_key()).map(|_| ()),
+            Err(ExecutionAttestationError::InvalidPayload),
+            "{name}: {json}"
+        );
+    }
+    // The unchanged receipt, re-signed the same way, verifies: the refusals
+    // above come from the shape, not from the re-signing.
+    let (json, public) = resigned_from(v5, |_| {});
+    assert!(verify_gateway_receipt_json(&json, &public, KEY_ID, &evidence_key()).is_ok());
+}
+
+/// T-016 (finding 15): an approval claimed after its window is closed with
+/// the signed reason `approved_claim_expired` (schema v3), and is final.
+#[test]
+fn accepts_the_approved_claim_expired_close_as_final() {
+    use praetore_receipt::{AttestedExecution, NotDispatchedReason};
+    let receipt = verify_gateway_receipt_json(
+        &fixture("receipt-v3-approved-claim-expired.json"),
+        &key(),
+        KEY_ID,
+        &evidence_key(),
+    )
+    .unwrap();
+    assert_eq!(receipt.execution_attestation.schema_version, 3);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
+    assert_eq!(
+        receipt.execution_attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovedClaimExpired)
+    );
+    assert!(receipt.is_final());
 }

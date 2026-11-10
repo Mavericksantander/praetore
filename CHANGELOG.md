@@ -38,6 +38,51 @@
   line over 32 MiB, is refused in both modes. Other unparseable lines are
   still forwarded in observe, now with a warning that gives the SHA-256 and
   the length.
+- **The receipt of a held approval is signed as `awaiting_approval`
+  (T-016, schema v5).** The 202 response of a request that requires human
+  approval now carries `execution: "awaiting_approval"` (before:
+  `"not_dispatched"` with no reason), signed in execution attestation
+  schema v5. Schema v5 has exactly one shape: `requires_approval`, no
+  reason, no output, no failure. A saved 202 receipt keeps verifying as
+  `awaiting_approval` with `final: false` after the request was approved
+  and executed; it can no longer be read as a closed `not_dispatched`
+  request. `awaiting_approval` is a signed receipt state only, never a
+  journal state: `GatewayReceipt::execution` and
+  `ExecutionAttestation::execution` are now `AttestedExecution`
+  (`ExecutionStatus` remains the journal row state, and
+  `AttestedExecution::journal_status()` maps between them).
+  `NonFinalReason` gains `AwaitingApproval` and loses `Intermediate` (no
+  signed receipt carries an intermediate state). Action: HTTP clients that
+  match on the 202 `execution` field accept `awaiting_approval`; offline
+  verifiers are upgraded together with the gateway (see the table below).
+- **An approval claimed after its window closes as
+  `approved_claim_expired` (T-016).** New signed `not_dispatched_reason`
+  (schema v3) for an approved request whose single dispatch is claimed too
+  late. `approval_expired` now means only that the window closed without a
+  decision. Rows closed before this release keep `approval_expired`.
+- **Migration 0022 (`0022_awaiting_approval_state`).** Admits
+  `awaiting_approval` in `execution_attestations` (accepted only while the
+  journal row is held: `requires_approval`, `not_dispatched`, no reason, no
+  decision, no expiration receipt, schema v5), adds `approved_claim_expired`
+  to both reason vocabularies, and refuses a new `approval_expired` close of
+  `approved_pending_dispatch` and an `approved_claim_expired` close without
+  an approve decision. No row is rewritten; a held row written before 0022
+  gets an `awaiting_approval` attestation in addition when the gateway next
+  reads it. Manual rollback: `docs/rollback/0022-awaiting-approval-state.sql`,
+  refused while any `awaiting_approval` or `approved_claim_expired` row
+  exists (in practice, once a request was held under 0022).
+
+  | | praetore-verify / Python binding <= 0.3.3 | This release |
+  |---|---|---|
+  | Receipts v1 to v4 | verify | verify as before; pending v2 receipts and `outcome_unknown` report `final: false` |
+  | Receipt v5 (`awaiting_approval`) | rejected (`RECEIPT_INVALID`, `False`) | verifies, `final: false`, `non_final_reason: awaiting_approval` |
+  | Reason `approved_claim_expired` | rejected (`RECEIPT_INVALID`, `False`) | verifies, final |
+  | Database at 0021 | runs | `praetore migrate` applies 0022 |
+  | Database at 0022 | refused (newer schema) | runs |
+  | Rollback of 0022 | n/a | only while no `awaiting_approval` or `approved_claim_expired` row exists |
+
+  Older verifiers fail closed: they never accept a new receipt with another
+  meaning.
 
 ### Added
 
