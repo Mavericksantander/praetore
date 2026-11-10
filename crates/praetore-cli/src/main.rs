@@ -1718,6 +1718,7 @@ fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
@@ -2587,6 +2588,109 @@ mod tests {
             fs::read_dir(&self.outside).unwrap().count() == 1
                 && fs::read_to_string(self.outside.join("victim.txt")).unwrap() == "original"
         }
+
+        /// Submits `fs:delete_file` for `path` (held for approval by the
+        /// fixture policy) and returns the key of the signed, held request.
+        fn hold_delete(&self, gateway: &Gateway, path: &str) -> praetore_gateway::ExecutionKey {
+            let receipt = gateway.execute(self.delete(path)).unwrap();
+            assert_eq!(
+                receipt.execution,
+                praetore_gateway::ExecutionStatus::NotDispatched
+            );
+            self.verify(&receipt);
+            praetore_gateway::ExecutionKey {
+                tenant_id: self.config.tenant_id,
+                agent_id: *receipt.evidence.agent.id.as_uuid(),
+                request_id: receipt.evidence.request_id,
+            }
+        }
+
+        fn delete(&self, path: &str) -> AuthorizationRequest {
+            self.request(
+                "fs:delete_file",
+                "fs:delete",
+                "sandbox",
+                serde_json::json!({"path": path}),
+            )
+        }
+
+        /// `not_dispatched_reason` of the journal row, as persisted.
+        fn journal_reason(&self, request_id: Uuid) -> Option<String> {
+            let mut client = connect_local_database(&self.database_url).unwrap();
+            let mut transaction = client.transaction().unwrap();
+            transaction
+                .query_one(
+                    "SELECT set_config('praetore.tenant_id', $1, true)",
+                    &[&self.config.tenant_id.to_string()],
+                )
+                .unwrap();
+            let row = transaction
+                .query_one(
+                    "SELECT not_dispatched_reason FROM praetore.execution_journal \
+                     WHERE tenant_id = $1 AND request_id = $2",
+                    &[&self.config.tenant_id, &request_id],
+                )
+                .unwrap();
+            let reason = row.get(0);
+            transaction.commit().unwrap();
+            reason
+        }
+
+        /// Rows of `table` (keyed by request_id) for this tenant.
+        fn rows_for_request(&self, table: &str, request_id: Uuid) -> i64 {
+            let mut client = connect_local_database(&self.database_url).unwrap();
+            let mut transaction = client.transaction().unwrap();
+            transaction
+                .query_one(
+                    "SELECT set_config('praetore.tenant_id', $1, true)",
+                    &[&self.config.tenant_id.to_string()],
+                )
+                .unwrap();
+            let count = transaction
+                .query_one(
+                    &format!(
+                        "SELECT count(*) FROM {table} WHERE tenant_id = $1 AND request_id = $2"
+                    ),
+                    &[&self.config.tenant_id, &request_id],
+                )
+                .unwrap()
+                .get(0);
+            transaction.commit().unwrap();
+            count
+        }
+
+        /// Every entry under the sandbox root and the outside directory, not
+        /// following links: path -> (kind, inode, content or link target).
+        fn tree(&self) -> BTreeMap<PathBuf, (&'static str, u64, Vec<u8>)> {
+            fn walk(dir: &Path, entries: &mut BTreeMap<PathBuf, (&'static str, u64, Vec<u8>)>) {
+                use std::os::unix::fs::MetadataExt;
+                for entry in fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    let kind = metadata.file_type();
+                    let value = if kind.is_symlink() {
+                        (
+                            "symlink",
+                            metadata.ino(),
+                            fs::read_link(&path)
+                                .unwrap()
+                                .into_os_string()
+                                .into_encoded_bytes(),
+                        )
+                    } else if kind.is_dir() {
+                        walk(&path, entries);
+                        ("dir", metadata.ino(), Vec::new())
+                    } else {
+                        ("file", metadata.ino(), fs::read(&path).unwrap())
+                    };
+                    entries.insert(path, value);
+                }
+            }
+            let mut entries = BTreeMap::new();
+            walk(&self.root, &mut entries);
+            walk(&self.outside, &mut entries);
+            entries
+        }
     }
 
     fn refused_key(error: praetore_gateway::GatewayError) -> (Uuid, &'static str) {
@@ -2925,73 +3029,6 @@ mod tests {
         }
         assert!(!fx.root.join("pwned").exists());
 
-        // A file swapped for a symlink while held is refused at approval
-        // time, and the refusal is final: closed with the signed reason
-        // dispatch_refused, never approvable again (see
-        // postgres_t013b_challenge_refusal_is_final_even_if_the_file_returns).
-        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
-        fs::write(fx.root.join("swap.txt"), "x").unwrap();
-        let key = held("swap.txt");
-        fs::remove_file(fx.root.join("swap.txt")).unwrap();
-        symlink(fx.outside.join("victim.txt"), fx.root.join("swap.txt")).unwrap();
-        let challenge = gateway.approval_challenge(key);
-        assert!(matches!(
-            challenge,
-            Err(praetore_gateway::GatewayError::DispatchRefused {
-                transient: false,
-                receipt: Some(_),
-                ..
-            })
-        ));
-        assert!(fx.outside_untouched());
-        assert_eq!(
-            fx.journal(key.request_id),
-            ("requires_approval".into(), "not_dispatched".into())
-        );
-        assert_eq!(
-            gateway.approval_state(key).unwrap().not_dispatched_reason,
-            Some(NotDispatchedReason::DispatchRefused)
-        );
-        assert!(matches!(
-            gateway.approval_challenge(key),
-            Err(praetore_gateway::GatewayError::Approval(
-                praetore_gateway::ApprovalError::NotPending
-            ))
-        ));
-
-        // A file swapped for a symlink AFTER approval is refused at the
-        // dispatch claim (after the approval is re-verified) and closed as
-        // not_dispatched with a signed reason; the outside file is intact.
-        fs::write(fx.root.join("late.txt"), "x").unwrap();
-        let key = held("late.txt");
-        let decision = sign_decision(
-            gateway.approval_challenge(key).unwrap(),
-            LOCAL_APPROVER_ID,
-            HumanApprovalOutcome::Approve,
-            &approver,
-        )
-        .unwrap();
-        gateway.resolve_human_approval(decision).unwrap();
-        fs::remove_file(fx.root.join("late.txt")).unwrap();
-        symlink(fx.outside.join("victim.txt"), fx.root.join("late.txt")).unwrap();
-        let (_, reason) = refused_key(gateway.dispatch_approved(key).unwrap_err());
-        assert_eq!(reason, "symlink_not_allowed");
-        assert_eq!(
-            fx.journal(key.request_id),
-            ("requires_approval".into(), "not_dispatched".into())
-        );
-        assert_eq!(
-            gateway.approval_state(key).unwrap().not_dispatched_reason,
-            Some(NotDispatchedReason::DispatchRefused)
-        );
-        assert!(fx.outside_untouched());
-        assert!(
-            fs::symlink_metadata(fx.root.join("late.txt"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-
         println!("journal counts: {counts:?}");
         assert!(
             fx.journal_counts()
@@ -3266,18 +3303,725 @@ mod tests {
         );
     }
 
+    /// The CLI's local HTTP API (what `praetore run` serves) over the
+    /// fixture's gateway and real PostgreSQL, for the end-to-end tests that
+    /// assert the HTTP status. Requests carry the gateway exec-mode header,
+    /// like `praetore demo`.
+    struct HttpSandbox {
+        runtime: Option<tokio::runtime::Runtime>,
+        // Dropped after the runtime is shut down: the Postgres clients must
+        // not be dropped inside tokio.
+        _gateway: Arc<Gateway>,
+        client: reqwest::blocking::Client,
+        base: String,
+        agent_token: String,
+        approver_token: String,
+    }
+
+    impl Drop for HttpSandbox {
+        fn drop(&mut self) {
+            if let Some(runtime) = self.runtime.take() {
+                runtime.shutdown_timeout(StdDuration::from_secs(2));
+            }
+        }
+    }
+
+    impl HttpSandbox {
+        fn start(fx: &SandboxFixture) -> Self {
+            let gateway = Arc::new(fx.gateway());
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let port = fx.config.port;
+            let options = http_options(&fx.config);
+            assert!(options.gateway_executes_effects);
+            let auth = local_api_auth(&fx.directory, &fx.config).unwrap();
+            let served = Arc::clone(&gateway);
+            runtime.spawn(async move {
+                let _ = http_api::serve_local_with_options(port, served, auth, options).await;
+            });
+            let client = http_client().unwrap();
+            let base = format!("http://127.0.0.1:{port}");
+            let up = (0..100).any(|_| {
+                let ok = client.get(format!("{base}/healthz")).send().is_ok();
+                if !ok {
+                    std::thread::sleep(StdDuration::from_millis(50));
+                }
+                ok
+            });
+            assert!(up, "gateway did not start");
+            Self {
+                runtime: Some(runtime),
+                _gateway: gateway,
+                client,
+                base,
+                agent_token: read_api_token(&fx.directory, AGENT_TOKEN_FILE).unwrap(),
+                approver_token: read_api_token(&fx.directory, APPROVER_TOKEN_FILE).unwrap(),
+            }
+        }
+
+        fn execute(&self, request: &AuthorizationRequest) -> (u16, serde_json::Value) {
+            let response = self
+                .client
+                .post(format!("{}/v1/execute", self.base))
+                .bearer_auth(&self.agent_token)
+                .json(request)
+                .send()
+                .unwrap();
+            let status = response.status().as_u16();
+            (status, response.json().unwrap())
+        }
+
+        fn approval_path(
+            &self,
+            fx: &SandboxFixture,
+            receipt: &praetore_gateway::GatewayReceipt,
+        ) -> String {
+            format!(
+                "{}/v1/approvals/{}/{}/{}",
+                self.base,
+                fx.config.tenant_id,
+                receipt.evidence.agent.id.as_uuid(),
+                receipt.evidence.request_id
+            )
+        }
+    }
+
+    /// Submits `request` over HTTP and checks the explicit refusal before
+    /// any effect: 403 `action_not_dispatchable` with `reason`, a signed
+    /// `not_dispatched` / `dispatch_refused` receipt that verifies, the
+    /// journal row closed as (`authorization`, `not_dispatched`,
+    /// `dispatch_refused`), and no change at all under the sandbox root or
+    /// in the outside directory.
+    fn assert_http_refused(
+        fx: &SandboxFixture,
+        http: &HttpSandbox,
+        request: &AuthorizationRequest,
+        reason: &str,
+        authorization: &str,
+        label: &str,
+    ) {
+        let before = fx.tree();
+        let (status, body) = http.execute(request);
+        assert_eq!(status, 403, "{label}: {body}");
+        assert_eq!(body["code"], "action_not_dispatchable", "{label}");
+        assert_eq!(body["reason"], reason, "{label}");
+        let receipt: praetore_gateway::GatewayReceipt =
+            serde_json::from_value(body["receipt"].clone()).unwrap();
+        assert_eq!(
+            receipt.execution,
+            praetore_gateway::ExecutionStatus::NotDispatched,
+            "{label}"
+        );
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(praetore_gateway::NotDispatchedReason::DispatchRefused),
+            "{label}"
+        );
+        fx.verify(&receipt);
+        let request_id = receipt.evidence.request_id;
+        assert_eq!(
+            fx.journal(request_id),
+            (authorization.into(), "not_dispatched".into()),
+            "{label}"
+        );
+        assert_eq!(
+            fx.journal_reason(request_id).as_deref(),
+            Some("dispatch_refused"),
+            "{label}"
+        );
+        assert_eq!(fx.tree(), before, "{label}: the filesystem changed");
+    }
+
+    /// Refuses `path` for both allowlisted actions: the write is allowed by
+    /// policy, the delete is held for approval; both are refused at
+    /// submission.
+    fn assert_write_and_delete_refused(
+        fx: &SandboxFixture,
+        http: &HttpSandbox,
+        path: &str,
+        reason: &str,
+    ) {
+        assert_http_refused(
+            fx,
+            http,
+            &fx.write(path, "pwned"),
+            reason,
+            "allowed",
+            &format!("write {path:?}"),
+        );
+        assert_http_refused(
+            fx,
+            http,
+            &fx.delete(path),
+            reason,
+            "requires_approval",
+            &format!("delete {path:?}"),
+        );
+    }
+
+    fn assert_no_outcome_unknown(fx: &SandboxFixture, refused: i64) {
+        let counts = fx.journal_counts();
+        println!("journal counts: {counts:?}");
+        assert!(
+            counts
+                .iter()
+                .all(|(_, execution, _)| execution != "outcome_unknown")
+        );
+        assert_eq!(
+            counts,
+            vec![
+                ("allowed".into(), "not_dispatched".into(), refused),
+                ("requires_approval".into(), "not_dispatched".into(), refused),
+            ]
+        );
+    }
+
+    /// A file that must stay as it is, created next to the sandbox root
+    /// (where `..` resolves), removed when dropped.
+    struct OutsideFile(PathBuf);
+
+    impl OutsideFile {
+        fn next_to(root: &Path, label: &str) -> Self {
+            let path = root
+                .parent()
+                .unwrap()
+                .join(format!("praetore-cli-{label}-{}", Uuid::new_v4()));
+            fs::write(&path, "original").unwrap();
+            Self(path)
+        }
+
+        fn name(&self) -> String {
+            self.0.file_name().unwrap().to_str().unwrap().to_owned()
+        }
+
+        fn untouched(&self) -> bool {
+            fs::symlink_metadata(&self.0).is_ok_and(|metadata| metadata.is_file())
+                && fs::read_to_string(&self.0).unwrap() == "original"
+        }
+    }
+
+    impl Drop for OutsideFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// T2, real PostgreSQL over HTTP: `fs:delete_file` under an Allow rule
+    /// is executed by the gateway itself. The file is gone, the receipt is
+    /// `confirmed` with a signed attestation that verifies, the journal row
+    /// is `allowed` / `confirmed`, and nothing else under the root or
+    /// outside it changes. Deleting the same path again is refused before
+    /// dispatch (`file_not_found`).
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t2_allow_delete_executes_in_the_gateway() {
+        let mut fx = SandboxFixture::new();
+        // Same fixture policy, with the delete rule turned into Allow.
+        let mut policy = sandbox_policy();
+        let rule = policy
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "approve-delete")
+            .unwrap();
+        rule.effect = PolicyEffect::Allow;
+        fs::write(
+            fx.directory.join(POLICY_FILE),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+        fx.policy = load_policy(&fx.directory).unwrap();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::write(fx.root.join("borrar.txt"), "x").unwrap();
+        fs::write(fx.root.join("queda.txt"), "keep").unwrap();
+        let before = fx.tree();
+        let http = HttpSandbox::start(&fx);
+
+        let response = http
+            .client
+            .post(format!("{}/v1/execute", http.base))
+            .bearer_auth(&http.agent_token)
+            .json(&fx.delete("borrar.txt"))
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(response.headers()["praetore-executed-by"], "gateway");
+        let receipt: praetore_gateway::GatewayReceipt = response.json().unwrap();
+        assert_eq!(
+            receipt.authorization,
+            praetore_gateway::AuthorizationStatus::Allowed
+        );
+        assert_eq!(
+            receipt.execution,
+            praetore_gateway::ExecutionStatus::Confirmed
+        );
+        assert_eq!(
+            receipt.execution_attestation.execution,
+            praetore_gateway::ExecutionStatus::Confirmed
+        );
+        assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
+        assert_eq!(receipt.output.as_ref().unwrap()["path"], "borrar.txt");
+        fx.verify(&receipt);
+        assert!(fs::symlink_metadata(fx.root.join("borrar.txt")).is_err());
+        let mut expected = before;
+        expected.remove(&fx.root.join("borrar.txt"));
+        assert_eq!(fx.tree(), expected, "only the deleted file is gone");
+        assert!(fx.outside_untouched());
+        assert_eq!(
+            fx.journal(receipt.evidence.request_id),
+            ("allowed".into(), "confirmed".into())
+        );
+        assert_eq!(fx.journal_reason(receipt.evidence.request_id), None);
+
+        // The file is gone: a second delete is refused before dispatch.
+        assert_http_refused(
+            &fx,
+            &http,
+            &fx.delete("borrar.txt"),
+            "file_not_found",
+            "allowed",
+            "delete again",
+        );
+        drop(http);
+        let counts = fx.journal_counts();
+        println!("journal counts: {counts:?}");
+        assert_eq!(
+            counts,
+            vec![
+                ("allowed".into(), "confirmed".into(), 1),
+                ("allowed".into(), "not_dispatched".into(), 1),
+            ]
+        );
+    }
+
+    /// T22, real PostgreSQL over HTTP: every `..` form, including `..`
+    /// alone, is refused with 403 for write and delete, and the place the
+    /// path would resolve to (next to the root, or the sibling outside
+    /// directory) is unchanged.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t22_dot_dot_escapes_are_refused_with_403() {
+        let fx = SandboxFixture::new();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::create_dir(fx.root.join("sub")).unwrap();
+        let victim = OutsideFile::next_to(&fx.root, "t22-victim");
+        let fresh = format!("praetore-cli-t22-new-{}", Uuid::new_v4());
+        let fresh_target = fx.root.parent().unwrap().join(&fresh);
+        let outside_name = fx.outside.file_name().unwrap().to_str().unwrap().to_owned();
+        let http = HttpSandbox::start(&fx);
+        let cases = [
+            "..".to_owned(),
+            "../".to_owned(),
+            "sub/..".to_owned(),
+            "./..".to_owned(),
+            format!("../{fresh}"),
+            format!("../{}", victim.name()),
+            format!("sub/../../{fresh}"),
+            format!("sub/../../{}", victim.name()),
+            format!("./../{fresh}"),
+            format!("../{outside_name}/victim.txt"),
+            format!("../{outside_name}/t22-new.txt"),
+            format!("sub/../../{outside_name}/victim.txt"),
+        ];
+        for path in &cases {
+            assert_write_and_delete_refused(&fx, &http, path, "path_traversal");
+            assert!(victim.untouched(), "{path}");
+            assert!(!fresh_target.exists(), "{path}");
+            assert!(fx.root.parent().unwrap().is_dir(), "{path}");
+            assert!(fx.outside_untouched(), "{path}");
+        }
+        drop(http);
+        assert_no_outcome_unknown(&fx, cases.len() as i64);
+    }
+
+    /// T23, real PostgreSQL over HTTP: paths with a backslash (Windows
+    /// separators, UNC and drive forms, `..` written with `\`) are refused
+    /// with 403 `invalid_path_character`; nothing is created under the root
+    /// (a backslash is an ordinary byte in a Unix file name) or outside it.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t23_backslash_paths_are_refused_with_403() {
+        let fx = SandboxFixture::new();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::create_dir(fx.root.join("a")).unwrap();
+        fs::write(fx.root.join("a").join("b"), "inside").unwrap();
+        let victim = OutsideFile::next_to(&fx.root, "t23-victim");
+        let outside_name = fx.outside.file_name().unwrap().to_str().unwrap().to_owned();
+        let http = HttpSandbox::start(&fx);
+        let cases = [
+            r"a\..\b".to_owned(),
+            r"ok/..\x".to_owned(),
+            r"\etc\passwd".to_owned(),
+            r"\\server\share".to_owned(),
+            r"C:\x".to_owned(),
+            r"a\b".to_owned(),
+            format!(r"..\{}", victim.name()),
+            format!(r"..\{outside_name}\victim.txt"),
+            format!(r"a\..\..\{outside_name}\victim.txt"),
+        ];
+        for path in &cases {
+            assert_write_and_delete_refused(&fx, &http, path, "invalid_path_character");
+            assert!(victim.untouched(), "{path}");
+            assert!(fx.outside_untouched(), "{path}");
+        }
+        assert_eq!(fs::read_to_string(fx.root.join("a/b")).unwrap(), "inside");
+        drop(http);
+        assert_no_outcome_unknown(&fx, cases.len() as i64);
+    }
+
+    /// T24, real PostgreSQL over HTTP: absolute paths, including `/`, are
+    /// refused with 403 `absolute_path`, also when they point inside the
+    /// root; the absolute destination is unchanged.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t24_absolute_paths_are_refused_with_403() {
+        let fx = SandboxFixture::new();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::write(fx.root.join("inside.txt"), "inside").unwrap();
+        let http = HttpSandbox::start(&fx);
+        let display = |path: PathBuf| path.display().to_string();
+        let cases = [
+            "/".to_owned(),
+            "//".to_owned(),
+            display(fx.outside.join("victim.txt")),
+            display(fx.outside.join("t24-new.txt")),
+            display(fx.outside.clone()),
+            display(fx.root.join("inside.txt")),
+            display(fx.root.join("t24-new.txt")),
+            format!("{}/../victim.txt", display(fx.outside.clone())),
+        ];
+        for path in &cases {
+            assert_write_and_delete_refused(&fx, &http, path, "absolute_path");
+            assert!(fx.outside_untouched(), "{path}");
+            assert_eq!(
+                fs::read_to_string(fx.root.join("inside.txt")).unwrap(),
+                "inside",
+                "{path}"
+            );
+            assert!(!fx.root.join("t24-new.txt").exists(), "{path}");
+        }
+        drop(http);
+        assert_no_outcome_unknown(&fx, cases.len() as i64);
+    }
+
+    /// T25, real PostgreSQL over HTTP: a final symlink and a symlink as an
+    /// intermediate directory, both pointing outside the root, are refused
+    /// with 403 for write and delete. The symlinks stay symlinks and the
+    /// files they point to are unchanged.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t25_symlinks_are_refused_with_403() {
+        let fx = SandboxFixture::new();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::create_dir(fx.root.join("sub")).unwrap();
+        symlink(fx.outside.join("victim.txt"), fx.root.join("link.txt")).unwrap();
+        symlink(fx.outside.join("victim.txt"), fx.root.join("sub/link.txt")).unwrap();
+        symlink(&fx.outside, fx.root.join("escape")).unwrap();
+        symlink(&fx.outside, fx.root.join("sub/escape")).unwrap();
+        let http = HttpSandbox::start(&fx);
+        let cases = [
+            ("link.txt", "symlink_not_allowed"),
+            ("sub/link.txt", "symlink_not_allowed"),
+            ("escape/victim.txt", "symlink_or_non_directory_in_path"),
+            ("escape/t25-new.txt", "symlink_or_non_directory_in_path"),
+            ("sub/escape/victim.txt", "symlink_or_non_directory_in_path"),
+            ("sub/escape/t25-new.txt", "symlink_or_non_directory_in_path"),
+        ];
+        for (path, reason) in cases {
+            assert_write_and_delete_refused(&fx, &http, path, reason);
+            assert!(fx.outside_untouched(), "{path}");
+            assert!(!fx.outside.join("t25-new.txt").exists(), "{path}");
+        }
+        for link in ["link.txt", "sub/link.txt", "escape", "sub/escape"] {
+            assert!(
+                fs::symlink_metadata(fx.root.join(link))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{link}"
+            );
+        }
+        drop(http);
+        assert_no_outcome_unknown(&fx, cases.len() as i64);
+    }
+
+    /// T26, real PostgreSQL over HTTP: a NUL byte anywhere in the path is
+    /// refused with 403 `invalid_path_character`, so a path cannot be cut
+    /// short at the NUL; nothing changes under the root or outside it.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t26_nul_in_path_is_refused_with_403() {
+        let fx = SandboxFixture::new();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::write(fx.root.join("ok"), "inside").unwrap();
+        let http = HttpSandbox::start(&fx);
+        let cases = [
+            "ok\0/etc",
+            "ok\0",
+            "\0",
+            "a\0b.txt",
+            "\0ok",
+            "../\0",
+            "ok\0/../../victim.txt",
+        ];
+        for path in cases {
+            assert_write_and_delete_refused(&fx, &http, path, "invalid_path_character");
+            assert!(fx.outside_untouched(), "{path:?}");
+            assert_eq!(
+                fs::read_to_string(fx.root.join("ok")).unwrap(),
+                "inside",
+                "{path:?}"
+            );
+        }
+        drop(http);
+        assert_no_outcome_unknown(&fx, cases.len() as i64);
+    }
+
+    /// Real PostgreSQL: a file swapped for a symlink to a file outside the
+    /// root while its delete is held for approval is refused when the
+    /// approval challenge is requested, before any decision exists. The
+    /// outside file is unchanged and no decision is recorded. The refusal is
+    /// final: the request is closed as not dispatched with a signed
+    /// `dispatch_refused` reason and is never offered for approval again
+    /// (see postgres_t013b_challenge_refusal_is_final_even_if_the_file_returns).
+    /// Deterministic: the swap happens between two gateway calls.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_symlink_swapped_in_while_held_is_refused() {
+        use praetore_gateway::ApprovalResolution;
+        let fx = SandboxFixture::new();
+        let gateway = fx.gateway();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::write(fx.root.join("swap.txt"), "x").unwrap();
+        let key = fx.hold_delete(&gateway, "swap.txt");
+        fs::remove_file(fx.root.join("swap.txt")).unwrap();
+        symlink(fx.outside.join("victim.txt"), fx.root.join("swap.txt")).unwrap();
+        let challenge = gateway.approval_challenge(key);
+        let receipt = match challenge {
+            Err(praetore_gateway::GatewayError::DispatchRefused {
+                transient: false,
+                receipt: Some(receipt),
+                ..
+            }) => *receipt,
+            other => panic!("expected a final refusal with a receipt, got {other:?}"),
+        };
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(praetore_gateway::NotDispatchedReason::DispatchRefused)
+        );
+        fx.verify(&receipt);
+        assert!(fx.outside_untouched());
+        assert_eq!(
+            fx.journal(key.request_id),
+            ("requires_approval".into(), "not_dispatched".into())
+        );
+        assert_eq!(
+            gateway.approval_resolution(key).unwrap(),
+            ApprovalResolution::NotDispatched
+        );
+        assert_eq!(
+            gateway.approval_state(key).unwrap().not_dispatched_reason,
+            Some(praetore_gateway::NotDispatchedReason::DispatchRefused)
+        );
+        assert_eq!(
+            fx.journal_reason(key.request_id).as_deref(),
+            Some("dispatch_refused")
+        );
+        assert_eq!(
+            fx.rows_for_request("praetore.human_approvals", key.request_id),
+            0
+        );
+        // Asking again: closed, no longer pending.
+        assert!(matches!(
+            gateway.approval_challenge(key),
+            Err(praetore_gateway::GatewayError::Approval(
+                praetore_gateway::ApprovalError::NotPending
+            ))
+        ));
+        assert!(fx.outside_untouched());
+        assert!(
+            fs::symlink_metadata(fx.root.join("swap.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fx.journal_counts()
+                .iter()
+                .all(|(_, execution, _)| execution != "outcome_unknown")
+        );
+    }
+
+    /// Real PostgreSQL: a file swapped for a symlink to a file outside the
+    /// root AFTER its delete was approved is refused at the dispatch claim
+    /// (after the approval is re-verified) and closed as not dispatched with
+    /// a signed `dispatch_refused` reason; the outside file is unchanged.
+    /// Deterministic: the swap happens between two gateway calls.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_symlink_swapped_in_after_approval_is_refused_at_dispatch() {
+        use praetore_gateway::NotDispatchedReason;
+        let fx = SandboxFixture::new();
+        let gateway = fx.gateway();
+        let approver =
+            SigningKey::from_bytes(&read_secret(&fx.directory, APPROVER_KEY_FILE).unwrap());
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        fs::write(fx.root.join("late.txt"), "x").unwrap();
+        let key = fx.hold_delete(&gateway, "late.txt");
+        let decision = sign_decision(
+            gateway.approval_challenge(key).unwrap(),
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+        gateway.resolve_human_approval(decision).unwrap();
+        assert_eq!(
+            fx.journal(key.request_id),
+            (
+                "requires_approval".into(),
+                "approved_pending_dispatch".into()
+            )
+        );
+        fs::remove_file(fx.root.join("late.txt")).unwrap();
+        symlink(fx.outside.join("victim.txt"), fx.root.join("late.txt")).unwrap();
+        let (_, reason) = refused_key(gateway.dispatch_approved(key).unwrap_err());
+        assert_eq!(reason, "symlink_not_allowed");
+        assert_eq!(
+            fx.journal(key.request_id),
+            ("requires_approval".into(), "not_dispatched".into())
+        );
+        assert_eq!(
+            gateway.approval_state(key).unwrap().not_dispatched_reason,
+            Some(NotDispatchedReason::DispatchRefused)
+        );
+        assert!(fx.outside_untouched());
+        assert!(
+            fs::symlink_metadata(fx.root.join("late.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(gateway.dispatch_approved(key).is_err(), "never retried");
+        assert!(fx.outside_untouched());
+        assert!(
+            fx.journal_counts()
+                .iter()
+                .all(|(_, execution, _)| execution != "outcome_unknown")
+        );
+    }
+
+    /// T7, real PostgreSQL over HTTP, with the sandbox dispatcher: a delete
+    /// held for approval whose window closes is never executed. After the window
+    /// (at most 30 s locally, the freshness lease) the status reports
+    /// `expired`, a correctly signed approval gets 410 `approval_expired`
+    /// with the id of the signed expiration receipt, the dispatch gets 409
+    /// `approval_not_pending`, the file is still there and the journal row stays
+    /// `requires_approval` / `not_dispatched`. Uses the real clock.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_sandbox_http_t7_approval_expiry_never_executes() {
+        let fx = SandboxFixture::new();
+        fs::write(fx.root.join("expira.txt"), "keep").unwrap();
+        let http = HttpSandbox::start(&fx);
+        let (status, body) = http.execute(&fx.delete("expira.txt"));
+        assert_eq!(status, 202, "{body}");
+        let held: praetore_gateway::GatewayReceipt = serde_json::from_value(body).unwrap();
+        fx.verify(&held);
+        let request_id = held.evidence.request_id;
+        let path = http.approval_path(&fx, &held);
+        let status: serde_json::Value = http
+            .client
+            .get(format!("{path}/status"))
+            .bearer_auth(&http.agent_token)
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        assert_eq!(status["resolution"], "pending");
+        let view = ApprovalChallengeView::from_json(
+            &http
+                .client
+                .get(&path)
+                .bearer_auth(&http.approver_token)
+                .send()
+                .unwrap()
+                .text()
+                .unwrap(),
+        )
+        .unwrap();
+        let approver =
+            SigningKey::from_bytes(&read_secret(&fx.directory, APPROVER_KEY_FILE).unwrap());
+        let decision = sign_decision(
+            view.challenge,
+            LOCAL_APPROVER_ID,
+            HumanApprovalOutcome::Approve,
+            &approver,
+        )
+        .unwrap();
+
+        std::thread::sleep(StdDuration::from_secs(31));
+
+        let response = http
+            .client
+            .get(format!("{path}/status"))
+            .bearer_auth(&http.agent_token)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let status: serde_json::Value = response.json().unwrap();
+        assert_eq!(status["resolution"], "expired", "{status}");
+        assert_eq!(status["execution"], "not_dispatched", "{status}");
+        let response = http
+            .client
+            .post(&path)
+            .bearer_auth(&http.approver_token)
+            .json(&decision)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 410);
+        let body: serde_json::Value = response.json().unwrap();
+        assert_eq!(body["code"], "approval_expired", "{body}");
+        assert_eq!(body["resolution"], "expired", "{body}");
+        assert!(body["expiration_receipt_id"].is_string(), "{body}");
+        let response = http
+            .client
+            .post(format!("{path}/dispatch"))
+            .bearer_auth(&http.approver_token)
+            .send()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 409);
+        let body: serde_json::Value = response.json().unwrap();
+        assert_eq!(body["code"], "approval_not_pending", "{body}");
+        assert_eq!(
+            fs::read_to_string(fx.root.join("expira.txt")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            fx.journal(request_id),
+            ("requires_approval".into(), "not_dispatched".into())
+        );
+        assert_eq!(
+            fx.rows_for_request("praetore.human_approval_expirations", request_id),
+            1
+        );
+        assert_eq!(
+            fx.rows_for_request("praetore.human_approvals", request_id),
+            0
+        );
+        drop(http);
+        let counts = fx.journal_counts();
+        println!("journal counts: {counts:?}");
+        assert_eq!(
+            counts,
+            vec![("requires_approval".into(), "not_dispatched".into(), 1)]
+        );
+    }
+
     // ---- T-013 PR-B: signed final states and their reasons ----
 
     impl SandboxFixture {
-        fn delete(&self, path: &str) -> AuthorizationRequest {
-            self.request(
-                "fs:delete_file",
-                "fs:delete",
-                "sandbox",
-                serde_json::json!({"path": path}),
-            )
-        }
-
         /// Submits `fs:delete_file` for `path` (held for approval by the
         /// fixture policy) and returns the key of the signed, held request.
         fn held_delete(&self, gateway: &Gateway, path: &str) -> praetore_gateway::ExecutionKey {
