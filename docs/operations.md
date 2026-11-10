@@ -350,8 +350,11 @@ row with an approve decision is closed because its dispatch was claimed
 after the window; a new `approval_expired` close of
 `approved_pending_dispatch` is refused (`approval_expired` now means the
 window closed without a decision). No row is rewritten: a held row written
-before 0022 keeps its old attestation and gets an `awaiting_approval`
-attestation next to it when the gateway next reads it. To undo 0022 alone,
+before 0022 keeps its existing attestation. `Gateway::reconcile` adds an
+`awaiting_approval` attestation (schema v5) next to it; starting the
+gateway, `praetore run`, and the published HTTP and CLI routes do not.
+Until that reconcile, the inherited v2 receipt still verifies as
+`final: false` (`awaiting_approval_or_legacy`). To undo 0022 alone,
 the schema owner runs
 [`docs/rollback/0022-awaiting-approval-state.sql`](rollback/0022-awaiting-approval-state.sql)
 with every gateway stopped; it refuses to run if 0022 is not recorded, if a

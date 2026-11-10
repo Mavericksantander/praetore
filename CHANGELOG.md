@@ -68,8 +68,12 @@
   `approved_claim_expired` to both reason vocabularies, and refuses a new
   `approval_expired` close of `approved_pending_dispatch` and an
   `approved_claim_expired` close without an approve decision. No row is
-  rewritten; a held row written before 0022 gets an `awaiting_approval`
-  attestation in addition when the gateway next reads it. Manual rollback:
+  rewritten. A held row written before 0022 keeps its existing attestation.
+  `Gateway::reconcile` adds an `awaiting_approval` attestation (schema v5)
+  next to it; starting the gateway, `praetore run`, and the published HTTP
+  and CLI routes do not. Until that reconcile, the inherited v2 receipt
+  still verifies as `final: false` (`awaiting_approval_or_legacy`). Manual
+  rollback:
   `docs/rollback/0022-awaiting-approval-state.sql`, refused while any
   `awaiting_approval` or `approved_claim_expired` row exists (in practice,
   once a request was held under 0022). The gateway never signs a held
@@ -83,11 +87,17 @@
   | Reason `approved_claim_expired` | rejected (`RECEIPT_INVALID`, `False`) | verifies, final |
   | Rollback of 0022 | n/a | only while no `awaiting_approval` or `approved_claim_expired` row exists |
 
+  The <= 0.3.3 column is the receipts that release already knew. v0.3.3
+  rejects the later v3 reason `approval_rejected` (`RECEIPT_INVALID`).
+
   A gateway or CLI built before this release refuses a database at 0022
-  (unknown migration version); `praetore migrate` from this release applies
-  0022 to a database at 0021. Release 0.3.3 knows migrations up to 0019 and
-  already refuses a database at 0020 or 0021. The offline verifiers do not
-  open the database.
+  (unknown migration version). This release applies 0022 to a database at
+  0021 with `praetore-gateway-demo migrate` (schema owner URL in
+  `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`), and `praetore run` also
+  applies pending migrations when it starts. A production gateway process
+  applies them on start only when that migration URL is set. Release 0.3.3
+  knows migrations up to 0019 and already refuses a database at 0020 or
+  0021. The offline verifiers do not open the database.
 
   Older verifiers fail closed: they never accept a new receipt with another
   meaning.
