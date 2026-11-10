@@ -2,15 +2,43 @@
 # Claude Code PreToolUse hook: authorizes every tool call with PRÆTORE.
 # Install it in a project as .claude/hooks/praetore-hook.sh, with the binary
 # at .claude/bin/praetore-claude-hook (or set PRAETORE_HOOK_BIN) and the state
-# created by `praetore-claude-hook init .claude/praetore`.
-# Fails closed when the binary or the state is missing: a hook that merely
-# errors would let the tool call through.
-root="${CLAUDE_PROJECT_DIR:?}"
+# created by `praetore-claude-hook init .claude/praetore`. Register it with
+# "onFailure": "block" (Claude Code 2.1.295 or later), so that a failure of
+# this script itself also blocks the tool call.
+#
+# Fails closed: if the project directory, the binary or the state is
+# missing, or the binary cannot start, panics, is killed by a signal or
+# exits with any status other than 0, this script prints a deny decision and
+# exits 0. A hook that merely errors would let the tool call through.
+
+deny() {
+  printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$1"
+  exit 0
+}
+
+root="${CLAUDE_PROJECT_DIR:-}"
+if [ -z "$root" ]; then
+  cat >/dev/null
+  deny "PRÆTORE hook: CLAUDE_PROJECT_DIR is not set"
+fi
 bin="${PRAETORE_HOOK_BIN:-$root/.claude/bin/praetore-claude-hook}"
 state="$root/.claude/praetore"
 if [ ! -x "$bin" ] || [ ! -f "$state/policy.json" ]; then
   cat >/dev/null
-  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"PRÆTORE hook is not set up: install the praetore-claude-hook binary and run init .claude/praetore"}}'
-  exit 0
+  deny "PRÆTORE hook is not set up: install the praetore-claude-hook binary and run init .claude/praetore"
 fi
-exec "$bin" hook "$state"
+
+# No exec: the binary's status is checked before its output is passed on.
+# The binary reads the event on stdin; stderr goes straight through.
+output="$("$bin" hook "$state")"
+status=$?
+if [ "$status" -ne 0 ]; then
+  cat >/dev/null
+  deny "PRÆTORE hook binary failed (exit status $status); the tool call is denied"
+fi
+case "$output" in
+  '') ;;                       # no decision: Claude Code's permissions apply
+  '{'*'}') printf '%s\n' "$output" ;;
+  *) deny "PRÆTORE hook binary printed something other than a JSON object; the tool call is denied" ;;
+esac
+exit 0

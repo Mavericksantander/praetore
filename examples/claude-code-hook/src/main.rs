@@ -27,6 +27,8 @@ mod tests_g7;
 mod tests_high_assurance;
 #[cfg(test)]
 mod tests_messages;
+#[cfg(all(test, unix))]
+mod tests_wrapper;
 
 use std::{
     collections::BTreeMap,
@@ -1054,8 +1056,7 @@ fn absolute(path: &str, cwd: Option<&str>) -> String {
 }
 
 fn run_hook(directory: &Path) {
-    let verdict = read_hook_input()
-        .and_then(|input| authorize(directory, &input))
+    let verdict = guarded(|| read_hook_input().and_then(|input| authorize(directory, &input)))
         .unwrap_or_else(fail_closed);
     // stderr is for people: invisible, bidi and control characters in tool
     // names and reasons are escaped (`praetore_core::display`).
@@ -1104,6 +1105,16 @@ fn stderr_line(verdict: &Verdict) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+/// Runs the authorization, turning a panic into an error, so that a bug
+/// still produces a deny on stdout instead of a crash (which Claude Code
+/// treats as a non-blocking error unless the hook has `onFailure: "block"`).
+/// The wrapper script covers what this cannot: the binary not starting, or
+/// being killed.
+fn guarded<T>(run: impl FnOnce() -> Result<T, BoxError>) -> Result<T, BoxError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .unwrap_or_else(|_| Err("internal error (panic) while authorizing".into()))
 }
 
 /// Any error denies, including an unreadable `policy.json`: without a policy
@@ -2231,6 +2242,19 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    /// Hallazgo 13: a panic while authorizing becomes an error, which
+    /// `run_hook` turns into a deny on stdout.
+    #[test]
+    fn a_panic_while_authorizing_becomes_an_error() {
+        let result: Result<(), BoxError> = guarded(|| panic!("test panic"));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("panic"), "{error}");
+        let verdict = fail_closed(error.into());
+        assert_eq!(verdict.outcome, DecisionOutcome::Deny);
+        let output = hook_output(&verdict).unwrap();
+        assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
 
     struct Fixture {
         root: PathBuf,
