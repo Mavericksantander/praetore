@@ -843,6 +843,25 @@ mod tests {
         }
     }
 
+    /// Opens the dispatcher the way the gateway does (`open_sandbox` in
+    /// `praetore-cli`): with `PRAETORE_SANDBOX_REQUIRE_OPENAT2=1` it must
+    /// resolve paths with `openat2`, and the test fails (instead of falling
+    /// back to the portable walk) when the kernel or a seccomp profile does
+    /// not provide it. Used by the race tests that CI runs with it set.
+    fn open_as_gateway(root: &Path) -> SandboxDispatcher {
+        let required = require_openat2_from_env(std::env::var(REQUIRE_OPENAT2_ENV).ok().as_deref())
+            .expect("valid PRAETORE_SANDBOX_REQUIRE_OPENAT2");
+        let d = SandboxDispatcher::open(root).unwrap();
+        if !required {
+            return d;
+        }
+        let d = d
+            .require_openat2()
+            .unwrap_or_else(|error| panic!("{REQUIRE_OPENAT2_ENV} is set: {error}"));
+        assert_eq!(d.path_resolution(), "openat2 (required)");
+        d
+    }
+
     fn write(path: &str, content: &str) -> Action {
         Action::new(
             WRITE_ACTION,
@@ -1655,6 +1674,13 @@ mod tests {
                 Some("symlink_or_non_directory_in_path")
             );
         } else {
+            // CI sets PRAETORE_SANDBOX_REQUIRE_OPENAT2=1 on Linux: there the
+            // fallback branch is a failure, not a pass.
+            assert!(
+                !require_openat2_from_env(std::env::var(REQUIRE_OPENAT2_ENV).ok().as_deref())
+                    .expect("valid PRAETORE_SANDBOX_REQUIRE_OPENAT2"),
+                "{REQUIRE_OPENAT2_ENV} is set but openat2 is {status:?}"
+            );
             assert!(d.path_resolution().starts_with("portable") || status == Openat2Status::Denied);
             match d.require_openat2() {
                 Err(SandboxConfigError::Openat2Required(reason)) => {
@@ -1703,7 +1729,7 @@ mod tests {
         let dirs = dirs();
         std::fs::create_dir(dirs.root.join("d")).unwrap();
         std::fs::write(dirs.outside.join("victim"), "original").unwrap();
-        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let d = open_as_gateway(&dirs.root);
         // Created after open: `open` only accepts a clean root.
         symlink(&dirs.outside, dirs.root.join("d.link")).unwrap();
         let baseline = snapshot(&dirs.outside);
@@ -1836,7 +1862,7 @@ mod tests {
         let dirs = dirs();
         std::fs::write(dirs.outside.join("victim"), "original").unwrap();
         std::fs::write(dirs.root.join("f"), "inside").unwrap();
-        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let d = open_as_gateway(&dirs.root);
         // Created after open: `open` only accepts a clean root.
         symlink(dirs.outside.join("victim"), dirs.root.join("f.link")).unwrap();
         let baseline = snapshot(&dirs.outside);

@@ -64,31 +64,54 @@ jobs:
           run "test result: ok\. 13 passed" cargo test --locked -p praetore-cli --bin praetore-safety-ingest
           run "test result: ok\. 2 passed" cargo test --locked -p praetore-cli --bin praetore safety_export
           run "test result: ok\. 3 passed" cargo test --locked -p praetore-verify --test safety_journal_cli
+      # Two variables on purpose: praetore-sandbox-fs's race test reads
+      # PRAETORE_REQUIRE_OPENAT2; the gateway (and its tests, through
+      # sandbox::REQUIRE_OPENAT2_ENV) reads PRAETORE_SANDBOX_REQUIRE_OPENAT2.
       - name: T-013B confinement race tests (Linux, openat2 required, output shown)
         env:
           PRAETORE_REQUIRE_OPENAT2: "1"
+          PRAETORE_SANDBOX_REQUIRE_OPENAT2: "1"
         run: |
           cargo test --locked -p praetore-sandbox-fs -- --nocapture
           cargo test --locked -p praetore-gateway --lib -- --nocapture sandbox::tests::race sandbox::tests::require_openat2
+      # T-013: the two intermediate-symlink swap races of praetore-sandbox-fs
+      # (Resolver::Auto and the portable walk), one at a time with --exact;
+      # each must report "1 passed".
+      - name: T-013 sandbox-fs intermediate symlink swap races (exact names)
+        run: |
+          set -euo pipefail
+          for name in \
+            race_intermediate_symlink_swap_never_touches_outside_auto \
+            race_intermediate_symlink_swap_never_touches_outside_portable_walk; do
+            echo "::group::$name"
+            output="$(cargo test --locked -p praetore-sandbox-fs --test race -- --exact "$name" --nocapture 2>&1)" || { echo "$output"; echo "::error::$name failed"; exit 1; }
+            echo "$output"
+            echo "::endgroup::"
+            grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+          done
       # T-013: the symlink races through the gateway's dispatcher, one at a
       # time with --exact; each must report "1 passed". The preflight then
       # dispatch race is a unit test on purpose: its window lies between two
       # filesystem calls of one process and the sandbox crate has no test
       # hook to stop there (see the test's comment). The deterministic swaps
       # run against PostgreSQL in the replay-postgres job.
+      # The gateway's variable: with it the tests open the dispatcher as
+      # the gateway does and fail if openat2 is missing (no walk fallback);
+      # the grep checks that the race ran with "openat2 (required)".
       - name: T-013 dispatcher symlink race tests (exact names, openat2 required)
         env:
-          PRAETORE_REQUIRE_OPENAT2: "1"
+          PRAETORE_SANDBOX_REQUIRE_OPENAT2: "1"
         run: |
           set -euo pipefail
           for name in \
             sandbox::tests::race_intermediate_directory_swapped_for_outside_symlink_never_escapes \
             sandbox::tests::race_final_component_swapped_for_outside_symlink_after_preflight_never_escapes; do
             echo "::group::$name"
-            output="$(cargo test --locked -p praetore-gateway --lib -- --exact "$name" --nocapture 2>&1)" || { echo "$output"; exit 1; }
+            output="$(cargo test --locked -p praetore-gateway --lib -- --exact "$name" --nocapture 2>&1)" || { echo "$output"; echo "::error::$name failed"; exit 1; }
             echo "$output"
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+            grep -qF 'path_resolution="openat2 (required)"' <<<"$output" || { echo "::error::$name did not require openat2"; exit 1; }
           done
       - run: cargo run --locked --package praetore-core --example high_assurance
       - name: Walkthrough demo (docs/DEMO.md; in-memory replay guard, fixed lease)
