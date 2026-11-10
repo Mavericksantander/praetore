@@ -32,5 +32,9 @@ def gateway_receipt_finality(
     key_id: str,
     evidence_attester_public_key_hex: str,
 ) -> tuple[bool, str | None] | None:
-    """None unless the receipt verifies; else (final, non_final_reason)."""
+    """None unless the receipt verifies; else (final, non_final_reason).
+
+    non_final_reason is "awaiting_approval" (schema v5),
+    "awaiting_approval_or_legacy", "outcome_unknown" or None.
+    """
     ...

@@ -19,7 +19,7 @@ receipt_ok = praetore.verify_gateway_receipt(
 ```
 
 `verify_gateway_receipt` checks a gateway receipt's signed execution
-attestation (schema v1, v2, v3 or v4) and the evidence `attester_signature`
+attestation (schema v1 to v5) and the evidence `attester_signature`
 against the pinned evidence attester key. It rejects an unknown or tampered
 `not_dispatched_reason` and a missing, forged or foreign evidence signature.
 
@@ -29,10 +29,15 @@ pending, and `outcome_unknown`. `verify_final_gateway_receipt` (same
 arguments) also requires a final state, and `gateway_receipt_finality`
 returns `None` for a receipt that does not verify, otherwise
 `(final, non_final_reason)` with `non_final_reason` one of
-`"awaiting_approval_or_legacy"`, `"outcome_unknown"`, `"intermediate"` or
-`None`. `"intermediate"` (`authorized`, `approved_pending_dispatch` or
-`dispatched`) is defensive: verification refuses those states, so a receipt
-that verifies never reports it:
+`"awaiting_approval"`, `"awaiting_approval_or_legacy"`, `"outcome_unknown"`
+or `None`. Since schema v5 the receipt returned while an approval is
+pending is signed with `execution: "awaiting_approval"`
+(`"awaiting_approval"`); it keeps saying so after the request was approved
+and executed. `"awaiting_approval_or_legacy"` is a pending receipt written
+before schema v5, or one written before signed closing reasons existed.
+An approved request claimed after its window closes with the signed reason
+`approved_claim_expired`. Releases up to 0.3.3 reject schema v5 receipts
+and that reason (`False`):
 
 ```python
 final_ok = praetore.verify_final_gateway_receipt(

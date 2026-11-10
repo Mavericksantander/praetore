@@ -17,11 +17,12 @@ use praetore_core::{
     },
 };
 use praetore_gateway::{
-    ActionDispatcher, ApprovalError, AuthorizationStatus, DispatchError, DispatchReport,
-    ExecutionAttestationError, ExecutionAttestationSigner, ExecutionFailure, ExecutionJournal,
-    ExecutionKey, ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
-    HumanApprovalOutcome, HumanApprovalResult, HumanApprovalVerifier, HumanDecisionRecord,
-    JournalError, NotDispatchedReason, ReconciliationReport, RefusalCode, authority_tenant_id,
+    ActionDispatcher, ApprovalError, AttestedExecution, AuthorizationStatus, DispatchError,
+    DispatchReport, ExecutionAttestationError, ExecutionAttestationSigner, ExecutionFailure,
+    ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus, Gateway, GatewayError,
+    HumanApprovalDecision, HumanApprovalOutcome, HumanApprovalResult, HumanApprovalVerifier,
+    HumanDecisionRecord, JournalError, NotDispatchedReason, ReconciliationReport, RefusalCode,
+    authority_tenant_id,
 };
 use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
@@ -284,9 +285,23 @@ struct MemoryJournal {
     /// SAF-10 test hook: once an expiration receipt is stored, reads of that
     /// record fail as if the stored receipt were unreadable.
     unreadable_expiration: AtomicBool,
+    /// The next `claim_dispatch` fails with `ApprovalExpired`, as when the
+    /// approval expires between the engine's check and the claim.
+    claim_expired_once: AtomicBool,
 }
 
 impl MemoryJournal {
+    /// Replaces the stored attestations of `key` with `attestation`, as a
+    /// record written by an older release would hold.
+    fn replace_attestation_for_test(
+        &self,
+        key: ExecutionKey,
+        attestation: praetore_gateway::ExecutionAttestation,
+    ) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.get_mut(&key).unwrap().execution_attestations = vec![attestation];
+    }
+
     fn record_authorization(
         &self,
         key: ExecutionKey,
@@ -470,8 +485,11 @@ impl ExecutionJournal for MemoryJournal {
             .ok_or(JournalError::InvalidTransition)?;
         let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
         let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
+        }
         attestation
-            .validate_binding(evidence, authorization, execution, output)
+            .validate_binding(evidence, authorization, attestation.execution, output)
             .map_err(|_| JournalError::InvalidRecord)?;
         if !matches!(
             entry.execution,
@@ -514,13 +532,16 @@ impl ExecutionJournal for MemoryJournal {
         if entry.execution != execution || entry.output.as_ref() != output {
             return Err(JournalError::InvalidTransition);
         }
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
+        }
         attestation
-            .validate_binding(evidence, authorization, execution, output)
+            .validate_binding(evidence, authorization, attestation.execution, output)
             .map_err(|_| JournalError::InvalidRecord)?;
         if let Some(existing) = entry
             .execution_attestations
             .iter()
-            .find(|existing| existing.execution == execution)
+            .find(|existing| existing.execution == attestation.execution)
         {
             return if serde_json::to_value(existing).ok() == serde_json::to_value(attestation).ok()
             {
@@ -611,8 +632,11 @@ impl ExecutionJournal for MemoryJournal {
             {
                 ExecutionStatus::NotDispatched
             }
-            (AuthorizationStatus::RequiresApproval, Some(_))
-                if entry.execution != ExecutionStatus::NotDispatched =>
+            // Like migration 0022: an approval claimed too late closes with
+            // approved_claim_expired, never approval_expired.
+            (AuthorizationStatus::RequiresApproval, Some(reason))
+                if entry.execution != ExecutionStatus::NotDispatched
+                    && reason != NotDispatchedReason::ApprovalExpired =>
             {
                 ExecutionStatus::ApprovedPendingDispatch
             }
@@ -625,7 +649,7 @@ impl ExecutionJournal for MemoryJournal {
             .validate_binding(
                 evidence,
                 authorization,
-                ExecutionStatus::NotDispatched,
+                AttestedExecution::NotDispatched,
                 None,
             )
             .map_err(|_| JournalError::InvalidRecord)?;
@@ -682,7 +706,7 @@ impl ExecutionJournal for MemoryJournal {
                 .validate_binding(
                     evidence,
                     AuthorizationStatus::RequiresApproval,
-                    ExecutionStatus::NotDispatched,
+                    AttestedExecution::NotDispatched,
                     None,
                 )
                 .map_err(|_| JournalError::InvalidRecord)?;
@@ -699,6 +723,9 @@ impl ExecutionJournal for MemoryJournal {
     fn claim_dispatch(&self, key: ExecutionKey, now: OffsetDateTime) -> Result<(), JournalError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
+        }
+        if self.claim_expired_once.swap(false, Ordering::SeqCst) {
+            return Err(JournalError::ApprovalExpired);
         }
         let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
         let entry = entries
@@ -1280,7 +1307,7 @@ async fn http_gateway_returns_approval_receipt_without_dispatch() {
     let body = to_bytes(response.into_body(), 65_536).await.unwrap();
     let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(receipt["authorization"], "requires_approval");
-    assert_eq!(receipt["execution"], "not_dispatched");
+    assert_eq!(receipt["execution"], "awaiting_approval");
     assert_eq!(fixture.tool.invocations(), 0);
 }
 
@@ -1289,7 +1316,7 @@ fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
     let (gateway, request, tool, journal, approver_key) = approval_fixture();
     let pending = gateway.execute(request).unwrap();
     assert_eq!(pending.authorization, AuthorizationStatus::RequiresApproval);
-    assert_eq!(pending.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(pending.execution, AttestedExecution::AwaitingApproval);
     assert_eq!(tool.invocations(), 0);
 
     let key = ExecutionKey {
@@ -1329,7 +1356,7 @@ fn signed_human_approval_dispatches_the_exact_persisted_action_once() {
 
     let receipt = gateway.dispatch_approved(key).unwrap();
     assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(tool.value("mode"), Some(json!("approved")));
     assert_eq!(tool.invocations(), 1);
     assert_eq!(
@@ -1400,10 +1427,10 @@ fn approved_action_is_not_dispatched_if_freshness_expires_during_approval_commit
     assert_eq!(record.execution, ExecutionStatus::NotDispatched);
     assert_eq!(record.human_approval, Some(decision.clone()));
     let attestation = record.execution_attestation.unwrap();
-    assert_eq!(attestation.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(attestation.execution, AttestedExecution::NotDispatched);
     assert_eq!(
         attestation.not_dispatched_reason,
-        Some(NotDispatchedReason::ApprovalExpired)
+        Some(NotDispatchedReason::ApprovedClaimExpired)
     );
     assert_eq!(attestation.schema_version, 3);
     assert!(
@@ -1461,7 +1488,7 @@ fn rejected_human_approval_is_persisted_without_dispatch() {
         panic!("a rejection must return its receipt");
     };
 
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
     // Final, with its own signed reason (0020), distinct from expiry.
     assert_eq!(
         receipt.execution_attestation.not_dispatched_reason,
@@ -1649,7 +1676,7 @@ async fn http_human_approval_resumes_the_pending_execution() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 65_536).await.unwrap();
     let receipt: praetore_gateway::GatewayReceipt = serde_json::from_slice(&body).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(tool.value("mode"), Some(json!("approved")));
     assert_eq!(tool.invocations(), 1);
 
@@ -1737,7 +1764,7 @@ async fn http_gateway_executes_authorized_action_with_local_demo_adapter() {
         )
         .unwrap();
     assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(dispatcher.value("mode").as_deref(), Some("safe"));
 }
 
@@ -1772,7 +1799,7 @@ fn allowed_action_is_confirmed_once_and_receipt_separates_decision_from_effect()
     let entry = fixture.journal.entry(key).unwrap();
 
     assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     receipt
         .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
@@ -1833,7 +1860,7 @@ fn denied_or_unmatched_action_has_no_observable_tool_effect() {
         let fixture = fixture(effect, false);
         let receipt = fixture.gateway.execute(fixture.request).unwrap();
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         receipt
             .verify_with_test_evidence_attester(
                 &execution_attester_public_key(),
@@ -1850,7 +1877,7 @@ fn approval_required_is_not_permission_to_dispatch() {
     let fixture = fixture(Some(PolicyEffect::RequireApproval), false);
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
     assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
     receipt
         .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
@@ -1953,7 +1980,7 @@ fn gateway_does_not_dispatch_when_freshness_expires_after_journal_claim() {
     assert_eq!(record.execution, ExecutionStatus::Failed);
     assert_eq!(
         record.execution_attestation.unwrap().execution,
-        ExecutionStatus::Failed
+        AttestedExecution::Failed
     );
     assert!(matches!(
         gateway.execute(request),
@@ -1984,7 +2011,7 @@ fn gateway_uses_atomic_commit_instead_of_standalone_replay_guard() {
     replay_guard.unavailable.store(true, Ordering::SeqCst);
     let fixture = fixture_with_replay(Some(PolicyEffect::Allow), false, replay_guard);
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(fixture.tool.value("mode"), Some(json!("safe")));
     assert_eq!(fixture.tool.invocations(), 1);
 }
@@ -2035,7 +2062,7 @@ fn ambiguous_adapter_failure_is_recorded_and_never_retried() {
     };
     let entry = fixture.journal.entry(key).unwrap();
 
-    assert_eq!(receipt.execution, ExecutionStatus::OutcomeUnknown);
+    assert_eq!(receipt.execution, AttestedExecution::OutcomeUnknown);
     assert_eq!(fixture.tool.value("mode"), Some(json!("safe")));
     assert_eq!(fixture.tool.invocations(), 1);
     assert_eq!(
@@ -2047,14 +2074,14 @@ fn ambiguous_adapter_failure_is_recorded_and_never_retried() {
         .reconciliation_unknown
         .store(true, Ordering::SeqCst);
     let unresolved = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(unresolved.execution, ExecutionStatus::OutcomeUnknown);
+    assert_eq!(unresolved.execution, AttestedExecution::OutcomeUnknown);
     assert_eq!(fixture.tool.invocations(), 1);
     fixture
         .tool
         .reconciliation_unknown
         .store(false, Ordering::SeqCst);
     let reconciled = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(reconciled.execution, ExecutionStatus::Confirmed);
+    assert_eq!(reconciled.execution, AttestedExecution::Confirmed);
     assert!(matches!(
         fixture.gateway.execute(fixture.request),
         Err(GatewayError::Journal(JournalError::AlreadyRecorded))
@@ -2080,7 +2107,7 @@ fn terminal_journal_failure_is_reported_without_a_retry() {
     assert_eq!(fixture.tool.invocations(), 1);
     fixture.journal.fail_terminal.store(false, Ordering::SeqCst);
     let reconciled = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(reconciled.execution, ExecutionStatus::Confirmed);
+    assert_eq!(reconciled.execution, AttestedExecution::Confirmed);
     assert_eq!(fixture.tool.invocations(), 1);
     assert!(matches!(
         fixture.gateway.execute(fixture.request),
@@ -2118,7 +2145,7 @@ fn signer_failure_after_execution_is_recoverable_without_redispatch() {
         .fail_signing
         .store(false, Ordering::SeqCst);
     let receipt = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     receipt
         .verify_with_test_evidence_attester(
             &execution_attester_public_key(),
@@ -2140,7 +2167,7 @@ fn reconciliation_reuses_the_persisted_attestation_without_signing_again() {
     };
 
     let recovered = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(recovered.execution, ExecutionStatus::Confirmed);
+    assert_eq!(recovered.execution, AttestedExecution::Confirmed);
     assert_eq!(fixture.execution_attester.sign_count(), signed_count);
     assert_eq!(
         serde_json::to_value(recovered.execution_attestation).unwrap(),
@@ -2215,7 +2242,7 @@ fn shared_execution_journal_rejects_duplicate_key_across_independent_engines() {
     assert_eq!(fixture.tool.value("mode"), Some(json!("safe")));
     assert_eq!(fixture.tool.invocations(), 1);
     let reconciled = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(reconciled.execution, ExecutionStatus::Confirmed);
+    assert_eq!(reconciled.execution, AttestedExecution::Confirmed);
     assert_eq!(fixture.tool.invocations(), 1);
 }
 
@@ -2608,7 +2635,7 @@ mod saf10_today {
             let fixture = fixture(Some(PolicyEffect::Deny), false);
             let receipt = fixture.gateway.execute(fixture.request).unwrap();
             prop_assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
-            prop_assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            prop_assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
             prop_assert_eq!(fixture.tool.invocations(), 0);
         }
 
@@ -2797,7 +2824,7 @@ mod saf10_full {
             Some(&praetore_core::DecidedBy::rule(recovery.rule_id.clone()))
         );
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         receipt
             .verify_with_test_evidence_attester(
                 &execution_attester_public_key(),
@@ -3120,7 +3147,7 @@ mod apd {
         let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
         approve(&gateway, key, &approver_key);
         let receipt = gateway.reconcile(key).unwrap();
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::CrashRecovered)
@@ -3153,20 +3180,188 @@ mod apd {
         key: ExecutionKey,
     ) -> praetore_gateway::GatewayReceipt {
         let record = journal.get(key).unwrap().unwrap();
+        let execution_attestation = record.execution_attestation.unwrap();
         praetore_gateway::GatewayReceipt {
             evidence: record.evidence,
             authorization: record.authorization,
-            execution: record.execution,
+            execution: execution_attestation.execution,
             output: record.output,
-            execution_attestation: record.execution_attestation.unwrap(),
+            execution_attestation,
         }
     }
 
+    /// T-016, end to end: the 202 receipt of a held
+    /// request is signed as schema v5 `awaiting_approval`. Saved and checked
+    /// again after the request was approved and executed, it still verifies
+    /// only as `awaiting_approval`, not final, and cannot be presented as a
+    /// final `not_dispatched`.
+    #[test]
+    fn saved_202_receipt_stays_awaiting_approval_after_approval_and_execution() {
+        let (gateway, request, tool, journal, approver_key) = approval_fixture();
+        let pending = gateway.execute(request).unwrap();
+        assert_eq!(pending.authorization, AuthorizationStatus::RequiresApproval);
+        assert_eq!(pending.execution, AttestedExecution::AwaitingApproval);
+        assert_eq!(pending.execution_attestation.schema_version, 5);
+        assert_eq!(pending.execution_attestation.not_dispatched_reason, None);
+        assert_eq!(pending.execution_attestation.failure, None);
+        assert_eq!(pending.output, None);
+        let saved = serde_json::to_string(&pending).unwrap();
+
+        let key_id = "test-execution-attester-v1";
+        let public_key = execution_attester_public_key();
+        let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap();
+        let verify = |json: &str| {
+            praetore_gateway::verify_gateway_receipt_json(json, &public_key, key_id, &evidence_key)
+        };
+        let check_saved = || {
+            let receipt = verify(&saved).unwrap();
+            assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
+            assert_eq!(
+                receipt.non_final_reason(),
+                Some(praetore_gateway::NonFinalReason::AwaitingApproval)
+            );
+            assert!(!receipt.is_final());
+        };
+        check_saved();
+
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        approve(&gateway, key, &approver_key);
+        let executed = gateway.dispatch_approved(key).unwrap();
+        assert_eq!(tool.invocations(), 1);
+        assert_eq!(executed.execution, AttestedExecution::Confirmed);
+        assert!(
+            verify(&serde_json::to_string(&executed).unwrap())
+                .unwrap()
+                .is_final()
+        );
+        assert_eq!(
+            stored_receipt(&journal, key).execution,
+            AttestedExecution::Confirmed
+        );
+
+        // The saved 202 still says what it said: awaiting approval.
+        check_saved();
+        // Relabelled as `not_dispatched`, under v5 or under v2, it does not
+        // verify at all.
+        let relabelled = saved.replace("\"awaiting_approval\"", "\"not_dispatched\"");
+        assert_eq!(relabelled.matches("\"not_dispatched\"").count(), 2);
+        assert!(matches!(
+            verify(&relabelled),
+            Err(ExecutionAttestationError::InvalidPayload)
+        ));
+        let downgraded = relabelled.replace("\"schema_version\":5", "\"schema_version\":2");
+        assert_ne!(downgraded, relabelled);
+        assert!(matches!(
+            verify(&downgraded),
+            Err(ExecutionAttestationError::InvalidSignature)
+        ));
+    }
+
+    /// T-016: only a held request can be signed as
+    /// awaiting approval.
+    #[test]
+    fn awaiting_approval_is_signed_only_for_requires_approval() {
+        let (_, key, _, journal, _, _) = clocked_fixture();
+        let evidence = journal.get(key).unwrap().unwrap().evidence;
+        for authorization in [AuthorizationStatus::Allowed, AuthorizationStatus::Denied] {
+            assert!(matches!(
+                praetore_gateway::ExecutionAttestation::create(
+                    &evidence,
+                    authorization,
+                    &praetore_gateway::AttestedOutcome::AwaitingApproval,
+                    FixedClock::try_new(NOW).unwrap().now(),
+                    execution_attester().as_ref(),
+                ),
+                Err(ExecutionAttestationError::InvalidPayload)
+            ));
+        }
+        let signed = praetore_gateway::ExecutionAttestation::create(
+            &evidence,
+            AuthorizationStatus::RequiresApproval,
+            &praetore_gateway::AttestedOutcome::AwaitingApproval,
+            FixedClock::try_new(NOW).unwrap().now(),
+            execution_attester().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(signed.schema_version, 5);
+        assert_eq!(signed.execution, AttestedExecution::AwaitingApproval);
+    }
+
+    /// T-016: a held request whose stored attestation
+    /// is the pre-v5 `not_dispatched` shape (written by an older release)
+    /// is signed again as `awaiting_approval` when the gateway reads it; the
+    /// stored attestation is not rewritten.
+    #[test]
+    fn held_request_signed_before_v5_is_signed_again_as_awaiting_approval() {
+        let (gateway, key, _, journal, _, _) = clocked_fixture();
+        let evidence = journal.get(key).unwrap().unwrap().evidence;
+        let legacy = praetore_gateway::ExecutionAttestation::create(
+            &evidence,
+            AuthorizationStatus::RequiresApproval,
+            &praetore_gateway::AttestedOutcome::NotDispatched(None),
+            FixedClock::try_new(NOW).unwrap().now(),
+            execution_attester().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(legacy.schema_version, 2);
+        journal.replace_attestation_for_test(key, legacy);
+        let receipt = gateway.reconcile(key).unwrap();
+        assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
+        assert_eq!(receipt.execution_attestation.schema_version, 5);
+        assert!(!receipt.is_final());
+        assert_eq!(
+            journal.get(key).unwrap().unwrap().execution,
+            ExecutionStatus::NotDispatched
+        );
+    }
+
+    /// T-016: the journal refuses a new `approval_expired` close
+    /// of an approved request (0022); the approved request claimed too late
+    /// is closed as `approved_claim_expired`.
+    #[test]
+    fn approved_request_never_closes_as_approval_expired() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        let evidence = journal.get(key).unwrap().unwrap().evidence;
+        let close = |reason| {
+            praetore_gateway::ExecutionAttestation::create(
+                &evidence,
+                AuthorizationStatus::RequiresApproval,
+                &praetore_gateway::AttestedOutcome::NotDispatched(Some(reason)),
+                FixedClock::try_new(NOW).unwrap().now(),
+                execution_attester().as_ref(),
+            )
+            .unwrap()
+        };
+        assert!(
+            journal
+                .mark_not_dispatched_attested(key, &close(NotDispatchedReason::ApprovalExpired))
+                .is_err()
+        );
+        assert_eq!(
+            journal.get(key).unwrap().unwrap().execution,
+            ExecutionStatus::ApprovedPendingDispatch
+        );
+        journal
+            .mark_not_dispatched_attested(key, &close(NotDispatchedReason::ApprovedClaimExpired))
+            .unwrap();
+        assert_eq!(tool.invocations(), 0);
+    }
+
     /// Receipt finality fixtures: one committed receipt per finality case,
-    /// read by praetore-verify and the Python package. Regenerated only with
-    /// `UPDATE_FINALITY_RECEIPT_FIXTURES=1` (the older fixtures are left
-    /// untouched); by default the committed files must verify and report
-    /// the expected finality.
+    /// read by praetore-verify and the Python package. The schema v5 receipt of a
+    /// held request and the `approved_claim_expired` close are regenerated
+    /// with `UPDATE_V5_RECEIPT_FIXTURES=1`. The older files are frozen
+    /// history: `receipt-v2-awaiting-approval.json` and
+    /// `receipt-v3-approval-expired.json` (an approval claimed too late) are
+    /// what the gateway signed before schema v5 and `approved_claim_expired`.
+    /// By default every file must verify and report the expected finality.
     #[test]
     fn finality_receipt_fixtures_for_external_verifiers() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3176,70 +3371,63 @@ mod apd {
         let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
             .public_key()
             .unwrap();
-        if std::env::var_os("UPDATE_FINALITY_RECEIPT_FIXTURES").is_some() {
-            // The 202 receipt of a held request.
-            let (_, key, _, journal, _, _) = clocked_fixture();
-            let awaiting = stored_receipt(&journal, key);
-            // Rejected by a human (signed approval_rejected).
-            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
-            let decision = human_approval_decision(
-                gateway.approval_challenge(key).unwrap(),
-                HumanApprovalOutcome::Reject,
-                &approver_key,
-            );
-            let HumanApprovalResult::Rejected {
-                receipt: rejected, ..
-            } = gateway.resolve_human_approval(decision).unwrap()
-            else {
-                panic!("a rejection returns its receipt");
-            };
-            // Approved, claimed after the window (signed approval_expired).
+        if std::env::var_os("UPDATE_V5_RECEIPT_FIXTURES").is_some() {
+            // The 202 receipt of a held request, as the gateway returns it.
+            let (gateway, request, _, _, _) = approval_fixture();
+            let awaiting = gateway.execute(request).unwrap();
+            // Approved, claimed after the window.
             let (gateway, key, _, journal, approver_key, clock) = clocked_fixture();
             approve(&gateway, key, &approver_key);
             *clock.lock().unwrap() += Duration::seconds(21);
             assert!(gateway.dispatch_approved(key).is_err());
-            let expired = stored_receipt(&journal, key);
-            // Approved, dispatched, adapter outcome unknown.
-            let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
-            approve(&gateway, key, &approver_key);
-            tool.fail_after_write.store(true, Ordering::SeqCst);
-            let _ = gateway.dispatch_approved(key);
-            let unknown = stored_receipt(&journal, key);
+            let claim_expired = stored_receipt(&journal, key);
             for (name, receipt) in [
-                ("receipt-v2-awaiting-approval.json", &awaiting),
-                ("receipt-v3-approval-rejected.json", &*rejected),
-                ("receipt-v3-approval-expired.json", &expired),
-                ("receipt-v2-outcome-unknown.json", &unknown),
+                ("receipt-v5-awaiting-approval.json", &awaiting),
+                ("receipt-v3-approved-claim-expired.json", &claim_expired),
             ] {
                 std::fs::write(dir.join(name), serde_json::to_string(receipt).unwrap()).unwrap();
             }
         }
         for (name, schema, execution, reason, non_final) in [
             (
+                "receipt-v5-awaiting-approval.json",
+                5,
+                AttestedExecution::AwaitingApproval,
+                None,
+                Some(praetore_gateway::NonFinalReason::AwaitingApproval),
+            ),
+            (
+                "receipt-v3-approved-claim-expired.json",
+                3,
+                AttestedExecution::NotDispatched,
+                Some(NotDispatchedReason::ApprovedClaimExpired),
+                None,
+            ),
+            (
                 "receipt-v2-awaiting-approval.json",
                 2,
-                ExecutionStatus::NotDispatched,
+                AttestedExecution::NotDispatched,
                 None,
                 Some(praetore_gateway::NonFinalReason::AwaitingApprovalOrLegacy),
             ),
             (
                 "receipt-v3-approval-rejected.json",
                 3,
-                ExecutionStatus::NotDispatched,
+                AttestedExecution::NotDispatched,
                 Some(NotDispatchedReason::ApprovalRejected),
                 None,
             ),
             (
                 "receipt-v3-approval-expired.json",
                 3,
-                ExecutionStatus::NotDispatched,
+                AttestedExecution::NotDispatched,
                 Some(NotDispatchedReason::ApprovalExpired),
                 None,
             ),
             (
                 "receipt-v2-outcome-unknown.json",
                 2,
-                ExecutionStatus::OutcomeUnknown,
+                AttestedExecution::OutcomeUnknown,
                 None,
                 Some(praetore_gateway::NonFinalReason::OutcomeUnknown),
             ),
@@ -3268,7 +3456,7 @@ mod apd {
     }
 
     #[test]
-    fn engine_clock_expiry_before_claim_closes_as_approval_expired() {
+    fn engine_clock_expiry_before_claim_closes_as_approved_claim_expired() {
         let (gateway, key, tool, journal, approver_key, clock) = clocked_fixture();
         approve(&gateway, key, &approver_key);
         *clock.lock().unwrap() += Duration::seconds(21);
@@ -3281,8 +3469,70 @@ mod apd {
         assert!(record.approval_expiration.is_none());
         assert_eq!(
             record.execution_attestation.unwrap().not_dispatched_reason,
-            Some(NotDispatchedReason::ApprovalExpired)
+            Some(NotDispatchedReason::ApprovedClaimExpired)
         );
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// T-016: when the journal's claim reports the approval expired (the
+    /// engine's check passed just before), the approved request is closed
+    /// with the signed reason `approved_claim_expired` and never invoked.
+    #[test]
+    fn journal_claim_expiry_closes_as_approved_claim_expired() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        journal.claim_expired_once.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            gateway.dispatch_approved(key),
+            Err(GatewayError::Approval(ApprovalError::Expired))
+        ));
+        assert!(!journal.claim_expired_once.load(Ordering::SeqCst));
+        let record = journal.get(key).unwrap().unwrap();
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert!(record.approval_expiration.is_none());
+        let close = record.execution_attestation.unwrap();
+        assert_eq!(close.execution, AttestedExecution::NotDispatched);
+        assert_eq!(
+            close.not_dispatched_reason,
+            Some(NotDispatchedReason::ApprovedClaimExpired)
+        );
+        let receipt = gateway.reconcile(key).unwrap();
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(NotDispatchedReason::ApprovedClaimExpired)
+        );
+        assert!(receipt.is_final());
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// T-016: a held request with a decision but no signed close (a state
+    /// no journal transition produces) is never signed as `not_dispatched`
+    /// with no reason: reading it fails with `InvalidRecord` and stores
+    /// nothing new.
+    #[test]
+    fn held_request_with_a_decision_and_no_close_is_not_signed() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        let attestations_before = {
+            let mut entries = journal.entries.lock().unwrap();
+            let entry = entries.get_mut(&key).unwrap();
+            entry.execution = ExecutionStatus::NotDispatched;
+            entry.execution_attestations.len()
+        };
+        assert!(matches!(
+            gateway.reconcile(key),
+            Err(GatewayError::Journal(JournalError::InvalidRecord))
+        ));
+        let entries = journal.entries.lock().unwrap();
+        let entry = entries.get(&key).unwrap();
+        assert_eq!(entry.execution_attestations.len(), attestations_before);
+        assert!(
+            entry
+                .execution_attestations
+                .iter()
+                .all(|attestation| attestation.execution != AttestedExecution::NotDispatched)
+        );
+        drop(entries);
         assert_eq!(tool.invocations(), 0);
     }
 
@@ -3294,14 +3544,26 @@ mod apd {
         let key_id = "test-execution-attester-v1";
         let public_key = execution_attester_public_key();
 
-        let mut forged = closed.clone();
-        forged.execution = ExecutionStatus::ApprovedPendingDispatch;
-        forged.execution_attestation.execution = ExecutionStatus::ApprovedPendingDispatch;
-        assert!(
-            forged
-                .verify_with_test_evidence_attester(&public_key, key_id)
-                .is_err()
+        // `approved_pending_dispatch` is not a signed state: a receipt that
+        // names it does not parse.
+        let json = serde_json::to_string(&closed).unwrap();
+        let forged = json.replace(
+            "\"execution\":\"not_dispatched\"",
+            "\"execution\":\"approved_pending_dispatch\"",
         );
+        assert_eq!(forged.matches("approved_pending_dispatch").count(), 2);
+        let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap();
+        assert!(matches!(
+            praetore_gateway::verify_gateway_receipt_json(
+                &forged,
+                &public_key,
+                key_id,
+                &evidence_key
+            ),
+            Err(ExecutionAttestationError::InvalidPayload)
+        ));
 
         // The reason is signed: changing or removing it breaks verification.
         let mut changed = closed.clone();
@@ -3556,7 +3818,7 @@ fn transient_clock_failure_at_claim_leaves_the_approval_retryable() {
 
     *clock.lock().unwrap() = now;
     let receipt = gateway.dispatch_approved(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(tool.invocations(), 1);
 }
 
@@ -3714,7 +3976,7 @@ fn approval_resolution_reports_not_dispatched_after_crash_recovery_or_expiry() {
     );
     assert_eq!(
         state.not_dispatched_reason,
-        Some(NotDispatchedReason::ApprovalExpired)
+        Some(NotDispatchedReason::ApprovedClaimExpired)
     );
 }
 
@@ -4399,7 +4661,7 @@ fn terminal_preflight_refusal_while_held_closes_the_request_for_good() {
         );
         let receipt = refused_receipt(error);
         assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::DispatchRefused)
@@ -4768,7 +5030,7 @@ fn refused_receipt(error: GatewayError) -> praetore_gateway::GatewayReceipt {
     }
 }
 
-/// Review finding 1: a held approval refused at submission is closed for
+/// Refused at submission: a held approval refused there is closed for
 /// good with a signed `dispatch_refused` reason, distinguishable from a live
 /// pending approval, and can never be approved or dispatched, even after the
 /// adapter would admit the action again.
@@ -4778,7 +5040,7 @@ fn approval_refused_at_submission_is_closed_terminally_and_never_approvable() {
     tool.refuse_preflight.store(true, Ordering::SeqCst);
     let receipt = refused_receipt(gateway.execute(request.clone()).unwrap_err());
     assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
     assert_eq!(
         receipt.execution_attestation.not_dispatched_reason,
         Some(NotDispatchedReason::DispatchRefused)
@@ -4842,7 +5104,7 @@ fn approval_refused_at_submission_is_closed_terminally_and_never_approvable() {
     assert!(journal.get(key).unwrap().unwrap().human_approval.is_none());
 }
 
-/// Review finding 4: an allowed action refused at submission carries the
+/// Refused at submission: an allowed action refused there carries the
 /// signed `dispatch_refused` receipt, also in the HTTP 403 body.
 #[tokio::test]
 async fn allowed_action_refused_at_submission_returns_signed_dispatch_refused_receipt() {
@@ -4862,7 +5124,7 @@ async fn allowed_action_refused_at_submission_returns_signed_dispatch_refused_re
     let receipt: praetore_gateway::GatewayReceipt =
         serde_json::from_value(body["receipt"].clone()).unwrap();
     assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
-    assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
     assert_eq!(
         receipt.execution_attestation.not_dispatched_reason,
         Some(NotDispatchedReason::DispatchRefused)
@@ -4883,7 +5145,7 @@ async fn allowed_action_refused_at_submission_returns_signed_dispatch_refused_re
     assert_eq!(fixture.tool.invocations(), 0);
 }
 
-/// Review finding 2: approval status reports journal state only; it never
+/// Approval status: it reports journal state only; it never
 /// consults the adapter, so it does not depend on live filesystem state.
 #[test]
 fn approval_status_does_not_consult_the_adapter() {
@@ -4910,7 +5172,7 @@ fn approval_status_does_not_consult_the_adapter() {
     assert_eq!(tool.preflights.load(Ordering::SeqCst), before);
 }
 
-/// Review finding 3: a transient refusal at the dispatch claim leaves the
+/// Transient refusal at the claim: it leaves the
 /// approval `approved_pending_dispatch` (nothing burnt); the claim can be
 /// attempted again and dispatches once.
 #[test]
@@ -4944,7 +5206,7 @@ fn transient_refusal_at_claim_keeps_the_approval_pending_dispatch() {
     assert_eq!(tool.invocations(), 0);
     tool.refuse_transient.store(false, Ordering::SeqCst);
     let receipt = gateway.dispatch_approved(key).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(receipt.execution, AttestedExecution::Confirmed);
     assert_eq!(tool.invocations(), 1);
 }
 
@@ -5260,11 +5522,11 @@ fn refusal_before_effect_at_dispatch_is_a_signed_terminal_failed_state() {
     );
     let receipt = refused_receipt(error);
     assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
-    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(receipt.execution, AttestedExecution::Failed);
     assert_eq!(receipt.output, None);
     assert_eq!(
         receipt.execution_attestation.execution,
-        ExecutionStatus::Failed
+        AttestedExecution::Failed
     );
     // D-B1: the refusal reason is signed, as `no_effect`, in schema v4.
     assert_eq!(receipt.execution_attestation.schema_version, 4);
@@ -5301,7 +5563,7 @@ fn refusal_before_effect_at_dispatch_is_a_signed_terminal_failed_state() {
         .store(false, Ordering::SeqCst);
     assert_eq!(
         fixture.gateway.reconcile(key).unwrap().execution,
-        ExecutionStatus::Failed
+        AttestedExecution::Failed
     );
     assert!(fixture.gateway.execute(fixture.request).is_err());
     assert_eq!(fixture.tool.invocations(), 1);
@@ -5323,7 +5585,7 @@ fn refusal_before_effect_at_dispatch_is_a_signed_terminal_failed_state() {
     tool.refuse_at_dispatch.store(true, Ordering::SeqCst);
     let receipt = refused_receipt(gateway.dispatch_approved(key).unwrap_err());
     assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
-    assert_eq!(receipt.execution, ExecutionStatus::Failed);
+    assert_eq!(receipt.execution, AttestedExecution::Failed);
     assert_eq!(
         receipt.execution_attestation.failure,
         Some(ExecutionFailure::NoEffect {
@@ -5368,7 +5630,7 @@ fn effect_failed_at_dispatch_is_a_signed_failed_state_with_class_effect_failed()
         }
     }
     fn assert_effect_failed(receipt: &praetore_gateway::GatewayReceipt) {
-        assert_eq!(receipt.execution, ExecutionStatus::Failed);
+        assert_eq!(receipt.execution, AttestedExecution::Failed);
         assert_eq!(receipt.output, None);
         assert_eq!(receipt.execution_attestation.schema_version, 4);
         assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
@@ -5418,7 +5680,7 @@ fn effect_failed_at_dispatch_is_a_signed_failed_state_with_class_effect_failed()
         .effect_failed_at_dispatch
         .store(false, Ordering::SeqCst);
     let reconciled = fixture.gateway.reconcile(key).unwrap();
-    assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+    assert_eq!(reconciled.execution, AttestedExecution::Failed);
     assert_eq!(
         reconciled.execution_attestation.failure,
         Some(ExecutionFailure::EffectFailed)
@@ -5465,7 +5727,7 @@ fn ambiguous_dispatch_error_still_becomes_outcome_unknown() {
     let fixture = fixture(Some(PolicyEffect::Allow), false);
     fixture.tool.fail_after_write.store(true, Ordering::SeqCst);
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
-    assert_eq!(receipt.execution, ExecutionStatus::OutcomeUnknown);
+    assert_eq!(receipt.execution, AttestedExecution::OutcomeUnknown);
 }
 
 /// Engine clock: every execution attestation is timestamped

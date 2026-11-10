@@ -2213,7 +2213,7 @@ mod tests {
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_approval_dispatches_once_and_rejection_is_final() {
         use praetore_gateway::{
-            ApprovalError, ApprovalResolution, ExecutionKey, ExecutionStatus, GatewayError,
+            ApprovalError, ApprovalResolution, AttestedExecution, ExecutionKey, GatewayError,
             HumanApprovalResult,
         };
         let database_url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
@@ -2235,7 +2235,7 @@ mod tests {
         let pending = |value: &str| {
             let request = build_demo_request(&directory, &config, &policy, "k", value).unwrap();
             let receipt = gateway.execute(request).unwrap();
-            assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            assert_eq!(receipt.execution, AttestedExecution::AwaitingApproval);
             let request_id = receipt.evidence.request_id;
             let agent_id = find_pending_agent(&database_url, config.tenant_id, request_id).unwrap();
             assert_eq!(agent_id, *receipt.evidence.agent.id.as_uuid());
@@ -2274,7 +2274,7 @@ mod tests {
         );
         assert!(gateway.resolve_human_approval(decision).is_err());
         let receipt = gateway.dispatch_approved(key).unwrap();
-        assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+        assert_eq!(receipt.execution, AttestedExecution::Confirmed);
         assert!(gateway.dispatch_approved(key).is_err());
         assert!(matches!(
             gateway.approval_challenge(key),
@@ -2296,7 +2296,7 @@ mod tests {
         else {
             panic!("a rejection must return its receipt");
         };
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),
             ApprovalResolution::Rejected
@@ -2688,7 +2688,7 @@ mod tests {
             let receipt = gateway.execute(self.delete(path)).unwrap();
             assert_eq!(
                 receipt.execution,
-                praetore_gateway::ExecutionStatus::NotDispatched
+                praetore_gateway::AttestedExecution::AwaitingApproval
             );
             self.verify(&receipt);
             praetore_gateway::ExecutionKey {
@@ -2800,7 +2800,7 @@ mod tests {
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_sandbox_allow_deny_and_escape() {
-        use praetore_gateway::{AuthorizationStatus, ExecutionStatus};
+        use praetore_gateway::{AttestedExecution, AuthorizationStatus};
         let fx = SandboxFixture::new();
         fs::write(fx.outside.join("victim.txt"), "original").unwrap();
         let gateway = fx.gateway();
@@ -2808,7 +2808,7 @@ mod tests {
         // ALLOW: the gateway itself writes the file; executed/confirmed.
         let receipt = gateway.execute(fx.write("hola.txt", "hola mundo")).unwrap();
         assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
-        assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+        assert_eq!(receipt.execution, AttestedExecution::Confirmed);
         assert_eq!(receipt.output.as_ref().unwrap()["bytes"], 10);
         fx.verify(&receipt);
         assert_eq!(
@@ -2830,7 +2830,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(receipt.authorization, AuthorizationStatus::Denied);
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         fx.verify(&receipt);
         assert_eq!(
             fs::read_to_string(fx.root.join("hola.txt")).unwrap(),
@@ -2935,7 +2935,10 @@ mod tests {
                     serde_json::json!({"path": path}),
                 ))
                 .unwrap();
-            assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+            assert_eq!(
+                receipt.execution,
+                praetore_gateway::AttestedExecution::AwaitingApproval
+            );
             fx.verify(&receipt);
             ExecutionKey {
                 tenant_id: fx.config.tenant_id,
@@ -2976,7 +2979,10 @@ mod tests {
             )
         );
         let receipt = gateway.dispatch_approved(key).unwrap();
-        assert_eq!(receipt.execution, ExecutionStatus::Confirmed);
+        assert_eq!(
+            receipt.execution,
+            praetore_gateway::AttestedExecution::Confirmed
+        );
         fx.verify(&receipt);
         assert!(!fx.root.join("borrar.txt").exists());
         assert!(gateway.dispatch_approved(key).is_err(), "single dispatch");
@@ -3007,7 +3013,10 @@ mod tests {
         else {
             panic!("a rejection must return its receipt");
         };
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(
+            receipt.execution,
+            praetore_gateway::AttestedExecution::NotDispatched
+        );
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::ApprovalRejected)
@@ -3212,7 +3221,7 @@ mod tests {
         let receipt: praetore_gateway::GatewayReceipt = response.json().unwrap();
         assert_eq!(
             receipt.execution,
-            praetore_gateway::ExecutionStatus::Confirmed
+            praetore_gateway::AttestedExecution::Confirmed
         );
         fx.verify(&receipt);
         assert_eq!(
@@ -3820,7 +3829,7 @@ mod tests {
             serde_json::from_value(body["receipt"].clone()).unwrap();
         assert_eq!(
             receipt.execution,
-            praetore_gateway::ExecutionStatus::NotDispatched,
+            praetore_gateway::AttestedExecution::NotDispatched,
             "{label}"
         );
         assert_eq!(
@@ -3963,11 +3972,11 @@ mod tests {
         );
         assert_eq!(
             receipt.execution,
-            praetore_gateway::ExecutionStatus::Confirmed
+            praetore_gateway::AttestedExecution::Confirmed
         );
         assert_eq!(
             receipt.execution_attestation.execution,
-            praetore_gateway::ExecutionStatus::Confirmed
+            praetore_gateway::AttestedExecution::Confirmed
         );
         assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
         assert_eq!(receipt.output.as_ref().unwrap()["path"], "borrar.txt");
@@ -4437,7 +4446,7 @@ mod tests {
             let receipt = gateway.execute(self.delete(path)).unwrap();
             assert_eq!(
                 receipt.execution,
-                praetore_gateway::ExecutionStatus::NotDispatched
+                praetore_gateway::AttestedExecution::AwaitingApproval
             );
             assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
             self.verify(&receipt);
@@ -4692,7 +4701,7 @@ mod tests {
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_t013b_refusal_before_effect_is_a_signed_failed_state() {
-        use praetore_gateway::{ExecutionStatus, GatewayError};
+        use praetore_gateway::{AttestedExecution, GatewayError};
         let fx = SandboxFixture::new();
         let gateway = fx.gateway();
         fs::write(fx.outside.join("victim.txt"), "original").unwrap();
@@ -4721,11 +4730,11 @@ mod tests {
             }
             other => panic!("expected a final refusal with a receipt, got {other:?}"),
         };
-        assert_eq!(receipt.execution, ExecutionStatus::Failed);
+        assert_eq!(receipt.execution, AttestedExecution::Failed);
         assert_eq!(receipt.output, None);
         assert_eq!(
             receipt.execution_attestation.execution,
-            ExecutionStatus::Failed
+            AttestedExecution::Failed
         );
         fx.verify(&receipt);
         let (reason, execution) = fx.verified_with_praetore_verify(&receipt);
@@ -4770,7 +4779,7 @@ mod tests {
         // Final: reconciliation keeps it, and it is never dispatched again,
         // even with the regular file back.
         let reconciled = gateway.reconcile(key).unwrap();
-        assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+        assert_eq!(reconciled.execution, AttestedExecution::Failed);
         assert_eq!(
             reconciled.execution_attestation.signature,
             receipt.execution_attestation.signature
@@ -4806,7 +4815,7 @@ mod tests {
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_t013b_effect_failed_after_the_temporary_write_is_signed_effect_failed() {
-        use praetore_gateway::{ExecutionFailure, ExecutionStatus, GatewayReceipt};
+        use praetore_gateway::{AttestedExecution, ExecutionFailure, GatewayReceipt};
         use std::io::Read;
         use std::os::unix::process::CommandExt;
 
@@ -4900,7 +4909,7 @@ mod tests {
             receipt.authorization,
             praetore_gateway::AuthorizationStatus::Allowed
         );
-        assert_eq!(receipt.execution, ExecutionStatus::Failed);
+        assert_eq!(receipt.execution, AttestedExecution::Failed);
         assert_eq!(receipt.output, None);
         assert_eq!(receipt.execution_attestation.schema_version, 4);
         assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
@@ -4949,7 +4958,7 @@ mod tests {
             request_id,
         };
         let reconciled = gateway.reconcile(key).unwrap();
-        assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+        assert_eq!(reconciled.execution, AttestedExecution::Failed);
         assert_eq!(
             reconciled.execution_attestation.signature, receipt.execution_attestation.signature,
             "{stderr}"
@@ -4973,7 +4982,7 @@ mod tests {
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_t013b_challenge_refusal_is_final_even_if_the_file_returns() {
         use praetore_gateway::{
-            ApprovalError, ApprovalResolution, ExecutionStatus, GatewayError, NotDispatchedReason,
+            ApprovalError, ApprovalResolution, AttestedExecution, GatewayError, NotDispatchedReason,
         };
         let fx = SandboxFixture::new();
         let gateway = fx.gateway();
@@ -5004,7 +5013,7 @@ mod tests {
             }
             other => panic!("expected a final refusal with a receipt, got {other:?}"),
         };
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::DispatchRefused)
@@ -5075,7 +5084,7 @@ mod tests {
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
     fn postgres_t013b_t20_rejected_and_expired_have_distinct_signed_reasons() {
         use praetore_gateway::{
-            ApprovalResolution, ExecutionStatus, HumanApprovalResult, NotDispatchedReason,
+            ApprovalResolution, AttestedExecution, HumanApprovalResult, NotDispatchedReason,
         };
         let fx = SandboxFixture::new();
         let gateway = fx.gateway();
@@ -5098,7 +5107,7 @@ mod tests {
         else {
             panic!("a rejection must return its receipt");
         };
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::ApprovalRejected)
@@ -5113,7 +5122,7 @@ mod tests {
             ApprovalResolution::Expired
         );
         let receipt = gateway.reconcile(expired).unwrap();
-        assert_eq!(receipt.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
             Some(NotDispatchedReason::ApprovalExpired)
@@ -5141,10 +5150,11 @@ mod tests {
 
     /// T7b (real PostgreSQL): approved, then the window expires before the
     /// dispatch. The claim closes it with the signed reason
-    /// `approval_expired`; nothing is executed.
+    /// `approved_claim_expired` (a human approved it), not `approval_expired`
+    /// (window closed without a decision); nothing is executed.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
-    fn postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approval_expired() {
+    fn postgres_t013b_t7b_approved_then_expired_before_dispatch_is_approved_claim_expired() {
         use praetore_gateway::{
             ApprovalError, ApprovalResolution, ExecutionStatus, GatewayError, NotDispatchedReason,
         };
@@ -5171,16 +5181,16 @@ mod tests {
         );
         assert_eq!(
             fx.closed_reason(key.request_id).as_deref(),
-            Some("approval_expired")
+            Some("approved_claim_expired")
         );
         let receipt = gateway.reconcile(key).unwrap();
         assert_eq!(
             receipt.execution_attestation.not_dispatched_reason,
-            Some(NotDispatchedReason::ApprovalExpired)
+            Some(NotDispatchedReason::ApprovedClaimExpired)
         );
         fx.verify(&receipt);
         let (reason, execution) = fx.verified_with_praetore_verify(&receipt);
-        assert_eq!(reason, "approval_expired");
+        assert_eq!(reason, "approved_claim_expired");
         assert_eq!(execution, "not_dispatched");
         assert_eq!(
             gateway.approval_resolution(key).unwrap(),

@@ -336,6 +336,36 @@ run while 0021 is recorded. The tests
 `postgres_journal_insert_rules_migration_rolls_back_and_applies_again` cover
 the rules (as a login member of `praetore_runtime`) and the rollback.
 
+Migration `0022_awaiting_approval_state` (T-016) lets the receipt of a held
+approval be signed in its own state. `execution_attestations` admits
+`execution_status = 'awaiting_approval'` (a receipt state only; the journal
+row stays `not_dispatched` with no reason), accepted on INSERT only while
+the row is `requires_approval` / `not_dispatched` with no reason, no failure
+class, no human decision and no expiration receipt, and with schema v5 in
+its JSON. A held row is attested only as `awaiting_approval`: an INSERT of
+`not_dispatched` with no reason on a `requires_approval` row is refused, and
+schema v5 is refused for every other state. Both reason vocabularies gain
+`approved_claim_expired`, written only when an `approved_pending_dispatch`
+row with an approve decision is closed because its dispatch was claimed
+after the window; a new `approval_expired` close of
+`approved_pending_dispatch` is refused (`approval_expired` now means the
+window closed without a decision). No row is rewritten: a held row written
+before 0022 keeps its existing attestation. `Gateway::reconcile` adds an
+`awaiting_approval` attestation (schema v5) next to it; starting the
+gateway, `praetore run`, and the published HTTP and CLI routes do not.
+Until that reconcile, the inherited v2 receipt still verifies as
+`final: false` (`awaiting_approval_or_legacy`). To undo 0022 alone,
+the schema owner runs
+[`docs/rollback/0022-awaiting-approval-state.sql`](rollback/0022-awaiting-approval-state.sql)
+with every gateway stopped; it refuses to run if 0022 is not recorded, if a
+newer migration is, or while any `awaiting_approval` attestation or
+`approved_claim_expired` row exists, which is the case once any request was
+held under 0022. Roll back 0022 before 0021. The tests
+`postgres_awaiting_approval_attestation_only_on_a_held_row`,
+`postgres_approved_claim_expired_needs_an_approve_decision` and
+`postgres_awaiting_approval_migration_rolls_back_and_applies_again` cover
+the rules and the rollback.
+
 #### TLS
 
 Every connection (gateway, CLI, `praetore-observe`) validates its URL before
@@ -966,7 +996,7 @@ provisioned production pin.
 
 `praetore-verify receipt --receipt receipt.json --execution-pin key.hex
 --key-id ID --evidence-attester-pin attester.hex --format json` verifies a
-gateway receipt's signed execution attestation (schema v1, v2, v3 or v4) and the
+gateway receipt's signed execution attestation (schema v1 to v5) and the
 embedded evidence's `attester_signature` against the pinned evidence attester
 key; a missing or invalid evidence signature fails with
 `RECEIPT_EVIDENCE_SIGNATURE_INVALID`. Both signatures must be exactly 128
@@ -974,7 +1004,8 @@ lowercase hex characters; uppercase or mixed case is rejected. The execution att
 evidence `context_hash`, which excludes that signature, so both checks are
 required. A v3 attestation carries
 `not_dispatched_reason` (`approval_expired`, `approval_rejected`,
-`dispatch_failed`, `crash_recovered` or `dispatch_refused`); unknown reasons
+`dispatch_failed`, `crash_recovered`, `dispatch_refused` or
+`approved_claim_expired`); unknown reasons
 fail with `RECEIPT_INVALID`, a reason that does not match the signature fails
 with `RECEIPT_SIGNATURE_INVALID`. A v4 attestation is a `failed` execution
 and carries `failure`: `{"class": "no_effect", "reason": CODE}` when the
@@ -985,30 +1016,32 @@ effect was attempted and may have left a partial residue. The gateway signs
 and `effect_failed` otherwise. `failure` on any other state, or a `failed`
 v4 attestation without it, fails with `RECEIPT_INVALID`; the verifier reports
 it as `details.failure` (null when absent). `failed` attestations signed
-before this field existed (v2) carry no classification. Like
+before this field existed (v2) carry no classification. A v5 attestation is
+the receipt of a held approval: `requires_approval`,
+`execution: "awaiting_approval"`, no reason, no output and no `failure`;
+any other v5 shape fails with `RECEIPT_INVALID`. Verifiers up to 0.3.3
+reject v5 and `approved_claim_expired` with `RECEIPT_INVALID`. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
 
 A receipt that verifies is not always final: a later receipt for the same
 request can record another state. The verifier reports `details.final` and
-`details.non_final_reason`, read from the signed attestation (the signed
-format is unchanged):
+`details.non_final_reason`, read from the signed attestation:
 
 | Signed state | `final` | `non_final_reason` |
 |---|---|---|
+| `awaiting_approval` (schema v5) | `false` | `awaiting_approval` |
 | `requires_approval`, `not_dispatched`, no `not_dispatched_reason` | `false` | `awaiting_approval_or_legacy` |
 | `outcome_unknown` | `false` | `outcome_unknown` |
-| `authorized`, `approved_pending_dispatch` or `dispatched` | `false` | `intermediate` |
 | any other state a receipt carries | `true` | `null` |
 
-`awaiting_approval_or_legacy` is the receipt returned with `202 Accepted`
-while a human approval is pending: the request may still be approved and
-executed, so it does not show that the action was never dispatched. Receipts
-signed before rejection and expiry carried a signed reason have the same
-shape and are reported the same way. `outcome_unknown` may later be resolved
-by reconciliation. `intermediate` is defensive: verification refuses a
-receipt in `authorized`, `approved_pending_dispatch` or `dispatched`, so a
-receipt that verifies never reports it; only `GatewayReceipt::non_final_reason()`
-in Rust, called on a receipt that was not verified, can return it. With `--require-final` such a receipt fails with
+`awaiting_approval` is the receipt returned with `202 Accepted` while a
+human approval is pending (schema v5): the request may still be approved
+and executed, so it does not show that the action was never dispatched, and
+a saved copy keeps saying `awaiting_approval` after the request ran.
+`awaiting_approval_or_legacy` is the same receipt written before schema v5;
+receipts signed before rejection and expiry carried a signed reason have
+the same shape and are reported the same way. `outcome_unknown` may later be resolved
+by reconciliation. With `--require-final` such a receipt fails with
 `RECEIPT_NOT_FINAL` (exit 1; the reason is written to stderr). A receipt whose
 signatures do not verify fails with its own code first. In Rust,
 `GatewayReceipt::is_final()` and `GatewayReceipt::non_final_reason()` apply

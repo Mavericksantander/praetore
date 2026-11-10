@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import unittest
 
@@ -139,11 +140,13 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
 
 
 class GatewayReceiptFinalityTests(unittest.TestCase):
-    """T-015: a receipt can verify and still describe a state that a later
+    """T-016: a receipt can verify and still describe a state that a later
     receipt for the same request changes."""
 
     KEY_ID = "test-execution-attester-v1"
     CASES = [
+        ("receipt-v5-awaiting-approval.json", False, "awaiting_approval"),
+        ("receipt-v3-approved-claim-expired.json", True, None),
         ("receipt-v2-awaiting-approval.json", False, "awaiting_approval_or_legacy"),
         ("receipt-v2-outcome-unknown.json", False, "outcome_unknown"),
         ("receipt-v3-approval-rejected.json", True, None),
@@ -192,6 +195,24 @@ class GatewayReceiptFinalityTests(unittest.TestCase):
                 args = (candidate, pin, self.KEY_ID, self.evidence_pin)
                 self.assertIsNone(praetore.gateway_receipt_finality(*args))
                 self.assertFalse(praetore.verify_final_gateway_receipt(*args))
+
+    def test_v5_receipt_names_awaiting_approval_and_resists_relabelling(self) -> None:
+        receipt = (FIXTURES / "receipt-v5-awaiting-approval.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(json.loads(receipt)["execution"], "awaiting_approval")
+        self.assertEqual(
+            json.loads(receipt)["execution_attestation"]["schema_version"], 5
+        )
+        relabelled = receipt.replace('"awaiting_approval"', '"not_dispatched"')
+        self.assertNotEqual(relabelled, receipt)
+        downgraded = relabelled.replace('"schema_version":5', '"schema_version":2')
+        self.assertNotEqual(downgraded, relabelled)
+        for candidate in (relabelled, downgraded):
+            with self.subTest(candidate=candidate[:40]):
+                self.assertFalse(praetore.verify_gateway_receipt(*self.args(candidate)))
+                self.assertIsNone(praetore.gateway_receipt_finality(*self.args(candidate)))
+
 
 class LegacyEvidenceVerificationTests(unittest.TestCase):
     """Receipts whose evidence predates ``decided_by`` (schema v1-v3) keep

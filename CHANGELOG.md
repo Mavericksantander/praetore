@@ -16,14 +16,14 @@
   `praetore init --dev-cooperative-exec` or
   `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` (local-demo adapter).
 - **`ExecutionJournal::record_human_approval` takes a `HumanDecisionRecord`
-  (T-015).** A rejection now carries its signed `approval_rejected` close and
+  (T-016).** A rejection now carries its signed `approval_rejected` close and
   the journal writes the decision and the close in one transaction; an
   approval carries no close. Action: custom journal implementations write
   both, or neither, as `PostgresExecutionJournal` does.
-- **`ExecutionAttestation::create` takes `observed_at` (T-015, `signing`
+- **`ExecutionAttestation::create` takes `observed_at` (T-016, `signing`
   feature).** Callers pass the time from their trusted clock; the gateway
   passes the engine's clock.
-- **praetore-mcp journal lines are hash-linked (T-015).** Each line of
+- **praetore-mcp journal lines are hash-linked (T-016).** Each line of
   `receipts/<date>.jsonl` is now `{"seq","prev","evidence"}`, the line
   format of `praetore_core::journal_chain`, instead of a bare evidence
   document. `praetore-mcp verify` checks the order (an entry removed,
@@ -34,14 +34,77 @@
   entries before the chain. Action: tools that read journal lines
   directly take the `evidence` member (see the praetore-mcp README).
 - **praetore-mcp no longer forwards unchecked client lines in observe
-  (T-015).** A line it cannot parse that may name a `safety*` tool, and any
+  (T-016).** A line it cannot parse that may name a `safety*` tool, and any
   line over 32 MiB, is refused in both modes. Other unparseable lines are
   still forwarded in observe, now with a warning that gives the SHA-256 and
   the length.
+- **The receipt of a held approval is signed as `awaiting_approval`
+  (T-016, schema v5).** The 202 response of a request that requires human
+  approval now carries `execution: "awaiting_approval"` (before:
+  `"not_dispatched"` with no reason), signed in execution attestation
+  schema v5. Schema v5 has exactly one shape: `requires_approval`, no
+  reason, no output, no failure. A saved 202 receipt keeps verifying as
+  `awaiting_approval` with `final: false` after the request was approved
+  and executed; it can no longer be read as a closed `not_dispatched`
+  request. `awaiting_approval` is a signed receipt state only, never a
+  journal state: `GatewayReceipt::execution` and
+  `ExecutionAttestation::execution` are now `AttestedExecution`
+  (`ExecutionStatus` remains the journal row state, and
+  `AttestedExecution::journal_status()` maps between them).
+  `NonFinalReason` gains `AwaitingApproval` and loses `Intermediate` (no
+  signed receipt carries an intermediate state). Action: HTTP clients that
+  match on the 202 `execution` field accept `awaiting_approval`; offline
+  verifiers are upgraded together with the gateway (see the table below).
+- **An approval claimed after its window closes as
+  `approved_claim_expired` (T-016).** New signed `not_dispatched_reason`
+  (schema v3) for an approved request whose single dispatch is claimed too
+  late. `approval_expired` now means only that the window closed without a
+  decision. Rows closed before this release keep `approval_expired`.
+- **Migration 0022 (`0022_awaiting_approval_state`).** Admits
+  `awaiting_approval` in `execution_attestations` (accepted only while the
+  journal row is held: `requires_approval`, `not_dispatched`, no reason, no
+  decision, no expiration receipt, schema v5; a held row is attested only as
+  `awaiting_approval`, and schema v5 is accepted for no other state), adds
+  `approved_claim_expired` to both reason vocabularies, and refuses a new
+  `approval_expired` close of `approved_pending_dispatch` and an
+  `approved_claim_expired` close without an approve decision. No row is
+  rewritten. A held row written before 0022 keeps its existing attestation.
+  `Gateway::reconcile` adds an `awaiting_approval` attestation (schema v5)
+  next to it; starting the gateway, `praetore run`, and the published HTTP
+  and CLI routes do not. Until that reconcile, the inherited v2 receipt
+  still verifies as `final: false` (`awaiting_approval_or_legacy`). Manual
+  rollback:
+  `docs/rollback/0022-awaiting-approval-state.sql`, refused while any
+  `awaiting_approval` or `approved_claim_expired` row exists (in practice,
+  once a request was held under 0022). The gateway never signs a held
+  request as `not_dispatched` with no reason: a held row with a decision or
+  an expiration and no signed close is reported as `InvalidRecord`.
+
+  | | praetore-verify / Python binding <= 0.3.3 | This release |
+  |---|---|---|
+  | Receipts v1 to v4 | verify | verify as before; pending v2 receipts and `outcome_unknown` report `final: false` |
+  | Receipt v5 (`awaiting_approval`) | rejected (`RECEIPT_INVALID`, `False`) | verifies, `final: false`, `non_final_reason: awaiting_approval` |
+  | Reason `approved_claim_expired` | rejected (`RECEIPT_INVALID`, `False`) | verifies, final |
+  | Rollback of 0022 | n/a | only while no `awaiting_approval` or `approved_claim_expired` row exists |
+
+  The <= 0.3.3 column is the receipts that release already knew. v0.3.3
+  rejects the later v3 reason `approval_rejected` (`RECEIPT_INVALID`).
+
+  A gateway or CLI built before this release refuses a database at 0022
+  (unknown migration version). This release applies 0022 to a database at
+  0021 with `praetore-gateway-demo migrate` (schema owner URL in
+  `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`), and `praetore run` also
+  applies pending migrations when it starts. A production gateway process
+  applies them on start only when that migration URL is set. Release 0.3.3
+  knows migrations up to 0019 and already refuses a database at 0020 or
+  0021. The offline verifiers do not open the database.
+
+  Older verifiers fail closed: they never accept a new receipt with another
+  meaning.
 
 ### Added
 
-- **Receipt finality in the verifiers (T-015).** `praetore-verify receipt`
+- **Receipt finality in the verifiers (T-016).** `praetore-verify receipt`
   reports `final` and `non_final_reason`: the receipt returned while a human
   approval is pending (`requires_approval`, `not_dispatched`, no signed
   reason; older receipts with that shape too) is reported as
@@ -54,7 +117,7 @@
 
 ### Changed
 
-- **Migration `0021_journal_insert_rules` (T-015).** The execution journal
+- **Migration `0021_journal_insert_rules` (T-016).** The execution journal
   accepts on INSERT only the initial states the gateway writes (`authorized`
   for `allowed`, `not_dispatched` otherwise, with no output, reason or
   failure class), and an execution attestation only for the journal row's
@@ -63,25 +126,25 @@
   `docs/rollback/0021-journal-insert-rules.sql`; the 0020 rollback now
   refuses to run while 0021 is applied.
 - **Execution attestations are timestamped with the engine's trusted clock
-  (T-015).** `observed_at` comes from the same clock as approval
+  (T-016).** `observed_at` comes from the same clock as approval
   expirations, not the host clock. When that clock is unavailable the gateway signs
   nothing and returns an error; an execution already dispatched stays
   `dispatched` until `reconcile` closes it.
-- **A human rejection and its signed close commit together (T-015).** The
+- **A human rejection and its signed close commit together (T-016).** The
   decision and the `approval_rejected` close are written in one
   transaction: when the write fails, neither is recorded and the request
   can still be decided. Rows written by earlier releases with a decision
   and no close are still repaired on the next read.
-- **Claude Code hook example fails closed when its binary fails (T-015).**
+- **Claude Code hook example fails closed when its binary fails (T-016).**
   `hook/praetore-hook.sh` no longer `exec`s the binary: a binary that cannot
   start, panics, is killed by a signal, exits with a status other than 0 or
   prints something other than a JSON object yields a `deny` decision. The
   binary turns a panic during authorization into a deny. The README
   registers the hook with `"onFailure": "block"` and a `timeout`.
-- **Claude Code hook example: `-c` in a group of short options (T-015).**
+- **Claude Code hook example: `-c` in a group of short options (T-016).**
   `bash -lc '...'`, `sh -ec '...'` and fish's `--command` are treated as
   `shell -c` (unanalyzable command).
-- **praetore-mcp fsyncs directories (T-015)** after creating a daily journal
+- **praetore-mcp fsyncs directories (T-016)** after creating a daily journal
   file or a directory, and after writing a new file, a backup or a renamed
   config or policy.
 - `praetore_core::journal_chain::receipt_link` is public, so other journals

@@ -4,10 +4,10 @@ use praetore_core::{
     canonical::canonicalize_json, replay::AtomicAuthorizationCommit,
 };
 use praetore_gateway::{
-    ApprovalChallenge, ApprovalExpiredReceipt, AuthorizationStatus, ExecutionAttestation,
-    ExecutionFailure, ExecutionJournal, ExecutionKey, ExecutionRecord, ExecutionStatus,
-    HumanApprovalDecision, HumanApprovalOutcome, HumanDecisionRecord, JournalError,
-    NotDispatchedReason, RefusalCode, action_digest, authority_tenant_id,
+    ApprovalChallenge, ApprovalExpiredReceipt, AttestedExecution, AuthorizationStatus,
+    ExecutionAttestation, ExecutionFailure, ExecutionJournal, ExecutionKey, ExecutionRecord,
+    ExecutionStatus, HumanApprovalDecision, HumanApprovalOutcome, HumanDecisionRecord,
+    JournalError, NotDispatchedReason, RefusalCode, action_digest, authority_tenant_id,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -118,9 +118,13 @@ impl AtomicAuthorizationCommit for PostgresExecutionJournal {
                       WHERE ea.tenant_id = execution_journal.tenant_id \
                         AND ea.agent_id = execution_journal.agent_id \
                         AND ea.request_id = execution_journal.request_id \
-                        AND ea.execution_status = execution_journal.execution_status \
-                    AND ea.not_dispatched_reason IS NOT DISTINCT FROM \
-                        execution_journal.not_dispatched_reason), \
+                        AND ((ea.execution_status = execution_journal.execution_status \
+                          AND ea.not_dispatched_reason IS NOT DISTINCT FROM \
+                              execution_journal.not_dispatched_reason) \
+                      OR (ea.execution_status = 'awaiting_approval' \
+                          AND execution_journal.execution_status = 'not_dispatched' \
+                          AND execution_journal.not_dispatched_reason IS NULL)) \
+                  ORDER BY ea.execution_status = 'awaiting_approval' DESC LIMIT 1), \
                      (SELECT decision_json FROM praetore.human_approvals ha \
                       WHERE ha.tenant_id = execution_journal.tenant_id \
                         AND ha.agent_id = execution_journal.agent_id \
@@ -335,7 +339,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 .validate_binding(
                     &evidence,
                     authorization,
-                    ExecutionStatus::NotDispatched,
+                    AttestedExecution::NotDispatched,
                     None,
                 )
                 .map_err(|_| JournalError::InvalidRecord)?;
@@ -393,7 +397,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
             insert_execution_attestation(
                 &mut transaction,
                 key,
-                ExecutionStatus::NotDispatched,
+                AttestedExecution::NotDispatched,
                 close_json,
             )?;
         } else if decision.outcome == HumanApprovalOutcome::Approve {
@@ -612,6 +616,10 @@ impl ExecutionJournal for PostgresExecutionJournal {
         if !is_terminal(execution) {
             return Err(JournalError::InvalidTransition);
         }
+        // The attestation must sign the state being written.
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
+        }
         // Every new `failed` row carries its signed classification (D-B1).
         if (execution == ExecutionStatus::Failed) != attestation.failure.is_some() {
             return Err(JournalError::InvalidRecord);
@@ -647,7 +655,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
         let authorization = super::execution::parse_authorization(&row.get::<_, String>(3))?;
         let evidence = Evidence::from_json(&evidence).map_err(|_| JournalError::InvalidRecord)?;
         attestation
-            .validate_binding(&evidence, authorization, execution, output)
+            .validate_binding(&evidence, authorization, attestation.execution, output)
             .map_err(|_| JournalError::InvalidRecord)?;
         if current == execution_as_db(execution) {
             let same_output = current_output.as_deref() == output_json.as_deref();
@@ -698,7 +706,12 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 ],
             )
             .map_err(|_| JournalError::Unavailable)?;
-        insert_execution_attestation(&mut transaction, key, execution, &attestation_json)?;
+        insert_execution_attestation(
+            &mut transaction,
+            key,
+            attestation.execution,
+            &attestation_json,
+        )?;
         transaction
             .commit()
             .map_err(|_| JournalError::Unavailable)?;
@@ -716,6 +729,11 @@ impl ExecutionJournal for PostgresExecutionJournal {
             // Only mark_not_dispatched_attested writes a closing reason, and
             // only record_terminal_attested a failure class.
             return Err(JournalError::InvalidTransition);
+        }
+        // An attestation belongs to its row's state (`awaiting_approval` to
+        // a held `not_dispatched` row).
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
         }
         let attestation_json =
             serialize_attestation(attestation).map_err(|_| JournalError::InvalidRecord)?;
@@ -754,7 +772,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
             return Err(JournalError::InvalidTransition);
         }
         attestation
-            .validate_binding(&evidence, authorization, execution, output)
+            .validate_binding(&evidence, authorization, attestation.execution, output)
             .map_err(|_| JournalError::InvalidRecord)?;
         if let Some(existing) = transaction
             .query_opt(
@@ -765,7 +783,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
                     &key.tenant_id,
                     &key.agent_id,
                     &key.request_id,
-                    &execution_as_db(execution),
+                    &attestation.execution.as_str(),
                 ],
             )
             .map_err(|_| JournalError::Unavailable)?
@@ -780,7 +798,12 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 .map_err(|_| JournalError::Unavailable)?;
             return result;
         }
-        insert_execution_attestation(&mut transaction, key, execution, &attestation_json)?;
+        insert_execution_attestation(
+            &mut transaction,
+            key,
+            attestation.execution,
+            &attestation_json,
+        )?;
         transaction
             .commit()
             .map_err(|_| JournalError::Unavailable)?;
@@ -802,9 +825,13 @@ impl ExecutionJournal for PostgresExecutionJournal {
                   WHERE ea.tenant_id = execution_journal.tenant_id \
                     AND ea.agent_id = execution_journal.agent_id \
                     AND ea.request_id = execution_journal.request_id \
-                    AND ea.execution_status = execution_journal.execution_status \
-                    AND ea.not_dispatched_reason IS NOT DISTINCT FROM \
-                        execution_journal.not_dispatched_reason), \
+                    AND ((ea.execution_status = execution_journal.execution_status \
+                          AND ea.not_dispatched_reason IS NOT DISTINCT FROM \
+                              execution_journal.not_dispatched_reason) \
+                      OR (ea.execution_status = 'awaiting_approval' \
+                          AND execution_journal.execution_status = 'not_dispatched' \
+                          AND execution_journal.not_dispatched_reason IS NULL)) \
+                  ORDER BY ea.execution_status = 'awaiting_approval' DESC LIMIT 1), \
                  (SELECT decision_json FROM praetore.human_approvals ha \
                   WHERE ha.tenant_id = execution_journal.tenant_id \
                     AND ha.agent_id = execution_journal.agent_id \
@@ -863,10 +890,10 @@ impl ExecutionJournal for PostgresExecutionJournal {
             Evidence::from_json(&evidence_json).map_err(|_| JournalError::InvalidRecord)?;
         // Allowed closes from Authorized without a reason or with
         // dispatch_refused. RequiresApproval closes from
-        // ApprovedPendingDispatch with a reason, or in place from a held
-        // NotDispatched: dispatch_refused while undecided, approval_rejected
-        // after a reject decision, approval_expired after the expiration
-        // receipt (0020).
+        // ApprovedPendingDispatch with a reason other than approval_expired
+        // (0022), or in place from a held NotDispatched: dispatch_refused
+        // while undecided, approval_rejected after a reject decision,
+        // approval_expired after the expiration receipt (0020).
         let from = match (authorization, attestation.not_dispatched_reason) {
             (AuthorizationStatus::Allowed, None)
             | (AuthorizationStatus::Allowed, Some(NotDispatchedReason::DispatchRefused)) => {
@@ -880,6 +907,11 @@ impl ExecutionJournal for PostgresExecutionJournal {
                 AuthorizationStatus::RequiresApproval,
                 Some(NotDispatchedReason::DispatchRefused | NotDispatchedReason::ApprovalExpired),
             ) if current == ExecutionStatus::NotDispatched => ExecutionStatus::NotDispatched,
+            // 0022: an approved request claimed too late closes as
+            // approved_claim_expired, never as approval_expired.
+            (AuthorizationStatus::RequiresApproval, Some(NotDispatchedReason::ApprovalExpired)) => {
+                return Err(JournalError::InvalidTransition);
+            }
             (AuthorizationStatus::RequiresApproval, Some(_)) => {
                 ExecutionStatus::ApprovedPendingDispatch
             }
@@ -889,7 +921,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
             .validate_binding(
                 &evidence,
                 authorization,
-                ExecutionStatus::NotDispatched,
+                AttestedExecution::NotDispatched,
                 None,
             )
             .map_err(|_| JournalError::InvalidRecord)?;
@@ -969,7 +1001,7 @@ impl ExecutionJournal for PostgresExecutionJournal {
         insert_execution_attestation(
             &mut transaction,
             key,
-            ExecutionStatus::NotDispatched,
+            AttestedExecution::NotDispatched,
             &attestation_json,
         )?;
         transaction
@@ -1008,9 +1040,13 @@ fn verify_authorization_pair(
               WHERE ea.tenant_id = execution_journal.tenant_id \
                 AND ea.agent_id = execution_journal.agent_id \
                 AND ea.request_id = execution_journal.request_id \
-                AND ea.execution_status = execution_journal.execution_status \
-                    AND ea.not_dispatched_reason IS NOT DISTINCT FROM \
-                        execution_journal.not_dispatched_reason), \
+                AND ((ea.execution_status = execution_journal.execution_status \
+                          AND ea.not_dispatched_reason IS NOT DISTINCT FROM \
+                              execution_journal.not_dispatched_reason) \
+                      OR (ea.execution_status = 'awaiting_approval' \
+                          AND execution_journal.execution_status = 'not_dispatched' \
+                          AND execution_journal.not_dispatched_reason IS NULL)) \
+                  ORDER BY ea.execution_status = 'awaiting_approval' DESC LIMIT 1), \
              (SELECT decision_json FROM praetore.human_approvals ha \
               WHERE ha.tenant_id = execution_journal.tenant_id \
                 AND ha.agent_id = execution_journal.agent_id \
@@ -1230,6 +1266,7 @@ fn not_dispatched_reason_as_db(reason: NotDispatchedReason) -> &'static str {
         NotDispatchedReason::DispatchFailed => "dispatch_failed",
         NotDispatchedReason::CrashRecovered => "crash_recovered",
         NotDispatchedReason::DispatchRefused => "dispatch_refused",
+        NotDispatchedReason::ApprovedClaimExpired => "approved_claim_expired",
     }
 }
 
@@ -1270,7 +1307,7 @@ fn serialize_attestation(attestation: &ExecutionAttestation) -> Result<Value, Jo
 fn insert_execution_attestation(
     transaction: &mut postgres::Transaction<'_>,
     key: ExecutionKey,
-    execution: ExecutionStatus,
+    execution: AttestedExecution,
     attestation: &Value,
 ) -> Result<(), JournalError> {
     transaction
@@ -1284,7 +1321,7 @@ fn insert_execution_attestation(
                 &key.tenant_id,
                 &key.agent_id,
                 &key.request_id,
-                &execution_as_db(execution),
+                &execution.as_str(),
                 attestation,
                 &attestation
                     .get("not_dispatched_reason")
