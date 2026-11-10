@@ -2174,7 +2174,7 @@ mod tests {
                 "INSERT INTO praetore.execution_journal \
                  (tenant_id, agent_id, request_id, request_digest, action_digest, \
                   authorization_status, execution_status, evidence_json) \
-                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'not_dispatched', '{}')",
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', '{}')",
                 &[&other_tenant, &agent, &request, &"ab".repeat(32)],
             )
             .unwrap();

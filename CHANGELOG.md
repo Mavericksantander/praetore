@@ -15,6 +15,14 @@
   only, with no guarantee about who performs an effect:
   `praetore init --dev-cooperative-exec` or
   `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` (local-demo adapter).
+- **`ExecutionJournal::record_human_approval` takes a `HumanDecisionRecord`
+  (T-015).** A rejection now carries its signed `approval_rejected` close and
+  the journal writes the decision and the close in one transaction; an
+  approval carries no close. Action: custom journal implementations write
+  both, or neither, as `PostgresExecutionJournal` does.
+- **`ExecutionAttestation::create` takes `observed_at` (T-015, `signing`
+  feature).** Callers pass the time from their trusted clock; the gateway
+  passes the engine's clock.
 - **praetore-mcp journal lines are hash-linked (T-015).** Each line of
   `receipts/<date>.jsonl` is now `{"seq","prev","evidence"}`, the line
   format of `praetore_core::journal_chain`, instead of a bare evidence
@@ -31,8 +39,39 @@
   still forwarded in observe, now with a warning that gives the SHA-256 and
   the length.
 
+### Added
+
+- **Receipt finality in the verifiers (T-015).** `praetore-verify receipt`
+  reports `final` and `non_final_reason`: the receipt returned while a human
+  approval is pending (`requires_approval`, `not_dispatched`, no signed
+  reason; older receipts with that shape too) is reported as
+  `awaiting_approval_or_legacy`, and `outcome_unknown` as `outcome_unknown`,
+  because a later receipt for the same request can record another state.
+  `--require-final` fails with `RECEIPT_NOT_FINAL` for them. Rust:
+  `GatewayReceipt::is_final()` and `non_final_reason()`; Python:
+  `verify_final_gateway_receipt` and `gateway_receipt_finality`. The signed
+  format and the result of signature verification are unchanged.
+
 ### Changed
 
+- **Migration `0021_journal_insert_rules` (T-015).** The execution journal
+  accepts on INSERT only the initial states the gateway writes (`authorized`
+  for `allowed`, `not_dispatched` otherwise, with no output, reason or
+  failure class), and an execution attestation only for the journal row's
+  current state, with the same reason, failure class and signed identity.
+  Rows written before 0021 are not rewritten. Manual rollback:
+  `docs/rollback/0021-journal-insert-rules.sql`; the 0020 rollback now
+  refuses to run while 0021 is applied.
+- **Execution attestations are timestamped with the engine's trusted clock
+  (T-015).** `observed_at` comes from the same clock as approval
+  expirations, not the host clock. When that clock is unavailable the gateway signs
+  nothing and returns an error; an execution already dispatched stays
+  `dispatched` until `reconcile` closes it.
+- **A human rejection and its signed close commit together (T-015).** The
+  decision and the `approval_rejected` close are written in one
+  transaction: when the write fails, neither is recorded and the request
+  can still be decided. Rows written by earlier releases with a decision
+  and no close are still repaired on the next read.
 - **Claude Code hook example fails closed when its binary fails (T-015).**
   `hook/praetore-hook.sh` no longer `exec`s the binary: a binary that cannot
   start, panics, is killed by a signal, exits with a status other than 0 or

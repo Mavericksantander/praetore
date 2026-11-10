@@ -11,13 +11,24 @@
 -- a schema without the failure columns can hold them. Afterwards only a release
 -- without 0020 can run against the database, or `praetore migrate` applies
 -- 0020 again. Rows closed as 'approval_expired' in place stay valid under
--- 0013.
+-- 0013. Migration 0021 reads the failure columns: roll it back first
+-- (docs/rollback/0021-journal-insert-rules.sql); this script refuses to run
+-- while a migration newer than 0020 is recorded.
 
 BEGIN;
 
 -- The constraint and trigger changes need ACCESS EXCLUSIVE on the tables:
 -- fail after 5 s instead of queueing every other session behind this one.
 SET LOCAL lock_timeout = '5s';
+
+DO $guard$
+BEGIN
+    IF EXISTS (SELECT 1 FROM praetore.schema_migrations
+               WHERE version > '0020_approval_close_reasons') THEN
+        RAISE EXCEPTION 'a migration newer than 0020 is recorded: roll it back first';
+    END IF;
+END
+$guard$;
 
 -- Guard (D-B1): refuse while any row carries a failure class. Validating a
 -- constraint scans every row, whatever the row level security policies.

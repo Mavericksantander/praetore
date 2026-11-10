@@ -513,7 +513,7 @@ mod tests {
             "INSERT INTO praetore.execution_journal \
              (tenant_id, agent_id, request_id, request_digest, action_digest, \
               authorization_status, execution_status, evidence_json, created_at) \
-             VALUES ($1, $2, $3, $4, $4, 'allowed', 'not_dispatched', $5, \
+             VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
                      COALESCE(($6::text)::timestamptz, clock_timestamp()))",
             &[
                 &tenant_id,

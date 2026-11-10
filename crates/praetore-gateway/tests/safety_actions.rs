@@ -26,7 +26,7 @@ use praetore_core::{
 use praetore_gateway::{
     ActionDispatcher, ApprovalExpiredReceipt, DispatchError, DispatchReport, ExecutionAttestation,
     ExecutionAttestationError, ExecutionAttestationSigner, ExecutionJournal, ExecutionKey,
-    ExecutionRecord, ExecutionStatus, Gateway, HumanApprovalDecision, JournalError, http_api,
+    ExecutionRecord, ExecutionStatus, Gateway, HumanDecisionRecord, JournalError, http_api,
 };
 use serde_json::{Value, json};
 use std::{
@@ -127,7 +127,7 @@ impl ExecutionJournal for DownJournal {
     fn record_human_approval(
         &self,
         _: ExecutionKey,
-        _: &HumanApprovalDecision,
+        _: HumanDecisionRecord<'_>,
         _: OffsetDateTime,
     ) -> Result<(), JournalError> {
         self.0.hit();

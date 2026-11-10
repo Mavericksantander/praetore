@@ -174,6 +174,7 @@ fn issue_receipt() -> DemoResult<(String, DemoPublicKeys)> {
         &evidence,
         AuthorizationStatus::Allowed,
         &AttestedOutcome::Executed(output.clone()),
+        engine.trusted_now()?,
         &signer,
     )?;
     let receipt = GatewayReceipt {

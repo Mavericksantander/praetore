@@ -20,8 +20,8 @@ use praetore_gateway::{
     ActionDispatcher, ApprovalError, AuthorizationStatus, DispatchError, DispatchReport,
     ExecutionAttestationError, ExecutionAttestationSigner, ExecutionFailure, ExecutionJournal,
     ExecutionKey, ExecutionRecord, ExecutionStatus, Gateway, GatewayError, HumanApprovalDecision,
-    HumanApprovalOutcome, HumanApprovalResult, HumanApprovalVerifier, JournalError,
-    NotDispatchedReason, ReconciliationReport, RefusalCode, authority_tenant_id,
+    HumanApprovalOutcome, HumanApprovalResult, HumanApprovalVerifier, HumanDecisionRecord,
+    JournalError, NotDispatchedReason, ReconciliationReport, RefusalCode, authority_tenant_id,
 };
 use praetore_gateway::{http_api, local_demo::LocalDemoDispatcher};
 use serde_json::{Value, json};
@@ -97,6 +97,21 @@ impl ExecutionAttestationSigner for TestExecutionAttester {
         self.sign_count.fetch_add(1, Ordering::SeqCst);
         Ok(self.signing_key.sign(message).to_bytes().to_vec())
     }
+}
+
+/// A signed `approval_rejected` close for a held request, for tests that
+/// call the journal directly.
+fn signed_rejection_close(evidence: &Evidence) -> praetore_gateway::ExecutionAttestation {
+    praetore_gateway::ExecutionAttestation::create(
+        evidence,
+        AuthorizationStatus::RequiresApproval,
+        &praetore_gateway::AttestedOutcome::NotDispatched(Some(
+            NotDispatchedReason::ApprovalRejected,
+        )),
+        FixedClock::try_new(NOW).unwrap().now(),
+        execution_attester().as_ref(),
+    )
+    .unwrap()
 }
 
 fn execution_attester() -> Arc<TestExecutionAttester> {
@@ -623,12 +638,13 @@ impl ExecutionJournal for MemoryJournal {
     fn record_human_approval(
         &self,
         key: ExecutionKey,
-        decision: &HumanApprovalDecision,
+        record: HumanDecisionRecord<'_>,
         now: OffsetDateTime,
     ) -> Result<(), JournalError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
         }
+        let decision = record.decision();
         let expires_at = OffsetDateTime::parse(
             &decision.challenge.expires_at,
             &time::format_description::well_known::Rfc3339,
@@ -658,7 +674,21 @@ impl ExecutionJournal for MemoryJournal {
         {
             return Err(JournalError::InvalidTransition);
         }
-        if decision.outcome == HumanApprovalOutcome::Approve {
+        // Like PostgreSQL: a rejection is closed with its signed reason in
+        // the same write as the decision.
+        if let Some(close) = record.rejection_close() {
+            let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
+            close
+                .validate_binding(
+                    evidence,
+                    AuthorizationStatus::RequiresApproval,
+                    ExecutionStatus::NotDispatched,
+                    None,
+                )
+                .map_err(|_| JournalError::InvalidRecord)?;
+            entry.states.push(ExecutionStatus::NotDispatched);
+            entry.execution_attestations.push(close.clone());
+        } else if decision.outcome == HumanApprovalOutcome::Approve {
             entry.states.push(ExecutionStatus::ApprovedPendingDispatch);
             entry.execution = ExecutionStatus::ApprovedPendingDispatch;
         }
@@ -2735,7 +2765,11 @@ mod saf10_full {
         *clock.lock().unwrap() += Duration::seconds(21);
         gateway.approval_resolution(key).unwrap();
         let now = *clock.lock().unwrap();
-        assert!(journal.record_human_approval(key, &decision, now).is_err());
+        assert!(
+            journal
+                .record_human_approval(key, HumanDecisionRecord::approve(&decision).unwrap(), now)
+                .is_err()
+        );
         let record = journal.get(key).unwrap().unwrap();
         assert!(record.human_approval.is_none());
         assert!(record.approval_expiration.is_some());
@@ -3111,6 +3145,126 @@ mod apd {
             Err(GatewayError::Approval(ApprovalError::NotPending))
         ));
         assert_eq!(tool.invocations(), 0);
+    }
+
+    /// The receipt the journal holds for `key`, as the gateway returns it.
+    fn stored_receipt(
+        journal: &MemoryJournal,
+        key: ExecutionKey,
+    ) -> praetore_gateway::GatewayReceipt {
+        let record = journal.get(key).unwrap().unwrap();
+        praetore_gateway::GatewayReceipt {
+            evidence: record.evidence,
+            authorization: record.authorization,
+            execution: record.execution,
+            output: record.output,
+            execution_attestation: record.execution_attestation.unwrap(),
+        }
+    }
+
+    /// Receipt finality fixtures: one committed receipt per finality case,
+    /// read by praetore-verify and the Python package. Regenerated only with
+    /// `UPDATE_FINALITY_RECEIPT_FIXTURES=1` (the older fixtures are left
+    /// untouched); by default the committed files must verify and report
+    /// the expected finality.
+    #[test]
+    fn finality_receipt_fixtures_for_external_verifiers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/praetore-python/tests/fixtures");
+        let key_id = "test-execution-attester-v1";
+        let public_key = execution_attester_public_key();
+        let evidence_key = EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap();
+        if std::env::var_os("UPDATE_FINALITY_RECEIPT_FIXTURES").is_some() {
+            // The 202 receipt of a held request.
+            let (_, key, _, journal, _, _) = clocked_fixture();
+            let awaiting = stored_receipt(&journal, key);
+            // Rejected by a human (signed approval_rejected).
+            let (gateway, key, _, _, approver_key, _) = clocked_fixture();
+            let decision = human_approval_decision(
+                gateway.approval_challenge(key).unwrap(),
+                HumanApprovalOutcome::Reject,
+                &approver_key,
+            );
+            let HumanApprovalResult::Rejected {
+                receipt: rejected, ..
+            } = gateway.resolve_human_approval(decision).unwrap()
+            else {
+                panic!("a rejection returns its receipt");
+            };
+            // Approved, claimed after the window (signed approval_expired).
+            let (gateway, key, _, journal, approver_key, clock) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            *clock.lock().unwrap() += Duration::seconds(21);
+            assert!(gateway.dispatch_approved(key).is_err());
+            let expired = stored_receipt(&journal, key);
+            // Approved, dispatched, adapter outcome unknown.
+            let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+            approve(&gateway, key, &approver_key);
+            tool.fail_after_write.store(true, Ordering::SeqCst);
+            let _ = gateway.dispatch_approved(key);
+            let unknown = stored_receipt(&journal, key);
+            for (name, receipt) in [
+                ("receipt-v2-awaiting-approval.json", &awaiting),
+                ("receipt-v3-approval-rejected.json", &*rejected),
+                ("receipt-v3-approval-expired.json", &expired),
+                ("receipt-v2-outcome-unknown.json", &unknown),
+            ] {
+                std::fs::write(dir.join(name), serde_json::to_string(receipt).unwrap()).unwrap();
+            }
+        }
+        for (name, schema, execution, reason, non_final) in [
+            (
+                "receipt-v2-awaiting-approval.json",
+                2,
+                ExecutionStatus::NotDispatched,
+                None,
+                Some(praetore_gateway::NonFinalReason::AwaitingApprovalOrLegacy),
+            ),
+            (
+                "receipt-v3-approval-rejected.json",
+                3,
+                ExecutionStatus::NotDispatched,
+                Some(NotDispatchedReason::ApprovalRejected),
+                None,
+            ),
+            (
+                "receipt-v3-approval-expired.json",
+                3,
+                ExecutionStatus::NotDispatched,
+                Some(NotDispatchedReason::ApprovalExpired),
+                None,
+            ),
+            (
+                "receipt-v2-outcome-unknown.json",
+                2,
+                ExecutionStatus::OutcomeUnknown,
+                None,
+                Some(praetore_gateway::NonFinalReason::OutcomeUnknown),
+            ),
+        ] {
+            let json = std::fs::read_to_string(dir.join(name)).unwrap();
+            let receipt = praetore_gateway::verify_gateway_receipt_json(
+                &json,
+                &public_key,
+                key_id,
+                &evidence_key,
+            )
+            .unwrap();
+            assert_eq!(receipt.authorization, AuthorizationStatus::RequiresApproval);
+            assert_eq!(
+                receipt.execution_attestation.schema_version, schema,
+                "{name}"
+            );
+            assert_eq!(receipt.execution, execution, "{name}");
+            assert_eq!(
+                receipt.execution_attestation.not_dispatched_reason, reason,
+                "{name}"
+            );
+            assert_eq!(receipt.non_final_reason(), non_final, "{name}");
+            assert_eq!(receipt.is_final(), non_final.is_none(), "{name}");
+        }
     }
 
     #[test]
@@ -4278,7 +4432,11 @@ fn terminal_preflight_refusal_while_held_closes_the_request_for_good() {
         ));
         assert!(
             journal
-                .record_human_approval(key, &decision, FixedClock::try_new(NOW).unwrap().now())
+                .record_human_approval(
+                    key,
+                    HumanDecisionRecord::approve(&decision).unwrap(),
+                    FixedClock::try_new(NOW).unwrap().now(),
+                )
                 .is_err()
         );
         assert!(gateway.dispatch_approved(key).is_err());
@@ -4657,6 +4815,7 @@ fn approval_refused_at_submission_is_closed_terminally_and_never_approvable() {
         &praetore_gateway::action_digest(&receipt.evidence.action).unwrap(),
     )
     .unwrap();
+    let close = signed_rejection_close(&journal.get(key).unwrap().unwrap().evidence);
     for outcome in [HumanApprovalOutcome::Approve, HumanApprovalOutcome::Reject] {
         let decision = human_approval_decision(challenge.clone(), outcome, &approver_key);
         assert!(matches!(
@@ -4665,9 +4824,14 @@ fn approval_refused_at_submission_is_closed_terminally_and_never_approvable() {
         ));
         // The journal itself refuses too (the SQL trigger in 0013 for
         // PostgreSQL), not only the gateway.
+        let write = match outcome {
+            HumanApprovalOutcome::Approve => HumanDecisionRecord::approve(&decision),
+            HumanApprovalOutcome::Reject => HumanDecisionRecord::reject(&decision, &close),
+        }
+        .unwrap();
         assert!(
             journal
-                .record_human_approval(key, &decision, FixedClock::try_new(NOW).unwrap().now())
+                .record_human_approval(key, write, FixedClock::try_new(NOW).unwrap().now())
                 .is_err()
         );
     }
@@ -5302,4 +5466,141 @@ fn ambiguous_dispatch_error_still_becomes_outcome_unknown() {
     fixture.tool.fail_after_write.store(true, Ordering::SeqCst);
     let receipt = fixture.gateway.execute(fixture.request).unwrap();
     assert_eq!(receipt.execution, ExecutionStatus::OutcomeUnknown);
+}
+
+/// Engine clock: every execution attestation is timestamped
+/// with the engine's trusted clock, never the host clock: the pending
+/// receipt, the rejection close, and the outcome of an approved dispatch.
+#[test]
+fn execution_attestations_are_timestamped_with_the_engine_clock() {
+    for outcome in [HumanApprovalOutcome::Reject, HumanApprovalOutcome::Approve] {
+        let captured_clock = Arc::new(Mutex::new(None));
+        let capture = captured_clock.clone();
+        let (gateway, request, tool, _journal, approver_key) =
+            approval_fixture_with_provider(move |clock| {
+                *capture.lock().unwrap() = Some(clock);
+                Arc::new(CurrentFreshness)
+            });
+        let clock = captured_clock.lock().unwrap().clone().unwrap();
+        let set = |offset: i64| {
+            let at = FixedClock::try_new(NOW).unwrap().now() + Duration::seconds(offset);
+            *clock.lock().unwrap() = at;
+            at.format(&Rfc3339).unwrap()
+        };
+
+        let pending_at = set(2);
+        let pending = gateway.execute(request.clone()).unwrap();
+        assert_eq!(pending.execution_attestation.observed_at, pending_at);
+        let key = ExecutionKey {
+            tenant_id: TEST_TENANT_ID,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        };
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            outcome,
+            &approver_key,
+        );
+        let decided_at = set(4);
+        let receipt = match gateway.resolve_human_approval(decision).unwrap() {
+            HumanApprovalResult::Rejected { receipt, .. } => *receipt,
+            HumanApprovalResult::ApprovedPendingDispatch { .. } => {
+                gateway.dispatch_approved(key).unwrap()
+            }
+        };
+        assert_eq!(receipt.execution_attestation.observed_at, decided_at);
+        receipt
+            .verify_with_test_evidence_attester(
+                &execution_attester_public_key(),
+                "test-execution-attester-v1",
+            )
+            .unwrap();
+        let invocations = usize::from(outcome == HumanApprovalOutcome::Approve);
+        assert_eq!(tool.invocations(), invocations);
+    }
+}
+
+/// Human decision shapes: the journal write of a decision can only be
+/// built in its legal shapes: an approval without a close, a rejection with
+/// the signed `approval_rejected` close of the same request.
+#[test]
+fn human_decision_record_admits_only_legal_shapes() {
+    let (gateway, request, _tool, journal, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let challenge = gateway.approval_challenge(key).unwrap();
+    let approve = human_approval_decision(
+        challenge.clone(),
+        HumanApprovalOutcome::Approve,
+        &approver_key,
+    );
+    let reject = human_approval_decision(challenge, HumanApprovalOutcome::Reject, &approver_key);
+    let evidence = journal.get(key).unwrap().unwrap().evidence;
+    let close = signed_rejection_close(&evidence);
+
+    assert!(HumanDecisionRecord::approve(&approve).is_some());
+    assert!(HumanDecisionRecord::approve(&reject).is_none());
+    let write = HumanDecisionRecord::reject(&reject, &close).unwrap();
+    assert_eq!(write.decision(), &reject);
+    assert!(write.rejection_close().is_some());
+    assert!(HumanDecisionRecord::reject(&approve, &close).is_none());
+
+    // A close with another reason, or for another request, is refused.
+    let refused = praetore_gateway::ExecutionAttestation::create(
+        &evidence,
+        AuthorizationStatus::RequiresApproval,
+        &praetore_gateway::AttestedOutcome::NotDispatched(Some(
+            NotDispatchedReason::DispatchRefused,
+        )),
+        FixedClock::try_new(NOW).unwrap().now(),
+        execution_attester().as_ref(),
+    )
+    .unwrap();
+    assert!(HumanDecisionRecord::reject(&reject, &refused).is_none());
+    let mut other_request = reject.clone();
+    other_request.challenge.request_id = uuid::Uuid::new_v4();
+    assert!(HumanDecisionRecord::reject(&other_request, &close).is_none());
+}
+
+/// Rejection and close in one transaction: a rejection is recorded with its
+/// close. When the journal refuses the write, neither the decision nor a
+/// close exists, and the request can still be decided.
+#[test]
+fn a_failed_rejection_write_records_nothing_and_can_be_retried() {
+    let (gateway, request, tool, journal, approver_key) = approval_fixture();
+    let key = pending_key(&gateway, request);
+    let decision = human_approval_decision(
+        gateway.approval_challenge(key).unwrap(),
+        HumanApprovalOutcome::Reject,
+        &approver_key,
+    );
+    journal.unavailable.store(true, Ordering::SeqCst);
+    assert!(gateway.resolve_human_approval(decision.clone()).is_err());
+    journal.unavailable.store(false, Ordering::SeqCst);
+    let record = journal.get(key).unwrap().unwrap();
+    assert!(record.human_approval.is_none());
+    assert_eq!(
+        record
+            .execution_attestation
+            .and_then(|attestation| attestation.not_dispatched_reason),
+        None
+    );
+
+    let HumanApprovalResult::Rejected { receipt, .. } =
+        gateway.resolve_human_approval(decision).unwrap()
+    else {
+        panic!("a rejection must return its receipt");
+    };
+    assert_eq!(
+        receipt.execution_attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::ApprovalRejected)
+    );
+    let record = journal.get(key).unwrap().unwrap();
+    assert!(record.human_approval.is_some());
+    assert_eq!(
+        record
+            .execution_attestation
+            .and_then(|attestation| attestation.not_dispatched_reason),
+        Some(NotDispatchedReason::ApprovalRejected)
+    );
+    assert_eq!(tool.invocations(), 0);
 }

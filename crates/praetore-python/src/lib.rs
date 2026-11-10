@@ -31,7 +31,8 @@ fn verify_evidence_attester_signature(evidence_json: &str, attester_public_key_h
 /// v2, v3 or v4) against a pinned execution key, and its evidence attester
 /// signature against a pinned evidence attester key. Unknown
 /// `not_dispatched_reason` values, unknown fields and bad or missing
-/// signatures return `false`. Historical only.
+/// signatures return `false`. Historical only. `true` does not mean the
+/// state is final: see [`gateway_receipt_finality`].
 #[pyfunction]
 fn verify_gateway_receipt(
     receipt_json: &str,
@@ -39,19 +40,73 @@ fn verify_gateway_receipt(
     key_id: &str,
     evidence_attester_public_key_hex: &str,
 ) -> bool {
-    let (Some(public_key), Some(evidence_attester)) = (
-        parse_public_key(execution_public_key_hex),
-        parse_public_key(evidence_attester_public_key_hex),
-    ) else {
-        return false;
-    };
+    verified_receipt(
+        receipt_json,
+        execution_public_key_hex,
+        key_id,
+        evidence_attester_public_key_hex,
+    )
+    .is_some()
+}
+
+/// Like [`verify_gateway_receipt`], and also requires the signed state to
+/// be final: `false` for a receipt returned while an approval is pending
+/// (or written before signed closing reasons existed) and for
+/// `outcome_unknown`, whose state a later receipt can change.
+#[pyfunction]
+fn verify_final_gateway_receipt(
+    receipt_json: &str,
+    execution_public_key_hex: &str,
+    key_id: &str,
+    evidence_attester_public_key_hex: &str,
+) -> bool {
+    verified_receipt(
+        receipt_json,
+        execution_public_key_hex,
+        key_id,
+        evidence_attester_public_key_hex,
+    )
+    .is_some_and(|receipt| receipt.is_final())
+}
+
+/// `None` unless the receipt verifies as in [`verify_gateway_receipt`];
+/// otherwise `(final, non_final_reason)`, where `non_final_reason` is
+/// `"awaiting_approval_or_legacy"`, `"outcome_unknown"`, `"intermediate"`
+/// or `None`, the same values `praetore-verify receipt` reports
+/// (`"intermediate"` is defensive: a receipt that verifies never carries
+/// those states). Historical only.
+#[pyfunction]
+fn gateway_receipt_finality(
+    receipt_json: &str,
+    execution_public_key_hex: &str,
+    key_id: &str,
+    evidence_attester_public_key_hex: &str,
+) -> Option<(bool, Option<&'static str>)> {
+    let reason = verified_receipt(
+        receipt_json,
+        execution_public_key_hex,
+        key_id,
+        evidence_attester_public_key_hex,
+    )?
+    .non_final_reason();
+    Some((reason.is_none(), reason.map(|reason| reason.as_str())))
+}
+
+fn verified_receipt(
+    receipt_json: &str,
+    execution_public_key_hex: &str,
+    key_id: &str,
+    evidence_attester_public_key_hex: &str,
+) -> Option<praetore_receipt::GatewayReceipt> {
+    let public_key = parse_public_key(execution_public_key_hex)?;
+    let evidence_attester = parse_public_key(evidence_attester_public_key_hex)?;
     praetore_receipt::verify_gateway_receipt_json(
         receipt_json,
         &public_key,
         key_id,
         &evidence_attester,
     )
-    .is_ok()
+    .ok()
 }
 
 fn parse_public_key(hex_value: &str) -> Option<VerifiedPublicKey> {
@@ -65,6 +120,8 @@ fn parse_public_key(hex_value: &str) -> Option<VerifiedPublicKey> {
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(verify_evidence_integrity, module)?)?;
     module.add_function(wrap_pyfunction!(verify_gateway_receipt, module)?)?;
+    module.add_function(wrap_pyfunction!(verify_final_gateway_receipt, module)?)?;
+    module.add_function(wrap_pyfunction!(gateway_receipt_finality, module)?)?;
     module.add_function(wrap_pyfunction!(
         verify_evidence_attester_signature,
         module
