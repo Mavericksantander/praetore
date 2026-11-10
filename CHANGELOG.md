@@ -15,6 +15,36 @@
   only, with no guarantee about who performs an effect:
   `praetore init --dev-cooperative-exec` or
   `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` (local-demo adapter).
+- **praetore-mcp journal lines are hash-linked (T-015).** Each line of
+  `receipts/<date>.jsonl` is now `{"seq","prev","evidence"}`, the line
+  format of `praetore_core::journal_chain`, instead of a bare evidence
+  document. `praetore-mcp verify` checks the order (an entry removed,
+  duplicated or reordered is reported), prints the journal head and accepts
+  `--expected-head HEX`. Lines written by earlier versions still verify as
+  unchained entries before the chain. Action: tools that read journal lines
+  directly take the `evidence` member (see the praetore-mcp README).
+- **praetore-mcp no longer forwards unchecked client lines in observe
+  (T-015).** A line it cannot parse that may name a `safety*` tool, and any
+  line over 32 MiB, is refused in both modes. Other unparseable lines are
+  still forwarded in observe, now with a warning that gives the SHA-256 and
+  the length.
+
+### Changed
+
+- **Claude Code hook example fails closed when its binary fails (T-015).**
+  `hook/praetore-hook.sh` no longer `exec`s the binary: a binary that cannot
+  start, panics, is killed by a signal, exits with a status other than 0 or
+  prints something other than a JSON object yields a `deny` decision. The
+  binary turns a panic during authorization into a deny. The README
+  registers the hook with `"onFailure": "block"` and a `timeout`.
+- **Claude Code hook example: `-c` in a group of short options (T-015).**
+  `bash -lc '...'`, `sh -ec '...'` and fish's `--command` are treated as
+  `shell -c` (unanalyzable command).
+- **praetore-mcp fsyncs directories (T-015)** after creating a daily journal
+  file or a directory, and after writing a new file, a backup or a renamed
+  config or policy.
+- `praetore_core::journal_chain::receipt_link` is public, so other journals
+  link receipts with the same function.
 
 ## 0.3.3 - 2026-11-03
 
