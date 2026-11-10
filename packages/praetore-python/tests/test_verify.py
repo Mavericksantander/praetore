@@ -140,7 +140,7 @@ class GatewayReceiptVerificationTests(unittest.TestCase):
 
 
 class GatewayReceiptFinalityTests(unittest.TestCase):
-    """T-015: a receipt can verify and still describe a state that a later
+    """T-016: a receipt can verify and still describe a state that a later
     receipt for the same request changes."""
 
     KEY_ID = "test-execution-attester-v1"

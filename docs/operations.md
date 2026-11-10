@@ -342,14 +342,17 @@ approval be signed in its own state. `execution_attestations` admits
 row stays `not_dispatched` with no reason), accepted on INSERT only while
 the row is `requires_approval` / `not_dispatched` with no reason, no failure
 class, no human decision and no expiration receipt, and with schema v5 in
-its JSON. Both reason vocabularies gain `approved_claim_expired`, written
-only when an `approved_pending_dispatch` row with an approve decision is
-closed because its dispatch was claimed after the window; a new
-`approval_expired` close of `approved_pending_dispatch` is refused
-(`approval_expired` now means the window closed without a decision). No row
-is rewritten: a held row written before 0022 gets an `awaiting_approval`
-attestation next to its old one when the gateway next reads it. To undo 0022
-alone, the schema owner runs
+its JSON. A held row is attested only as `awaiting_approval`: an INSERT of
+`not_dispatched` with no reason on a `requires_approval` row is refused, and
+schema v5 is refused for every other state. Both reason vocabularies gain
+`approved_claim_expired`, written only when an `approved_pending_dispatch`
+row with an approve decision is closed because its dispatch was claimed
+after the window; a new `approval_expired` close of
+`approved_pending_dispatch` is refused (`approval_expired` now means the
+window closed without a decision). No row is rewritten: a held row written
+before 0022 keeps its old attestation and gets an `awaiting_approval`
+attestation next to it when the gateway next reads it. To undo 0022 alone,
+the schema owner runs
 [`docs/rollback/0022-awaiting-approval-state.sql`](rollback/0022-awaiting-approval-state.sql)
 with every gateway stopped; it refuses to run if 0022 is not recorded, if a
 newer migration is, or while any `awaiting_approval` attestation or

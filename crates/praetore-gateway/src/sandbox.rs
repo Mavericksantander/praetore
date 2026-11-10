@@ -1547,8 +1547,7 @@ mod tests {
         assert!(no_temp_files(&dirs.root));
     }
 
-    /// Review finding 5: mode and owner are re-validated on every
-    /// operation, not only at open.
+    /// Mode and owner are re-validated on every operation, not only at open.
     #[test]
     fn root_mode_changed_after_open_fails_closed() {
         let dirs = dirs();
@@ -1568,7 +1567,7 @@ mod tests {
         ));
     }
 
-    /// Review finding 5 (macOS): an extended ACL can grant write access the
+    /// On macOS, an extended ACL can grant write access the
     /// mode bits do not show; it is refused at open and on every operation.
     #[cfg(target_os = "macos")]
     #[test]
@@ -1604,7 +1603,7 @@ mod tests {
         assert!(d.preflight(&write("a.txt", "x")).is_ok());
     }
 
-    /// Review finding 6: the reserved prefix is matched case-insensitively
+    /// The reserved prefix is matched case-insensitively
     /// (case-insensitive APFS), and leftovers are swept at open without
     /// following symlinks.
     #[test]

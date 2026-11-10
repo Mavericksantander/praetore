@@ -1741,6 +1741,14 @@ impl Gateway {
 
         let outcome = match (record.execution, record.output.clone()) {
             (ExecutionStatus::NotDispatched, None) if awaiting => AttestedOutcome::AwaitingApproval,
+            // A held request with a decision or an expiration but no signed
+            // close is inconsistent: it is never signed as `not_dispatched`
+            // with no reason, the form of a denied request.
+            (ExecutionStatus::NotDispatched, None)
+                if record.authorization == AuthorizationStatus::RequiresApproval =>
+            {
+                return Err(GatewayError::Journal(JournalError::InvalidRecord));
+            }
             (ExecutionStatus::NotDispatched, None) => AttestedOutcome::NotDispatched(None),
             (ExecutionStatus::Executed, Some(output)) => AttestedOutcome::Executed(output),
             (ExecutionStatus::Confirmed, Some(output)) => AttestedOutcome::Confirmed(output),

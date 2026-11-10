@@ -7744,7 +7744,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     );
 }
 
-/// T-015 (migration 0021): as a LOGIN member of `praetore_runtime`, the
+/// T-016 (migration 0021): as a LOGIN member of `praetore_runtime`, the
 /// journal accepts on INSERT only the initial states the gateway writes,
 /// and an attestation only for the journal row's current state with the
 /// same reason, class and signed identity. Covers the INSERT shapes the
@@ -7940,13 +7940,42 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
         );
     }
 
-    // Accepted: an attestation for the row's current state, matching it.
+    // Accepted: an attestation for the row's current state, matching it. A
+    // held row is attested only as awaiting_approval (schema version 5).
+    let mut awaiting = attestation(request(2), "requires_approval", "awaiting_approval");
+    awaiting["schema_version"] = json!(5);
     assert_eq!(
+        attestation_insert(&mut client, request(2), "awaiting_approval", &awaiting).unwrap(),
+        1
+    );
+    // A held row is not attested as not_dispatched with no reason.
+    refused_by(
         attestation_insert(
             &mut client,
             request(2),
             "not_dispatched",
             &attestation(request(2), "requires_approval", "not_dispatched"),
+        )
+        .map(drop),
+        mismatch,
+        "held row as not_dispatched with no reason",
+    );
+    // Schema version 5 is used only by awaiting_approval (checked before
+    // the row has any attestation, so only the trigger can refuse it).
+    let mut denied_v5 = attestation(request(3), "denied", "not_dispatched");
+    denied_v5["schema_version"] = json!(5);
+    refused_by(
+        attestation_insert(&mut client, request(3), "not_dispatched", &denied_v5).map(drop),
+        mismatch,
+        "schema version 5 on a denied row",
+    );
+    // Accepted: a denied row is attested as not_dispatched with no reason.
+    assert_eq!(
+        attestation_insert(
+            &mut client,
+            request(3),
+            "not_dispatched",
+            &attestation(request(3), "denied", "not_dispatched"),
         )
         .unwrap(),
         1
@@ -8102,10 +8131,12 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
             .unwrap();
         (row.get(0), row.get(1), row.get(2))
     };
-    assert_eq!(counts, (3, 1, 3));
+    // Two accepted attestations: awaiting_approval on the held row and
+    // not_dispatched on the denied row.
+    assert_eq!(counts, (3, 2, 3));
 }
 
-/// T-015: migration 0021 up, down and up again, in its own database. The
+/// T-016: migration 0021 up, down and up again, in its own database. The
 /// documented rollback removes only its two triggers and functions, after
 /// which the INSERT of P1 is accepted again; it refuses to run twice; and
 /// applying 0021 again leaves a current schema that refuses it.
@@ -9779,8 +9810,10 @@ fn postgres_saved_202_receipt_stays_awaiting_approval_after_execution() {
 /// not_dispatched, no reason, no decision, no expiration receipt) and with
 /// schema v5. It is refused after an approve or reject decision, after the
 /// window expired, on an allowed row, and with another schema or a reason.
-/// A held row signed before v5 is signed again as `awaiting_approval` on
-/// read, next to its old attestation.
+/// A held row is not attested as `not_dispatched` with no reason, and
+/// schema v5 is refused outside `awaiting_approval`. A held row signed
+/// before v5 (stored with the triggers off) is signed again as
+/// `awaiting_approval` on read, next to its old attestation.
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
@@ -9836,8 +9869,8 @@ fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
         );
     }
     // A pre-v5 attestation of the held shape (v2 not_dispatched, no reason)
-    // is still accepted, and the gateway signs `awaiting_approval` next to
-    // it when it reads the row.
+    // is refused on insert: a held row is attested only as
+    // awaiting_approval.
     let legacy = praetore_gateway::ExecutionAttestation::create(
         &pending.evidence,
         praetore_gateway::AuthorizationStatus::RequiresApproval,
@@ -9846,9 +9879,47 @@ fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
         execution_attester().as_ref(),
     )
     .unwrap();
-    connect_journal()
-        .record_attestation(held_key, ExecutionStatus::NotDispatched, None, &legacy)
-        .unwrap();
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    refused_with(
+        insert_raw_attestation(held_key, "not_dispatched", &legacy_json),
+        mismatch,
+        "held row as v2 not_dispatched with no reason",
+    );
+    // Nor with schema version 5 outside awaiting_approval.
+    let mut legacy_v5 = legacy_json.clone();
+    legacy_v5["schema_version"] = 5.into();
+    refused_with(
+        insert_raw_attestation(held_key, "not_dispatched", &legacy_v5),
+        mismatch,
+        "held row as v5 not_dispatched",
+    );
+    assert!(stored_attestations(held_key).is_empty());
+    // A row written before 0022 can still carry it: stored with the
+    // triggers off, the gateway signs `awaiting_approval` next to it when
+    // it reads the row.
+    {
+        let mut client = connect_client();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .batch_execute("SET LOCAL session_replication_role = replica")
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO praetore.execution_attestations \
+                 (attestation_id, tenant_id, agent_id, request_id, execution_status, \
+                  attestation_json) \
+                 VALUES ($1, $2, $3, $4, 'not_dispatched', $5::jsonb)",
+                &[
+                    &Uuid::new_v4(),
+                    &held_key.tenant_id,
+                    &held_key.agent_id,
+                    &held_key.request_id,
+                    &legacy_json,
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+    }
     assert_eq!(
         stored_attestations(held_key),
         vec![("not_dispatched".to_owned(), None, 2)]
@@ -9968,6 +10039,15 @@ fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
         request_id: allowed.evidence.request_id,
     };
     let mut allowed_json = serde_json::to_value(&allowed.execution_attestation).unwrap();
+    let allowed_status = allowed_json["execution"].as_str().unwrap().to_owned();
+    // The row's own state with schema version 5 is refused too.
+    let mut allowed_v5 = allowed_json.clone();
+    allowed_v5["schema_version"] = 5.into();
+    refused_with(
+        insert_raw_attestation(allowed_key, &allowed_status, &allowed_v5),
+        mismatch,
+        "allowed row, its own state with schema v5",
+    );
     allowed_json["execution"] = "awaiting_approval".into();
     allowed_json["schema_version"] = 5.into();
     allowed_json["output_digest"] = Value::Null;

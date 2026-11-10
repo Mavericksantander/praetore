@@ -285,6 +285,9 @@ struct MemoryJournal {
     /// SAF-10 test hook: once an expiration receipt is stored, reads of that
     /// record fail as if the stored receipt were unreadable.
     unreadable_expiration: AtomicBool,
+    /// The next `claim_dispatch` fails with `ApprovalExpired`, as when the
+    /// approval expires between the engine's check and the claim.
+    claim_expired_once: AtomicBool,
 }
 
 impl MemoryJournal {
@@ -720,6 +723,9 @@ impl ExecutionJournal for MemoryJournal {
     fn claim_dispatch(&self, key: ExecutionKey, now: OffsetDateTime) -> Result<(), JournalError> {
         if self.unavailable.load(Ordering::SeqCst) {
             return Err(JournalError::Unavailable);
+        }
+        if self.claim_expired_once.swap(false, Ordering::SeqCst) {
+            return Err(JournalError::ApprovalExpired);
         }
         let mut entries = self.entries.lock().map_err(|_| JournalError::Unavailable)?;
         let entry = entries
@@ -3465,6 +3471,68 @@ mod apd {
             record.execution_attestation.unwrap().not_dispatched_reason,
             Some(NotDispatchedReason::ApprovedClaimExpired)
         );
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// T-016: when the journal's claim reports the approval expired (the
+    /// engine's check passed just before), the approved request is closed
+    /// with the signed reason `approved_claim_expired` and never invoked.
+    #[test]
+    fn journal_claim_expiry_closes_as_approved_claim_expired() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        journal.claim_expired_once.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            gateway.dispatch_approved(key),
+            Err(GatewayError::Approval(ApprovalError::Expired))
+        ));
+        assert!(!journal.claim_expired_once.load(Ordering::SeqCst));
+        let record = journal.get(key).unwrap().unwrap();
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert!(record.approval_expiration.is_none());
+        let close = record.execution_attestation.unwrap();
+        assert_eq!(close.execution, AttestedExecution::NotDispatched);
+        assert_eq!(
+            close.not_dispatched_reason,
+            Some(NotDispatchedReason::ApprovedClaimExpired)
+        );
+        let receipt = gateway.reconcile(key).unwrap();
+        assert_eq!(
+            receipt.execution_attestation.not_dispatched_reason,
+            Some(NotDispatchedReason::ApprovedClaimExpired)
+        );
+        assert!(receipt.is_final());
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// T-016: a held request with a decision but no signed close (a state
+    /// no journal transition produces) is never signed as `not_dispatched`
+    /// with no reason: reading it fails with `InvalidRecord` and stores
+    /// nothing new.
+    #[test]
+    fn held_request_with_a_decision_and_no_close_is_not_signed() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        approve(&gateway, key, &approver_key);
+        let attestations_before = {
+            let mut entries = journal.entries.lock().unwrap();
+            let entry = entries.get_mut(&key).unwrap();
+            entry.execution = ExecutionStatus::NotDispatched;
+            entry.execution_attestations.len()
+        };
+        assert!(matches!(
+            gateway.reconcile(key),
+            Err(GatewayError::Journal(JournalError::InvalidRecord))
+        ));
+        let entries = journal.entries.lock().unwrap();
+        let entry = entries.get(&key).unwrap();
+        assert_eq!(entry.execution_attestations.len(), attestations_before);
+        assert!(
+            entry
+                .execution_attestations
+                .iter()
+                .all(|attestation| attestation.execution != AttestedExecution::NotDispatched)
+        );
+        drop(entries);
         assert_eq!(tool.invocations(), 0);
     }
 

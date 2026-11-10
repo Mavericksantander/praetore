@@ -304,7 +304,13 @@ BEGIN
         state_matches := NEW.execution_status = journal.execution_status
             AND NEW.not_dispatched_reason IS NOT DISTINCT FROM journal.not_dispatched_reason
             AND NEW.failure_class IS NOT DISTINCT FROM journal.failure_class
-            AND NEW.failure_reason IS NOT DISTINCT FROM journal.failure_reason;
+            AND NEW.failure_reason IS NOT DISTINCT FROM journal.failure_reason
+            -- A held row is attested only as awaiting_approval, and schema
+            -- version 5 is used only by awaiting_approval.
+            AND NOT (journal.authorization_status = 'requires_approval'
+                AND NEW.execution_status = 'not_dispatched'
+                AND NEW.not_dispatched_reason IS NULL)
+            AND NEW.attestation_json -> 'schema_version' IS DISTINCT FROM '5'::jsonb;
     END IF;
 
     IF NOT COALESCE(

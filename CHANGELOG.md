@@ -63,23 +63,31 @@
 - **Migration 0022 (`0022_awaiting_approval_state`).** Admits
   `awaiting_approval` in `execution_attestations` (accepted only while the
   journal row is held: `requires_approval`, `not_dispatched`, no reason, no
-  decision, no expiration receipt, schema v5), adds `approved_claim_expired`
-  to both reason vocabularies, and refuses a new `approval_expired` close of
-  `approved_pending_dispatch` and an `approved_claim_expired` close without
-  an approve decision. No row is rewritten; a held row written before 0022
-  gets an `awaiting_approval` attestation in addition when the gateway next
-  reads it. Manual rollback: `docs/rollback/0022-awaiting-approval-state.sql`,
-  refused while any `awaiting_approval` or `approved_claim_expired` row
-  exists (in practice, once a request was held under 0022).
+  decision, no expiration receipt, schema v5; a held row is attested only as
+  `awaiting_approval`, and schema v5 is accepted for no other state), adds
+  `approved_claim_expired` to both reason vocabularies, and refuses a new
+  `approval_expired` close of `approved_pending_dispatch` and an
+  `approved_claim_expired` close without an approve decision. No row is
+  rewritten; a held row written before 0022 gets an `awaiting_approval`
+  attestation in addition when the gateway next reads it. Manual rollback:
+  `docs/rollback/0022-awaiting-approval-state.sql`, refused while any
+  `awaiting_approval` or `approved_claim_expired` row exists (in practice,
+  once a request was held under 0022). The gateway never signs a held
+  request as `not_dispatched` with no reason: a held row with a decision or
+  an expiration and no signed close is reported as `InvalidRecord`.
 
   | | praetore-verify / Python binding <= 0.3.3 | This release |
   |---|---|---|
   | Receipts v1 to v4 | verify | verify as before; pending v2 receipts and `outcome_unknown` report `final: false` |
   | Receipt v5 (`awaiting_approval`) | rejected (`RECEIPT_INVALID`, `False`) | verifies, `final: false`, `non_final_reason: awaiting_approval` |
   | Reason `approved_claim_expired` | rejected (`RECEIPT_INVALID`, `False`) | verifies, final |
-  | Database at 0021 | runs | `praetore migrate` applies 0022 |
-  | Database at 0022 | refused (newer schema) | runs |
   | Rollback of 0022 | n/a | only while no `awaiting_approval` or `approved_claim_expired` row exists |
+
+  A gateway or CLI built before this release refuses a database at 0022
+  (unknown migration version); `praetore migrate` from this release applies
+  0022 to a database at 0021. Release 0.3.3 knows migrations up to 0019 and
+  already refuses a database at 0020 or 0021. The offline verifiers do not
+  open the database.
 
   Older verifiers fail closed: they never accept a new receipt with another
   meaning.
