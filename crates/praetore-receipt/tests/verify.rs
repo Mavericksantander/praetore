@@ -786,7 +786,8 @@ fn accepts_the_v5_awaiting_approval_receipt_as_not_final() {
 #[test]
 fn rejects_every_other_v5_shape_even_when_signed() {
     let v5 = "receipt-v5-awaiting-approval.json";
-    let mut cases: Vec<(&str, Box<dyn FnOnce(&mut serde_json::Value)>)> = Vec::new();
+    type Edit = Box<dyn FnOnce(&mut serde_json::Value)>;
+    let mut cases: Vec<(&str, Edit)> = Vec::new();
     for reason in [
         "approval_expired",
         "approval_rejected",
