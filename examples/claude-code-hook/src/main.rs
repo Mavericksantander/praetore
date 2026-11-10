@@ -2243,7 +2243,7 @@ mod tests {
 
     use super::*;
 
-    /// Hallazgo 13: a panic while authorizing becomes an error, which
+    /// Panic handling: a panic while authorizing becomes an error, which
     /// `run_hook` turns into a deny on stdout.
     #[test]
     fn a_panic_while_authorizing_becomes_an_error() {

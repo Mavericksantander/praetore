@@ -1,4 +1,4 @@
-//! Hallazgo 13: `hook/praetore-hook.sh` fails closed. Whatever happens to
+//! Wrapper fails closed: `hook/praetore-hook.sh` denies on any failure. Whatever happens to
 //! the binary (it cannot start, panics, is killed by a signal, prints
 //! something that is not a decision), the wrapper prints a deny decision and
 //! exits 0. The binary is replaced by test doubles; the wrapper runs under

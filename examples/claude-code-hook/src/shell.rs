@@ -363,7 +363,7 @@ mod tests {
             "sudo $G push",
             "bash -c 'git push'",
             "sh -c \"git push\"",
-            // M3: `-c` grouped with other short options, and fish's long form.
+            // `-c` grouped with other short options, and fish's long form.
             "bash -lc 'git push'",
             "sh -ec 'git push'",
             "bash -l -c 'git push'",

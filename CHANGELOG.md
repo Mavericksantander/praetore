@@ -20,8 +20,10 @@
   format of `praetore_core::journal_chain`, instead of a bare evidence
   document. `praetore-mcp verify` checks the order (an entry removed,
   duplicated or reordered is reported), prints the journal head and accepts
-  `--expected-head HEX`. Lines written by earlier versions still verify as
-  unchained entries before the chain. Action: tools that read journal lines
+  `--expected-head HEX`. Entries removed at the end of the journal are only
+  detected with `--expected-head` against a head kept elsewhere; the chain
+  has no key. Lines written by earlier versions still verify as unchained
+  entries before the chain. Action: tools that read journal lines
   directly take the `evidence` member (see the praetore-mcp README).
 - **praetore-mcp no longer forwards unchecked client lines in observe
   (T-015).** A line it cannot parse that may name a `safety*` tool, and any

@@ -566,8 +566,8 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     match report.head {
         Some(head) => println!(
-            "journal head: {} chained entries, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
-            head.seq, head.prev, report.unchained
+            "journal head: {} chained entries present, next seq {}, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
+            report.chained, head.seq, head.prev, report.unchained
         ),
         None => println!(
             "journal head: none ({} chained, {} unchained entries)",

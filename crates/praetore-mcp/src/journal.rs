@@ -296,8 +296,10 @@ impl ChainCheck {
         self.head = None;
     }
 
-    /// Number of chained entries and the link after the last one, to keep
-    /// somewhere else and compare later. `None` if the last entry could not
+    /// Position after the last chained entry: the next `seq` (the last
+    /// entry's `seq` + 1, which is not the number of entries present when
+    /// some were removed; see `chained`) and the link to keep somewhere else
+    /// and compare later. `None` if the last entry could not
     /// be linked or there is no chained entry.
     pub fn head(&self) -> Option<Position> {
         self.head

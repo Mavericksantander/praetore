@@ -914,7 +914,7 @@ mod tests {
         assert!(out.warnings[0].contains("could NOT be written"));
     }
 
-    /// Test 24d: observe forwards an unparseable line, but never silently:
+    /// Unparseable client lines: observe forwards an unparseable line, but never silently:
     /// the warning names the reason, the SHA-256 and the length.
     #[test]
     fn unparseable_lines_refused_in_enforce_forwarded_with_warning_in_observe() {
@@ -950,7 +950,7 @@ mod tests {
         .into_bytes()
     }
 
-    /// Hallazgo 11: JSON that other parsers accept and this one rejects.
+    /// Lenient JSON: JSON that other parsers accept and this one rejects.
     /// For an ordinary tool, observe forwards with a warning and enforce
     /// refuses; the evaluator is never called (no reading to evaluate).
     #[test]
@@ -993,7 +993,7 @@ mod tests {
         }
     }
 
-    /// Hallazgo 11 / G7: a malformed line that may name a `safety*` tool is
+    /// Safety tool names in unparseable lines: a malformed line that may name a `safety*` tool is
     /// refused in both modes, never forwarded, and never evaluated.
     #[test]
     fn lenient_json_naming_a_safety_tool_is_refused_in_both_modes() {

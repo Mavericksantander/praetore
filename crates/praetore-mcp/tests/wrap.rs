@@ -1288,7 +1288,7 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
         .expect("mission action")
 }
 
-/// Hallazgo 11, end to end in observe: lines the proxy cannot parse are
+/// Unparseable client lines, end to end in observe: lines the proxy cannot parse are
 /// never forwarded silently. An ordinary tool call with a duplicate key is
 /// forwarded with a warning; an undeclared `safety:halt` with a duplicate
 /// key is refused and never reaches the server.
@@ -1369,7 +1369,7 @@ fn head_of(report: &str) -> String {
     report[start..start + 64].to_owned()
 }
 
-/// Hallazgo 12: the journal is a hash chain. Every entry carries `seq` and
+/// Journal order: the journal is a hash chain. Every entry carries `seq` and
 /// `prev`, and `verify` reports a removed, duplicated or reordered entry,
 /// and (against a head kept elsewhere) entries removed at the end.
 #[test]
@@ -1531,7 +1531,7 @@ fn torn_journal_tail_refuses_in_enforce() {
     assert!(!stderr.contains("EXECUTED"), "{stderr}");
 }
 
-/// Hallazgo 11: a client line over 32 MiB is not parsed, so it cannot be
+/// Oversized client lines: a client line over 32 MiB is not parsed, so it cannot be
 /// checked for a `safety*` tool; it is refused in observe too, and the
 /// traffic after it still flows.
 #[test]
@@ -1552,4 +1552,20 @@ fn oversized_lines_are_refused_in_observe_too() {
         false
     );
     assert!(responses.iter().all(|r| r["id"] != "big"));
+}
+
+/// The head line counts the chained entries present in the journal, not the
+/// sequence number after the last one: with a middle entry removed, three
+/// entries written leave two present.
+#[test]
+fn verify_counts_the_chained_entries_present_after_a_removal() {
+    let (_temp, home, file, lines) = journal_of_three();
+    fs::write(&file, format!("{}\n{}\n", lines[0], lines[2])).unwrap();
+    let (code, report) = verify_output(&home, &[]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        report.contains("journal head: 2 chained entries present"),
+        "{report}"
+    );
+    assert!(report.contains("next seq 3"), "{report}");
 }

@@ -135,8 +135,10 @@ pub struct VerifyReport {
     pub unchained: u64,
     /// Chained entries.
     pub chained: u64,
-    /// Entry count and link after the last chained entry, to keep somewhere
-    /// the journal's writers cannot change and pass back as `expected_head`.
+    /// Position after the last chained entry: `seq` is the next sequence
+    /// number (the last entry's `seq` + 1, not a count of the entries
+    /// present, see `chained`) and `prev` the link to keep somewhere the
+    /// journal's writers cannot change and pass back as `expected_head`.
     pub head: Option<Position>,
     pub by_mode: BTreeMap<String, usize>,
     pub by_decision: BTreeMap<&'static str, usize>,
@@ -251,8 +253,8 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
         match report.head {
             Some(head) if head.prev == expected => {}
             Some(head) => report.failures.push(format!(
-                "FAIL journal head {} ({} entries) does not match the expected head {expected}: entries were removed or added",
-                head.prev, head.seq
+                "FAIL journal head {} ({} chained entries present, next seq {}) does not match the expected head {expected}: entries were removed or added",
+                head.prev, report.chained, head.seq
             )),
             None => report.failures.push(format!(
                 "FAIL journal has no verifiable head; expected {expected}"

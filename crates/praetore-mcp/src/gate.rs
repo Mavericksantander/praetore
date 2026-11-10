@@ -2603,7 +2603,7 @@ mod tests {
         );
     }
 
-    /// Hallazgo 12: wrappers append concurrently (one per server); the
+    /// Concurrent appends: wrappers append concurrently (one per server); the
     /// journal lock keeps their entries one chain, with no position used
     /// twice.
     #[test]
@@ -2633,7 +2633,7 @@ mod tests {
         assert_eq!(report.head.unwrap().seq, 40);
     }
 
-    /// M4: the directory fsync used after creating, renaming or removing a
+    /// Directory sync: the directory fsync used after creating, renaming or removing a
     /// file works on a directory and reports an error for a missing one.
     #[cfg(unix)]
     #[test]
