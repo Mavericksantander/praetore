@@ -4962,7 +4962,7 @@ fn refused_receipt(error: GatewayError) -> praetore_gateway::GatewayReceipt {
     }
 }
 
-/// Review finding 1: a held approval refused at submission is closed for
+/// Refused at submission: a held approval refused there is closed for
 /// good with a signed `dispatch_refused` reason, distinguishable from a live
 /// pending approval, and can never be approved or dispatched, even after the
 /// adapter would admit the action again.
@@ -5036,7 +5036,7 @@ fn approval_refused_at_submission_is_closed_terminally_and_never_approvable() {
     assert!(journal.get(key).unwrap().unwrap().human_approval.is_none());
 }
 
-/// Review finding 4: an allowed action refused at submission carries the
+/// Refused at submission: an allowed action refused there carries the
 /// signed `dispatch_refused` receipt, also in the HTTP 403 body.
 #[tokio::test]
 async fn allowed_action_refused_at_submission_returns_signed_dispatch_refused_receipt() {
@@ -5077,7 +5077,7 @@ async fn allowed_action_refused_at_submission_returns_signed_dispatch_refused_re
     assert_eq!(fixture.tool.invocations(), 0);
 }
 
-/// Review finding 2: approval status reports journal state only; it never
+/// Approval status: it reports journal state only; it never
 /// consults the adapter, so it does not depend on live filesystem state.
 #[test]
 fn approval_status_does_not_consult_the_adapter() {
@@ -5104,7 +5104,7 @@ fn approval_status_does_not_consult_the_adapter() {
     assert_eq!(tool.preflights.load(Ordering::SeqCst), before);
 }
 
-/// Review finding 3: a transient refusal at the dispatch claim leaves the
+/// Transient refusal at the claim: it leaves the
 /// approval `approved_pending_dispatch` (nothing burnt); the claim can be
 /// attempted again and dispatches once.
 #[test]

@@ -16,14 +16,14 @@
   `praetore init --dev-cooperative-exec` or
   `PRAETORE_GATEWAY_DEV_COOPERATIVE_EXEC=1` (local-demo adapter).
 - **`ExecutionJournal::record_human_approval` takes a `HumanDecisionRecord`
-  (T-015).** A rejection now carries its signed `approval_rejected` close and
+  (T-016).** A rejection now carries its signed `approval_rejected` close and
   the journal writes the decision and the close in one transaction; an
   approval carries no close. Action: custom journal implementations write
   both, or neither, as `PostgresExecutionJournal` does.
-- **`ExecutionAttestation::create` takes `observed_at` (T-015, `signing`
+- **`ExecutionAttestation::create` takes `observed_at` (T-016, `signing`
   feature).** Callers pass the time from their trusted clock; the gateway
   passes the engine's clock.
-- **praetore-mcp journal lines are hash-linked (T-015).** Each line of
+- **praetore-mcp journal lines are hash-linked (T-016).** Each line of
   `receipts/<date>.jsonl` is now `{"seq","prev","evidence"}`, the line
   format of `praetore_core::journal_chain`, instead of a bare evidence
   document. `praetore-mcp verify` checks the order (an entry removed,
@@ -34,7 +34,7 @@
   entries before the chain. Action: tools that read journal lines
   directly take the `evidence` member (see the praetore-mcp README).
 - **praetore-mcp no longer forwards unchecked client lines in observe
-  (T-015).** A line it cannot parse that may name a `safety*` tool, and any
+  (T-016).** A line it cannot parse that may name a `safety*` tool, and any
   line over 32 MiB, is refused in both modes. Other unparseable lines are
   still forwarded in observe, now with a warning that gives the SHA-256 and
   the length.
@@ -86,7 +86,7 @@
 
 ### Added
 
-- **Receipt finality in the verifiers (T-015).** `praetore-verify receipt`
+- **Receipt finality in the verifiers (T-016).** `praetore-verify receipt`
   reports `final` and `non_final_reason`: the receipt returned while a human
   approval is pending (`requires_approval`, `not_dispatched`, no signed
   reason; older receipts with that shape too) is reported as
@@ -99,7 +99,7 @@
 
 ### Changed
 
-- **Migration `0021_journal_insert_rules` (T-015).** The execution journal
+- **Migration `0021_journal_insert_rules` (T-016).** The execution journal
   accepts on INSERT only the initial states the gateway writes (`authorized`
   for `allowed`, `not_dispatched` otherwise, with no output, reason or
   failure class), and an execution attestation only for the journal row's
@@ -108,25 +108,25 @@
   `docs/rollback/0021-journal-insert-rules.sql`; the 0020 rollback now
   refuses to run while 0021 is applied.
 - **Execution attestations are timestamped with the engine's trusted clock
-  (T-015).** `observed_at` comes from the same clock as approval
+  (T-016).** `observed_at` comes from the same clock as approval
   expirations, not the host clock. When that clock is unavailable the gateway signs
   nothing and returns an error; an execution already dispatched stays
   `dispatched` until `reconcile` closes it.
-- **A human rejection and its signed close commit together (T-015).** The
+- **A human rejection and its signed close commit together (T-016).** The
   decision and the `approval_rejected` close are written in one
   transaction: when the write fails, neither is recorded and the request
   can still be decided. Rows written by earlier releases with a decision
   and no close are still repaired on the next read.
-- **Claude Code hook example fails closed when its binary fails (T-015).**
+- **Claude Code hook example fails closed when its binary fails (T-016).**
   `hook/praetore-hook.sh` no longer `exec`s the binary: a binary that cannot
   start, panics, is killed by a signal, exits with a status other than 0 or
   prints something other than a JSON object yields a `deny` decision. The
   binary turns a panic during authorization into a deny. The README
   registers the hook with `"onFailure": "block"` and a `timeout`.
-- **Claude Code hook example: `-c` in a group of short options (T-015).**
+- **Claude Code hook example: `-c` in a group of short options (T-016).**
   `bash -lc '...'`, `sh -ec '...'` and fish's `--command` are treated as
   `shell -c` (unanalyzable command).
-- **praetore-mcp fsyncs directories (T-015)** after creating a daily journal
+- **praetore-mcp fsyncs directories (T-016)** after creating a daily journal
   file or a directory, and after writing a new file, a backup or a renamed
   config or policy.
 - `praetore_core::journal_chain::receipt_link` is public, so other journals
