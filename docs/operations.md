@@ -997,6 +997,7 @@ format is unchanged):
 |---|---|---|
 | `requires_approval`, `not_dispatched`, no `not_dispatched_reason` | `false` | `awaiting_approval_or_legacy` |
 | `outcome_unknown` | `false` | `outcome_unknown` |
+| `authorized`, `approved_pending_dispatch` or `dispatched` | `false` | `intermediate` |
 | any other state a receipt carries | `true` | `null` |
 
 `awaiting_approval_or_legacy` is the receipt returned with `202 Accepted`
@@ -1004,7 +1005,10 @@ while a human approval is pending: the request may still be approved and
 executed, so it does not show that the action was never dispatched. Receipts
 signed before rejection and expiry carried a signed reason have the same
 shape and are reported the same way. `outcome_unknown` may later be resolved
-by reconciliation. With `--require-final` such a receipt fails with
+by reconciliation. `intermediate` is defensive: verification refuses a
+receipt in `authorized`, `approved_pending_dispatch` or `dispatched`, so a
+receipt that verifies never reports it; only `GatewayReceipt::non_final_reason()`
+in Rust, called on a receipt that was not verified, can return it. With `--require-final` such a receipt fails with
 `RECEIPT_NOT_FINAL` (exit 1; the reason is written to stderr). A receipt whose
 signatures do not verify fails with its own code first. In Rust,
 `GatewayReceipt::is_final()` and `GatewayReceipt::non_final_reason()` apply

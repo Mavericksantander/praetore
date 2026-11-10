@@ -604,7 +604,7 @@ fn run_receipt_with(receipt: &Path, extra: &[&str]) -> Output {
     run(&args)
 }
 
-/// T-015 finding 1 (option A): every committed receipt, with the finality
+/// Receipt finality: every committed receipt, with the finality
 /// the verifier reports for it.
 const FINALITY: [(&str, bool, Option<&str>); 6] = [
     (

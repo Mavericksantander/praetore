@@ -3162,7 +3162,7 @@ mod apd {
         }
     }
 
-    /// T-015 finding 1 (option A): one committed receipt per finality case,
+    /// Receipt finality fixtures: one committed receipt per finality case,
     /// read by praetore-verify and the Python package. Regenerated only with
     /// `UPDATE_FINALITY_RECEIPT_FIXTURES=1` (the older fixtures are left
     /// untouched); by default the committed files must verify and report
@@ -5468,7 +5468,7 @@ fn ambiguous_dispatch_error_still_becomes_outcome_unknown() {
     assert_eq!(receipt.execution, ExecutionStatus::OutcomeUnknown);
 }
 
-/// T-015 (review finding 4): every execution attestation is timestamped
+/// Engine clock: every execution attestation is timestamped
 /// with the engine's trusted clock, never the host clock: the pending
 /// receipt, the rejection close, and the outcome of an approved dispatch.
 #[test]
@@ -5520,7 +5520,7 @@ fn execution_attestations_are_timestamped_with_the_engine_clock() {
     }
 }
 
-/// T-015 (review finding 16): the journal write of a decision can only be
+/// Human decision shapes: the journal write of a decision can only be
 /// built in its legal shapes: an approval without a close, a rejection with
 /// the signed `approval_rejected` close of the same request.
 #[test]
@@ -5561,7 +5561,7 @@ fn human_decision_record_admits_only_legal_shapes() {
     assert!(HumanDecisionRecord::reject(&other_request, &close).is_none());
 }
 
-/// T-015 (review finding 16): a rejection is recorded together with its
+/// Rejection and close in one transaction: a rejection is recorded with its
 /// close. When the journal refuses the write, neither the decision nor a
 /// close exists, and the request can still be decided.
 #[test]

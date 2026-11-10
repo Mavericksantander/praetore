@@ -63,15 +63,15 @@
   `docs/rollback/0021-journal-insert-rules.sql`; the 0020 rollback now
   refuses to run while 0021 is applied.
 - **Execution attestations are timestamped with the engine's trusted clock
-  (T-015).** `observed_at` used the host clock; it now uses the same clock
-  as approval expirations. When that clock is unavailable the gateway signs
+  (T-015).** `observed_at` comes from the same clock as approval
+  expirations, not the host clock. When that clock is unavailable the gateway signs
   nothing and returns an error; an execution already dispatched stays
   `dispatched` until `reconcile` closes it.
-- **A human rejection and its signed close commit together (T-015).** Before,
-  the decision and the `approval_rejected` close were two transactions, and
-  a failure between them returned an error although the rejection was
-  recorded (the next read repaired it). The repair stays for rows written
-  by earlier releases.
+- **A human rejection and its signed close commit together (T-015).** The
+  decision and the `approval_rejected` close are written in one
+  transaction: when the write fails, neither is recorded and the request
+  can still be decided. Rows written by earlier releases with a decision
+  and no close are still repaired on the next read.
 - **Claude Code hook example fails closed when its binary fails (T-015).**
   `hook/praetore-hook.sh` no longer `exec`s the binary: a binary that cannot
   start, panics, is killed by a signal, exits with a status other than 0 or

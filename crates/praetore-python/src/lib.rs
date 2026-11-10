@@ -71,8 +71,10 @@ fn verify_final_gateway_receipt(
 
 /// `None` unless the receipt verifies as in [`verify_gateway_receipt`];
 /// otherwise `(final, non_final_reason)`, where `non_final_reason` is
-/// `"awaiting_approval_or_legacy"`, `"outcome_unknown"` or `None`, the same
-/// values `praetore-verify receipt` reports. Historical only.
+/// `"awaiting_approval_or_legacy"`, `"outcome_unknown"`, `"intermediate"`
+/// or `None`, the same values `praetore-verify receipt` reports
+/// (`"intermediate"` is defensive: a receipt that verifies never carries
+/// those states). Historical only.
 #[pyfunction]
 fn gateway_receipt_finality(
     receipt_json: &str,

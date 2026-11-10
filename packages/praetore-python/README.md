@@ -29,7 +29,10 @@ pending, and `outcome_unknown`. `verify_final_gateway_receipt` (same
 arguments) also requires a final state, and `gateway_receipt_finality`
 returns `None` for a receipt that does not verify, otherwise
 `(final, non_final_reason)` with `non_final_reason` one of
-`"awaiting_approval_or_legacy"`, `"outcome_unknown"` or `None`:
+`"awaiting_approval_or_legacy"`, `"outcome_unknown"`, `"intermediate"` or
+`None`. `"intermediate"` (`authorized`, `approved_pending_dispatch` or
+`dispatched`) is defensive: verification refuses those states, so a receipt
+that verifies never reports it:
 
 ```python
 final_ok = praetore.verify_final_gateway_receipt(
