@@ -225,7 +225,7 @@ Migration 0011 grants `praetore_runtime` exactly what the code uses:
 | Table | Privileges |
 | --- | --- |
 | `replay_claims` | `SELECT`, `INSERT` |
-| `execution_journal` | `SELECT`, `INSERT`, `UPDATE (execution_status, output_json, not_dispatched_reason, updated_at)` |
+| `execution_journal` | `SELECT`, `INSERT`, `UPDATE (execution_status, output_json, not_dispatched_reason, failure_class, failure_reason, updated_at)` |
 | `execution_journal_events` | `SELECT` (rows are written by a `SECURITY DEFINER` trigger owned by the migration role) |
 | `execution_attestations`, `human_approvals`, `human_approval_expirations` | `SELECT`, `INSERT` |
 | `schema_migrations` | `SELECT` (startup schema check) |
@@ -300,9 +300,13 @@ signed attestations are never rewritten. To undo 0020 alone, the schema
 owner runs
 [`docs/rollback/0020-approval-close-reasons.sql`](rollback/0020-approval-close-reasons.sql)
 with every gateway stopped; it fails and changes nothing once a row uses
-`approval_rejected`. The test
-`postgres_approval_close_reasons_migration_rolls_back_and_applies_again`
-applies it, checks the 0013 rules are back and applies 0020 again.
+`approval_rejected`, or once a `failed` row carries a signed failure class
+(`failure_class`, `failure_reason`, also added by 0020). The gateway of this
+version reads those columns, so it does not run against a schema with 0020
+rolled back. The tests
+`postgres_approval_close_reasons_migration_rolls_back_and_applies_again` and
+`postgres_failure_class_migration_rolls_back_and_applies_again` apply it,
+check the previous rules are back and apply 0020 again.
 
 #### TLS
 
@@ -934,7 +938,7 @@ provisioned production pin.
 
 `praetore-verify receipt --receipt receipt.json --execution-pin key.hex
 --key-id ID --evidence-attester-pin attester.hex --format json` verifies a
-gateway receipt's signed execution attestation (schema v1, v2 or v3) and the
+gateway receipt's signed execution attestation (schema v1, v2, v3 or v4) and the
 embedded evidence's `attester_signature` against the pinned evidence attester
 key; a missing or invalid evidence signature fails with
 `RECEIPT_EVIDENCE_SIGNATURE_INVALID`. Both signatures must be exactly 128
@@ -944,7 +948,16 @@ required. A v3 attestation carries
 `not_dispatched_reason` (`approval_expired`, `approval_rejected`,
 `dispatch_failed`, `crash_recovered` or `dispatch_refused`); unknown reasons
 fail with `RECEIPT_INVALID`, a reason that does not match the signature fails
-with `RECEIPT_SIGNATURE_INVALID`. Like
+with `RECEIPT_SIGNATURE_INVALID`. A v4 attestation is a `failed` execution
+and carries `failure`: `{"class": "no_effect", "reason": CODE}` when the
+adapter proved that nothing changed (CODE is the adapter's refusal code, for
+example `symlink_not_allowed`), or `{"class": "effect_failed"}` when the
+effect was attempted and may have left a partial residue. The gateway signs
+`no_effect` only on the adapter's positive proof (`DispatchError::NotApplied`)
+and `effect_failed` otherwise. `failure` on any other state, or a `failed`
+v4 attestation without it, fails with `RECEIPT_INVALID`; the verifier reports
+it as `details.failure` (null when absent). `failed` attestations signed
+before this field existed (v2) carry no classification. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
 
 `praetore-verify safety-journal --journal executor-1.jsonl --ingest-pin

@@ -1,5 +1,5 @@
-//! Gateway receipts and their signed execution attestations (schema v1, v2
-//! and v3), with the signing and verification logic they need.
+//! Gateway receipts and their signed execution attestations (schema v1 to
+//! v4), with the signing and verification logic they need.
 //!
 //! This crate has no server dependencies so offline verifiers
 //! (`praetore-verify`, the Python bindings) can use it. `praetore-gateway`
@@ -105,6 +105,166 @@ impl NotDispatchedReason {
     }
 }
 
+/// Stable, machine-readable code an adapter (or the gateway) gives for a
+/// refusal: 1 to 64 characters, `[a-z][a-z0-9_]*`. The constructor and
+/// deserialization are the only ways to build one, so a signed code is
+/// always well formed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct RefusalCode(String);
+
+impl RefusalCode {
+    pub const MAX_LEN: usize = 64;
+
+    /// `None` unless `code` matches `[a-z][a-z0-9_]{0,63}`.
+    pub fn new(code: &str) -> Option<Self> {
+        let mut bytes = code.bytes();
+        let valid = code.len() <= Self::MAX_LEN
+            && bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+            && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+        valid.then(|| Self(code.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for RefusalCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for RefusalCode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let code = String::deserialize(deserializer)?;
+        Self::new(&code).ok_or_else(|| serde::de::Error::custom("invalid refusal code"))
+    }
+}
+
+/// Signed classification of a `failed` execution (schema v4). Every new
+/// `failed` attestation carries exactly one; see [`AttestedOutcome::Failed`].
+///
+/// Serialized as `{"class": "no_effect", "reason": "<code>"}` or
+/// `{"class": "effect_failed"}`.
+/// Deserialization is strict: an unknown class, a `no_effect` without a
+/// valid reason, or any other field (including a `reason` on
+/// `effect_failed`, or a `null` reason) is a payload error, not a
+/// signature mismatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "class",
+    rename_all = "snake_case",
+    try_from = "RawExecutionFailure"
+)]
+pub enum ExecutionFailure {
+    /// Refused before anything was touched at the target, with the refusal
+    /// code. Only signed on positive proof: the adapter reported a refusal
+    /// it guarantees changed nothing, or the gateway never invoked the
+    /// adapter.
+    NoEffect { reason: RefusalCode },
+    /// The effect was attempted and did not complete; it may have left a
+    /// residue (for example a temporary file, or a failure after opening or
+    /// writing). Also the class whenever no effect cannot be proven
+    /// (fail closed).
+    EffectFailed,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawFailureClass {
+    NoEffect,
+    EffectFailed,
+}
+
+/// Wire form of [`ExecutionFailure`]. Serde ignores extra fields on an
+/// internally tagged unit variant, so the shape is checked here instead.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExecutionFailure {
+    class: RawFailureClass,
+    /// `None`: absent; `Some(None)`: an explicit `null`.
+    #[serde(default, deserialize_with = "present_field")]
+    reason: Option<Option<RefusalCode>>,
+}
+
+fn present_field<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<RawExecutionFailure> for ExecutionFailure {
+    type Error = &'static str;
+
+    fn try_from(raw: RawExecutionFailure) -> Result<Self, Self::Error> {
+        match (raw.class, raw.reason) {
+            (RawFailureClass::NoEffect, Some(Some(reason))) => Ok(Self::NoEffect { reason }),
+            (RawFailureClass::EffectFailed, None) => Ok(Self::EffectFailed),
+            (RawFailureClass::NoEffect, _) => Err("no_effect requires a reason"),
+            (RawFailureClass::EffectFailed, Some(_)) => Err("effect_failed carries no reason"),
+        }
+    }
+}
+
+/// What a closing execution attestation states. Each variant carries exactly
+/// the data its state may carry, so the signer cannot build a `failed`
+/// attestation without its [`ExecutionFailure`], an output outside
+/// `executed`/`confirmed`, or a [`NotDispatchedReason`] outside
+/// `not_dispatched`. Intermediate states have no variant: they are never
+/// attested.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttestedOutcome {
+    NotDispatched(Option<NotDispatchedReason>),
+    Executed(Value),
+    Confirmed(Value),
+    OutcomeUnknown,
+    Failed(ExecutionFailure),
+}
+
+impl AttestedOutcome {
+    pub fn execution(&self) -> ExecutionStatus {
+        match self {
+            Self::NotDispatched(_) => ExecutionStatus::NotDispatched,
+            Self::Executed(_) => ExecutionStatus::Executed,
+            Self::Confirmed(_) => ExecutionStatus::Confirmed,
+            Self::OutcomeUnknown => ExecutionStatus::OutcomeUnknown,
+            Self::Failed(_) => ExecutionStatus::Failed,
+        }
+    }
+
+    pub fn output(&self) -> Option<&Value> {
+        match self {
+            Self::Executed(output) | Self::Confirmed(output) => Some(output),
+            _ => None,
+        }
+    }
+
+    pub fn into_output(self) -> Option<Value> {
+        match self {
+            Self::Executed(output) | Self::Confirmed(output) => Some(output),
+            _ => None,
+        }
+    }
+
+    pub fn not_dispatched_reason(&self) -> Option<NotDispatchedReason> {
+        match self {
+            Self::NotDispatched(reason) => *reason,
+            _ => None,
+        }
+    }
+
+    pub fn failure(&self) -> Option<&ExecutionFailure> {
+        match self {
+            Self::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ExecutionAttestationError {
     #[error("execution attestation signer failed")]
@@ -153,6 +313,10 @@ pub struct ExecutionAttestation {
     /// approved execution that was never dispatched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_dispatched_reason: Option<NotDispatchedReason>,
+    /// Present only on schema version 4: the signed classification of a
+    /// `failed` execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ExecutionFailure>,
     pub signature: String,
 }
 
@@ -174,6 +338,8 @@ struct ExecutionAttestationPayload<'a> {
     observed_at: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     not_dispatched_reason: Option<NotDispatchedReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<&'a ExecutionFailure>,
 }
 
 impl ExecutionAttestation {
@@ -187,31 +353,28 @@ impl ExecutionAttestation {
     pub fn create(
         evidence: &Evidence,
         authorization: AuthorizationStatus,
-        execution: ExecutionStatus,
-        output: Option<&Value>,
-        not_dispatched_reason: Option<NotDispatchedReason>,
+        outcome: &AttestedOutcome,
         signer: &dyn ExecutionAttestationSigner,
     ) -> Result<Self, ExecutionAttestationError> {
         let key_id = signer.key_id();
         if key_id.is_empty() || key_id.len() > 256 || key_id.trim() != key_id {
             return Err(ExecutionAttestationError::InvalidKeyId);
         }
-        // Intermediate states are never attested, and a reason is only
-        // meaningful when closing an approved execution without dispatch.
-        if matches!(
-            execution,
-            ExecutionStatus::Authorized
-                | ExecutionStatus::ApprovedPendingDispatch
-                | ExecutionStatus::Dispatched
-        ) || not_dispatched_reason
-            .is_some_and(|reason| !reason.applies_to(authorization, execution))
+        // `AttestedOutcome` has no intermediate state, keeps an output only
+        // on executed/confirmed and a failure only on failed. A reason is
+        // only meaningful when closing without dispatch.
+        let execution = outcome.execution();
+        let output = outcome.output();
+        let not_dispatched_reason = outcome.not_dispatched_reason();
+        let failure = outcome.failure();
+        if not_dispatched_reason.is_some_and(|reason| !reason.applies_to(authorization, execution))
         {
             return Err(ExecutionAttestationError::InvalidPayload);
         }
-        let schema_version = if not_dispatched_reason.is_some() {
-            3
-        } else {
-            2
+        let schema_version = match (not_dispatched_reason, failure) {
+            (Some(_), _) => 3,
+            (None, Some(_)) => 4,
+            (None, None) => 2,
         };
         if !evidence.verify_integrity()
             || !evidence.is_high_assurance_shape()
@@ -247,6 +410,7 @@ impl ExecutionAttestation {
             output_digest: output_digest.as_deref(),
             observed_at: &observed_at,
             not_dispatched_reason,
+            failure,
         };
         let canonical = attestation_payload_bytes(&payload)?;
         let mut message = Vec::with_capacity(EXECUTION_ATTESTATION_DOMAIN.len() + canonical.len());
@@ -274,6 +438,7 @@ impl ExecutionAttestation {
             output_digest,
             observed_at,
             not_dispatched_reason,
+            failure: failure.cloned(),
             signature: hex::encode(signature),
         })
     }
@@ -307,6 +472,7 @@ impl ExecutionAttestation {
             output_digest: self.output_digest.as_deref(),
             observed_at: &self.observed_at,
             not_dispatched_reason: self.not_dispatched_reason,
+            failure: self.failure.as_ref(),
         };
         let canonical = attestation_payload_bytes(&payload)?;
         let signature = hex::decode(&self.signature)
@@ -323,15 +489,23 @@ impl ExecutionAttestation {
         execution: ExecutionStatus,
         output: Option<&Value>,
     ) -> Result<(), ExecutionAttestationError> {
+        // A failure classification exists only on v4, and v4 only for
+        // `failed`. A v1/v2 `failed` attestation without it predates v4 and
+        // stays verifiable as history; the gateway can no longer sign one.
         if !matches!(
             (
                 self.schema_version,
                 self.tenant_id,
-                self.not_dispatched_reason
+                self.not_dispatched_reason,
+                &self.failure
             ),
-            (1, None, None) | (2, Some(_), None) | (3, Some(_), Some(_))
-        ) || self.schema_version >= 2
-            && self.tenant_id != authority_tenant_id(&evidence.authority)
+            (1, None, None, None)
+                | (2, Some(_), None, None)
+                | (3, Some(_), Some(_), None)
+                | (4, Some(_), None, Some(_))
+        ) || self.failure.is_some() && execution != ExecutionStatus::Failed
+            || self.schema_version >= 2
+                && self.tenant_id != authority_tenant_id(&evidence.authority)
             || self
                 .not_dispatched_reason
                 .is_some_and(|reason| !reason.applies_to(authorization, execution))
@@ -476,14 +650,15 @@ impl GatewayReceipt {
 }
 
 /// Parses a serialized [`GatewayReceipt`], verifies its execution
-/// attestation (schema v1, v2 or v3) against a pinned execution key, and
+/// attestation (schema v1 to v4) against a pinned execution key, and
 /// verifies the evidence `attester_signature` against a pinned evidence
 /// attester key. A missing, malformed or foreign evidence signature fails
 /// with [`ExecutionAttestationError::InvalidEvidenceSignature`].
 ///
 /// Duplicate JSON keys, unknown fields and unknown `not_dispatched_reason`
 /// values are rejected, as is a reason on anything but an approval closed
-/// without dispatch. This proves historical integrity only; it never
+/// without dispatch, and a `failure` class that is unknown, malformed or on
+/// anything but `failed`. This proves historical integrity only; it never
 /// authorizes an action.
 pub fn verify_gateway_receipt_json(
     json: &str,

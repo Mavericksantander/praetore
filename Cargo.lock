@@ -1109,6 +1109,7 @@ version = "0.3.3"
 dependencies = [
  "ed25519-dalek",
  "hex",
+ "libc",
  "postgres",
  "praetore-core",
  "praetore-gateway",

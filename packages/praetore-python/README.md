@@ -19,7 +19,7 @@ receipt_ok = praetore.verify_gateway_receipt(
 ```
 
 `verify_gateway_receipt` checks a gateway receipt's signed execution
-attestation (schema v1, v2 or v3) and the evidence `attester_signature`
+attestation (schema v1, v2, v3 or v4) and the evidence `attester_signature`
 against the pinned evidence attester key. It rejects an unknown or tampered
 `not_dispatched_reason` and a missing, forged or foreign evidence signature.
 

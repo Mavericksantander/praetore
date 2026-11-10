@@ -28,7 +28,7 @@ fn verify_evidence_attester_signature(evidence_json: &str, attester_public_key_h
 }
 
 /// Verifies a serialized gateway receipt's execution attestation (schema v1,
-/// v2 or v3) against a pinned execution key, and its evidence attester
+/// v2, v3 or v4) against a pinned execution key, and its evidence attester
 /// signature against a pinned evidence attester key. Unknown
 /// `not_dispatched_reason` values, unknown fields and bad or missing
 /// signatures return `false`. Historical only.

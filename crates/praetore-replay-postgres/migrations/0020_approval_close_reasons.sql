@@ -14,6 +14,16 @@
 -- Rows closed before 0020 keep their NULL reason: their attestations are
 -- signed and are not rewritten here.
 --
+-- 0020 also adds the signed classification of a failed execution (T-013,
+-- D-B1): failure_class and failure_reason on execution_journal and on
+-- execution_attestations (copied from attestation_json -> 'failure').
+--   * 'no_effect' + reason: refused before anything was touched;
+--   * 'effect_failed', no reason: the effect was attempted and failed, and
+--     may have left a residue.
+-- Written once, with the transition to failed. Every failed row written
+-- from now on must carry it; failed rows written before 0020 have none and
+-- are not rewritten (that rule is NOT VALID for them).
+--
 -- Forward-only; 0001-0019 are not edited. Old constraints and the 0013
 -- trigger are dropped by exact name; every new object has a new name.
 -- Manual rollback: docs/rollback/0020-approval-close-reasons.sql.
@@ -51,7 +61,56 @@ ALTER TABLE praetore.execution_attestations
                 AND execution_status = 'not_dispatched'))
     );
 
--- 3. Transition rules: 0013's rules plus the rejected and expired closes.
+-- 3. Signed classification of a failed execution (D-B1).
+-- Each CHECK is wrapped in COALESCE(..., false): a CHECK that evaluates to
+-- NULL passes, so a NULL reason must not make an illegal row acceptable.
+ALTER TABLE praetore.execution_journal
+    ADD COLUMN failure_class TEXT,
+    ADD COLUMN failure_reason TEXT;
+ALTER TABLE praetore.execution_journal
+    ADD CONSTRAINT execution_journal_failure_class_v1 CHECK (COALESCE(
+        (failure_class IS NULL AND failure_reason IS NULL)
+        OR (execution_status = 'failed'
+            AND ((failure_class = 'effect_failed' AND failure_reason IS NULL)
+                OR (failure_class = 'no_effect'
+                    AND failure_reason IS NOT NULL
+                    AND octet_length(failure_reason) BETWEEN 1 AND 64
+                    AND failure_reason COLLATE "C" ~ '^[a-z][a-z0-9_]*$'))),
+        false)
+    );
+-- Failed is terminal, so a failed row written before 0020 is never updated
+-- again; NOT VALID leaves those rows as they are and checks every new one.
+ALTER TABLE praetore.execution_journal
+    ADD CONSTRAINT execution_journal_failed_has_class_v1 CHECK (
+        execution_status <> 'failed' OR failure_class IS NOT NULL
+    ) NOT VALID;
+
+ALTER TABLE praetore.execution_attestations
+    ADD COLUMN failure_class TEXT,
+    ADD COLUMN failure_reason TEXT;
+ALTER TABLE praetore.execution_attestations
+    ADD CONSTRAINT execution_attestations_failure_class_v1 CHECK (COALESCE(
+        failure_class IS NOT DISTINCT FROM (attestation_json -> 'failure' ->> 'class')
+        AND failure_reason IS NOT DISTINCT FROM (attestation_json -> 'failure' ->> 'reason')
+        AND ((failure_class IS NULL AND failure_reason IS NULL)
+            OR (execution_status = 'failed'
+                AND ((failure_class = 'effect_failed' AND failure_reason IS NULL)
+                    OR (failure_class = 'no_effect'
+                        AND failure_reason IS NOT NULL
+                        AND octet_length(failure_reason) BETWEEN 1 AND 64
+                        AND failure_reason COLLATE "C" ~ '^[a-z][a-z0-9_]*$')))),
+        false)
+    );
+ALTER TABLE praetore.execution_attestations
+    ADD CONSTRAINT execution_attestations_failed_has_class_v1 CHECK (
+        execution_status <> 'failed' OR failure_class IS NOT NULL
+    ) NOT VALID;
+
+GRANT UPDATE (failure_class, failure_reason)
+    ON praetore.execution_journal TO praetore_runtime;
+
+-- 4. Transition rules: 0013's rules plus the rejected and expired closes,
+-- and the write-once failure class.
 CREATE FUNCTION praetore.validate_execution_journal_transition_v4()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -142,6 +201,17 @@ BEGIN
             AND NEW.execution_status = 'not_dispatched'
             AND OLD.not_dispatched_reason IS NULL) THEN
         RAISE EXCEPTION 'not_dispatched_reason is write-once when closing without dispatch';
+    END IF;
+
+    -- 0020 (D-B1): the failure class is written once, together with the
+    -- transition to failed, and never changed afterwards.
+    IF (NEW.failure_class IS DISTINCT FROM OLD.failure_class
+            OR NEW.failure_reason IS DISTINCT FROM OLD.failure_reason)
+        AND NOT (OLD.failure_class IS NULL
+            AND OLD.failure_reason IS NULL
+            AND OLD.execution_status IN ('dispatched', 'outcome_unknown')
+            AND NEW.execution_status = 'failed') THEN
+        RAISE EXCEPTION 'failure_class is write-once, with the transition to failed';
     END IF;
 
     IF NEW.execution_status = OLD.execution_status THEN

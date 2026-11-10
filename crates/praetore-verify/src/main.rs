@@ -553,6 +553,13 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                 "not_dispatched_reason".into(),
                 serde_json::to_value(attestation.not_dispatched_reason).unwrap_or_default(),
             );
+            // Signed classification of a `failed` execution (schema v4):
+            // `{"class": "no_effect", "reason": ...}` or
+            // `{"class": "effect_failed"}`; null otherwise.
+            details.insert(
+                "failure".into(),
+                serde_json::to_value(&attestation.failure).unwrap_or_default(),
+            );
             details.insert(
                 "verification_scope".into(),
                 serde_json::Value::String("historical_execution_attestation".into()),

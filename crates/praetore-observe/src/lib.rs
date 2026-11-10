@@ -654,7 +654,7 @@ fn execution_interpretation(status: ExecutionStatus) -> &'static str {
         }
         ExecutionStatus::Confirmed => "the adapter reported confirmation under its contract",
         ExecutionStatus::Failed => {
-            "the adapter or reconciler reported a failed/not-applied outcome"
+            "the adapter or reconciler reported a failed outcome; the signed failure class says whether an effect was attempted"
         }
     }
 }

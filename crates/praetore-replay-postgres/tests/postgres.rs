@@ -446,6 +446,12 @@ struct PostgresTestAdapter {
     client: Mutex<Client>,
     invocations: AtomicUsize,
     fail_after_effect: AtomicBool,
+    /// Refuse before any effect, with the not-applied guarantee
+    /// (`DispatchError::NotApplied`).
+    refuse_before_effect: AtomicBool,
+    /// Record the effect, then report that it failed
+    /// (`DispatchError::EffectFailed`).
+    effect_failed_after_effect: AtomicBool,
     reconciliation_unknown: AtomicBool,
     kill_backend_after_effect: Option<i32>,
 }
@@ -456,6 +462,8 @@ impl PostgresTestAdapter {
             client: Mutex::new(connect_client()),
             invocations: AtomicUsize::new(0),
             fail_after_effect: AtomicBool::new(false),
+            refuse_before_effect: AtomicBool::new(false),
+            effect_failed_after_effect: AtomicBool::new(false),
             reconciliation_unknown: AtomicBool::new(false),
             kill_backend_after_effect,
         }
@@ -499,6 +507,11 @@ impl ActionDispatcher for PostgresTestAdapter {
             .ok_or(DispatchError::Ambiguous)?;
         let value = parameters.get("value").ok_or(DispatchError::Ambiguous)?;
         let output = json!({"key": parameter_key, "value": value});
+        if self.refuse_before_effect.load(Ordering::SeqCst) {
+            return Err(DispatchError::NotApplied(
+                praetore_gateway::DispatchRefused::terminal("test_refused_before_effect"),
+            ));
+        }
 
         let mut client = self.client.lock().map_err(|_| DispatchError::Ambiguous)?;
         let mut transaction = client.transaction().map_err(|_| DispatchError::Ambiguous)?;
@@ -551,6 +564,9 @@ impl ActionDispatcher for PostgresTestAdapter {
         }
         if self.fail_after_effect.swap(false, Ordering::SeqCst) {
             return Err(DispatchError::Ambiguous);
+        }
+        if self.effect_failed_after_effect.load(Ordering::SeqCst) {
+            return Err(DispatchError::EffectFailed("test_effect_failed"));
         }
         Ok(DispatchReport::Confirmed(output))
     }
@@ -7251,18 +7267,21 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         false,
         false,
     );
-    let reject = |fixture: &PostgresApprovalFixture| {
+    let hold = |fixture: &PostgresApprovalFixture| {
         let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
-        let key = ExecutionKey {
+        ExecutionKey {
             tenant_id: TEST_TENANT_ID,
             agent_id: *pending.evidence.agent.id.as_uuid(),
             request_id: pending.evidence.request_id,
-        };
+        }
+    };
+    let reject_held = |fixture: &PostgresApprovalFixture, key: ExecutionKey| {
+        let challenge = fixture.gateway.approval_challenge(key)?;
         let mut decision = HumanApprovalDecision {
             schema_version: 1,
             approval_id: Uuid::new_v4(),
             approver_key_id: "postgres-human-approver-v1".into(),
-            challenge: fixture.gateway.approval_challenge(key).unwrap(),
+            challenge,
             outcome: HumanApprovalOutcome::Reject,
             signature: String::new(),
         };
@@ -7272,7 +7291,11 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
                 .sign(&decision.signing_message().unwrap())
                 .to_bytes(),
         );
-        (key, fixture.gateway.resolve_human_approval(decision))
+        fixture.gateway.resolve_human_approval(decision)
+    };
+    let reject = |fixture: &PostgresApprovalFixture| {
+        let key = hold(fixture);
+        (key, reject_held(fixture, key))
     };
     let reason = |key: ExecutionKey| -> Option<String> {
         connect_client()
@@ -7287,6 +7310,9 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
 
     let fixture = create_postgres_approval_gateway(Uuid::new_v4());
     assert_eq!(state(), up);
+    // Held while 0020 is applied. The gateway reads the 0020 columns
+    // (D-B1), so with 0020 rolled back it refuses to act at all.
+    let key = hold(&fixture);
 
     // Down: the 0013 trigger and constraints are back.
     connect_client().batch_execute(ROLLBACK_0020).unwrap();
@@ -7310,14 +7336,10 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         "praetore.execution_attestations",
         "execution_attestations_not_dispatched_reason_v2"
     ));
-    // Without 0020 the decision is recorded but the close is refused.
-    let (key, result) = reject(&fixture);
+    // Without 0020 the rejection is refused and nothing is closed.
+    let result = reject_held(&fixture, key);
     assert!(result.is_err(), "{result:?}");
     assert_eq!(reason(key), None);
-    assert_eq!(
-        database_rows_for_request("praetore.human_approvals", key.request_id),
-        1
-    );
 
     // Up again: only 0020 is applied, and the schema is current.
     let mut admin = connect_client();
@@ -7329,11 +7351,19 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         "praetore.execution_journal",
         "execution_journal_not_dispatched_reason_v3"
     ));
-    // The idempotent repair closes the rejection left open while down.
-    assert_eq!(
-        fixture.gateway.approval_resolution(key).unwrap(),
-        praetore_gateway::ApprovalResolution::Rejected
-    );
+    // A decision recorded while down is closed by the idempotent repair;
+    // otherwise the request is still held and is rejected now.
+    if database_rows_for_request("praetore.human_approvals", key.request_id) == 1 {
+        assert_eq!(
+            fixture.gateway.approval_resolution(key).unwrap(),
+            praetore_gateway::ApprovalResolution::Rejected
+        );
+    } else {
+        assert!(matches!(
+            reject_held(&fixture, key),
+            Ok(HumanApprovalResult::Rejected { .. })
+        ));
+    }
     assert_eq!(reason(key).as_deref(), Some("approval_rejected"));
     let (key, result) = reject(&create_postgres_approval_gateway(Uuid::new_v4()));
     assert!(matches!(result, Ok(HumanApprovalResult::Rejected { .. })));
@@ -7346,6 +7376,251 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     assert!(error.as_db_error().is_some(), "{error}");
     assert_eq!(state(), up);
     assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
+}
+
+/// D-B1: the signed failure class of migration 0020 against real PostgreSQL,
+/// in its own database. Up, down and up again with no classified row; then
+/// a `no_effect` and an `effect_failed` row are persisted in the journal and
+/// the attestation table, the CHECK constraints refuse every illegal shape
+/// (also with triggers disabled), the trigger keeps the class write-once,
+/// and the rollback refuses to run while such a row exists, leaving 0020 in
+/// place.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_failure_class_migration_rolls_back_and_applies_again() {
+    const TEST: &str = "postgres_failure_class_migration_rolls_back_and_applies_again";
+    const ROLLBACK_0020: &str =
+        include_str!("../../../docs/rollback/0020-approval-close-reasons.sql");
+    if !in_own_scratch_database(TEST) {
+        return;
+    }
+    // (failure columns, failure constraints, 0020 recorded)
+    let state = || -> (i64, i64, bool) {
+        let row = connect_client()
+            .query_one(
+                "SELECT (SELECT count(*) FROM information_schema.columns \
+                         WHERE table_schema = 'praetore' \
+                           AND table_name IN ('execution_journal', 'execution_attestations') \
+                           AND column_name IN ('failure_class', 'failure_reason')), \
+                        (SELECT count(*) FROM pg_constraint \
+                         WHERE conname IN ('execution_journal_failure_class_v1', \
+                                           'execution_attestations_failure_class_v1', \
+                                           'execution_journal_failed_has_class_v1', \
+                                           'execution_attestations_failed_has_class_v1')), \
+                        EXISTS (SELECT 1 FROM praetore.schema_migrations \
+                                WHERE version = '0020_approval_close_reasons')",
+                &[],
+            )
+            .unwrap();
+        (row.get(0), row.get(1), row.get(2))
+    };
+    let up = (4, 4, true);
+    let down = (0, 0, false);
+    let columns = |table: &str, key: ExecutionKey| -> (Option<String>, Option<String>) {
+        assert!(matches!(
+            table,
+            "execution_journal" | "execution_attestations"
+        ));
+        let row = connect_client()
+            .query_one(
+                &format!(
+                    "SELECT failure_class, failure_reason FROM praetore.{table} \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3 \
+                       AND execution_status = 'failed'"
+                ),
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    let key_of = |receipt: &praetore_gateway::GatewayReceipt| ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *receipt.evidence.agent.id.as_uuid(),
+        request_id: receipt.evidence.request_id,
+    };
+
+    // A confirmed execution: no class, and nothing blocks the rollback.
+    let confirmed = create_postgres_gateway(Uuid::new_v4());
+    let confirmed_receipt = confirmed
+        .gateway
+        .execute(confirmed.request.clone())
+        .unwrap();
+    assert_eq!(confirmed_receipt.execution, ExecutionStatus::Confirmed);
+    assert_eq!(confirmed_receipt.execution_attestation.failure, None);
+    assert_eq!(state(), up);
+
+    // Down: the columns, their constraints and grant are gone.
+    connect_client().batch_execute(ROLLBACK_0020).unwrap();
+    assert_eq!(state(), down);
+
+    // Up again: only 0020 is applied, and the schema is current.
+    let mut admin = connect_client();
+    let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    assert_eq!(applied, vec!["0020_approval_close_reasons"]);
+    praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    assert_eq!(state(), up);
+
+    // no_effect, with its reason.
+    let refused = create_postgres_gateway(Uuid::new_v4());
+    refused
+        .adapter
+        .refuse_before_effect
+        .store(true, Ordering::SeqCst);
+    let no_effect = match refused.gateway.execute(refused.request.clone()) {
+        Err(GatewayError::DispatchRefused {
+            reason: "test_refused_before_effect",
+            transient: false,
+            receipt: Some(receipt),
+            ..
+        }) => *receipt,
+        other => panic!("expected a final refusal with a receipt, got {other:?}"),
+    };
+    assert_eq!(no_effect.execution, ExecutionStatus::Failed);
+    assert_eq!(no_effect.execution_attestation.schema_version, 4);
+    let no_effect_key = key_of(&no_effect);
+    let no_effect_columns = (
+        Some("no_effect".to_owned()),
+        Some("test_refused_before_effect".to_owned()),
+    );
+    assert_eq!(
+        columns("execution_journal", no_effect_key),
+        no_effect_columns
+    );
+    assert_eq!(
+        columns("execution_attestations", no_effect_key),
+        no_effect_columns
+    );
+
+    // effect_failed, without a reason.
+    let failed = create_postgres_gateway(Uuid::new_v4());
+    failed
+        .adapter
+        .effect_failed_after_effect
+        .store(true, Ordering::SeqCst);
+    let effect_failed = match failed.gateway.execute(failed.request.clone()) {
+        Err(GatewayError::EffectFailed {
+            reason: "test_effect_failed",
+            receipt,
+            ..
+        }) => *receipt,
+        other => panic!("expected EffectFailed with a receipt, got {other:?}"),
+    };
+    assert_eq!(effect_failed.execution, ExecutionStatus::Failed);
+    assert_eq!(
+        effect_failed.execution_attestation.failure,
+        Some(praetore_gateway::ExecutionFailure::EffectFailed)
+    );
+    let effect_failed_key = key_of(&effect_failed);
+    let effect_failed_columns = (Some("effect_failed".to_owned()), None);
+    assert_eq!(
+        columns("execution_journal", effect_failed_key),
+        effect_failed_columns
+    );
+    assert_eq!(
+        columns("execution_attestations", effect_failed_key),
+        effect_failed_columns
+    );
+    // The persisted records parse and keep their class.
+    for (fixture, receipt) in [(&refused, &no_effect), (&failed, &effect_failed)] {
+        let reconciled = fixture.gateway.reconcile(key_of(receipt)).unwrap();
+        assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+        assert_eq!(
+            reconciled.execution_attestation.failure,
+            receipt.execution_attestation.failure
+        );
+    }
+
+    // CHECK constraints, with triggers disabled so only they decide.
+    let check_refuses = |table: &str, set: &str, key: ExecutionKey| {
+        let mut client = connect_client();
+        let mut transaction = client.transaction().unwrap();
+        transaction
+            .batch_execute("SET LOCAL session_replication_role = replica")
+            .unwrap();
+        let error = transaction
+            .execute(
+                &format!(
+                    "UPDATE praetore.{table} SET {set} \
+                     WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3"
+                ),
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .expect_err(set);
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::CHECK_VIOLATION),
+            "{table}: {set}: {error}"
+        );
+    };
+    for set in [
+        "failure_class = 'partial'",
+        "failure_reason = 'file_unavailable'",
+        "failure_class = NULL, failure_reason = NULL",
+    ] {
+        check_refuses("execution_journal", set, effect_failed_key);
+    }
+    for set in [
+        "failure_reason = NULL",
+        "failure_reason = 'Not A Code'",
+        "failure_reason = ''",
+        "failure_reason = repeat('a', 65)",
+        "failure_class = 'effect_failed'",
+    ] {
+        check_refuses("execution_journal", set, no_effect_key);
+    }
+    // A class on a state other than failed.
+    check_refuses(
+        "execution_journal",
+        "failure_class = 'effect_failed'",
+        key_of(&confirmed_receipt),
+    );
+    // The attestation row must match its signed JSON.
+    check_refuses(
+        "execution_attestations",
+        "failure_class = 'no_effect', failure_reason = 'test_refused_before_effect'",
+        effect_failed_key,
+    );
+    check_refuses(
+        "execution_attestations",
+        "failure_reason = 'other_reason'",
+        no_effect_key,
+    );
+
+    // Write-once: the trigger refuses to change a recorded class.
+    let error = connect_client()
+        .execute(
+            "UPDATE praetore.execution_journal \
+             SET failure_class = 'no_effect', failure_reason = 'test_refused_before_effect' \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[
+                &effect_failed_key.tenant_id,
+                &effect_failed_key.agent_id,
+                &effect_failed_key.request_id,
+            ],
+        )
+        .expect_err("a recorded class is write-once");
+    let message = error.as_db_error().map(|error| error.message().to_owned());
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|message| message.contains("write-once")),
+        "{error}: {message:?}"
+    );
+    assert_eq!(
+        columns("execution_journal", effect_failed_key),
+        effect_failed_columns
+    );
+
+    // With classified rows the rollback fails as a whole and 0020 stays.
+    let error = connect_client()
+        .batch_execute(ROLLBACK_0020)
+        .expect_err("the rollback must refuse rows with a failure class");
+    assert!(error.as_db_error().is_some(), "{error}");
+    assert_eq!(state(), up);
+    assert_eq!(
+        columns("execution_journal", no_effect_key),
+        no_effect_columns
+    );
 }
 
 mod g1_safety {

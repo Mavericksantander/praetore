@@ -1198,22 +1198,29 @@ fn execute_demo(
 
 /// The CLI summary of a refused submission. It only names a DENY when the
 /// authorization was denied: an allowed or approved action whose effect the
-/// adapter refused is reported as such, with the signed execution state.
+/// adapter refused, or whose attempted effect failed, is reported as such,
+/// with the signed execution state and its failure class.
 fn submit_failure_message(status: reqwest::StatusCode, body: Option<&serde_json::Value>) -> String {
     let field = |value: &serde_json::Value, name: &str| {
         value[name].as_str().unwrap_or("unknown").to_owned()
+    };
+    let signed_state = |receipt: &serde_json::Value| -> (String, String) {
+        if !receipt.is_object() {
+            return ("unknown".to_owned(), "unknown".to_owned());
+        }
+        let execution = field(receipt, "execution");
+        let execution = match receipt["execution_attestation"]["failure"]["class"].as_str() {
+            Some(class) => format!("{execution} ({class})"),
+            None => execution,
+        };
+        (field(receipt, "authorization"), execution)
     };
     match body {
         Some(body)
             if body["code"] == "action_not_dispatchable"
                 || body["code"] == "dispatch_temporarily_refused" =>
         {
-            let receipt = &body["receipt"];
-            let (authorization, execution) = if receipt.is_object() {
-                (field(receipt, "authorization"), field(receipt, "execution"))
-            } else {
-                ("unknown".to_owned(), "unknown".to_owned())
-            };
+            let (authorization, execution) = signed_state(&body["receipt"]);
             let condition = if body["code"] == "dispatch_temporarily_refused" {
                 "the adapter reported a temporary condition"
             } else {
@@ -1221,6 +1228,13 @@ fn submit_failure_message(status: reqwest::StatusCode, body: Option<&serde_json:
             };
             format!(
                 "gateway returned HTTP {status}; authorization was {authorization}, but the action was refused before any effect (reason: {}; {condition}); the signed execution state is {execution}. This is not a DENY, and the CLI did not retry. Review the response above",
+                field(body, "reason")
+            )
+        }
+        Some(body) if body["code"] == "action_effect_failed" => {
+            let (authorization, execution) = signed_state(&body["receipt"]);
+            format!(
+                "gateway returned HTTP {status}; authorization was {authorization}, and the effect was attempted but failed (reason: {}); it may have left a partial residue at the target; the signed execution state is {execution}. This is not a DENY, and the CLI did not retry. Review the response above",
                 field(body, "reason")
             )
         }
@@ -4061,6 +4075,39 @@ mod tests {
             )
         }
 
+        /// `[failure_class, failure_reason]` of the `failed` row of one
+        /// request in `table` (`execution_journal` or
+        /// `execution_attestations`), as persisted.
+        fn failure_columns(&self, table: &str, request_id: Uuid) -> Vec<Option<String>> {
+            assert!(matches!(
+                table,
+                "execution_journal" | "execution_attestations"
+            ));
+            self.tenant_query_one(
+                &format!(
+                    "SELECT ARRAY[failure_class, failure_reason] FROM praetore.{table} \
+                     WHERE tenant_id = $1 AND request_id = $2 AND execution_status = 'failed'"
+                ),
+                request_id,
+            )
+        }
+
+        /// Verifies `receipt` with `praetore-verify receipt` and returns the
+        /// verified `details.failure`.
+        fn verified_failure_with_praetore_verify(
+            &self,
+            receipt: &praetore_gateway::GatewayReceipt,
+        ) -> serde_json::Value {
+            let (code, summary) = self.praetore_verify(
+                &serde_json::to_value(receipt).unwrap(),
+                &self.execution_public_key(),
+            );
+            assert_eq!(code, 0, "{summary}");
+            assert_eq!(summary["ok"], true, "{summary}");
+            assert_eq!(summary["details"]["schema_version"], 4, "{summary}");
+            summary["details"]["failure"].clone()
+        }
+
         /// Rows of `praetore.human_approvals` for one request.
         fn decisions(&self, request_id: Uuid) -> i64 {
             self.tenant_query_one(
@@ -4287,6 +4334,31 @@ mod tests {
         let (reason, execution) = fx.verified_with_praetore_verify(&receipt);
         assert_eq!(execution, "failed");
         assert_eq!(reason, serde_json::Value::Null);
+        // D-B1: the refusal reason is signed, as `no_effect`, and persisted
+        // in the journal and in the attestation row.
+        let no_effect = serde_json::json!({"class": "no_effect", "reason": "symlink_not_allowed"});
+        assert_eq!(
+            receipt.execution_attestation.failure,
+            Some(praetore_gateway::ExecutionFailure::NoEffect {
+                reason: praetore_gateway::RefusalCode::new("symlink_not_allowed").unwrap()
+            })
+        );
+        assert_eq!(
+            fx.verified_failure_with_praetore_verify(&receipt),
+            no_effect
+        );
+        let columns = vec![
+            Some("no_effect".to_owned()),
+            Some("symlink_not_allowed".to_owned()),
+        ];
+        assert_eq!(
+            fx.failure_columns("execution_journal", key.request_id),
+            columns
+        );
+        assert_eq!(
+            fx.failure_columns("execution_attestations", key.request_id),
+            columns
+        );
         assert_eq!(
             fx.journal(key.request_id),
             ("requires_approval".into(), "failed".into())
@@ -4300,9 +4372,15 @@ mod tests {
         );
         // Final: reconciliation keeps it, and it is never dispatched again,
         // even with the regular file back.
+        let reconciled = gateway.reconcile(key).unwrap();
+        assert_eq!(reconciled.execution, ExecutionStatus::Failed);
         assert_eq!(
-            gateway.reconcile(key).unwrap().execution,
-            ExecutionStatus::Failed
+            reconciled.execution_attestation.signature,
+            receipt.execution_attestation.signature
+        );
+        assert_eq!(
+            reconciled.execution_attestation.failure,
+            receipt.execution_attestation.failure
         );
         fs::remove_file(fx.root.join("cambia.txt")).unwrap();
         fs::write(fx.root.join("cambia.txt"), "x").unwrap();
@@ -4312,6 +4390,175 @@ mod tests {
             fx.journal(key.request_id),
             ("requires_approval".into(), "failed".into())
         );
+        assert!(
+            fx.journal_counts()
+                .iter()
+                .all(|(_, execution, _)| execution != "outcome_unknown")
+        );
+    }
+
+    /// D-B1, case B (real PostgreSQL, real `praetore run`): the effect starts
+    /// and fails. The gateway runs as a child process with RLIMIT_FSIZE at
+    /// 8 KiB and SIGXFSZ ignored, so a 16 KiB write fails with EFBIG after
+    /// the temporary file was written and before it is linked in place. The
+    /// sandbox cannot prove that nothing changed, so the gateway signs
+    /// `failed` with the class `effect_failed` (HTTP 502
+    /// `action_effect_failed`), never `no_effect`. It is persisted in the
+    /// journal and the attestation row, verifies with `praetore-verify`, and
+    /// is never retried.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
+    fn postgres_t013b_effect_failed_after_the_temporary_write_is_signed_effect_failed() {
+        use praetore_gateway::{ExecutionFailure, ExecutionStatus, GatewayReceipt};
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+
+        /// Kills the child gateway on every exit path.
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        const FILE_SIZE_LIMIT: u64 = 8192;
+        let fx = SandboxFixture::new();
+        fs::write(fx.outside.join("victim.txt"), "original").unwrap();
+        let mut command = std::process::Command::new(sibling_binary("praetore"));
+        command
+            .arg("run")
+            .arg(&fx.directory)
+            .env("PRAETORE_GATEWAY_DATABASE_URL", &fx.database_url)
+            .env("RUST_LOG", "warn")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            // A pipe is not limited by RLIMIT_FSIZE; read after the kill.
+            .stderr(std::process::Stdio::piped());
+        // SAFETY: between fork and exec the closure only calls `signal` and
+        // `setrlimit`, which POSIX allows in that window (no allocation, no
+        // locks); the disposition SIG_IGN and the limit survive the exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let limit = libc::rlimit {
+                    rlim_cur: FILE_SIZE_LIMIT as libc::rlim_t,
+                    rlim_max: FILE_SIZE_LIMIT as libc::rlim_t,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = Child(command.spawn().unwrap());
+        let client = http_client().unwrap();
+        let base = format!("http://127.0.0.1:{}", fx.config.port);
+        let up = (0..400).any(|_| {
+            let ok = client
+                .get(format!("{base}/healthz"))
+                .send()
+                .is_ok_and(|response| response.status().is_success());
+            if !ok {
+                assert!(
+                    child.0.try_wait().unwrap().is_none(),
+                    "praetore run exited early"
+                );
+                std::thread::sleep(StdDuration::from_millis(50));
+            }
+            ok
+        });
+        assert!(up, "praetore run did not start");
+        let agent_token = read_api_token(&fx.directory, AGENT_TOKEN_FILE).unwrap();
+        let execute = |request: &AuthorizationRequest| {
+            let response = client
+                .post(format!("{base}/v1/execute"))
+                .bearer_auth(&agent_token)
+                .json(request)
+                .send()
+                .unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<serde_json::Value>().unwrap())
+        };
+
+        // Control: a write under the limit executes in the same gateway.
+        let (status, body) = execute(&fx.write("small.txt", "ok"));
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(fs::read_to_string(fx.root.join("small.txt")).unwrap(), "ok");
+
+        // Over the limit: the temporary file is written up to 8 KiB, then
+        // the write fails with EFBIG.
+        let big = fx.write("big.txt", &"a".repeat(2 * FILE_SIZE_LIMIT as usize));
+        let (status, body) = execute(&big);
+        assert_eq!(status, 502, "{body}");
+        assert_eq!(body["code"], "action_effect_failed", "{body}");
+        assert!(body["reason"].is_string(), "{body}");
+        let receipt: GatewayReceipt = serde_json::from_value(body["receipt"].clone()).unwrap();
+        assert_eq!(
+            receipt.authorization,
+            praetore_gateway::AuthorizationStatus::Allowed
+        );
+        assert_eq!(receipt.execution, ExecutionStatus::Failed);
+        assert_eq!(receipt.output, None);
+        assert_eq!(receipt.execution_attestation.schema_version, 4);
+        assert_eq!(receipt.execution_attestation.not_dispatched_reason, None);
+        assert_eq!(receipt.execution_attestation.output_digest, None);
+        assert_eq!(
+            receipt.execution_attestation.failure,
+            Some(ExecutionFailure::EffectFailed)
+        );
+        assert_eq!(
+            body["receipt"]["execution_attestation"]["failure"],
+            serde_json::json!({"class": "effect_failed"})
+        );
+        fx.verify(&receipt);
+        assert_eq!(
+            fx.verified_failure_with_praetore_verify(&receipt),
+            serde_json::json!({"class": "effect_failed"})
+        );
+        let request_id = receipt.evidence.request_id;
+        assert_eq!(fx.journal(request_id), ("allowed".into(), "failed".into()));
+        let columns = vec![Some("effect_failed".to_owned()), None];
+        assert_eq!(fx.failure_columns("execution_journal", request_id), columns);
+        assert_eq!(
+            fx.failure_columns("execution_attestations", request_id),
+            columns
+        );
+        assert!(!fx.root.join("big.txt").exists());
+        assert!(fx.outside_untouched());
+
+        // Never retried: the same request is refused and nothing changes.
+        let (status, body) = execute(&big);
+        assert_ne!(status, 200, "{body}");
+        assert!(!fx.root.join("big.txt").exists());
+        drop(client);
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        let mut stderr = String::new();
+        let _ = child.0.stderr.take().unwrap().read_to_string(&mut stderr);
+        drop(child);
+
+        // The persisted record parses and reconciles with its class; it is
+        // never dispatched again.
+        let gateway = fx.gateway();
+        let key = praetore_gateway::ExecutionKey {
+            tenant_id: fx.config.tenant_id,
+            agent_id: *receipt.evidence.agent.id.as_uuid(),
+            request_id,
+        };
+        let reconciled = gateway.reconcile(key).unwrap();
+        assert_eq!(reconciled.execution, ExecutionStatus::Failed);
+        assert_eq!(
+            reconciled.execution_attestation.signature, receipt.execution_attestation.signature,
+            "{stderr}"
+        );
+        assert_eq!(
+            reconciled.execution_attestation.failure,
+            Some(ExecutionFailure::EffectFailed)
+        );
+        assert!(!fx.root.join("big.txt").exists());
         assert!(
             fx.journal_counts()
                 .iter()
@@ -4707,6 +4954,46 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("execution state is failed"), "{message}");
+        assert!(!message.contains("DENY receipt"), "{message}");
+
+        let no_effect = serde_json::json!({
+            "code": "action_not_dispatchable",
+            "reason": "symlink_not_allowed",
+            "receipt": {
+                "authorization": "requires_approval",
+                "execution": "failed",
+                "execution_attestation": {
+                    "failure": {"class": "no_effect", "reason": "symlink_not_allowed"}
+                },
+            },
+        });
+        let message = submit_failure_message(forbidden, Some(&no_effect));
+        assert!(
+            message.contains("execution state is failed (no_effect)"),
+            "{message}"
+        );
+        assert!(message.contains("refused before any effect"), "{message}");
+
+        let effect_failed = serde_json::json!({
+            "code": "action_effect_failed",
+            "reason": "file_unavailable",
+            "receipt": {
+                "authorization": "allowed",
+                "execution": "failed",
+                "execution_attestation": {"failure": {"class": "effect_failed"}},
+            },
+        });
+        let message =
+            submit_failure_message(reqwest::StatusCode::BAD_GATEWAY, Some(&effect_failed));
+        assert!(message.contains("authorization was allowed"), "{message}");
+        assert!(message.contains("attempted but failed"), "{message}");
+        assert!(message.contains("reason: file_unavailable"), "{message}");
+        assert!(
+            message.contains("execution state is failed (effect_failed)"),
+            "{message}"
+        );
+        assert!(!message.contains("before any effect"), "{message}");
+        assert!(message.contains("not a DENY"), "{message}");
         assert!(!message.contains("DENY receipt"), "{message}");
 
         let transient = serde_json::json!({
