@@ -323,7 +323,7 @@ Migration `0021_journal_insert_rules` adds BEFORE INSERT triggers. A new
 through the UPDATE rules of 0012, 0013 and 0020. A new
 `execution_attestations` row is accepted only for the journal row's current
 state, with the same reason and failure class, and its JSON must name the
-same tenant, agent, request, evidence, authorization and state. The journal
+same tenant, agent, request, action digest, authorization and state. The journal
 row must be visible to the inserting role (row level security). These are
 defense in depth for code paths that skip the gateway; they do not verify
 signatures and do not constrain the schema owner or a superuser. Rows
