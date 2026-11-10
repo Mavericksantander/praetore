@@ -7738,9 +7738,9 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
 /// T-015 (migration 0021): as a LOGIN member of `praetore_runtime`, the
 /// journal accepts on INSERT only the initial states the gateway writes,
 /// and an attestation only for the journal row's current state with the
-/// same reason, class and signed identity. Repeats the cases of the
-/// triage probe of 2026-11-10 (P1 to P5 and the controls C1 to C3) plus
-/// the accepted shapes, and checks that nothing refused left a row.
+/// same reason, class and signed identity. Covers the INSERT shapes the
+/// gateway never writes (P1 to P5), the UPDATE and grant controls (C1 to
+/// C3) and the accepted shapes, and checks that nothing refused left a row.
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
@@ -7954,7 +7954,7 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
         mismatch,
         "P4",
     );
-    // P4 with the arbitrary JSON of the probe, on a matching state.
+    // P4 with an arbitrary JSON document, on a matching state.
     refused_by(
         attestation_insert(
             &mut client,
@@ -8019,7 +8019,7 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
         )
         .unwrap();
 
-    // Controls C1 to C3 of the probe: still refused by the UPDATE rules and
+    // Controls C1 to C3: still refused by the UPDATE rules and
     // the grants.
     let error = client
         .execute(
@@ -8183,7 +8183,7 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     assert!(p1(&mut admin).is_err());
 }
 
-/// T-015 (review finding 16): a human rejection and its signed
+/// Rejection and close in one transaction: a human rejection and its signed
 /// `approval_rejected` close commit in one transaction. With the close's
 /// attestation INSERT failing, the gateway reports an error and nothing is
 /// recorded (no decision, no reason); once the fault is gone the same signed
@@ -9923,7 +9923,10 @@ fn postgres_awaiting_approval_attestation_only_on_a_held_row() {
     // receipt and the close): forced back to that shape with the triggers
     // off, it still refuses `awaiting_approval`.
     forget_awaiting_approval_attestations();
-    for (key, case) in [(rejected, "decided, no reason"), (expired, "expired, no reason")] {
+    for (key, case) in [
+        (rejected, "decided, no reason"),
+        (expired, "expired, no reason"),
+    ] {
         let mut client = connect_client();
         let mut transaction = client.transaction().unwrap();
         transaction

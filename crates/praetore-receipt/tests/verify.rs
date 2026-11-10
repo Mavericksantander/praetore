@@ -672,7 +672,7 @@ fn failure_classification_parsing_is_strict() {
     }
 }
 
-/// T-015 and T-016 (finding 1): `non_final_reason` over every combination of signed
+/// Receipt finality: `non_final_reason` over every combination of signed
 /// authorization, execution and reason, including ones a verified receipt
 /// never carries. Only `awaiting_approval` (v5), the older pending shape
 /// and `outcome_unknown` are not final.
