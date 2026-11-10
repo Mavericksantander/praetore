@@ -613,8 +613,12 @@ impl ExecutionJournal for PostgresExecutionJournal {
         output: Option<&Value>,
         attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError> {
-        if !is_terminal(execution) || attestation.execution.journal_status() != execution {
+        if !is_terminal(execution) {
             return Err(JournalError::InvalidTransition);
+        }
+        // The attestation must sign the state being written.
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
         }
         // Every new `failed` row carries its signed classification (D-B1).
         if (execution == ExecutionStatus::Failed) != attestation.failure.is_some() {
@@ -721,15 +725,15 @@ impl ExecutionJournal for PostgresExecutionJournal {
         output: Option<&Value>,
         attestation: &ExecutionAttestation,
     ) -> Result<(), JournalError> {
-        if attestation.not_dispatched_reason.is_some()
-            || attestation.failure.is_some()
-            || attestation.execution.journal_status() != execution
-        {
+        if attestation.not_dispatched_reason.is_some() || attestation.failure.is_some() {
             // Only mark_not_dispatched_attested writes a closing reason, and
-            // only record_terminal_attested a failure class. An attestation
-            // belongs to its row's state (`awaiting_approval` to a held
-            // `not_dispatched` row).
+            // only record_terminal_attested a failure class.
             return Err(JournalError::InvalidTransition);
+        }
+        // An attestation belongs to its row's state (`awaiting_approval` to
+        // a held `not_dispatched` row).
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
         }
         let attestation_json =
             serialize_attestation(attestation).map_err(|_| JournalError::InvalidRecord)?;

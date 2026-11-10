@@ -483,7 +483,7 @@ impl ExecutionJournal for MemoryJournal {
         let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
         let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
         if attestation.execution.journal_status() != execution {
-            return Err(JournalError::InvalidTransition);
+            return Err(JournalError::InvalidRecord);
         }
         attestation
             .validate_binding(evidence, authorization, attestation.execution, output)
@@ -526,11 +526,11 @@ impl ExecutionJournal for MemoryJournal {
             .ok_or(JournalError::InvalidTransition)?;
         let evidence = entry.evidence.as_ref().ok_or(JournalError::InvalidRecord)?;
         let authorization = entry.authorization.ok_or(JournalError::InvalidRecord)?;
-        if entry.execution != execution
-            || entry.output.as_ref() != output
-            || attestation.execution.journal_status() != execution
-        {
+        if entry.execution != execution || entry.output.as_ref() != output {
             return Err(JournalError::InvalidTransition);
+        }
+        if attestation.execution.journal_status() != execution {
+            return Err(JournalError::InvalidRecord);
         }
         attestation
             .validate_binding(evidence, authorization, attestation.execution, output)
