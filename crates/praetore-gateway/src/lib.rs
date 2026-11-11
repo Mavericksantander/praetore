@@ -1715,6 +1715,16 @@ impl Gateway {
             && Self::closed_reason(record).is_none()
     }
 
+    /// A held request with a decision or an expiration and no signed close.
+    /// A stored schema v2 `not_dispatched` attestation (no reason) is not a
+    /// close of it.
+    fn inconsistent_hold(record: &ExecutionRecord) -> bool {
+        record.authorization == AuthorizationStatus::RequiresApproval
+            && record.execution == ExecutionStatus::NotDispatched
+            && (record.human_approval.is_some() || record.approval_expiration.is_some())
+            && Self::closed_reason(record).is_none()
+    }
+
     fn attest_record(&self, record: &mut ExecutionRecord) -> Result<GatewayReceipt, GatewayError> {
         let awaiting = Self::is_awaiting_approval(record);
         if let Some(attestation) = &record.execution_attestation
@@ -1722,6 +1732,11 @@ impl Gateway {
             // A held request signed before schema v5 (`not_dispatched`, no
             // reason) is signed again as awaiting approval below.
             && (attestation.execution == AttestedExecution::AwaitingApproval) == awaiting
+            // An inconsistent hold's stored v2 attestation is not
+            // `awaiting_approval`, and the row is not awaiting either, so
+            // the comparison above is `false == false`. That attestation
+            // is not returned.
+            && !Self::inconsistent_hold(record)
         {
             attestation
                 .validate_binding(
