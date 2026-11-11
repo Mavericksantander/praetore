@@ -26,11 +26,13 @@ what it does not cover, and has a troubleshooting table.
 
 ## Install
 
-`praetore-mcp` is not published on crates.io. Install it with Cargo, without
-cloning the repository (below), or use a CI-built binary (see "Prebuilt
-binaries"). The
-workspace declares `rust-version = "1.88"` (checked with Rust 1.94); building
-praetore-mcp needs no PostgreSQL, Node or Python.
+To install `praetore-mcp` v0.3.3 without Rust and without cloning the
+repository, use the binaries from the published v0.3.3 release:
+[Install from the v0.3.3 release](../../docs/install-prebuilt.md).
+
+The commands below are the from-source path. `praetore-mcp` is not published
+on crates.io. The workspace declares `rust-version = "1.88"` (checked with
+Rust 1.94); building praetore-mcp needs no PostgreSQL, Node or Python.
 
 ```sh
 cargo install --git https://github.com/Mavericksantander/praetore praetore-mcp --locked
@@ -38,7 +40,8 @@ praetore-mcp --version
 ```
 
 `--locked` builds with the repository's `Cargo.lock`. To pin an exact
-revision, add `--rev <commit>` (or `--tag <tag>` once releases are tagged).
+revision, add `--rev <commit>` or `--tag <tag>`. That Cargo path still needs
+Rust. The published binaries are the no-Rust path linked above.
 The binary goes to `~/.cargo/bin` (or `--root DIR`); `cargo uninstall
 praetore-mcp` removes it. `praetore-mcp install` writes the absolute path of
 the running binary into client configs, so run `install` again after moving

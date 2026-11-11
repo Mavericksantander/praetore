@@ -24,6 +24,10 @@ Not run: Windows, Linux desktop apps, VS Code, other MCP servers.
 
 ## Ten-minute walkthrough
 
+The walkthrough below installs from source with Cargo, which needs Rust.
+The no-Rust path is the binaries from the published v0.3.3 release:
+[Install from the v0.3.3 release](../../docs/install-prebuilt.md).
+
 ```sh
 cargo install --git https://github.com/Mavericksantander/praetore praetore-mcp --locked
 praetore-mcp init
