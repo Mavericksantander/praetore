@@ -340,6 +340,9 @@ fn enforce_refuses_unparseable_lines_but_relays_other_traffic() {
             .unwrap()
             .starts_with("praetore-mcp")
     }));
+    // The duplicate-key call has an id; the non-JSON line does not.
+    assert!(parse_errors.iter().any(|r| r["id"] == json!(2)));
+    assert!(parse_errors.iter().any(|r| r["id"].is_null()));
     assert!(!stderr.contains("EXECUTED"), "{stderr}");
 }
 
@@ -519,7 +522,18 @@ fn enforce_refuses_line_split_and_case_fold_differentials() {
         .filter(|r| r["error"]["code"] == -32700)
         .collect();
     assert_eq!(refused.len(), 2, "{responses:?}");
-    assert!(responses.iter().all(|r| r["id"] != 8), "{responses:?}");
+    // The case-variant line's id is recovered. The bare-CR line's id is
+    // nested inside the split, so that refusal keeps a null id.
+    let case_fold = by_id(&responses, &json!(8));
+    assert_eq!(case_fold["error"]["code"], -32700);
+    assert!(
+        case_fold["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not forwarded"),
+        "{case_fold}"
+    );
+    assert!(refused.iter().any(|r| r["id"].is_null()), "{responses:?}");
     // The CRLF-terminated line is still relayed normally.
     assert_eq!(
         by_id(&responses, &json!(9))["result"]["tools"][0]["name"],

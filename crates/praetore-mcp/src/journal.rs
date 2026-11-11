@@ -23,6 +23,7 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    time::Duration,
 };
 use uuid::Uuid;
 
@@ -31,6 +32,13 @@ use uuid::Uuid;
 const MAX_TAIL_BYTES: u64 = 256 * 1024;
 /// Lock file next to the daily files (not `*.jsonl`, so never read as one).
 const LOCK_FILE: &str = ".journal.lock";
+/// How long an append waits for another wrapper to finish one entry.
+/// An fsync of a receipt is far shorter; a holder that does not release
+/// the lock by then is treated as stuck and the wait is rejected.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+/// Pause between non-blocking attempts while `LOCK_WAIT` has not elapsed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const LOCK_POLL: Duration = Duration::from_millis(20);
 
 /// Position of a chained entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +194,9 @@ pub fn next_append(dir: &Path, today: PathBuf) -> Result<(PathBuf, Position), St
 /// Exclusive lock over the journal while one entry is appended, so that
 /// concurrent wrappers (one per server) never write two entries at the same
 /// position. Released when dropped (and by the kernel if the process dies).
+/// On Linux and macOS the wait is bounded by [`LOCK_WAIT`]: if the holder
+/// does not release the lock in time, acquisition fails and the append is
+/// rejected.
 pub struct JournalLock {
     /// Holding the descriptor holds the lock.
     _file: fs::File,
@@ -193,6 +204,10 @@ pub struct JournalLock {
 
 impl JournalLock {
     pub fn acquire(dir: &Path) -> Result<Self, String> {
+        Self::acquire_within(dir, LOCK_WAIT)
+    }
+
+    fn acquire_within(dir: &Path, wait: Duration) -> Result<Self, String> {
         let path = dir.join(LOCK_FILE);
         let mut options = fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
@@ -205,20 +220,44 @@ impl JournalLock {
             .open(&path)
             .map_err(|e| format!("cannot open lock {}: {e}", path.display()))?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: `flock` on a descriptor this function owns; no memory
-            // is passed to the kernel.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-            if rc != 0 {
-                return Err(format!(
-                    "cannot lock {}: {}",
-                    path.display(),
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        lock_exclusive(&file, wait)
+            .map_err(|error| format!("cannot lock {}: {error}", path.display()))?;
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = wait;
         Ok(Self { _file: file })
+    }
+}
+
+/// `LOCK_EX` with a deadline. `flock` itself does not take a timeout, so this
+/// retries `LOCK_NB` until `wait` elapses and then rejects the wait.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lock_exclusive(file: &fs::File, wait: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::time::Instant;
+    let fd = file.as_raw_fd();
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: `flock` on a descriptor this function owns; no memory is
+        // passed to the kernel. `LOCK_NB` returns instead of waiting.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted && error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting {}ms for the journal lock",
+                    wait.as_millis()
+                ),
+            ));
+        }
+        std::thread::sleep(LOCK_POLL.min(deadline - now));
     }
 }
 
@@ -303,5 +342,113 @@ impl ChainCheck {
     /// be linked or there is no chained entry.
     pub fn head(&self) -> Option<Position> {
         self.head
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn journal_lock_acquires_immediately_when_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let lock = JournalLock::acquire_within(dir.path(), Duration::from_secs(5)).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a free lock waited {:?}",
+            started.elapsed()
+        );
+        drop(lock);
+        JournalLock::acquire(dir.path()).unwrap();
+    }
+
+    /// Another process holds the lock. `flock` is per process on macOS, so a
+    /// second acquire in this process would not wait there; a child process
+    /// does, on both macOS and Linux.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn journal_lock_times_out_while_another_process_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCK_FILE);
+        let child = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import fcntl, os, sys, time\n\
+                 fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n\
+                 fcntl.flock(fd, fcntl.LOCK_EX)\n\
+                 print('held', flush=True)\n\
+                 time.sleep(30)\n",
+            )
+            .arg(&lock_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 is required to hold the journal lock");
+        struct KillOnDrop(Option<std::process::Child>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                if let Some(child) = self.0.as_mut() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let mut holder = KillOnDrop(Some(child));
+
+        let stdout = holder.0.as_mut().unwrap().stdout.take().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let mut reader = std::io::BufReader::new(stdout);
+            let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+            let _ = ready_tx.send(line);
+        });
+        let ready = ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default();
+        assert_eq!(
+            ready.trim(),
+            "held",
+            "holder did not take the lock: {ready:?}"
+        );
+
+        let dir_path = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = JournalLock::acquire_within(&dir_path, Duration::from_millis(200));
+            let _ = tx.send((result.map(|_| ()), started.elapsed()));
+        });
+        let (result, elapsed) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the lock wait was not rejected");
+        let message = result.expect_err("acquired a lock another process holds");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "wait returned early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wait ran long: {elapsed:?}"
+        );
+
+        let child = holder.0.as_mut().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let dir_path = dir.path().to_path_buf();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if JournalLock::acquire_within(&dir_path, Duration::from_millis(50)).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the lock was not released after the holder exited"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
