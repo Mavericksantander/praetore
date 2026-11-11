@@ -43,3 +43,6 @@ build/
 
 # Local Engineering Command Center
 /engineering-command-center/
+
+# Node (scripts/mcp-smoke)
+node_modules/

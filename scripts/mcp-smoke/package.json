@@ -1,0 +1,10 @@
+{
+  "name": "praetore-mcp-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MCP server used by scripts/mcp-smoke.py. Install with npm ci --ignore-scripts.",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2.1.0"
+  }
+}

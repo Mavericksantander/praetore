@@ -149,6 +149,15 @@
   config or policy.
 - `praetore_core::journal_chain::receipt_link` is public, so other journals
   link receipts with the same function.
+- **praetore-mcp release archives are packaged before the smoke test
+  (T-016).** In `Assurance gates`, `mcp-binaries` builds, packages and
+  checksums each binary without installing Node tooling, and a new
+  `mcp-smoke` job tests the uploaded archive after checking its `.sha256`.
+  `Release checksums` waits for both. The smoke test installs
+  `@modelcontextprotocol/server-filesystem@2.1.0` with `npm ci` from the
+  committed `scripts/mcp-smoke/package-lock.json` instead of `npx -y`, and
+  `scripts/mcp-smoke.py` stops if that install is missing or another version.
+  The binaries and the archive layout are unchanged.
 
 ## 0.3.3 - 2026-11-03
 
