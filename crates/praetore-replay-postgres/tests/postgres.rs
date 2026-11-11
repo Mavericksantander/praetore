@@ -3174,7 +3174,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0019_safety_ingest_row_lock",
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
-            "0022_awaiting_approval_state"
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -7026,7 +7027,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0019_safety_ingest_row_lock",
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
-            "0022_awaiting_approval_state"
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
         ]
     );
     assert!(again.is_empty());
@@ -7289,6 +7291,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         include_str!("../../../docs/rollback/0021-journal-insert-rules.sql");
     const ROLLBACK_0022: &str =
         include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
+    const ROLLBACK_0023: &str =
+        include_str!("../../../docs/rollback/0023-attestation-output-digest.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
@@ -7378,6 +7382,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
 
     // The held request is signed `awaiting_approval` (0022): the 0022
     // rollback refuses while that row exists and changes nothing.
+    // 0023 is newer, so roll it back first.
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
         .batch_execute(ROLLBACK_0022)
         .expect_err("the 0022 rollback must refuse an awaiting_approval row");
@@ -7429,7 +7435,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         vec![
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
-            "0022_awaiting_approval_state"
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7459,6 +7466,7 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     // With such rows the rollback fails as a whole and 0020 stays (0021 is
     // rolled back first, so only the row guard can refuse it).
     forget_awaiting_approval_attestations();
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     let error = connect_client()
@@ -7470,7 +7478,11 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     assert_eq!(
         applied,
-        vec!["0021_journal_insert_rules", "0022_awaiting_approval_state"]
+        vec![
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
+        ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
@@ -7493,6 +7505,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         include_str!("../../../docs/rollback/0021-journal-insert-rules.sql");
     const ROLLBACK_0022: &str =
         include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
+    const ROLLBACK_0023: &str =
+        include_str!("../../../docs/rollback/0023-attestation-output-digest.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
@@ -7552,6 +7566,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), up);
 
     // Down (0021 first): the columns, their constraints and grant are gone.
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     connect_client().batch_execute(ROLLBACK_0020).unwrap();
@@ -7565,7 +7580,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         vec![
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
-            "0022_awaiting_approval_state"
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7724,6 +7740,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
 
     // With classified rows the rollback fails as a whole and 0020 stays
     // (0021 is rolled back first, so only the row guard can refuse it).
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
     let error = connect_client()
@@ -7735,7 +7752,11 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     assert_eq!(
         applied,
-        vec!["0021_journal_insert_rules", "0022_awaiting_approval_state"]
+        vec![
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
+        ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
     assert_eq!(
@@ -8136,6 +8157,193 @@ fn postgres_runtime_insert_rules_refuse_states_the_gateway_never_writes() {
     assert_eq!(counts, (3, 2, 3));
 }
 
+/// The attestation insert trigger compares `output_digest` with the journal
+/// row. An otherwise valid attestation whose digest differs is rejected, and
+/// the same attestation with the digest of the stored `output_json` is
+/// accepted. A row with no output accepts only a null digest.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_attestation_output_digest_must_match_the_journal_row() {
+    fn execution_output_digest(output_json: &str) -> String {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"PRAETORE_EXECUTION_OUTPUT_V1\0");
+        hash.update(output_json.as_bytes());
+        hex::encode(hash.finalize())
+    }
+
+    let output_json = r#"{"ok":true}"#;
+    let canonical = praetore_core::canonical::canonicalize_json(output_json).unwrap();
+    assert_eq!(
+        canonical,
+        output_json.as_bytes(),
+        "the stored output text is the canonical JSON the gateway signs"
+    );
+    let matching = execution_output_digest(output_json);
+    let different = execution_output_digest(r#"{"ok":false}"#);
+    assert_ne!(matching, different);
+
+    let runtime = TestRole::create("LOGIN NOSUPERUSER NOBYPASSRLS");
+    let scratch = migrated_with_runtime(&runtime);
+    let mut client = connect_scratch_as(&scratch, &runtime.name);
+    let tenant = Uuid::new_v4();
+    let agent = Uuid::new_v4();
+    let action = "a".repeat(64);
+    client
+        .query_one(
+            "SELECT pg_catalog.set_config('praetore.tenant_id', $1, false)",
+            &[&tenant.to_string()],
+        )
+        .unwrap();
+    let from_sql: String = client
+        .query_one(
+            "SELECT praetore.execution_output_digest_v1($1)",
+            &[&output_json],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(from_sql, matching);
+    let long = "y".repeat(120);
+    let from_sql: String = client
+        .query_one("SELECT praetore.execution_output_digest_v1($1)", &[&long])
+        .unwrap()
+        .get(0);
+    assert_eq!(from_sql, execution_output_digest(&long));
+    let absent: Option<String> = client
+        .query_one(
+            "SELECT praetore.execution_output_digest_v1(NULL::text)",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(absent, None);
+
+    let request = |n: u128| Uuid::from_u128(0x0023_0000 + n);
+    let open_journal = |client: &mut Client, id: Uuid, authorization: &str, execution: &str| {
+        client
+            .execute(
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3)",
+                &[&tenant, &agent, &id],
+            )
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json) \
+                 VALUES ($1, $2, $3, $4, $4, $5, $6, '{}')",
+                &[&tenant, &agent, &id, &action, &authorization, &execution],
+            )
+            .unwrap();
+    };
+    let attestation = |id: Uuid, authorization: &str, execution: &str, digest: Value| {
+        json!({
+            "schema_version": 2,
+            "tenant_id": tenant,
+            "agent_id": agent,
+            "request_id": id,
+            "evidence_id": id,
+            "action_digest": action,
+            "authorization": authorization,
+            "execution": execution,
+            "output_digest": digest,
+        })
+    };
+    let insert_attestation = |client: &mut Client, id: Uuid, execution: &str, body: &Value| {
+        client.execute(
+            "INSERT INTO praetore.execution_attestations \
+             (attestation_id, tenant_id, agent_id, request_id, execution_status, \
+              attestation_json) \
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb)",
+            &[&Uuid::new_v4(), &tenant, &agent, &id, &execution, body],
+        )
+    };
+    let refused = |result: Result<u64, postgres::Error>, case: &str| {
+        let error = result.expect_err(case);
+        let message = error
+            .as_db_error()
+            .map(|error| error.message().to_owned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("does not match the journal state"),
+            "{case}: {error}: {message}"
+        );
+    };
+
+    // No output: a digest is rejected, and a null digest is accepted.
+    let closed = request(1);
+    open_journal(&mut client, closed, "denied", "not_dispatched");
+    refused(
+        insert_attestation(
+            &mut client,
+            closed,
+            "not_dispatched",
+            &attestation(closed, "denied", "not_dispatched", json!(matching)),
+        ),
+        "digest on a row with no output",
+    );
+    assert_eq!(
+        insert_attestation(
+            &mut client,
+            closed,
+            "not_dispatched",
+            &attestation(closed, "denied", "not_dispatched", Value::Null),
+        )
+        .unwrap(),
+        1,
+        "null output_digest matches a null output"
+    );
+
+    // An executed row with output. Reach it through the allowed transitions.
+    let executed = request(2);
+    open_journal(&mut client, executed, "allowed", "authorized");
+    client
+        .execute(
+            "UPDATE praetore.execution_journal SET execution_status = 'dispatched' \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&tenant, &agent, &executed],
+        )
+        .unwrap();
+    client
+        .execute(
+            "UPDATE praetore.execution_journal \
+             SET execution_status = 'executed', output_json = $4 \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&tenant, &agent, &executed, &output_json],
+        )
+        .unwrap();
+    refused(
+        insert_attestation(
+            &mut client,
+            executed,
+            "executed",
+            &attestation(executed, "allowed", "executed", json!(different)),
+        ),
+        "output_digest of a different output",
+    );
+    let stored: i64 = client
+        .query_one(
+            "SELECT count(*) FROM praetore.execution_attestations \
+             WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+            &[&tenant, &agent, &executed],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(stored, 0, "a rejected attestation leaves no row");
+    assert_eq!(
+        insert_attestation(
+            &mut client,
+            executed,
+            "executed",
+            &attestation(executed, "allowed", "executed", json!(matching)),
+        )
+        .unwrap(),
+        1,
+        "the digest of the stored output is accepted"
+    );
+}
+
 /// T-016: migration 0021 up, down and up again, in its own database. The
 /// documented rollback removes only its two triggers and functions, after
 /// which the INSERT of P1 is accepted again; it refuses to run twice; and
@@ -8148,6 +8356,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
         include_str!("../../../docs/rollback/0021-journal-insert-rules.sql");
     const ROLLBACK_0022: &str =
         include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
+    const ROLLBACK_0023: &str =
+        include_str!("../../../docs/rollback/0023-attestation-output-digest.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
@@ -8194,6 +8404,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     };
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    // 0023 replaces the v2 attestation trigger this count includes.
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state(), (2, 2, true));
     assert!(p1(&mut admin).is_err());
 
@@ -8216,10 +8428,15 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     assert_eq!(
         applied,
-        vec!["0021_journal_insert_rules", "0022_awaiting_approval_state"]
+        vec![
+            "0021_journal_insert_rules",
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
+        ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
-    assert_eq!(state(), (2, 2, true));
+    // 0023 is applied again, so the v2 attestation trigger is gone.
+    assert_eq!(state(), (1, 2, true));
     assert!(p1(&mut admin).is_err());
 }
 
@@ -10178,6 +10395,8 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     const TEST: &str = "postgres_awaiting_approval_migration_rolls_back_and_applies_again";
     const ROLLBACK_0022: &str =
         include_str!("../../../docs/rollback/0022-awaiting-approval-state.sql");
+    const ROLLBACK_0023: &str =
+        include_str!("../../../docs/rollback/0023-attestation-output-digest.sql");
     if !in_own_scratch_database(TEST) {
         return;
     }
@@ -10227,6 +10446,8 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     );
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    // This test checks 0022. 0023 only replaces the attestation insert trigger.
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let initial = state();
     assert_eq!((&initial.0, &initial.2, initial.3), (&up.0, &up.1, up.2));
     // 0022's functions are new; the ones it replaced stay for the rollback.
@@ -10268,18 +10489,28 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     assert!(error.as_db_error().is_some(), "{error}");
     assert_eq!(state().0, down.0);
 
-    // Up again: only 0022 is applied, and the schema is current.
+    // Up again: 0022 and 0023. Roll 0023 back so the rest of this test sees 0022.
     let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-    assert_eq!(applied, vec!["0022_awaiting_approval_state"]);
+    assert_eq!(
+        applied,
+        vec![
+            "0022_awaiting_approval_state",
+            "0023_attestation_output_digest"
+        ]
+    );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state().0, up.0);
     assert_eq!(state().1, older_functions);
     assert_eq!(state().2, up.1);
 
     // A held request signed under 0022: the rollback refuses, as a whole.
+    // Opening the gateway applies pending migrations, so roll 0023 back
+    // again before checking 0022's row guard.
     let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let late = approved_pending(&fixture);
+    connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
         .batch_execute(ROLLBACK_0022)
         .expect_err("the rollback must refuse an awaiting_approval attestation");
