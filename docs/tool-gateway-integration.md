@@ -366,6 +366,12 @@ responses are bounded to 64 KiB. Configured bearer credentials are read from
 the named process environment variable and never accepted from the agent.
 Requests have a 10-second timeout and carry a tenant-scoped
 `Idempotency-Key` based on the verified tenant, agent, and request IDs.
+An action with no route for its verified tenant, action type and target,
+with a capability other than the route's, or with parameters over 64 KiB is
+refused before any request is sent: at submission by the adapter's
+`preflight` (403 `action_not_dispatchable`, signed `dispatch_refused`, never
+held for approval), and at dispatch as `NotApplied` (signed `failed` with the
+class `no_effect`).
 An HTTP success response is recorded as `Executed`, not `Confirmed`; an
 adapter timeout or non-success response is ambiguous and is never retried
 automatically. This adapter cannot query downstream operation status, so an
