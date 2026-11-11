@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Historial · PRÆTORE</title>
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">PRÆTORE</div>
+    <div class="environment"><i></i>Solo en este computador</div>
+  </header>
+  <main>
+    <div class="section-head">
+      <h1>Historial</h1>
+      <div class="pager">
+        <button id="anterior" type="button">Anteriores</button>
+        <span id="pagina">Página 1</span>
+        <button id="siguiente" type="button">Siguientes</button>
+      </div>
+    </div>
+    <p id="aviso" class="aviso">Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.</p>
+    <p id="estado" class="estado" role="status">Leyendo el registro…</p>
+    <form id="filtros" class="filters">
+      <label>Situación
+        <select name="situacion">
+          <option value="">Cualquier situación</option>
+          <option>permitido</option>
+          <option>denegado</option>
+          <option>aprobado</option>
+          <option>rechazado</option>
+          <option>expirado</option>
+          <option>pendiente de aprobación</option>
+          <option>aprobado, pendiente de ejecución</option>
+          <option>no se ejecutó</option>
+        </select>
+      </label>
+      <label>Desde<input name="desde" type="date"></label>
+      <label>Hasta<input name="hasta" type="date"></label>
+      <button type="submit">Ver</button>
+    </form>
+    <ul id="lista" class="lista"></ul>
+    <section id="detalle" class="detail-panel hidden" aria-live="polite"></section>
+    <footer>
+      <p>Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.</p>
+      <small>© 2026 PRÆTOR TECHNOLOGIES · CHILE</small>
+    </footer>
+  </main>
+</body>
+</html>
