@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-description = "Local stdio MCP proxy that records signed PRÆTORE evidence for every tools/call (observe) or enforces policy (enforce)."
+description = "Local stdio MCP proxy that records signed PRÆTORE evidence for the tools/call requests it evaluates (observe) or enforces policy (enforce)."
 
 [[bin]]
 name = "praetore-mcp"

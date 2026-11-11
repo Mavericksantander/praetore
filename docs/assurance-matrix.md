@@ -6,7 +6,7 @@ absence of defects.
 
 | Requirement | Implementation | Test / evidence | CI job |
 |---|---|---|---|
-| Stable canonical encoding and policy digest | `crates/praetore-core/src/canonical.rs`, `policy.rs` | `policy_canonical_bytes_match_committed_golden_vector`, `policy_digest_matches_canonical_golden_value`; `docs/golden/canonical-policy-v1.json` | `rust` |
+| Stable canonical encoding and policy digest | `crates/praetore-core/src/canonical.rs`, `policy.rs` | `policy_canonical_bytes_match_committed_golden_v2_vector`, `format_1_golden_vector_keeps_its_historical_digest`; `docs/golden/canonical-policy-v2.json`, `docs/golden/canonical-policy-v1.json` | `rust` |
 | Agent key fingerprint v1 | `identity::AgentKeyFingerprint` and authority subject binding | deterministic seed/public-key/fingerprint vector in `docs/golden/agent-key-fingerprint-v1.json` | `rust` |
 | Ed25519 identity keys are non-weak before fingerprinting or trust use | `VerifiedPublicKey::from_bytes` rejects small-order public keys | malformed-length and weak all-zero-point regression tests; strict signature verification continues to use `verify_strict` | `rust` |
 | Evidence/policy v1 reject extensions and unsupported versions | strict Serde schemas and v1 version checks | `evidence_import_rejects_unknown_fields_and_versions`, `policy_import_rejects_unknown_fields_and_versions` | `rust` |
@@ -95,5 +95,9 @@ absence of defects.
   adapter-health telemetry, or remote authentication. The database reader
   depends on deployment-created SELECT-only credentials and protected local
   or tunneled PostgreSQL transport.
-- CI produces an SBOM and checksums, but does not sign releases, attest
-  artifacts, or protect the hosted runner/build supply chain.
+- CI produces an SBOM and checksums on every run. On a `v*` tag it signs
+  `SHA256SUMS` with a Sigstore keyless signature (cosign) and publishes it
+  with the release; on pull requests and pushes to `main` those jobs are
+  skipped, and only a throwaway-key sign/verify of the signing tooling runs.
+  CI does not produce build provenance attestations and does not protect the
+  hosted runner/build supply chain.

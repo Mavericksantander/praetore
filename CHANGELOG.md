@@ -149,6 +149,18 @@
   config or policy.
 - `praetore_core::journal_chain::receipt_link` is public, so other journals
   link receipts with the same function.
+- **Documentation matches the current code (T-016).** `docs/operations.md`
+  describes an execution attestation that cannot be signed after dispatch
+  (the row stays `dispatched` until `reconcile`) and the scope of the 0012
+  trigger next to 0021. The descriptions of `praetore-gateway-service` and
+  `praetore-mcp`, `demo/README.md`, the release-signing notes in
+  `docs/assurance-matrix.md` and `docs/pre-user-pilot-gates.md`, the policy
+  golden-vector test names in `docs/assurance-matrix.md` and
+  `docs/threat-model.md`, and the migration range in
+  `docs/observability-mvp.md` are corrected. The praetore-mcp GUIDE lists a
+  held journal lock as a troubleshooting case. The help of
+  `praetore-mcp policy` describes how `--arg-path-prefix` values are
+  resolved; the flags and their behavior are unchanged.
 
 ## 0.3.3 - 2026-11-03
 
