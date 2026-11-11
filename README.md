@@ -1039,7 +1039,10 @@ signature, key ID, and time validity and reports that the subject identity was
 not independently matched. Evidence verification with issuer pins checks the
 subject binding against the embedded agent identity. `--require-intent` also
 requires `--issuer-pins`, so intent verification is bound to an issuer-trusted
-agent key rather than a self-asserted key in the evidence. The CLI never treats
+agent key rather than a self-asserted key in the evidence. The output always
+reports `authority_verified` (`false` without `--issuer-pins`); `--strict`
+requires `--issuer-pins` and `--policy` and implies `--require-intent` and
+`--require-decision-time`. The CLI never treats
 public keys inside evidence or authority documents as trust anchors. Invalid
 inputs return non-zero with stable reason codes.
 
