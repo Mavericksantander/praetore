@@ -957,6 +957,16 @@ back to the verifier's clock. Use it when only HighAssurance receipts are
 acceptable. The `journal` command does not check authorities and does not
 accept the flag.
 
+The evidence command always reports `authority_verified`: `false` when no
+`--issuer-pins` were given, so the embedded authority was not checked.
+`--strict` runs every check the command offers: it requires `--issuer-pins`
+and `--policy` (`USAGE` otherwise) and implies `--require-intent` and
+`--require-decision-time`. Known limit: a receipt that is not HighAssurance
+does not record the mode of the engine that produced it, so the verifier
+cannot tell a decision of a development engine from one of a strict engine.
+`--require-decision-time` (and `--strict`) accept HighAssurance receipts
+only.
+
 Known limit of the decision-time check: it is only as trustworthy as the
 attester key. Anyone holding that key can sign a receipt with a back-dated
 `decided_at`, and that receipt passes even after the issuer pin has expired,

@@ -110,6 +110,12 @@ pub struct JournalSummary {
 pub struct JournalReport {
     pub summary: JournalSummary,
     pub signed_by: BTreeMap<String, u64>,
+    /// The tenant of every receipt of a tenant chain, read from each
+    /// receipt's issuer-signed authority (`Authority::tenant_id`). All
+    /// receipts of one chain name the same tenant, or none
+    /// ([`ChainError::TenantMismatch`] otherwise). `None` for a database
+    /// chain and for a chain whose receipts carry no tenant.
+    pub tenant_id: Option<Uuid>,
 }
 
 /// What a tenant chain's database reference must match: a head, and the
@@ -164,6 +170,9 @@ pub enum ChainError {
     /// The receipt names an attester key id that is not among the pinned
     /// keys (for example a retired key that was not pinned).
     UnpinnedAttesterKey { line: u64, key_id: String },
+    /// The receipt's authority names another tenant than the earlier
+    /// receipts of the chain (or one names a tenant and another none).
+    TenantMismatch { line: u64 },
 }
 
 impl ChainError {
@@ -179,6 +188,7 @@ impl ChainError {
             Self::DatabaseHeadMismatch => "JOURNAL_HEAD_MISMATCH",
             Self::PolicyNotApplicable => "INVALID_REQUEST",
             Self::UnpinnedAttesterKey { .. } => "AUTH_FAIL",
+            Self::TenantMismatch { .. } => "JOURNAL_TENANT_MISMATCH",
             Self::TooLarge => "INPUT_TOO_LARGE",
             Self::Malformed { .. } => "INVALID_REQUEST",
             Self::MissingSignature { .. } => "AUTH_FAIL",
@@ -229,6 +239,11 @@ impl fmt::Display for ChainError {
             Self::UnpinnedAttesterKey { line, key_id } => write!(
                 f,
                 "entry {line}: receipt signed by attester key {key_id}, not by a pinned key"
+            ),
+            Self::TenantMismatch { line } => write!(
+                f,
+                "entry {line}: receipt authority names another tenant than the earlier \
+                 receipts of this chain"
             ),
             Self::PolicyNotApplicable => write!(
                 f,
@@ -312,6 +327,8 @@ struct ChainState<'k> {
     database_head: Option<DatabaseHead>,
     /// Entries per signing attester key id.
     signed_by: BTreeMap<String, u64>,
+    /// Tenant of the first receipt (`Some(None)`: it names no tenant).
+    tenant: Option<Option<Uuid>>,
 }
 
 impl<'k> ChainState<'k> {
@@ -330,6 +347,7 @@ impl<'k> ChainState<'k> {
             kind: Kind::Unknown,
             receipts: 0,
             database_head: None,
+            tenant: None,
         }
     }
 
@@ -429,6 +447,12 @@ impl<'k> ChainState<'k> {
             && evidence.verify_recorded_policy(policy).is_err()
         {
             return Err(ChainError::PolicyMismatch { line });
+        }
+        // One chain, one tenant: read from the signed authority of each
+        // receipt (checked by the signature above).
+        let tenant = evidence.authority.tenant_id();
+        if *self.tenant.get_or_insert(tenant) != tenant {
+            return Err(ChainError::TenantMismatch { line });
         }
         self.prev = link(self.seq, &self.prev, evidence)?;
         if let Some(key_id) = &evidence.attester_key_id {
@@ -707,6 +731,7 @@ pub fn verify_journal_report(
     Ok(JournalReport {
         summary,
         signed_by: state.signed_by,
+        tenant_id: state.tenant.flatten(),
     })
 }
 

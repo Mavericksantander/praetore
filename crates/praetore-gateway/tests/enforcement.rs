@@ -907,7 +907,11 @@ impl ActionDispatcher for LocalSetTool {
             .unwrap_or(ReconciliationReport::Unknown)
     }
 
-    fn preflight(&self, _action: &Action) -> Result<(), praetore_gateway::DispatchRefused> {
+    fn preflight(
+        &self,
+        _authority: &Authority,
+        _action: &Action,
+    ) -> Result<(), praetore_gateway::DispatchRefused> {
         self.preflights.fetch_add(1, Ordering::SeqCst);
         if self.refuse_transient.load(Ordering::SeqCst) {
             return Err(praetore_gateway::DispatchRefused::transient(
@@ -3533,6 +3537,79 @@ mod apd {
                 .all(|attestation| attestation.execution != AttestedExecution::NotDispatched)
         );
         drop(entries);
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    /// An inherited held row: an approve decision that never moved to
+    /// `approved_pending_dispatch`, still holding the schema v2
+    /// `not_dispatched` attestation (no reason) written for the hold.
+    /// Reconcile does not return that attestation.
+    #[test]
+    fn inherited_unclosed_approve_does_not_return_stored_v2_attestation() {
+        let (gateway, key, tool, journal, approver_key, _) = clocked_fixture();
+        let evidence = journal.get(key).unwrap().unwrap().evidence;
+        let legacy = praetore_gateway::ExecutionAttestation::create(
+            &evidence,
+            AuthorizationStatus::RequiresApproval,
+            &praetore_gateway::AttestedOutcome::NotDispatched(None),
+            FixedClock::try_new(NOW).unwrap().now(),
+            execution_attester().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(legacy.schema_version, 2);
+        assert!(legacy.not_dispatched_reason.is_none());
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        {
+            let mut entries = journal.entries.lock().unwrap();
+            let entry = entries.get_mut(&key).unwrap();
+            entry.execution_attestations = vec![legacy.clone()];
+            entry.human_approval = Some(decision);
+            entry.execution = ExecutionStatus::NotDispatched;
+            assert!(
+                !entry
+                    .states
+                    .contains(&ExecutionStatus::ApprovedPendingDispatch)
+            );
+        }
+        let stored = journal.get(key).unwrap().unwrap();
+        let stored_attestation = stored.execution_attestation.clone().unwrap();
+        let stored_json = serde_json::to_value(&stored_attestation).unwrap();
+        assert_eq!(stored.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(
+            stored
+                .human_approval
+                .as_ref()
+                .map(|decision| decision.outcome),
+            Some(HumanApprovalOutcome::Approve)
+        );
+        assert!(stored.approval_expiration.is_none());
+        assert_eq!(stored_json, serde_json::to_value(&legacy).unwrap());
+        let shape = praetore_gateway::GatewayReceipt {
+            evidence: stored.evidence,
+            authorization: stored.authorization,
+            execution: stored_attestation.execution,
+            output: None,
+            execution_attestation: stored_attestation,
+        };
+        assert_eq!(
+            shape.non_final_reason(),
+            Some(praetore_gateway::NonFinalReason::AwaitingApprovalOrLegacy)
+        );
+
+        assert!(matches!(
+            gateway.reconcile(key),
+            Err(GatewayError::Journal(JournalError::InvalidRecord))
+        ));
+        let after = journal.get(key).unwrap().unwrap();
+        assert_eq!(after.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(
+            serde_json::to_value(&after.execution_attestation).unwrap(),
+            serde_json::to_value(Some(&legacy)).unwrap()
+        );
         assert_eq!(tool.invocations(), 0);
     }
 

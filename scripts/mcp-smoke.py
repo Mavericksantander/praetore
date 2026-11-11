@@ -2,12 +2,17 @@
 """End-to-end smoke test of a built praetore-mcp binary.
 
 Runs the binary in front of the real @modelcontextprotocol/server-filesystem
-(through npx) with a fresh LOCAL/DEV home and a deny rule for write_file,
-sends one allowed tools/call (read_text_file) and one denied one
-(write_file), and checks the replies, the file system, the receipts and
-`verify`. Needs Python 3 (standard library only) and Node with npx.
+with a fresh LOCAL/DEV home and a deny rule for write_file, sends one
+allowed tools/call (read_text_file) and one denied one (write_file), and
+checks the replies, the file system, the receipts and `verify`. Needs
+Python 3 (standard library only) and Node.
 
-Usage: python3 -I scripts/mcp-smoke.py path/to/praetore-mcp
+The server comes from scripts/mcp-smoke/, installed from its committed
+lockfile; the script does not download anything:
+
+    npm ci --ignore-scripts --prefix scripts/mcp-smoke
+    python3 -I scripts/mcp-smoke.py path/to/praetore-mcp
+
 Exit code 0 when every check passes; every check is printed.
 """
 
@@ -18,8 +23,35 @@ import sys
 import tempfile
 import threading
 
-SERVER = "@modelcontextprotocol/server-filesystem@2.1.0"
-TIMEOUT_SECONDS = 180  # first run downloads the server through npx
+SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem"
+SERVER_VERSION = "2.1.0"
+SERVER_BIN = "mcp-server-filesystem"
+NODE_PROJECT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mcp-smoke")
+TIMEOUT_SECONDS = 180
+
+
+def server_command():
+    """`node <entry point>` of the server installed by `npm ci` in NODE_PROJECT.
+
+    Exits when it is missing or is not the pinned version, so a run never
+    falls back to a download.
+    """
+    package_dir = os.path.join(NODE_PROJECT, "node_modules", *SERVER_PACKAGE.split("/"))
+    try:
+        with open(os.path.join(package_dir, "package.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except FileNotFoundError:
+        sys.exit(f"error: {SERVER_PACKAGE} is not installed; run "
+                 f"`npm ci --ignore-scripts --prefix {NODE_PROJECT}` first")
+    if manifest.get("version") != SERVER_VERSION:
+        sys.exit(f"error: {SERVER_PACKAGE} {manifest.get('version')} is installed, "
+                 f"expected {SERVER_VERSION} (scripts/mcp-smoke/package-lock.json)")
+    entry = manifest.get("bin")
+    if isinstance(entry, dict):
+        entry = entry.get(SERVER_BIN)
+    if not isinstance(entry, str):
+        sys.exit(f"error: {SERVER_PACKAGE} has no `{SERVER_BIN}` bin entry")
+    return ["node", os.path.join(package_dir, entry)]
 
 
 def run(binary, *args):
@@ -32,11 +64,11 @@ def run(binary, *args):
     return result
 
 
-def wrap_session(binary, home, root, requests, wanted_ids):
+def wrap_session(binary, home, root, server, requests, wanted_ids):
     """Sends `requests`, returns {id: response} once every wanted id answered."""
     process = subprocess.Popen(
         [binary, "wrap", "--dir", home, "--name", "filesystem", "--mode", "enforce",
-         "--", "npx", "-y", SERVER, root],
+         "--", *server, root],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     stderr_lines = []
@@ -73,6 +105,7 @@ def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     binary = os.path.realpath(sys.argv[1])
+    server = server_command()
     failures = []
 
     def check(name, condition, detail=""):
@@ -108,8 +141,9 @@ def main():
             "name": "write_file",
             "arguments": {"path": os.path.join(root, "b.txt"), "content": "x"}}},
     ]
-    print(f"$ praetore-mcp wrap --dir <home> --name filesystem --mode enforce -- npx -y {SERVER} <fsroot>")
-    responses = wrap_session(binary, home, root, requests, {1, 2, 3})
+    print(f"$ praetore-mcp wrap --dir <home> --name filesystem --mode enforce -- "
+          f"node <{SERVER_PACKAGE}@{SERVER_VERSION}> <fsroot>")
+    responses = wrap_session(binary, home, root, server, requests, {1, 2, 3})
     for key in sorted(responses):
         print(f"    reply {key}: {json.dumps(responses[key])[:300]}")
 

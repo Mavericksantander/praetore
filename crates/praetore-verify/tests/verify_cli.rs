@@ -293,6 +293,88 @@ fn evidence_command_verifies_trusted_signature_intent_and_authority() {
     assert!(text.contains("current_authorization=false"));
 }
 
+/// T-016: `authority_verified` is always reported, and `--strict` needs the
+/// issuer pins and the policy and implies `--require-intent` and
+/// `--require-decision-time`.
+#[test]
+fn evidence_command_always_reports_authority_verified_and_strict_checks_everything() {
+    let files = TestFiles::new();
+    let evidence = |extra: &[&str]| {
+        let mut args: Vec<String> = vec![
+            "evidence".into(),
+            "--evidence".into(),
+            files.write_path(&files.evidence),
+            "--attester-pin".into(),
+            files.write_path(&files.attester_pin),
+        ];
+        args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+        args.extend(["--format".into(), "json".into()]);
+        let output = run(&args);
+        let summary = json_output(&output);
+        assert_eq!(output.status.success(), summary["ok"] == true, "{summary}");
+        summary
+    };
+    let issuer_pins = files.write_path(&files.issuer_pins);
+    let policy = files.write_path(&files.policy);
+
+    // Without --issuer-pins the authority is not checked, and says so.
+    let summary = evidence(&[]);
+    assert_eq!(summary["code"], "OK");
+    assert_eq!(summary["details"]["authority_verified"], false);
+    assert_eq!(summary["details"]["intent_verified"], false);
+    assert!(summary["details"]["authority_checked_at"].is_null());
+    let summary = evidence(&["--issuer-pins", &issuer_pins]);
+    assert_eq!(summary["details"]["authority_verified"], true);
+
+    // --strict without the issuer pins or the policy is a usage error.
+    for extra in [
+        vec!["--strict"],
+        vec!["--strict", "--issuer-pins", issuer_pins.as_str()],
+        vec!["--strict", "--policy", policy.as_str()],
+        vec![
+            "--strict",
+            "--strict",
+            "--issuer-pins",
+            &issuer_pins,
+            "--policy",
+            &policy,
+        ],
+    ] {
+        assert_eq!(evidence(&extra)["code"], "USAGE", "{extra:?}");
+    }
+    // With both, it implies --require-decision-time: this receipt records
+    // no decision time (not HighAssurance), so it fails for that, as
+    // --require-decision-time alone does.
+    let summary = evidence(&[
+        "--strict",
+        "--issuer-pins",
+        &issuer_pins,
+        "--policy",
+        &policy,
+    ]);
+    assert_eq!(summary["code"], "DECISION_TIME_MISSING", "{summary}");
+    assert_eq!(
+        evidence(&[
+            "--require-decision-time",
+            "--issuer-pins",
+            &issuer_pins,
+            "--policy",
+            &policy
+        ])["code"],
+        "DECISION_TIME_MISSING"
+    );
+    // Other commands do not take --strict.
+    let output = run(&[
+        "policy-digest".into(),
+        "--policy".into(),
+        policy.clone(),
+        "--strict".into(),
+        "--format".into(),
+        "json".into(),
+    ]);
+    assert_eq!(json_output(&output)["code"], "USAGE");
+}
+
 #[test]
 fn expired_high_assurance_receipt_is_historical_only_and_cannot_authorize_new_action() {
     let directory = std::env::temp_dir().join(format!(
@@ -683,18 +765,26 @@ fn receipt_command_require_final_refuses_states_that_can_still_change() {
             assert_eq!(summary["code"], "RECEIPT_NOT_FINAL", "{name}");
         }
     }
-    // A forged receipt is still refused for its signature, not for finality.
+    // A forged receipt is refused for what it breaks, not for finality.
+    // Editing only the top-level `execution` no longer matches the signed
+    // attestation: the binding check refuses it (RECEIPT_INVALID) before
+    // any signature is checked.
     let awaiting =
         fs::read_to_string(receipt_fixture("receipt-v2-awaiting-approval.json")).unwrap();
     let forged = awaiting.replacen("\"not_dispatched\"", "\"failed\"", 1);
     assert_ne!(forged, awaiting);
-    let path = std::env::temp_dir().join(format!("praetore-receipt-final-{}.json", Uuid::new_v4()));
-    fs::write(&path, forged).unwrap();
-    let output = run_receipt_with(&path, &["--require-final"]);
-    let _ = fs::remove_file(&path);
-    assert!(!output.status.success());
-    assert_ne!(json_output(&output)["code"], "RECEIPT_NOT_FINAL");
-    assert_ne!(json_output(&output)["code"], "OK");
+    assert_eq!(
+        run_receipt_text_with(&forged, &["--require-final"])["code"],
+        "RECEIPT_INVALID"
+    );
+    // Editing both the top-level and the attested state keeps them bound:
+    // only the execution signature refuses it.
+    let forged = awaiting.replace("\"not_dispatched\"", "\"failed\"");
+    assert_eq!(forged.matches("\"failed\"").count(), 2);
+    assert_eq!(
+        run_receipt_text_with(&forged, &["--require-final"])["code"],
+        "RECEIPT_SIGNATURE_INVALID"
+    );
     // Given twice, or to another command, the flag is a usage error.
     let twice = run_receipt_with(
         &receipt_fixture("receipt-v2-confirmed.json"),
@@ -809,15 +899,38 @@ fn receipt_command_verifies_v1_and_rejects_a_tampered_copy() {
     assert_eq!(summary["details"]["schema_version"], 1);
     assert_eq!(summary["details"]["execution"], "confirmed");
 
+    // Only the top-level `execution` changes: the receipt no longer matches
+    // its signed attestation, and the binding check refuses it.
     let v1 = fs::read_to_string(receipt_fixture("receipt-v1-confirmed.json")).unwrap();
     let tampered = v1.replacen("\"confirmed\"", "\"failed\"", 1);
     assert_ne!(tampered, v1);
-    let path = std::env::temp_dir().join(format!("praetore-receipt-v1-{}.json", Uuid::new_v4()));
-    fs::write(&path, tampered).unwrap();
-    let output = run_receipt(&path);
+    let summary = run_receipt_text_with(&tampered, &[]);
+    assert_eq!(summary["ok"], false);
+    assert_eq!(summary["code"], "RECEIPT_INVALID");
+    // The signed `observed_at` changes, everything still bound: only the
+    // execution signature refuses it.
+    let receipt: Value = serde_json::from_str(&v1).unwrap();
+    let observed_at = receipt["execution_attestation"]["observed_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let retimed = v1.replacen(&observed_at, "2020-01-01T00:00:00Z", 1);
+    assert_ne!(retimed, v1);
+    let summary = run_receipt_text_with(&retimed, &[]);
+    assert_eq!(summary["ok"], false);
+    assert_eq!(summary["code"], "RECEIPT_SIGNATURE_INVALID");
+}
+
+/// Runs `receipt` on `text` written to a temporary file; returns the JSON
+/// summary and checks that a failure exits non-zero.
+fn run_receipt_text_with(text: &str, extra: &[&str]) -> Value {
+    let path = std::env::temp_dir().join(format!("praetore-receipt-t-{}.json", Uuid::new_v4()));
+    fs::write(&path, text).unwrap();
+    let output = run_receipt_with(&path, extra);
     let _ = fs::remove_file(&path);
-    assert!(!output.status.success());
-    assert_eq!(json_output(&output)["ok"], false);
+    let summary = json_output(&output);
+    assert_eq!(output.status.success(), summary["ok"] == true, "{summary}");
+    summary
 }
 
 /// G7 test helper: declares every action type a rule names as Mission.

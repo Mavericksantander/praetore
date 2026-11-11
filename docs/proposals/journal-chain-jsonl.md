@@ -70,9 +70,22 @@ trigger), signed with the evidence attester key that the binary passes in
   (`JOURNAL_CHAIN_FAIL`). Each kind has its own link domain, so a record
   line cannot stand in for a receipt line.
 - `praetore-verify journal` verifies both kinds (record hash and signature
-  against the attester pin, `record_id` unique). With `--database-journal
-  JSONL` (verified too) or `--expected-database-head HEX`, a tenant chain
-  must carry a matching reference (`JOURNAL_HEAD_MISMATCH` otherwise).
+  against the attester pin, `record_id` unique, signature in lowercase hex).
+  With `--database-journal JSONL` (verified too) or `--expected-database-head
+  HEX`, a tenant chain must carry a matching reference
+  (`JOURNAL_HEAD_MISMATCH` otherwise), reported as
+  `database_head_consistent`. `database_head_anchored` is true only with
+  `--expected-database-head`: the head of a `--database-journal` file is not
+  anchored by that file (T-016; before, one field `database_head_verified`
+  covered both cases).
+- **One tenant per chain (T-016).** Every receipt of a tenant chain must
+  name the same tenant in its signed authority (`Authority::tenant_id`), or
+  all must name none; otherwise the chain is refused
+  (`JOURNAL_TENANT_MISMATCH`) by the verifier and by the producer. The
+  verifier reports it as `tenant_id`.
+- **Unanchored head (T-016).** Without `--expected-head` the verifier reports
+  the `head_not_anchored` warning (stderr and `details.warnings`);
+  `--require-anchored` turns it into a failure (`JOURNAL_NOT_ANCHORED`).
 - **Attester key rotation.** Records and receipts keep the signature of the
   key that was current when they were written; nothing is re-signed (the
   table is append-only). `praetore journal-export` and `praetore-verify
