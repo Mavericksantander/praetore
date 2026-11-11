@@ -9,8 +9,10 @@
 -- an attestation already uses 'approval_rejected', or carries a
 -- failure_class: those rows are signed, and neither the 0013 vocabulary nor
 -- a schema without the failure columns can hold them. Afterwards only a release
--- without 0020 can run against the database, or `praetore migrate` applies
--- 0020 again. Rows closed as 'approval_expired' in place stay valid under
+-- without 0020 can run against the database, or `praetore-gateway-demo migrate`
+-- (schema owner URL in `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`) applies
+-- 0020 again, and `praetore run` also applies pending migrations when it
+-- starts. Rows closed as 'approval_expired' in place stay valid under
 -- 0013. Migration 0021 reads the failure columns: roll it back first
 -- (docs/rollback/0021-journal-insert-rules.sql); this script refuses to run
 -- while a migration newer than 0020 is recorded.

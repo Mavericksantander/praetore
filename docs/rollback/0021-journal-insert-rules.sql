@@ -8,7 +8,9 @@
 -- changes nothing, if a migration newer than 0021 is recorded (roll that
 -- one back first) or if 0021's triggers are not exactly the ones it
 -- created. Afterwards only a release without 0021 can run against the
--- database, or `praetore migrate` applies 0021 again.
+-- database, or `praetore-gateway-demo migrate` (schema owner URL in
+-- `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`) applies 0021 again, and
+-- `praetore run` also applies pending migrations when it starts.
 
 BEGIN;
 
