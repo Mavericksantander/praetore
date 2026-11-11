@@ -139,15 +139,18 @@ recreating it, then restart the supervisor and gateway so they reload keys.
 Test CEL evaluation with
 the target API server; YAML parsing alone does not validate admission rules.
 These admission and network templates have not been tested on a cluster; CI
-checks YAML syntax only.
+checks YAML syntax and, with
+[`scripts/check-k8s-default-deny.rb`](../scripts/check-k8s-default-deny.rb),
+that each namespace of the network templates has its default-deny floor.
 Add supervisor-side request/concurrency limits as well, because namespace
 quotas are shared capacity limits, not per-tenant fairness controls.
 
 [`sandbox-network-policy.yaml`](../deploy/kubernetes/sandbox-network-policy.yaml)
-provides a portable NetworkPolicy baseline: sandbox ingress is denied except
-gateway mTLS on supervisor port 8443 and worker callbacks over TLS on port
-8444. Workers can egress only to the callback, their egress proxy, and cluster
-DNS. Workers and the gateway use different proxies: workers use
+provides a portable NetworkPolicy baseline: a namespace-wide default-deny of
+ingress and egress (`podSelector: {}`), then sandbox ingress only for gateway
+mTLS on supervisor port 8443 and worker callbacks over TLS on port 8444.
+Workers can egress only to the callback, their egress proxy, and cluster
+DNS; the supervisor only to the Kubernetes API and cluster DNS. Workers and the gateway use different proxies: workers use
 `egress-proxy` (the Service name fixed in the supervisor Job spec and in
 admission), which accepts only `tool-invocation` pods and may reach only
 public addresses (generic profile) or the listed FQDNs (Cilium profile); the
@@ -161,10 +164,22 @@ also allows the gateway to reach the supervisor on port 8443. The generic
 profile requires a CNI that enforces NetworkPolicy. The Cilium supervisor
 ingress policy provides the same gateway/worker paths, and its proxy policy
 permits worker HTTPS proxy traffic. This generic profile cannot portably
-select the Kubernetes API server for supervisor egress; restrict that path
-with the cluster firewall or use the Cilium profile, which allows the
-supervisor's API access explicitly. Do not combine the generic and Cilium
-profiles.
+select the Kubernetes API server for supervisor egress, so it allows TCP 443
+and 6443 to any address: replace `0.0.0.0/0` in
+`praetore-sandbox-supervisor-egress` with the API server endpoint addresses,
+or restrict that path with the cluster firewall, or use the Cilium profile,
+which allows the supervisor's API access explicitly. Do not combine the
+generic and Cilium profiles.
+
+Both profiles start every namespace they write policies for
+(`praetore-agents`, `praetore-gateway`, `praetore-tools`, `praetore-egress`
+and `praetore-sandbox`) from a default-deny of ingress and egress for every
+pod, labeled or not; the allow policies add to that floor. In Cilium the
+floor is a rule with an empty entry (`ingress: [{}]`, `egress: [{}]`): an
+empty or omitted list does not enable default-deny. `praetore-data`
+(PostgreSQL) is not covered by the templates. Protected tools in
+`praetore-tools` get no egress from the templates; add the egress each tool
+needs as its own allow policy.
 
 Enable encryption at rest for Secrets, use one-time credentials with short
 expiry, and configure operator-managed TLS key material separately from

@@ -1,3 +1,5 @@
+# Namespace floor: every pod in praetore-sandbox is denied all ingress and
+# egress unless a policy below allows it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -7,6 +9,7 @@ spec:
   podSelector: {}
   policyTypes:
     - Ingress
+    - Egress
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -69,6 +72,44 @@ spec:
       ports:
         - protocol: TCP
           port: 3128
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# The supervisor creates Jobs and Secrets through the Kubernetes API
+# (KUBERNETES_SERVICE_HOST, an IP address). A portable NetworkPolicy cannot
+# select the API server, so this allows TCP 443 and 6443 to any address:
+# replace 0.0.0.0/0 with the API server endpoint addresses of the target
+# cluster, or restrict the path with the cluster firewall.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: praetore-sandbox-supervisor-egress
+  namespace: praetore-sandbox
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: praetore-sandbox-supervisor
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
     - to:
         - namespaceSelector:
             matchLabels:

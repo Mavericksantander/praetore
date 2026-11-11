@@ -68,6 +68,37 @@ credentials.
    rates: repeated 403s with a valid token indicate a caller probing another
    tenant or an endpoint outside its role.
 
+## Gateway service adapter and attester keys
+
+`praetore-gateway-demo` starts only with an adapter named in
+`PRAETORE_GATEWAY_ADAPTER`: `sandbox`, `http` or `local-demo`. There is no
+default; without the variable (or with an empty value) the service exits
+before it connects to PostgreSQL. `local-demo` is valid only when it is set
+explicitly.
+
+The evidence attester and the execution attester keys are read at startup
+from two files:
+
+- `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE`
+- `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE`
+
+Each file holds a 32-byte Ed25519 secret as 64 lowercase hexadecimal
+characters, optionally followed by one newline. The file is opened without
+following a symlink and must be a regular file owned by the service user,
+with no group or other permission bits (`0600` or `0400`), and at most 128
+bytes. The two files must hold different keys; the service refuses to start
+if they are equal. `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_HEX` and
+`PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_HEX` are no longer read: if either
+is set, the service refuses to start and names the variable to remove.
+Legacy baseline adoption (`praetore-gateway-demo migrate` with
+`PRAETORE_ADOPT_LEGACY_BASELINE`) reads the evidence key from the same file
+variable.
+
+Execution receipts carry the key id `execution-attester-<public key hex>`.
+Generate each key with a CSPRNG, for example
+`umask 077 && openssl rand -hex 32 > evidence-attester.key`, and deliver the
+files through the secret manager of the gateway workload.
+
 ## Approver keys
 
 Human-approval public keys are bound to tenants with

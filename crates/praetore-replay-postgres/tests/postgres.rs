@@ -3427,6 +3427,8 @@ fn postgres_documented_observe_grant_supports_list() {
     let mut client = connect_scratch_as(&scratch, "praetore_observe");
     verify_runtime_role(&mut client)
         .expect("the documented observe role passes the runtime role check");
+    praetore_replay_postgres::verify_observe_role_with(&mut client, &Default::default())
+        .expect("the documented observe role passes the observe role check");
     let reader =
         praetore_replay_postgres::PostgresObservabilityReader::from_client(client).expect("reader");
     let filters = praetore_replay_postgres::ExecutionFilters {
@@ -3441,6 +3443,114 @@ fn postgres_documented_observe_grant_supports_list() {
         "list() with the documented grant: {} executions",
         page.total
     );
+}
+
+/// praetore-observe's startup check (`verify_observe_role_with`) accepts
+/// only a read-only role: the documented praetore_observe grant (and a
+/// login member of it) passes; the gateway's runtime credential, a member
+/// of praetore_safety_audit, a write privilege and a column beyond the
+/// documented ones are refused.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_observe_role_check_accepts_only_the_read_only_role() {
+    use praetore_replay_postgres::{RuntimeRoleError, verify_observe_role_with};
+    const DOC: &str = include_str!("../../../docs/observability-mvp.md");
+    let start = DOC
+        .find("CREATE ROLE praetore_observe LOGIN;")
+        .expect("documented grant");
+    let block = &DOC[start..];
+    let grant = &block[..block.find("```").expect("end of the SQL block")];
+    let scratch = ScratchDatabase::create();
+    let mut admin = scratch.connect();
+    praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+    ensure_test_role(&mut admin, "praetore_observe", "LOGIN NOBYPASSRLS");
+    admin
+        .batch_execute(&grant.replace("CREATE ROLE praetore_observe LOGIN;", ""))
+        .unwrap();
+    let options = praetore_replay_postgres::RuntimeRoleOptions::default();
+    let check =
+        |user: &str| verify_observe_role_with(&mut connect_scratch_as(&scratch, user), &options);
+
+    // The documented read-only role, and a login member of it.
+    check("praetore_observe").expect("the documented observe role is accepted");
+    ensure_test_role(
+        &mut admin,
+        "praetore_observe_check_member",
+        "LOGIN NOBYPASSRLS",
+    );
+    admin
+        .batch_execute("GRANT praetore_observe TO praetore_observe_check_member")
+        .unwrap();
+    check("praetore_observe_check_member").expect("a login member of praetore_observe is accepted");
+    admin
+        .batch_execute("REVOKE praetore_observe FROM praetore_observe_check_member")
+        .unwrap();
+
+    // The gateway's runtime credential: a login member of praetore_runtime.
+    ensure_test_role(
+        &mut admin,
+        "praetore_observe_check_runtime",
+        "LOGIN NOBYPASSRLS",
+    );
+    admin
+        .batch_execute("GRANT praetore_runtime TO praetore_observe_check_runtime")
+        .unwrap();
+    praetore_replay_postgres::verify_runtime_role(&mut connect_scratch_as(
+        &scratch,
+        "praetore_observe_check_runtime",
+    ))
+    .expect("the runtime credential passes the gateway's own check");
+    let result = check("praetore_observe_check_runtime");
+    admin
+        .batch_execute("REVOKE praetore_runtime FROM praetore_observe_check_runtime")
+        .unwrap();
+    let error = result.expect_err("the gateway runtime credential must be refused");
+    assert!(
+        matches!(&error, RuntimeRoleError::RoleSeparation(reason)
+            if reason.contains("is a member of praetore_runtime")),
+        "{error}"
+    );
+    eprintln!("refused as expected: {error}");
+
+    // More than the documented read-only grant.
+    for (grant, revoke, expected) in [
+        (
+            "GRANT praetore_safety_audit TO praetore_observe",
+            "REVOKE praetore_safety_audit FROM praetore_observe",
+            "is a member of praetore_safety_audit",
+        ),
+        (
+            "GRANT INSERT ON praetore.execution_journal TO praetore_observe",
+            "REVOKE INSERT ON praetore.execution_journal FROM praetore_observe",
+            "beyond the observe columns on praetore.execution_journal",
+        ),
+        (
+            "GRANT UPDATE (execution_status) ON praetore.execution_journal TO praetore_observe",
+            "REVOKE UPDATE (execution_status) ON praetore.execution_journal FROM praetore_observe",
+            "beyond the observe columns on praetore.execution_journal",
+        ),
+        (
+            "GRANT SELECT (output_json) ON praetore.execution_journal TO praetore_observe",
+            "REVOKE SELECT (output_json) ON praetore.execution_journal FROM praetore_observe",
+            "beyond the observe columns on praetore.execution_journal",
+        ),
+        (
+            "GRANT SELECT ON praetore.human_approvals TO praetore_observe",
+            "REVOKE SELECT ON praetore.human_approvals FROM praetore_observe",
+            "beyond the observe columns on praetore.human_approvals",
+        ),
+    ] {
+        admin.batch_execute(grant).unwrap();
+        let result = check("praetore_observe");
+        admin.batch_execute(revoke).unwrap();
+        let error = result.expect_err(grant);
+        assert!(
+            matches!(&error, RuntimeRoleError::RoleSeparation(reason) if reason.contains(expected)),
+            "{grant}: {error}"
+        );
+        eprintln!("refused as expected: {error}");
+    }
+    check("praetore_observe").expect("accepted again once the extra grants are revoked");
 }
 
 #[test]
