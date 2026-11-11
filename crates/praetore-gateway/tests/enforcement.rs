@@ -907,7 +907,11 @@ impl ActionDispatcher for LocalSetTool {
             .unwrap_or(ReconciliationReport::Unknown)
     }
 
-    fn preflight(&self, _action: &Action) -> Result<(), praetore_gateway::DispatchRefused> {
+    fn preflight(
+        &self,
+        _authority: &Authority,
+        _action: &Action,
+    ) -> Result<(), praetore_gateway::DispatchRefused> {
         self.preflights.fetch_add(1, Ordering::SeqCst);
         if self.refuse_transient.load(Ordering::SeqCst) {
             return Err(praetore_gateway::DispatchRefused::transient(

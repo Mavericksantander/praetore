@@ -283,8 +283,10 @@ pub struct Written {
     pub confirmed: bool,
 }
 
-/// Result of [`Root::remove_file`]. Returned only once the entry was
-/// unlinked; any `Err` means nothing was removed.
+/// Result of [`Root::remove_file`] and [`Dir::unlink_file`]. Returned only
+/// once the entry was unlinked. An `Err` before the `unlinkat` call (a path
+/// or entry check) means nothing was removed; an `Err` from the call itself
+/// does not prove that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Removed {
     /// The directory was `fsync`ed and the entry is gone.
@@ -560,17 +562,7 @@ impl Root {
     pub fn remove_file(&self, path: &str) -> Result<Removed, ConfineError> {
         let (dir, name) = self.open_parent(path)?;
         dir.check_entry(name, false)?;
-        rustix::fs::unlinkat(&dir.fd, name, AtFlags::empty()).map_err(|errno| {
-            if errno == Errno::NOENT {
-                ConfineError::NotFound
-            } else {
-                final_error(errno)
-            }
-        })?;
-        let synced = rustix::fs::fsync(&dir.fd).is_ok();
-        Ok(Removed {
-            confirmed: synced && matches!(dir.stat_entry(name), Ok(None)),
-        })
+        dir.unlink_file(name)
     }
 }
 
@@ -619,6 +611,27 @@ impl Dir {
             None if may_be_absent => Ok(None),
             None => Err(ConfineError::NotFound),
         }
+    }
+
+    /// `unlinkat(fd, name, 0)` without any check of the entry (callers run
+    /// [`Dir::check_entry`] first), then `fsync` of this directory. Never
+    /// removes a directory. An `Err` comes from the `unlinkat` call itself,
+    /// so it does not prove that the entry is still there: `ENOENT`, for
+    /// example, is reported as [`ConfineError::NotFound`] whatever removed
+    /// the entry.
+    pub fn unlink_file(&self, name: &str) -> Result<Removed, ConfineError> {
+        check_component(name)?;
+        rustix::fs::unlinkat(&self.fd, name, AtFlags::empty()).map_err(|errno| {
+            if errno == Errno::NOENT {
+                ConfineError::NotFound
+            } else {
+                final_error(errno)
+            }
+        })?;
+        let synced = rustix::fs::fsync(&self.fd).is_ok();
+        Ok(Removed {
+            confirmed: synced && matches!(self.stat_entry(name), Ok(None)),
+        })
     }
 
     /// `openat(O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW)`, then `fchmod` to

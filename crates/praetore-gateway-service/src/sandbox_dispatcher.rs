@@ -1,7 +1,7 @@
 use praetore_core::{Action, Authority};
 use praetore_gateway::{
-    ActionDispatcher, DispatchError, DispatchReport, ExecutionKey, ReconciliationReport,
-    action_digest, authority_tenant_id,
+    ActionDispatcher, DispatchError, DispatchRefused, DispatchReport, ExecutionKey,
+    ReconciliationReport, action_digest, authority_tenant_id,
 };
 use reqwest::{
     Url,
@@ -122,6 +122,9 @@ impl SandboxActionDispatcher {
 }
 
 impl ActionDispatcher for SandboxActionDispatcher {
+    /// Every refusal before the request is sent is `NotApplied`: nothing
+    /// reached the supervisor. Errors after that point, including any
+    /// refusal by the supervisor, are `Ambiguous`.
     fn dispatch(
         &self,
         key: ExecutionKey,
@@ -129,29 +132,22 @@ impl ActionDispatcher for SandboxActionDispatcher {
         action: &Action,
         expected_digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
-        if authority_tenant_id(authority) != Some(key.tenant_id)
-            || action_digest(action).map_err(|_| DispatchError::Ambiguous)? != expected_digest
-        {
-            return Err(DispatchError::Ambiguous);
+        let refused = |reason| DispatchError::NotApplied(DispatchRefused::terminal(reason));
+        if authority_tenant_id(authority) != Some(key.tenant_id) {
+            return Err(refused("execution_key_mismatch"));
         }
-        let request = DispatchRequest {
-            schema_version: 1,
-            execution_key: key,
-            authority,
-            action,
-            action_digest: expected_digest,
-        };
-        let body = serde_json::to_vec(&request).map_err(|_| DispatchError::Ambiguous)?;
-        if body.len() > MAX_REQUEST_BYTES {
-            return Err(DispatchError::Ambiguous);
+        if action_digest(action).map_err(|_| refused("invalid_action"))? != expected_digest {
+            return Err(refused("action_digest_mismatch"));
         }
+        let body = request_body(key, authority, action, expected_digest)
+            .map_err(DispatchError::NotApplied)?;
         let url = self
             .endpoint
             .join("v1/executions")
-            .map_err(|_| DispatchError::Ambiguous)?;
+            .map_err(|_| refused("invalid_endpoint"))?;
         let idempotency_key = format!("{}:{}:{}", key.tenant_id, key.agent_id, key.request_id);
-        let idempotency_key =
-            HeaderValue::from_str(&idempotency_key).map_err(|_| DispatchError::Ambiguous)?;
+        let idempotency_key = HeaderValue::from_str(&idempotency_key)
+            .map_err(|_| refused("invalid_execution_key"))?;
         let response = self
             .client
             .post(url)
@@ -211,6 +207,43 @@ impl ActionDispatcher for SandboxActionDispatcher {
             ReconciliationStatus::Unknown => ReconciliationReport::Unknown,
         }
     }
+
+    /// The checks of `dispatch` that need neither the execution key nor the
+    /// network: a verified tenant and the request size.
+    fn preflight(&self, authority: &Authority, action: &Action) -> Result<(), DispatchRefused> {
+        let tenant_id = authority_tenant_id(authority)
+            .ok_or(DispatchRefused::terminal("tenant_identity_invalid"))?;
+        let digest =
+            action_digest(action).map_err(|_| DispatchRefused::terminal("invalid_action"))?;
+        // UUIDs serialize to a fixed length, so this request has the size of
+        // the real one.
+        let key = ExecutionKey {
+            tenant_id,
+            agent_id: uuid::Uuid::nil(),
+            request_id: uuid::Uuid::nil(),
+        };
+        request_body(key, authority, action, &digest).map(drop)
+    }
+}
+
+fn request_body(
+    key: ExecutionKey,
+    authority: &Authority,
+    action: &Action,
+    action_digest: &str,
+) -> Result<Vec<u8>, DispatchRefused> {
+    let body = serde_json::to_vec(&DispatchRequest {
+        schema_version: 1,
+        execution_key: key,
+        authority,
+        action,
+        action_digest,
+    })
+    .map_err(|_| DispatchRefused::terminal("invalid_action"))?;
+    if body.len() > MAX_REQUEST_BYTES {
+        return Err(DispatchRefused::terminal("request_too_large"));
+    }
+    Ok(body)
 }
 
 fn read_limited(path: &str, max_bytes: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -284,5 +317,58 @@ mod tests {
             Uuid::from_u128(10).to_string()
         );
         assert!(serde_json::to_vec(&value).unwrap().len() < MAX_REQUEST_BYTES);
+    }
+
+    /// The endpoint does not resolve: a request that reached the network
+    /// would fail as `Ambiguous`, never as `NotApplied`.
+    #[test]
+    fn refusals_before_the_request_is_sent_are_not_applied() {
+        let dispatcher = SandboxActionDispatcher {
+            client: Client::builder().https_only(true).build().unwrap(),
+            endpoint: Url::parse("https://supervisor.invalid/").unwrap(),
+        };
+        let not_applied =
+            |reason| Err(DispatchError::NotApplied(DispatchRefused::terminal(reason)));
+        let key = |tenant| ExecutionKey {
+            tenant_id: Uuid::from_u128(tenant),
+            agent_id: Uuid::from_u128(11),
+            request_id: Uuid::from_u128(12),
+        };
+        let authority = authority();
+        let action = action();
+        let digest = action_digest(&action).unwrap();
+        assert!(dispatcher.preflight(&authority, &action).is_ok());
+        assert_eq!(
+            dispatcher.dispatch(key(99), &authority, &action, &digest),
+            not_applied("execution_key_mismatch")
+        );
+        assert_eq!(
+            dispatcher.dispatch(key(10), &authority, &action, &"0".repeat(64)),
+            not_applied("action_digest_mismatch")
+        );
+
+        let no_tenant = Authority::new(AgentId::new(), "test-issuer", vec![]);
+        assert_eq!(
+            dispatcher.preflight(&no_tenant, &action),
+            Err(DispatchRefused::terminal("tenant_identity_invalid"))
+        );
+
+        // Valid parameters, but the request with the authority exceeds the
+        // limit.
+        let large = Action::new(
+            "orders:create",
+            Some("orders-api".into()),
+            json!({"note": "x".repeat(MAX_REQUEST_BYTES - 300)}),
+        )
+        .unwrap()
+        .with_capability("orders:write");
+        assert_eq!(
+            dispatcher.preflight(&authority, &large),
+            Err(DispatchRefused::terminal("request_too_large"))
+        );
+        assert_eq!(
+            dispatcher.dispatch(key(10), &authority, &large, &action_digest(&large).unwrap()),
+            not_applied("request_too_large")
+        );
     }
 }

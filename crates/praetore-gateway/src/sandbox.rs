@@ -64,6 +64,10 @@
 //! - `fs:delete_file` uses `unlinkat(…, 0)` on the parent descriptor, which
 //!   never removes a directory and removes a symlink itself, never its target.
 //!
+//! A refusal by the checks before the effect call is signed `failed` with the
+//! class `no_effect`. Any error from the effect call itself (`write_file`, or
+//! the `unlinkat` of a delete, `ENOENT` included) is signed `effect_failed`.
+//!
 //! Residual risks (documented, not solved here): a process that can rename
 //! directories inside the root *and* write outside it on the same
 //! filesystem can move an already opened directory out of the root while a
@@ -81,7 +85,7 @@ use crate::{
 use praetore_core::{Action, Authority};
 // `is_temp_name`: TEMP_PREFIX compared ASCII case-insensitively, shared with
 // praetore-sandbox-fs (which also refuses such paths on its own).
-use praetore_sandbox_fs::{ConfineError, Openat2Status, Resolver, Root, is_temp_name};
+use praetore_sandbox_fs::{ConfineError, Openat2Status, Removed, Resolver, Root, is_temp_name};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -194,14 +198,15 @@ enum FsOp<'a> {
 /// with `Executed` instead, because the effect did happen.
 enum PerformFailure {
     /// Refused by a check that touches nothing (the root check, the parent
-    /// resolution and the inspection of the final component), or an
-    /// `unlinkat` that failed and so removed nothing. Positive proof of no
-    /// effect: signed `no_effect` with this reason.
+    /// resolution and the inspection of the final component). Positive
+    /// proof of no effect: signed `no_effect` with this reason.
     BeforeEffect(&'static str),
-    /// `write_file` failed after the checks above passed. It may already
-    /// have created and written a temporary file in the target directory
-    /// (removed on a best-effort basis), and its error does not say whether
-    /// it did, so this is signed `effect_failed` (fail closed).
+    /// The effect call itself failed after the checks above passed.
+    /// `write_file` may already have created and written a temporary file
+    /// in the target directory (removed on a best-effort basis); an error
+    /// from `unlinkat` does not prove that the entry was not removed. The
+    /// error does not say what happened, so this is signed `effect_failed`
+    /// (fail closed).
     EffectFailed(&'static str),
 }
 
@@ -443,11 +448,11 @@ impl SandboxDispatcher {
         self.check_final(&op)
     }
 
-    /// Performs the effect through [`praetore_sandbox_fs::Root`]. Before
-    /// calling it, the target is checked here without touching anything,
-    /// so a refusal at that point is a proven `no_effect`. An `Err` from
-    /// `write_file` or `remove_file` means the target entry was not changed;
-    /// only `remove_file` also guarantees that nothing else was created.
+    /// Performs the effect through [`praetore_sandbox_fs`]. Before calling
+    /// it, the target is checked here without touching anything, so a
+    /// refusal at that point is a proven `no_effect`. Any error from the
+    /// effect call itself (`write_file`, or the `unlinkat` of a delete) is
+    /// `effect_failed`.
     fn perform(&self, op: &FsOp<'_>) -> Result<DispatchReport, PerformFailure> {
         let before = |refused: DispatchRefused| PerformFailure::BeforeEffect(refused.reason());
         // Side-effect free: no file is opened for writing or created here.
@@ -471,12 +476,17 @@ impl SandboxDispatcher {
                 })
             }
             FsOp::Delete { path } => {
-                // `remove_file` creates nothing, and its only change is the
-                // single `unlinkat`: an `Err` removed nothing.
-                let removed = self
+                // The steps of `Root::remove_file`. Resolving the parent and
+                // checking the entry touch nothing; the only effect is the
+                // single `unlinkat`.
+                let (parent, name) = self
                     .root_fd
-                    .remove_file(path)
+                    .open_parent(path)
                     .map_err(|error| before(refusal(error)))?;
+                parent
+                    .check_entry(name, false)
+                    .map_err(|error| before(refusal(error)))?;
+                let removed = unlink(&parent, name)?;
                 let output = json!({"action": DELETE_ACTION, "path": path});
                 Ok(if removed.confirmed {
                     DispatchReport::Confirmed(output)
@@ -601,9 +611,18 @@ impl ActionDispatcher for SandboxDispatcher {
         }
     }
 
-    fn preflight(&self, action: &Action) -> Result<(), DispatchRefused> {
+    fn preflight(&self, _authority: &Authority, action: &Action) -> Result<(), DispatchRefused> {
         self.admit(action)
     }
+}
+
+/// The `unlinkat` of a checked delete. Its error does not prove that the
+/// entry was not removed (`ENOENT`, for example, does not say who removed
+/// it), so any error is `effect_failed`, never `no_effect`.
+fn unlink(parent: &praetore_sandbox_fs::Dir, name: &str) -> Result<Removed, PerformFailure> {
+    parent
+        .unlink_file(name)
+        .map_err(|error| PerformFailure::EffectFailed(refusal(error).reason()))
 }
 
 /// Accepts only `name(/name)*` with each name a normal, non-empty component.
@@ -970,7 +989,7 @@ mod tests {
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
         std::fs::create_dir(dirs.root.join("sub")).unwrap();
         let action = write("sub/hola.txt", "hola");
-        assert!(d.preflight(&action).is_ok());
+        assert!(d.preflight(&authority(), &action).is_ok());
         let report = run(&d, 1, &action).unwrap();
         assert!(matches!(report, DispatchReport::Confirmed(ref o) if o["bytes"] == 4));
         assert_eq!(
@@ -996,7 +1015,7 @@ mod tests {
         assert!(matches!(run(&d, 2, &del), Ok(DispatchReport::Confirmed(_))));
         assert!(!dirs.root.join("sub/hola.txt").exists());
         assert_eq!(
-            d.preflight(&del),
+            d.preflight(&authority(), &del),
             Err(DispatchRefused::terminal("file_not_found"))
         );
     }
@@ -1010,7 +1029,7 @@ mod tests {
             .enumerate()
         {
             let action = write(path, "x");
-            assert!(d.preflight(&action).is_err(), "{path}");
+            assert!(d.preflight(&authority(), &action).is_err(), "{path}");
             assert!(not_applied(run(&d, 100 + n as u128, &action)), "{path}");
         }
         assert!(outside_is_empty(&dirs));
@@ -1029,11 +1048,11 @@ mod tests {
         .enumerate()
         {
             assert_eq!(
-                d.preflight(&write(&path, "x")),
+                d.preflight(&authority(), &write(&path, "x")),
                 Err(DispatchRefused::terminal("absolute_path"))
             );
             assert_eq!(
-                d.preflight(&delete(&path)),
+                d.preflight(&authority(), &delete(&path)),
                 Err(DispatchRefused::terminal("absolute_path"))
             );
             assert!(not_applied(run(&d, 110 + n as u128, &write(&path, "x"))));
@@ -1053,15 +1072,15 @@ mod tests {
         symlink(dirs.outside.join("new.txt"), dirs.root.join("dangling.txt")).unwrap();
 
         assert_eq!(
-            d.preflight(&write("link.txt", "pwned")),
+            d.preflight(&authority(), &write("link.txt", "pwned")),
             Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         assert_eq!(
-            d.preflight(&write("dangling.txt", "pwned")),
+            d.preflight(&authority(), &write("dangling.txt", "pwned")),
             Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         assert_eq!(
-            d.preflight(&delete("link.txt")),
+            d.preflight(&authority(), &delete("link.txt")),
             Err(DispatchRefused::terminal("symlink_not_allowed"))
         );
         // Even bypassing preflight, dispatch refuses (O_NOFOLLOW / lstat).
@@ -1091,7 +1110,7 @@ mod tests {
             .enumerate()
         {
             assert_eq!(
-                d.preflight(&write(path, "pwned")),
+                d.preflight(&authority(), &write(path, "pwned")),
                 Err(DispatchRefused::terminal(
                     "symlink_or_non_directory_in_path"
                 )),
@@ -1103,7 +1122,7 @@ mod tests {
             );
         }
         assert_eq!(
-            d.preflight(&delete("escape/victim.txt")),
+            d.preflight(&authority(), &delete("escape/victim.txt")),
             Err(DispatchRefused::terminal(
                 "symlink_or_non_directory_in_path"
             ))
@@ -1121,18 +1140,21 @@ mod tests {
         let dirs = dirs();
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
         assert_eq!(
-            d.preflight(&write("", "x")),
+            d.preflight(&authority(), &write("", "x")),
             Err(DispatchRefused::terminal("empty_path"))
         );
         assert_eq!(
-            d.preflight(&delete("")),
+            d.preflight(&authority(), &delete("")),
             Err(DispatchRefused::terminal("empty_path"))
         );
         for path in ["a//b", "dir/", "/"] {
-            assert!(d.preflight(&write(path, "x")).is_err(), "{path}");
+            assert!(
+                d.preflight(&authority(), &write(path, "x")).is_err(),
+                "{path}"
+            );
         }
         assert_eq!(
-            d.preflight(&write("a\0b", "x")),
+            d.preflight(&authority(), &write("a\0b", "x")),
             Err(DispatchRefused::terminal("invalid_path_character"))
         );
         assert!(not_applied(run(&d, 40, &write("", "x"))));
@@ -1146,10 +1168,13 @@ mod tests {
             .unwrap()
             .with_max_content_bytes(8)
             .unwrap();
-        assert!(d.preflight(&write("ok.txt", "12345678")).is_ok());
+        assert!(
+            d.preflight(&authority(), &write("ok.txt", "12345678"))
+                .is_ok()
+        );
         let big = write("big.txt", "123456789");
         assert_eq!(
-            d.preflight(&big),
+            d.preflight(&authority(), &big),
             Err(DispatchRefused::terminal("content_too_large"))
         );
         assert!(not_applied(run(&d, 50, &big)));
@@ -1157,19 +1182,22 @@ mod tests {
         let default = SandboxDispatcher::open(&dirs.root).unwrap();
         let huge = write("huge.txt", &"x".repeat(DEFAULT_MAX_CONTENT_BYTES + 1));
         assert_eq!(
-            default.preflight(&huge),
+            default.preflight(&authority(), &huge),
             Err(DispatchRefused::terminal("content_too_large"))
         );
         assert_eq!(
-            default.preflight(&write(&"a".repeat(256), "x")),
+            default.preflight(&authority(), &write(&"a".repeat(256), "x")),
             Err(DispatchRefused::terminal("path_component_too_long"))
         );
         assert_eq!(
-            default.preflight(&write(&"a/".repeat(600), "x")),
+            default.preflight(&authority(), &write(&"a/".repeat(600), "x")),
             Err(DispatchRefused::terminal("path_too_long"))
         );
         assert_eq!(
-            default.preflight(&write(&format!("{}leaf", "a/".repeat(16)), "x")),
+            default.preflight(
+                &authority(),
+                &write(&format!("{}leaf", "a/".repeat(16)), "x")
+            ),
             Err(DispatchRefused::terminal("path_too_deep"))
         );
         assert!(
@@ -1188,7 +1216,7 @@ mod tests {
         std::fs::write(&outside, "original").unwrap();
         if std::fs::hard_link(&outside, dirs.root.join("hard.txt")).is_ok() {
             assert_eq!(
-                d.preflight(&write("hard.txt", "pwned")),
+                d.preflight(&authority(), &write("hard.txt", "pwned")),
                 Err(DispatchRefused::terminal("hard_link_not_allowed"))
             );
             assert!(not_applied(run(&d, 60, &write("hard.txt", "pwned"))));
@@ -1196,24 +1224,24 @@ mod tests {
         }
         std::fs::create_dir(dirs.root.join("dir")).unwrap();
         assert_eq!(
-            d.preflight(&write("dir", "x")),
+            d.preflight(&authority(), &write("dir", "x")),
             Err(DispatchRefused::terminal("not_a_regular_file"))
         );
         assert_eq!(
-            d.preflight(&delete("dir")),
+            d.preflight(&authority(), &delete("dir")),
             Err(DispatchRefused::terminal("not_a_regular_file"))
         );
         let fifo = CString::new(dirs.root.join("fifo").as_os_str().as_bytes()).unwrap();
         // SAFETY: valid path.
         if unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) } == 0 {
             assert_eq!(
-                d.preflight(&write("fifo", "x")),
+                d.preflight(&authority(), &write("fifo", "x")),
                 Err(DispatchRefused::terminal("not_a_regular_file"))
             );
             assert!(not_applied(run(&d, 61, &write("fifo", "x"))));
         }
         assert_eq!(
-            d.preflight(&write("missing/x.txt", "x")),
+            d.preflight(&authority(), &write("missing/x.txt", "x")),
             Err(DispatchRefused::terminal("parent_directory_missing"))
         );
     }
@@ -1230,7 +1258,7 @@ mod tests {
         .unwrap()
         .with_capability("shell:exec");
         assert_eq!(
-            d.preflight(&exec),
+            d.preflight(&authority(), &exec),
             Err(DispatchRefused::terminal("action_not_in_sandbox_allowlist"))
         );
         assert!(not_applied(run(&d, 70, &exec)));
@@ -1242,12 +1270,12 @@ mod tests {
         .unwrap()
         .with_capability("demo:write");
         assert!(
-            d.preflight(&demo).is_err(),
+            d.preflight(&authority(), &demo).is_err(),
             "demo disabled unless configured"
         );
         let wrong_cap = write("x", "y").with_capability("fs:delete");
         assert_eq!(
-            d.preflight(&wrong_cap),
+            d.preflight(&authority(), &wrong_cap),
             Err(DispatchRefused::terminal("capability_mismatch"))
         );
         let wrong_target = Action::new(
@@ -1258,7 +1286,7 @@ mod tests {
         .unwrap()
         .with_capability(WRITE_CAPABILITY);
         assert_eq!(
-            d.preflight(&wrong_target),
+            d.preflight(&authority(), &wrong_target),
             Err(DispatchRefused::terminal("target_mismatch"))
         );
         let extra = Action::new(
@@ -1269,13 +1297,13 @@ mod tests {
         .unwrap()
         .with_capability(WRITE_CAPABILITY);
         assert_eq!(
-            d.preflight(&extra),
+            d.preflight(&authority(), &extra),
             Err(DispatchRefused::terminal("invalid_parameters"))
         );
         let with_demo = SandboxDispatcher::open(&dirs.root)
             .unwrap()
             .with_local_demo(LocalDemoDispatcher::new());
-        assert!(with_demo.preflight(&demo).is_ok());
+        assert!(with_demo.preflight(&authority(), &demo).is_ok());
         assert!(matches!(
             run(&with_demo, 71, &demo),
             Ok(DispatchReport::Confirmed(_))
@@ -1354,7 +1382,7 @@ mod tests {
         );
         assert!(no_temp_files(&dirs.root));
         assert_eq!(
-            d.preflight(&write(&format!("{TEMP_PREFIX}x"), "x")),
+            d.preflight(&authority(), &write(&format!("{TEMP_PREFIX}x"), "x")),
             Err(DispatchRefused::terminal("reserved_file_name"))
         );
     }
@@ -1368,13 +1396,13 @@ mod tests {
         std::fs::rename(&dirs.root, &moved).unwrap();
         // Path missing.
         assert_eq!(
-            d.preflight(&write("a.txt", "x")),
+            d.preflight(&authority(), &write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
         // Path replaced by another directory.
         std::fs::create_dir(&dirs.root).unwrap();
         assert_eq!(
-            d.preflight(&write("a.txt", "x")),
+            d.preflight(&authority(), &write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
         assert!(not_applied(run(&d, 110, &write("a.txt", "x"))));
@@ -1383,7 +1411,7 @@ mod tests {
         // Path replaced by a symlink to the original directory.
         symlink(&moved, &dirs.root).unwrap();
         assert_eq!(
-            d.preflight(&write("a.txt", "x")),
+            d.preflight(&authority(), &write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_replaced"))
         );
         assert!(not_applied(run(&d, 112, &write("a.txt", "x"))));
@@ -1443,7 +1471,7 @@ mod tests {
             .into_iter()
             .enumerate()
         {
-            assert!(d.preflight(&delete(path)).is_err(), "{path}");
+            assert!(d.preflight(&authority(), &delete(path)).is_err(), "{path}");
             assert!(
                 not_applied(run(&d, 120 + n as u128, &delete(path))),
                 "{path}"
@@ -1460,18 +1488,18 @@ mod tests {
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
         std::fs::write(dirs.root.join("file.txt"), "x").unwrap();
         assert_eq!(
-            d.preflight(&write("file.txt/x", "x")),
+            d.preflight(&authority(), &write("file.txt/x", "x")),
             Err(DispatchRefused::terminal(
                 "symlink_or_non_directory_in_path"
             ))
         );
         if let Ok(_listener) = std::os::unix::net::UnixListener::bind(dirs.root.join("sock")) {
             assert_eq!(
-                d.preflight(&write("sock", "x")),
+                d.preflight(&authority(), &write("sock", "x")),
                 Err(DispatchRefused::terminal("not_a_regular_file"))
             );
             assert_eq!(
-                d.preflight(&delete("sock")),
+                d.preflight(&authority(), &delete("sock")),
                 Err(DispatchRefused::terminal("not_a_regular_file"))
             );
             assert!(not_applied(run(&d, 130, &write("sock", "x"))));
@@ -1492,7 +1520,7 @@ mod tests {
             "del\u{7F}",
         ] {
             assert_eq!(
-                d.preflight(&write(path, "x")),
+                d.preflight(&authority(), &write(path, "x")),
                 Err(DispatchRefused::terminal("invalid_path_character")),
                 "{path:?}"
             );
@@ -1552,10 +1580,10 @@ mod tests {
     fn root_mode_changed_after_open_fails_closed() {
         let dirs = dirs();
         let d = SandboxDispatcher::open(&dirs.root).unwrap();
-        assert!(d.preflight(&write("a.txt", "x")).is_ok());
+        assert!(d.preflight(&authority(), &write("a.txt", "x")).is_ok());
         std::fs::set_permissions(&dirs.root, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert_eq!(
-            d.preflight(&write("a.txt", "x")),
+            d.preflight(&authority(), &write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_insecure"))
         );
         assert!(not_applied(run(&d, 400, &write("a.txt", "x"))));
@@ -1593,14 +1621,14 @@ mod tests {
             Err(SandboxConfigError::ExtendedAcl)
         ));
         assert_eq!(
-            d.preflight(&write("a.txt", "x")),
+            d.preflight(&authority(), &write("a.txt", "x")),
             Err(DispatchRefused::terminal("sandbox_root_insecure"))
         );
         assert!(not_applied(run(&d, 410, &write("a.txt", "x"))));
         assert!(!dirs.root.join("a.txt").exists());
         chmod(&["-N"]);
         assert!(SandboxDispatcher::open(&dirs.root).is_ok());
-        assert!(d.preflight(&write("a.txt", "x")).is_ok());
+        assert!(d.preflight(&authority(), &write("a.txt", "x")).is_ok());
     }
 
     /// The reserved prefix is matched case-insensitively
@@ -1708,7 +1736,7 @@ mod tests {
         // Control: a write under the limit succeeds.
         assert!(run(&d, 1, &write("small.txt", "small")).is_ok());
         let big = write("big.txt", &"a".repeat(8192));
-        assert!(d.preflight(&big).is_ok(), "the checks pass");
+        assert!(d.preflight(&authority(), &big).is_ok(), "the checks pass");
         let result = run(&d, 2, &big);
         assert!(
             matches!(result, Err(DispatchError::EffectFailed(_))),
@@ -1727,6 +1755,82 @@ mod tests {
         assert_eq!(
             d.reconcile(key(2), &authority(), &big, &digest),
             ReconciliationReport::NotApplied
+        );
+        assert!(outside_is_empty(&dirs));
+    }
+
+    /// A delete refused by the entry check, before `unlinkat`, is a proven
+    /// `no_effect`.
+    #[test]
+    fn delete_refused_by_the_entry_check_is_no_effect() {
+        let dirs = dirs();
+        std::fs::write(dirs.outside.join("victim.txt"), "outside").unwrap();
+        symlink(dirs.outside.join("victim.txt"), dirs.root.join("link.txt")).unwrap();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        assert!(not_applied(run(&d, 1, &delete("missing.txt"))));
+        assert_eq!(d.not_applied_reason(key(1)), Some("file_not_found"));
+        assert!(not_applied(run(&d, 2, &delete("link.txt"))));
+        assert_eq!(d.not_applied_reason(key(2)), Some("symlink_not_allowed"));
+        assert!(dirs.root.join("link.txt").symlink_metadata().is_ok());
+        assert!(dirs.outside.join("victim.txt").exists());
+    }
+
+    /// An error from the `unlinkat` itself is `effect_failed`, including
+    /// `ENOENT`: here the entry passed the check and was then removed by
+    /// someone else, so the error does not show that nothing was removed.
+    #[test]
+    fn unlink_error_after_the_entry_check_is_effect_failed() {
+        let dirs = dirs();
+        std::fs::write(dirs.root.join("gone.txt"), "x").unwrap();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let (parent, name) = d.root_fd.open_parent("gone.txt").unwrap();
+        parent.check_entry(name, false).unwrap();
+        std::fs::remove_file(dirs.root.join("gone.txt")).unwrap();
+        assert!(matches!(
+            unlink(&parent, name),
+            Err(PerformFailure::EffectFailed("file_not_found"))
+        ));
+    }
+
+    /// Through `dispatch`: the entry check passes and `unlinkat` fails
+    /// (`EACCES` in a read-only directory). It is `EffectFailed`, never
+    /// `NotApplied`, and is never attempted again. Root bypasses the
+    /// directory mode, so the check is skipped when running as root.
+    #[test]
+    fn delete_whose_unlink_fails_is_effect_failed() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, a read-only directory does not refuse unlinkat");
+            return;
+        }
+        let dirs = dirs();
+        let locked = dirs.root.join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("keep.txt"), "keep").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let d = SandboxDispatcher::open(&dirs.root).unwrap();
+        let del = delete("locked/keep.txt");
+        assert!(d.preflight(&authority(), &del).is_ok(), "the checks pass");
+        let result = run(&d, 1, &del);
+        assert!(
+            matches!(result, Err(DispatchError::EffectFailed(_))),
+            "{result:?}"
+        );
+        assert_eq!(d.not_applied_reason(key(1)), None);
+        assert!(d.failure_reason(key(1)).is_some());
+        assert!(matches!(
+            run(&d, 1, &del),
+            Err(DispatchError::EffectFailed(_))
+        ));
+        let digest = crate::action_digest(&del).unwrap();
+        assert_eq!(
+            d.reconcile(key(1), &authority(), &del, &digest),
+            ReconciliationReport::NotApplied
+        );
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(locked.join("keep.txt")).unwrap(),
+            "keep"
         );
         assert!(outside_is_empty(&dirs));
     }
@@ -2049,7 +2153,7 @@ mod tests {
                 let content = format!("inside-{iterations}");
                 for action in [write("f", &content), delete("f"), write("f", &content)] {
                     n += 1;
-                    match d.preflight(&action) {
+                    match d.preflight(&authority(), &action) {
                         Err(refusal) => *refused.entry(refusal.reason()).or_default() += 1,
                         Ok(()) => match run(&d, n, &action) {
                             Ok(_) => ok += 1,

@@ -60,6 +60,39 @@
   (schema v3) for an approved request whose single dispatch is claimed too
   late. `approval_expired` now means only that the window closed without a
   decision. Rows closed before this release keep `approval_expired`.
+- **`ActionDispatcher::preflight` takes the verified authority (T-016).**
+  The signature is now `preflight(&self, authority: &Authority, action:
+  &Action)`; the gateway passes the same authority that `dispatch` receives,
+  so an adapter that routes per tenant can check its route before an action
+  is dispatched or held for approval. Action: adapters that override
+  `preflight` add the parameter.
+- **HTTP and sandbox-supervisor adapters report refusals made before sending
+  as `no_effect` (T-016).** `HttpActionDispatcher` now implements
+  `preflight`: an action with no configured route for the verified tenant,
+  action type and target, with a capability other than the route's, or with
+  parameters over 64 KiB is refused at submission (403
+  `action_not_dispatchable`, signed `not_dispatched` with reason
+  `dispatch_refused`), and an action that requires approval is not held.
+  Before, it was dispatched and signed `outcome_unknown`, or held for
+  approval first. In `dispatch`, every check before the request is sent
+  (action digest, tenant, route, capability, size) now returns
+  `DispatchError::NotApplied` (signed `failed` with the class `no_effect`)
+  instead of `Ambiguous` (`outcome_unknown`). `SandboxActionDispatcher`
+  (the mTLS supervisor client) does the same for its checks before sending
+  (tenant, action digest, request size), and its `preflight` refuses a
+  request without a verified tenant or over 64 KiB. Any error after the
+  request may have been sent is still `outcome_unknown`. Action: clients
+  that expected `outcome_unknown` for these cases handle 403
+  `action_not_dispatchable` and `failed` / `no_effect`.
+- **A sandbox delete whose `unlinkat` fails is signed `effect_failed`
+  (T-016).** `fs:delete_file` is `failed` / `no_effect` (403
+  `action_not_dispatchable`) only when the checks before `unlinkat` refuse
+  it (path, parent directory, entry). An error from the `unlinkat` call
+  itself, `ENOENT` included, is now `failed` / `effect_failed` (502
+  `action_effect_failed`): that error does not show that nothing was
+  removed. Before, it was signed `no_effect`. New:
+  `praetore_sandbox_fs::Dir::unlink_file`; `Root::remove_file` is
+  unchanged.
 - **Migration 0022 (`0022_awaiting_approval_state`).** Admits
   `awaiting_approval` in `execution_attestations` (accepted only while the
   journal row is held: `requires_approval`, `not_dispatched`, no reason, no

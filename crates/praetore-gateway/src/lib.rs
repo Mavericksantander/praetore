@@ -814,14 +814,17 @@ pub trait ActionDispatcher: Send + Sync {
     }
 
     /// Side-effect-free admission check run by the gateway before an action
-    /// is dispatched or offered for human approval. An adapter that returns
-    /// `Err` guarantees it would not perform the action now. A terminal
+    /// is dispatched or offered for human approval, with the same verified
+    /// authority that [`ActionDispatcher::dispatch`] would receive (an
+    /// adapter that routes per tenant derives the tenant from it). An
+    /// adapter that returns `Err` guarantees it would not perform the
+    /// action now. A terminal
     /// refusal at submission or at the dispatch claim closes the execution
     /// as `not_dispatched` with the signed reason `dispatch_refused` (never
     /// `outcome_unknown`); a transient refusal at the dispatch claim leaves an
     /// approved execution `approved_pending_dispatch`. The default admits
     /// every action, which preserves the behaviour of existing adapters.
-    fn preflight(&self, _action: &Action) -> Result<(), DispatchRefused> {
+    fn preflight(&self, _authority: &Authority, _action: &Action) -> Result<(), DispatchRefused> {
         Ok(())
     }
 }
@@ -1193,7 +1196,10 @@ impl Gateway {
     /// even if the target later becomes admissible again (the agent must
     /// submit a new request). A transient refusal leaves it pending.
     fn preflight_held(&self, record: &ExecutionRecord) -> Result<(), GatewayError> {
-        let Err(refusal) = self.dispatcher.preflight(&record.evidence.action) else {
+        let Err(refusal) = self
+            .dispatcher
+            .preflight(&record.evidence.authority, &record.evidence.action)
+        else {
             return Ok(());
         };
         let receipt = if refusal.is_transient() {
@@ -1552,7 +1558,10 @@ impl Gateway {
         // pending) is closed as `NotDispatched`, never claimed or dispatched.
         // A transient refusal leaves it approved_pending_dispatch, like the
         // other transient revalidation failures above.
-        if let Err(refusal) = self.dispatcher.preflight(&record.evidence.action) {
+        if let Err(refusal) = self
+            .dispatcher
+            .preflight(&record.evidence.authority, &record.evidence.action)
+        {
             let key = record.key;
             let receipt = if refusal.is_transient() {
                 None
@@ -1852,7 +1861,9 @@ impl Gateway {
         };
 
         if authorization != AuthorizationStatus::Denied
-            && let Err(refusal) = self.dispatcher.preflight(&evidence.action)
+            && let Err(refusal) = self
+                .dispatcher
+                .preflight(&evidence.authority, &evidence.action)
         {
             // Explicit, terminal refusal: nothing was dispatched, and the
             // signed `dispatch_refused` attestation says so. Never left as
