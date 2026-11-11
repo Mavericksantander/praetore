@@ -10,7 +10,9 @@
 -- `awaiting_approval` or a journal row or an attestation carries
 -- `approved_claim_expired`: those rows are signed, and the 0021 vocabulary
 -- cannot hold them. Afterwards only a release without 0022 can run against
--- the database, or `praetore migrate` applies 0022 again.
+-- the database, or `praetore-gateway-demo migrate` (schema owner URL in
+-- `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`) applies 0022 again, and
+-- `praetore run` also applies pending migrations when it starts.
 
 BEGIN;
 
