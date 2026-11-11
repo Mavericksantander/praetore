@@ -57,7 +57,7 @@ jobs:
           # non-blocking client, praetore-safety-ingest, journal-export
           # --safety and praetore-verify safety-journal). The PostgreSQL
           # end-to-end tests run in the replay-postgres job.
-          run "test result: ok\. 34 passed" cargo test --locked -p praetore-core --lib safety_ingest
+          run "test result: ok\. 35 passed" cargo test --locked -p praetore-core --lib safety_ingest
           run "test result: ok\. 5 passed" \
             cargo test --locked -p praetore-safety-client --test nonblocking -- --nocapture
           # 13 on Linux: secret_file's extended-ACL test is macOS only.
