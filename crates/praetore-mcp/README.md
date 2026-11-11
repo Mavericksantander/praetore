@@ -51,13 +51,15 @@ crates/praetore-mcp`, or `cargo build --release -p praetore-mcp`.
 
 The `Assurance gates` workflow builds `praetore-mcp` with `--release
 --locked` for `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin` and
-`x86_64-apple-darwin` (cross-built on Apple silicon). Before packaging, each
-binary runs `scripts/mcp-smoke.py`: one allowed `read_text_file` and one
-denied `write_file` through `npx @modelcontextprotocol/server-filesystem@2.1.0`,
-then `verify`. Each run uploads
-`praetore-mcp-<version>-<target>.tar.gz` (the binary, `LICENSE`, `NOTICE`)
-and its `.sha256` as workflow artifacts. `Release checksums` then re-checks
-them and writes one `SHA256SUMS` covering the three archives and
+`x86_64-apple-darwin` (cross-built on Apple silicon). The build job packages
+`praetore-mcp-<version>-<target>.tar.gz` (the binary, `LICENSE`, `NOTICE`),
+writes its `.sha256` and uploads both as workflow artifacts; it installs no
+Node tooling. A separate smoke job downloads that archive, checks the
+`.sha256`, installs `@modelcontextprotocol/server-filesystem@2.1.0` with
+`npm ci` from `scripts/mcp-smoke/package-lock.json` and runs
+`scripts/mcp-smoke.py`: one allowed `read_text_file` and one denied
+`write_file`, then `verify`. `Release checksums` waits for both jobs, then
+re-checks the archives and writes one `SHA256SUMS` covering the three archives and
 `praetore-verify` (`scripts/release-checksums.sh`); on a `v*` tag it is kept
 as the `release-assets-<tag>` artifact.
 
@@ -81,8 +83,12 @@ tar -xzf praetore-mcp-<version>-<target>.tar.gz
 The Linux binary is built on GitHub's `ubuntu-latest` runner and needs a
 glibc at least as new as that image's; build it yourself on older systems.
 
-To run the same smoke test on your own build: `python3 -I
-scripts/mcp-smoke.py target/release/praetore-mcp` (needs Node with `npx`).
+To run the same smoke test on your own build (needs Node):
+
+```sh
+npm ci --ignore-scripts --prefix scripts/mcp-smoke
+python3 -I scripts/mcp-smoke.py target/release/praetore-mcp
+```
 
 ## 5-minute quickstart
 
