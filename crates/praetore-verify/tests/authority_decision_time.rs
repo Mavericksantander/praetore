@@ -151,6 +151,11 @@ impl Fixture {
                 .with_max_intent_lifetime(Duration::days(60))
                 .with_replay_guard(Arc::new(TestReplayGuard::default()))
                 .with_freshness_provider(Arc::new(TestFreshnessProvider));
+        fs::write(
+            directory.join("policy.json"),
+            serde_json::to_vec(&policy).unwrap(),
+        )
+        .unwrap();
         let engine =
             AuthorizationEngine::production_with_clock(policy, config, FixedClock::new(DECIDED_AT))
                 .unwrap();
@@ -344,6 +349,32 @@ fn high_assurance_receipt_passes_with_require_decision_time() {
         "{text}"
     );
     assert_eq!(text.matches("authority_checked_at_source=").count(), 1);
+}
+
+/// T-016: `--strict` runs every check of the command; this HighAssurance
+/// receipt passes all of them.
+#[test]
+fn high_assurance_receipt_passes_strict() {
+    let fixture = Fixture::new();
+    let policy = fixture
+        .directory
+        .join("policy.json")
+        .to_string_lossy()
+        .into_owned();
+    let output = fixture.run_evidence(
+        &fixture.evidence.to_json().unwrap(),
+        &["--strict", "--policy", &policy, "--format", "json"],
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.status.success(), "{summary}");
+    assert_eq!(summary["code"], "OK", "{summary}");
+    assert_eq!(summary["details"]["authority_verified"], true);
+    assert_eq!(summary["details"]["intent_verified"], true);
+    assert_eq!(summary["details"]["policy_verified"], true);
+    assert_eq!(
+        summary["details"]["authority_checked_at_source"],
+        "receipt_decided_at"
+    );
 }
 
 /// G7 test helper: declares every action type a rule names as Mission.

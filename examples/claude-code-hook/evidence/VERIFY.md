@@ -3,7 +3,12 @@
 Run from the root of a clone. Requirements: Rust stable (cargo) and python3.
 Only public keys are used. Outputs below were obtained by running these exact
 commands on 2026-10-31 (Linux x86_64, `praetore-verify` 0.3.0 built from this
-branch).
+branch). Later releases add fields to the same commands: since T-016 the
+`journal` command reports `database_head_consistent` and
+`database_head_anchored` instead of `database_head_verified`, plus
+`tenant_id` and `warnings` (`head_not_anchored` without `--expected-head`),
+and `evidence` always reports `authority_verified`. The recorded outputs
+below predate that.
 
 What a passing check proves: each receipt is intact, its attester signature
 matches the pinned attester public key, its authority was signed by the pinned

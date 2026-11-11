@@ -4,6 +4,27 @@
 
 ### Breaking
 
+- **`praetore-verify journal` renames `database_head_verified` to
+  `database_head_consistent` (T-016).** The field means that the tenant
+  chain's reference matches the database head given by `--database-journal`
+  or `--expected-database-head`. The new `database_head_anchored` is true
+  only with `--expected-database-head`, a head the caller holds; the head
+  of a `--database-journal` file is not anchored by that file. Action:
+  scripts that read `database_head_verified` read `database_head_consistent`,
+  and check `database_head_anchored` where an anchored database head is
+  required.
+- **A journal chain holds the receipts of one tenant (T-016).** `praetore-verify
+  journal` and `praetore journal-export` refuse a chain whose receipts name
+  different tenants in their signed authority, or a tenant and none
+  (`JOURNAL_TENANT_MISMATCH`). The verifier reports the chain's tenant as
+  `tenant_id` (`null` for a database chain, or when the receipts name
+  none). Exports written by `journal-export --tenant` hold one tenant and
+  are not affected.
+- **Storage record signatures must be lowercase hex (T-016).** A storage
+  record whose signature is written in uppercase or mixed-case hex is
+  refused (`EVIDENCE_FAIL`), as receipts and safety records already were.
+  `praetore` only ever wrote lowercase.
+
 - **Cooperative execution is refused by default (T-013).** The local HTTP
   API (`praetore run`) and `praetore-gateway-demo`, with every adapter and
   with or without `sandbox_root`, require `praetore-exec-mode: gateway` on
@@ -104,6 +125,18 @@
 
 ### Added
 
+- **`praetore-verify journal` reports an unanchored head (T-016).** Without
+  `--expected-head` it reports the `head_not_anchored` warning, on stderr
+  and in `details.warnings`, as `safety-journal` does: a truncated or
+  re-linked chain also verifies then. `--require-anchored` fails with
+  `JOURNAL_NOT_ANCHORED` (exit 1) after the chain verifies when no
+  `--expected-head` was given.
+- **`praetore-verify evidence` always reports `authority_verified`, and
+  takes `--strict` (T-016).** `authority_verified` is `false` when no
+  `--issuer-pins` were given. `--strict` requires `--issuer-pins` and
+  `--policy` (`USAGE` otherwise) and implies `--require-intent` and
+  `--require-decision-time`. A receipt that is not HighAssurance does not
+  record the engine mode that produced it; no flag can show it.
 - **Receipt finality in the verifiers (T-016).** `praetore-verify receipt`
   reports `final` and `non_final_reason`: the receipt returned while a human
   approval is pending (`requires_approval`, `not_dispatched`, no signed

@@ -1973,15 +1973,46 @@ mod tests {
             let (evidence, attester) = signed_evidence_for(action_type);
             let key = attester.public_key().unwrap();
 
+            // `verify()` is integrity only: an edit without a new hash fails
+            // there, before any signature is checked.
             let mut forged_evidence = evidence.clone();
             forged_evidence.decision.decided_by = Some(forged.clone());
             assert!(!forged_evidence.verify());
-            assert!(forged_evidence.verify_attester_signature(&key).is_err());
+            assert!(matches!(
+                forged_evidence.verify_attester_signature(&key),
+                Err(PraetoreError::EvidenceError(message))
+                    if message.contains("integrity")
+            ));
+            // A forgery that passes integrity: drop the evaluation trace
+            // (which names the real decider) and recompute the unkeyed hash.
+            // Only the Ed25519 signature catches it.
+            forged_evidence.decision.contributions.clear();
+            forged_evidence.context_hash = forged_evidence
+                .compute_context_hash()
+                .expect("a consistent forged decision");
+            assert!(forged_evidence.verify(), "{action_type}");
+            assert!(
+                matches!(
+                    forged_evidence.verify_attester_signature(&key),
+                    Err(PraetoreError::IdentityVerificationFailed)
+                ),
+                "{action_type}"
+            );
 
+            // Removing `decided_by` from a v4 receipt cannot pass integrity,
+            // even with the hash recomputed (v4 always records it), so it is
+            // refused there, before the signature.
             let mut stripped = evidence.clone();
             stripped.decision.decided_by = None;
+            if let Some(hash) = stripped.compute_context_hash() {
+                stripped.context_hash = hash;
+            }
             assert!(!stripped.verify());
-            assert!(stripped.verify_attester_signature(&key).is_err());
+            assert!(matches!(
+                stripped.verify_attester_signature(&key),
+                Err(PraetoreError::EvidenceError(message))
+                    if message.contains("integrity")
+            ));
 
             // Same forgery applied to the exported JSON receipt.
             let mut document: serde_json::Value =
