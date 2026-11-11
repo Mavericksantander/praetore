@@ -672,12 +672,18 @@ The HTTP flow is:
    against the engine clock and moves `approved_pending_dispatch` to
    `dispatched` only if exactly one row changes. Only then is the adapter
    invoked; the response is the signed receipt. A concurrent or repeated claim
-   gets 409. If the window closed first, or revalidation fails terminally
-   (for example the authority was revoked), the execution is closed as
-   `not_dispatched` with a signed attestation (schema version 3) whose
-   `not_dispatched_reason` is `approved_claim_expired` (the window closed
-   before the claim) or `dispatch_failed`. Rows closed before migration 0022
-   carry `approval_expired` for the first case.
+   gets 409. If the window closed before the claim, that `POST .../dispatch`
+   answers HTTP 410 with `{"code": "approval_expired"}`. The execution is
+   closed as `not_dispatched` with a signed attestation (schema version 3)
+   whose `not_dispatched_reason` is `approved_claim_expired`. Those strings
+   name different places for the same late claim: `approval_expired` is the
+   `code` field of that 410 body on
+   `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}/dispatch`;
+   `approved_claim_expired` is the signed close, the `not_dispatched_reason`
+   on the execution attestation and on the journal row. A terminal
+   revalidation failure that is not expiry (for example the authority was
+   revoked) closes with `dispatch_failed` instead. Rows closed before
+   migration 0022 carry `approval_expired` as that signed reason.
    Transient failures (trusted clock, freshness source or replay storage
    unavailable, HTTP 503) leave it `approved_pending_dispatch`, so the
    dispatch can be requested again while the window is open.
