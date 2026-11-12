@@ -11,6 +11,7 @@ members = [
     "crates/praetore-gateway-service",
     "crates/praetore-cli",
     "crates/praetore-observe",
+    "crates/praetore-console",
     "crates/praetore-mcp",
     "crates/praetore-safety-client",
 ]

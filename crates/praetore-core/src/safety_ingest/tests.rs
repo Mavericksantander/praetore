@@ -514,6 +514,44 @@ fn a_resent_event_is_counted_not_stored_and_another_event_with_its_seq_is_a_conf
 }
 
 #[test]
+fn a_resent_conflict_is_counted_not_stored_again() {
+    let mut harness = Harness::new();
+    let first = harness.ingest(&wire(&event(1, "safety:halt")));
+    harness.ingest(&wire(&event(2, "safety:halt")));
+    let conflict = harness.ingest(&wire(&event(1, "safety:stop_all")));
+    assert_eq!(conflict[0].payload().status, SafetyRecordStatus::Conflict);
+    let entries = harness.chain("executor-1").lines().count();
+    // The same conflicting event again, as sent and in another encoding:
+    // counted as a duplicate, with no second conflict record.
+    let pretty = serde_json::to_vec_pretty(
+        &serde_json::from_slice::<Value>(&wire(&event(1, "safety:stop_all"))).unwrap(),
+    )
+    .unwrap();
+    for input in [wire(&event(1, "safety:stop_all")), pretty] {
+        assert_eq!(
+            harness.suppressed(&input),
+            Some(Suppressed {
+                reason: LossReason::Duplicate,
+                source_id: Some("executor-1".into()),
+            })
+        );
+        assert!(harness.ingest(&input).is_empty());
+    }
+    assert_eq!(harness.chain("executor-1").lines().count(), entries);
+    // A third, different event with source_seq 1 is still a conflict, and
+    // it names the first event, not the earlier conflict.
+    let other = harness.ingest(&wire(&event(1, "safety:freeze")));
+    assert_eq!(other[0].payload().status, SafetyRecordStatus::Conflict);
+    assert_eq!(
+        other[0].payload().original_record_hash.as_deref(),
+        Some(first[0].record_hash())
+    );
+    assert_eq!(harness.ingestor.head("executor-1").high_water, 2);
+    let report = harness.verify("executor-1").unwrap();
+    assert_eq!((report.counts.duplicate, report.counts.conflict), (0, 2));
+}
+
+#[test]
 fn an_event_for_a_lost_seq_is_late_and_only_once() {
     let mut harness = Harness::new();
     harness.ingest(&wire(&event(1, "safety:halt")));

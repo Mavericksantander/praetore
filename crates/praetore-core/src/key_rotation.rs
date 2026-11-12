@@ -276,7 +276,8 @@ mod tests {
     }
 
     // Regression: an ALLOW protected only by the unkeyed context_hash was
-    // accepted, so a DENY could be rewritten into an ALLOW.
+    // accepted, so a DENY could be rewritten into an ALLOW (with the hash
+    // recomputed). The last case below does exactly that.
     #[test]
     fn rotation_evidence_requires_a_trusted_attester_signature() {
         let request = make_rotation_request();
@@ -312,10 +313,23 @@ mod tests {
             .unwrap();
         denied.bind_policy_digest("ab".repeat(32)).unwrap();
         denied.sign(&attester()).unwrap();
-        assert!(denied.verify_key_rotation(&attester_key()).is_err());
-        // Flip the signed DENY into an ALLOW, keeping the attester signature.
-        let mut flipped = make_rotation_evidence();
-        flipped.decision = Decision::deny("flipped", crate::DecidedBy::rule("test-rule")).into();
-        assert!(flipped.verify_key_rotation(&attester_key()).is_err());
+        assert!(matches!(
+            denied.verify_key_rotation(&attester_key()),
+            Err(crate::PraetoreError::EvidenceError(message))
+                if message == "key rotation was not authorized"
+        ));
+        // The regression: rewrite the signed DENY into an ALLOW, recompute
+        // the unkeyed context_hash so integrity passes, keep the attester
+        // signature. Only that signature refuses it.
+        let mut flipped = denied.clone();
+        flipped.decision = Decision::allow("flipped", crate::DecidedBy::rule("test-rule")).into();
+        assert!(!flipped.verify_integrity());
+        flipped.context_hash = flipped.compute_context_hash().unwrap();
+        assert!(flipped.verify_integrity());
+        assert_eq!(flipped.attester_signature, denied.attester_signature);
+        assert!(matches!(
+            flipped.verify_key_rotation(&attester_key()),
+            Err(crate::PraetoreError::IdentityVerificationFailed)
+        ));
     }
 }

@@ -108,6 +108,10 @@ deletes the previous ones first. Only public keys are written.
 ## Expected output
 
 Output of `make demo-verify`. Ids, digests and hashes differ on every run.
+Since T-016 the `praetore-verify journal` line reports
+`database_head_consistent` and `database_head_anchored` instead of
+`database_head_verified`, plus `tenant_id` and `warnings`; the output below
+was recorded before that.
 
 ```text
 Compilando y ejecutando la demo (la primera vez tarda entre 20 s y unos minutos)...

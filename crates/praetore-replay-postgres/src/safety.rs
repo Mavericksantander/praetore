@@ -549,6 +549,32 @@ impl EventLookup for PostgresSafetyStore {
             record_hash: row.get(1),
         }))
     }
+
+    fn conflict_recorded(
+        &mut self,
+        tenant_id: Uuid,
+        chain: &str,
+        source_epoch: u64,
+        source_seq: u64,
+        event_hash: &str,
+    ) -> Result<bool, Self::Error> {
+        let mut transaction = self.client.build_transaction().read_only(true).start()?;
+        set_tenant_context(&mut transaction, tenant_id)?;
+        let row = transaction.query_one(
+            "SELECT EXISTS (SELECT 1 FROM praetore.safety_records \
+             WHERE tenant_id = $1 AND chain = $2 AND source_epoch = $3 AND source_seq = $4 \
+               AND status = 'conflict' AND event_hash::pg_catalog.text = $5)",
+            &[
+                &tenant_id,
+                &chain,
+                &(source_epoch as i64),
+                &(source_seq as i64),
+                &event_hash,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(row.get(0))
+    }
 }
 
 /// The records of one chain of `tenant_id`, in `chain_seq` order, read in

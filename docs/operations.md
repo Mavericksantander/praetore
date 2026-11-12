@@ -742,8 +742,10 @@ resent event as a `duplicate` record, to keep replays visible. A replay of
 captured datagrams could then grow a chain without bound, so an exact
 duplicate is now only counted (`duplicate` in the signed counts, per
 source). A different event with a used `source_seq` is still a `conflict`
-record. Chains written before the change may hold `duplicate` records, and
-the verifier still checks them.
+record, once: the same event sent again after its `conflict` record is
+also only counted as a duplicate. Chains written before the change may
+hold `duplicate` records, or the same `conflict` more than once, and the
+verifier still checks them.
 
 ### Source epochs
 
@@ -762,8 +764,11 @@ falling back to 1 would make the ingester record every event as `rejected`
 (`stale_epoch`). The failure must not stop or delay the executor either:
 log it, alert the operator, and run without reporting (the crate example of
 `praetore-safety-client` shows the pattern; never `unwrap` it).
-Restoring the file from an old backup has the same effect until the epoch
-passes the chain's again; set it to at least the epoch that
+A missing file means the first start of the source (epoch 1). `EpochFile`
+cannot tell that from a deleted file: deleting the file, or restoring it
+from an old backup, after the source has reported has the same effect as
+falling back to 1, until the epoch passes the chain's again. Keep the file
+for the life of the source; to recover, set it to at least the epoch that
 `praetore-verify safety-journal` reports (`source_epoch`).
 
 An event of a newer epoch starts a new segment of the source's chain (a gap
@@ -842,6 +847,10 @@ role sees no rows.
 | source key (one per `source_id`) | the executor | the ingester (`PRAETORE_SAFETY_SOURCE_PINS_FILE`) and the verifier (`--source-pins`) |
 | ingestion key | the ingester only | the exporter and the verifier (`--ingest-pin`) |
 | namespace key | whoever releases the policy (offline) | the ingester (`PRAETORE_SAFETY_NAMESPACE_PIN_FILE`) |
+
+Use one source key per source, ingester and tenant: a source key is not
+shared between ingesters or tenants. Pin it only in the ingester of the
+tenant whose source holds it.
 
 Generate each as 32 random bytes in hex (for example `(umask 077; openssl
 rand -hex 32 > ingest.key)`); the public key is what you pin:
@@ -978,6 +987,16 @@ closed: a receipt that records no signed `decided_at` fails with
 back to the verifier's clock. Use it when only HighAssurance receipts are
 acceptable. The `journal` command does not check authorities and does not
 accept the flag.
+
+The evidence command always reports `authority_verified`: `false` when no
+`--issuer-pins` were given, so the embedded authority was not checked.
+`--strict` runs every check the command offers: it requires `--issuer-pins`
+and `--policy` (`USAGE` otherwise) and implies `--require-intent` and
+`--require-decision-time`. Known limit: a receipt that is not HighAssurance
+does not record the mode of the engine that produced it, so the verifier
+cannot tell a decision of a development engine from one of a strict engine.
+`--require-decision-time` (and `--strict`) accept HighAssurance receipts
+only.
 
 Known limit of the decision-time check: it is only as trustworthy as the
 attester key. Anyone holding that key can sign a receipt with a back-dated
