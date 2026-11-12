@@ -279,15 +279,24 @@ function pintarSolicitud(solicitud) {
       clave.textContent = parametro.clave;
       const valor = document.createElement("dd");
       if (Array.isArray(parametro.lista)) {
-        const elementos = document.createElement("ol");
-        elementos.className = "lista";
-        if (!parametro.lista.length) valor.textContent = "(lista vacía)";
-        for (const elemento of parametro.lista) {
-          const item = document.createElement("li");
-          item.textContent = elemento;
-          elementos.append(item);
-        }
-        if (parametro.lista.length) valor.append(elementos);
+        // A list never looks like a text: it says it is a list and how long,
+        // and each element carries its own mark "[n]".
+        valor.className = "es-lista";
+        const cabecera = document.createElement("span");
+        cabecera.className = "marca";
+        cabecera.textContent = parametro.lista.length
+          ? "lista de " + parametro.lista.length + (parametro.lista.length === 1 ? " elemento:" : " elementos:")
+          : "lista vacía []";
+        valor.append(cabecera);
+        parametro.lista.forEach((elemento, indice) => {
+          const fila = document.createElement("div");
+          fila.className = "elemento";
+          const marca = document.createElement("span");
+          marca.className = "marca";
+          marca.textContent = "[" + (indice + 1) + "] ";
+          fila.append(marca, document.createTextNode(elemento));
+          valor.append(fila);
+        });
       } else {
         valor.textContent = parametro.valor;
       }

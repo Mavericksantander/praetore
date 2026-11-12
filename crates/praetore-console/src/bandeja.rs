@@ -4,7 +4,7 @@
 //! and until when. The browser never receives the journal keys: each pending
 //! request gets an opaque reference that only this process can resolve.
 
-use crate::historia::{readable_time, unambiguous_text};
+use crate::historia::{quoted_text, readable_time};
 use praetore_core::Evidence;
 use praetore_gateway::{ApprovalChallenge, ExecutionKey, action_digest};
 use std::{collections::HashMap, sync::Mutex};
@@ -69,7 +69,7 @@ pub struct Parameter {
 }
 
 /// Strings are quoted and escaped, numbers are shown as written, so `"10"`
-/// and `10` (or `"sí"` and `sí`) never look the same. A list keeps each
+/// and `10` (or `"sí"` and `sí`) are told apart. A list keeps each
 /// element apart, so a string with a comma is never two elements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParameterValue {
@@ -82,7 +82,8 @@ pub const MAX_PARAMETER_LINES: usize = 20;
 pub const MAX_PARAMETER_CHARS: usize = 200;
 pub const MAX_PARAMETER_DEPTH: usize = 2;
 
-/// The action parameters, keys sorted, nested objects as `clave.subclave`.
+/// The action parameters, keys sorted. Keys are quoted like texts, so a
+/// trailing space shows; nested objects as `"clave"."subclave"`.
 /// `None` (only rejecting is offered) when they do not fit or could be
 /// read two ways: more than 20 lines, a key or value longer than 200
 /// characters once escaped, nesting deeper than 2, a non-object root, an
@@ -118,7 +119,7 @@ fn collect(
         if key.is_empty() || key.contains('.') || !is_nfc(key) {
             return None;
         }
-        let key = format!("{prefix}{}", unambiguous_text(key));
+        let key = format!("{prefix}{}", quoted_text(key));
         if key.chars().count() > MAX_PARAMETER_CHARS {
             return None;
         }
@@ -165,7 +166,7 @@ fn scalar_text(value: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
     let text = match value {
         Value::String(text) if !is_nfc(text) => return None,
-        Value::String(text) => format!("\"{}\"", unambiguous_text(text).replace('"', "\\\"")),
+        Value::String(text) => quoted_text(text),
         Value::Number(number) => number.to_string(),
         Value::Bool(true) => "sí".to_owned(),
         Value::Bool(false) => "no".to_owned(),
@@ -432,12 +433,12 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "cuenta",
-                "etiquetas",
-                "monto",
-                "opciones.nota",
-                "opciones.urgente",
-                "texto"
+                "\"cuenta\"",
+                "\"etiquetas\"",
+                "\"monto\"",
+                "\"opciones\".\"nota\"",
+                "\"opciones\".\"urgente\"",
+                "\"texto\""
             ]
         );
         assert_eq!(shown[0].value, text("\"cuenta-1\""));
@@ -504,6 +505,36 @@ mod tests {
                 "{left} and {right} look the same"
             );
         }
+        // Escaped by Unicode category, not by a closed list.
+        for hidden in [
+            '\u{200d}',  // zero-width joiner (Cf)
+            '\u{00a0}',  // no-break space (Zs)
+            '\u{3000}',  // ideographic space (Zs)
+            '\u{e0041}', // tag latin capital A (Cf)
+            '\u{fe0f}',  // variation selector 16
+            '\u{034f}',  // combining grapheme joiner
+            '\u{3164}',  // hangul filler
+            '\u{2800}',  // blank braille pattern
+            '\u{e000}',  // private use (Co)
+            '\u{0378}',  // unassigned (Cn)
+        ] {
+            let with = parameters_shown(&json!({ "v": format!("a{hidden}b") })).unwrap();
+            let without = parameters_shown(&json!({"v": "ab"})).unwrap();
+            assert_ne!(with, without, "U+{:04X}", hidden as u32);
+            assert_eq!(
+                with[0].value,
+                ParameterValue::Text(format!("\"a\\u{{{:04x}}}b\"", hidden as u32))
+            );
+        }
+        // Plain spaces, letters and emoji stay as they are.
+        assert_eq!(
+            parameters_shown(&json!({"v": "a b é ✓"})).unwrap()[0].value,
+            ParameterValue::Text("\"a b é ✓\"".to_owned())
+        );
+        // Keys are quoted: a trailing space shows.
+        let spaced = parameters_shown(&json!({"monto ": 1})).unwrap();
+        assert_eq!(spaced[0].key, "\"monto \"");
+        assert_ne!(spaced, parameters_shown(&json!({"monto": 1})).unwrap());
         // A key with a dot could be read as a nested key: only rejecting.
         assert!(parameters_shown(&json!({"a.b": 1})).is_none());
         assert!(parameters_shown(&json!({"a": {"b": 1}})).is_some());

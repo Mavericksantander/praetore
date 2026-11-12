@@ -267,8 +267,8 @@ pub fn plain_text(value: &str) -> String {
 
 /// Like [`plain_text`], and a backslash is shown doubled, so text that
 /// spells out an escape (`\u{202e}`) never looks like the escaped character.
-/// Used in the approvals inbox, where two different signed actions must
-/// never look the same.
+/// Used in the approvals inbox, which must tell apart structure, types and
+/// hidden characters of what is signed.
 pub fn unambiguous_text(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
@@ -281,25 +281,51 @@ pub fn unambiguous_text(value: &str) -> String {
     safe
 }
 
-/// Control, bidirectional and invisible characters (zero-width space,
-/// BOM, word joiner, soft hyphen, line and paragraph separators) are shown
-/// as `\u{xxxx}`.
+/// Agent text in quotes, with `"` and `\\` escaped and hidden characters
+/// shown as `\u{xxxx}`: a value "sin objetivo indicado" never looks like the
+/// console's own placeholder, and a trailing space shows.
+pub fn quoted_text(value: &str) -> String {
+    format!("\"{}\"", unambiguous_text(value).replace('"', "\\\""))
+}
+
+/// Characters that could hide or disguise text are shown as `\u{xxxx}`,
+/// by Unicode general category rather than by a closed list: control
+/// (Cc), format (Cf: bidi, zero-width, tags, BOM, soft hyphen...), line and
+/// paragraph separators (Zl, Zp), private use (Co), unassigned (Cn), and
+/// every space separator (Zs) other than U+0020 (no-break space, U+3000...).
+/// Also variation selectors, the combining grapheme joiner, the Hangul
+/// fillers and the blank Braille pattern, which render as nothing.
+pub(crate) fn is_hidden(character: char) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    let by_category = match character.general_category() {
+        GeneralCategory::Control
+        | GeneralCategory::Format
+        | GeneralCategory::LineSeparator
+        | GeneralCategory::ParagraphSeparator
+        | GeneralCategory::PrivateUse
+        | GeneralCategory::Unassigned
+        | GeneralCategory::Surrogate => true,
+        GeneralCategory::SpaceSeparator => character != ' ',
+        _ => false,
+    };
+    by_category
+        || matches!(
+            character,
+            '\u{fe00}'..='\u{fe0f}'
+                | '\u{e0100}'..='\u{e01ef}'
+                | '\u{180b}'..='\u{180d}'
+                | '\u{180f}'
+                | '\u{034f}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{ffa0}'
+                | '\u{2800}'
+        )
+}
+
 fn push_inert(safe: &mut String, character: char) {
-    let hidden = matches!(
-        character,
-        '\u{061c}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{200b}'
-            | '\u{feff}'
-            | '\u{2060}'
-            | '\u{00ad}'
-            | '\u{2028}'
-            | '\u{2029}'
-    );
-    if character.is_control() || hidden {
+    if is_hidden(character) {
         safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
     } else {
         safe.push(character);

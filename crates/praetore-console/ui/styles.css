@@ -77,8 +77,9 @@ h2 { margin-bottom: 20px; font-size: 28px; letter-spacing: -.02em; }
 .parametros { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 6px 0; font-size: 14px; }
 .parametros dt { color: var(--muted); overflow-wrap: anywhere; }
 .parametros dd { margin: 0; overflow-wrap: anywhere; }
-.parametros .lista { margin: 0; padding-left: 20px; }
-.confirmacion { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line, #ccc); border-radius: 6px; }
+.parametros .es-lista .marca { color: var(--muted); font-variant-numeric: tabular-nums; }
+.parametros .es-lista .elemento { padding-left: 12px; }
+.confirmacion { display: grid; gap: 4px; margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line, #ccc); border-radius: 6px; }
 .solicitud .nota { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
 .solicitud .nota:empty { display: none; }
 .vacio { padding: 48px 8px; color: var(--muted); text-align: center; }

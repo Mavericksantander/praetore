@@ -362,8 +362,8 @@ async fn the_inbox_says_who_what_on_what_and_until_when_in_plain_words() {
     assert_eq!(status, StatusCode::OK);
     let first = &list["solicitudes"][0];
     assert_eq!(first["situacion"], "pendiente de aprobación");
-    assert_eq!(first["queria"], "borrar_archivo");
-    assert_eq!(first["sobre"], "informe-trimestral");
+    assert_eq!(first["queria"], "\"borrar_archivo\"");
+    assert_eq!(first["sobre"], "\"informe-trimestral\"");
     assert!(first["agente"].as_str().unwrap().starts_with("Agente"));
     assert!(first["vale_hasta"].as_str().unwrap().ends_with(" UTC"));
     assert!(first["vale_hasta"].as_str().unwrap().contains(" de "));
@@ -373,7 +373,7 @@ async fn the_inbox_says_who_what_on_what_and_until_when_in_plain_words() {
     assert_eq!(first["parametros_visibles"], true);
     assert_eq!(
         first["parametros"],
-        json!([{"clave": "nota", "valor": "\"texto-libre\""}])
+        json!([{"clave": "\"nota\"", "valor": "\"texto-libre\""}])
     );
     assert!(first.get("nota").is_none());
     assert_eq!(first["puede_ejecutar"], false);
@@ -954,7 +954,10 @@ async fn agent_text_is_shown_inert_and_a_cut_list_says_so() {
     .router();
     let (_, list, text) = json_of(app.oneshot(get("/api/bandeja")).await.unwrap()).await;
     assert_eq!(list["hay_mas"], true);
-    assert_eq!(list["solicitudes"][0]["sobre"], "informe\\u{202e}fdp.exe");
+    assert_eq!(
+        list["solicitudes"][0]["sobre"],
+        "\"informe\\u{202e}fdp.exe\""
+    );
     assert!(!text.contains('\u{202e}'));
 }
 
@@ -1019,11 +1022,11 @@ async fn two_requests_that_differ_only_in_the_amount_look_different() {
     assert_ne!(first["parametros"], second["parametros"]);
     assert_eq!(
         first["parametros"],
-        json!([{"clave": "moneda", "valor": "\"CLP\""}, {"clave": "monto", "valor": "10"}])
+        json!([{"clave": "\"moneda\"", "valor": "\"CLP\""}, {"clave": "\"monto\"", "valor": "10"}])
     );
     assert_eq!(
         second["parametros"],
-        json!([{"clave": "moneda", "valor": "\"CLP\""}, {"clave": "monto", "valor": "100000"}])
+        json!([{"clave": "\"moneda\"", "valor": "\"CLP\""}, {"clave": "\"monto\"", "valor": "100000"}])
     );
 }
 
@@ -1116,15 +1119,38 @@ async fn texts_numbers_and_lists_are_told_apart_in_the_inbox() {
     assert_eq!(
         list["solicitudes"][0]["parametros"],
         json!([
-            {"clave": "etiquetas", "valor": "\"a, b\""},
-            {"clave": "monto", "valor": "\"10\""},
+            {"clave": "\"etiquetas\"", "valor": "\"a, b\""},
+            {"clave": "\"monto\"", "valor": "\"10\""},
         ])
     );
     assert_eq!(
         list["solicitudes"][1]["parametros"],
         json!([
-            {"clave": "etiquetas", "lista": ["\"a\"", "\"b\""]},
-            {"clave": "monto", "valor": "10"},
+            {"clave": "\"etiquetas\"", "lista": ["\"a\"", "\"b\""]},
+            {"clave": "\"monto\"", "valor": "10"},
         ])
     );
+}
+
+#[tokio::test]
+async fn an_action_or_target_that_spells_a_placeholder_is_quoted() {
+    let expires = OffsetDateTime::now_utc() + Duration::minutes(10);
+    let (spelled, spelled_json) =
+        pending_evidence("no se muestra", "sin objetivo indicado", expires);
+    let gateway = Arc::new(FakeGateway::new(&spelled));
+    let app = console(
+        vec![facts_for(
+            &spelled,
+            spelled_json,
+            PendingKind::AwaitingApproval,
+        )],
+        0,
+        gateway,
+    );
+    let (_, list, _) = json_of(app.oneshot(get("/api/bandeja")).await.unwrap()).await;
+    let item = &list["solicitudes"][0];
+    assert_eq!(item["queria"], "\"no se muestra\"");
+    assert_eq!(item["sobre"], "\"sin objetivo indicado\"");
+    assert_ne!(item["queria"], "no se muestra");
+    assert_ne!(item["sobre"], "sin objetivo indicado");
 }

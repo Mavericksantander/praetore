@@ -94,16 +94,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .issue_opening_link()
         .ok_or("no se pudo crear el enlace de apertura de la consola")?;
     // A new link only by the operator's hand: Enter in this terminal.
-    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+    if operator_terminal() {
         eprintln!("Para un enlace nuevo, pulsa Enter en esta terminal.");
         let operator = Arc::clone(&state);
-        std::thread::spawn(move || {
-            for line in std::io::stdin().lines() {
-                if line.is_err() || operator.issue_opening_link().is_none() {
-                    break;
-                }
-            }
-        });
+        std::thread::spawn(move || read_enter_for_links(&operator));
     }
     let served = runtime.block_on(
         axum::serve(listener, ConsoleState::router_from(Arc::clone(&state))).into_future(),
@@ -148,4 +142,51 @@ fn approver_settings()
     let signer = ApproverSigner::from_file(&key_id, &PathBuf::from(key_file))?;
     let token = read_token_file(&PathBuf::from(token_file))?;
     Ok(Some((HttpApprovalGateway::new(address, token), signer)))
+}
+
+/// True when stdin and stderr are a terminal and this process is in that
+/// terminal's foreground: started with `&`, it never reads the terminal.
+/// SIGTTIN is then ignored, so if the console is later sent to the
+/// background (Ctrl-Z, `bg`) a read fails with EIO instead of the system
+/// stopping the whole process.
+#[cfg(unix)]
+fn operator_terminal() -> bool {
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() || !std::io::stderr().is_terminal() {
+        return false;
+    }
+    let foreground =
+        rustix::termios::tcgetpgrp(&stdin).is_ok_and(|group| group == rustix::process::getpgrp());
+    if !foreground {
+        return false;
+    }
+    // SAFETY: setting SIGTTIN to SIG_IGN installs no handler and runs no
+    // code in signal context; it only changes the disposition.
+    let previous = unsafe { libc::signal(libc::SIGTTIN, libc::SIG_IGN) };
+    previous != libc::SIG_ERR
+}
+
+#[cfg(not(unix))]
+fn operator_terminal() -> bool {
+    false
+}
+
+/// Each Enter writes a new link. In the background a read fails (EIO, as
+/// SIGTTIN is ignored): wait and try again, so Enter works once the console
+/// is back in the foreground. End of input ends the thread.
+fn read_enter_for_links(state: &ConsoleState) {
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {
+                if state.issue_opening_link().is_none() {
+                    return;
+                }
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+        }
+    }
 }

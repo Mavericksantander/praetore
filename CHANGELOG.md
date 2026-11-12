@@ -217,11 +217,13 @@
   tested setup is the gateway's runtime role: the reads run in
   transactions the console opens read only (per session, not by
   privilege), under the tenant's row-level security. Each request shows
-  who, what, on what, until when, and its parameters with keys sorted:
-  texts quoted, numbers as written, each list element apart, and control,
-  bidirectional and invisible characters (U+200B, U+FEFF, U+2060, U+00AD,
-  U+2028, U+2029) escaped, so two different signed actions do not look the
-  same. A request whose parameters do not fit (more than 20 lines, 200
+  who, what (quoted), on what (quoted), until when, and its parameters
+  with keys sorted and quoted: texts quoted, numbers as written, each list
+  element apart with its own mark, and characters escaped by Unicode
+  category (Cc, Cf, Zl, Zp, Co, Cn, every Zs other than U+0020, plus
+  variation selectors, U+034F, the Hangul fillers and U+2800). The inbox
+  tells apart structure, types and invisible characters; it does not flag
+  look-alike characters from different scripts (homoglyphs). A request whose parameters do not fit (more than 20 lines, 200
   characters per value or 2 levels) or could be read two ways (a key with
   a dot, keys that repeat once normalized, text not in Unicode NFC) can
   only be rejected in the console, also server side, and approved with
@@ -247,11 +249,13 @@
   systemd that is the journal, readable by whoever reads it. The link works
   once and for at most five minutes. A new link is issued only by the
   operator (Enter in the console's terminal, when stdin and stderr are a
-  terminal, or a restart); asking for the page never issues one. `/` alone
+  terminal and the console is in its foreground, or a restart); asking for
+  the page never issues one. SIGTTIN is ignored, so a console sent to the
+  background keeps serving instead of being stopped by the system. `/` alone
   no longer sets the cookie, and responses carry `Referrer-Policy:
   no-referrer`. Every request must carry the
-  console's own `Host` (DNS rebinding). Agent-chosen text is shown with
-  control and bidirectional characters escaped. Action: open the printed
+  console's own `Host` (DNS rebinding). Agent-chosen text in the history
+  is shown with the same characters escaped. Action: open the printed
   link after each start.
 
 ### Changed

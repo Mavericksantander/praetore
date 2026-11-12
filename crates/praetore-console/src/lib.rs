@@ -432,12 +432,12 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             queria: if facts.wanted.is_empty() {
                 "no se muestra".to_owned()
             } else {
-                historia::unambiguous_text(&facts.wanted)
+                historia::quoted_text(&facts.wanted)
             },
             sobre: facts
                 .target
                 .as_deref()
-                .map(historia::unambiguous_text)
+                .map(historia::quoted_text)
                 .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
             vale_hasta: readable_deadline(facts.expires_at),
             queda: time_left(facts.expires_at, now),

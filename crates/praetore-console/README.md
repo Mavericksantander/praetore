@@ -43,18 +43,18 @@ Abre la consola en este computador con este enlace (vale una vez, 5 minutos):
 
 - **One use, five minutes at most.** The link works once and for at most five minutes. Opening it sets the session cookie (HttpOnly, SameSite=Strict) and redirects to `/`.
 - **Cookie per run.** The session secret is new on every start and is never written to disk, so a cookie from an earlier run stops working.
-- **New link only by the operator.** When stdin and stderr are a terminal, pressing Enter there writes a new link and the earlier one stops working. Otherwise, restart the console. Asking for the page never issues a link.
+- **New link only by the operator.** When stdin and stderr are a terminal and the console is in that terminal's foreground, pressing Enter there writes a new link and the earlier one stops working. Otherwise (started with `&`, under systemd), restart the console. Asking for the page never issues a link. The console ignores SIGTTIN: sent to the background with Ctrl-Z and `bg`, it keeps serving instead of being stopped, and Enter works again after `fg`.
 - **Under systemd,** stderr goes to the journal. Whoever can read that journal can see the opening link, and can open the console with it while it is live. Restrict who can read the journal, or run the console in a terminal.
 - **Headers.** Responses carry `Referrer-Policy: no-referrer`, `Cache-Control: no-store` and a same-origin `Content-Security-Policy`.
 - **Request checks.** Every request must carry the console's own `Host`. An action also needs the console's exact `Origin` and the `x-praetore-consola` header.
 
 ## What the inbox shows and checks
 
-- **Each request:** who (agent name), what action, on what target, until when it is valid, and the action parameters.
-- **Parameters:** shown with sorted keys, nested keys as `clave.subclave`, so that two different signed actions never look the same:
-  - texts are quoted, with `"` and `\` escaped, so `"10"` differs from `10` and `"sí"` from `sí` (true);
-  - each list element is shown apart, so `"a, b"` is never two elements;
-  - control, bidirectional and invisible characters (U+200B, U+FEFF, U+2060, U+00AD, U+2028, U+2029) are shown as `\u{xxxx}`.
+- **Each request:** who (agent name), what action, on what target, until when it is valid, and the action parameters. The action and the target are quoted, so a target that reads "sin objetivo indicado" is not the console's own placeholder.
+- **Parameters:** shown with sorted keys, nested keys as `"clave"."subclave"`. The inbox tells apart structure, types and invisible characters; it does not flag look-alike characters from different scripts (see Limits):
+  - keys and texts are quoted, with `"` and `\` escaped, so `"10"` differs from `10`, `"sí"` from `sí` (true), and a key with a trailing space shows it;
+  - a list says it is a list and how long ("lista de 1 elemento:", "lista vacía []"), and each element has its own mark (`[1] "a"`), so `["a"]` is not `"a"` and `"a, b"` is never two elements;
+  - characters are escaped as `\u{xxxx}` by Unicode general category, not by a closed list: Cc, Cf (bidi, zero-width, tags, BOM, soft hyphen), Zl, Zp, Co, Cn, every Zs other than U+0020 (no-break space, U+3000...), plus variation selectors, U+034F, the Hangul fillers and U+2800.
 - **Parameters that can't be shown:** the signature covers the parameters, so the request can only be rejected here, and the console refuses an approval server side, in these cases:
   - more than 20 lines (each list element counts), a key or value over 200 characters once escaped, or more than 2 levels;
   - a key with a dot (it would read as a nested key);

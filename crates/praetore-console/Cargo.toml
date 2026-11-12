@@ -26,11 +26,15 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-normalization = "0.1.26"
+unicode-properties = "0.1.4"
 uuid = { version = "1.18", features = ["serde"] }
 
 [target.'cfg(unix)'.dependencies]
-# Secret files: O_NOFOLLOW and the effective uid for the owner check.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+# Secret files: O_NOFOLLOW and the effective uid for the owner check;
+# foreground check for the Enter-for-a-new-link thread.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "termios"] }
+# Ignoring SIGTTIN (rustix has no safe signal disposition API).
+libc = "0.2"
 
 [dev-dependencies]
 time = { version = "0.3", features = ["macros"] }

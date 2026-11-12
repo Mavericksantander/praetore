@@ -1137,6 +1137,7 @@ dependencies = [
  "axum",
  "ed25519-dalek",
  "hex",
+ "libc",
  "postgres",
  "praetore-core",
  "praetore-gateway",
@@ -1152,6 +1153,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "unicode-properties",
  "uuid",
 ]
 
