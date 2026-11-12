@@ -414,6 +414,23 @@ async function descargarPaquete() {
   }
 }
 
+async function estadoPaquete() {
+  const boton = document.getElementById("descargar-paquete");
+  const estado = document.getElementById("paquete-estado");
+  let data = null;
+  try {
+    const response = await fetch("/api/paquete/estado", { credentials: "same-origin" });
+    if (response.ok) data = await response.json();
+  } catch (_error) {
+    data = null;
+  }
+  // Without an answer the button stays: the download itself says what failed.
+  if (data && data.configurado === false) {
+    boton.hidden = true;
+    estado.textContent = typeof data.mensaje === "string" ? data.mensaje : "El paquete de compliance no está configurado en esta consola.";
+  }
+}
+
 document.getElementById("descargar-paquete").addEventListener("click", descargarPaquete);
 
 document.getElementById("recargar-bandeja").addEventListener("click", () => {
@@ -440,3 +457,4 @@ document.getElementById("siguiente").addEventListener("click", () => {
 });
 cargar();
 cargarBandeja();
+estadoPaquete();

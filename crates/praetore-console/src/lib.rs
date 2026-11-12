@@ -62,6 +62,9 @@ pub struct ConsoleState {
     inbox: Option<Inbox>,
     /// D3. Present only with a policy file and attester pins.
     pack: Option<Arc<CompliancePack>>,
+    /// One package is built at a time: each holds the shared database
+    /// client for the whole export.
+    pack_gate: Arc<tokio::sync::Semaphore>,
     address: SocketAddr,
     /// `Host` values the console answers to (DNS rebinding).
     hosts: Vec<String>,
@@ -172,6 +175,7 @@ impl ConsoleState {
             names,
             inbox: None,
             pack: None,
+            pack_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             address: DEFAULT_ADDRESS.parse().expect("fixed address"),
             hosts: Vec::new(),
             origins: Vec::new(),
@@ -255,6 +259,7 @@ impl ConsoleState {
             .route("/bandeja/{referencia}/rechazar", post(reject))
             .route("/bandeja/{referencia}/ejecutar", post(execute))
             .route("/paquete", get(download_pack))
+            .route("/paquete/estado", get(pack_status))
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_session,
@@ -512,16 +517,20 @@ async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
     let Some(pack) = state.pack.clone() else {
         return api_message(StatusCode::SERVICE_UNAVAILABLE, PACK_OFF);
     };
+    let Ok(permit) = Arc::clone(&state.pack_gate).try_acquire_owned() else {
+        return api_text(StatusCode::TOO_MANY_REQUESTS, PackError::Busy.message());
+    };
     let signer = state.inbox.as_ref().map(|inbox| Arc::clone(&inbox.signer));
     let built = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         paquete::generate(&pack, signer.as_deref(), time::OffsetDateTime::now_utc())
     })
     .await;
     let bytes = match built {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => return api_message(StatusCode::SERVICE_UNAVAILABLE, error.message()),
+        Ok(Err(error)) => return api_text(StatusCode::SERVICE_UNAVAILABLE, error.message()),
         Err(_) => {
-            return api_message(
+            return api_text(
                 StatusCode::SERVICE_UNAVAILABLE,
                 PackError::Archive.message(),
             );
@@ -541,6 +550,24 @@ async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
         .into_response();
     set_security_headers(response.headers_mut());
     response
+}
+
+/// Whether the page should offer the package at all.
+async fn pack_status(State(state): State<Arc<ConsoleState>>) -> Response {
+    #[derive(Serialize)]
+    struct PackStatus {
+        configurado: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mensaje: Option<&'static str>,
+    }
+    let configurado = state.pack.is_some();
+    api_json(
+        StatusCode::OK,
+        PackStatus {
+            configurado,
+            mensaje: (!configurado).then_some(PACK_OFF),
+        },
+    )
 }
 
 /// A read the page asks for with `fetch`: same-origin GETs carry no
@@ -740,12 +767,16 @@ fn api_json<T: Serialize>(status: StatusCode, body: T) -> Response {
 }
 
 fn api_message(status: StatusCode, mensaje: &'static str) -> Response {
+    api_text(status, mensaje.into())
+}
+
+fn api_text(status: StatusCode, mensaje: std::borrow::Cow<'static, str>) -> Response {
     api_json(status, Message { mensaje })
 }
 
 #[derive(Serialize)]
 struct Message {
-    mensaje: &'static str,
+    mensaje: std::borrow::Cow<'static, str>,
 }
 
 #[derive(Serialize)]

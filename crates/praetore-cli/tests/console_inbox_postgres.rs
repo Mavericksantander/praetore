@@ -731,6 +731,13 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         export["journal"]["entries"].as_u64().unwrap() >= 3,
         "{export}"
     );
+    // Without storage records there is no reference line: every line is a
+    // decision receipt, and LEEME.txt says how many.
+    assert_eq!(export["journal"]["database_head"], serde_json::Value::Null);
+    let receipts = export["journal"]["decision_receipts"].as_u64().unwrap();
+    assert_eq!(receipts, export["journal"]["entries"].as_u64().unwrap());
+    let readme = fs::read_to_string(pack_dir.join("LEEME.txt")).unwrap();
+    assert!(readme.contains(&format!("Tiene {receipts} recibos de decisión.")));
     let anchored = run(
         Command::new(&verify)
             .args([

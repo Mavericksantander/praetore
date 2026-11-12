@@ -119,14 +119,32 @@ pub enum PackError {
     Pins,
     PinIsApproverKey,
     /// A configured pin verified no receipt and no storage record: it is
-    /// not needed, and it may be the wrong file (a secret, say).
-    PinUnused,
+    /// not needed, and it may be the wrong file (a secret, say). `index` is
+    /// the first such pin in configuration order; `more` when others too.
+    PinUnused {
+        index: usize,
+        more: bool,
+    },
+    /// Another download is still being built.
+    Busy,
     Journal,
     Archive,
 }
 
 impl PackError {
-    pub fn message(self) -> &'static str {
+    pub fn message(self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::PinUnused { index, more } => format!(
+                "La {} clave configurada como clave pública del atestador (en el orden de PRAETORE_CONSOLE_ATTESTER_PIN_FILES) no verifica ningún registro: sobra o es un archivo equivocado.{} No se generó ningún paquete.",
+                ordinal(index),
+                if more { " Puede haber más claves en la misma situación." } else { "" }
+            )
+            .into(),
+            other => other.fixed_message().into(),
+        }
+    }
+
+    fn fixed_message(self) -> &'static str {
         match self {
             Self::Policy => {
                 "No se pudo leer la política configurada en la consola. No se generó ningún paquete."
@@ -137,11 +155,10 @@ impl PackError {
             Self::PinIsApproverKey => {
                 "Una de las claves configuradas como clave pública del atestador es la clave del aprobador. No se generó ningún paquete."
             }
-            Self::PinUnused => {
-                "Una de las claves configuradas como clave pública del atestador no verifica ningún registro: sobra o es un archivo equivocado. No se generó ningún paquete."
-            }
+            Self::PinUnused { .. } => unreachable!("message() words it"),
+            Self::Busy => "Ya se está armando un paquete. Espera a que termine.",
             Self::Journal => {
-                "No se pudo exportar el registro firmado: la base no respondió, no hay registros, hay más de los que caben en una exportación, o alguna firma no corresponde a las claves del atestador configuradas. No se generó ningún paquete."
+                "No se pudo exportar el registro firmado: la base no respondió, no hay registros, el registro es demasiado grande para una exportación, o alguna firma no corresponde a las claves del atestador configuradas. No se generó ningún paquete."
             }
             Self::Archive => "No se pudo armar el paquete. No se generó ningún paquete.",
         }
@@ -152,7 +169,8 @@ impl PackError {
             Self::Policy => "policy",
             Self::Pins => "attester_pins",
             Self::PinIsApproverKey => "attester_pin_is_approver_key",
-            Self::PinUnused => "attester_pin_unused",
+            Self::PinUnused { .. } => "attester_pin_unused",
+            Self::Busy => "busy",
             Self::Journal => "journal_export",
             Self::Archive => "archive",
         }
@@ -221,8 +239,18 @@ fn collect(
     })?;
     // Every pin must have verified an entry: only then is it known to be the
     // public key of a signer, and not some other 32-byte value.
-    if !export.unused_attesters.is_empty() {
-        return Err(PackError::PinUnused);
+    if let Some(&index) = export.unused_attesters.first() {
+        let path = &pack.settings.attester_pin_files[index];
+        tracing::warn!(
+            position = index + 1,
+            path = %path.display(),
+            unused = export.unused_attesters.len(),
+            "compliance package: attester pin verified no entry"
+        );
+        return Err(PackError::PinUnused {
+            index,
+            more: export.unused_attesters.len() > 1,
+        });
     }
     Ok(PackContents {
         tenant_id: pack.store.tenant_id(),
@@ -286,6 +314,7 @@ pub fn pack_files(contents: &PackContents) -> Result<Vec<PackFile>, PackError> {
             "file": JOURNAL_FILE,
             "source": format!("praetore journal-export --tenant {}", contents.tenant_id),
             "entries": contents.export.head.entries.get(),
+            "decision_receipts": decision_receipts(&contents.export),
             "head": contents.export.head.head.to_hex(),
             "database_head": contents.export.database_head.map(|reference| serde_json::json!({
                 "entries": reference.entries.get(),
@@ -364,7 +393,7 @@ pub fn archive(files: &[PackFile], mtime: OffsetDateTime) -> Result<Vec<u8>, Pac
 
 fn readme(contents: &PackContents, generated_at: &str, pin_names: &[String]) -> String {
     let tenant = contents.tenant_id;
-    let entries = contents.export.head.entries.get();
+    let receipts = decision_receipts(&contents.export);
     let head = contents.export.head.head.to_hex();
     let digest = contents.policy.digest();
     let pins = pin_names
@@ -374,13 +403,41 @@ fn readme(contents: &PackContents, generated_at: &str, pin_names: &[String]) -> 
         .join(" ");
     let repository = env!("CARGO_PKG_REPOSITORY");
     let version = env!("CARGO_PKG_VERSION");
-    let database = if contents.export.database_head.is_some() {
-        "La primera línea de journal.jsonl referencia el head de la cadena de la base\n\
-         de datos (los registros de almacenamiento de toda la base). Esa cadena no va\n\
-         en el paquete, así que esa referencia no se puede comprobar con él."
+    let counted = if receipts == 1 {
+        "1 recibo de decisión".to_owned()
     } else {
-        "Esta exportación no referencia la cadena de la base de datos: la base no\n\
-         tenía registros de almacenamiento."
+        format!("{receipts} recibos de decisión")
+    };
+    let lines = match &contents.export.database_head {
+        Some(reference) => format!(
+            "Tiene {counted}. La primera línea no es un recibo: es la\n    \
+             referencia (database_head) a la cadena de la base de datos, que dice\n    \
+             cuántos registros tenía esa cadena, de toda la base: {}.\n    \
+             Después, cada línea encadena con la anterior un recibo de decisión",
+            reference.entries
+        ),
+        None => {
+            format!("Tiene {counted}. Cada línea encadena con la anterior un recibo de decisión")
+        }
+    };
+    let database = match &contents.export.database_head {
+        Some(reference) => format!(
+            "La primera línea de journal.jsonl referencia el head de la cadena de la base\n\
+             de datos (los registros de almacenamiento de toda la base, {} en el momento\n\
+             de la exportación). Esa cadena no va en el paquete, así que esa referencia\n\
+             no se puede comprobar con él.",
+            reference.entries
+        ),
+        None => "Esta exportación no referencia la cadena de la base de datos: la base no\n\
+                 tenía registros de almacenamiento."
+            .to_owned(),
+    };
+    let database_complete = if contents.export.database_head.is_some() {
+        "\n\nComo journal.jsonl referencia la cadena de la base, pida aparte el head\n\
+         de esa cadena por el mismo tipo de canal y páselo con\n\
+         --expected-database-head."
+    } else {
+        ""
     };
     format!(
         "\
@@ -398,11 +455,11 @@ journal.jsonl
     El registro firmado de este tenant: la salida de
         praetore journal-export --tenant {tenant}
     para el estado de la base en el momento de la exportación, producida por
-    el mismo código. Tiene {entries} entradas. Cada línea encadena con la
-    anterior un recibo de decisión firmado por el atestador: lo que la
-    política resolvió para cada solicitud (permitir, denegar o retener para
-    aprobación). No trae la aprobación o el rechazo de una persona ni el
-    resultado de la ejecución: esos recibos no van en este paquete.
+    el mismo código. {lines}
+    firmado por el atestador: lo que la política resolvió para cada
+    solicitud (permitir, denegar o retener para aprobación). No trae la
+    aprobación o el rechazo de una persona ni el resultado de la ejecución:
+    esos recibos no van en este paquete.
 
 policy.json
     El archivo de política configurado en la consola, copiado tal cual.
@@ -414,10 +471,11 @@ policy-digest.txt
 
 {pin_list}
     Las claves públicas Ed25519 del atestador configuradas en la consola.
-    Cada una verificó al menos una entrada de la exportación.
+    Cada una verificó al menos un recibo de journal.jsonl o un registro de
+    la cadena de la base, que no va en el paquete.
 
 export.json
-    Los datos de la exportación: tenant, hora, cantidad de entradas, head
+    Los datos de la exportación: tenant, hora, cantidad de líneas, head
     de la cadena y digest de la política.
 
 SHA256SUMS
@@ -438,16 +496,18 @@ No hace falta confiar en la consola que lo generó.
    Esto detecta un archivo dañado o cambiado sin recalcular SHA256SUMS. No es
    una firma: quien cambie un archivo puede recalcular SHA256SUMS.
 
-2. Construya praetore-verify desde la rama main:
+2. Construya praetore-verify desde main, en un commit que incluya este
+   paquete de compliance (P-002 D3), o desde un release posterior a v0.3.3:
        git clone {repository}
        cd praetore
        cargo build --release --locked -p praetore-verify
-   El programa queda en target/release/praetore-verify. El praetore-verify
-   de v0.3.3 rechaza los recibos schema v5 (el recibo de ejecución
-   `awaiting_approval` de una solicitud retenida) y la razón
-   `approved_claim_expired`, con RECEIPT_INVALID. Esos son recibos de
-   ejecución y no van en este paquete; aun así, use el de main, que conoce
-   los formatos que el gateway escribe hoy.
+   El programa queda en target/release/praetore-verify.
+   Use praetore-verify construido desde main. El praetore-verify de v0.3.3
+   también acepta este journal.jsonl, pero no muestra tenant_id ni avisa
+   head_not_anchored, que el paso 3 usa. Además, v0.3.3 rechaza con
+   RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y
+   las razones approved_claim_expired y approval_rejected; esos recibos no
+   van en este paquete.
 
 3. El registro y sus firmas:
        praetore-verify journal --journal journal.jsonl {pins}
@@ -460,9 +520,7 @@ No hace falta confiar en la consola que lo generó.
    El head de esta exportación es
        {head}
    (también en export.json), pero viene del mismo operador que el paquete.
-   Para saber que no faltan ni se reordenaron registros, compárelo con un
-   head obtenido por un canal que el operador no controle y páselo con
-   --expected-head.
+   Vea \"¿Está completo?\".
 
 4. La política:
        praetore-verify policy-digest --policy policy.json
@@ -471,6 +529,16 @@ No hace falta confiar en la consola que lo generó.
    exige además que cada recibo registre el digest de esta política. Si una
    parte del registro se decidió con otra política (por ejemplo, antes de un
    cambio de política), este comando falla aunque el registro esté íntegro.
+
+
+¿ESTÁ COMPLETO?
+---------------
+
+Sin más, este paquete prueba integridad y firmas, no completitud. Para saber
+que no faltan ni se reordenaron recibos, compare el head con uno obtenido
+fuera del control del operador y páselo con --expected-head: un head que
+usted anotó antes, uno publicado, o el de una exportación que usted mismo
+corra con acceso de solo lectura.{database_complete}
 
 
 LAS CLAVES
@@ -503,10 +571,37 @@ LO QUE ESTE PAQUETE NO PRUEBA
   el paso 4 los compara.
 - No prueba que una autorización siga vigente, ni autoriza nada.
 - {database}
-- El praetore-verify de v0.3.3 rechaza los recibos schema v5 (recibos de
-  ejecución, que este paquete no trae): use uno construido desde main.
 ",
         pin_list = pin_names.join("\n"),
         database = database.replace('\n', "\n  "),
     )
+}
+
+/// "primera", "segunda", ... for a position counted from zero, up to
+/// [`MAX_ATTESTER_PINS`]: the page names a pin without digits.
+pub fn ordinal(index: usize) -> &'static str {
+    const NAMES: [&str; MAX_ATTESTER_PINS] = [
+        "primera",
+        "segunda",
+        "tercera",
+        "cuarta",
+        "quinta",
+        "sexta",
+        "séptima",
+        "octava",
+        "novena",
+        "décima",
+        "undécima",
+        "duodécima",
+        "decimotercera",
+        "decimocuarta",
+        "decimoquinta",
+        "decimosexta",
+    ];
+    NAMES.get(index).copied().unwrap_or("última")
+}
+
+/// Decision receipts in the chain: every line but the database reference.
+pub fn decision_receipts(export: &TenantExport) -> u64 {
+    export.head.entries.get() - u64::from(export.database_head.is_some())
 }

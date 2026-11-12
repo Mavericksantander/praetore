@@ -309,15 +309,22 @@ async fn the_package_has_fixed_names_and_the_cli_export_policy_and_pins() {
         .is_ok()
     );
 
-    let readme = text(&files, "LEEME.txt");
+    // Compared with line breaks folded into single spaces.
+    let readme = text(&files, "LEEME.txt")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(!readme.contains("recibos de ejecución, que este paquete no trae"));
     for needed in [
         "praetore-verify journal --journal journal.jsonl --attester-pin attester-pin-1.hex",
         "praetore-verify policy-digest --policy policy.json",
         "cargo build --release --locked -p praetore-verify",
         "No prueba que el agente no tuvo un camino fuera del gateway",
-        "No prueba nada de lo ocurrido antes del primer registro ni después de la\n  exportación",
-        "El praetore-verify de v0.3.3 rechaza los recibos schema v5",
-        "No muestra si una solicitud retenida fue aprobada, rechazada, venció o\n  se ejecutó",
+        "No prueba nada de lo ocurrido antes del primer registro ni después de la exportación",
+        "Use praetore-verify construido desde main. El praetore-verify de v0.3.3 también acepta este journal.jsonl, pero no muestra tenant_id ni avisa head_not_anchored, que el paso 3 usa. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y las razones approved_claim_expired y approval_rejected; esos recibos no van en este paquete.",
+        "Tiene 8 recibos de decisión. Cada línea encadena",
+        "desde main, en un commit que incluya este paquete de compliance (P-002 D3), o desde un release posterior a v0.3.3",
+        "No muestra si una solicitud retenida fue aprobada, rechazada, venció o se ejecutó",
         "sha256sum -c SHA256SUMS",
         &digest,
         &head.head.to_hex(),
@@ -680,7 +687,10 @@ fn a_pin_that_verified_nothing_is_refused_so_no_secret_slips_in() {
     );
     assert_eq!(
         generate(&pack, None, time::OffsetDateTime::now_utc()).err(),
-        Some(PackError::PinUnused)
+        Some(PackError::PinUnused {
+            index: 1,
+            more: false
+        })
     );
     // The approver's own key as a pin, with no inbox configured: the
     // approver check cannot run, the unused check still refuses it.
@@ -688,7 +698,10 @@ fn a_pin_that_verified_nothing_is_refused_so_no_secret_slips_in() {
     fs::write(&second, hex::encode(approver_public) + "\n").unwrap();
     assert_eq!(
         generate(&pack, None, time::OffsetDateTime::now_utc()).err(),
-        Some(PackError::PinUnused)
+        Some(PackError::PinUnused {
+            index: 1,
+            more: false
+        })
     );
 }
 
@@ -696,13 +709,20 @@ fn a_pin_that_verified_nothing_is_refused_so_no_secret_slips_in() {
 fn a_database_head_reference_is_reported_and_said_to_be_unchecked_here() {
     use praetore_core::journal_chain::{ChainLink, DatabaseHead};
     let pin = attester_pin();
-    let (text, head) =
-        export_with_database_head(&receipts_of_set_04(), None, std::slice::from_ref(&pin)).unwrap();
     let policy_json = fs::read_to_string(set_04().join("policy.json")).unwrap();
     let reference = DatabaseHead {
         entries: std::num::NonZeroU64::new(2).unwrap(),
         head: ChainLink::from_hex(&"ab".repeat(32)).unwrap(),
     };
+    // Line 0 is the reference, then set 04's eight receipts.
+    let (text, head) = export_with_database_head(
+        &receipts_of_set_04(),
+        Some(reference),
+        std::slice::from_ref(&pin),
+    )
+    .unwrap();
+    assert_eq!(head.entries.get(), 9);
+    assert!(text.lines().next().unwrap().contains("\"database_head\""));
     let contents = PackContents {
         tenant_id: TENANT,
         generated_at: time::OffsetDateTime::now_utc(),
@@ -732,5 +752,168 @@ fn a_database_head_reference_is_reported_and_said_to_be_unchecked_here() {
     let export: serde_json::Value = serde_json::from_str(&get("export.json")).unwrap();
     assert_eq!(export["journal"]["database_head"]["entries"], 2);
     assert_eq!(export["journal"]["database_head"]["head"], "ab".repeat(32));
-    assert!(get("LEEME.txt").contains("esa referencia no se puede comprobar con él"));
+    assert_eq!(export["journal"]["entries"], 9);
+    assert_eq!(export["journal"]["decision_receipts"], 8);
+    let readme = get("LEEME.txt")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(readme.contains("esa referencia no se puede comprobar con él"));
+    assert!(
+        readme.contains("Tiene 8 recibos de decisión. La primera línea no es un recibo"),
+        "{readme}"
+    );
+    assert!(readme.contains("de toda la base: 2."), "{readme}");
+    assert!(readme.contains("--expected-database-head"));
+    assert!(!readme.contains("9 recibos"));
+}
+
+#[tokio::test]
+async fn the_second_pin_unused_is_named_in_words() {
+    let setup = Setup::new("second-unused");
+    let second = setup.dir.join("second.hex");
+    fs::write(
+        &second,
+        hex::encode(
+            SigningKey::from_bytes(&[0x09; 32])
+                .verifying_key()
+                .to_bytes(),
+        ) + "\n",
+    )
+    .unwrap();
+    let settings = PackSettings::new(
+        setup.policy.clone(),
+        vec![setup.pin.clone(), second.clone()],
+    )
+    .unwrap();
+    let response = app(Some(settings), store(), false)
+        .oneshot(download())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .is_none()
+    );
+    let message: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
+    let message = message["mensaje"].as_str().unwrap();
+    assert!(
+        message.starts_with("La segunda clave configurada como clave pública del atestador"),
+        "{message}"
+    );
+    assert!(message.contains("PRAETORE_CONSOLE_ATTESTER_PIN_FILES"));
+    assert!(message.contains("No se generó ningún paquete"));
+    assert!(!message.contains("Puede haber más"));
+    assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
+
+    // First and third unused: the first is named, and the page says there
+    // may be more.
+    let third = setup.dir.join("third.hex");
+    fs::write(
+        &third,
+        hex::encode(
+            SigningKey::from_bytes(&[0x0a; 32])
+                .verifying_key()
+                .to_bytes(),
+        ),
+    )
+    .unwrap();
+    let pack = CompliancePack::new(
+        PackSettings::new(setup.policy.clone(), vec![second, setup.pin.clone(), third]).unwrap(),
+        store(),
+    );
+    let error = generate(&pack, None, time::OffsetDateTime::now_utc()).unwrap_err();
+    assert_eq!(
+        error,
+        PackError::PinUnused {
+            index: 0,
+            more: true
+        }
+    );
+    let message = error.message();
+    assert!(message.starts_with("La primera clave"), "{message}");
+    assert!(message.contains("Puede haber más claves"));
+    assert!(!message.chars().any(|c| c.is_ascii_digit()));
+}
+
+#[test]
+fn every_pin_position_has_a_word() {
+    for index in 0..MAX_ATTESTER_PINS {
+        let message = PackError::PinUnused { index, more: false }.message();
+        assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
+        assert!(!message.contains("última"), "{index}");
+    }
+    assert!(
+        !PackError::Journal
+            .message()
+            .chars()
+            .any(|c| c.is_ascii_digit())
+    );
+    assert!(
+        PackError::Journal
+            .message()
+            .contains("el registro es demasiado grande para una exportación")
+    );
+}
+
+#[tokio::test]
+async fn one_package_at_a_time() {
+    let setup = Setup::new("busy");
+    let store = store();
+    let state = Arc::new(
+        ConsoleState::new(
+            Arc::new(NoHistory),
+            LocalSession::from_secret(SESSION_SECRET),
+            HashMap::new(),
+        )
+        .with_compliance_pack(CompliancePack::new(setup.settings(), store.clone())),
+    );
+    let router = ConsoleState::router_from(Arc::clone(&state));
+    let held = Arc::clone(&state.pack_gate).try_acquire_owned().unwrap();
+    let response = router.clone().oneshot(download()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let message: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
+    assert_eq!(
+        message["mensaje"],
+        "Ya se está armando un paquete. Espera a que termine."
+    );
+    assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+    drop(held);
+    let response = router.oneshot(download()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_page_learns_whether_the_package_is_configured() {
+    let setup = Setup::new("status");
+    for (settings, configured) in [(Some(setup.settings()), true), (None, false)] {
+        let request = Request::builder()
+            .uri("/api/paquete/estado")
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(
+                header::COOKIE,
+                LocalSession::from_secret(SESSION_SECRET).cookie_header(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let store = store();
+        let response = app(settings, store.clone(), false)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let status: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
+        assert_eq!(status["configurado"], configured);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0, "nothing exported");
+    }
+    // Without the session, refused like the rest of the API.
+    let request = Request::builder()
+        .uri("/api/paquete/estado")
+        .header(header::HOST, "127.0.0.1:8090")
+        .body(Body::empty())
+        .unwrap();
+    let response = app(None, store(), false).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
