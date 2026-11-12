@@ -283,6 +283,19 @@
   `scripts/mcp-smoke.py` stops if that install is missing or another version.
   The binaries and the archive layout are unchanged.
 
+### Fixed
+
+- **CLI PostgreSQL tests locate `praetore-verify` on Cargo 1.100.**
+  The test helper walked two parent directories from the test
+  executable, which matched Cargo 1.99 (`target/debug/deps/`). Cargo
+  1.100 places test executables under
+  `target/debug/build/<package>/<hash>/out/`, so the helper looked in
+  the hash directory and `postgres_t013b_refusal_before_effect_is_a_signed_failed_state`
+  failed after stable moved to rustc 1.100.0. The helper now walks
+  ancestors until it finds the binary in the artifact directory
+  (`target/debug` or `target/release`), which is still where Cargo
+  uplifts workspace binaries.
+
 ## 0.3.3 - 2026-11-03
 
 Closes the two known limitations of v0.3.2 in the post-hoc safety ingestion
