@@ -4623,22 +4623,73 @@ mod tests {
         }
     }
 
-    /// A binary of this workspace built next to the test executable
-    /// (`cargo build -p praetore-cli -p praetore-verify --locked`).
+    /// A workspace binary in the Cargo artifact directory (`target/debug`
+    /// or `target/release`). Built with
+    /// `cargo build -p praetore-cli -p praetore-verify --locked`.
+    ///
+    /// Cargo 1.99 places the test executable in `…/deps/`. Cargo 1.100
+    /// places it in `…/build/<package>/<hash>/out/` (the intermediate
+    /// layout is not a stable interface; rust-lang/cargo#17354). In both
+    /// cases the named binary is uplifted to the artifact directory, so
+    /// this walks ancestors of the test executable until it finds it.
     fn sibling_binary(name: &str) -> PathBuf {
-        let path = env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        assert!(
-            path.is_file(),
-            "{} is missing: run `cargo build -p praetore-cli -p praetore-verify --locked` first",
-            path.display()
+        let exe = env::current_exe().unwrap();
+        locate_sibling_binary(&exe, name).unwrap_or_else(|| {
+            let filename = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+            panic!(
+                "{filename} is missing (looked from {}): run `cargo build -p praetore-cli -p praetore-verify --locked` first",
+                exe.display()
+            )
+        })
+    }
+
+    fn locate_sibling_binary(current_exe: &Path, name: &str) -> Option<PathBuf> {
+        let filename = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let mut dir = current_exe.parent()?;
+        // Two hops from `…/deps/<test>`, five from
+        // `…/build/<package>/<hash>/out/<test>`. The bound stays inside
+        // the target directory.
+        for _ in 0..8 {
+            let path = dir.join(&filename);
+            if path.is_file() {
+                return Some(path);
+            }
+            dir = dir.parent()?;
+        }
+        None
+    }
+
+    #[test]
+    fn sibling_binary_finds_the_uplifted_artifact_from_the_1_99_and_1_100_layouts() {
+        let root = temp_path("sibling-layout");
+        fs::create_dir_all(&root).unwrap();
+        let debug = root.join("debug");
+        fs::create_dir_all(&debug).unwrap();
+        let bin = debug.join(format!("praetore-verify{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&bin, []).unwrap();
+
+        let v199 = debug.join("deps").join("praetore-abc");
+        fs::create_dir_all(v199.parent().unwrap()).unwrap();
+        fs::write(&v199, []).unwrap();
+        assert_eq!(
+            locate_sibling_binary(&v199, "praetore-verify").as_deref(),
+            Some(bin.as_path())
         );
-        path
+
+        let v1100 = debug
+            .join("build")
+            .join("praetore-cli")
+            .join("89b3229a21bd5c5c")
+            .join("out")
+            .join("praetore-89b3229a21bd5c5c");
+        fs::create_dir_all(v1100.parent().unwrap()).unwrap();
+        fs::write(&v1100, []).unwrap();
+        assert_eq!(
+            locate_sibling_binary(&v1100, "praetore-verify").as_deref(),
+            Some(bin.as_path())
+        );
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// The CLI's local HTTP API over the fixture's gateway and real
