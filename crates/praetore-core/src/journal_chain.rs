@@ -680,6 +680,45 @@ pub fn verify_journal_report(
     expected_head: Option<&ChainLink>,
     expected_database_head: Option<&ExpectedDatabaseHead>,
 ) -> Result<JournalReport, ChainError> {
+    verify_journal_inner(
+        text,
+        attesters,
+        policy,
+        expected_head,
+        expected_database_head,
+        None,
+    )
+}
+
+/// [`verify_journal_report`] that also returns the verified receipts, in
+/// chain order (none for a database chain). For checks that need the
+/// receipts themselves, such as binding approval and execution receipts to
+/// the requests of the chain.
+pub fn verify_journal_receipts(
+    text: &str,
+    attesters: &[VerifiedPublicKey],
+    expected_head: Option<&ChainLink>,
+) -> Result<(JournalReport, Vec<Evidence>), ChainError> {
+    let mut receipts = Vec::new();
+    let report = verify_journal_inner(
+        text,
+        attesters,
+        None,
+        expected_head,
+        None,
+        Some(&mut receipts),
+    )?;
+    Ok((report, receipts))
+}
+
+fn verify_journal_inner(
+    text: &str,
+    attesters: &[VerifiedPublicKey],
+    policy: Option<&RecordedPolicy>,
+    expected_head: Option<&ChainLink>,
+    expected_database_head: Option<&ExpectedDatabaseHead>,
+    mut receipts: Option<&mut Vec<Evidence>>,
+) -> Result<JournalReport, ChainError> {
     if text.len() > MAX_CHAIN_BYTES {
         return Err(ChainError::TooLarge);
     }
@@ -705,6 +744,9 @@ pub fn verify_journal_report(
                 let evidence = Evidence::from_json(evidence.get())
                     .map_err(|error| ChainError::Evidence { line, error })?;
                 state.append(&evidence)?;
+                if let Some(receipts) = receipts.as_mut() {
+                    receipts.push(evidence);
+                }
             }
             (None, Some(record), None) => {
                 let record = StorageRecord::from_json(record.get())
@@ -787,6 +829,27 @@ mod tests {
 
     /// A pin that verified nothing is reported; one that verified a record
     /// or a receipt is not.
+    #[test]
+    fn verify_journal_receipts_returns_the_verified_receipts_in_order() {
+        let (report, receipts) =
+            verify_journal_receipts(SET_03_CHAIN, &[set_03_pin()], None).unwrap();
+        assert_eq!(
+            report,
+            verify_journal_report(SET_03_CHAIN, &[set_03_pin()], None, None, None).unwrap()
+        );
+        assert_eq!(receipts.len() as u64, report.summary.head.entries.get());
+        for (line, evidence) in SET_03_CHAIN.lines().zip(&receipts) {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(
+                entry["evidence"]["evidence_id"],
+                evidence.evidence_id.to_string()
+            );
+        }
+        // A broken chain returns nothing.
+        let broken = SET_03_CHAIN.replacen("\"seq\":1", "\"seq\":7", 1);
+        assert!(verify_journal_receipts(&broken, &[set_03_pin()], None).is_err());
+    }
+
     #[test]
     fn the_exporter_reports_pins_that_verified_no_entry() {
         let attester = EvidenceAttesterKey::from_secret_bytes(&[7; 32]);

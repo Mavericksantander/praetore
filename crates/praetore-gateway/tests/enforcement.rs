@@ -5943,3 +5943,593 @@ fn a_failed_rejection_write_records_nothing_and_can_be_retried() {
     );
     assert_eq!(tool.invocations(), 0);
 }
+
+/// P-002 D3.1: the approval and execution records of held requests, as the
+/// console's compliance package carries them, verified offline.
+mod outcomes {
+    use super::*;
+    use praetore_receipt::outcomes::{
+        HeldOutcome, KeyPin, Outcome, OutcomeError, OutcomeKeys, verify_outcomes, write_outcomes,
+    };
+
+    /// Every record the journal holds for `key`, in recording order.
+    fn recorded(journal: &MemoryJournal, key: ExecutionKey) -> Vec<Outcome> {
+        let entries = journal.entries.lock().unwrap();
+        let entry = &entries[&key];
+        let evidence = entry.evidence.clone().unwrap();
+        let mut records = Vec::new();
+        if let Some(decision) = &entry.human_approval {
+            records.push(Outcome::HumanDecision(decision.clone()));
+        }
+        if let Some(receipt) = &entry.approval_expiration {
+            records.push(Outcome::ApprovalExpired(receipt.clone()));
+        }
+        for attestation in &entry.execution_attestations {
+            let output = matches!(
+                attestation.execution,
+                AttestedExecution::Executed | AttestedExecution::Confirmed
+            )
+            .then(|| entry.output.clone())
+            .flatten();
+            records.push(Outcome::ExecutionReceipt(Box::new(
+                praetore_gateway::GatewayReceipt {
+                    evidence: evidence.clone(),
+                    authorization: attestation.authorization,
+                    execution: attestation.execution,
+                    output,
+                    execution_attestation: attestation.clone(),
+                },
+            )));
+        }
+        records
+    }
+
+    struct Held {
+        evidence: Evidence,
+        records: Vec<Outcome>,
+    }
+
+    fn held(journal: &MemoryJournal, key: ExecutionKey) -> Held {
+        Held {
+            evidence: journal.entry(key).unwrap().evidence,
+            records: recorded(journal, key),
+        }
+    }
+
+    fn approved_and_executed() -> Held {
+        let (gateway, request, _, journal, approver_key) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        gateway.dispatch_approved(key).unwrap();
+        held(&journal, key)
+    }
+
+    fn rejected() -> Held {
+        let (gateway, request, _, journal, approver_key) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Reject,
+            &approver_key,
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        held(&journal, key)
+    }
+
+    fn approved_not_dispatched() -> Held {
+        let (gateway, request, _, journal, approver_key) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        held(&journal, key)
+    }
+
+    fn pending() -> Held {
+        let (gateway, request, _, journal, _) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        held(&journal, key)
+    }
+
+    fn expired() -> Held {
+        let captured_clock = Arc::new(Mutex::new(None));
+        let capture = captured_clock.clone();
+        let (gateway, request, _, journal, approver_key) =
+            approval_fixture_with_provider(move |clock| {
+                *capture.lock().unwrap() = Some(clock);
+                Arc::new(CurrentFreshness)
+            });
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        let clock = captured_clock.lock().unwrap().clone().unwrap();
+        *clock.lock().unwrap() += Duration::seconds(21);
+        assert!(gateway.resolve_human_approval(decision).is_err());
+        held(&journal, key)
+    }
+
+    fn approver_pin() -> KeyPin {
+        KeyPin {
+            key_id: "test-human-approver-v1".into(),
+            public_key: VerifiedPublicKey::from_bytes(
+                &SigningKey::from_bytes(&[34; 32]).verifying_key().to_bytes(),
+            )
+            .unwrap(),
+        }
+    }
+
+    fn execution_pin() -> KeyPin {
+        KeyPin {
+            key_id: "test-execution-attester-v1".into(),
+            public_key: execution_attester_public_key(),
+        }
+    }
+
+    fn evidence_attesters() -> Vec<VerifiedPublicKey> {
+        vec![
+            EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+                .public_key()
+                .unwrap(),
+        ]
+    }
+
+    fn verify(
+        text: &str,
+        journal: &[Evidence],
+        execution: &[KeyPin],
+        approvers: &[KeyPin],
+    ) -> Result<praetore_receipt::outcomes::OutcomeReport, OutcomeError> {
+        verify_outcomes(
+            text,
+            journal,
+            &OutcomeKeys {
+                evidence_attesters: &evidence_attesters(),
+                execution,
+                approvers,
+            },
+        )
+    }
+
+    fn file(requests: &[&Held]) -> (String, Vec<Evidence>) {
+        let records: Vec<Outcome> = requests
+            .iter()
+            .flat_map(|held| held.records.clone())
+            .collect();
+        (
+            write_outcomes(&records).unwrap(),
+            requests.iter().map(|held| held.evidence.clone()).collect(),
+        )
+    }
+
+    #[test]
+    fn each_held_request_ends_as_its_verified_records_say() {
+        let requests = [
+            approved_and_executed(),
+            rejected(),
+            approved_not_dispatched(),
+            pending(),
+            expired(),
+        ];
+        let (text, journal) = file(&requests.iter().collect::<Vec<_>>());
+        let report = verify(&text, &journal, &[execution_pin()], &[approver_pin()]).unwrap();
+        assert_eq!(
+            report
+                .held
+                .iter()
+                .map(|held| held.outcome)
+                .collect::<Vec<_>>(),
+            vec![
+                HeldOutcome::ApprovedExecuted,
+                HeldOutcome::Rejected,
+                HeldOutcome::ApprovedPendingDispatch,
+                HeldOutcome::Pending,
+                HeldOutcome::Expired,
+            ]
+        );
+        for (held, evidence) in report.held.iter().zip(&journal) {
+            assert_eq!(held.evidence_id, evidence.evidence_id);
+            assert_eq!(held.request_id, evidence.request_id);
+        }
+        assert_eq!(
+            report.held[1].not_dispatched_reason,
+            Some(NotDispatchedReason::ApprovalRejected)
+        );
+        assert_eq!(report.counts.approvals, 2);
+        assert_eq!(report.counts.rejections, 1);
+        assert_eq!(report.counts.expirations, 1);
+        // Each held request got its awaiting_approval receipt; then one
+        // confirmed, one rejected close and one expired close.
+        assert_eq!(report.counts.by_execution["awaiting_approval"], 5);
+        assert_eq!(report.counts.by_execution["confirmed"], 1);
+        assert_eq!(report.counts.by_execution["not_dispatched"], 2);
+        assert_eq!(report.counts.execution_receipts, 8);
+        assert_eq!(text.lines().count(), 8 + 3 + 1);
+        assert!(report.unused_execution_pins.is_empty());
+        assert!(report.unused_approver_pins.is_empty());
+
+        // An empty file verifies: every held request is pending.
+        let report = verify("", &journal, &[], &[]).unwrap();
+        assert!(
+            report
+                .held
+                .iter()
+                .all(|held| held.outcome == HeldOutcome::Pending)
+        );
+        assert_eq!(report.counts.execution_receipts, 0);
+    }
+
+    #[test]
+    fn a_record_that_does_not_verify_fails_the_whole_file() {
+        let executed = approved_and_executed();
+        let other = rejected();
+        let (text, journal) = file(&[&executed, &other]);
+        let lines: Vec<&str> = text.lines().collect();
+        let join = |lines: &[String]| {
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>()
+        };
+        let owned: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        // Its request is not in the journal.
+        assert!(matches!(
+            verify(&text, &journal[..1], &[execution_pin()], &[approver_pin()]),
+            Err(OutcomeError::UnknownRequest { .. })
+        ));
+        // No pin names the key id, or the key behind the id is another one.
+        assert!(matches!(
+            verify(&text, &journal, &[execution_pin()], &[]),
+            Err(OutcomeError::UnknownKey { line: 0 })
+        ));
+        let wrong_key = KeyPin {
+            key_id: "test-human-approver-v1".into(),
+            public_key: execution_attester_public_key(),
+        };
+        assert!(matches!(
+            verify(&text, &journal, &[execution_pin()], &[wrong_key]),
+            Err(OutcomeError::InvalidSignature { line: 0 })
+        ));
+        // A decision flipped after signing.
+        let mut flipped = owned.clone();
+        flipped[0] = flipped[0].replacen("\"outcome\":\"approve\"", "\"outcome\":\"reject\"", 1);
+        assert_ne!(flipped[0], owned[0]);
+        assert!(matches!(
+            verify(
+                &join(&flipped),
+                &journal,
+                &[execution_pin()],
+                &[approver_pin()]
+            ),
+            Err(OutcomeError::InvalidSignature { line: 0 })
+        ));
+        // An execution receipt whose evidence is not the journal's.
+        let mut changed = owned.clone();
+        let confirmed = changed
+            .iter()
+            .position(|line| line.contains("\"execution\":\"confirmed\""))
+            .unwrap();
+        let mut value: Value = serde_json::from_str(&changed[confirmed]).unwrap();
+        value["execution_receipt"]["evidence"]["evidence_id"] = json!(Uuid::new_v4());
+        changed[confirmed] = value.to_string();
+        assert!(matches!(
+            verify(
+                &join(&changed),
+                &journal,
+                &[execution_pin()],
+                &[approver_pin()]
+            ),
+            Err(OutcomeError::EvidenceMismatch { .. })
+        ));
+        // An executed held request without its approve decision.
+        assert!(matches!(
+            verify(
+                &join(&owned[1..]),
+                &journal,
+                &[execution_pin()],
+                &[approver_pin()]
+            ),
+            Err(OutcomeError::Inconsistent { .. })
+        ));
+        // A decision repeated.
+        let mut repeated = owned.clone();
+        repeated.insert(1, owned[0].clone());
+        assert!(matches!(
+            verify(
+                &join(&repeated),
+                &journal,
+                &[execution_pin()],
+                &[approver_pin()]
+            ),
+            Err(OutcomeError::Duplicate { line: 1 })
+        ));
+        // Lines that are not one record of this format.
+        for bad in [
+            owned[0].replacen("\"schema_version\":1", "\"schema_version\":2", 1),
+            owned[0].replacen("{", "{\"note\":1,", 1),
+            owned[0].replacen("}", ",\"approval_expired\":null}", 1),
+            "{}".to_owned(),
+        ] {
+            let mut lines = owned.clone();
+            lines[0] = bad;
+            assert!(matches!(
+                verify(
+                    &join(&lines),
+                    &journal,
+                    &[execution_pin()],
+                    &[approver_pin()]
+                ),
+                Err(OutcomeError::Malformed { line: 0 } | OutcomeError::Duplicate { .. })
+            ));
+        }
+        assert!(matches!(
+            verify(
+                text.trim_end(),
+                &journal,
+                &[execution_pin()],
+                &[approver_pin()]
+            ),
+            Err(OutcomeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_pin_that_verified_nothing_is_reported() {
+        let executed = approved_and_executed();
+        let (text, journal) = file(&[&executed]);
+        let spare = KeyPin {
+            key_id: "spare-approver".into(),
+            public_key: execution_attester_public_key(),
+        };
+        let report = verify(
+            &text,
+            &journal,
+            &[execution_pin()],
+            &[approver_pin(), spare.clone()],
+        )
+        .unwrap();
+        assert_eq!(report.unused_approver_pins, vec![1]);
+        assert!(report.unused_execution_pins.is_empty());
+        // Two pins with one key id cannot be told apart.
+        assert_eq!(
+            verify(
+                &text,
+                &journal,
+                &[execution_pin()],
+                &[approver_pin(), approver_pin()]
+            ),
+            Err(OutcomeError::DuplicatePin)
+        );
+        // The pin file round-trips.
+        assert_eq!(KeyPin::from_json(&spare.to_json()).unwrap(), spare);
+        assert!(KeyPin::from_json(&spare.to_json().to_uppercase()).is_err());
+    }
+
+    #[test]
+    fn the_requesting_agent_cannot_be_the_approver() {
+        let (gateway, request, _, journal, _) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        // The agent signs a decision with its own key (the gateway would not
+        // accept it; a forged file could carry it).
+        let agent_secret = SigningKey::from_bytes(&[31; 32]);
+        let mut decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &agent_secret,
+        );
+        decision.approver_key_id = "agent-as-approver".into();
+        decision.signature = hex::encode(
+            agent_secret
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        let text = write_outcomes(&[Outcome::HumanDecision(decision)]).unwrap();
+        let agent_pin = KeyPin {
+            key_id: "agent-as-approver".into(),
+            public_key: VerifiedPublicKey::from_bytes(&agent_secret.verifying_key().to_bytes())
+                .unwrap(),
+        };
+        assert_eq!(
+            verify(
+                &text,
+                &[journal.entry(key).unwrap().evidence],
+                &[],
+                &[agent_pin]
+            ),
+            Err(OutcomeError::SelfApproval { line: 0 })
+        );
+    }
+}
+
+/// Review follow-ups: history written before migration 0022, line order, and
+/// closing reasons that need an approval.
+mod outcomes_history {
+    use super::*;
+    use praetore_receipt::outcomes::{
+        HeldOutcome, KeyPin, Outcome, OutcomeError, OutcomeKeys, verify_outcomes, write_outcomes,
+    };
+
+    fn receipt(evidence: &Evidence, outcome: praetore_gateway::AttestedOutcome) -> Outcome {
+        let attestation = praetore_gateway::ExecutionAttestation::create(
+            evidence,
+            AuthorizationStatus::RequiresApproval,
+            &outcome,
+            FixedClock::try_new(NOW).unwrap().now(),
+            execution_attester().as_ref(),
+        )
+        .unwrap();
+        Outcome::ExecutionReceipt(Box::new(praetore_gateway::GatewayReceipt {
+            evidence: evidence.clone(),
+            authorization: attestation.authorization,
+            execution: attestation.execution,
+            output: outcome.output().cloned(),
+            execution_attestation: attestation,
+        }))
+    }
+
+    /// A held request and the decision `outcome` on it, signed by the test
+    /// approver.
+    fn held(outcome: HumanApprovalOutcome) -> (Evidence, Outcome) {
+        let (gateway, request, _, journal, approver_key) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            outcome,
+            &approver_key,
+        );
+        (
+            journal.entry(key).unwrap().evidence,
+            Outcome::HumanDecision(decision),
+        )
+    }
+
+    fn check(
+        records: &[Outcome],
+        evidence: &Evidence,
+        attesters: &[VerifiedPublicKey],
+    ) -> Result<HeldOutcome, OutcomeError> {
+        let text = write_outcomes(records).unwrap();
+        verify_outcomes(
+            &text,
+            std::slice::from_ref(evidence),
+            &OutcomeKeys {
+                evidence_attesters: attesters,
+                execution: &[KeyPin {
+                    key_id: "test-execution-attester-v1".into(),
+                    public_key: execution_attester_public_key(),
+                }],
+                approvers: &[KeyPin {
+                    key_id: "test-human-approver-v1".into(),
+                    public_key: VerifiedPublicKey::from_bytes(
+                        &SigningKey::from_bytes(&[34; 32]).verifying_key().to_bytes(),
+                    )
+                    .unwrap(),
+                }],
+            },
+        )
+        .map(|report| report.held[0].outcome)
+    }
+
+    fn attester() -> Vec<VerifiedPublicKey> {
+        vec![
+            EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+                .public_key()
+                .unwrap(),
+        ]
+    }
+
+    use praetore_gateway::AttestedOutcome as Signed;
+
+    #[test]
+    fn a_pre_0022_pending_receipt_and_its_close_both_verify() {
+        // Before 0022: `not_dispatched` without a reason when held, then a
+        // second `not_dispatched` with the closing reason.
+        let (evidence, reject) = held(HumanApprovalOutcome::Reject);
+        let records = [
+            receipt(&evidence, Signed::NotDispatched(None)),
+            reject,
+            receipt(
+                &evidence,
+                Signed::NotDispatched(Some(NotDispatchedReason::ApprovalRejected)),
+            ),
+        ];
+        assert_eq!(
+            check(&records, &evidence, &attester()),
+            Ok(HeldOutcome::Rejected)
+        );
+        // The same pending receipt twice is still a duplicate.
+        let twice = [records[0].clone(), records[0].clone()];
+        assert!(matches!(
+            check(&twice, &evidence, &attester()),
+            Err(OutcomeError::Duplicate { line: 1 })
+        ));
+    }
+
+    #[test]
+    fn a_pending_receipt_never_reads_as_closed_whatever_the_line_order() {
+        let (evidence, approve) = held(HumanApprovalOutcome::Approve);
+        let pending = receipt(&evidence, Signed::NotDispatched(None));
+        // Approved, only the old pending receipt: not closed.
+        assert_eq!(
+            check(&[pending.clone(), approve.clone()], &evidence, &attester()),
+            Ok(HeldOutcome::ApprovedPendingDispatch)
+        );
+        assert_eq!(
+            check(std::slice::from_ref(&pending), &evidence, &attester()),
+            Ok(HeldOutcome::Pending)
+        );
+        // Approved and executed: the same label in either order.
+        let executed = receipt(&evidence, Signed::Confirmed(json!({"ok": true})));
+        for records in [
+            vec![pending.clone(), approve.clone(), executed.clone()],
+            vec![executed.clone(), approve.clone(), pending.clone()],
+        ] {
+            assert_eq!(
+                check(&records, &evidence, &attester()),
+                Ok(HeldOutcome::ApprovedExecuted)
+            );
+        }
+    }
+
+    #[test]
+    fn closing_reasons_of_an_approved_request_need_the_approval() {
+        let (evidence, approve) = held(HumanApprovalOutcome::Approve);
+        for reason in [
+            NotDispatchedReason::DispatchFailed,
+            NotDispatchedReason::CrashRecovered,
+            NotDispatchedReason::ApprovedClaimExpired,
+        ] {
+            let close = receipt(&evidence, Signed::NotDispatched(Some(reason)));
+            assert!(
+                matches!(
+                    check(std::slice::from_ref(&close), &evidence, &attester()),
+                    Err(OutcomeError::Inconsistent { .. })
+                ),
+                "{reason:?}"
+            );
+            assert_eq!(
+                check(&[approve.clone(), close], &evidence, &attester()),
+                Ok(HeldOutcome::ApprovedNotDispatched)
+            );
+        }
+        // dispatch_refused may close a held request without a decision.
+        let refused = receipt(
+            &evidence,
+            Signed::NotDispatched(Some(NotDispatchedReason::DispatchRefused)),
+        );
+        assert_eq!(
+            check(&[refused], &evidence, &attester()),
+            Ok(HeldOutcome::NotDispatched)
+        );
+    }
+
+    #[test]
+    fn the_evidence_attester_may_be_any_of_the_pins() {
+        let (evidence, _) = held(HumanApprovalOutcome::Approve);
+        let pending = receipt(&evidence, Signed::AwaitingApproval);
+        let other = EvidenceAttesterKey::from_secret_bytes(&[13; 32])
+            .public_key()
+            .unwrap();
+        let mut both = vec![other.clone()];
+        both.extend(attester());
+        assert_eq!(
+            check(std::slice::from_ref(&pending), &evidence, &both),
+            Ok(HeldOutcome::Pending)
+        );
+        assert!(matches!(
+            check(&[pending], &evidence, &[other]),
+            Err(OutcomeError::InvalidSignature { line: 0 })
+        ));
+    }
+}

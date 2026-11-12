@@ -115,6 +115,13 @@ impl ApproverSigner {
         bool::from(public.ct_eq(candidate) | self.key.as_bytes().ct_eq(candidate))
     }
 
+    /// True when `candidate` is this approver's secret. Its public key is a
+    /// valid approver pin; its secret never is.
+    pub(crate) fn is_secret(&self, candidate: &[u8; 32]) -> bool {
+        use subtle::ConstantTimeEq;
+        bool::from(self.key.as_bytes().ct_eq(candidate))
+    }
+
     pub fn sign(
         &self,
         view: ApprovalChallengeView,

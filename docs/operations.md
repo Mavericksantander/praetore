@@ -1103,6 +1103,29 @@ any other v5 shape fails with `RECEIPT_INVALID`. Verifiers up to 0.3.3
 reject v5 and `approved_claim_expired` with `RECEIPT_INVALID`. Like
 `evidence`, this is historical verification only (`current_authorization=false`).
 
+`praetore-verify outcomes --outcomes approvals.jsonl --journal journal.jsonl
+--attester-pin attester.hex --execution-pin execution-pin.json --approver-pin
+approver-pin.json --format json` verifies many records at once: a tenant's
+human decisions, approval-expiration receipts and execution receipts (one
+signed record per line, the `approvals.jsonl` of the console's compliance
+package), against the tenant's journal chain, which it verifies first like
+`journal`. Execution and approver pins are JSON documents
+`{"schema_version":1,"key_id":...,"public_key_hex":...}` (the format of
+`approver-pin.json` from `praetore init`), repeatable up to 16 each. Each
+decision must carry the challenge derived from its journal receipt and verify
+against the approver pin its `approver_key_id` names; each expiration and
+execution receipt must verify against the execution pin its key id names; the
+evidence inside an execution receipt must be the journal's receipt for that
+request; the records of one request must agree (a dispatched held request was
+approved, `approval_rejected` has a reject decision). The command reports
+`counts`, `held` (every held request of the journal with its `outcome`) and
+`held_by_outcome`. The records are not chained: a removed record leaves no
+trace, so the output does not show that the file is complete. Pin only the
+journal tenant's approvers: the gateway ties each approver to a tenant, the
+pin format does not. An execution receipt written before migration 0023,
+whose output digest the database did not check, fails if it does not match
+its output. Historical verification only (`current_authorization=false`).
+
 A receipt that verifies is not always final: a later receipt for the same
 request can record another state. The verifier reports `details.final` and
 `details.non_final_reason`, read from the signed attestation:

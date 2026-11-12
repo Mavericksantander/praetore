@@ -168,17 +168,29 @@ fn pack_settings() -> Result<Option<PackSettings>, Box<dyn std::error::Error>> {
         Some(value) if !value.is_empty() => Some(value),
         _ => None,
     };
-    match (read(POLICY), read(PINS)) {
-        (None, None) => Ok(None),
-        (Some(policy), Some(pins)) => {
-            let pins: Vec<PathBuf> = env::split_paths(&pins)
+    // D3.1: the pins that verify approvals.jsonl; optional, and only with
+    // the two above.
+    const EXECUTION_PINS: &str = "PRAETORE_CONSOLE_EXECUTION_PIN_FILES";
+    const APPROVER_PINS: &str = "PRAETORE_CONSOLE_APPROVER_PIN_FILES";
+    let paths = |value: Option<std::ffi::OsString>| -> Vec<PathBuf> {
+        value.map_or_else(Vec::new, |value| {
+            env::split_paths(&value)
                 .filter(|path| !path.as_os_str().is_empty())
-                .collect();
-            Ok(Some(PackSettings::new(PathBuf::from(policy), pins)?))
-        }
-        _ => Err(
-            format!("el paquete de compliance necesita las dos variables: {POLICY}, {PINS}").into(),
-        ),
+                .collect()
+        })
+    };
+    let execution = read(EXECUTION_PINS);
+    let approvers = read(APPROVER_PINS);
+    match (read(POLICY), read(PINS)) {
+        (None, None) if execution.is_none() && approvers.is_none() => Ok(None),
+        (Some(policy), Some(pins)) => Ok(Some(
+            PackSettings::new(PathBuf::from(policy), paths(Some(pins)))?
+                .with_outcome_pins(paths(execution), paths(approvers))?,
+        )),
+        _ => Err(format!(
+            "el paquete de compliance necesita las dos variables {POLICY} y {PINS} (y {EXECUTION_PINS} y {APPROVER_PINS} solo junto con ellas)"
+        )
+        .into()),
     }
 }
 

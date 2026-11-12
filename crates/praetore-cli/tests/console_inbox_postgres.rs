@@ -512,13 +512,15 @@ fn pack_request() -> Request<Body> {
         .unwrap()
 }
 
-/// D3 end to end: real decisions through the gateway (one approved and
-/// executed, one rejected, one left pending), then the console's compliance
-/// package. Its journal must be byte for byte what `praetore journal-export
-/// --tenant` writes for the same database, and the unpacked package must
-/// verify with the workspace's `praetore-verify` (journal, policy digest,
-/// `--policy`, `--expected-head`) and with `sha256sum -c`. No key file of
-/// `praetore init` may appear in it.
+/// D3 and D3.1 end to end: real decisions through the gateway (one approved
+/// and executed, one rejected, one approved and not executed, one left
+/// pending), then the console's compliance package. Its journal must be byte
+/// for byte what `praetore journal-export --tenant` writes for the same
+/// database, and the unpacked package must verify with the workspace's
+/// `praetore-verify` (journal, policy digest, `--policy`, `--expected-head`,
+/// and `outcomes` over approvals.jsonl, each outcome matching its request of
+/// the journal) and with `sha256sum -c`. No key file of `praetore init` may
+/// appear in it.
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
@@ -562,11 +564,41 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         ) + "\n",
     )
     .unwrap();
+    // D3.1: the gateway's execution key (key id as `praetore run` names it)
+    // and the approver pin `praetore init` wrote, as an operator would hand
+    // them out.
+    let execution_secret: [u8; 32] = hex::decode(
+        fs::read_to_string(dir.join("execution-attester.key"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let execution_public = hex::encode(
+        ed25519_dalek::SigningKey::from_bytes(&execution_secret)
+            .verifying_key()
+            .to_bytes(),
+    );
+    let execution_pin = root.join("execution-pin.json");
+    fs::write(
+        &execution_pin,
+        serde_json::json!({
+            "schema_version": 1,
+            "key_id": format!("local-demo-{execution_public}"),
+            "public_key_hex": execution_public,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let approver_pin = root.join("approver-pin.json");
+    fs::copy(dir.join("approver-pin.json"), &approver_pin).unwrap();
 
     let gateway = Gateway::start(&dir, &admin_url, &runtime_url);
     let port = config(&dir)["port"].as_u64().unwrap() as u16;
-    held_demo(&dir, "aprobar");
-    held_demo(&dir, "rechazar");
+    let approved_id = held_demo(&dir, "aprobar");
+    let rejected_id = held_demo(&dir, "rechazar");
+    let not_run_id = held_demo(&dir, "aprobar-sin-ejecutar");
 
     let client = postgres::Client::connect(&runtime_url, postgres::NoTls).unwrap();
     let history = Arc::new(PostgresHistory::from_client(client, tenant).unwrap());
@@ -585,7 +617,10 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
             ApproverSigner::from_file("local-approver", &dir.join("approver.key")).unwrap(),
         ))
         .with_compliance_pack(CompliancePack::new(
-            PackSettings::new(dir.join("policy.json"), vec![pin.clone()]).unwrap(),
+            PackSettings::new(dir.join("policy.json"), vec![pin.clone()])
+                .unwrap()
+                .with_outcome_pins(vec![execution_pin.clone()], vec![approver_pin.clone()])
+                .unwrap(),
             history.clone(),
         )),
     );
@@ -594,12 +629,13 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         .enable_all()
         .build()
         .unwrap();
-    let (pack, missing_policy) = runtime.block_on(async {
+    let (pack, missing_policy, pending_id) = runtime.block_on(async {
         let (_, list, text) = call(&app, inbox_request()).await;
         let items = list["solicitudes"].as_array().unwrap();
-        assert_eq!(items.len(), 2, "{text}");
-        let first = items[1]["referencia"].as_str().unwrap().to_owned();
-        let second = items[0]["referencia"].as_str().unwrap().to_owned();
+        assert_eq!(items.len(), 3, "{text}");
+        let first = items[2]["referencia"].as_str().unwrap().to_owned();
+        let second = items[1]["referencia"].as_str().unwrap().to_owned();
+        let third = items[0]["referencia"].as_str().unwrap().to_owned();
         let (_, approved, text) =
             call(&app, action(&format!("/api/bandeja/{first}/aprobar"))).await;
         assert_eq!(
@@ -612,8 +648,15 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         let (_, rejected, text) =
             call(&app, action(&format!("/api/bandeja/{second}/rechazar"))).await;
         assert_eq!(rejected["situacion"], "rechazado", "{text}");
+        // Approved, never executed.
+        let (_, approved, text) =
+            call(&app, action(&format!("/api/bandeja/{third}/aprobar"))).await;
+        assert_eq!(
+            approved["situacion"], "aprobado, pendiente de ejecución",
+            "{text}"
+        );
         // One more left pending: its receipt is in the journal too.
-        held_demo(&dir, "pendiente");
+        let pending_id = held_demo(&dir, "pendiente");
 
         let response = app.clone().oneshot(pack_request()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -630,7 +673,7 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         fs::rename(root.join("policy.json.aside"), dir.join("policy.json")).unwrap();
         let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        (pack, (status, message))
+        (pack, (status, message), pending_id)
     });
     drop(runtime);
     drop(app);
@@ -664,7 +707,10 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         [
             "LEEME.txt",
             "SHA256SUMS",
+            "approvals.jsonl",
+            "approver-pin-1.json",
             "attester-pin-1.hex",
+            "execution-pin-1.json",
             "export.json",
             "journal.jsonl",
             "policy-digest.txt",
@@ -792,6 +838,135 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         .output()
         .unwrap();
     assert!(!refused.status.success());
+
+    // D3.1: every approval, rejection and execution receipt verifies, and
+    // each held request of the journal ends as it did.
+    let outcomes_args = [
+        "outcomes",
+        "--outcomes",
+        "approvals.jsonl",
+        "--journal",
+        "journal.jsonl",
+        "--attester-pin",
+        "attester-pin-1.hex",
+        "--execution-pin",
+        "execution-pin-1.json",
+        "--approver-pin",
+        "approver-pin-1.json",
+        "--format",
+        "json",
+    ];
+    let readme_folded = readme.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        readme_folded.contains(&outcomes_args[..11].join(" ")),
+        "LEEME.txt gives the outcomes command"
+    );
+    let outcomes = run(
+        Command::new(&verify)
+            .args(outcomes_args)
+            .current_dir(&pack_dir),
+        "praetore-verify outcomes",
+    );
+    let outcomes: serde_json::Value = serde_json::from_slice(&outcomes.stdout).unwrap();
+    assert_eq!(outcomes["ok"], true, "{outcomes}");
+    let details = &outcomes["details"];
+    assert_eq!(details["tenant_id"], tenant.to_string(), "{outcomes}");
+    let ends: HashMap<String, String> = details["held"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|held| {
+            (
+                held["request_id"].as_str().unwrap().to_owned(),
+                held["outcome"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    for (request, end) in [
+        (approved_id, "approved_executed"),
+        (rejected_id, "rejected"),
+        (not_run_id, "approved_pending_dispatch"),
+        (pending_id, "pending"),
+    ] {
+        assert_eq!(
+            ends.get(&request.to_string()).map(String::as_str),
+            Some(end),
+            "{request}: {outcomes}"
+        );
+    }
+    // Each held row is a request of journal.jsonl (by evidence_id), and
+    // every held request of the journal has its row.
+    let journal_text = String::from_utf8(journal.clone()).unwrap();
+    for held in details["held"].as_array().unwrap() {
+        let evidence_id = held["evidence_id"].as_str().unwrap();
+        assert!(
+            journal_text.contains(&format!("\"evidence_id\":\"{evidence_id}\"")),
+            "{evidence_id} not in journal.jsonl"
+        );
+    }
+    assert_eq!(details["held"].as_array().unwrap().len(), 4, "{outcomes}");
+    assert_eq!(details["counts"]["approvals"], 2, "{outcomes}");
+    assert_eq!(details["counts"]["rejections"], 1, "{outcomes}");
+    assert_eq!(details["counts"]["expirations"], 0, "{outcomes}");
+    assert_eq!(
+        details["counts"]["execution_receipts_by_state"]["awaiting_approval"], 4,
+        "{outcomes}"
+    );
+    assert_eq!(
+        details["counts"]["execution_receipts_by_state"]["not_dispatched"], 1,
+        "{outcomes}"
+    );
+    assert_eq!(details["unused_execution_pins"], serde_json::json!([]));
+    assert_eq!(details["unused_approver_pins"], serde_json::json!([]));
+    // export.json counts what the verifier counts.
+    for field in [
+        "approvals",
+        "rejections",
+        "expirations",
+        "execution_receipts",
+    ] {
+        assert_eq!(
+            export["outcomes"][field], details["counts"][field],
+            "{field}"
+        );
+    }
+    assert_eq!(
+        export["outcomes"]["execution_receipts_by_state"],
+        details["counts"]["execution_receipts_by_state"]
+    );
+    assert_eq!(
+        export["outcomes"]["held_by_outcome"],
+        details["held_by_outcome"]
+    );
+    let lines = fs::read_to_string(pack_dir.join("approvals.jsonl"))
+        .unwrap()
+        .lines()
+        .count() as u64;
+    assert_eq!(export["outcomes"]["records"], lines);
+    // A decision flipped after signing, or a missing approver pin: refused.
+    let approvals = fs::read_to_string(pack_dir.join("approvals.jsonl")).unwrap();
+    let flipped = approvals.replacen("\"outcome\":\"reject\"", "\"outcome\":\"approve\"", 1);
+    assert_ne!(flipped, approvals);
+    fs::write(pack_dir.join("flipped.jsonl"), flipped).unwrap();
+    let mut flipped_args = outcomes_args;
+    flipped_args[2] = "flipped.jsonl";
+    let refused = Command::new(&verify)
+        .args(flipped_args)
+        .current_dir(&pack_dir)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["code"], "OUTCOME_SIGNATURE_INVALID", "{refused}");
+    let refused = Command::new(&verify)
+        .args(&outcomes_args[..9])
+        .args(["--format", "json"])
+        .current_dir(&pack_dir)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["code"], "OUTCOME_KEY_UNKNOWN", "{refused}");
 
     // No secret of `praetore init` is in the package.
     let mut everything = Vec::new();

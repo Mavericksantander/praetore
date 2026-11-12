@@ -5,7 +5,11 @@
 //! `praetore_replay_postgres::journal_export`), the configured policy and its
 //! digest (`RecordedPolicy`, as the engine and `praetore-verify
 //! policy-digest` compute it), the attester pins, `SHA256SUMS` and a plain
-//! `LEEME.txt`.
+//! `LEEME.txt`. Since D3.1 it also carries the tenant's approval, rejection,
+//! expiration and execution receipts (`approvals.jsonl`, read in the same
+//! snapshot as the journal) and the execution and approver pins that verify
+//! them; every record is verified with `praetore_receipt::outcomes`, the
+//! code `praetore-verify outcomes` runs, before anything is archived.
 //!
 //! Every piece is read and checked before anything is archived; a missing or
 //! unreadable piece means no package at all. Only public keys are written:
@@ -15,7 +19,13 @@
 //! signatures).
 
 use crate::ApproverSigner;
-use praetore_core::{VerifiedPublicKey, policy::RecordedPolicy};
+use praetore_core::{
+    VerifiedPublicKey, journal_chain::verify_journal_receipts, policy::RecordedPolicy,
+};
+use praetore_receipt::outcomes::{
+    KeyPin, MAX_OUTCOME_PINS, Outcome, OutcomeError, OutcomeKeys, OutcomeReport, verify_outcomes,
+    write_outcomes,
+};
 use praetore_replay_postgres::journal_export::{TenantExport, parse_attester_pin};
 use sha2::{Digest, Sha256};
 use std::{
@@ -38,6 +48,8 @@ pub const POLICY_FILE: &str = "policy.json";
 pub const POLICY_DIGEST_FILE: &str = "policy-digest.txt";
 pub const EXPORT_FILE: &str = "export.json";
 pub const SUMS_FILE: &str = "SHA256SUMS";
+/// D3.1: the approval, rejection, expiration and execution receipts.
+pub const OUTCOMES_FILE: &str = "approvals.jsonl";
 
 /// Most attester pins, as `praetore journal-export`.
 pub const MAX_ATTESTER_PINS: usize = 16;
@@ -49,11 +61,54 @@ pub fn pin_file_name(index: usize) -> String {
     format!("attester-pin-{}.hex", index + 1)
 }
 
-/// Where the policy and the attester pins are read from, at each download.
+/// `execution-pin-1.json`, ... or `approver-pin-1.json`, ... in
+/// configuration order.
+pub fn key_pin_file_name(role: PinRole, index: usize) -> String {
+    match role {
+        PinRole::Execution => format!("execution-pin-{}.json", index + 1),
+        PinRole::Approver => format!("approver-pin-{}.json", index + 1),
+    }
+}
+
+/// The two kinds of key pin `approvals.jsonl` is verified with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinRole {
+    /// Gateway execution keys: execution and expiration receipts.
+    Execution,
+    /// Human approver keys: approve and reject decisions.
+    Approver,
+}
+
+impl PinRole {
+    pub fn variable(self) -> &'static str {
+        match self {
+            Self::Execution => "PRAETORE_CONSOLE_EXECUTION_PIN_FILES",
+            Self::Approver => "PRAETORE_CONSOLE_APPROVER_PIN_FILES",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Execution => "clave pública de ejecución del gateway",
+            Self::Approver => "clave pública de aprobador",
+        }
+    }
+
+    fn log_name(self) -> &'static str {
+        match self {
+            Self::Execution => "execution",
+            Self::Approver => "approver",
+        }
+    }
+}
+
+/// Where the policy and the pins are read from, at each download.
 #[derive(Debug, Clone)]
 pub struct PackSettings {
     policy_file: PathBuf,
     attester_pin_files: Vec<PathBuf>,
+    execution_pin_files: Vec<PathBuf>,
+    approver_pin_files: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -68,7 +123,7 @@ impl std::fmt::Display for PackConfigError {
             Self::NoPins => f.write_str("el paquete de compliance necesita al menos un pin"),
             Self::TooManyPins => write!(
                 f,
-                "el paquete de compliance acepta a lo más {MAX_ATTESTER_PINS} pins"
+                "el paquete de compliance acepta a lo más {MAX_ATTESTER_PINS} pins de cada tipo"
             ),
         }
     }
@@ -90,15 +145,46 @@ impl PackSettings {
         Ok(Self {
             policy_file,
             attester_pin_files,
+            execution_pin_files: Vec::new(),
+            approver_pin_files: Vec::new(),
         })
+    }
+
+    /// D3.1: the execution and approver pins (0 to 16 of each) that verify
+    /// `approvals.jsonl`. Without them, a tenant with any approval or
+    /// execution receipt yields no package.
+    pub fn with_outcome_pins(
+        mut self,
+        execution_pin_files: Vec<PathBuf>,
+        approver_pin_files: Vec<PathBuf>,
+    ) -> Result<Self, PackConfigError> {
+        if execution_pin_files.len() > MAX_OUTCOME_PINS
+            || approver_pin_files.len() > MAX_OUTCOME_PINS
+        {
+            return Err(PackConfigError::TooManyPins);
+        }
+        self.execution_pin_files = execution_pin_files;
+        self.approver_pin_files = approver_pin_files;
+        Ok(self)
+    }
+
+    fn key_pin_files(&self, role: PinRole) -> &[PathBuf] {
+        match role {
+            PinRole::Execution => &self.execution_pin_files,
+            PinRole::Approver => &self.approver_pin_files,
+        }
     }
 }
 
-/// The tenant's chain, exported in one read-only snapshot.
+/// The tenant's chain and its approval and execution records, exported in
+/// one read-only snapshot.
 pub trait JournalExportStore: Send + Sync + 'static {
     fn tenant_id(&self) -> Uuid;
     /// `Err` carries the detail for the console's log, never for the page.
-    fn export_tenant(&self, attesters: &[VerifiedPublicKey]) -> Result<TenantExport, String>;
+    fn export_tenant(
+        &self,
+        attesters: &[VerifiedPublicKey],
+    ) -> Result<(TenantExport, Vec<Outcome>), String>;
 }
 
 pub struct CompliancePack {
@@ -129,6 +215,28 @@ pub enum PackError {
     Busy,
     Journal,
     Archive,
+    /// D3.1: an execution or approver pin file could not be read, is not a
+    /// pin, or repeats a key or key id.
+    KeyPins {
+        role: PinRole,
+    },
+    /// An execution pin is the approver's key, or an approver pin is the
+    /// approver's secret.
+    KeyPinIsApproverKey {
+        role: PinRole,
+    },
+    /// An execution or approver pin verified no record of `approvals.jsonl`.
+    KeyPinUnused {
+        role: PinRole,
+        index: usize,
+        more: bool,
+    },
+    /// A record names a key id no configured pin has.
+    OutcomeKeyMissing,
+    /// A record does not verify, is not bound to its journal request, or
+    /// contradicts another record of the same request.
+    Outcomes,
+    OutcomesTooLarge,
 }
 
 impl PackError {
@@ -137,6 +245,25 @@ impl PackError {
             Self::PinUnused { index, more } => format!(
                 "La {} clave configurada como clave pública del atestador (en el orden de PRAETORE_CONSOLE_ATTESTER_PIN_FILES) no verifica ningún registro: sobra o es un archivo equivocado.{} No se generó ningún paquete.",
                 ordinal(index),
+                if more { " Puede haber más claves en la misma situación." } else { "" }
+            )
+            .into(),
+            Self::KeyPins { role } => format!(
+                "No se pudieron leer las claves configuradas en {}: cada archivo debe ser un pin JSON con key_id y public_key_hex, sin repetir clave ni key_id. No se generó ningún paquete.",
+                role.variable()
+            )
+            .into(),
+            Self::KeyPinIsApproverKey { role: PinRole::Execution } => {
+                "Una de las claves configuradas como clave pública de ejecución del gateway es la clave del aprobador. No se generó ningún paquete.".into()
+            }
+            Self::KeyPinIsApproverKey { role: PinRole::Approver } => {
+                "Una de las claves configuradas como clave pública de aprobador es la clave privada del aprobador de esta consola. No se generó ningún paquete.".into()
+            }
+            Self::KeyPinUnused { role, index, more } => format!(
+                "La {} clave configurada como {} (en el orden de {}) no verifica ningún recibo de aprobación o de ejecución: sobra o es un archivo equivocado.{} No se generó ningún paquete.",
+                ordinal(index),
+                role.noun(),
+                role.variable(),
                 if more { " Puede haber más claves en la misma situación." } else { "" }
             )
             .into(),
@@ -155,7 +282,19 @@ impl PackError {
             Self::PinIsApproverKey => {
                 "Una de las claves configuradas como clave pública del atestador es la clave del aprobador. No se generó ningún paquete."
             }
-            Self::PinUnused { .. } => unreachable!("message() words it"),
+            Self::PinUnused { .. }
+            | Self::KeyPins { .. }
+            | Self::KeyPinIsApproverKey { .. }
+            | Self::KeyPinUnused { .. } => unreachable!("message() words it"),
+            Self::OutcomeKeyMissing => {
+                "Un recibo de aprobación o de ejecución está firmado con una clave que no está configurada: agrégala en PRAETORE_CONSOLE_EXECUTION_PIN_FILES o PRAETORE_CONSOLE_APPROVER_PIN_FILES. No se generó ningún paquete."
+            }
+            Self::Outcomes => {
+                "Un recibo de aprobación, rechazo, vencimiento o ejecución no verifica con las claves configuradas, no corresponde a su solicitud del registro o contradice otro recibo de la misma solicitud. No se generó ningún paquete."
+            }
+            Self::OutcomesTooLarge => {
+                "Los recibos de aprobación y de ejecución son demasiado grandes para un paquete. No se generó ningún paquete."
+            }
             Self::Busy => "Ya se está armando un paquete. Espera a que termine.",
             Self::Journal => {
                 "No se pudo exportar el registro firmado: la base no respondió, no hay registros, el registro es demasiado grande para una exportación, o alguna firma no corresponde a las claves del atestador configuradas. No se generó ningún paquete."
@@ -173,6 +312,12 @@ impl PackError {
             Self::Busy => "busy",
             Self::Journal => "journal_export",
             Self::Archive => "archive",
+            Self::KeyPins { .. } => "key_pins",
+            Self::KeyPinIsApproverKey { .. } => "key_pin_is_approver_key",
+            Self::KeyPinUnused { .. } => "key_pin_unused",
+            Self::OutcomeKeyMissing => "outcome_key_missing",
+            Self::Outcomes => "outcomes",
+            Self::OutcomesTooLarge => "outcomes_too_large",
         }
     }
 }
@@ -186,6 +331,16 @@ pub struct PackContents {
     pub policy_json: String,
     pub policy: RecordedPolicy,
     pub pins: Vec<VerifiedPublicKey>,
+    pub outcomes: PackOutcomes,
+}
+
+/// D3.1: `approvals.jsonl`, verified, and the pins that verified it.
+#[derive(Debug, Clone, Default)]
+pub struct PackOutcomes {
+    pub text: String,
+    pub report: OutcomeReport,
+    pub execution_pins: Vec<KeyPin>,
+    pub approver_pins: Vec<KeyPin>,
 }
 
 pub struct PackFile {
@@ -233,7 +388,9 @@ fn collect(
         }
         pins.push(pin);
     }
-    let export = pack.store.export_tenant(&pins).map_err(|detail| {
+    let execution_pins = read_key_pins(pack, PinRole::Execution, approver)?;
+    let approver_pins = read_key_pins(pack, PinRole::Approver, approver)?;
+    let (export, records) = pack.store.export_tenant(&pins).map_err(|detail| {
         tracing::warn!(%detail, "compliance package: journal export failed");
         PackError::Journal
     })?;
@@ -252,6 +409,54 @@ fn collect(
             more: export.unused_attesters.len() > 1,
         });
     }
+    // D3.1: every record is checked against the receipts of the chain just
+    // exported, with the code `praetore-verify outcomes` runs.
+    let (_, receipts) = verify_journal_receipts(&export.text, &pins, None).map_err(|error| {
+        tracing::warn!(%error, "compliance package: exported journal does not verify");
+        PackError::Journal
+    })?;
+    let text = write_outcomes(&records).map_err(|_| PackError::OutcomesTooLarge)?;
+    let report = verify_outcomes(
+        &text,
+        &receipts,
+        &OutcomeKeys {
+            evidence_attesters: &pins,
+            execution: &execution_pins,
+            approvers: &approver_pins,
+        },
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            code = error.code(),
+            %error,
+            "compliance package: approval or execution record does not verify"
+        );
+        match error {
+            OutcomeError::UnknownKey { .. } => PackError::OutcomeKeyMissing,
+            OutcomeError::TooLarge => PackError::OutcomesTooLarge,
+            _ => PackError::Outcomes,
+        }
+    })?;
+    for (role, unused) in [
+        (PinRole::Execution, &report.unused_execution_pins),
+        (PinRole::Approver, &report.unused_approver_pins),
+    ] {
+        if let Some(&index) = unused.first() {
+            let path = &pack.settings.key_pin_files(role)[index];
+            tracing::warn!(
+                role = role.log_name(),
+                position = index + 1,
+                path = %path.display(),
+                unused = unused.len(),
+                "compliance package: key pin verified no record"
+            );
+            return Err(PackError::KeyPinUnused {
+                role,
+                index,
+                more: unused.len() > 1,
+            });
+        }
+    }
     Ok(PackContents {
         tenant_id: pack.store.tenant_id(),
         generated_at: now,
@@ -259,7 +464,44 @@ fn collect(
         policy_json,
         policy,
         pins,
+        outcomes: PackOutcomes {
+            text,
+            report,
+            execution_pins,
+            approver_pins,
+        },
     })
+}
+
+/// Execution or approver pins, parsed. Only public keys pass: an execution
+/// pin that is the approver's key, or an approver pin that is its secret, is
+/// refused; any other wrong 32 bytes verify no record and are refused later.
+fn read_key_pins(
+    pack: &CompliancePack,
+    role: PinRole,
+    approver: Option<&ApproverSigner>,
+) -> Result<Vec<KeyPin>, PackError> {
+    let mut pins: Vec<KeyPin> = Vec::new();
+    for path in pack.settings.key_pin_files(role) {
+        let text = read_limited(path, MAX_PIN_BYTES).map_err(|()| PackError::KeyPins { role })?;
+        let pin = KeyPin::from_json(&text).map_err(|_| PackError::KeyPins { role })?;
+        let bytes = pin.public_key.as_bytes();
+        let is_approver_key = approver.is_some_and(|signer| match role {
+            PinRole::Execution => signer.is_key_material(&bytes),
+            PinRole::Approver => signer.is_secret(&bytes),
+        });
+        if is_approver_key {
+            return Err(PackError::KeyPinIsApproverKey { role });
+        }
+        if pins
+            .iter()
+            .any(|other| other.key_id == pin.key_id || other.public_key == pin.public_key)
+        {
+            return Err(PackError::KeyPins { role });
+        }
+        pins.push(pin);
+    }
+    Ok(pins)
 }
 
 fn read_limited(path: &Path, max: u64) -> Result<String, ()> {
@@ -292,6 +534,7 @@ pub fn pack_files(contents: &PackContents) -> Result<Vec<PackFile>, PackError> {
             readme(contents, &generated_at, &pin_names).into_bytes(),
         ),
         file(JOURNAL_FILE, contents.export.text.clone().into_bytes()),
+        file(OUTCOMES_FILE, contents.outcomes.text.clone().into_bytes()),
         file(POLICY_FILE, contents.policy_json.clone().into_bytes()),
         file(
             POLICY_DIGEST_FILE,
@@ -304,6 +547,21 @@ pub fn pack_files(contents: &PackContents) -> Result<Vec<PackFile>, PackError> {
             format!("{}\n", hex::encode(pin.as_bytes())).into_bytes(),
         ));
     }
+    let key_pin_names = |role: PinRole, pins: &[KeyPin]| -> Vec<String> {
+        (0..pins.len())
+            .map(|index| key_pin_file_name(role, index))
+            .collect()
+    };
+    let execution_names = key_pin_names(PinRole::Execution, &contents.outcomes.execution_pins);
+    let approver_names = key_pin_names(PinRole::Approver, &contents.outcomes.approver_pins);
+    for (name, pin) in execution_names
+        .iter()
+        .zip(&contents.outcomes.execution_pins)
+        .chain(approver_names.iter().zip(&contents.outcomes.approver_pins))
+    {
+        files.push(file(name, pin.to_json().into_bytes()));
+    }
+    let report = &contents.outcomes.report;
     let export = serde_json::json!({
         "format": "praetore-compliance-pack",
         "format_version": 1,
@@ -329,6 +587,22 @@ pub fn pack_files(contents: &PackContents) -> Result<Vec<PackFile>, PackError> {
             "digest": contents.policy.digest(),
         },
         "attester_pins": pin_names,
+        "outcomes": {
+            "file": OUTCOMES_FILE,
+            "records": report.counts.approvals
+                + report.counts.rejections
+                + report.counts.expirations
+                + report.counts.execution_receipts,
+            "approvals": report.counts.approvals,
+            "rejections": report.counts.rejections,
+            "expirations": report.counts.expirations,
+            "execution_receipts": report.counts.execution_receipts,
+            "execution_receipts_by_state": report.counts.by_execution,
+            "held_requests": report.held.len(),
+            "held_by_outcome": held_by_outcome(report),
+        },
+        "execution_pins": execution_names,
+        "approver_pins": approver_names,
     });
     let mut export = serde_json::to_string_pretty(&export).map_err(|_| PackError::Archive)?;
     export.push('\n');
@@ -432,6 +706,7 @@ fn readme(contents: &PackContents, generated_at: &str, pin_names: &[String]) -> 
                  tenía registros de almacenamiento."
             .to_owned(),
     };
+    let outcomes = outcomes_readme(contents, pin_names);
     let database_complete = if contents.export.database_head.is_some() {
         "\n\nComo journal.jsonl referencia la cadena de la base, pida aparte el head\n\
          de esa cadena por el mismo tipo de canal y páselo con\n\
@@ -459,7 +734,7 @@ journal.jsonl
     firmado por el atestador: lo que la política resolvió para cada
     solicitud (permitir, denegar o retener para aprobación). No trae la
     aprobación o el rechazo de una persona ni el resultado de la ejecución:
-    esos recibos no van en este paquete.
+    esos recibos van en approvals.jsonl.
 
 policy.json
     El archivo de política configurado en la consola, copiado tal cual.
@@ -474,9 +749,12 @@ policy-digest.txt
     Cada una verificó al menos un recibo de journal.jsonl o un registro de
     la cadena de la base, que no va en el paquete.
 
+{outcomes_contents}
+
 export.json
     Los datos de la exportación: tenant, hora, cantidad de líneas, head
-    de la cadena y digest de la política.
+    de la cadena, digest de la política y cuántos registros de cada tipo
+    trae approvals.jsonl.
 
 SHA256SUMS
     El SHA-256 de cada uno de los archivos anteriores.
@@ -497,17 +775,19 @@ No hace falta confiar en la consola que lo generó.
    una firma: quien cambie un archivo puede recalcular SHA256SUMS.
 
 2. Construya praetore-verify desde main, en un commit que incluya este
-   paquete de compliance (P-002 D3), o desde un release posterior a v0.3.3:
+   paquete de compliance con approvals.jsonl (P-002 D3.1), o desde un
+   release posterior a v0.3.3:
        git clone {repository}
        cd praetore
        cargo build --release --locked -p praetore-verify
    El programa queda en target/release/praetore-verify.
    Use praetore-verify construido desde main. El praetore-verify de v0.3.3
    también acepta este journal.jsonl, pero no muestra tenant_id ni avisa
-   head_not_anchored, que el paso 3 usa. Además, v0.3.3 rechaza con
-   RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y
-   las razones approved_claim_expired y approval_rejected; esos recibos no
-   van en este paquete.
+   head_not_anchored, que el paso 3 usa, y no tiene el comando outcomes del
+   paso 5. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de
+   ejecución schema v5 (awaiting_approval) y las razones
+   approved_claim_expired y approval_rejected, que approvals.jsonl puede
+   traer.
 
 3. El registro y sus firmas:
        praetore-verify journal --journal journal.jsonl {pins}
@@ -530,6 +810,8 @@ No hace falta confiar en la consola que lo generó.
    parte del registro se decidió con otra política (por ejemplo, antes de un
    cambio de política), este comando falla aunque el registro esté íntegro.
 
+{outcomes_step}
+
 
 ¿ESTÁ COMPLETO?
 ---------------
@@ -548,7 +830,9 @@ Los archivos de pin vienen de la configuración de la consola: los eligió el
 operador. Con solo esos archivos, la verificación muestra que el registro es
 coherente con esas claves, no que lo firmó el atestador que usted espera.
 Obtenga las claves públicas del atestador por otro canal y compárelas con
-estos archivos.
+estos archivos. Lo mismo vale para las claves de ejecución y de aprobación:
+compare su public_key_hex y su key_id con los que usted obtenga por otro
+canal.
 
 
 LO QUE ESTE PAQUETE NO PRUEBA
@@ -561,9 +845,13 @@ LO QUE ESTE PAQUETE NO PRUEBA
 - No prueba que el registro esté completo: sin un head anclado fuera del
   control del operador, un subconjunto de los recibos (truncado,
   reordenado o reencadenado) también verifica.
-- No muestra si una solicitud retenida fue aprobada, rechazada, venció o
-  se ejecutó: journal.jsonl trae solo la decisión de la política. Los
-  recibos de aprobación y de ejecución no van en este paquete.
+- No prueba que approvals.jsonl esté completo. Sus registros no van
+  encadenados: uno quitado no deja rastro en journal.jsonl, así que una
+  solicitud aprobada o ejecutada puede aparecer como pending o
+  approved_pending_dispatch.
+- Una solicitud retenida que aparece como pending puede seguir pendiente o
+  haber vencido sin que el gateway lo haya registrado todavía: el gateway
+  firma el vencimiento cuando lo detecta, no cuando ocurre.
 - No prueba que una acción permitida o aprobada tuvo efecto fuera del
   gateway: los recibos muestran lo que el gateway decidió y registró.
 - No prueba que el gateway usó policy.json: es el archivo configurado en la
@@ -574,7 +862,140 @@ LO QUE ESTE PAQUETE NO PRUEBA
 ",
         pin_list = pin_names.join("\n"),
         database = database.replace('\n', "\n  "),
+        outcomes_contents = outcomes.contents,
+        outcomes_step = outcomes.step,
     )
+}
+
+struct OutcomesReadme {
+    contents: String,
+    step: String,
+}
+
+/// The `approvals.jsonl` parts of `LEEME.txt`: what the file holds and how
+/// to verify it (step 5).
+fn outcomes_readme(contents: &PackContents, attester_names: &[String]) -> OutcomesReadme {
+    let outcomes = &contents.outcomes;
+    let counts = &outcomes.report.counts;
+    let records =
+        counts.approvals + counts.rejections + counts.expirations + counts.execution_receipts;
+    let held = outcomes.report.held.len();
+    let mut description = if records == 0 {
+        "approvals.jsonl\n    \
+         Los recibos de aprobación, rechazo, vencimiento y ejecución de este\n    \
+         tenant. Este tenant no tiene ninguno: el archivo está vacío."
+            .to_owned()
+    } else {
+        format!(
+            "approvals.jsonl\n    \
+             Los recibos de aprobación, rechazo, vencimiento y ejecución de este\n    \
+             tenant, uno por línea, tal como los guardó el gateway, leídos en el\n    \
+             mismo momento que journal.jsonl. Tiene {records} registros: {} \
+             aprobaciones,\n    {} rechazos, {} vencimientos y {} recibos de ejecución. Cada\n    \
+             registro nombra el agent_id y el request_id de su solicitud en\n    \
+             journal.jsonl. Los recibos de ejecución traen la salida del adaptador\n    \
+             de cada acción ejecutada, porque su firma la cubre: revísela antes de\n    \
+             compartir el paquete.",
+            counts.approvals, counts.rejections, counts.expirations, counts.execution_receipts
+        )
+    };
+    let execution_names: Vec<String> = (0..outcomes.execution_pins.len())
+        .map(|index| key_pin_file_name(PinRole::Execution, index))
+        .collect();
+    let approver_names: Vec<String> = (0..outcomes.approver_pins.len())
+        .map(|index| key_pin_file_name(PinRole::Approver, index))
+        .collect();
+    if !execution_names.is_empty() {
+        description.push_str(&format!(
+            "\n\n{}\n    \
+             Las claves públicas de ejecución del gateway configuradas en la\n    \
+             consola, cada una con su key_id. Firman los recibos de ejecución y\n    \
+             de vencimiento. Cada una verificó al menos un registro de\n    \
+             approvals.jsonl.",
+            execution_names.join("\n")
+        ));
+    }
+    if !approver_names.is_empty() {
+        description.push_str(&format!(
+            "\n\n{}\n    \
+             Las claves públicas de los aprobadores configuradas en la consola,\n    \
+             cada una con su key_id. Firman las decisiones de aprobar o rechazar.\n    \
+             Cada una verificó al menos una decisión de approvals.jsonl. El\n    \
+             gateway ata cada aprobador a un tenant; el archivo de pin no: compruebe\n    \
+             por otro canal que estas claves son de aprobadores de este tenant.",
+            approver_names.join("\n")
+        ));
+    }
+    let flags = attester_names
+        .iter()
+        .map(|name| format!("--attester-pin {name}"))
+        .chain(
+            execution_names
+                .iter()
+                .map(|name| format!("--execution-pin {name}")),
+        )
+        .chain(
+            approver_names
+                .iter()
+                .map(|name| format!("--approver-pin {name}")),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let breakdown = held_by_outcome(&outcomes.report)
+        .iter()
+        .map(|(outcome, count)| format!("{count} {outcome}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let held_line = match held {
+        0 => "Esta exportación no tiene solicitudes retenidas.".to_owned(),
+        1 => format!("Esta exportación tiene 1 solicitud retenida: {breakdown}."),
+        _ => format!("Esta exportación tiene {held} solicitudes retenidas: {breakdown}."),
+    };
+    let step = format!(
+        "\
+5. Cómo terminó cada solicitud:
+       praetore-verify outcomes --outcomes approvals.jsonl --journal journal.jsonl {flags}
+   Primero verifica journal.jsonl como el paso 3. Después comprueba cada
+   registro de approvals.jsonl: la firma de cada decisión con la clave del
+   aprobador que nombra y contra la solicitud de journal.jsonl que aprueba o
+   rechaza; la firma de cada recibo de vencimiento y de ejecución con la
+   clave de ejecución; que la evidencia dentro de cada recibo de ejecución
+   es el recibo de journal.jsonl de la misma solicitud; y que los registros
+   de una solicitud no se contradicen (por ejemplo, una ejecución sin
+   aprobación). Un solo registro que falle hace fallar el comando.
+   La salida trae counts (cuántos registros hay de cada tipo) y held: una
+   fila por cada solicitud retenida de journal.jsonl, en su orden, con
+   agent_id, request_id, evidence_id y outcome:
+       pending                    sin decisión ni vencimiento registrados
+       rejected                   una persona la rechazó
+       expired                    venció sin decisión (recibo de vencimiento)
+       approved_pending_dispatch  aprobada, sin ejecución registrada
+       approved_executed          aprobada y ejecutada
+       approved_failed            aprobada; la ejecución falló
+       approved_outcome_unknown   aprobada; el resultado no se conoce aún
+       approved_not_dispatched    aprobada y cerrada sin ejecutarse
+                                  (vea not_dispatched_reason)
+       not_dispatched             cerrada sin ejecutarse y sin decisión
+   Para cruzar una solicitud retenida de journal.jsonl con su desenlace,
+   busque su request_id (o su evidence_id) en held. Con --format json la
+   salida es un solo objeto JSON; held está en details.
+   {held_line}
+   Acepta --expected-head como el paso 3."
+    );
+    OutcomesReadme {
+        contents: description,
+        step,
+    }
+}
+
+/// Held requests by outcome code, as `praetore-verify outcomes` reports
+/// them (`held_by_outcome`).
+fn held_by_outcome(report: &OutcomeReport) -> std::collections::BTreeMap<&'static str, u64> {
+    let mut counts = std::collections::BTreeMap::new();
+    for held in &report.held {
+        *counts.entry(held.outcome.as_str()).or_default() += 1;
+    }
+    counts
 }
 
 /// "primera", "segunda", ... for a position counted from zero, up to
