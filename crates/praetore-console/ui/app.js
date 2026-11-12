@@ -74,7 +74,7 @@ async function cargar() {
     return;
   }
   if (response.status === 401) {
-    estado.textContent = "No se pudo abrir la sesión local. Vuelve a cargar la página.";
+    estado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
     return;
   }
   if (!response.ok) {
@@ -127,6 +127,254 @@ async function abrir(numero) {
   detalle.scrollIntoView({ block: "nearest" });
 }
 
+const bandejaEstado = document.getElementById("bandeja-estado");
+const bandejaAviso = document.getElementById("bandeja-aviso");
+const solicitudes = document.getElementById("solicitudes");
+
+function linea(texto) {
+  const span = document.createElement("span");
+  span.textContent = texto;
+  return span;
+}
+
+async function actuar(referencia, accion) {
+  let response;
+  try {
+    response = await fetch("/api/bandeja/" + encodeURIComponent(referencia) + "/" + accion, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "x-praetore-consola": "1" },
+    });
+  } catch (_error) {
+    return { situacion: "sin cambios", mensaje: "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.", puede_ejecutar: accion === "ejecutar" };
+  }
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_error) {
+    data = null;
+  }
+  if (!response.ok || !data || typeof data.mensaje !== "string") {
+    return {
+      situacion: "sin cambios",
+      mensaje: data && typeof data.mensaje === "string" ? data.mensaje : "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.",
+      puede_ejecutar: false,
+    };
+  }
+  return data;
+}
+
+function pintarSolicitud(solicitud) {
+  const item = document.createElement("li");
+  item.className = "solicitud";
+  const situacion = document.createElement("strong");
+  situacion.textContent = solicitud.situacion;
+  const resultado = document.createElement("p");
+  resultado.className = "resultado";
+  resultado.setAttribute("role", "status");
+  const acciones = document.createElement("div");
+  acciones.className = "acciones";
+
+  function boton(texto, clase, alHacerClic) {
+    const nuevo = document.createElement("button");
+    nuevo.type = "button";
+    if (clase) nuevo.className = clase;
+    nuevo.textContent = texto;
+    nuevo.addEventListener("click", alHacerClic);
+    return nuevo;
+  }
+
+  function bloquear() {
+    for (const cada of acciones.querySelectorAll("button")) cada.disabled = true;
+  }
+
+  function mostrar(data) {
+    if (data.situacion !== "sin cambios") situacion.textContent = data.situacion;
+    resultado.textContent = data.mensaje;
+    acciones.replaceChildren();
+    if (data.puede_ejecutar) acciones.append(botonEjecutar("Reintentar ejecución"));
+  }
+
+  async function ejecutar() {
+    bloquear();
+    resultado.textContent = "Ejecutando…";
+    mostrar(await actuar(solicitud.referencia, "ejecutar"));
+  }
+
+  function botonEjecutar(texto) {
+    return boton(texto, "aprobar", ejecutar);
+  }
+
+  // First click: the summary to confirm, in the same card. Second click:
+  // the one signed decision.
+  function confirmar(pregunta, textoConfirmar, alConfirmar) {
+    acciones.replaceChildren();
+    resultado.textContent = "";
+    confirmacion.replaceChildren(resumen(pregunta));
+    acciones.append(
+      boton(textoConfirmar, "aprobar", alConfirmar),
+      boton("Cancelar", "", () => {
+        confirmacion.replaceChildren();
+        pintarDecision();
+      }),
+    );
+  }
+
+  // One line per fact and per parameter, as in the card: nothing is joined
+  // into a sentence where a comma or a colon could be read two ways.
+  function resumen(pregunta) {
+    const caja = document.createElement("div");
+    caja.className = "confirmacion";
+    const titulo = document.createElement("strong");
+    titulo.textContent = pregunta;
+    caja.append(
+      titulo,
+      linea(solicitud.agente),
+      linea("Quiere hacer: " + solicitud.queria),
+      linea("Sobre: " + solicitud.sobre),
+      listaParametros(),
+      linea("Vale hasta: " + solicitud.vale_hasta + " (" + solicitud.queda + ")"),
+    );
+    return caja;
+  }
+
+  async function aprobarYEjecutar() {
+    confirmacion.replaceChildren();
+    bloquear();
+    resultado.textContent = "Aprobando…";
+    const aprobado = await actuar(solicitud.referencia, "aprobar");
+    mostrar(aprobado);
+    if (!aprobado.puede_ejecutar) return;
+    await ejecutar();
+  }
+
+  async function rechazar() {
+    confirmacion.replaceChildren();
+    bloquear();
+    resultado.textContent = "Rechazando…";
+    mostrar(await actuar(solicitud.referencia, "rechazar"));
+  }
+
+  function pintarDecision() {
+    acciones.replaceChildren();
+    if (solicitud.puede_aprobar) {
+      acciones.append(boton("Aprobar y ejecutar", "aprobar", () =>
+        confirmar("¿Aprobar y ejecutar?", "Confirmar: aprobar y ejecutar", aprobarYEjecutar)));
+    }
+    if (solicitud.puede_rechazar) {
+      acciones.append(boton("Rechazar", "", () =>
+        confirmar("¿Rechazar? Es final.", "Confirmar: rechazar", rechazar)));
+    }
+    if (solicitud.puede_ejecutar) acciones.append(botonEjecutar("Ejecutar"));
+  }
+
+  // Texts come quoted from the console; a list shows each element apart.
+  function listaParametros() {
+    const parametros = document.createElement("dl");
+    parametros.className = "parametros";
+    if (!solicitud.parametros_visibles) return parametros;
+    if (!solicitud.parametros.length) parametros.append(linea("Sin parámetros"));
+    for (const parametro of solicitud.parametros) {
+      const clave = document.createElement("dt");
+      clave.textContent = parametro.clave;
+      const valor = document.createElement("dd");
+      if (Array.isArray(parametro.lista)) {
+        // A list never looks like a text: it says it is a list and how long,
+        // and each element carries its own mark "[n]".
+        valor.className = "es-lista";
+        const cabecera = document.createElement("span");
+        cabecera.className = "marca";
+        cabecera.textContent = parametro.lista.length
+          ? "lista de " + parametro.lista.length + (parametro.lista.length === 1 ? " elemento:" : " elementos:")
+          : "lista vacía []";
+        valor.append(cabecera);
+        parametro.lista.forEach((elemento, indice) => {
+          const fila = document.createElement("div");
+          fila.className = "elemento";
+          const marca = document.createElement("span");
+          marca.className = "marca";
+          marca.textContent = "[" + (indice + 1) + "] ";
+          fila.append(marca, document.createTextNode(elemento));
+          valor.append(fila);
+        });
+      } else {
+        valor.textContent = parametro.valor;
+      }
+      parametros.append(clave, valor);
+    }
+    return parametros;
+  }
+
+  const confirmacion = document.createElement("div");
+  const nota = document.createElement("p");
+  nota.className = "nota";
+  if (solicitud.nota) nota.textContent = solicitud.nota;
+
+  pintarDecision();
+  item.append(
+    situacion,
+    linea(solicitud.agente),
+    linea("Quiere hacer: " + solicitud.queria),
+    linea("Sobre: " + solicitud.sobre),
+    listaParametros(),
+    linea("Vale hasta: " + solicitud.vale_hasta + " (" + solicitud.queda + ")"),
+    linea("Pedida: " + solicitud.pedida),
+    nota,
+    confirmacion,
+    acciones,
+    resultado,
+  );
+  return item;
+}
+
+async function cargarBandeja() {
+  bandejaEstado.textContent = "Leyendo la bandeja…";
+  let response;
+  try {
+    response = await fetch("/api/bandeja", { credentials: "same-origin" });
+  } catch (_error) {
+    bandejaEstado.textContent = "No se pudo leer la bandeja.";
+    return;
+  }
+  let data = null;
+  try {
+    data = await response.json();
+  } catch (_error) {
+    data = null;
+  }
+  if (response.status === 401) {
+    solicitudes.replaceChildren();
+    bandejaEstado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
+    return;
+  }
+  if (!response.ok || !data) {
+    solicitudes.replaceChildren();
+    bandejaEstado.textContent = data && typeof data.mensaje === "string" ? data.mensaje : "No se pudo leer la bandeja.";
+    return;
+  }
+  bandejaAviso.textContent = data.aviso;
+  solicitudes.replaceChildren();
+  const partes = [];
+  partes.push(data.solicitudes.length === 1 ? "1 solicitud espera" : data.solicitudes.length + " solicitudes esperan");
+  if (data.vencidas) partes.push(data.vencidas === 1 ? "1 venció sin decisión" : data.vencidas + " vencieron sin decisión");
+  if (data.hay_mas) partes.push("hay más esperando: se muestran las 200 más recientes");
+  if (data.ilegibles) partes.push(data.ilegibles === 1 ? "1 no se puede leer y no se ofrece" : data.ilegibles + " no se pueden leer y no se ofrecen");
+  bandejaEstado.textContent = partes.join(" · ");
+  if (!data.solicitudes.length) {
+    const vacio = document.createElement("li");
+    vacio.className = "vacio";
+    vacio.textContent = "Nada espera una decisión.";
+    solicitudes.append(vacio);
+    return;
+  }
+  for (const solicitud of data.solicitudes) solicitudes.append(pintarSolicitud(solicitud));
+}
+
+document.getElementById("recargar-bandeja").addEventListener("click", () => {
+  cargarBandeja();
+  cargar();
+});
+
 document.getElementById("filtros").addEventListener("submit", (event) => {
   event.preventDefault();
   pagina = 1;
@@ -145,3 +393,4 @@ document.getElementById("siguiente").addEventListener("click", () => {
   }
 });
 cargar();
+cargarBandeja();

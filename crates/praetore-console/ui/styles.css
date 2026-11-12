@@ -66,6 +66,25 @@ h2 { margin-bottom: 20px; font-size: 28px; letter-spacing: -.02em; }
 .recibo { width: 100%; display: grid; gap: 2px; padding: 16px 18px; border-radius: var(--radius); background: var(--surface); box-shadow: 0 0 0 1px var(--line); text-align: left; }
 .recibo strong { font-size: 16px; font-weight: 600; }
 .recibo span { color: var(--muted); font-size: 14px; }
+.bandeja { margin-bottom: 72px; }
+.titulo-seccion { margin: 0; font-size: clamp(32px, 5vw, 44px); letter-spacing: -.035em; }
+.solicitud { display: grid; gap: 4px; padding: 18px 20px; border-radius: var(--radius); background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
+.solicitud strong { font-size: 16px; font-weight: 600; }
+.solicitud span { color: var(--muted); font-size: 14px; }
+.solicitud .acciones { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+.solicitud .resultado { margin: 8px 0 0; color: var(--text); font-size: 14px; }
+.solicitud button.aprobar { background: var(--text); color: var(--bg); }
+.parametros { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 6px 0; font-size: 14px; }
+.parametros dt { color: var(--muted); overflow-wrap: anywhere; }
+.parametros dd { margin: 0; overflow-wrap: anywhere; }
+.parametros .es-lista .marca { color: var(--muted); font-variant-numeric: tabular-nums; }
+.parametros .es-lista .elemento { padding-left: 12px; }
+/* Agent text keeps every space: "a  b" must not look like "a b", nor a
+   leading space vanish. Covers the card and the confirmation inside it. */
+.solicitud span, .parametros dt, .parametros dd, .parametros .elemento { white-space: pre-wrap; }
+.confirmacion { display: grid; gap: 4px; margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line, #ccc); border-radius: 6px; }
+.solicitud .nota { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+.solicitud .nota:empty { display: none; }
 .vacio { padding: 48px 8px; color: var(--muted); text-align: center; }
 
 .detail-panel { margin-top: 24px; padding: clamp(20px, 3vw, 36px); border-radius: var(--radius); background: var(--surface); box-shadow: 0 0 0 1px var(--line); }

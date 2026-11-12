@@ -442,6 +442,13 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
           done
+      - name: Console approvals inbox against PostgreSQL and praetore run (P-002 D2)
+        run: |
+          set -euo pipefail
+          name=postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway
+          output="$(cargo test -p praetore-cli --locked --test console_inbox_postgres -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
       - name: G1 safety ingestion against PostgreSQL (binary, flood, sender check, export, verify)
         run: |
           set -euo pipefail

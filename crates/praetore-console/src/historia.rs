@@ -254,6 +254,84 @@ pub fn readable_time(moment: OffsetDateTime) -> String {
     )
 }
 
+/// Text the agent chose, made safe to read: control and bidirectional
+/// override characters are shown as `\u{...}` instead of acting on the
+/// page (a target like `informe\u{202e}fdp.exe` cannot disguise itself).
+pub fn plain_text(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        push_inert(&mut safe, character);
+    }
+    safe
+}
+
+/// Like [`plain_text`], and a backslash is shown doubled, so text that
+/// spells out an escape (`\u{202e}`) never looks like the escaped character.
+/// Used in the approvals inbox, which must tell apart structure, types and
+/// hidden characters of what is signed.
+pub fn unambiguous_text(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\\' {
+            safe.push_str("\\\\");
+        } else {
+            push_inert(&mut safe, character);
+        }
+    }
+    safe
+}
+
+/// Agent text in quotes, with `"` and `\\` escaped and hidden characters
+/// shown as `\u{xxxx}`: a value "sin objetivo indicado" never looks like the
+/// console's own placeholder, and a trailing space shows.
+pub fn quoted_text(value: &str) -> String {
+    format!("\"{}\"", unambiguous_text(value).replace('"', "\\\""))
+}
+
+/// Characters that could hide or disguise text are shown as `\u{xxxx}`,
+/// by Unicode general category rather than by a closed list: control
+/// (Cc), format (Cf: bidi, zero-width, tags, BOM, soft hyphen...), line and
+/// paragraph separators (Zl, Zp), private use (Co), unassigned (Cn), and
+/// every space separator (Zs) other than U+0020 (no-break space, U+3000...).
+/// Also variation selectors, the combining grapheme joiner, the Hangul
+/// fillers and the blank Braille pattern, which render as nothing.
+pub(crate) fn is_hidden(character: char) -> bool {
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    let by_category = match character.general_category() {
+        GeneralCategory::Control
+        | GeneralCategory::Format
+        | GeneralCategory::LineSeparator
+        | GeneralCategory::ParagraphSeparator
+        | GeneralCategory::PrivateUse
+        | GeneralCategory::Unassigned
+        | GeneralCategory::Surrogate => true,
+        GeneralCategory::SpaceSeparator => character != ' ',
+        _ => false,
+    };
+    by_category
+        || matches!(
+            character,
+            '\u{fe00}'..='\u{fe0f}'
+                | '\u{e0100}'..='\u{e01ef}'
+                | '\u{180b}'..='\u{180d}'
+                | '\u{180f}'
+                | '\u{034f}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{3164}'
+                | '\u{ffa0}'
+                | '\u{2800}'
+        )
+}
+
+fn push_inert(safe: &mut String, character: char) {
+    if is_hidden(character) {
+        safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
+    } else {
+        safe.push(character);
+    }
+}
+
 pub fn visible_target(facts: &ReceiptFacts) -> String {
     if !facts.legible {
         return "no se muestra".to_owned();
@@ -262,6 +340,7 @@ pub fn visible_target(facts: &ReceiptFacts) -> String {
         .target
         .clone()
         .filter(|target| !target.is_empty())
+        .map(|target| plain_text(&target))
         .unwrap_or_else(|| "sin objetivo indicado".to_owned())
 }
 
@@ -269,7 +348,7 @@ pub fn visible_wanted(facts: &ReceiptFacts) -> String {
     if !facts.legible || facts.wanted.is_empty() {
         "no se muestra".to_owned()
     } else {
-        facts.wanted.clone()
+        plain_text(&facts.wanted)
     }
 }
 
@@ -474,6 +553,16 @@ mod tests {
             wanted: "escribir_archivo".into(),
             target: Some("informe-trimestral".into()),
         }
+    }
+
+    #[test]
+    fn agent_text_cannot_hide_behind_bidi_or_control_characters() {
+        assert_eq!(
+            plain_text("informe\u{202e}fdp.exe"),
+            "informe\\u{202e}fdp.exe"
+        );
+        assert_eq!(plain_text("a\nb\u{0007}"), "a\\u{000a}b\\u{0007}");
+        assert_eq!(plain_text("informe-trimestral"), "informe-trimestral");
     }
 
     #[test]

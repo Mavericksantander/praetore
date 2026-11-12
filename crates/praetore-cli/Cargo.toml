@@ -42,7 +42,11 @@ uuid = "1.18"
 rustix = { version = "1.1", default-features = false, features = ["std", "fs", "net", "process"] }
 
 [dev-dependencies]
+axum = "0.8"
+# D2 end-to-end test: the console inbox against `praetore run`.
+praetore-console = { path = "../praetore-console" }
 praetore-safety-client = { path = "../praetore-safety-client" }
+tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # D-B1 test: RLIMIT_FSIZE and SIGXFSZ for a child `praetore run`.

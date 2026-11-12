@@ -206,6 +206,57 @@
   `GatewayReceipt::is_final()` and `non_final_reason()`; Python:
   `verify_final_gateway_receipt` and `gateway_receipt_finality`. The signed
   format and the result of signature verification are unchanged.
+- **Approvals inbox in `praetore-console` (P-002 D2).** With
+  `PRAETORE_CONSOLE_GATEWAY_URL` (a loopback `http://IP:port`),
+  `PRAETORE_CONSOLE_APPROVER_KEY_ID`, `PRAETORE_CONSOLE_APPROVER_KEY_FILE`
+  and `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE` (owner-only files, the
+  `approver.key` / `approver-api.token` formats of `praetore init`) the
+  console lists the requests held for approval and lets the operator
+  approve, reject, or run the single dispatch of an approved request. It
+  reads the journal through `PRAETORE_CONSOLE_DATABASE_URL`, which in the
+  tested setup is the gateway's runtime role: the reads run in
+  transactions the console opens read only (per session, not by
+  privilege), under the tenant's row-level security. Each request shows
+  who, what (quoted), on what (quoted), until when, and its parameters
+  with keys sorted and quoted: texts quoted, numbers as written, each list
+  element apart with its own mark, and characters escaped by Unicode
+  category (Cc, Cf, Zl, Zp, Co, Cn, every Zs other than U+0020, plus
+  variation selectors, U+034F, the Hangul fillers and U+2800). The inbox
+  tells apart structure, types and invisible characters; it does not flag
+  look-alike characters from different scripts (homoglyphs). A request whose parameters do not fit (more than 20 lines, 200
+  characters per value or 2 levels) or could be read two ways (a key with
+  a dot, keys that repeat once normalized, text not in Unicode NFC) can
+  only be rejected in the console, also server side, and approved with
+  `praetore approve`. Approve and reject take a confirmation in the same
+  card that repeats the parameters and the deadline. The console signs on
+  this computer, as `praetore approve` does, only after it checks that the
+  gateway challenge is the one rebuilt from the journal evidence it read;
+  it checks that evidence's integrity hash, not its attester signature. The
+  gateway verifies, records and dispatches. The browser gets opaque
+  references, never keys, journal ids or raw evidence. Actions need the
+  console's own `Origin` and an `x-praetore-consola` header besides the
+  session cookie. A partial set of the four variables is a startup error;
+  none of them leaves the console without the inbox (history only). The
+  gateway API is unchanged. Limit: a process running as the same operating
+  system user as the console can read `approver.key` (and the token file)
+  directly and sign without the console; real separation requires running
+  the agent as another user (`crates/praetore-console/README.md`).
+- **`praetore-console` sessions are per run and open through a single-use
+  link (P-002 D2).** The session secret is new on every start and is no
+  longer read from or written to a file (`PRAETORE_CONSOLE_SESSION_FILE` is
+  ignored, with a warning); a cookie from an earlier run stops working. At
+  startup the console writes `http://<bind>/?abrir=<code>` to stderr; under
+  systemd that is the journal, readable by whoever reads it. The link works
+  once and for at most five minutes. A new link is issued only by the
+  operator (Enter in the console's terminal, when stdin and stderr are a
+  terminal and the console is in its foreground, or a restart); asking for
+  the page never issues one. SIGTTIN is ignored, so a console sent to the
+  background keeps serving instead of being stopped by the system. `/` alone
+  no longer sets the cookie, and responses carry `Referrer-Policy:
+  no-referrer`. Every request must carry the
+  console's own `Host` (DNS rebinding). Agent-chosen text in the history
+  is shown with the same characters escaped. Action: open the printed
+  link after each start.
 
 ### Changed
 

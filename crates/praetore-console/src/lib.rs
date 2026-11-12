@@ -1,12 +1,19 @@
 //! Local operator console for a PRÆTORE journal.
 //!
 //! A separate surface from `praetore-observe`: loopback, a session file the
-//! page never shows, and receipts retold in plain language. It does not
-//! approve, dispatch, or export a compliance package.
+//! page never shows, and receipts retold in plain language (D1). With an
+//! approver configured it also shows the approvals inbox (D2): the console
+//! signs the operator's decision on this computer, as `praetore approve`
+//! does, and the gateway verifies, records and dispatches it. It does not
+//! export a compliance package.
 
+mod aprobador;
+mod bandeja;
 mod historia;
 mod lectura;
 mod sesion;
+#[cfg(test)]
+mod tests_bandeja;
 
 use axum::{
     Json, Router,
@@ -15,8 +22,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use bandeja::{PendingFacts, References, readable_deadline, time_left};
 use historia::{
     ListRequest, NOTICE, RawQuery, ReceiptFacts, agent_label, page_window, prepare_detail_query,
     prepare_query, readable_time, situation, story, visible_target, visible_wanted,
@@ -25,6 +33,11 @@ use serde::Serialize;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use uuid::Uuid;
 
+pub use aprobador::{
+    ActOutcome, ApprovalGateway, ApproverConfigError, ApproverSigner, GatewayReply,
+    HttpApprovalGateway, parse_gateway_address, read_token_file,
+};
+pub use bandeja::{PendingKind, PendingRef};
 pub use historia::{NamesError, parse_agent_names};
 pub use lectura::PostgresHistory;
 pub use sesion::LocalSession;
@@ -37,6 +50,58 @@ pub struct ConsoleState {
     store: Arc<dyn HistoryStore>,
     session: LocalSession,
     names: HashMap<Uuid, String>,
+    inbox: Option<Inbox>,
+    address: SocketAddr,
+    /// `Host` values the console answers to (DNS rebinding).
+    hosts: Vec<String>,
+    /// `http://host:port` values a mutating request may come from.
+    origins: Vec<String>,
+    /// Code of the opening link printed in the terminal: single use, five
+    /// minutes at most. The session cookie is handed out only to a request
+    /// that carries it, so another local process that just asks for the
+    /// page gets no cookie.
+    opener: sesion::Opener,
+    /// Where opening links go: the console's stderr by default.
+    printer: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+const DEFAULT_ADDRESS: &str = "127.0.0.1:8090";
+
+/// D2. Present only when the console has an approver key, its gateway token
+/// and the gateway address.
+pub struct Inbox {
+    store: Arc<dyn InboxStore>,
+    gateway: Arc<dyn ApprovalGateway>,
+    signer: Arc<ApproverSigner>,
+    references: References,
+}
+
+impl Inbox {
+    pub fn new(
+        store: Arc<dyn InboxStore>,
+        gateway: Arc<dyn ApprovalGateway>,
+        signer: ApproverSigner,
+    ) -> Self {
+        Self {
+            store,
+            gateway,
+            signer: Arc::new(signer),
+            references: References::default(),
+        }
+    }
+}
+
+pub trait InboxStore: Send + Sync + 'static {
+    fn pending(&self) -> Result<InboxPage, HistoryError>;
+}
+
+pub struct InboxPage {
+    pub items: Vec<PendingFacts>,
+    /// Pending rows whose receipt does not check out. Never offered.
+    pub unreadable: u32,
+    /// More rows wait than one read returns.
+    pub truncated: bool,
+    pub agents: Vec<Uuid>,
 }
 
 impl std::fmt::Debug for ConsoleState {
@@ -90,11 +155,73 @@ impl ConsoleState {
         session: LocalSession,
         names: HashMap<Uuid, String>,
     ) -> Self {
-        Self {
+        let mut state = Self {
             store,
             session,
             names,
+            inbox: None,
+            address: DEFAULT_ADDRESS.parse().expect("fixed address"),
+            hosts: Vec::new(),
+            origins: Vec::new(),
+            opener: sesion::Opener::new(sesion::MAX_OPENING_TTL),
+            printer: Arc::new(|link: &str| {
+                eprintln!(
+                    "Abre la consola en este computador con este enlace (vale una vez, 5 minutos):\n  {link}"
+                );
+            }),
+        };
+        state.set_address(state.address);
+        state
+    }
+
+    /// The console's own address: the page and its actions are answered
+    /// only under it (and `localhost` on the same port for 127.0.0.1).
+    pub fn with_address(mut self, address: SocketAddr) -> Self {
+        self.set_address(address);
+        self
+    }
+
+    fn set_address(&mut self, address: SocketAddr) {
+        self.address = address;
+        self.hosts = vec![address.to_string()];
+        if address.ip() == std::net::IpAddr::from([127, 0, 0, 1]) {
+            self.hosts.push(format!("localhost:{}", address.port()));
         }
+        self.origins = self
+            .hosts
+            .iter()
+            .map(|host| format!("http://{host}"))
+            .collect();
+    }
+
+    /// At most five minutes; shorter in tests.
+    pub fn with_opening_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.opener = sesion::Opener::new(ttl);
+        self
+    }
+
+    /// Where opening links are written. Default: stderr, which under systemd
+    /// ends up in the journal.
+    pub fn with_link_printer(mut self, printer: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.printer = Arc::new(printer);
+        self
+    }
+
+    /// Issues a new single-use opening link, writes it to the printer and
+    /// returns it. Any earlier link stops working.
+    pub fn issue_opening_link(&self) -> Option<String> {
+        let link = self.link_for(self.opener.issue()?);
+        (self.printer)(&link);
+        Some(link)
+    }
+
+    fn link_for(&self, code: String) -> String {
+        format!("http://{}/?abrir={code}", self.address)
+    }
+
+    pub fn with_inbox(mut self, inbox: Inbox) -> Self {
+        self.inbox = Some(inbox);
+        self
     }
 
     pub fn router(self) -> Router {
@@ -106,6 +233,10 @@ impl ConsoleState {
         let api = Router::new()
             .route("/historial", get(list_receipts))
             .route("/historial/{numero}", get(receipt_detail))
+            .route("/bandeja", get(list_inbox))
+            .route("/bandeja/{referencia}/aprobar", post(approve))
+            .route("/bandeja/{referencia}/rechazar", post(reject))
+            .route("/bandeja/{referencia}/ejecutar", post(execute))
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_session,
@@ -115,6 +246,10 @@ impl ConsoleState {
             .route("/app.js", get(app_js))
             .route("/styles.css", get(app_css))
             .nest("/api", api)
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_own_host,
+            ))
             .with_state(state)
     }
 }
@@ -128,14 +263,61 @@ async fn require_session(
         .headers()
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok());
-    if state.session.accepts(cookie) {
+    if !state.session.accepts(cookie) {
+        return api_message(
+            StatusCode::UNAUTHORIZED,
+            "Hay que abrir esta página en este computador.",
+        );
+    }
+    next.run(request).await
+}
+
+/// Refuses a request whose `Host` is not the console's own address: a page
+/// whose name was re-pointed at 127.0.0.1 (DNS rebinding) reads nothing.
+async fn require_own_host(
+    State(state): State<Arc<ConsoleState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut values = request.headers().get_all(header::HOST).iter();
+    let host = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    };
+    if host.is_some_and(|host| state.hosts.iter().any(|own| own == host)) {
         next.run(request).await
     } else {
         api_message(
-            StatusCode::UNAUTHORIZED,
-            "Hay que abrir esta página en este computador.",
+            StatusCode::MISDIRECTED_REQUEST,
+            "Esta consola no atiende ese nombre.",
         )
     }
+}
+
+/// Header the console page sends on every action. A page from another
+/// origin cannot add it without a preflight the console never answers.
+pub const ACTION_HEADER: &str = "x-praetore-consola";
+
+/// A mutation must come from the console's own page: exact `Origin`, the
+/// action header, and, when the browser sends it, `Sec-Fetch-Site:
+/// same-origin`. The cookie alone is not enough: another local port is the
+/// same site for `SameSite=Strict`.
+fn same_page(state: &ConsoleState, headers: &HeaderMap) -> bool {
+    let single = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value.to_str().ok(),
+            _ => None,
+        }
+    };
+    let origin_ok = single(header::ORIGIN.as_str())
+        .is_some_and(|origin| state.origins.iter().any(|allowed| allowed == origin));
+    let marker_ok = single(ACTION_HEADER) == Some("1");
+    let fetch_site_ok = match headers.get("sec-fetch-site") {
+        None => true,
+        Some(value) => value.as_bytes() == b"same-origin",
+    };
+    origin_ok && marker_ok && fetch_site_ok
 }
 
 async fn list_receipts(
@@ -215,6 +397,172 @@ async fn receipt_detail(
     )
 }
 
+const INBOX_OFF: &str = "La bandeja de aprobaciones no está configurada en esta consola.";
+const INBOX_NOTICE: &str = "Cada solicitud muestra sus parámetros: la firma los cubre. El primer clic muestra el resumen y el segundo firma una sola decisión. «Aprobar y ejecutar» registra la aprobación y pide la única ejecución; si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.";
+
+async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
+    let Some(inbox) = &state.inbox else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
+    };
+    let store = Arc::clone(&inbox.store);
+    let page = match tokio::task::spawn_blocking(move || store.pending()).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) => return storage_error(error),
+        Err(_) => return storage_error(HistoryError::Unavailable),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut solicitudes = Vec::with_capacity(page.items.len());
+    let mut vencidas = 0u32;
+    for facts in &page.items {
+        // A window that closed is not offered: the gateway would refuse it,
+        // and it records the expiry when it next sees the request.
+        if facts.expires_at <= now {
+            vencidas += 1;
+            continue;
+        }
+        let awaiting = facts.kind == PendingKind::AwaitingApproval;
+        let Some(referencia) = inbox.references.reference_for(facts) else {
+            return storage_error(HistoryError::Unavailable);
+        };
+        solicitudes.push(InboxItemView {
+            referencia,
+            situacion: facts.kind.phrase(),
+            pedida: readable_time(facts.created_at),
+            agente: agent_label(facts.key.agent_id, &state.names, &page.agents),
+            queria: if facts.wanted.is_empty() {
+                "no se muestra".to_owned()
+            } else {
+                historia::quoted_text(&facts.wanted)
+            },
+            sobre: facts
+                .target
+                .as_deref()
+                .map(historia::quoted_text)
+                .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
+            vale_hasta: readable_deadline(facts.expires_at),
+            queda: time_left(facts.expires_at, now),
+            parametros: facts
+                .parameters
+                .iter()
+                .flatten()
+                .map(|parameter| match &parameter.value {
+                    bandeja::ParameterValue::Text(valor) => ParameterView {
+                        clave: parameter.key.clone(),
+                        valor: Some(valor.clone()),
+                        lista: None,
+                    },
+                    bandeja::ParameterValue::List(lista) => ParameterView {
+                        clave: parameter.key.clone(),
+                        valor: None,
+                        lista: Some(lista.clone()),
+                    },
+                })
+                .collect(),
+            parametros_visibles: facts.parameters.is_some(),
+            puede_aprobar: awaiting && facts.parameters.is_some(),
+            puede_rechazar: awaiting,
+            puede_ejecutar: facts.kind == PendingKind::ApprovedPendingExecution,
+            nota: (awaiting && facts.parameters.is_none()).then_some(PARAMETERS_TOO_BIG),
+        });
+    }
+    api_json(
+        StatusCode::OK,
+        InboxView {
+            aviso: INBOX_NOTICE,
+            solicitudes,
+            vencidas,
+            ilegibles: page.unreadable,
+            hay_mas: page.truncated,
+        },
+    )
+}
+
+async fn approve(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    let what = Act::Decide(praetore_gateway::HumanApprovalOutcome::Approve);
+    act(state, headers, referencia, what).await
+}
+
+async fn reject(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    let what = Act::Decide(praetore_gateway::HumanApprovalOutcome::Reject);
+    act(state, headers, referencia, what).await
+}
+
+async fn execute(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    act(state, headers, referencia, Act::Dispatch).await
+}
+
+#[derive(Clone, Copy)]
+enum Act {
+    Decide(praetore_gateway::HumanApprovalOutcome),
+    Dispatch,
+}
+
+async fn act(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    Path(referencia): Path<String>,
+    what: Act,
+) -> Response {
+    let Some(inbox) = &state.inbox else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
+    };
+    if !same_page(&state, &headers) {
+        return api_message(
+            StatusCode::FORBIDDEN,
+            "Esta acción solo se acepta desde la página de la consola.",
+        );
+    }
+    let Some(pending) = inbox.references.resolve(&referencia) else {
+        return api_message(
+            StatusCode::NOT_FOUND,
+            "Esa solicitud ya no está en la bandeja. Vuelve a cargarla.",
+        );
+    };
+    if matches!(
+        what,
+        Act::Decide(praetore_gateway::HumanApprovalOutcome::Approve)
+    ) && !pending.approvable
+    {
+        return api_json(
+            StatusCode::OK,
+            ActOutcome {
+                situacion: "sin cambios",
+                mensaje: PARAMETERS_TOO_BIG,
+                puede_ejecutar: false,
+            },
+        );
+    }
+    let gateway = Arc::clone(&inbox.gateway);
+    let signer = Arc::clone(&inbox.signer);
+    let result = tokio::task::spawn_blocking(move || match what {
+        Act::Decide(outcome) => aprobador::decide(gateway.as_ref(), &signer, &pending, outcome),
+        Act::Dispatch => aprobador::dispatch(gateway.as_ref(), &pending),
+    })
+    .await;
+    match result {
+        Ok(outcome) => api_json(StatusCode::OK, outcome),
+        Err(_) => {
+            tracing::error!(failure = "gateway_worker", "console action failed");
+            api_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.",
+            )
+        }
+    }
+}
+
 async fn read_page(
     state: Arc<ConsoleState>,
     query: ListRequest,
@@ -263,8 +611,29 @@ fn storage_error(error: HistoryError) -> Response {
     )
 }
 
-async fn index(State(state): State<Arc<ConsoleState>>) -> Response {
-    let mut response = static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+#[derive(serde::Deserialize)]
+struct OpenQuery {
+    abrir: Option<String>,
+}
+
+/// The page itself holds no secret. The session cookie is set only when the
+/// request carries a live opening code, which is then consumed; the browser
+/// is sent to `/` so the code leaves the address bar. Asking for the page
+/// never issues a link: only the operator does (see `issue_opening_link`).
+async fn index(
+    State(state): State<Arc<ConsoleState>>,
+    query: Result<Query<OpenQuery>, QueryRejection>,
+) -> Response {
+    let offered = query.ok().and_then(|Query(query)| query.abrir);
+    let Some(offered) = offered else {
+        return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+    };
+    if !state.opener.redeem(&offered) {
+        tracing::warn!(failure = "opening_code", "console opening link refused");
+        return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+    }
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    set_security_headers(response.headers_mut());
     if let Ok(cookie) = HeaderValue::from_str(&state.session.cookie_header()) {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
@@ -331,11 +700,61 @@ struct DetailView {
     relato: &'static str,
 }
 
+#[derive(Serialize)]
+struct InboxView {
+    aviso: &'static str,
+    solicitudes: Vec<InboxItemView>,
+    /// Pending in the journal, window already closed: not offered.
+    vencidas: u32,
+    /// Pending in the journal, receipt does not check out: not offered.
+    ilegibles: u32,
+    /// Older requests wait beyond what one read shows.
+    hay_mas: bool,
+}
+
+#[derive(Serialize)]
+struct InboxItemView {
+    referencia: String,
+    situacion: &'static str,
+    pedida: String,
+    agente: String,
+    queria: String,
+    sobre: String,
+    vale_hasta: String,
+    queda: String,
+    /// `clave: valor` lines, keys sorted. Empty with `parametros_visibles`
+    /// false when they do not fit the inbox.
+    parametros: Vec<ParameterView>,
+    parametros_visibles: bool,
+    puede_aprobar: bool,
+    puede_rechazar: bool,
+    puede_ejecutar: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nota: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct ParameterView {
+    clave: String,
+    /// A text (quoted), a number, `sí`/`no`, `(nulo)` or `(objeto vacío)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valor: Option<String>,
+    /// A list, each element apart (possibly empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lista: Option<Vec<String>>,
+}
+
+const PARAMETERS_TOO_BIG: &str = "Los parámetros de esta solicitud no se pueden mostrar aquí sin ambigüedad (más de 20 líneas, valores de más de 200 caracteres, más de 2 niveles, claves con punto o repetidas, o texto Unicode no normalizado). Aquí solo se puede rechazar; para revisarla completa y aprobarla usa praetore approve en la terminal.";
+
 fn set_security_headers(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -428,6 +847,7 @@ mod tests {
 
     fn authed(uri: &str) -> Request<Body> {
         Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
             .uri(uri)
             .header(
                 header::COOKIE,
@@ -491,14 +911,51 @@ mod tests {
 
     #[tokio::test]
     async fn the_page_does_not_ask_for_a_token_and_sets_a_local_cookie() {
-        let (app, _) = app(Vec::new());
-        let response = app
+        let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
+        let state = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            session(),
+            HashMap::new(),
+        )
+        .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
+        let link = state.issue_opening_link().unwrap();
+        assert_eq!(*printed.lock().unwrap(), vec![link.clone()]);
+        let code = link.split_once("?abrir=").unwrap().1.to_owned();
+        assert!(link.starts_with("http://127.0.0.1:8090/?abrir="));
+        assert!(Uuid::parse_str(&code).is_err());
+        assert!(!code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let app = state.router();
+        let page = |uri: String| {
+            Request::builder()
+                .header(header::HOST, "127.0.0.1:8090")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Asking for the page is not enough to get the session, and the
+        // live link is not replaced.
+        for uri in [
+            "/".to_owned(),
+            "/?abrir=otro".to_owned(),
+            format!("/?abrir={code}x"),
+        ] {
+            let plain = app.clone().oneshot(page(uri.clone())).await.unwrap();
+            assert_eq!(plain.status(), StatusCode::OK, "{uri}");
+            assert!(plain.headers().get(header::SET_COOKIE).is_none(), "{uri}");
+        }
+        assert_eq!(printed.lock().unwrap().len(), 1);
+        let opened = app
             .clone()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(page(format!("/?abrir={code}")))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
+        assert_eq!(opened.status(), StatusCode::SEE_OTHER);
+        assert_eq!(opened.headers().get(header::LOCATION).unwrap(), "/");
+        let cookie = opened
             .headers()
             .get(header::SET_COOKIE)
             .unwrap()
@@ -509,9 +966,19 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         let secret = hex::encode([0x11; 32]);
         assert!(cookie.contains(&secret));
+        // The link works once.
+        let again = app
+            .clone()
+            .oneshot(page(format!("/?abrir={code}")))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        assert!(again.headers().get(header::SET_COOKIE).is_none());
+        let response = app.clone().oneshot(page("/".to_owned())).await.unwrap();
         let html = body_text(response).await;
         assert!(!html.contains(&secret));
         assert!(html.contains("Historial"));
+        assert!(html.contains("Bandeja"));
         assert!(html.contains(NOTICE));
         assert!(html.contains("pendiente de aprobación"));
         assert!(html.contains("aprobado, pendiente de ejecución"));
@@ -520,11 +987,11 @@ mod tests {
         assert!(!html.contains("RFC"));
         assert!(!html.contains("UUID"));
         assert!(!html.contains("awaiting_approval"));
-        assert!(!html.to_lowercase().contains("aprobar"));
         assert!(!html.contains("descargar"));
         let script = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/app.js")
                     .body(Body::empty())
                     .unwrap(),
@@ -533,9 +1000,70 @@ mod tests {
             .unwrap();
         let script = body_text(script).await;
         assert!(!script.contains("innerHTML"));
-        assert!(!script.contains("POST"));
+        assert!(script.contains(ACTION_HEADER));
+        assert!(!script.contains("localStorage"));
         assert!(!script.contains(&secret));
         assert!(!script.contains(sesion::COOKIE_NAME));
+    }
+
+    #[tokio::test]
+    async fn an_expired_link_is_refused_and_a_restart_drops_the_old_cookie() {
+        let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
+        let first = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .with_opening_ttl(std::time::Duration::ZERO)
+        .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
+        let expired = first.issue_opening_link().unwrap();
+        let first = Arc::new(first);
+        let app = ConsoleState::router_from(Arc::clone(&first));
+        let request = |uri: &str, cookie: Option<&str>| {
+            let mut builder = Request::builder()
+                .header(header::HOST, "127.0.0.1:8090")
+                .uri(uri);
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let path = expired.split_once("8090").unwrap().1.to_owned();
+        let refused = app.clone().oneshot(request(&path, None)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::OK);
+        assert!(refused.headers().get(header::SET_COOKIE).is_none());
+        // Asking for the page never issues a link; nothing reaches the page.
+        let plain = app.clone().oneshot(request("/", None)).await.unwrap();
+        assert!(plain.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(printed.lock().unwrap().len(), 1);
+        assert!(!body_text(refused).await.contains("abrir="));
+
+        // A cookie from one run does not open the next one.
+        let old_cookie = format!("{}={}", sesion::COOKIE_NAME, first.session.cookie_value());
+        let ok = app
+            .clone()
+            .oneshot(request("/api/historial", Some(&old_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let restarted = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .router();
+        let stale = restarted
+            .oneshot(request("/api/historial", Some(&old_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -684,6 +1212,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(header::HOST, "127.0.0.1:8090")
                         .method(method)
                         .uri(uri)
                         .header(
@@ -711,6 +1240,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
                     .body(Body::empty())
                     .unwrap(),
@@ -725,6 +1255,7 @@ mod tests {
         let wrong = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
                     .header(
                         header::COOKIE,
