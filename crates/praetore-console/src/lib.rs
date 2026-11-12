@@ -56,11 +56,13 @@ pub struct ConsoleState {
     hosts: Vec<String>,
     /// `http://host:port` values a mutating request may come from.
     origins: Vec<String>,
-    /// Code of the opening link printed in the terminal. The session cookie
-    /// is handed out only to a request that carries it, so another local
-    /// process that just asks for the page gets no cookie. `None` fails
-    /// closed: nobody can open the console.
-    opener: Option<String>,
+    /// Code of the opening link printed in the terminal: single use, five
+    /// minutes at most. The session cookie is handed out only to a request
+    /// that carries it, so another local process that just asks for the
+    /// page gets no cookie.
+    opener: sesion::Opener,
+    /// Where opening links go: the console's stderr by default.
+    printer: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:8090";
@@ -161,7 +163,12 @@ impl ConsoleState {
             address: DEFAULT_ADDRESS.parse().expect("fixed address"),
             hosts: Vec::new(),
             origins: Vec::new(),
-            opener: bandeja::random_code(),
+            opener: sesion::Opener::new(sesion::MAX_OPENING_TTL),
+            printer: Arc::new(|link: &str| {
+                eprintln!(
+                    "Abre la consola en este computador con este enlace (vale una vez, 5 minutos):\n  {link}"
+                );
+            }),
         };
         state.set_address(state.address);
         state
@@ -187,11 +194,37 @@ impl ConsoleState {
             .collect();
     }
 
-    /// The link the operator opens; print it only to the operator's terminal.
-    pub fn opening_link(&self) -> Option<String> {
-        self.opener
-            .as_ref()
-            .map(|code| format!("http://{}/?abrir={code}", self.address))
+    /// At most five minutes; shorter in tests.
+    pub fn with_opening_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.opener = sesion::Opener::new(ttl);
+        self
+    }
+
+    /// Where opening links are written. Default: stderr, which under systemd
+    /// ends up in the journal.
+    pub fn with_link_printer(mut self, printer: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.printer = Arc::new(printer);
+        self
+    }
+
+    /// Issues a new single-use opening link, writes it to the printer and
+    /// returns it. Any earlier link stops working.
+    pub fn issue_opening_link(&self) -> Option<String> {
+        let link = self.link_for(self.opener.issue()?);
+        (self.printer)(&link);
+        Some(link)
+    }
+
+    fn link_for(&self, code: String) -> String {
+        format!("http://{}/?abrir={code}", self.address)
+    }
+
+    /// Someone without a session asked for the page: if no link is live,
+    /// print a new one to the terminal (never to the requester).
+    fn reissue_link(&self) {
+        if let Some(code) = self.opener.reissue_if_needed() {
+            (self.printer)(&self.link_for(code));
+        }
     }
 
     pub fn with_inbox(mut self, inbox: Inbox) -> Self {
@@ -373,7 +406,7 @@ async fn receipt_detail(
 }
 
 const INBOX_OFF: &str = "La bandeja de aprobaciones no está configurada en esta consola.";
-const INBOX_NOTICE: &str = "«Aprobar y ejecutar» registra la aprobación y pide la única ejecución. Si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.";
+const INBOX_NOTICE: &str = "Cada solicitud muestra sus parámetros: la firma los cubre. El primer clic muestra el resumen y el segundo firma una sola decisión. «Aprobar y ejecutar» registra la aprobación y pide la única ejecución; si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.";
 
 async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
     let Some(inbox) = &state.inbox else {
@@ -395,6 +428,7 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             vencidas += 1;
             continue;
         }
+        let awaiting = facts.kind == PendingKind::AwaitingApproval;
         let Some(referencia) = inbox.references.reference_for(facts) else {
             return storage_error(HistoryError::Unavailable);
         };
@@ -415,8 +449,20 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
                 .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
             vale_hasta: readable_deadline(facts.expires_at),
             queda: time_left(facts.expires_at, now),
-            puede_decidir: facts.kind == PendingKind::AwaitingApproval,
+            parametros: facts
+                .parameters
+                .iter()
+                .flatten()
+                .map(|(clave, valor)| ParameterView {
+                    clave: clave.clone(),
+                    valor: valor.clone(),
+                })
+                .collect(),
+            parametros_visibles: facts.parameters.is_some(),
+            puede_aprobar: awaiting && facts.parameters.is_some(),
+            puede_rechazar: awaiting,
             puede_ejecutar: facts.kind == PendingKind::ApprovedPendingExecution,
+            nota: (awaiting && facts.parameters.is_none()).then_some(PARAMETERS_TOO_BIG),
         });
     }
     api_json(
@@ -484,6 +530,20 @@ async fn act(
             "Esa solicitud ya no está en la bandeja. Vuelve a cargarla.",
         );
     };
+    if matches!(
+        what,
+        Act::Decide(praetore_gateway::HumanApprovalOutcome::Approve)
+    ) && !pending.approvable
+    {
+        return api_json(
+            StatusCode::OK,
+            ActOutcome {
+                situacion: "sin cambios",
+                mensaje: PARAMETERS_TOO_BIG,
+                puede_ejecutar: false,
+            },
+        );
+    }
     let gateway = Arc::clone(&inbox.gateway);
     let signer = Arc::clone(&inbox.signer);
     let result = tokio::task::spawn_blocking(move || match what {
@@ -557,25 +617,32 @@ struct OpenQuery {
 }
 
 /// The page itself holds no secret. The session cookie is set only when the
-/// request carries the opening link's code; the browser is then sent to `/`
-/// so the code leaves the address bar.
+/// request carries a live opening code, which is then consumed; the browser
+/// is sent to `/` so the code leaves the address bar. A request without a
+/// session makes the console print a new link to its terminal when none is
+/// live; the requester never sees it.
 async fn index(
     State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
     query: Result<Query<OpenQuery>, QueryRejection>,
 ) -> Response {
     let offered = query.ok().and_then(|Query(query)| query.abrir);
+    let has_session = state.session.accepts(
+        headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok()),
+    );
     let Some(offered) = offered else {
+        if !has_session {
+            state.reissue_link();
+        }
         return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
     };
-    let accepted = state.opener.as_deref().is_some_and(|code| {
-        code.len() == offered.len()
-            && bool::from(subtle::ConstantTimeEq::ct_eq(
-                code.as_bytes(),
-                offered.as_bytes(),
-            ))
-    });
-    if !accepted {
+    if !state.opener.redeem(&offered) {
         tracing::warn!(failure = "opening_code", "console opening link refused");
+        if !has_session {
+            state.reissue_link();
+        }
         return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
     }
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
@@ -668,9 +735,24 @@ struct InboxItemView {
     sobre: String,
     vale_hasta: String,
     queda: String,
-    puede_decidir: bool,
+    /// `clave: valor` lines, keys sorted. Empty with `parametros_visibles`
+    /// false when they do not fit the inbox.
+    parametros: Vec<ParameterView>,
+    parametros_visibles: bool,
+    puede_aprobar: bool,
+    puede_rechazar: bool,
     puede_ejecutar: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nota: Option<&'static str>,
 }
+
+#[derive(Serialize)]
+struct ParameterView {
+    clave: String,
+    valor: String,
+}
+
+const PARAMETERS_TOO_BIG: &str = "Los parámetros de esta solicitud no caben en la bandeja (más de 20 claves, valores de más de 200 caracteres o más de 2 niveles). Aquí solo se puede rechazar; para revisarla completa y aprobarla usa praetore approve en la terminal.";
 
 fn set_security_headers(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -833,6 +915,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_page_does_not_ask_for_a_token_and_sets_a_local_cookie() {
+        let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
         let state = ConsoleState::new(
             Arc::new(MemoryHistory {
                 receipts: Vec::new(),
@@ -840,42 +924,37 @@ mod tests {
             }),
             session(),
             HashMap::new(),
-        );
-        let link = state.opening_link().unwrap();
+        )
+        .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
+        let link = state.issue_opening_link().unwrap();
+        assert_eq!(*printed.lock().unwrap(), vec![link.clone()]);
         let code = link.split_once("?abrir=").unwrap().1.to_owned();
         assert!(link.starts_with("http://127.0.0.1:8090/?abrir="));
         assert!(Uuid::parse_str(&code).is_err());
         assert!(!code.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let app = state.router();
-        // Asking for the page is not enough to get the session.
+        let page = |uri: String| {
+            Request::builder()
+                .header(header::HOST, "127.0.0.1:8090")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        // Asking for the page is not enough to get the session, and the
+        // live link is not replaced.
         for uri in [
             "/".to_owned(),
             "/?abrir=otro".to_owned(),
             format!("/?abrir={code}x"),
         ] {
-            let plain = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .header(header::HOST, "127.0.0.1:8090")
-                        .uri(&uri)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+            let plain = app.clone().oneshot(page(uri.clone())).await.unwrap();
             assert_eq!(plain.status(), StatusCode::OK, "{uri}");
             assert!(plain.headers().get(header::SET_COOKIE).is_none(), "{uri}");
         }
+        assert_eq!(printed.lock().unwrap().len(), 1);
         let opened = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .header(header::HOST, "127.0.0.1:8090")
-                    .uri(format!("/?abrir={code}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(page(format!("/?abrir={code}")))
             .await
             .unwrap();
         assert_eq!(opened.status(), StatusCode::SEE_OTHER);
@@ -891,17 +970,15 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         let secret = hex::encode([0x11; 32]);
         assert!(cookie.contains(&secret));
-        let response = app
+        // The link works once.
+        let again = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .header(header::HOST, "127.0.0.1:8090")
-                    .uri("/")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(page(format!("/?abrir={code}")))
             .await
             .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        assert!(again.headers().get(header::SET_COOKIE).is_none());
+        let response = app.clone().oneshot(page("/".to_owned())).await.unwrap();
         let html = body_text(response).await;
         assert!(!html.contains(&secret));
         assert!(html.contains("Historial"));
@@ -931,6 +1008,65 @@ mod tests {
         assert!(!script.contains("localStorage"));
         assert!(!script.contains(&secret));
         assert!(!script.contains(sesion::COOKIE_NAME));
+    }
+
+    #[tokio::test]
+    async fn an_expired_link_is_refused_and_a_restart_drops_the_old_cookie() {
+        let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = printed.clone();
+        let first = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .with_opening_ttl(std::time::Duration::ZERO)
+        .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
+        let expired = first.issue_opening_link().unwrap();
+        let first = Arc::new(first);
+        let app = ConsoleState::router_from(Arc::clone(&first));
+        let request = |uri: &str, cookie: Option<&str>| {
+            let mut builder = Request::builder()
+                .header(header::HOST, "127.0.0.1:8090")
+                .uri(uri);
+            if let Some(cookie) = cookie {
+                builder = builder.header(header::COOKIE, cookie);
+            }
+            builder.body(Body::empty()).unwrap()
+        };
+        let path = expired.split_once("8090").unwrap().1.to_owned();
+        let refused = app.clone().oneshot(request(&path, None)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::OK);
+        assert!(refused.headers().get(header::SET_COOKIE).is_none());
+        // The link was issued a moment ago, so no new one is printed yet
+        // (at most one every few seconds); nothing reaches the page.
+        assert_eq!(printed.lock().unwrap().len(), 1);
+        assert!(!body_text(refused).await.contains("abrir="));
+
+        // A cookie from one run does not open the next one.
+        let old_cookie = format!("{}={}", sesion::COOKIE_NAME, first.session.cookie_value());
+        let ok = app
+            .clone()
+            .oneshot(request("/api/historial", Some(&old_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let restarted = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        )
+        .router();
+        let stale = restarted
+            .oneshot(request("/api/historial", Some(&old_cookie)))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

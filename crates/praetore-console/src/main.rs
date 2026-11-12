@@ -2,8 +2,14 @@
 //!
 //! Required: `PRAETORE_CONSOLE_TENANT_ID`, `PRAETORE_CONSOLE_DATABASE_URL`
 //! (read-only journal access). Optional: `PRAETORE_CONSOLE_BIND` (loopback
-//! only, default `127.0.0.1:8090`), `PRAETORE_CONSOLE_SESSION_FILE`,
-//! `PRAETORE_CONSOLE_AGENT_NAMES_FILE`.
+//! only, default `127.0.0.1:8090`), `PRAETORE_CONSOLE_AGENT_NAMES_FILE`.
+//!
+//! Opening: at startup the console writes a link `http://<bind>/?abrir=<code>`
+//! to stderr. Under systemd stderr goes to the journal, so whoever can read
+//! that journal can open the console while the link is live. The link works
+//! once and for at most five minutes; asking for the page without a session
+//! prints a new one when none is live. The session secret is new on every
+//! start and is never written to disk.
 //!
 //! Approvals inbox (D2), all four or none:
 //! - `PRAETORE_CONSOLE_GATEWAY_URL`: `http://127.0.0.1:<port>` of the gateway;
@@ -44,11 +50,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8090".into())
         .parse()?;
     let address = validate_bind_address(address)?;
-    let session_path = match env::var_os("PRAETORE_CONSOLE_SESSION_FILE") {
-        Some(path) => PathBuf::from(path),
-        None => default_session_path()?,
-    };
-    let session = LocalSession::load_or_create(&session_path)?;
+    if env::var_os("PRAETORE_CONSOLE_SESSION_FILE").is_some() {
+        tracing::warn!(
+            "PRAETORE_CONSOLE_SESSION_FILE ya no se usa: la sesión es nueva en cada arranque"
+        );
+    }
+    // New on every start: a cookie from an earlier run stops working.
+    let session = LocalSession::random()?;
     let names = match env::var("PRAETORE_CONSOLE_AGENT_NAMES_FILE") {
         Ok(path) => parse_agent_names(&fs::read_to_string(path)?)?,
         Err(env::VarError::NotPresent) => HashMap::new(),
@@ -70,17 +78,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => tracing::info!("bandeja de aprobaciones sin configurar: solo historial"),
     }
-    let link = state
-        .opening_link()
-        .ok_or("no se pudo crear el enlace de apertura de la consola")?;
     let state = Arc::new(state);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind(address))?;
     tracing::info!(%address, "consola local escuchando");
-    // Only to this terminal: whoever has the link gets the session.
-    eprintln!("Abre la consola en este computador con este enlace:\n  {link}");
+    // To stderr only (under systemd, also the journal): whoever has the
+    // link first gets the session. Single use, five minutes.
+    state
+        .issue_opening_link()
+        .ok_or("no se pudo crear el enlace de apertura de la consola")?;
     let served = runtime.block_on(
         axum::serve(listener, ConsoleState::router_from(Arc::clone(&state))).into_future(),
     );
@@ -124,10 +132,4 @@ fn approver_settings()
     let signer = ApproverSigner::from_file(&key_id, &PathBuf::from(key_file))?;
     let token = read_token_file(&PathBuf::from(token_file))?;
     Ok(Some((HttpApprovalGateway::new(address, token), signer)))
-}
-
-fn default_session_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let home =
-        env::var_os("HOME").ok_or("HOME no está definido; indica PRAETORE_CONSOLE_SESSION_FILE")?;
-    Ok(PathBuf::from(home).join(".local/share/praetore/consola-sesion"))
 }

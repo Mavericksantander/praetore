@@ -129,7 +129,7 @@ impl HistoryStore for PostgresHistory {
 }
 
 impl InboxStore for PostgresHistory {
-    /// Requests that wait for the operator, oldest first. Same SELECT-only
+    /// Requests that wait for the operator, newest first. Same SELECT-only
     /// role and tenant context as the history; nothing is written.
     fn pending(&self) -> Result<InboxPage, HistoryError> {
         let mut client = self.client.lock().map_err(|_| HistoryError::Unavailable)?;

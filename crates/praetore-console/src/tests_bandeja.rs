@@ -34,6 +34,20 @@ fn pending_evidence(
     target: &str,
     expires_at: OffsetDateTime,
 ) -> (Evidence, String) {
+    pending_evidence_with(
+        action_type,
+        target,
+        expires_at,
+        json!({"nota": "texto-libre"}),
+    )
+}
+
+fn pending_evidence_with(
+    action_type: &str,
+    target: &str,
+    expires_at: OffsetDateTime,
+    parameters: Value,
+) -> (Evidence, String) {
     let expires_at = expires_at.replace_nanosecond(0).unwrap();
     let agent_key = AgentKeyPair::from_secret_bytes(&[0x51; 32]);
     let agent = agent_key.identity(AgentId::new());
@@ -44,13 +58,9 @@ fn pending_evidence(
     )
     .with_constraint("tenant_id", TENANT.to_string());
     let authority_digest = authority.content_digest().unwrap();
-    let action = Action::new(
-        action_type,
-        Some(target.into()),
-        json!({"secreto": "parameter-secret"}),
-    )
-    .unwrap()
-    .with_capability("archivo:borrar");
+    let action = Action::new(action_type, Some(target.into()), parameters)
+        .unwrap()
+        .with_capability("archivo:borrar");
     let mut evidence = Evidence::new_with_context(
         Uuid::new_v4(),
         agent,
@@ -358,16 +368,23 @@ async fn the_inbox_says_who_what_on_what_and_until_when_in_plain_words() {
     assert!(first["vale_hasta"].as_str().unwrap().ends_with(" UTC"));
     assert!(first["vale_hasta"].as_str().unwrap().contains(" de "));
     assert!(first["queda"].as_str().unwrap().starts_with("queda"));
-    assert_eq!(first["puede_decidir"], true);
+    assert_eq!(first["puede_aprobar"], true);
+    assert_eq!(first["puede_rechazar"], true);
+    assert_eq!(first["parametros_visibles"], true);
+    assert_eq!(
+        first["parametros"],
+        json!([{"clave": "nota", "valor": "texto-libre"}])
+    );
+    assert!(first.get("nota").is_none());
     assert_eq!(first["puede_ejecutar"], false);
     let second = &list["solicitudes"][1];
     assert_eq!(second["situacion"], "aprobado, pendiente de ejecución");
-    assert_eq!(second["puede_decidir"], false);
+    assert_eq!(second["puede_aprobar"], false);
+    assert_eq!(second["puede_rechazar"], false);
     assert_eq!(second["puede_ejecutar"], true);
     assert_eq!(list["solicitudes"].as_array().unwrap().len(), 2);
     assert_eq!(list["vencidas"], 1);
     assert_eq!(list["ilegibles"], 1);
-    assert!(!text.contains("parameter-secret"));
     assert!(!text.contains("motivo-interno"));
     assert!(!text.contains("awaiting_approval"));
     assert!(!text.contains("approved_pending_dispatch"));
@@ -968,4 +985,89 @@ fn nothing_is_signed_when_any_part_of_the_challenge_differs() {
         assert_eq!(outcome.situacion, "sin cambios");
         assert_eq!(gateway.calls(), vec!["challenge"]);
     }
+}
+
+#[tokio::test]
+async fn two_requests_that_differ_only_in_the_amount_look_different() {
+    let expires = OffsetDateTime::now_utc() + Duration::minutes(10);
+    let (small, small_json) = pending_evidence_with(
+        "transferir",
+        "cuenta-1",
+        expires,
+        json!({"monto": 10, "moneda": "CLP"}),
+    );
+    let (large, large_json) = pending_evidence_with(
+        "transferir",
+        "cuenta-1",
+        expires,
+        json!({"monto": 100000, "moneda": "CLP"}),
+    );
+    let gateway = Arc::new(FakeGateway::new(&small));
+    let app = console(
+        vec![
+            facts_for(&small, small_json, PendingKind::AwaitingApproval),
+            facts_for(&large, large_json, PendingKind::AwaitingApproval),
+        ],
+        0,
+        gateway,
+    );
+    let (_, list, _) = json_of(app.oneshot(get("/api/bandeja")).await.unwrap()).await;
+    let first = &list["solicitudes"][0];
+    let second = &list["solicitudes"][1];
+    assert_eq!(first["queria"], second["queria"]);
+    assert_eq!(first["sobre"], second["sobre"]);
+    assert_ne!(first["parametros"], second["parametros"]);
+    assert_eq!(
+        first["parametros"],
+        json!([{"clave": "moneda", "valor": "CLP"}, {"clave": "monto", "valor": "10"}])
+    );
+    assert_eq!(
+        second["parametros"],
+        json!([{"clave": "moneda", "valor": "CLP"}, {"clave": "monto", "valor": "100000"}])
+    );
+}
+
+#[tokio::test]
+async fn parameters_that_do_not_fit_can_only_be_rejected_here() {
+    let many: serde_json::Map<String, Value> = (0..21)
+        .map(|index| (format!("k{index:02}"), json!(index)))
+        .collect();
+    let (evidence, json) = pending_evidence_with(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+        Value::Object(many),
+    );
+    let gateway = Arc::new(FakeGateway::new(&evidence));
+    let app = console(
+        vec![facts_for(&evidence, json, PendingKind::AwaitingApproval)],
+        0,
+        gateway.clone(),
+    );
+    let (_, list, _) = json_of(app.clone().oneshot(get("/api/bandeja")).await.unwrap()).await;
+    let item = &list["solicitudes"][0];
+    assert_eq!(item["parametros_visibles"], false);
+    assert_eq!(item["parametros"], json!([]));
+    assert_eq!(item["puede_aprobar"], false);
+    assert_eq!(item["puede_rechazar"], true);
+    assert!(item["nota"].as_str().unwrap().contains("praetore approve"));
+    let reference = item["referencia"].as_str().unwrap().to_owned();
+    // Refused server side even if the page asked anyway.
+    let (_, refused, _) = json_of(
+        app.clone()
+            .oneshot(post(&format!("/api/bandeja/{reference}/aprobar")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(refused["situacion"], "sin cambios");
+    assert!(gateway.calls().is_empty());
+    let (_, rejected, _) = json_of(
+        app.oneshot(post(&format!("/api/bandeja/{reference}/rechazar")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(rejected["situacion"], "rechazado");
+    assert_eq!(gateway.held(), Held::Rejected);
 }

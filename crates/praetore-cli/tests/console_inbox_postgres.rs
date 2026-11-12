@@ -5,8 +5,11 @@
 //! `praetore run` as the gateway, two `praetore demo` requests held. Then
 //! the console, in this process, reads the inbox from the journal, signs an
 //! approval with `approver.key` and dispatches it through the gateway's HTTP
-//! API, and rejects the other request. The journal must show one execution
-//! and one signed rejection, and the inbox must be empty.
+//! API, and rejects the other request. A third request is approved, then
+//! read again by a console started afresh, which offers only its dispatch.
+//! A fourth is left until its 30 s window closes: it is counted as expired,
+//! not offered, and approving its old reference gets "expirado". The journal
+//! must show two executions, one signed rejection and one signed expiry.
 //!
 //! Needs `PRAETORE_TEST_DATABASE_URL` (a role that can CREATE ROLE). The
 //! gateway helpers mirror `journal_export_postgres.rs`.
@@ -204,6 +207,15 @@ fn action(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn inbox_request() -> Request<Body> {
+    Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
+        .uri("/api/bandeja")
+        .header(header::COOKIE, cookie())
+        .body(Body::empty())
+        .unwrap()
+}
+
 fn cookie() -> String {
     LocalSession::from_secret([0x21; 32])
         .cookie_header()
@@ -290,7 +302,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         .enable_all()
         .build()
         .unwrap();
-    runtime.block_on(async {
+    let (reload_id, expire_id) = runtime.block_on(async {
         let list = Request::builder()
             .header(header::HOST, "127.0.0.1:8090")
             .uri("/api/bandeja")
@@ -303,6 +315,10 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         assert!(!text.contains(&tenant.to_string()));
         let items = list["solicitudes"].as_array().unwrap();
         assert_eq!(items.len(), 2);
+        // The parameters the signature covers are shown.
+        assert_eq!(items[0]["parametros_visibles"], true);
+        assert!(!items[0]["parametros"].as_array().unwrap().is_empty());
+        assert_eq!(items[0]["puede_aprobar"], true);
         // Newest first: the first `praetore demo` is the second item.
         let first = items[1]["referencia"].as_str().unwrap().to_owned();
         let second = items[0]["referencia"].as_str().unwrap().to_owned();
@@ -335,6 +351,85 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
             .unwrap();
         let (_, list, _) = call(&app, list).await;
         assert_eq!(list["solicitudes"].as_array().unwrap().len(), 0);
+
+        // Approved but not executed, then read again by a console started
+        // afresh (new references): only the dispatch is offered.
+        let reload_id = held_demo(&dir, "recargar");
+        let (_, list, _) = call(&app, inbox_request()).await;
+        let reload = list["solicitudes"][0]["referencia"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (_, approved, text) =
+            call(&app, action(&format!("/api/bandeja/{reload}/aprobar"))).await;
+        assert_eq!(
+            approved["situacion"], "aprobado, pendiente de ejecución",
+            "{text}"
+        );
+        let fresh = Arc::new(
+            ConsoleState::new(
+                history.clone(),
+                LocalSession::from_secret([0x21; 32]),
+                HashMap::new(),
+            )
+            .with_inbox(Inbox::new(
+                history.clone(),
+                Arc::new(HttpApprovalGateway::new(
+                    format!("127.0.0.1:{port}").parse().unwrap(),
+                    read_token_file(&dir.join("approver-api.token")).unwrap(),
+                )),
+                ApproverSigner::from_file("local-approver", &dir.join("approver.key")).unwrap(),
+            )),
+        );
+        let fresh_app = ConsoleState::router_from(Arc::clone(&fresh));
+        let (_, list, text) = call(&fresh_app, inbox_request()).await;
+        let items = list["solicitudes"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{text}");
+        assert_eq!(items[0]["situacion"], "aprobado, pendiente de ejecución");
+        assert_eq!(items[0]["puede_aprobar"], false);
+        assert_eq!(items[0]["puede_rechazar"], false);
+        assert_eq!(items[0]["puede_ejecutar"], true);
+        let again = items[0]["referencia"].as_str().unwrap().to_owned();
+        assert_ne!(again, reload);
+        // The old console's reference means nothing to the new one.
+        let (stale, _, _) = call(
+            &fresh_app,
+            action(&format!("/api/bandeja/{reload}/ejecutar")),
+        )
+        .await;
+        assert_eq!(stale, StatusCode::NOT_FOUND);
+        let (_, refused, _) =
+            call(&fresh_app, action(&format!("/api/bandeja/{again}/aprobar"))).await;
+        assert_eq!(refused["situacion"], "sin cambios");
+        let (_, executed, text) = call(
+            &fresh_app,
+            action(&format!("/api/bandeja/{again}/ejecutar")),
+        )
+        .await;
+        assert_eq!(executed["situacion"], "aprobado", "{text}");
+
+        // Expiry: the window (30 s in the demo) closes with no decision.
+        let expire_id = held_demo(&dir, "vencer");
+        let (_, list, _) = call(&fresh_app, inbox_request()).await;
+        let late = list["solicitudes"][0]["referencia"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        thread::sleep(Duration::from_secs(32));
+        let (_, list, text) = call(&fresh_app, inbox_request()).await;
+        assert_eq!(list["solicitudes"].as_array().unwrap().len(), 0, "{text}");
+        assert_eq!(list["vencidas"], 1, "{text}");
+        let (_, expired, text) =
+            call(&fresh_app, action(&format!("/api/bandeja/{late}/aprobar"))).await;
+        assert_eq!(expired["situacion"], "expirado", "{text}");
+        assert_eq!(expired["puede_ejecutar"], false);
+        // The gateway recorded the expiry: it is no longer pending at all.
+        let (_, list, _) = call(&fresh_app, inbox_request()).await;
+        assert_eq!(list["vencidas"], 0);
+        assert_eq!(list["solicitudes"].as_array().unwrap().len(), 0);
+        drop(fresh_app);
+        drop(fresh);
+        (reload_id, expire_id)
     });
     drop(runtime);
     drop(app);
@@ -360,6 +455,18 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         (
             "not_dispatched".to_owned(),
             Some("approval_rejected".to_owned())
+        )
+    );
+    let (reloaded, _) = row(reload_id);
+    assert!(
+        ["executed", "confirmed"].contains(&reloaded.as_str()),
+        "{reloaded}"
+    );
+    assert_eq!(
+        row(expire_id),
+        (
+            "not_dispatched".to_owned(),
+            Some("approval_expired".to_owned())
         )
     );
     drop(gateway);

@@ -4,7 +4,7 @@
 //! and until when. The browser never receives the journal keys: each pending
 //! request gets an opaque reference that only this process can resolve.
 
-use crate::historia::readable_time;
+use crate::historia::{plain_text, readable_time};
 use praetore_core::Evidence;
 use praetore_gateway::{ApprovalChallenge, ExecutionKey, action_digest};
 use std::{collections::HashMap, sync::Mutex};
@@ -45,13 +45,100 @@ pub struct PendingFacts {
     pub kind: PendingKind,
     pub wanted: String,
     pub target: Option<String>,
-    /// Digest of the action read from the signed journal evidence. The
-    /// challenge the gateway hands back must commit to this same digest.
+    /// Digest of the action read from the journal evidence (hash checked,
+    /// attester signature not checked). The challenge the gateway hands
+    /// back must commit to this same digest.
     pub action_digest: String,
     /// The challenge the gateway must hand back, rebuilt from the evidence
     /// exactly as the gateway builds it.
     pub expected: ApprovalChallenge,
     pub expires_at: OffsetDateTime,
+    /// The action parameters as `clave: valor` lines, sorted by key, or
+    /// `None` when they do not fit the inbox limits. The signature covers
+    /// them, so a request whose parameters cannot be shown cannot be
+    /// approved here.
+    pub parameters: Option<Vec<(String, String)>>,
+}
+
+/// Inbox limits for shown parameters.
+pub const MAX_PARAMETER_LINES: usize = 20;
+pub const MAX_PARAMETER_CHARS: usize = 200;
+pub const MAX_PARAMETER_DEPTH: usize = 2;
+
+/// `clave: valor` lines for the action parameters, keys sorted, nested
+/// objects as `clave.subclave`. Arrays of scalars are joined with `, `.
+/// Agent text (keys and values) is escaped like any other agent text.
+/// `None` when there are more than 20 lines, a key or value longer than 200
+/// characters once escaped, a nesting deeper than 2, or a non-object root.
+pub fn parameter_lines(parameters: &serde_json::Value) -> Option<Vec<(String, String)>> {
+    let serde_json::Value::Object(map) = parameters else {
+        return None;
+    };
+    let mut lines = Vec::new();
+    collect_lines(map, "", 1, &mut lines)?;
+    lines.sort_by(|left, right| left.0.cmp(&right.0));
+    Some(lines)
+}
+
+fn collect_lines(
+    map: &serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    depth: usize,
+    lines: &mut Vec<(String, String)>,
+) -> Option<()> {
+    use serde_json::Value;
+    for (key, value) in map {
+        let key = format!("{prefix}{}", plain_text(key));
+        if key.chars().count() > MAX_PARAMETER_CHARS {
+            return None;
+        }
+        let shown = match value {
+            Value::Object(inner) => {
+                if depth >= MAX_PARAMETER_DEPTH {
+                    return None;
+                }
+                if inner.is_empty() {
+                    "(vacío)".to_owned()
+                } else {
+                    collect_lines(inner, &format!("{key}."), depth + 1, lines)?;
+                    continue;
+                }
+            }
+            Value::Array(items) => {
+                // Elements must be scalars: an array is one level.
+                let mut parts = Vec::with_capacity(items.len());
+                for item in items {
+                    parts.push(scalar_text(item)?);
+                }
+                if parts.is_empty() {
+                    "(lista vacía)".to_owned()
+                } else {
+                    parts.join(", ")
+                }
+            }
+            scalar => scalar_text(scalar)?,
+        };
+        if shown.chars().count() > MAX_PARAMETER_CHARS {
+            return None;
+        }
+        lines.push((key, shown));
+        if lines.len() > MAX_PARAMETER_LINES {
+            return None;
+        }
+    }
+    Some(())
+}
+
+fn scalar_text(value: &serde_json::Value) -> Option<String> {
+    use serde_json::Value;
+    Some(match value {
+        Value::String(text) => plain_text(text),
+        Value::Number(number) => number.to_string(),
+        Value::Bool(true) => "sí".to_owned(),
+        Value::Bool(false) => "no".to_owned(),
+        Value::Null => "(nulo)".to_owned(),
+        Value::Array(_) | Value::Object(_) => return None,
+    })
 }
 
 /// Journal columns the inbox reads. Evidence JSON is consumed here.
@@ -80,6 +167,7 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
     }
     let expires_at = OffsetDateTime::parse(&challenge.expires_at, &Rfc3339).map_err(|_| ())?;
     let challenge = challenge.clone();
+    let parameters = parameter_lines(&evidence.action.parameters);
     let target = evidence.action.target.filter(|target| !target.is_empty());
     Ok(PendingFacts {
         created_at: columns.created_at,
@@ -94,6 +182,7 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
         action_digest: digest,
         expected: challenge,
         expires_at,
+        parameters,
     })
 }
 
@@ -140,6 +229,9 @@ pub struct PendingRef {
     pub key: ExecutionKey,
     pub action_digest: String,
     pub expected: ApprovalChallenge,
+    /// False when the parameters could not be shown: approving is refused
+    /// server side, rejecting is not.
+    pub approvable: bool,
 }
 
 impl From<&PendingFacts> for PendingRef {
@@ -148,6 +240,7 @@ impl From<&PendingFacts> for PendingRef {
             key: facts.key,
             action_digest: facts.action_digest.clone(),
             expected: facts.expected.clone(),
+            approvable: facts.parameters.is_some(),
         }
     }
 }
@@ -176,6 +269,7 @@ impl References {
             if known.action_digest == facts.action_digest
                 && known.key == facts.key
                 && known.expected == facts.expected
+                && known.approvable == facts.parameters.is_some()
             {
                 return Some(existing);
             }
@@ -259,6 +353,7 @@ mod tests {
                 expires_at: String::new(),
             },
             expires_at: datetime!(2026-11-12 10:05:09 UTC),
+            parameters: Some(Vec::new()),
         }
     }
 
@@ -285,6 +380,55 @@ mod tests {
 
         assert!(references.resolve("no-es-una-referencia").is_none());
         assert!(references.resolve(&"a".repeat(REFERENCE_LEN)).is_none());
+    }
+
+    #[test]
+    fn parameters_are_sorted_lines_within_fixed_limits() {
+        use serde_json::json;
+        let lines = parameter_lines(&json!({
+            "monto": 100000,
+            "cuenta": "cuenta-1",
+            "opciones": {"urgente": true, "nota": null},
+            "etiquetas": ["a", "b"],
+            "texto": "x\u{202e}y",
+        }))
+        .unwrap();
+        let keys: Vec<&str> = lines.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "cuenta",
+                "etiquetas",
+                "monto",
+                "opciones.nota",
+                "opciones.urgente",
+                "texto"
+            ]
+        );
+        assert_eq!(lines[2].1, "100000");
+        assert_eq!(lines[1].1, "a, b");
+        assert_eq!(lines[4].1, "sí");
+        assert_eq!(lines[5].1, "x\\u{202e}y");
+        assert_eq!(parameter_lines(&json!({})).unwrap(), Vec::new());
+
+        // Too many keys, too long, too deep, or not an object: not shown.
+        let many: serde_json::Map<_, _> = (0..=MAX_PARAMETER_LINES)
+            .map(|index| (format!("k{index:02}"), json!(index)))
+            .collect();
+        assert!(parameter_lines(&serde_json::Value::Object(many)).is_none());
+        let exactly: serde_json::Map<_, _> = (0..MAX_PARAMETER_LINES)
+            .map(|index| (format!("k{index:02}"), json!(index)))
+            .collect();
+        assert!(parameter_lines(&serde_json::Value::Object(exactly)).is_some());
+        assert!(parameter_lines(&json!({"v": "x".repeat(MAX_PARAMETER_CHARS + 1)})).is_none());
+        assert!(parameter_lines(&json!({"v": "x".repeat(MAX_PARAMETER_CHARS)})).is_some());
+        // Escaping counts: 40 bidi characters become 320 visible ones.
+        assert!(parameter_lines(&json!({"v": "\u{202e}".repeat(40)})).is_none());
+        assert!(parameter_lines(&json!({"a": {"b": {"c": 1}}})).is_none());
+        assert!(parameter_lines(&json!({"a": [[1]]})).is_none());
+        assert!(parameter_lines(&json!({"a": [{"b": 1}]})).is_none());
+        assert!(parameter_lines(&json!("texto")).is_none());
+        assert!(parameter_lines(&json!([1, 2])).is_none());
     }
 
     #[test]

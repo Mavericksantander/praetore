@@ -213,23 +213,36 @@
   `approver.key` / `approver-api.token` formats of `praetore init`) the
   console lists the requests held for approval, read from the journal with
   its read-only connection, and lets the operator approve, reject, or run
-  the single dispatch of an approved request. The console signs on this
-  computer, as `praetore approve` does, only after it checks that the
-  gateway challenge commits to the action read from the signed journal
-  evidence; the gateway verifies, records and dispatches. The browser gets
-  opaque references, never keys, journal ids or raw evidence. Actions need
-  the console's own `Origin` and an `x-praetore-consola` header besides the
+  the single dispatch of an approved request. Each request shows who, what,
+  on what, until when, and its parameters as sorted `clave: valor` lines
+  (at most 20 keys, 200 characters per value, 2 levels, control and bidi
+  characters escaped); a request whose parameters do not fit can only be
+  rejected in the console, and approved with `praetore approve`. Approve
+  and reject take a confirmation in the same card. The console signs on
+  this computer, as `praetore approve` does, only after it checks that the
+  gateway challenge is the one rebuilt from the journal evidence it read;
+  it checks that evidence's integrity hash, not its attester signature. The
+  gateway verifies, records and dispatches. The browser gets opaque
+  references, never keys, journal ids or raw evidence. Actions need the
+  console's own `Origin` and an `x-praetore-consola` header besides the
   session cookie. A partial set of the four variables is a startup error;
   none of them leaves the console without the inbox (history only). The
-  gateway API is unchanged.
-- **`praetore-console` hands out its session only through the opening link
-  (P-002 D2).** At startup the console prints `http://<bind>/?abrir=<code>`
-  to its terminal; the session cookie is set only for that link, and `/`
-  alone no longer sets it, so another local process that asks for the page
-  gets nothing. Every request must carry the console's own `Host` (DNS
-  rebinding). Agent-chosen action and target text is shown with control and
-  bidirectional characters escaped. Action: open the printed link once per
-  browser session.
+  gateway API is unchanged. Limit: a process running as the same operating
+  system user as the console can read `approver.key` (and the token file)
+  directly and sign without the console; real separation requires running
+  the agent as another user (`crates/praetore-console/README.md`).
+- **`praetore-console` sessions are per run and open through a single-use
+  link (P-002 D2).** The session secret is new on every start and is no
+  longer read from or written to a file (`PRAETORE_CONSOLE_SESSION_FILE` is
+  ignored, with a warning); a cookie from an earlier run stops working. At
+  startup the console writes `http://<bind>/?abrir=<code>` to stderr; under
+  systemd that is the journal, readable by whoever reads it. The link works
+  once and for at most five minutes; asking for the page without a session
+  prints a new link to stderr when none is live (never to the requester).
+  `/` alone no longer sets the cookie. Every request must carry the
+  console's own `Host` (DNS rebinding). Agent-chosen text is shown with
+  control and bidirectional characters escaped. Action: open the printed
+  link after each start.
 
 ### Changed
 

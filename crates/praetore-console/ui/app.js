@@ -74,7 +74,7 @@ async function cargar() {
     return;
   }
   if (response.status === 401) {
-    estado.textContent = "Abre la consola con el enlace que mostró al arrancar en la terminal.";
+    estado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos).";
     return;
   }
   if (!response.ok) {
@@ -175,8 +175,17 @@ function pintarSolicitud(solicitud) {
   const acciones = document.createElement("div");
   acciones.className = "acciones";
 
-  function bloquear(sino) {
-    for (const boton of acciones.querySelectorAll("button")) boton.disabled = sino;
+  function boton(texto, clase, alHacerClic) {
+    const nuevo = document.createElement("button");
+    nuevo.type = "button";
+    if (clase) nuevo.className = clase;
+    nuevo.textContent = texto;
+    nuevo.addEventListener("click", alHacerClic);
+    return nuevo;
+  }
+
+  function bloquear() {
+    for (const cada of acciones.querySelectorAll("button")) cada.disabled = true;
   }
 
   function mostrar(data) {
@@ -186,54 +195,96 @@ function pintarSolicitud(solicitud) {
     if (data.puede_ejecutar) acciones.append(botonEjecutar("Reintentar ejecución"));
   }
 
+  async function ejecutar() {
+    bloquear();
+    resultado.textContent = "Ejecutando…";
+    mostrar(await actuar(solicitud.referencia, "ejecutar"));
+  }
+
   function botonEjecutar(texto) {
-    const boton = document.createElement("button");
-    boton.type = "button";
-    boton.className = "aprobar";
-    boton.textContent = texto;
-    boton.addEventListener("click", async () => {
-      bloquear(true);
-      resultado.textContent = "Ejecutando…";
-      mostrar(await actuar(solicitud.referencia, "ejecutar"));
-    });
-    return boton;
+    return boton(texto, "aprobar", ejecutar);
   }
 
-  if (solicitud.puede_decidir) {
-    const aprobar = document.createElement("button");
-    aprobar.type = "button";
-    aprobar.className = "aprobar";
-    aprobar.textContent = "Aprobar y ejecutar";
-    aprobar.addEventListener("click", async () => {
-      bloquear(true);
-      resultado.textContent = "Aprobando…";
-      const aprobado = await actuar(solicitud.referencia, "aprobar");
-      mostrar(aprobado);
-      if (!aprobado.puede_ejecutar) return;
-      bloquear(true);
-      resultado.textContent = "Aprobado. Ejecutando…";
-      mostrar(await actuar(solicitud.referencia, "ejecutar"));
-    });
-    const rechazar = document.createElement("button");
-    rechazar.type = "button";
-    rechazar.textContent = "Rechazar";
-    rechazar.addEventListener("click", async () => {
-      bloquear(true);
-      resultado.textContent = "Rechazando…";
-      mostrar(await actuar(solicitud.referencia, "rechazar"));
-    });
-    acciones.append(aprobar, rechazar);
-  } else if (solicitud.puede_ejecutar) {
-    acciones.append(botonEjecutar("Ejecutar"));
+  // First click: the summary to confirm, in the same card. Second click:
+  // the one signed decision.
+  function confirmar(pregunta, textoConfirmar, alConfirmar) {
+    acciones.replaceChildren();
+    resultado.textContent = pregunta + " " + resumen();
+    acciones.append(
+      boton(textoConfirmar, "aprobar", alConfirmar),
+      boton("Cancelar", "", () => {
+        resultado.textContent = "";
+        pintarDecision();
+      }),
+    );
   }
 
+  function resumen() {
+    const partes = [solicitud.agente, "quiere hacer " + solicitud.queria, "sobre " + solicitud.sobre];
+    if (solicitud.parametros_visibles) {
+      partes.push(solicitud.parametros.length
+        ? "con " + solicitud.parametros.map((p) => p.clave + ": " + p.valor).join("; ")
+        : "sin parámetros");
+    }
+    return partes.join(", ") + ".";
+  }
+
+  async function aprobarYEjecutar() {
+    bloquear();
+    resultado.textContent = "Aprobando…";
+    const aprobado = await actuar(solicitud.referencia, "aprobar");
+    mostrar(aprobado);
+    if (!aprobado.puede_ejecutar) return;
+    await ejecutar();
+  }
+
+  async function rechazar() {
+    bloquear();
+    resultado.textContent = "Rechazando…";
+    mostrar(await actuar(solicitud.referencia, "rechazar"));
+  }
+
+  function pintarDecision() {
+    acciones.replaceChildren();
+    if (solicitud.puede_aprobar) {
+      acciones.append(boton("Aprobar y ejecutar", "aprobar", () =>
+        confirmar("¿Aprobar y ejecutar?", "Confirmar: aprobar y ejecutar", aprobarYEjecutar)));
+    }
+    if (solicitud.puede_rechazar) {
+      acciones.append(boton("Rechazar", "", () =>
+        confirmar("¿Rechazar? Es final.", "Confirmar: rechazar", rechazar)));
+    }
+    if (solicitud.puede_ejecutar) acciones.append(botonEjecutar("Ejecutar"));
+  }
+
+  const parametros = document.createElement("dl");
+  parametros.className = "parametros";
+  if (solicitud.parametros_visibles) {
+    if (!solicitud.parametros.length) {
+      parametros.append(linea("Sin parámetros"));
+    }
+    for (const parametro of solicitud.parametros) {
+      const clave = document.createElement("dt");
+      clave.textContent = parametro.clave;
+      const valor = document.createElement("dd");
+      valor.textContent = parametro.valor;
+      parametros.append(clave, valor);
+    }
+  }
+  const nota = document.createElement("p");
+  nota.className = "nota";
+  if (solicitud.nota) nota.textContent = solicitud.nota;
+
+  pintarDecision();
   item.append(
     situacion,
     linea(solicitud.agente),
     linea("Quiere hacer: " + solicitud.queria),
     linea("Sobre: " + solicitud.sobre),
+    parametros,
     linea("Vale hasta: " + solicitud.vale_hasta + " (" + solicitud.queda + ")"),
     linea("Pedida: " + solicitud.pedida),
+    nota,
     acciones,
     resultado,
   );
@@ -257,7 +308,7 @@ async function cargarBandeja() {
   }
   if (response.status === 401) {
     solicitudes.replaceChildren();
-    bandejaEstado.textContent = "Abre la consola con el enlace que mostró al arrancar en la terminal.";
+    bandejaEstado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos).";
     return;
   }
   if (!response.ok || !data) {
@@ -292,20 +343,17 @@ document.getElementById("filtros").addEventListener("submit", (event) => {
   event.preventDefault();
   pagina = 1;
   cargar();
-cargarBandeja();
 });
 document.getElementById("anterior").addEventListener("click", () => {
   if (pagina > 1) {
     pagina -= 1;
     cargar();
-cargarBandeja();
   }
 });
 document.getElementById("siguiente").addEventListener("click", () => {
   if (pagina < paginas) {
     pagina += 1;
     cargar();
-cargarBandeja();
   }
 });
 cargar();
