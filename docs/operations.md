@@ -171,6 +171,31 @@ With the `http` and `sandbox` adapters the gateway requires
 5. In tests and incident replay, use a fixed clock and preserve the exact
    timestamp supplied to evaluation.
 
+## Execution attestation failure after dispatch
+
+The gateway signs the execution attestation after the adapter returns. If
+signing fails at that point (for example the trusted clock is unavailable or
+the execution attester cannot sign), the effect may already have been applied
+but no outcome is recorded:
+
+- the journal row stays `dispatched`, with no output and no terminal
+  attestation, and the adapter's output is not kept;
+- the HTTP API answers `503` with `authorization_unavailable` (trusted clock)
+  or `execution_state_unavailable` (signer), and no receipt;
+- the request is not dispatched again: the dispatch claim is consumed, and
+  the same signed request cannot be submitted again (its request ID is
+  already consumed).
+
+This is fail-closed: nothing is retried and no receipt claims an outcome. To
+close the row, restore the clock or the signer, fence every worker that could
+still dispatch the execution, and run `Gateway::reconcile` for its execution
+key. Reconcile asks the adapter's read-only reconciliation: `Applied` is
+recorded as `confirmed` with its output, `NotApplied` as `failed`
+(`effect_failed`), and `Unknown` as `outcome_unknown`. Reconcile signs too, so
+it fails the same way while the clock or the signer is unavailable. Alert on
+rows that stay `dispatched`, and treat their effect as unknown until reconcile
+records one.
+
 ## Production profile checks
 
 Before deployment, verify that:
@@ -323,7 +348,12 @@ observation time, which `claim_dispatch` passes in the transaction-local
 setting `praetore.dispatch_observed_at`. The database clock is deliberately
 not used: the gateway's injected, trusted clock decides expiry (and is signed
 into expiration receipts), and the database clock may be skewed relative to
-it. A dispatch without the setting is refused.
+it. A dispatch without the setting is refused. The 0012 trigger runs only on
+UPDATE: when its comment says it protects against "code paths that skip the
+check", that covers the `approved_pending_dispatch -> dispatched` update.
+Rows inserted directly in a later state are refused by the BEFORE INSERT
+triggers of `0021_journal_insert_rules`. The 0012 file is kept
+byte-identical because its checksum is recorded in existing databases.
 
 Migrations are forward-only, including `0013_dispatch_refused` and
 `0014_closed_execution_row_lock`. There is no down migration; rolling one

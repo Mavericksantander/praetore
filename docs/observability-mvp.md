@@ -43,8 +43,9 @@ other host requires `sslmode=verify-full` and `sslrootcert` (see
 [PostgreSQL adapter](operations.md#postgresql-adapter)). The API never connects
 to PostgreSQL from the browser.
 
-Apply migrations in numeric order through
-`0008_tenant_row_level_security.sql`.
+Apply every migration in numeric order (on this tree, `0001` through
+`0022_awaiting_approval_state.sql`), with the migration role described in
+[Migrations](operations.md#migrations).
 Grant the service role schema usage and SELECT only on the tenant, journal identity,
 digest, status, evidence, and timestamp columns, plus event identity/status/
 timestamp/sequence columns. Do not grant it access to `output_json`; output availability

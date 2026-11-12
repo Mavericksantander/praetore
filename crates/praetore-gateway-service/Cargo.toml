@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-description = "Loopback-only development HTTP service for the PRÆTORE gateway."
+description = "Development HTTP service (plain HTTP) for the PRÆTORE gateway; loopback-only with the local-demo adapter."
 
 [lib]
 name = "praetore_gateway_service"

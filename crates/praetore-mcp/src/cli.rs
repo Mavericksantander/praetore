@@ -142,7 +142,12 @@ const POLICY_HELP: &str = "Usage:
 
 Reads and edits DIR/policy.json. Every change is re-validated and a backup is
 written first. Running MCP clients must be restarted to load a change.
---arg-path-prefix is a lexical match: symlinks are not resolved.
+--arg-path-prefix: `wrap` resolves the argument through the filesystem first;
+a value that does not resolve to itself (a symlink, `.`/`..`, a missing parent)
+or is ambiguous (case or Unicode normalization) matches every
+DENY/REQUIRE_APPROVAL path rule on that key and no ALLOW path rule.
+`policy deny|require-approval|allow` and `policy check` resolve each prefix
+and warn when it resolves to another path: write resolved prefixes.
 
 Exit code: 0 on success, 1 if `check` finds an invalid policy or engine,
 2 on a usage error or a rejected change.";

@@ -430,10 +430,10 @@ From the workspace `Cargo.toml` and each crate's `Cargo.toml`:
 | [`praetore-python`](crates/praetore-python) | Verify-only Python bindings (PyO3 extension `_core`). |
 | [`praetore-replay-postgres`](crates/praetore-replay-postgres) | PostgreSQL-backed durable replay guard for HighAssurance deployments. |
 | [`praetore-gateway`](crates/praetore-gateway) | Reference local tool-execution boundary. |
-| [`praetore-gateway-service`](crates/praetore-gateway-service) | Loopback-only development HTTP service for the gateway. |
+| [`praetore-gateway-service`](crates/praetore-gateway-service) | Development HTTP service (plain HTTP) for the gateway; loopback-only with the local-demo adapter. |
 | [`praetore-cli`](crates/praetore-cli) | Local PostgreSQL-backed gateway demo CLI (`praetore`). |
 | [`praetore-observe`](crates/praetore-observe) | Authenticated read-only observability API and UI for gateway journals. |
-| [`praetore-mcp`](crates/praetore-mcp) | Local stdio MCP proxy that records signed evidence for every `tools/call` (observe) or enforces policy (enforce). |
+| [`praetore-mcp`](crates/praetore-mcp) | Local stdio MCP proxy that records signed evidence for the `tools/call` requests it evaluates (observe) or enforces policy (enforce). |
 
 Other top-level directories: `fuzz/`, `packages/praetore-python/`, `docs/`,
 `examples/`, `scripts/`, `demo/`.
