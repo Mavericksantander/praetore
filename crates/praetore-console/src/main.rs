@@ -161,7 +161,9 @@ fn operator_terminal() -> bool {
         return false;
     }
     // SAFETY: setting SIGTTIN to SIG_IGN installs no handler and runs no
-    // code in signal context; it only changes the disposition.
+    // code in signal context; it only changes the disposition. That
+    // disposition is process-wide (every thread) and is inherited by child
+    // processes across fork and exec; the console starts none today.
     let previous = unsafe { libc::signal(libc::SIGTTIN, libc::SIG_IGN) };
     previous != libc::SIG_ERR
 }

@@ -72,6 +72,8 @@ Abre la consola en este computador con este enlace (vale una vez, 5 minutos):
 - **Same operating system user:** a process running as the same user as the console can read `approver.key`, the token file and the console's memory or files directly, and sign without the console. The single-use link, the `Host`, `Origin` and header checks are aimed at web pages in the browser; they do not stop that process. Real separation requires running the agent under another operating system user than the console and its key files.
 - **Who can see the link:** anyone who can read the console's stderr can see the opening link: under systemd, whoever can read that journal.
 - **Look-alike characters:** characters from different scripts that look alike (for example a Latin `a` and a Cyrillic `а`) are shown as they are and are not flagged.
+- **Emoji sequences:** an emoji with a variation selector or a zero-width joiner is shown with escapes, for example `❤\u{fe0f}` or `👩\u{200d}💻`, not as one glyph.
+- **Right-to-left text:** Arabic or Hebrew text can be reordered on screen by the browser's bidirectional algorithm even without any control characters (which are escaped); neutral characters next to it, such as digits or punctuation, may appear in a different order than they are stored.
 - **Not shown:** the console does not show the browser any journal ids, keys, hex digests, RFC 3339 instants or raw evidence. Parameter values are shown as the agent sent them, escaped.
 - **Expired windows:** requests whose approval window has closed are counted and not offered. The gateway records the expiry when it next sees the request.
 - **Truncation:** the inbox reads the 200 newest pending requests and says when there are more.

@@ -79,6 +79,9 @@ h2 { margin-bottom: 20px; font-size: 28px; letter-spacing: -.02em; }
 .parametros dd { margin: 0; overflow-wrap: anywhere; }
 .parametros .es-lista .marca { color: var(--muted); font-variant-numeric: tabular-nums; }
 .parametros .es-lista .elemento { padding-left: 12px; }
+/* Agent text keeps every space: "a  b" must not look like "a b", nor a
+   leading space vanish. Covers the card and the confirmation inside it. */
+.solicitud span, .parametros dt, .parametros dd, .parametros .elemento { white-space: pre-wrap; }
 .confirmacion { display: grid; gap: 4px; margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line, #ccc); border-radius: 6px; }
 .solicitud .nota { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
 .solicitud .nota:empty { display: none; }
