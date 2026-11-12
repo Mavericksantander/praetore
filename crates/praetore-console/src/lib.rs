@@ -4,16 +4,21 @@
 //! page never shows, and receipts retold in plain language (D1). With an
 //! approver configured it also shows the approvals inbox (D2): the console
 //! signs the operator's decision on this computer, as `praetore approve`
-//! does, and the gateway verifies, records and dispatches it. It does not
-//! export a compliance package.
+//! does, and the gateway verifies, records and dispatches it. With a policy
+//! file and attester pins configured it also builds the compliance package
+//! (D3), read only: the tenant's signed journal, the policy and its digest,
+//! the pins, `SHA256SUMS` and instructions for a third party.
 
 mod aprobador;
 mod bandeja;
 mod historia;
 mod lectura;
+mod paquete;
 mod sesion;
 #[cfg(test)]
 mod tests_bandeja;
+#[cfg(test)]
+mod tests_paquete;
 
 use axum::{
     Json, Router,
@@ -40,6 +45,10 @@ pub use aprobador::{
 pub use bandeja::{PendingKind, PendingRef};
 pub use historia::{NamesError, parse_agent_names};
 pub use lectura::PostgresHistory;
+pub use paquete::{
+    CompliancePack, JournalExportStore, MAX_ATTESTER_PINS, PACK_DIR, PACK_FILENAME,
+    PackConfigError, PackError, PackSettings,
+};
 pub use sesion::LocalSession;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -51,6 +60,11 @@ pub struct ConsoleState {
     session: LocalSession,
     names: HashMap<Uuid, String>,
     inbox: Option<Inbox>,
+    /// D3. Present only with a policy file and attester pins.
+    pack: Option<Arc<CompliancePack>>,
+    /// One package is built at a time: each holds the shared database
+    /// client for the whole export.
+    pack_gate: Arc<tokio::sync::Semaphore>,
     address: SocketAddr,
     /// `Host` values the console answers to (DNS rebinding).
     hosts: Vec<String>,
@@ -160,6 +174,8 @@ impl ConsoleState {
             session,
             names,
             inbox: None,
+            pack: None,
+            pack_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             address: DEFAULT_ADDRESS.parse().expect("fixed address"),
             hosts: Vec::new(),
             origins: Vec::new(),
@@ -224,6 +240,11 @@ impl ConsoleState {
         self
     }
 
+    pub fn with_compliance_pack(mut self, pack: CompliancePack) -> Self {
+        self.pack = Some(Arc::new(pack));
+        self
+    }
+
     pub fn router(self) -> Router {
         Self::router_from(Arc::new(self))
     }
@@ -237,6 +258,8 @@ impl ConsoleState {
             .route("/bandeja/{referencia}/aprobar", post(approve))
             .route("/bandeja/{referencia}/rechazar", post(reject))
             .route("/bandeja/{referencia}/ejecutar", post(execute))
+            .route("/paquete", get(download_pack))
+            .route("/paquete/estado", get(pack_status))
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_session,
@@ -477,6 +500,89 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
     )
 }
 
+const PACK_OFF: &str = "El paquete de compliance no está configurado en esta consola.";
+
+/// D3: read only. Asked for by the console's own page (the action header,
+/// and `Sec-Fetch-Site: same-origin` when the browser sends it), so another
+/// local page cannot make the console build packages. The package is built
+/// whole in memory; on any failure the page gets a plain message and no
+/// file.
+async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
+    if !same_page_read(&headers) {
+        return api_message(
+            StatusCode::FORBIDDEN,
+            "La descarga solo se pide desde la página de esta consola.",
+        );
+    }
+    let Some(pack) = state.pack.clone() else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, PACK_OFF);
+    };
+    let Ok(permit) = Arc::clone(&state.pack_gate).try_acquire_owned() else {
+        return api_text(StatusCode::TOO_MANY_REQUESTS, PackError::Busy.message());
+    };
+    let signer = state.inbox.as_ref().map(|inbox| Arc::clone(&inbox.signer));
+    let built = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        paquete::generate(&pack, signer.as_deref(), time::OffsetDateTime::now_utc())
+    })
+    .await;
+    let bytes = match built {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => return api_text(StatusCode::SERVICE_UNAVAILABLE, error.message()),
+        Err(_) => {
+            return api_text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                PackError::Archive.message(),
+            );
+        }
+    };
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/gzip".to_owned()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{PACK_FILENAME}\""),
+            ),
+        ],
+        bytes,
+    )
+        .into_response();
+    set_security_headers(response.headers_mut());
+    response
+}
+
+/// Whether the page should offer the package at all.
+async fn pack_status(State(state): State<Arc<ConsoleState>>) -> Response {
+    #[derive(Serialize)]
+    struct PackStatus {
+        configurado: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mensaje: Option<&'static str>,
+    }
+    let configurado = state.pack.is_some();
+    api_json(
+        StatusCode::OK,
+        PackStatus {
+            configurado,
+            mensaje: (!configurado).then_some(PACK_OFF),
+        },
+    )
+}
+
+/// A read the page asks for with `fetch`: same-origin GETs carry no
+/// `Origin`, so only the action header and `Sec-Fetch-Site` are checked.
+fn same_page_read(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(ACTION_HEADER).iter();
+    let marker_ok =
+        matches!((values.next(), values.next()), (Some(value), None) if value.as_bytes() == b"1");
+    let fetch_site_ok = match headers.get("sec-fetch-site") {
+        None => true,
+        Some(value) => value.as_bytes() == b"same-origin",
+    };
+    marker_ok && fetch_site_ok
+}
+
 async fn approve(
     state: State<Arc<ConsoleState>>,
     headers: HeaderMap,
@@ -661,12 +767,16 @@ fn api_json<T: Serialize>(status: StatusCode, body: T) -> Response {
 }
 
 fn api_message(status: StatusCode, mensaje: &'static str) -> Response {
+    api_text(status, mensaje.into())
+}
+
+fn api_text(status: StatusCode, mensaje: std::borrow::Cow<'static, str>) -> Response {
     api_json(status, Message { mensaje })
 }
 
 #[derive(Serialize)]
 struct Message {
-    mensaje: &'static str,
+    mensaje: std::borrow::Cow<'static, str>,
 }
 
 #[derive(Serialize)]
@@ -987,7 +1097,9 @@ mod tests {
         assert!(!html.contains("RFC"));
         assert!(!html.contains("UUID"));
         assert!(!html.contains("awaiting_approval"));
-        assert!(!html.contains("descargar"));
+        // The only download is D3's compliance package.
+        assert_eq!(html.matches("<button").count(), 5, "{html}");
+        assert!(html.contains(">Descargar paquete de compliance</button>"));
         let script = app
             .oneshot(
                 Request::builder()

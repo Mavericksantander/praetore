@@ -40,6 +40,30 @@ impl PostgresHistory {
     }
 }
 
+impl crate::paquete::JournalExportStore for PostgresHistory {
+    fn tenant_id(&self) -> Uuid {
+        self.tenant_id
+    }
+
+    /// `praetore journal-export --tenant`'s own code, on the console's
+    /// connection: one read-only, repeatable-read transaction.
+    fn export_tenant(
+        &self,
+        attesters: &[praetore_core::VerifiedPublicKey],
+    ) -> Result<praetore_replay_postgres::journal_export::TenantExport, String> {
+        let mut client = self
+            .client
+            .lock()
+            .map_err(|_| "console database client poisoned".to_owned())?;
+        praetore_replay_postgres::journal_export::export_tenant(
+            &mut client,
+            self.tenant_id,
+            attesters,
+        )
+        .map_err(|error| error.to_string())
+    }
+}
+
 impl HistoryStore for PostgresHistory {
     fn list(&self, query: &ListRequest) -> Result<HistoryPage, HistoryError> {
         let mut client = self.client.lock().map_err(|_| HistoryError::Unavailable)?;

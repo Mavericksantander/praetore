@@ -329,6 +329,8 @@ struct ChainState<'k> {
     signed_by: BTreeMap<String, u64>,
     /// Tenant of the first receipt (`Some(None)`: it names no tenant).
     tenant: Option<Option<Uuid>>,
+    /// Per pinned key, in pin order: whether it verified an entry.
+    used: Vec<bool>,
 }
 
 impl<'k> ChainState<'k> {
@@ -348,6 +350,14 @@ impl<'k> ChainState<'k> {
             receipts: 0,
             database_head: None,
             tenant: None,
+            used: vec![false; attesters.len()],
+        }
+    }
+
+    /// Records that `key` verified an entry.
+    fn mark_used(&mut self, key: &VerifiedPublicKey) {
+        if let Some(index) = self.attesters.iter().position(|(_, pinned)| *pinned == key) {
+            self.used[index] = true;
         }
     }
 
@@ -384,6 +394,7 @@ impl<'k> ChainState<'k> {
         record
             .verify(attester)
             .map_err(|error| ChainError::Record { line, error })?;
+        self.mark_used(attester);
         if !self.seen_records.insert(record.record_id) {
             return Err(ChainError::DuplicateRecordId {
                 line,
@@ -437,6 +448,7 @@ impl<'k> ChainState<'k> {
         evidence
             .verify_attester_signature(attester)
             .map_err(|error| ChainError::Evidence { line, error })?;
+        self.mark_used(attester);
         if !self.seen.insert(evidence.evidence_id) {
             return Err(ChainError::DuplicateEvidenceId {
                 line,
@@ -558,6 +570,18 @@ impl<'k> ChainExporter<'k> {
         }
         self.output.push_str(line);
         Ok(())
+    }
+
+    /// Positions, in the order given to [`Self::with_attesters`], of the
+    /// pinned keys that verified no entry pushed so far.
+    pub fn unused_attesters(&self) -> Vec<usize> {
+        self.state
+            .used
+            .iter()
+            .enumerate()
+            .filter(|(_, used)| !**used)
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Returns the JSONL text and its head. Fails if no receipt was pushed.
@@ -759,6 +783,30 @@ mod tests {
             exporter.push_record(&sample_record(attester)).unwrap();
         }
         exporter.finish().unwrap()
+    }
+
+    /// A pin that verified nothing is reported; one that verified a record
+    /// or a receipt is not.
+    #[test]
+    fn the_exporter_reports_pins_that_verified_no_entry() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[7; 32]);
+        let stranger = EvidenceAttesterKey::from_secret_bytes(&[8; 32]);
+        let pins = [
+            stranger.public_key().unwrap(),
+            attester.public_key().unwrap(),
+        ];
+        let mut exporter = ChainExporter::with_attesters(&pins);
+        assert_eq!(exporter.unused_attesters(), vec![0, 1]);
+        exporter.push_record(&sample_record(&attester)).unwrap();
+        assert_eq!(exporter.unused_attesters(), vec![0]);
+        let current = [set_03_pin(), pins[0].clone()];
+        let mut receipts = ChainExporter::with_attesters(&current);
+        let line = SET_03_CHAIN.lines().next().unwrap();
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        receipts
+            .push(&Evidence::from_json(&value["evidence"].to_string()).unwrap())
+            .unwrap();
+        assert_eq!(receipts.unused_attesters(), vec![1]);
     }
 
     #[test]
@@ -968,6 +1016,8 @@ mod tests {
                 .push(&Evidence::from_json(&value["evidence"].to_string()).unwrap())
                 .unwrap();
         }
+        // Only the current key signed a receipt: the old pin is unused here.
+        assert_eq!(exporter.unused_attesters(), vec![0]);
         let (tenant, head) = exporter.finish().unwrap();
         let expected = ExpectedDatabaseHead {
             head: database_head.head,

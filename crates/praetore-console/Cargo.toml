@@ -12,6 +12,8 @@ description = "Local operator console: a PRÆTORE journal retold in plain langua
 [dependencies]
 axum = "0.8"
 ed25519-dalek = "2"
+# D3: the compliance package is a .tar.gz built in memory.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 hex = "0.4.3"
 praetore-core = { path = "../praetore-core" }
 praetore-gateway = { path = "../praetore-gateway" }
@@ -20,9 +22,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 postgres = { version = "0.19", features = ["with-time-0_3", "with-uuid-1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.11.0"
 subtle = "2.6"
+tar = { version = "0.4", default-features = false }
 time = { version = "0.3", features = ["formatting", "parsing"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 unicode-normalization = "0.1.26"

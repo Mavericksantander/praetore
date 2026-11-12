@@ -25,6 +25,12 @@
       <p id="bandeja-estado" class="estado" role="status">Leyendo la bandeja…</p>
       <ul id="solicitudes" class="lista"></ul>
     </section>
+    <section id="paquete" class="paquete" aria-labelledby="paquete-titulo">
+      <h2 id="paquete-titulo" class="titulo-seccion">Paquete de compliance</h2>
+      <p class="aviso">Descarga un archivo comprimido (.tar.gz) para entregar a un auditor. Trae el registro firmado que lee esta consola, la política configurada y su digest, las claves públicas del atestador, las sumas SHA-256 de cada archivo y un LEEME.txt que explica cómo verificarlo con praetore-verify sin confiar en esta consola, y lo que el paquete no prueba. No trae claves privadas. Descargarlo no cambia nada.</p>
+      <button id="descargar-paquete" type="button">Descargar paquete de compliance</button>
+      <p id="paquete-estado" class="estado" role="status"></p>
+    </section>
     <div class="section-head historial-head">
       <h2 class="titulo-seccion">Historial</h2>
       <div class="pager">

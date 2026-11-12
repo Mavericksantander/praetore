@@ -21,10 +21,19 @@
 //!   (`approver.key` of `praetore init`);
 //! - `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE`: owner-only file with the
 //!   gateway's `approver` bearer token (`approver-api.token`).
+//!
+//! Compliance package (D3), both or none:
+//! - `PRAETORE_CONSOLE_POLICY_FILE`: the policy file the gateway loads;
+//! - `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`: one or more attester public-key
+//!   files (lowercase hex), separated like `PATH` (`:` on Unix).
+//!
+//! Both are read again at every download, so the package carries the files
+//! as they are at that moment.
 
 use praetore_console::{
-    ApproverSigner, ConsoleState, HttpApprovalGateway, Inbox, LocalSession, PostgresHistory,
-    parse_agent_names, parse_gateway_address, read_token_file, validate_bind_address,
+    ApproverSigner, CompliancePack, ConsoleState, HttpApprovalGateway, Inbox, LocalSession,
+    PackSettings, PostgresHistory, parse_agent_names, parse_gateway_address, read_token_file,
+    validate_bind_address,
 };
 use praetore_replay_postgres::{DatabaseConnector, RuntimeRoleOptions, verify_runtime_role_with};
 use std::io::IsTerminal;
@@ -77,10 +86,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inbox = approver_settings()?;
     match inbox {
         Some((gateway, signer)) => {
-            state = state.with_inbox(Inbox::new(history, Arc::new(gateway), signer));
+            state = state.with_inbox(Inbox::new(history.clone(), Arc::new(gateway), signer));
             tracing::info!("bandeja de aprobaciones activa");
         }
         None => tracing::info!("bandeja de aprobaciones sin configurar: solo historial"),
+    }
+    match pack_settings()? {
+        Some(settings) => {
+            state = state.with_compliance_pack(CompliancePack::new(settings, history.clone()));
+            tracing::info!("paquete de compliance disponible");
+        }
+        None => tracing::info!("paquete de compliance sin configurar"),
     }
     let state = Arc::new(state);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -142,6 +158,28 @@ fn approver_settings()
     let signer = ApproverSigner::from_file(&key_id, &PathBuf::from(key_file))?;
     let token = read_token_file(&PathBuf::from(token_file))?;
     Ok(Some((HttpApprovalGateway::new(address, token), signer)))
+}
+
+/// D3 is on only with both settings; one without the other is an error.
+fn pack_settings() -> Result<Option<PackSettings>, Box<dyn std::error::Error>> {
+    const POLICY: &str = "PRAETORE_CONSOLE_POLICY_FILE";
+    const PINS: &str = "PRAETORE_CONSOLE_ATTESTER_PIN_FILES";
+    let read = |name: &str| match env::var_os(name) {
+        Some(value) if !value.is_empty() => Some(value),
+        _ => None,
+    };
+    match (read(POLICY), read(PINS)) {
+        (None, None) => Ok(None),
+        (Some(policy), Some(pins)) => {
+            let pins: Vec<PathBuf> = env::split_paths(&pins)
+                .filter(|path| !path.as_os_str().is_empty())
+                .collect();
+            Ok(Some(PackSettings::new(PathBuf::from(policy), pins)?))
+        }
+        _ => Err(
+            format!("el paquete de compliance necesita las dos variables: {POLICY}, {PINS}").into(),
+        ),
+    }
 }
 
 /// True when stdin and stderr are a terminal and this process is in that

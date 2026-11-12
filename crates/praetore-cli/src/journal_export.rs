@@ -3,10 +3,15 @@
 //! `praetore_core::journal_chain::ChainExporter`, the same code the verifier
 //! uses, so producer and verifier cannot disagree on the link.
 
+#[cfg(test)]
+use praetore_core::Evidence;
 use praetore_core::{
-    Evidence, StorageRecord, VerifiedPublicKey,
-    journal_chain::{ChainExporter, ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
+    VerifiedPublicKey,
+    journal_chain::{ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
 };
+#[cfg(test)]
+use praetore_replay_postgres::journal_export::export_transaction;
+use praetore_replay_postgres::journal_export::{self as shared, RECORD_PIN_HINT};
 use std::{
     fs,
     io::{Read, Write},
@@ -17,6 +22,11 @@ use uuid::Uuid;
 type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 const MAX_RECEIPT_BYTES: u64 = 65_536;
+
+/// The shared export's errors are `Send + Sync`; the CLI's are not.
+fn lift<T>(result: shared::ExportResult<T>) -> CliResult<T> {
+    result.map_err(|error| error as Box<dyn std::error::Error>)
+}
 
 /// Where the receipts come from. Exactly one source per export.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,11 +108,6 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
 /// Most attester pins one export accepts.
 const MAX_ATTESTER_PINS: usize = 16;
 
-/// Hint for a storage record signed by a key that is not pinned.
-const RECORD_PIN_HINT: &str = "storage records keep the signature of the attester key that was \
-     current when they were recorded; after a key rotation, pass the retired key's pin as \
-     another --attester-pin";
-
 pub fn run(args: ExportArgs) -> CliResult<()> {
     let mut attesters: Vec<VerifiedPublicKey> = Vec::with_capacity(args.attester_pins.len());
     for path in &args.attester_pins {
@@ -127,14 +132,9 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             (text, head, "tenant", None)
         }
         Source::Database { tenant_id } => {
-            let (receipts, records) = read_tenant_export(&url()?, *tenant_id)?;
-            let database_head = if records.is_empty() {
-                None
-            } else {
-                Some(DatabaseHead::from(records_chain(&records)?.1))
-            };
-            let (text, head) = export_with_database_head(&receipts, database_head, attester)?;
-            (text, head, "tenant", database_head)
+            let mut client = connect_for_tenant_export(&url()?)?;
+            let export = lift(shared::export_tenant(&mut client, *tenant_id, attester))?;
+            (export.text, export.head, "tenant", export.database_head)
         }
         Source::StorageRecords => {
             let records = read_storage_records_only(&url()?)?;
@@ -187,16 +187,11 @@ pub fn export_with_database_head(
     database_head: Option<DatabaseHead>,
     attester: &[VerifiedPublicKey],
 ) -> CliResult<(String, ChainHead)> {
-    let mut exporter = ChainExporter::with_attesters(attester);
-    if let Some(reference) = &database_head {
-        exporter.push_database_head(reference)?;
-    }
-    for (index, json) in receipts.iter().enumerate() {
-        let evidence = Evidence::from_json(json.trim_end())
-            .map_err(|error| format!("receipt {index}: {error}"))?;
-        exporter.push(&evidence)?;
-    }
-    Ok(exporter.finish()?)
+    lift(shared::export_with_database_head(
+        receipts,
+        database_head,
+        attester,
+    ))
 }
 
 /// The database chain: signed storage records in recording order.
@@ -204,26 +199,11 @@ pub fn export_storage_records(
     records: &[String],
     attester: &[VerifiedPublicKey],
 ) -> CliResult<(String, ChainHead)> {
-    let mut exporter = ChainExporter::with_attesters(attester);
-    for (index, json) in records.iter().enumerate() {
-        let record = StorageRecord::from_json(json)
-            .map_err(|error| format!("storage record {index}: {error}"))?;
-        exporter.push_record(&record)?;
-    }
-    Ok(exporter.finish()?)
+    lift(shared::export_storage_records(records, attester))
 }
 
 pub(crate) fn read_attester_pin(path: &Path) -> CliResult<VerifiedPublicKey> {
-    let text = read_limited(path)?;
-    let encoded = text.trim();
-    if encoded.len() != 64
-        || !encoded
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
-        return Err("attester pin must be 64 lowercase hex characters".into());
-    }
-    Ok(VerifiedPublicKey::from_bytes(&hex::decode(encoded)?)?)
+    lift(shared::parse_attester_pin(&read_limited(path)?))
 }
 
 fn read_limited(path: &Path) -> CliResult<String> {
@@ -263,12 +243,6 @@ fn read_receipts_dir(dir: &Path) -> CliResult<Vec<String>> {
         .collect()
 }
 
-/// Total order of one tenant's rows. Without `agent_id`, two agents of the
-/// same tenant reusing a `request_id` with equal `created_at` would come back
-/// in an unspecified order, and two exports of the same journal could differ.
-const JOURNAL_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
-     WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id LIMIT $2";
-
 #[cfg(test)]
 fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut client = crate::connect_local_database(database_url)?;
@@ -281,84 +255,40 @@ fn read_journal(database_url: &str, tenant_id: Uuid) -> CliResult<Vec<String>> {
     read_journal_rows(&mut client, tenant_id)
 }
 
-/// Storage records in recording order (none before migration 0015).
-const STORAGE_RECORDS_QUERY: &str = "SELECT record_json FROM praetore.storage_records \
-     ORDER BY created_at, record_id LIMIT $1";
-
-fn read_storage_records(transaction: &mut postgres::Transaction<'_>) -> CliResult<Vec<String>> {
-    let exists: bool = transaction
-        .query_one(
-            "SELECT pg_catalog.to_regclass('praetore.storage_records') IS NOT NULL",
-            &[],
-        )?
-        .get(0);
-    if !exists {
-        return Ok(Vec::new());
-    }
-    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(STORAGE_RECORDS_QUERY, &[&limit])?;
-    if rows.len() > MAX_CHAIN_ENTRIES {
-        return Err("too many storage records for one export".into());
-    }
-    Ok(rows.iter().map(|row| row.get(0)).collect())
-}
-
 fn read_storage_records_only(database_url: &str) -> CliResult<Vec<String>> {
     let mut client = crate::connect_local_database(database_url)?;
-    let mut transaction = export_transaction(&mut client, Uuid::nil())?;
-    let records = read_storage_records(&mut transaction)?;
-    transaction.commit()?;
-    Ok(records)
+    lift(shared::read_storage_records_only(&mut client))
 }
 
-/// The tenant's receipts and the database's storage records, read in one
-/// repeatable-read snapshot so the tenant chain references the database
-/// head of the same moment.
-fn read_tenant_export(
-    database_url: &str,
-    tenant_id: Uuid,
-) -> CliResult<(Vec<String>, Vec<String>)> {
+/// The runtime role check warns and goes on, as before: the export query
+/// still filters by tenant.
+fn connect_for_tenant_export(database_url: &str) -> CliResult<postgres::Client> {
     let mut client = crate::connect_local_database(database_url)?;
     if let Err(error) = praetore_replay_postgres::verify_runtime_role(&mut client) {
         eprintln!("warning: {error} (the export query still filters by tenant)");
     }
-    let mut transaction = export_transaction(&mut client, tenant_id)?;
-    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
-    let records = read_storage_records(&mut transaction)?;
-    transaction.commit()?;
-    if rows.len() > MAX_CHAIN_ENTRIES {
-        return Err("too many journal rows for one export".into());
-    }
-    Ok((rows.iter().map(|row| row.get(0)).collect(), records))
+    Ok(client)
+}
+
+#[cfg(test)]
+fn read_tenant_export(
+    database_url: &str,
+    tenant_id: Uuid,
+) -> CliResult<(Vec<String>, Vec<String>)> {
+    let mut client = connect_for_tenant_export(database_url)?;
+    lift(shared::read_tenant_export(&mut client, tenant_id))
 }
 
 #[cfg(test)]
 fn read_journal_rows(client: &mut postgres::Client, tenant_id: Uuid) -> CliResult<Vec<String>> {
     let mut transaction = export_transaction(client, tenant_id)?;
     let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
-    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
+    let rows = transaction.query(shared::JOURNAL_QUERY, &[&tenant_id, &limit])?;
     transaction.commit()?;
     if rows.len() > MAX_CHAIN_ENTRIES {
         return Err("too many journal rows for one export".into());
     }
     Ok(rows.iter().map(|row| row.get(0)).collect())
-}
-
-/// A READ ONLY transaction with `praetore.tenant_id` set for its duration
-/// only, which is what the `tenant_isolation` RLS policies (migration 0008)
-/// read.
-fn export_transaction(
-    client: &mut postgres::Client,
-    tenant_id: Uuid,
-) -> Result<postgres::Transaction<'_>, postgres::Error> {
-    let mut transaction = client
-        .build_transaction()
-        .read_only(true)
-        .isolation_level(postgres::IsolationLevel::RepeatableRead)
-        .start()?;
-    praetore_replay_postgres::set_tenant_context(&mut transaction, tenant_id)?;
-    Ok(transaction)
 }
 
 #[cfg(test)]

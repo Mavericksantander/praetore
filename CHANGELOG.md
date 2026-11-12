@@ -257,6 +257,53 @@
   console's own `Host` (DNS rebinding). Agent-chosen text in the history
   is shown with the same characters escaped. Action: open the printed
   link after each start.
+- **Compliance package in `praetore-console` (P-002 D3).** With
+  `PRAETORE_CONSOLE_POLICY_FILE` and `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`
+  (one to 16 public-key files, separated like `PATH`) the page offers
+  "Descargar paquete de compliance": a `praetore-compliance.tar.gz` built on
+  this computer with `journal.jsonl` (the tenant's chain, produced by the
+  same code as `praetore journal-export --tenant`), `policy.json` as read,
+  `policy-digest.txt` (the digest `praetore-verify policy-digest`
+  computes), `attester-pin-N.hex`, `export.json`, `SHA256SUMS` over every
+  other file, and `LEEME.txt` with the `praetore-verify` commands and what
+  the package does not show: a path around the gateway, anything before
+  the first record or after the export, completeness without an anchored
+  head, whether a held request was approved, rejected or executed (the
+  chain carries the policy decision only; approval and execution receipts
+  are not included). `LEEME.txt` asks for `praetore-verify` built from
+  `main`: the v0.3.3 verifier also accepts this `journal.jsonl`, but does
+  not report `tenant_id` nor warn `head_not_anchored`, which the
+  instructions use; v0.3.3 also rejects with `RECEIPT_INVALID` schema v5
+  execution receipts (`awaiting_approval`) and the reasons
+  `approved_claim_expired` and `approval_rejected`, none of which is in
+  the package. `LEEME.txt` counts the decision receipts apart from the
+  `database_head` reference line, and has a section on completeness
+  (`--expected-head`, and `--expected-database-head` when the chain
+  references the database head). The download is a `GET` that needs the session cookie, the
+  console's `Host`, the `x-praetore-consola` header and, when the browser
+  sends it, `Sec-Fetch-Site: same-origin`; it writes nothing. Pins are
+  parsed and written back as public keys only; a pin equal to the
+  approver's public key or secret (with the inbox configured) is refused,
+  and so is any pin that verified no entry of the export, so a secret key
+  file listed by mistake is refused instead of copied; the page names the
+  unused pin in words by its place in `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`
+  and the log records its position and path. Every piece is read again at
+  each download; if one is missing or does not check out (policy, pins,
+  or the export) no package is produced and the page says what failed
+  (for a failed export, the possible causes; an export stops at 4096
+  entries or 8 MiB of chain). One package is built at a time; a second
+  request meanwhile is told to wait. The page asks
+  `/api/paquete/estado` and, when the package is not configured, says so
+  instead of offering the button. One variable without the other is a
+  startup error. New dependencies of the console: `tar` and
+  `flate2` (Rust backend).
+- **`praetore_replay_postgres::journal_export` (P-002 D3).** The tenant
+  export of `praetore journal-export` (`export_tenant`: receipts and
+  storage records in one read-only, repeatable-read snapshot, then the
+  chain) moved from the CLI to this module, so the CLI and the console run
+  the same code. The CLI's output and errors are unchanged. New in
+  `praetore_core::journal_chain`: `ChainExporter::unused_attesters`, the
+  pins that verified no entry.
 
 ### Changed
 
