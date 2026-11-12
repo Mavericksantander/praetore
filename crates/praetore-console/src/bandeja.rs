@@ -4,11 +4,12 @@
 //! and until when. The browser never receives the journal keys: each pending
 //! request gets an opaque reference that only this process can resolve.
 
-use crate::historia::{plain_text, readable_time};
+use crate::historia::{readable_time, unambiguous_text};
 use praetore_core::Evidence;
 use praetore_gateway::{ApprovalChallenge, ExecutionKey, action_digest};
 use std::{collections::HashMap, sync::Mutex};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use unicode_normalization::{UnicodeNormalization, is_nfc};
 use uuid::Uuid;
 
 /// How many pending requests one inbox read returns, newest first.
@@ -53,92 +54,125 @@ pub struct PendingFacts {
     /// exactly as the gateway builds it.
     pub expected: ApprovalChallenge,
     pub expires_at: OffsetDateTime,
-    /// The action parameters as `clave: valor` lines, sorted by key, or
-    /// `None` when they do not fit the inbox limits. The signature covers
+    /// The action parameters, keys sorted, or `None` when they cannot be
+    /// shown within the inbox limits without ambiguity. The signature covers
     /// them, so a request whose parameters cannot be shown cannot be
     /// approved here.
-    pub parameters: Option<Vec<(String, String)>>,
+    pub parameters: Option<Vec<Parameter>>,
 }
 
-/// Inbox limits for shown parameters.
+/// One shown parameter: `clave` and a text or a list of texts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    pub key: String,
+    pub value: ParameterValue,
+}
+
+/// Strings are quoted and escaped, numbers are shown as written, so `"10"`
+/// and `10` (or `"sí"` and `sí`) never look the same. A list keeps each
+/// element apart, so a string with a comma is never two elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParameterValue {
+    Text(String),
+    List(Vec<String>),
+}
+
+/// Inbox limits for shown parameters. Each list element counts as a line.
 pub const MAX_PARAMETER_LINES: usize = 20;
 pub const MAX_PARAMETER_CHARS: usize = 200;
 pub const MAX_PARAMETER_DEPTH: usize = 2;
 
-/// `clave: valor` lines for the action parameters, keys sorted, nested
-/// objects as `clave.subclave`. Arrays of scalars are joined with `, `.
-/// Agent text (keys and values) is escaped like any other agent text.
-/// `None` when there are more than 20 lines, a key or value longer than 200
-/// characters once escaped, a nesting deeper than 2, or a non-object root.
-pub fn parameter_lines(parameters: &serde_json::Value) -> Option<Vec<(String, String)>> {
+/// The action parameters, keys sorted, nested objects as `clave.subclave`.
+/// `None` (only rejecting is offered) when they do not fit or could be
+/// read two ways: more than 20 lines, a key or value longer than 200
+/// characters once escaped, nesting deeper than 2, a non-object root, an
+/// empty key, a key with a dot, a key or text not in Unicode NFC (`é` and
+/// `e` + U+0301 look the same), or two keys that repeat once normalized
+/// (NFKC, lower case).
+pub fn parameters_shown(parameters: &serde_json::Value) -> Option<Vec<Parameter>> {
     let serde_json::Value::Object(map) = parameters else {
         return None;
     };
-    let mut lines = Vec::new();
-    collect_lines(map, "", 1, &mut lines)?;
-    lines.sort_by(|left, right| left.0.cmp(&right.0));
-    Some(lines)
+    let mut shown = Vec::new();
+    let mut lines = 0;
+    collect(map, "", 1, &mut shown, &mut lines)?;
+    shown.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut normalized: Vec<String> = shown
+        .iter()
+        .map(|item| item.key.nfkc().collect::<String>().to_lowercase())
+        .collect();
+    normalized.sort();
+    let unique = normalized.windows(2).all(|pair| pair[0] != pair[1]);
+    unique.then_some(shown)
 }
 
-fn collect_lines(
+fn collect(
     map: &serde_json::Map<String, serde_json::Value>,
     prefix: &str,
     depth: usize,
-    lines: &mut Vec<(String, String)>,
+    shown: &mut Vec<Parameter>,
+    lines: &mut usize,
 ) -> Option<()> {
     use serde_json::Value;
     for (key, value) in map {
-        let key = format!("{prefix}{}", plain_text(key));
+        if key.is_empty() || key.contains('.') || !is_nfc(key) {
+            return None;
+        }
+        let key = format!("{prefix}{}", unambiguous_text(key));
         if key.chars().count() > MAX_PARAMETER_CHARS {
             return None;
         }
-        let shown = match value {
+        let value = match value {
+            Value::Object(inner) if inner.is_empty() => {
+                if depth >= MAX_PARAMETER_DEPTH {
+                    return None;
+                }
+                ParameterValue::Text("(objeto vacío)".to_owned())
+            }
             Value::Object(inner) => {
                 if depth >= MAX_PARAMETER_DEPTH {
                     return None;
                 }
-                if inner.is_empty() {
-                    "(vacío)".to_owned()
-                } else {
-                    collect_lines(inner, &format!("{key}."), depth + 1, lines)?;
-                    continue;
-                }
+                collect(inner, &format!("{key}."), depth + 1, shown, lines)?;
+                continue;
             }
             Value::Array(items) => {
                 // Elements must be scalars: an array is one level.
                 let mut parts = Vec::with_capacity(items.len());
                 for item in items {
                     parts.push(scalar_text(item)?);
+                    *lines += 1;
                 }
                 if parts.is_empty() {
-                    "(lista vacía)".to_owned()
-                } else {
-                    parts.join(", ")
+                    *lines += 1;
                 }
+                ParameterValue::List(parts)
             }
-            scalar => scalar_text(scalar)?,
+            scalar => {
+                *lines += 1;
+                ParameterValue::Text(scalar_text(scalar)?)
+            }
         };
-        if shown.chars().count() > MAX_PARAMETER_CHARS {
+        if *lines > MAX_PARAMETER_LINES {
             return None;
         }
-        lines.push((key, shown));
-        if lines.len() > MAX_PARAMETER_LINES {
-            return None;
-        }
+        shown.push(Parameter { key, value });
     }
     Some(())
 }
 
 fn scalar_text(value: &serde_json::Value) -> Option<String> {
     use serde_json::Value;
-    Some(match value {
-        Value::String(text) => plain_text(text),
+    let text = match value {
+        Value::String(text) if !is_nfc(text) => return None,
+        Value::String(text) => format!("\"{}\"", unambiguous_text(text).replace('"', "\\\"")),
         Value::Number(number) => number.to_string(),
         Value::Bool(true) => "sí".to_owned(),
         Value::Bool(false) => "no".to_owned(),
         Value::Null => "(nulo)".to_owned(),
         Value::Array(_) | Value::Object(_) => return None,
-    })
+    };
+    (text.chars().count() <= MAX_PARAMETER_CHARS).then_some(text)
 }
 
 /// Journal columns the inbox reads. Evidence JSON is consumed here.
@@ -167,7 +201,7 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
     }
     let expires_at = OffsetDateTime::parse(&challenge.expires_at, &Rfc3339).map_err(|_| ())?;
     let challenge = challenge.clone();
-    let parameters = parameter_lines(&evidence.action.parameters);
+    let parameters = parameters_shown(&evidence.action.parameters);
     let target = evidence.action.target.filter(|target| !target.is_empty());
     Ok(PendingFacts {
         created_at: columns.created_at,
@@ -383,9 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn parameters_are_sorted_lines_within_fixed_limits() {
+    fn parameters_are_sorted_quoted_and_kept_apart_within_fixed_limits() {
         use serde_json::json;
-        let lines = parameter_lines(&json!({
+        let text = |value: &str| ParameterValue::Text(value.to_owned());
+        let shown = parameters_shown(&json!({
             "monto": 100000,
             "cuenta": "cuenta-1",
             "opciones": {"urgente": true, "nota": null},
@@ -393,7 +428,7 @@ mod tests {
             "texto": "x\u{202e}y",
         }))
         .unwrap();
-        let keys: Vec<&str> = lines.iter().map(|(key, _)| key.as_str()).collect();
+        let keys: Vec<&str> = shown.iter().map(|item| item.key.as_str()).collect();
         assert_eq!(
             keys,
             [
@@ -405,30 +440,84 @@ mod tests {
                 "texto"
             ]
         );
-        assert_eq!(lines[2].1, "100000");
-        assert_eq!(lines[1].1, "a, b");
-        assert_eq!(lines[4].1, "sí");
-        assert_eq!(lines[5].1, "x\\u{202e}y");
-        assert_eq!(parameter_lines(&json!({})).unwrap(), Vec::new());
+        assert_eq!(shown[0].value, text("\"cuenta-1\""));
+        assert_eq!(
+            shown[1].value,
+            ParameterValue::List(vec!["\"a\"".into(), "\"b\"".into()])
+        );
+        assert_eq!(shown[2].value, text("100000"));
+        assert_eq!(shown[3].value, text("(nulo)"));
+        assert_eq!(shown[4].value, text("sí"));
+        assert_eq!(shown[5].value, text("\"x\\u{202e}y\""));
+        assert_eq!(parameters_shown(&json!({})).unwrap(), Vec::new());
 
-        // Too many keys, too long, too deep, or not an object: not shown.
+        // Too many lines, too long, too deep, or not an object: not shown.
         let many: serde_json::Map<_, _> = (0..=MAX_PARAMETER_LINES)
             .map(|index| (format!("k{index:02}"), json!(index)))
             .collect();
-        assert!(parameter_lines(&serde_json::Value::Object(many)).is_none());
+        assert!(parameters_shown(&serde_json::Value::Object(many)).is_none());
         let exactly: serde_json::Map<_, _> = (0..MAX_PARAMETER_LINES)
             .map(|index| (format!("k{index:02}"), json!(index)))
             .collect();
-        assert!(parameter_lines(&serde_json::Value::Object(exactly)).is_some());
-        assert!(parameter_lines(&json!({"v": "x".repeat(MAX_PARAMETER_CHARS + 1)})).is_none());
-        assert!(parameter_lines(&json!({"v": "x".repeat(MAX_PARAMETER_CHARS)})).is_some());
+        assert!(parameters_shown(&serde_json::Value::Object(exactly)).is_some());
+        let long_list: Vec<u32> = (0..=MAX_PARAMETER_LINES as u32).collect();
+        assert!(parameters_shown(&json!({ "l": long_list })).is_none());
+        // 198 characters plus the two quotes is the most a text can be.
+        assert!(parameters_shown(&json!({"v": "x".repeat(MAX_PARAMETER_CHARS - 2)})).is_some());
+        assert!(parameters_shown(&json!({"v": "x".repeat(MAX_PARAMETER_CHARS - 1)})).is_none());
         // Escaping counts: 40 bidi characters become 320 visible ones.
-        assert!(parameter_lines(&json!({"v": "\u{202e}".repeat(40)})).is_none());
-        assert!(parameter_lines(&json!({"a": {"b": {"c": 1}}})).is_none());
-        assert!(parameter_lines(&json!({"a": [[1]]})).is_none());
-        assert!(parameter_lines(&json!({"a": [{"b": 1}]})).is_none());
-        assert!(parameter_lines(&json!("texto")).is_none());
-        assert!(parameter_lines(&json!([1, 2])).is_none());
+        assert!(parameters_shown(&json!({"v": "\u{202e}".repeat(40)})).is_none());
+        assert!(parameters_shown(&json!({"a": {"b": {"c": 1}}})).is_none());
+        assert!(parameters_shown(&json!({"a": [[1]]})).is_none());
+        assert!(parameters_shown(&json!({"a": [{"b": 1}]})).is_none());
+        assert!(parameters_shown(&json!("texto")).is_none());
+        assert!(parameters_shown(&json!([1, 2])).is_none());
+    }
+
+    #[test]
+    fn signed_parameters_that_differ_never_look_the_same() {
+        use serde_json::json;
+        let pairs = [
+            (json!({"monto": "10"}), json!({"monto": 10})),
+            (json!({"ok": "sí"}), json!({"ok": true})),
+            (json!({"ok": "no"}), json!({"ok": false})),
+            (json!({"v": "(nulo)"}), json!({"v": null})),
+            (json!({"l": ["a, b"]}), json!({"l": ["a", "b"]})),
+            (json!({"l": "a"}), json!({"l": ["a"]})),
+            (json!({"l": "\"a\", \"b\""}), json!({"l": ["a", "b"]})),
+            (json!({"v": "a\"b"}), json!({"v": "a\\\"b"})),
+            (json!({"v": "\\u{202e}"}), json!({"v": "\u{202e}"})),
+            (json!({"v": "ab"}), json!({"v": "a\u{200b}b"})),
+            (json!({"v": "ab"}), json!({"v": "a\u{feff}b"})),
+            (json!({"v": "ab"}), json!({"v": "a\u{2060}b"})),
+            (json!({"v": "ab"}), json!({"v": "a\u{00ad}b"})),
+            (json!({"v": "a b"}), json!({"v": "a\u{2028}b"})),
+            (json!({"v": "a b"}), json!({"v": "a\u{2029}b"})),
+            (json!({"clave": 1}), json!({"cla\u{200b}ve": 1})),
+            (json!({"v": {}}), json!({"v": "(objeto vacío)"})),
+        ];
+        for (left, right) in pairs {
+            let left_shown = parameters_shown(&left);
+            let right_shown = parameters_shown(&right);
+            assert!(
+                left_shown.is_none() || right_shown.is_none() || left_shown != right_shown,
+                "{left} and {right} look the same"
+            );
+        }
+        // A key with a dot could be read as a nested key: only rejecting.
+        assert!(parameters_shown(&json!({"a.b": 1})).is_none());
+        assert!(parameters_shown(&json!({"a": {"b": 1}})).is_some());
+        assert!(parameters_shown(&json!({"": 1})).is_none());
+        // Escaping is one to one, so escaped keys never collide.
+        assert!(parameters_shown(&json!({"\\u{200b}": 1, "\u{200b}": 1})).is_some());
+        // Keys that repeat once normalized (NFKC, lower case): only rejecting.
+        assert!(parameters_shown(&json!({"monto": 1, "Monto": 2})).is_none());
+        assert!(parameters_shown(&json!({"monto": 1, "\u{ff4d}onto": 2})).is_none());
+        assert!(parameters_shown(&json!({"a": {"x": 1}, "A": {"x": 2}})).is_none());
+        // Not NFC (looks like an NFC text): only rejecting.
+        assert!(parameters_shown(&json!({"v": "caf\u{e9}"})).is_some());
+        assert!(parameters_shown(&json!({"v": "cafe\u{301}"})).is_none());
+        assert!(parameters_shown(&json!({"cafe\u{301}": 1})).is_none());
     }
 
     #[test]

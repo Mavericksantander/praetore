@@ -373,7 +373,7 @@ async fn the_inbox_says_who_what_on_what_and_until_when_in_plain_words() {
     assert_eq!(first["parametros_visibles"], true);
     assert_eq!(
         first["parametros"],
-        json!([{"clave": "nota", "valor": "texto-libre"}])
+        json!([{"clave": "nota", "valor": "\"texto-libre\""}])
     );
     assert!(first.get("nota").is_none());
     assert_eq!(first["puede_ejecutar"], false);
@@ -1019,11 +1019,11 @@ async fn two_requests_that_differ_only_in_the_amount_look_different() {
     assert_ne!(first["parametros"], second["parametros"]);
     assert_eq!(
         first["parametros"],
-        json!([{"clave": "moneda", "valor": "CLP"}, {"clave": "monto", "valor": "10"}])
+        json!([{"clave": "moneda", "valor": "\"CLP\""}, {"clave": "monto", "valor": "10"}])
     );
     assert_eq!(
         second["parametros"],
-        json!([{"clave": "moneda", "valor": "CLP"}, {"clave": "monto", "valor": "100000"}])
+        json!([{"clave": "moneda", "valor": "\"CLP\""}, {"clave": "monto", "valor": "100000"}])
     );
 }
 
@@ -1032,11 +1032,22 @@ async fn parameters_that_do_not_fit_can_only_be_rejected_here() {
     let many: serde_json::Map<String, Value> = (0..21)
         .map(|index| (format!("k{index:02}"), json!(index)))
         .collect();
+    for parameters in [
+        Value::Object(many),
+        json!({"a.b": 1}),
+        json!({"monto": 1, "Monto": 2}),
+        json!({"v": "cafe\u{301}"}),
+    ] {
+        only_rejecting(parameters).await;
+    }
+}
+
+async fn only_rejecting(parameters: Value) {
     let (evidence, json) = pending_evidence_with(
         "borrar_archivo",
         "informe",
         OffsetDateTime::now_utc() + Duration::minutes(10),
-        Value::Object(many),
+        parameters.clone(),
     );
     let gateway = Arc::new(FakeGateway::new(&evidence));
     let app = console(
@@ -1046,7 +1057,7 @@ async fn parameters_that_do_not_fit_can_only_be_rejected_here() {
     );
     let (_, list, _) = json_of(app.clone().oneshot(get("/api/bandeja")).await.unwrap()).await;
     let item = &list["solicitudes"][0];
-    assert_eq!(item["parametros_visibles"], false);
+    assert_eq!(item["parametros_visibles"], false, "{parameters}");
     assert_eq!(item["parametros"], json!([]));
     assert_eq!(item["puede_aprobar"], false);
     assert_eq!(item["puede_rechazar"], true);
@@ -1070,4 +1081,50 @@ async fn parameters_that_do_not_fit_can_only_be_rejected_here() {
     .await;
     assert_eq!(rejected["situacion"], "rechazado");
     assert_eq!(gateway.held(), Held::Rejected);
+}
+
+#[tokio::test]
+async fn texts_numbers_and_lists_are_told_apart_in_the_inbox() {
+    let expires = OffsetDateTime::now_utc() + Duration::minutes(10);
+    let (text, text_json) = pending_evidence_with(
+        "transferir",
+        "cuenta-1",
+        expires,
+        json!({"monto": "10", "etiquetas": "a, b"}),
+    );
+    let (typed, typed_json) = pending_evidence_with(
+        "transferir",
+        "cuenta-1",
+        expires,
+        json!({"monto": 10, "etiquetas": ["a", "b"]}),
+    );
+    let gateway = Arc::new(FakeGateway::new(&text));
+    let app = console(
+        vec![
+            facts_for(&text, text_json, PendingKind::AwaitingApproval),
+            facts_for(&typed, typed_json, PendingKind::AwaitingApproval),
+        ],
+        0,
+        gateway,
+    );
+    let response = app.oneshot(get("/api/bandeja")).await.unwrap();
+    assert_eq!(
+        response.headers().get("referrer-policy").unwrap(),
+        "no-referrer"
+    );
+    let (_, list, _) = json_of(response).await;
+    assert_eq!(
+        list["solicitudes"][0]["parametros"],
+        json!([
+            {"clave": "etiquetas", "valor": "\"a, b\""},
+            {"clave": "monto", "valor": "\"10\""},
+        ])
+    );
+    assert_eq!(
+        list["solicitudes"][1]["parametros"],
+        json!([
+            {"clave": "etiquetas", "lista": ["\"a\"", "\"b\""]},
+            {"clave": "monto", "valor": "10"},
+        ])
+    );
 }

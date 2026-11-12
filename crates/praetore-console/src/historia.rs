@@ -260,17 +260,50 @@ pub fn readable_time(moment: OffsetDateTime) -> String {
 pub fn plain_text(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
-        let bidi = matches!(
-            character,
-            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-        );
-        if character.is_control() || bidi {
-            safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
+        push_inert(&mut safe, character);
+    }
+    safe
+}
+
+/// Like [`plain_text`], and a backslash is shown doubled, so text that
+/// spells out an escape (`\u{202e}`) never looks like the escaped character.
+/// Used in the approvals inbox, where two different signed actions must
+/// never look the same.
+pub fn unambiguous_text(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character == '\\' {
+            safe.push_str("\\\\");
         } else {
-            safe.push(character);
+            push_inert(&mut safe, character);
         }
     }
     safe
+}
+
+/// Control, bidirectional and invisible characters (zero-width space,
+/// BOM, word joiner, soft hyphen, line and paragraph separators) are shown
+/// as `\u{xxxx}`.
+fn push_inert(safe: &mut String, character: char) {
+    let hidden = matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200b}'
+            | '\u{feff}'
+            | '\u{2060}'
+            | '\u{00ad}'
+            | '\u{2028}'
+            | '\u{2029}'
+    );
+    if character.is_control() || hidden {
+        safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
+    } else {
+        safe.push(character);
+    }
 }
 
 pub fn visible_target(facts: &ReceiptFacts) -> String {

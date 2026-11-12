@@ -74,7 +74,7 @@ async function cargar() {
     return;
   }
   if (response.status === 401) {
-    estado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos).";
+    estado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
     return;
   }
   if (!response.ok) {
@@ -209,27 +209,37 @@ function pintarSolicitud(solicitud) {
   // the one signed decision.
   function confirmar(pregunta, textoConfirmar, alConfirmar) {
     acciones.replaceChildren();
-    resultado.textContent = pregunta + " " + resumen();
+    resultado.textContent = "";
+    confirmacion.replaceChildren(resumen(pregunta));
     acciones.append(
       boton(textoConfirmar, "aprobar", alConfirmar),
       boton("Cancelar", "", () => {
-        resultado.textContent = "";
+        confirmacion.replaceChildren();
         pintarDecision();
       }),
     );
   }
 
-  function resumen() {
-    const partes = [solicitud.agente, "quiere hacer " + solicitud.queria, "sobre " + solicitud.sobre];
-    if (solicitud.parametros_visibles) {
-      partes.push(solicitud.parametros.length
-        ? "con " + solicitud.parametros.map((p) => p.clave + ": " + p.valor).join("; ")
-        : "sin parámetros");
-    }
-    return partes.join(", ") + ".";
+  // One line per fact and per parameter, as in the card: nothing is joined
+  // into a sentence where a comma or a colon could be read two ways.
+  function resumen(pregunta) {
+    const caja = document.createElement("div");
+    caja.className = "confirmacion";
+    const titulo = document.createElement("strong");
+    titulo.textContent = pregunta;
+    caja.append(
+      titulo,
+      linea(solicitud.agente),
+      linea("Quiere hacer: " + solicitud.queria),
+      linea("Sobre: " + solicitud.sobre),
+      listaParametros(),
+      linea("Vale hasta: " + solicitud.vale_hasta + " (" + solicitud.queda + ")"),
+    );
+    return caja;
   }
 
   async function aprobarYEjecutar() {
+    confirmacion.replaceChildren();
     bloquear();
     resultado.textContent = "Aprobando…";
     const aprobado = await actuar(solicitud.referencia, "aprobar");
@@ -239,6 +249,7 @@ function pintarSolicitud(solicitud) {
   }
 
   async function rechazar() {
+    confirmacion.replaceChildren();
     bloquear();
     resultado.textContent = "Rechazando…";
     mostrar(await actuar(solicitud.referencia, "rechazar"));
@@ -257,20 +268,35 @@ function pintarSolicitud(solicitud) {
     if (solicitud.puede_ejecutar) acciones.append(botonEjecutar("Ejecutar"));
   }
 
-  const parametros = document.createElement("dl");
-  parametros.className = "parametros";
-  if (solicitud.parametros_visibles) {
-    if (!solicitud.parametros.length) {
-      parametros.append(linea("Sin parámetros"));
-    }
+  // Texts come quoted from the console; a list shows each element apart.
+  function listaParametros() {
+    const parametros = document.createElement("dl");
+    parametros.className = "parametros";
+    if (!solicitud.parametros_visibles) return parametros;
+    if (!solicitud.parametros.length) parametros.append(linea("Sin parámetros"));
     for (const parametro of solicitud.parametros) {
       const clave = document.createElement("dt");
       clave.textContent = parametro.clave;
       const valor = document.createElement("dd");
-      valor.textContent = parametro.valor;
+      if (Array.isArray(parametro.lista)) {
+        const elementos = document.createElement("ol");
+        elementos.className = "lista";
+        if (!parametro.lista.length) valor.textContent = "(lista vacía)";
+        for (const elemento of parametro.lista) {
+          const item = document.createElement("li");
+          item.textContent = elemento;
+          elementos.append(item);
+        }
+        if (parametro.lista.length) valor.append(elementos);
+      } else {
+        valor.textContent = parametro.valor;
+      }
       parametros.append(clave, valor);
     }
+    return parametros;
   }
+
+  const confirmacion = document.createElement("div");
   const nota = document.createElement("p");
   nota.className = "nota";
   if (solicitud.nota) nota.textContent = solicitud.nota;
@@ -281,10 +307,11 @@ function pintarSolicitud(solicitud) {
     linea(solicitud.agente),
     linea("Quiere hacer: " + solicitud.queria),
     linea("Sobre: " + solicitud.sobre),
-    parametros,
+    listaParametros(),
     linea("Vale hasta: " + solicitud.vale_hasta + " (" + solicitud.queda + ")"),
     linea("Pedida: " + solicitud.pedida),
     nota,
+    confirmacion,
     acciones,
     resultado,
   );
@@ -308,7 +335,7 @@ async function cargarBandeja() {
   }
   if (response.status === 401) {
     solicitudes.replaceChildren();
-    bandejaEstado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos).";
+    bandejaEstado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
     return;
   }
   if (!response.ok || !data) {

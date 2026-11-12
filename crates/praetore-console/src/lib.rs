@@ -219,14 +219,6 @@ impl ConsoleState {
         format!("http://{}/?abrir={code}", self.address)
     }
 
-    /// Someone without a session asked for the page: if no link is live,
-    /// print a new one to the terminal (never to the requester).
-    fn reissue_link(&self) {
-        if let Some(code) = self.opener.reissue_if_needed() {
-            (self.printer)(&self.link_for(code));
-        }
-    }
-
     pub fn with_inbox(mut self, inbox: Inbox) -> Self {
         self.inbox = Some(inbox);
         self
@@ -440,12 +432,12 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             queria: if facts.wanted.is_empty() {
                 "no se muestra".to_owned()
             } else {
-                historia::plain_text(&facts.wanted)
+                historia::unambiguous_text(&facts.wanted)
             },
             sobre: facts
                 .target
                 .as_deref()
-                .map(historia::plain_text)
+                .map(historia::unambiguous_text)
                 .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
             vale_hasta: readable_deadline(facts.expires_at),
             queda: time_left(facts.expires_at, now),
@@ -453,9 +445,17 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
                 .parameters
                 .iter()
                 .flatten()
-                .map(|(clave, valor)| ParameterView {
-                    clave: clave.clone(),
-                    valor: valor.clone(),
+                .map(|parameter| match &parameter.value {
+                    bandeja::ParameterValue::Text(valor) => ParameterView {
+                        clave: parameter.key.clone(),
+                        valor: Some(valor.clone()),
+                        lista: None,
+                    },
+                    bandeja::ParameterValue::List(lista) => ParameterView {
+                        clave: parameter.key.clone(),
+                        valor: None,
+                        lista: Some(lista.clone()),
+                    },
                 })
                 .collect(),
             parametros_visibles: facts.parameters.is_some(),
@@ -618,31 +618,18 @@ struct OpenQuery {
 
 /// The page itself holds no secret. The session cookie is set only when the
 /// request carries a live opening code, which is then consumed; the browser
-/// is sent to `/` so the code leaves the address bar. A request without a
-/// session makes the console print a new link to its terminal when none is
-/// live; the requester never sees it.
+/// is sent to `/` so the code leaves the address bar. Asking for the page
+/// never issues a link: only the operator does (see `issue_opening_link`).
 async fn index(
     State(state): State<Arc<ConsoleState>>,
-    headers: HeaderMap,
     query: Result<Query<OpenQuery>, QueryRejection>,
 ) -> Response {
     let offered = query.ok().and_then(|Query(query)| query.abrir);
-    let has_session = state.session.accepts(
-        headers
-            .get(header::COOKIE)
-            .and_then(|value| value.to_str().ok()),
-    );
     let Some(offered) = offered else {
-        if !has_session {
-            state.reissue_link();
-        }
         return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
     };
     if !state.opener.redeem(&offered) {
         tracing::warn!(failure = "opening_code", "console opening link refused");
-        if !has_session {
-            state.reissue_link();
-        }
         return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
     }
     let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
@@ -749,16 +736,25 @@ struct InboxItemView {
 #[derive(Serialize)]
 struct ParameterView {
     clave: String,
-    valor: String,
+    /// A text (quoted), a number, `sí`/`no`, `(nulo)` or `(objeto vacío)`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    valor: Option<String>,
+    /// A list, each element apart (possibly empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lista: Option<Vec<String>>,
 }
 
-const PARAMETERS_TOO_BIG: &str = "Los parámetros de esta solicitud no caben en la bandeja (más de 20 claves, valores de más de 200 caracteres o más de 2 niveles). Aquí solo se puede rechazar; para revisarla completa y aprobarla usa praetore approve en la terminal.";
+const PARAMETERS_TOO_BIG: &str = "Los parámetros de esta solicitud no se pueden mostrar aquí sin ambigüedad (más de 20 líneas, valores de más de 200 caracteres, más de 2 niveles, claves con punto o repetidas, o texto Unicode no normalizado). Aquí solo se puede rechazar; para revisarla completa y aprobarla usa praetore approve en la terminal.";
 
 fn set_security_headers(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
@@ -1040,8 +1036,9 @@ mod tests {
         let refused = app.clone().oneshot(request(&path, None)).await.unwrap();
         assert_eq!(refused.status(), StatusCode::OK);
         assert!(refused.headers().get(header::SET_COOKIE).is_none());
-        // The link was issued a moment ago, so no new one is printed yet
-        // (at most one every few seconds); nothing reaches the page.
+        // Asking for the page never issues a link; nothing reaches the page.
+        let plain = app.clone().oneshot(request("/", None)).await.unwrap();
+        assert!(plain.headers().get(header::SET_COOKIE).is_none());
         assert_eq!(printed.lock().unwrap().len(), 1);
         assert!(!body_text(refused).await.contains("abrir="));
 

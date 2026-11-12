@@ -15,9 +15,6 @@ pub const COOKIE_NAME: &str = "praetore_consola";
 
 /// The longest an opening link is valid.
 pub const MAX_OPENING_TTL: Duration = Duration::from_secs(5 * 60);
-/// A new link is printed at most this often when someone asks for the page
-/// without a session.
-const REISSUE_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct LocalSession {
     secret: [u8; 32],
@@ -115,7 +112,6 @@ pub struct Opener {
 #[derive(Default)]
 struct OpenerState {
     current: Option<(String, Instant)>,
-    last_issued: Option<Instant>,
 }
 
 impl Opener {
@@ -130,29 +126,8 @@ impl Opener {
     pub fn issue(&self) -> Option<String> {
         let code = crate::bandeja::random_code()?;
         let mut state = self.state.lock().ok()?;
-        let now = Instant::now();
-        state.current = Some((code.clone(), now));
-        state.last_issued = Some(now);
+        state.current = Some((code.clone(), Instant::now()));
         Some(code)
-    }
-
-    /// A new code when none is valid and none was issued in the last few
-    /// seconds; otherwise `None` (the operator already has a live link).
-    pub fn reissue_if_needed(&self) -> Option<String> {
-        {
-            let state = self.state.lock().ok()?;
-            let live = state
-                .current
-                .as_ref()
-                .is_some_and(|(_, issued)| issued.elapsed() < self.ttl);
-            let recent = state
-                .last_issued
-                .is_some_and(|issued| issued.elapsed() < REISSUE_INTERVAL);
-            if live || recent {
-                return None;
-            }
-        }
-        self.issue()
     }
 
     /// Consumes the code: true at most once, and only before it expires.
@@ -203,12 +178,11 @@ mod tests {
         // The TTL is capped at five minutes.
         assert_eq!(Opener::new(Duration::from_secs(3600)).ttl, MAX_OPENING_TTL);
 
-        // A live link is not replaced by someone asking for the page.
+        // A new code replaces the earlier one.
         let opener = Opener::new(Duration::from_secs(60));
-        let live = opener.issue().unwrap();
-        assert!(opener.reissue_if_needed().is_none());
-        assert!(opener.redeem(&live));
-        // Just issued: no new one for a few seconds even though it was used.
-        assert!(opener.reissue_if_needed().is_none());
+        let old = opener.issue().unwrap();
+        let new = opener.issue().unwrap();
+        assert!(!opener.redeem(&old));
+        assert!(opener.redeem(&new));
     }
 }

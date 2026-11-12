@@ -211,14 +211,22 @@
   `PRAETORE_CONSOLE_APPROVER_KEY_ID`, `PRAETORE_CONSOLE_APPROVER_KEY_FILE`
   and `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE` (owner-only files, the
   `approver.key` / `approver-api.token` formats of `praetore init`) the
-  console lists the requests held for approval, read from the journal with
-  its read-only connection, and lets the operator approve, reject, or run
-  the single dispatch of an approved request. Each request shows who, what,
-  on what, until when, and its parameters as sorted `clave: valor` lines
-  (at most 20 keys, 200 characters per value, 2 levels, control and bidi
-  characters escaped); a request whose parameters do not fit can only be
-  rejected in the console, and approved with `praetore approve`. Approve
-  and reject take a confirmation in the same card. The console signs on
+  console lists the requests held for approval and lets the operator
+  approve, reject, or run the single dispatch of an approved request. It
+  reads the journal through `PRAETORE_CONSOLE_DATABASE_URL`, which in the
+  tested setup is the gateway's runtime role: the reads run in
+  transactions the console opens read only (per session, not by
+  privilege), under the tenant's row-level security. Each request shows
+  who, what, on what, until when, and its parameters with keys sorted:
+  texts quoted, numbers as written, each list element apart, and control,
+  bidirectional and invisible characters (U+200B, U+FEFF, U+2060, U+00AD,
+  U+2028, U+2029) escaped, so two different signed actions do not look the
+  same. A request whose parameters do not fit (more than 20 lines, 200
+  characters per value or 2 levels) or could be read two ways (a key with
+  a dot, keys that repeat once normalized, text not in Unicode NFC) can
+  only be rejected in the console, also server side, and approved with
+  `praetore approve`. Approve and reject take a confirmation in the same
+  card that repeats the parameters and the deadline. The console signs on
   this computer, as `praetore approve` does, only after it checks that the
   gateway challenge is the one rebuilt from the journal evidence it read;
   it checks that evidence's integrity hash, not its attester signature. The
@@ -237,9 +245,11 @@
   ignored, with a warning); a cookie from an earlier run stops working. At
   startup the console writes `http://<bind>/?abrir=<code>` to stderr; under
   systemd that is the journal, readable by whoever reads it. The link works
-  once and for at most five minutes; asking for the page without a session
-  prints a new link to stderr when none is live (never to the requester).
-  `/` alone no longer sets the cookie. Every request must carry the
+  once and for at most five minutes. A new link is issued only by the
+  operator (Enter in the console's terminal, when stdin and stderr are a
+  terminal, or a restart); asking for the page never issues one. `/` alone
+  no longer sets the cookie, and responses carry `Referrer-Policy:
+  no-referrer`. Every request must carry the
   console's own `Host` (DNS rebinding). Agent-chosen text is shown with
   control and bidirectional characters escaped. Action: open the printed
   link after each start.

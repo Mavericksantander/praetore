@@ -1,15 +1,18 @@
 //! `praetore-console`: local operator console. Linux first.
 //!
 //! Required: `PRAETORE_CONSOLE_TENANT_ID`, `PRAETORE_CONSOLE_DATABASE_URL`
-//! (read-only journal access). Optional: `PRAETORE_CONSOLE_BIND` (loopback
+//! (the journal is read in transactions opened read only by the console).
+//! Optional: `PRAETORE_CONSOLE_BIND` (loopback
 //! only, default `127.0.0.1:8090`), `PRAETORE_CONSOLE_AGENT_NAMES_FILE`.
 //!
 //! Opening: at startup the console writes a link `http://<bind>/?abrir=<code>`
 //! to stderr. Under systemd stderr goes to the journal, so whoever can read
 //! that journal can open the console while the link is live. The link works
-//! once and for at most five minutes; asking for the page without a session
-//! prints a new one when none is live. The session secret is new on every
-//! start and is never written to disk.
+//! once and for at most five minutes. A new link is issued only by the
+//! operator: when stdin and stderr are a terminal, pressing Enter there
+//! writes a new one (and the earlier one stops working); otherwise, restart
+//! the console. Asking for the page never issues a link. The session secret
+//! is new on every start and is never written to disk.
 //!
 //! Approvals inbox (D2), all four or none:
 //! - `PRAETORE_CONSOLE_GATEWAY_URL`: `http://127.0.0.1:<port>` of the gateway;
@@ -24,6 +27,7 @@ use praetore_console::{
     parse_agent_names, parse_gateway_address, read_token_file, validate_bind_address,
 };
 use praetore_replay_postgres::{DatabaseConnector, RuntimeRoleOptions, verify_runtime_role_with};
+use std::io::IsTerminal;
 use std::{
     collections::HashMap, env, fs, future::IntoFuture, net::SocketAddr, path::PathBuf, sync::Arc,
 };
@@ -89,6 +93,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state
         .issue_opening_link()
         .ok_or("no se pudo crear el enlace de apertura de la consola")?;
+    // A new link only by the operator's hand: Enter in this terminal.
+    if std::io::stdin().is_terminal() && std::io::stderr().is_terminal() {
+        eprintln!("Para un enlace nuevo, pulsa Enter en esta terminal.");
+        let operator = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                if line.is_err() || operator.issue_opening_link().is_none() {
+                    break;
+                }
+            }
+        });
+    }
     let served = runtime.block_on(
         axum::serve(listener, ConsoleState::router_from(Arc::clone(&state))).into_future(),
     );
