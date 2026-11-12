@@ -209,6 +209,11 @@ impl StorageRecord {
         {
             return Err(record_error("record_hash does not match"));
         }
+        // One textual form per signature: the chain link hashes this text,
+        // so uppercase or mixed-case hex is refused, as for receipts.
+        if !crate::canonical::is_canonical_signature_hex(&self.signature) {
+            return Err(record_error("signature is not canonical lowercase hex"));
+        }
         let signature = hex::decode(&self.signature).map_err(|_| record_error("bad signature"))?;
         attester
             .verify_domain_message(STORAGE_RECORD_DOMAIN, &bytes, &signature)
@@ -255,6 +260,40 @@ pub(crate) mod tests {
         assert!(record.verify(&other.public_key().unwrap()).is_err());
         let extra = record.to_json().unwrap().replacen('{', "{\"extra\":1,", 1);
         assert!(StorageRecord::from_json(&extra).is_err());
+    }
+
+    #[test]
+    fn non_canonical_signature_hex_is_refused() {
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[7; 32]);
+        let pin = attester.public_key().unwrap();
+        let record = sample_record(&attester);
+        record.verify(&pin).unwrap();
+        // The same signature bytes in uppercase or mixed case decode to the
+        // same value, but only the lowercase text is accepted.
+        let mut upper = record.clone();
+        upper.signature = record.signature.to_uppercase();
+        assert_ne!(upper.signature, record.signature);
+        let mut mixed = record.clone();
+        let position = record
+            .signature
+            .find(|c: char| c.is_ascii_lowercase())
+            .expect("a hex letter");
+        mixed.signature.replace_range(
+            position..=position,
+            &record.signature[position..=position].to_uppercase(),
+        );
+        for altered in [upper, mixed] {
+            assert_eq!(
+                hex::decode(&altered.signature).unwrap(),
+                hex::decode(&record.signature).unwrap()
+            );
+            let error = altered.verify(&pin).unwrap_err();
+            assert!(
+                error.to_string().contains("not canonical lowercase hex"),
+                "{error}"
+            );
+            assert_eq!(error.code(), "EVIDENCE_FAIL");
+        }
     }
 
     #[test]

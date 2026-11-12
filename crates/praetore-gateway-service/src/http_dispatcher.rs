@@ -1,7 +1,7 @@
 use praetore_core::{Action, Authority, canonical::parse_json_rejecting_duplicates};
 use praetore_gateway::{
-    ActionDispatcher, DispatchError, DispatchReport, ExecutionKey, ReconciliationReport,
-    action_digest, authority_tenant_id,
+    ActionDispatcher, DispatchError, DispatchRefused, DispatchReport, ExecutionKey,
+    ReconciliationReport, action_digest, authority_tenant_id,
 };
 use reqwest::{
     Url,
@@ -141,7 +141,38 @@ impl HttpActionDispatcher {
     }
 }
 
+impl HttpActionDispatcher {
+    /// The checks that need no network access: the configured route for the
+    /// verified tenant, action type and target, the route's capability, and
+    /// the request size. Returns the route and the request body.
+    fn admit(
+        &self,
+        tenant_id: Uuid,
+        action: &Action,
+    ) -> Result<(&Route, Vec<u8>), DispatchRefused> {
+        let target = action
+            .target
+            .clone()
+            .ok_or(DispatchRefused::terminal("route_not_configured"))?;
+        let route = self
+            .routes
+            .get(&(tenant_id, action.action_type.clone(), target))
+            .ok_or(DispatchRefused::terminal("route_not_configured"))?;
+        if action.capability.as_deref() != Some(route.capability.as_str()) {
+            return Err(DispatchRefused::terminal("capability_mismatch"));
+        }
+        let request_body = serde_json::to_vec(&action.parameters)
+            .map_err(|_| DispatchRefused::terminal("invalid_parameters"))?;
+        if request_body.len() > MAX_ACTION_BYTES {
+            return Err(DispatchRefused::terminal("request_too_large"));
+        }
+        Ok((route, request_body))
+    }
+}
+
 impl ActionDispatcher for HttpActionDispatcher {
+    /// Every refusal before the request is sent is `NotApplied`: nothing
+    /// reached the network. Only errors after that point are `Ambiguous`.
     fn dispatch(
         &self,
         key: ExecutionKey,
@@ -149,29 +180,17 @@ impl ActionDispatcher for HttpActionDispatcher {
         action: &Action,
         expected_digest: &str,
     ) -> Result<DispatchReport, DispatchError> {
-        if action_digest(action).map_err(|_| DispatchError::Ambiguous)? != expected_digest {
-            return Err(DispatchError::Ambiguous);
+        let refused = |reason| DispatchError::NotApplied(DispatchRefused::terminal(reason));
+        if action_digest(action).map_err(|_| refused("invalid_action"))? != expected_digest {
+            return Err(refused("action_digest_mismatch"));
         }
-        let tenant_id = authority_tenant_id(authority).ok_or(DispatchError::Ambiguous)?;
+        let tenant_id = authority_tenant_id(authority).ok_or(refused("tenant_identity_invalid"))?;
         if key.tenant_id != tenant_id {
-            return Err(DispatchError::Ambiguous);
+            return Err(refused("execution_key_mismatch"));
         }
-        let route = self
-            .routes
-            .get(&(
-                tenant_id,
-                action.action_type.clone(),
-                action.target.clone().ok_or(DispatchError::Ambiguous)?,
-            ))
-            .ok_or(DispatchError::Ambiguous)?;
-        if action.capability.as_deref() != Some(route.capability.as_str()) {
-            return Err(DispatchError::Ambiguous);
-        }
-        let request_body =
-            serde_json::to_vec(&action.parameters).map_err(|_| DispatchError::Ambiguous)?;
-        if request_body.len() > MAX_ACTION_BYTES {
-            return Err(DispatchError::Ambiguous);
-        }
+        let (route, request_body) = self
+            .admit(tenant_id, action)
+            .map_err(DispatchError::NotApplied)?;
 
         let idempotency_key = format!("{tenant_id}:{}:{}", key.agent_id, key.request_id);
         let mut request = self
@@ -227,6 +246,15 @@ impl ActionDispatcher for HttpActionDispatcher {
         _action_digest: &str,
     ) -> ReconciliationReport {
         ReconciliationReport::Unknown
+    }
+
+    /// The same checks as `dispatch` before the network, so an action this
+    /// adapter cannot send is refused before it is dispatched or held for
+    /// approval.
+    fn preflight(&self, authority: &Authority, action: &Action) -> Result<(), DispatchRefused> {
+        let tenant_id = authority_tenant_id(authority)
+            .ok_or(DispatchRefused::terminal("tenant_identity_invalid"))?;
+        self.admit(tenant_id, action).map(drop)
     }
 }
 
@@ -415,40 +443,56 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn not_applied(reason: &'static str) -> Result<DispatchReport, DispatchError> {
+        Err(DispatchError::NotApplied(DispatchRefused::terminal(reason)))
+    }
+
+    fn key(tenant: u128) -> ExecutionKey {
+        ExecutionKey {
+            tenant_id: Uuid::from_u128(tenant),
+            agent_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+        }
+    }
+
+    /// The endpoint does not resolve: a request that reached the network
+    /// would fail as `Ambiguous`, never as `NotApplied`.
     #[test]
     fn refuses_unconfigured_or_mismatched_actions_before_network_access() {
         let dispatcher =
             HttpActionDispatcher::from_json(&route_config("https://orders.internal/v1/orders"))
                 .unwrap();
+        let tenant = authority(Some(&Uuid::from_u128(10).to_string()));
+        let other_tenant = authority(Some(&Uuid::from_u128(11).to_string()));
         let matching_action = action();
+        assert!(dispatcher.preflight(&tenant, &matching_action).is_ok());
         assert_eq!(
             dispatcher.dispatch(
-                ExecutionKey {
-                    tenant_id: Uuid::from_u128(11),
-                    agent_id: Uuid::new_v4(),
-                    request_id: Uuid::new_v4(),
-                },
-                &authority(Some(&Uuid::from_u128(10).to_string())),
+                key(11),
+                &tenant,
                 &matching_action,
                 &action_digest(&matching_action).unwrap(),
             ),
-            Err(DispatchError::Ambiguous)
+            not_applied("execution_key_mismatch")
         );
-        let mut changed_action = action();
-        changed_action.capability = Some("orders:admin".into());
-        let digest = action_digest(&changed_action).unwrap();
+        assert_eq!(
+            dispatcher.dispatch(key(10), &tenant, &matching_action, &"0".repeat(64)),
+            not_applied("action_digest_mismatch")
+        );
+
+        // No route for this tenant, action type and target.
+        assert_eq!(
+            dispatcher.preflight(&other_tenant, &matching_action),
+            Err(DispatchRefused::terminal("route_not_configured"))
+        );
         assert_eq!(
             dispatcher.dispatch(
-                ExecutionKey {
-                    tenant_id: Uuid::from_u128(10),
-                    agent_id: Uuid::new_v4(),
-                    request_id: Uuid::new_v4(),
-                },
-                &authority(Some(&Uuid::from_u128(10).to_string())),
-                &changed_action,
-                &digest,
+                key(11),
+                &other_tenant,
+                &matching_action,
+                &action_digest(&matching_action).unwrap(),
             ),
-            Err(DispatchError::Ambiguous)
+            not_applied("route_not_configured")
         );
         let unconfigured = Action::new(
             "orders:delete",
@@ -457,19 +501,80 @@ mod tests {
         )
         .unwrap()
         .with_capability("orders:write");
+        let no_target = Action::new("orders:create", None, json!({"amount": 1}))
+            .unwrap()
+            .with_capability("orders:write");
+        for unrouted in [&unconfigured, &no_target] {
+            assert_eq!(
+                dispatcher.preflight(&tenant, unrouted),
+                Err(DispatchRefused::terminal("route_not_configured"))
+            );
+            assert_eq!(
+                dispatcher.dispatch(
+                    key(10),
+                    &tenant,
+                    unrouted,
+                    &action_digest(unrouted).unwrap()
+                ),
+                not_applied("route_not_configured")
+            );
+        }
+
+        // A capability other than the route's.
+        let mut changed_action = action();
+        changed_action.capability = Some("orders:admin".into());
+        assert_eq!(
+            dispatcher.preflight(&tenant, &changed_action),
+            Err(DispatchRefused::terminal("capability_mismatch"))
+        );
         assert_eq!(
             dispatcher.dispatch(
-                ExecutionKey {
-                    tenant_id: Uuid::from_u128(10),
-                    agent_id: Uuid::new_v4(),
-                    request_id: Uuid::new_v4(),
-                },
-                &authority(Some(&Uuid::from_u128(11).to_string())),
-                &unconfigured,
-                &action_digest(&unconfigured).unwrap(),
+                key(10),
+                &tenant,
+                &changed_action,
+                &action_digest(&changed_action).unwrap(),
             ),
+            not_applied("capability_mismatch")
+        );
+
+        // Parameters larger than 64 KiB once serialized. `Action::new`
+        // refuses them, so they are set directly.
+        let mut large = action();
+        large.parameters = json!({"note": "x".repeat(MAX_ACTION_BYTES)});
+        assert_eq!(
+            dispatcher.preflight(&tenant, &large),
+            Err(DispatchRefused::terminal("request_too_large"))
+        );
+        assert!(matches!(
+            dispatcher.dispatch(key(10), &tenant, &large, &"0".repeat(64)),
+            Err(DispatchError::NotApplied(refusal)) if !refusal.is_transient()
+        ));
+    }
+
+    /// Once the request may have been sent, a failure stays `Ambiguous`.
+    #[test]
+    fn failure_after_the_request_is_sent_stays_ambiguous() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let dispatcher =
+            HttpActionDispatcher::from_json(&route_config(&format!("http://{address}/v1/orders")))
+                .unwrap();
+        let tenant = authority(Some(&Uuid::from_u128(10).to_string()));
+        let action = action();
+        assert!(dispatcher.preflight(&tenant, &action).is_ok());
+        assert_eq!(
+            dispatcher.dispatch(key(10), &tenant, &action, &action_digest(&action).unwrap()),
             Err(DispatchError::Ambiguous)
         );
+        server.join().unwrap();
     }
 
     #[test]
@@ -556,7 +661,11 @@ mod tests {
         };
         assert_eq!(
             dispatcher.dispatch(key, &authority(None), &action, &digest),
-            Err(DispatchError::Ambiguous)
+            not_applied("tenant_identity_invalid")
+        );
+        assert_eq!(
+            dispatcher.preflight(&authority(None), &action),
+            Err(DispatchRefused::terminal("tenant_identity_invalid"))
         );
 
         let tenant = Uuid::from_u128(10).to_string();
@@ -569,7 +678,11 @@ mod tests {
             ));
         assert_eq!(
             dispatcher.dispatch(key, &duplicate_tenant, &action, &digest),
-            Err(DispatchError::Ambiguous)
+            not_applied("tenant_identity_invalid")
+        );
+        assert_eq!(
+            dispatcher.preflight(&duplicate_tenant, &action),
+            Err(DispatchRefused::terminal("tenant_identity_invalid"))
         );
     }
 }

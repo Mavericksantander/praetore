@@ -366,6 +366,12 @@ responses are bounded to 64 KiB. Configured bearer credentials are read from
 the named process environment variable and never accepted from the agent.
 Requests have a 10-second timeout and carry a tenant-scoped
 `Idempotency-Key` based on the verified tenant, agent, and request IDs.
+An action with no route for its verified tenant, action type and target,
+with a capability other than the route's, or with parameters over 64 KiB is
+refused before any request is sent: at submission by the adapter's
+`preflight` (403 `action_not_dispatchable`, signed `dispatch_refused`, never
+held for approval), and at dispatch as `NotApplied` (signed `failed` with the
+class `no_effect`).
 An HTTP success response is recorded as `Executed`, not `Confirmed`; an
 adapter timeout or non-success response is ambiguous and is never retried
 automatically. This adapter cannot query downstream operation status, so an
@@ -465,7 +471,12 @@ Production infrastructure must ensure protected tool credentials are absent
 from agent workloads and deny agent egress to protected APIs, allowing access
 only to the gateway. The repository includes a reference
 [Kubernetes NetworkPolicy set](../deploy/kubernetes/mandatory-enforcement.yaml)
-for separately networked agent, gateway, data, and tool workloads. Adapt its
+for separately networked agent, gateway, data, and tool workloads. It starts
+each namespace it writes policies for from a default-deny of ingress and
+egress for every pod (`podSelector: {}`), and the allows add to that
+floor. The gateway proxy may
+reach protected tools, cluster DNS and public HTTPS addresses; protected
+tools get no egress from the template (add what each tool needs). Adapt its
 selectors and ports to the cluster, use a CNI that enforces NetworkPolicy, and
 ensure no additional policy re-allows direct agent egress. Kubernetes
 NetworkPolicies are additive; this example does not override another policy
@@ -672,12 +683,18 @@ The HTTP flow is:
    against the engine clock and moves `approved_pending_dispatch` to
    `dispatched` only if exactly one row changes. Only then is the adapter
    invoked; the response is the signed receipt. A concurrent or repeated claim
-   gets 409. If the window closed first, or revalidation fails terminally
-   (for example the authority was revoked), the execution is closed as
-   `not_dispatched` with a signed attestation (schema version 3) whose
-   `not_dispatched_reason` is `approved_claim_expired` (the window closed
-   before the claim) or `dispatch_failed`. Rows closed before migration 0022
-   carry `approval_expired` for the first case.
+   gets 409. If the window closed before the claim, that `POST .../dispatch`
+   answers HTTP 410 with `{"code": "approval_expired"}`. The execution is
+   closed as `not_dispatched` with a signed attestation (schema version 3)
+   whose `not_dispatched_reason` is `approved_claim_expired`. Those strings
+   name different places for the same late claim: `approval_expired` is the
+   `code` field of that 410 body on
+   `POST /v1/approvals/{tenant_id}/{agent_id}/{request_id}/dispatch`;
+   `approved_claim_expired` is the signed close, the `not_dispatched_reason`
+   on the execution attestation and on the journal row. A terminal
+   revalidation failure that is not expiry (for example the authority was
+   revoked) closes with `dispatch_failed` instead. Rows closed before
+   migration 0022 carry `approval_expired` as that signed reason.
    Transient failures (trusted clock, freshness source or replay storage
    unavailable, HTTP 503) leave it `approved_pending_dispatch`, so the
    dispatch can be requested again while the window is open.

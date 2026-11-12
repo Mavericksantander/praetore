@@ -50,10 +50,18 @@ fn attester() -> EvidenceAttesterKey {
 }
 
 fn receipt(index: u8) -> Evidence {
+    receipt_for_tenant(index, None)
+}
+
+/// A receipt whose issuer-signed authority names `tenant` (or no tenant).
+fn receipt_for_tenant(index: u8, tenant: Option<uuid::Uuid>) -> Evidence {
     let agent_key = AgentKeyPair::from_secret_bytes(&[1; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[2; 32]);
     let agent = agent_key.identity(AgentId::new());
     let mut authority = Authority::new(agent.id.clone(), "test-issuer", vec!["data:read".into()]);
+    if let Some(tenant) = tenant {
+        authority = authority.with_constraint("tenant_id", tenant.to_string());
+    }
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
     let action = Action::new("read_data", Some("db".into()), json!({ "row": index }))
         .unwrap()
@@ -409,7 +417,15 @@ fn database_journal_and_tenant_reference_verify() {
         );
         let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(summary["details"]["kind"], "tenant");
-        assert_eq!(summary["details"]["database_head_verified"], true);
+        // The reference matches the given database head; it is anchored
+        // only when that head was given as a value.
+        assert_eq!(summary["details"]["database_head_consistent"], true);
+        assert_eq!(
+            summary["details"]["database_head_anchored"],
+            reference[0] == "--expected-database-head",
+            "{reference:?}"
+        );
+        assert!(summary["details"].get("database_head_verified").is_none());
         assert_eq!(
             summary["details"]["database_head"]["head"],
             database_head.head.to_hex()
@@ -664,6 +680,235 @@ fn policy_is_refused_for_a_database_journal() {
     assert!(output.status.success());
     let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(summary["details"]["policy_verified"], false);
+}
+
+/// T-016: without --expected-head the journal command warns that the head
+/// is not anchored (stderr and details.warnings); --require-anchored then
+/// fails with JOURNAL_NOT_ANCHORED. With an anchored head there is no
+/// warning and the flag passes.
+#[test]
+fn unanchored_chain_warns_and_require_anchored_fails() {
+    let fx = Fixture::new();
+    let path = fx.dir.write("unanchored.jsonl", &fx.text);
+    let run_journal = |extra: &[&str]| {
+        let mut args = vec!["journal", "--journal", &path, "--attester-pin", &fx.pin];
+        args.extend(extra.iter().copied());
+        args.extend(["--format", "json"]);
+        run_verify(&args)
+    };
+    let warnings = |summary: &Value| -> Vec<String> {
+        summary["details"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // No anchor: verifies, with the warning.
+    let output = run_journal(&[]);
+    assert!(output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let found = warnings(&summary);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].starts_with("head_not_anchored"), "{found:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("journal: warning: head_not_anchored"),
+        "{stderr}"
+    );
+
+    // A truncated chain verifies too, with the same warning; it is what the
+    // warning is about.
+    let truncated = fx.dir.write("truncated.jsonl", join(&fx.lines()[..3]));
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &truncated,
+        "--attester-pin",
+        &fx.pin,
+        "--format",
+        "json",
+    ]);
+    assert!(output.status.success());
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(warnings(&summary)[0].starts_with("head_not_anchored"));
+
+    // --require-anchored without an anchor: exit 1, JOURNAL_NOT_ANCHORED.
+    let output = run_journal(&["--require-anchored"]);
+    assert_rejected(&output, "JOURNAL_NOT_ANCHORED");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("head is not anchored"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // ...but a broken chain still fails for what is broken.
+    let mut lines = fx.lines();
+    lines.remove(1);
+    let broken = fx.dir.write("broken.jsonl", join(&lines));
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &broken,
+        "--attester-pin",
+        &fx.pin,
+        "--require-anchored",
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "JOURNAL_CHAIN_FAIL");
+
+    // Anchored: no warning, and --require-anchored passes.
+    let head = fx.expected();
+    for extra in [
+        vec!["--expected-head", head.as_str()],
+        vec!["--expected-head", head.as_str(), "--require-anchored"],
+    ] {
+        let output = run_journal(&extra);
+        assert!(
+            output.status.success(),
+            "{extra:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(warnings(&summary).is_empty(), "{summary}");
+        assert_eq!(summary["details"]["expected_head_verified"], true);
+        assert!(output.stderr.is_empty());
+    }
+
+    // Given twice, or to another command, the flag is a usage error.
+    assert_rejected_usage(&run_journal(&["--require-anchored", "--require-anchored"]));
+    let receipt = fx
+        .dir
+        .write("receipt.json", fx.receipts[0].to_json().unwrap());
+    assert_rejected_usage(&run_verify(&[
+        "evidence",
+        "--evidence",
+        &receipt,
+        "--attester-pin",
+        &fx.pin,
+        "--require-anchored",
+        "--format",
+        "json",
+    ]));
+}
+
+fn assert_rejected_usage(output: &Output) {
+    assert_ne!(output.status.code(), Some(0));
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["code"], "USAGE");
+}
+
+/// T-016: the journal command reports the tenant that every receipt's
+/// signed authority names, and refuses a chain whose receipts name more
+/// than one tenant (or a tenant and none). The shared producer refuses to
+/// build such a chain as well.
+#[test]
+fn tenant_chain_reports_its_tenant_and_refuses_a_second_one() {
+    let fx = Fixture::new();
+    let tenant_a = uuid::Uuid::from_u128(0xa);
+    let tenant_b = uuid::Uuid::from_u128(0xb);
+    let key = attester().public_key().unwrap();
+    let path = |name: &str, text: &str| fx.dir.write(name, text);
+    let verify = |file: &str| {
+        run_verify(&[
+            "journal",
+            "--journal",
+            file,
+            "--attester-pin",
+            &fx.pin,
+            "--format",
+            "json",
+        ])
+    };
+
+    // One tenant: reported.
+    let receipts: Vec<_> = (0..3)
+        .map(|i| receipt_for_tenant(i, Some(tenant_a)))
+        .collect();
+    let (text, _) = chain(&receipts);
+    let output = verify(&path("a.jsonl", &text));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["tenant_id"], tenant_a.to_string());
+
+    // No tenant in any receipt: null.
+    let summary: Value =
+        serde_json::from_slice(&verify(&path("none.jsonl", &fx.text)).stdout).unwrap();
+    assert_eq!(summary["ok"], true);
+    assert!(summary["details"]["tenant_id"].is_null());
+
+    // A second tenant, or a receipt without one, linked correctly: refused
+    // at the line that changes tenant.
+    for (name, other) in [("b", Some(tenant_b)), ("unscoped", None)] {
+        let mixed = [
+            receipts[0].clone(),
+            receipts[1].clone(),
+            receipt_for_tenant(9, other),
+        ];
+        let mut text = String::new();
+        let mut prev = "0".repeat(64);
+        for (seq, evidence) in mixed.iter().enumerate() {
+            let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+            text.push_str(
+                &json!({ "seq": seq, "prev": prev, "evidence": evidence_json }).to_string(),
+            );
+            text.push('\n');
+            prev = link_for_test(seq as u64, &prev, evidence);
+        }
+        let output = verify(&path(&format!("{name}.jsonl"), &text));
+        assert_rejected(&output, "JOURNAL_TENANT_MISMATCH");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("entry 2:"), "{name}: {stderr}");
+        assert!(stderr.contains("another tenant"), "{name}: {stderr}");
+
+        // The producer refuses the same chain.
+        let mut exporter = ChainExporter::new(&key);
+        exporter.push(&mixed[0]).unwrap();
+        exporter.push(&mixed[1]).unwrap();
+        let error = exporter.push(&mixed[2]).unwrap_err();
+        assert_eq!(error.code(), "JOURNAL_TENANT_MISMATCH", "{name}");
+    }
+
+    // A database chain has no tenant.
+    let mut database = ChainExporter::new(&key);
+    database.push_record(&storage_record()).unwrap();
+    let (database_text, _) = database.finish().unwrap();
+    let summary: Value =
+        serde_json::from_slice(&verify(&path("database.jsonl", &database_text)).stdout).unwrap();
+    assert_eq!(summary["details"]["kind"], "database");
+    assert!(summary["details"]["tenant_id"].is_null());
+}
+
+/// T-016: a storage record whose signature is written in uppercase hex
+/// decodes to the same bytes, but it is refused, even with the chain
+/// re-linked over that text.
+#[test]
+fn storage_record_with_uppercase_signature_is_refused() {
+    let fx = Fixture::new();
+    let mut record = storage_record();
+    record.signature = record.signature.to_uppercase();
+    let record_json: Value = serde_json::from_str(&record.to_json().unwrap()).unwrap();
+    let text = format!(
+        "{}\n",
+        json!({ "seq": 0, "prev": "0".repeat(64), "record": record_json })
+    );
+    let output = run_verify(&[
+        "journal",
+        "--journal",
+        &fx.dir.write("upper.jsonl", text),
+        "--attester-pin",
+        &fx.pin,
+        "--format",
+        "json",
+    ]);
+    assert_rejected(&output, "EVIDENCE_FAIL");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not canonical lowercase hex"), "{stderr}");
 }
 
 /// G7 test helper: declares every action type a rule names as Mission.

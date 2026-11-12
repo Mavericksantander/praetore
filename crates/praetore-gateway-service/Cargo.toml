@@ -45,3 +45,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower = { version = "0.5", features = ["util"] }
 uuid = "1.18"
+
+[target.'cfg(unix)'.dependencies]
+# Attester key files: `praetore-cli/src/secret_file.rs` (O_NOFOLLOW, fstat on
+# the open descriptor, the effective uid for the owner check).
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }

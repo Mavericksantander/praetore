@@ -6,7 +6,9 @@
 --
 -- No record is touched. Afterwards only a release before v0.3.3 can run
 -- against the database (it takes the advisory lock again), or
--- `praetore migrate` applies 0019 again.
+-- `praetore-gateway-demo migrate` (schema owner URL in
+-- `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`) applies 0019 again, and
+-- `praetore run` also applies pending migrations when it starts.
 
 BEGIN;
 

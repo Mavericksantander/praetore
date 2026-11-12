@@ -646,8 +646,12 @@ fn postgres_cli_journal_export_after_attester_key_rotation() {
         "praetore-verify tenant chain with {A, B}",
     ));
     assert_eq!(verified["details"]["kind"], "tenant");
-    assert_eq!(verified["details"]["database_head_verified"], true);
+    // The reference matches the --database-journal file; that file's head
+    // is not itself anchored.
+    assert_eq!(verified["details"]["database_head_consistent"], true);
+    assert_eq!(verified["details"]["database_head_anchored"], false);
     assert_eq!(verified["details"]["expected_head_verified"], true);
+    assert_eq!(verified["details"]["tenant_id"], tenant.to_string());
 
     // Only {B}: every step that verifies the record A signed fails, names
     // A's key and writes nothing.

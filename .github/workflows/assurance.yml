@@ -57,7 +57,7 @@ jobs:
           # non-blocking client, praetore-safety-ingest, journal-export
           # --safety and praetore-verify safety-journal). The PostgreSQL
           # end-to-end tests run in the replay-postgres job.
-          run "test result: ok\. 34 passed" cargo test --locked -p praetore-core --lib safety_ingest
+          run "test result: ok\. 35 passed" cargo test --locked -p praetore-core --lib safety_ingest
           run "test result: ok\. 5 passed" \
             cargo test --locked -p praetore-safety-client --test nonblocking -- --nocapture
           # 13 on Linux: secret_file's extended-ACL test is macOS only.
@@ -124,6 +124,10 @@ jobs:
       - name: Validate Kubernetes manifest YAML syntax
         run: |
           ruby -e 'require "yaml"; Dir.glob("deploy/kubernetes/**/*.yaml").each { |path| YAML.load_stream(File.read(path)); puts "valid YAML: #{path}" }'
+      - name: Kubernetes policy templates have an ingress and egress default-deny per namespace
+        run: |
+          ruby scripts/check-k8s-default-deny.rb
+          scripts/test-check-k8s-default-deny.sh
       - name: Check changed patch whitespace
         if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         run: git diff --check ${{ github.event.pull_request.base.sha || github.event.before }}...HEAD
@@ -455,12 +459,13 @@ jobs:
             echo "::endgroup::"
             grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
           done
-      - name: Services report a port in use (praetore-gateway-demo, praetore-observe)
+      - name: Services report a port in use (praetore-gateway-demo, praetore-observe); observe read-only role check
         run: |
           set -euo pipefail
           for test in \
             "praetore-gateway-service postgres_gateway_service_reports_a_port_in_use" \
-            "praetore-observe postgres_observe_reports_a_port_in_use"; do
+            "praetore-observe postgres_observe_reports_a_port_in_use" \
+            "praetore-observe postgres_observe_refuses_the_gateway_runtime_role"; do
             read -r package name <<<"$test"
             echo "::group::$name"
             output="$(cargo test -p "$package" --locked --test port_in_use -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
@@ -670,7 +675,7 @@ jobs:
       - run: scripts/check-actions-pinned.sh
 
   mcp-binaries:
-    name: praetore-mcp ${{ matrix.target }} build and smoke
+    name: praetore-mcp ${{ matrix.target }} build and package
     strategy:
       fail-fast: false
       matrix:
@@ -679,28 +684,21 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-15
             target: aarch64-apple-darwin
-          # Cross-built on Apple silicon; the smoke test runs it under Rosetta 2.
+          # Cross-built on Apple silicon.
           - os: macos-15
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
+    # Builds, packages and checksums the binary before anything else runs:
+    # this job installs no Node tooling. The smoke test runs in mcp-smoke,
+    # on the uploaded archive.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "24"
       - run: cargo build --release --locked --package praetore-mcp --target ${{ matrix.target }}
-      - name: Install Rosetta 2 for the x86_64 smoke test
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: softwareupdate --install-rosetta --agree-to-license
       - name: Show binary architecture
         run: file target/${{ matrix.target }}/release/praetore-mcp
-      # A real tools/call allowed and one denied, through npx and
-      # @modelcontextprotocol/server-filesystem@2.1.0, then `verify`.
-      - name: End-to-end smoke test of the release binary
-        run: python3 -I scripts/mcp-smoke.py target/${{ matrix.target }}/release/praetore-mcp
       - name: Package binary with its checksum
         shell: bash
         run: |
@@ -723,11 +721,62 @@ jobs:
             mcp-assets/*.tar.gz.sha256
           if-no-files-found: error
 
+  mcp-smoke:
+    name: praetore-mcp ${{ matrix.target }} smoke
+    needs: mcp-binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          # Runs under Rosetta 2 on Apple silicon.
+          - os: macos-15
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    # Tests the archive mcp-binaries uploaded, after checking its .sha256.
+    # Uploads nothing: the release uses the archives from mcp-binaries.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mcp-${{ matrix.target }}
+          path: mcp-assets
+      - name: Check and unpack the archive
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then version="${GITHUB_SHA::12}"; fi
+          name="praetore-mcp-${version}-${{ matrix.target }}"
+          cd mcp-assets
+          shasum -a 256 -c "${name}.tar.gz.sha256"
+          mkdir ../mcp-smoke-bin
+          tar -C ../mcp-smoke-bin -xzf "${name}.tar.gz"
+          echo "MCP_BINARY=${GITHUB_WORKSPACE}/mcp-smoke-bin/${name}/praetore-mcp" >> "$GITHUB_ENV"
+      - name: Install Rosetta 2 for the x86_64 smoke test
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      # @modelcontextprotocol/server-filesystem@2.1.0 and its dependencies
+      # exactly as in scripts/mcp-smoke/package-lock.json.
+      - run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/mcp-smoke
+      # A real tools/call allowed and one denied, then `verify`.
+      - name: End-to-end smoke test of the packaged binary
+        run: python3 -I scripts/mcp-smoke.py "$MCP_BINARY"
+
   release-integrity:
     name: Release checksums
     # Runs on every push and PR so SHA256SUMS is checked before a tag needs
     # it; only a v* tag keeps the result as release-assets-<tag>.
-    needs: mcp-binaries
+    needs:
+      - mcp-binaries
+      - mcp-smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

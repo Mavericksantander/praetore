@@ -4,6 +4,53 @@
 
 ### Breaking
 
+- **`praetore-gateway-demo` requires `PRAETORE_GATEWAY_ADAPTER` (T-016).**
+  The service no longer falls back to `local-demo` when the variable is
+  missing or empty: it exits before it connects to PostgreSQL and names the
+  three values (`sandbox`, `http`, `local-demo`). Action: set the adapter
+  explicitly, including `local-demo` for local runs (`docs/operations.md`).
+- **Gateway attester keys are read from owner-only files (T-016).**
+  `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE` and
+  `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE` name two files with 64
+  lowercase hexadecimal characters each, checked like the safety namespace
+  key (regular file, not a symlink, owned by the service user, no group or
+  other bits, at most 128 bytes). The two keys must differ. The
+  `..._KEY_HEX` variables are no longer read; the service refuses to start
+  while either is set. Execution receipts carry the key id
+  `execution-attester-<public key hex>` instead of the earlier prefixed id.
+  Legacy baseline adoption reads the evidence key from the same file
+  variable. Action: move each key into its own file and remove the
+  `..._KEY_HEX` variables.
+- **`praetore-observe` requires its read-only role (T-016).** At startup it
+  checks that `PRAETORE_OBSERVE_DATABASE_URL` logs in as `praetore_observe`
+  or as a member of it, is not a member of `praetore_runtime`,
+  `praetore_safety_ingest` or `praetore_safety_audit`, and holds no
+  privilege beyond the documented column `SELECT` grant
+  (`docs/observability-mvp.md`). New
+  `praetore_replay_postgres::verify_observe_role_with`. No migration creates
+  the role. Action: run observe with the documented role instead of the
+  gateway runtime credential.
+- **`praetore-verify journal` renames `database_head_verified` to
+  `database_head_consistent` (T-016).** The field means that the tenant
+  chain's reference matches the database head given by `--database-journal`
+  or `--expected-database-head`. The new `database_head_anchored` is true
+  only with `--expected-database-head`, a head the caller holds; the head
+  of a `--database-journal` file is not anchored by that file. Action:
+  scripts that read `database_head_verified` read `database_head_consistent`,
+  and check `database_head_anchored` where an anchored database head is
+  required.
+- **A journal chain holds the receipts of one tenant (T-016).** `praetore-verify
+  journal` and `praetore journal-export` refuse a chain whose receipts name
+  different tenants in their signed authority, or a tenant and none
+  (`JOURNAL_TENANT_MISMATCH`). The verifier reports the chain's tenant as
+  `tenant_id` (`null` for a database chain, or when the receipts name
+  none). Exports written by `journal-export --tenant` hold one tenant and
+  are not affected.
+- **Storage record signatures must be lowercase hex (T-016).** A storage
+  record whose signature is written in uppercase or mixed-case hex is
+  refused (`EVIDENCE_FAIL`), as receipts and safety records already were.
+  `praetore` only ever wrote lowercase.
+
 - **Cooperative execution is refused by default (T-013).** The local HTTP
   API (`praetore run`) and `praetore-gateway-demo`, with every adapter and
   with or without `sandbox_root`, require `praetore-exec-mode: gateway` on
@@ -60,6 +107,39 @@
   (schema v3) for an approved request whose single dispatch is claimed too
   late. `approval_expired` now means only that the window closed without a
   decision. Rows closed before this release keep `approval_expired`.
+- **`ActionDispatcher::preflight` takes the verified authority (T-016).**
+  The signature is now `preflight(&self, authority: &Authority, action:
+  &Action)`; the gateway passes the same authority that `dispatch` receives,
+  so an adapter that routes per tenant can check its route before an action
+  is dispatched or held for approval. Action: adapters that override
+  `preflight` add the parameter.
+- **HTTP and sandbox-supervisor adapters report refusals made before sending
+  as `no_effect` (T-016).** `HttpActionDispatcher` now implements
+  `preflight`: an action with no configured route for the verified tenant,
+  action type and target, with a capability other than the route's, or with
+  parameters over 64 KiB is refused at submission (403
+  `action_not_dispatchable`, signed `not_dispatched` with reason
+  `dispatch_refused`), and an action that requires approval is not held.
+  Before, it was dispatched and signed `outcome_unknown`, or held for
+  approval first. In `dispatch`, every check before the request is sent
+  (action digest, tenant, route, capability, size) now returns
+  `DispatchError::NotApplied` (signed `failed` with the class `no_effect`)
+  instead of `Ambiguous` (`outcome_unknown`). `SandboxActionDispatcher`
+  (the mTLS supervisor client) does the same for its checks before sending
+  (tenant, action digest, request size), and its `preflight` refuses a
+  request without a verified tenant or over 64 KiB. Any error after the
+  request may have been sent is still `outcome_unknown`. Action: clients
+  that expected `outcome_unknown` for these cases handle 403
+  `action_not_dispatchable` and `failed` / `no_effect`.
+- **A sandbox delete whose `unlinkat` fails is signed `effect_failed`
+  (T-016).** `fs:delete_file` is `failed` / `no_effect` (403
+  `action_not_dispatchable`) only when the checks before `unlinkat` refuse
+  it (path, parent directory, entry). An error from the `unlinkat` call
+  itself, `ENOENT` included, is now `failed` / `effect_failed` (502
+  `action_effect_failed`): that error does not show that nothing was
+  removed. Before, it was signed `no_effect`. New:
+  `praetore_sandbox_fs::Dir::unlink_file`; `Root::remove_file` is
+  unchanged.
 - **Migration 0022 (`0022_awaiting_approval_state`).** Admits
   `awaiting_approval` in `execution_attestations` (accepted only while the
   journal row is held: `requires_approval`, `not_dispatched`, no reason, no
@@ -104,6 +184,18 @@
 
 ### Added
 
+- **`praetore-verify journal` reports an unanchored head (T-016).** Without
+  `--expected-head` it reports the `head_not_anchored` warning, on stderr
+  and in `details.warnings`, as `safety-journal` does: a truncated or
+  re-linked chain also verifies then. `--require-anchored` fails with
+  `JOURNAL_NOT_ANCHORED` (exit 1) after the chain verifies when no
+  `--expected-head` was given.
+- **`praetore-verify evidence` always reports `authority_verified`, and
+  takes `--strict` (T-016).** `authority_verified` is `false` when no
+  `--issuer-pins` were given. `--strict` requires `--issuer-pins` and
+  `--policy` (`USAGE` otherwise) and implies `--require-intent` and
+  `--require-decision-time`. A receipt that is not HighAssurance does not
+  record the engine mode that produced it; no flag can show it.
 - **Receipt finality in the verifiers (T-016).** `praetore-verify receipt`
   reports `final` and `non_final_reason`: the receipt returned while a human
   approval is pending (`requires_approval`, `not_dispatched`, no signed
@@ -161,6 +253,47 @@
   held journal lock as a troubleshooting case. The help of
   `praetore-mcp policy` describes how `--arg-path-prefix` values are
   resolved; the flags and their behavior are unchanged.
+- **Kubernetes templates deny ingress and egress by default per namespace
+  (T-016).** `praetore-agents`, `praetore-gateway`, `praetore-tools`,
+  `praetore-egress` and `praetore-sandbox` each get a policy that selects
+  every pod for ingress and egress; the existing allows add to it. The
+  gateway proxy gets an explicit egress allow (protected tools, public 443,
+  DNS) and the sandbox supervisor an egress allow for the Kubernetes API
+  and DNS, to be narrowed to the cluster's API server addresses. The Cilium
+  profile writes these policies with the empty-rule form (`- {}`).
+  `praetore-data` is not covered. CI checks the floor with
+  `scripts/check-k8s-default-deny.rb`. Action: add the egress your protected
+  tools need as separate allow policies.
+- **Claude Code hook example: `PRAETORE_HOOK_BIN` must be an absolute path
+  to an executable regular file (T-016).** Otherwise the wrapper denies
+  without running anything; an empty value still means the installed
+  binary. The README states what is not checked: whoever controls the
+  environment of the hook process chooses the binary.
+- **Safety ingestion counts a resent `conflict` event as a duplicate
+  (T-016).** An event identical to one already recorded as `conflict` for
+  its `source_seq` creates no second record: it is counted as `duplicate`,
+  like a resend of the first event. A different event with that
+  `source_seq` is still recorded as `conflict`. The record format, the
+  verifier and the signed counts are unchanged; chains written before may
+  hold the same `conflict` more than once and still verify. Rust:
+  `safety_ingest::EventLookup` has a new method, `conflict_recorded`
+  (implemented by `MemoryLookup` and `PostgresSafetyStore`); custom
+  lookups implement it.
+- **Safety ingestion docs (T-016).** `docs/operations.md` and
+  `SafetySourceKey` state that a source key is used by one source,
+  ingester and tenant, and is not shared between ingesters or tenants.
+  `EpochFile` and `docs/operations.md` state that a missing epoch file is
+  read as the first start of the source, including after the file is
+  deleted, and how to recover from that.
+- **praetore-mcp release archives are packaged before the smoke test
+  (T-016).** In `Assurance gates`, `mcp-binaries` builds, packages and
+  checksums each binary without installing Node tooling, and a new
+  `mcp-smoke` job tests the uploaded archive after checking its `.sha256`.
+  `Release checksums` waits for both. The smoke test installs
+  `@modelcontextprotocol/server-filesystem@2.1.0` with `npm ci` from the
+  committed `scripts/mcp-smoke/package-lock.json` instead of `npx -y`, and
+  `scripts/mcp-smoke.py` stops if that install is missing or another version.
+  The binaries and the archive layout are unchanged.
 
 ## 0.3.3 - 2026-11-03
 

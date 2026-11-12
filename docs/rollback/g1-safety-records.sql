@@ -17,8 +17,10 @@
 -- cluster-wide and other databases may use them: this script only revokes
 -- what 0016 and 0018 granted in this database. Drop them separately (DROP
 -- ROLE) once no database uses them.
--- Afterwards `praetore migrate` (apply_migrations) applies 0016 to 0018
--- again from scratch.
+-- Afterwards `praetore-gateway-demo migrate` (schema owner URL in
+-- `PRAETORE_GATEWAY_MIGRATION_DATABASE_URL`; `apply_migrations`) applies
+-- 0016 to 0018 again from scratch, and `praetore run` also applies pending
+-- migrations when it starts.
 
 BEGIN;
 
