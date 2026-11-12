@@ -4,6 +4,32 @@
 
 ### Breaking
 
+- **`praetore-gateway-demo` requires `PRAETORE_GATEWAY_ADAPTER` (T-016).**
+  The service no longer falls back to `local-demo` when the variable is
+  missing or empty: it exits before it connects to PostgreSQL and names the
+  three values (`sandbox`, `http`, `local-demo`). Action: set the adapter
+  explicitly, including `local-demo` for local runs (`docs/operations.md`).
+- **Gateway attester keys are read from owner-only files (T-016).**
+  `PRAETORE_GATEWAY_EVIDENCE_ATTESTER_KEY_FILE` and
+  `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE` name two files with 64
+  lowercase hexadecimal characters each, checked like the safety namespace
+  key (regular file, not a symlink, owned by the service user, no group or
+  other bits, at most 128 bytes). The two keys must differ. The
+  `..._KEY_HEX` variables are no longer read; the service refuses to start
+  while either is set. Execution receipts carry the key id
+  `execution-attester-<public key hex>` instead of the earlier prefixed id.
+  Legacy baseline adoption reads the evidence key from the same file
+  variable. Action: move each key into its own file and remove the
+  `..._KEY_HEX` variables.
+- **`praetore-observe` requires its read-only role (T-016).** At startup it
+  checks that `PRAETORE_OBSERVE_DATABASE_URL` logs in as `praetore_observe`
+  or as a member of it, is not a member of `praetore_runtime`,
+  `praetore_safety_ingest` or `praetore_safety_audit`, and holds no
+  privilege beyond the documented column `SELECT` grant
+  (`docs/observability-mvp.md`). New
+  `praetore_replay_postgres::verify_observe_role_with`. No migration creates
+  the role. Action: run observe with the documented role instead of the
+  gateway runtime credential.
 - **`praetore-verify journal` renames `database_head_verified` to
   `database_head_consistent` (T-016).** The field means that the tenant
   chain's reference matches the database head given by `--database-journal`
@@ -215,6 +241,22 @@
   config or policy.
 - `praetore_core::journal_chain::receipt_link` is public, so other journals
   link receipts with the same function.
+- **Kubernetes templates deny ingress and egress by default per namespace
+  (T-016).** `praetore-agents`, `praetore-gateway`, `praetore-tools`,
+  `praetore-egress` and `praetore-sandbox` each get a policy that selects
+  every pod for ingress and egress; the existing allows add to it. The
+  gateway proxy gets an explicit egress allow (protected tools, public 443,
+  DNS) and the sandbox supervisor an egress allow for the Kubernetes API
+  and DNS, to be narrowed to the cluster's API server addresses. The Cilium
+  profile writes these policies with the empty-rule form (`- {}`).
+  `praetore-data` is not covered. CI checks the floor with
+  `scripts/check-k8s-default-deny.rb`. Action: add the egress your protected
+  tools need as separate allow policies.
+- **Claude Code hook example: `PRAETORE_HOOK_BIN` must be an absolute path
+  to an executable regular file (T-016).** Otherwise the wrapper denies
+  without running anything; an empty value still means the installed
+  binary. The README states what is not checked: whoever controls the
+  environment of the hook process chooses the binary.
 - **Safety ingestion counts a resent `conflict` event as a duplicate
   (T-016).** An event identical to one already recorded as `conflict` for
   its `source_seq` creates no second record: it is counted as `duplicate`,

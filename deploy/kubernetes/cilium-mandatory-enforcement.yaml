@@ -1,3 +1,59 @@
+# Namespace floor: a rule that selects an endpoint and has an ingress or
+# egress section puts that endpoint in default-deny for that direction; an
+# empty rule ({}) allows nothing. An empty or omitted list (ingress: []) does
+# not. Every endpoint in praetore-agents, praetore-gateway, praetore-tools
+# and praetore-egress is denied all ingress and egress unless a policy below
+# allows it (praetore-sandbox has its own floor further down; praetore-data,
+# where PostgreSQL runs, is not covered by these templates). Add the egress your protected tools need
+# (praetore-tools) as separate allow policies.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-agents-default-deny
+  namespace: praetore-agents
+spec:
+  endpointSelector: {}
+  ingress:
+    - {}
+  egress:
+    - {}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-gateway-default-deny
+  namespace: praetore-gateway
+spec:
+  endpointSelector: {}
+  ingress:
+    - {}
+  egress:
+    - {}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-tools-default-deny
+  namespace: praetore-tools
+spec:
+  endpointSelector: {}
+  ingress:
+    - {}
+  egress:
+    - {}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: praetore-egress-default-deny
+  namespace: praetore-egress
+spec:
+  endpointSelector: {}
+  ingress:
+    - {}
+  egress:
+    - {}
+---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -193,8 +249,10 @@ metadata:
   namespace: praetore-sandbox
 spec:
   endpointSelector: {}
-  ingress: []
-  egress: []
+  ingress:
+    - {}
+  egress:
+    - {}
 ---
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy

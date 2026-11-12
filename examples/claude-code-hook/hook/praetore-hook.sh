@@ -10,6 +10,11 @@
 # missing, or the binary cannot start, panics, is killed by a signal or
 # exits with any status other than 0, this script prints a deny decision and
 # exits 0. A hook that merely errors would let the tool call through.
+#
+# PRAETORE_HOOK_BIN, when set and not empty, must be an absolute path to an
+# executable regular file; anything else is a deny. It is not otherwise checked:
+# whoever controls the environment of the hook process chooses the binary
+# that decides, as with PATH.
 
 deny() {
   printf '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"%s"}}\n' "$1"
@@ -21,9 +26,19 @@ if [ -z "$root" ]; then
   cat >/dev/null
   deny "PRÆTORE hook: CLAUDE_PROJECT_DIR is not set"
 fi
-bin="${PRAETORE_HOOK_BIN:-$root/.claude/bin/praetore-claude-hook}"
+bin="$root/.claude/bin/praetore-claude-hook"
+if [ -n "${PRAETORE_HOOK_BIN:-}" ]; then
+  case "$PRAETORE_HOOK_BIN" in
+    /*) ;;
+    *)
+      cat >/dev/null
+      deny "PRÆTORE hook: PRAETORE_HOOK_BIN must be an absolute path"
+      ;;
+  esac
+  bin="$PRAETORE_HOOK_BIN"
+fi
 state="$root/.claude/praetore"
-if [ ! -x "$bin" ] || [ ! -f "$state/policy.json" ]; then
+if [ ! -f "$bin" ] || [ ! -x "$bin" ] || [ ! -f "$state/policy.json" ]; then
   cat >/dev/null
   deny "PRÆTORE hook is not set up: install the praetore-claude-hook binary and run init .claude/praetore"
 fi
