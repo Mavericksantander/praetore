@@ -215,6 +215,22 @@
   config or policy.
 - `praetore_core::journal_chain::receipt_link` is public, so other journals
   link receipts with the same function.
+- **Safety ingestion counts a resent `conflict` event as a duplicate
+  (T-016).** An event identical to one already recorded as `conflict` for
+  its `source_seq` creates no second record: it is counted as `duplicate`,
+  like a resend of the first event. A different event with that
+  `source_seq` is still recorded as `conflict`. The record format, the
+  verifier and the signed counts are unchanged; chains written before may
+  hold the same `conflict` more than once and still verify. Rust:
+  `safety_ingest::EventLookup` has a new method, `conflict_recorded`
+  (implemented by `MemoryLookup` and `PostgresSafetyStore`); custom
+  lookups implement it.
+- **Safety ingestion docs (T-016).** `docs/operations.md` and
+  `SafetySourceKey` state that a source key is used by one source,
+  ingester and tenant, and is not shared between ingesters or tenants.
+  `EpochFile` and `docs/operations.md` state that a missing epoch file is
+  read as the first start of the source, including after the file is
+  deleted, and how to recover from that.
 - **praetore-mcp release archives are packaged before the smoke test
   (T-016).** In `Assurance gates`, `mcp-binaries` builds, packages and
   checksums each binary without installing Node tooling, and a new

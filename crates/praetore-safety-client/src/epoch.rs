@@ -15,9 +15,18 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// writes the new value to a temporary file, `fsync`s it, renames it over
 /// the old one and `fsync`s the directory, and only then returns the new
 /// epoch. If any step fails, or the file holds anything but an epoch, it
-/// returns an error and the source must not report events: it never
-/// starts again from epoch 1, which would make the ingester reject every
-/// event as `stale_epoch` (or, worse, look like a replay of an earlier run).
+/// returns an error and the source must not report events: an error never
+/// falls back to a guessed epoch.
+///
+/// A missing file is the first start of the source, so its first epoch
+/// is 1. `EpochFile` cannot tell that from a file that was deleted (or
+/// restored from an old backup) after the source reported: the next start
+/// then returns an epoch at or below the one the ingester already holds
+/// for the source. The ingester records the events of an older epoch as
+/// `rejected` (`stale_epoch`), and those of the same epoch with an already
+/// used `source_seq` as `conflict`; neither is accepted. Keep the file for
+/// the life of the source; to recover, write at least the source's last
+/// recorded `source_epoch` to it before the next start.
 ///
 /// Call it once per start of the source, before the first event, and use
 /// the result as `source_epoch` of every event of that run, with

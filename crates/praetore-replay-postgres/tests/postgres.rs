@@ -9575,6 +9575,14 @@ mod g1_safety {
             duplicate.suppressed.map(|s| s.reason),
             Some(praetore_core::safety_ingest::LossReason::Duplicate)
         );
+        // The conflicting event of seq 1, resent: also a duplicate, with no
+        // second conflict record.
+        let resent_conflict = ingest(&mut resumed, &mut store, &event(1, "safety:other"));
+        assert!(resent_conflict.records.is_empty());
+        assert_eq!(
+            resent_conflict.suppressed.map(|s| s.reason),
+            Some(praetore_core::safety_ingest::LossReason::Duplicate)
+        );
         ingest(&mut resumed, &mut store, &event(6, "safety:halt"));
 
         let text = chain_text(store.client(), TENANT_A, "executor-1");

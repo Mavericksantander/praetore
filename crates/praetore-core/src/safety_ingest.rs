@@ -237,7 +237,9 @@ macro_rules! signing_role {
 
 signing_role!(
     /// The key of one source (an executor) of safety events. Held by the
-    /// executor; the ingester pins its public key per `source_id`.
+    /// executor; the ingester pins its public key per `source_id`. Use one
+    /// source key per source, ingester and tenant: a source key is not
+    /// shared between ingesters or tenants.
     SafetySourceKey,
     SAFETY_SOURCE_KEY_ID_DOMAIN
 );
@@ -1361,6 +1363,17 @@ pub trait EventLookup {
         source_epoch: u64,
         source_seq: u64,
     ) -> Result<Option<EventRef>, Self::Error>;
+
+    /// Whether `chain` already holds a `conflict` record for `source_epoch`
+    /// and `source_seq` whose event hash is `event_hash`.
+    fn conflict_recorded(
+        &mut self,
+        tenant_id: Uuid,
+        chain: &str,
+        source_epoch: u64,
+        source_seq: u64,
+        event_hash: &str,
+    ) -> Result<bool, Self::Error>;
 }
 
 /// Records to store together (one transaction), and the chain head after
@@ -1804,9 +1817,11 @@ impl SafetyIngestor {
     ///   unattributed chain; the source chain does not change;
     /// * an event whose `source_seq` is above the next expected one: a
     ///   `loss` record for the missing range, then the event record;
-    /// * an event whose `source_seq` was already recorded: `duplicate` (same
-    ///   event hash) or `conflict` (another one); if it was recorded as
-    ///   lost: `late`;
+    /// * an event whose `source_seq` was already recorded: counted as a
+    ///   duplicate, with no record, when its event hash is that of the
+    ///   first event or of a `conflict` already recorded for that
+    ///   `source_seq`; otherwise one `conflict` record; if it was recorded
+    ///   as lost: `late`;
     /// * otherwise the event record: `accepted` (declared name),
     ///   `undeclared` or `invalid_name`.
     ///
@@ -1994,15 +2009,23 @@ impl SafetyIngestor {
                 .first_event(self.tenant_id, &chain, epoch, seq)
                 .map_err(IngestError::Lookup)?
             {
-                // An exact duplicate is counted, not stored again: a replay
-                // of a captured datagram cannot grow the chain.
-                Some(first) if first.event_hash == event_hash => {
-                    return Ok(self.suppressed(Suppressed {
-                        reason: LossReason::Duplicate,
-                        source_id: Some(chain),
-                    }));
+                Some(first) => {
+                    // An exact duplicate, of the first event or of a
+                    // conflict already recorded for this source_seq, is
+                    // counted, not stored again: a resend cannot grow the
+                    // chain.
+                    let duplicate = first.event_hash == event_hash
+                        || lookup
+                            .conflict_recorded(self.tenant_id, &chain, epoch, seq, &event_hash)
+                            .map_err(IngestError::Lookup)?;
+                    if duplicate {
+                        return Ok(self.suppressed(Suppressed {
+                            reason: LossReason::Duplicate,
+                            source_id: Some(chain),
+                        }));
+                    }
+                    (SafetyRecordStatus::Conflict, Some(first.record_hash))
                 }
-                Some(first) => (SafetyRecordStatus::Conflict, Some(first.record_hash)),
                 None => (SafetyRecordStatus::Late, None),
             }
         };
@@ -2026,11 +2049,24 @@ impl SafetyIngestor {
 #[derive(Debug, Default)]
 pub struct MemoryLookup {
     first: HashMap<(Uuid, String, u64, u64), EventRef>,
+    conflicts: HashSet<(Uuid, String, u64, u64, String)>,
 }
 
 impl MemoryLookup {
     pub fn record(&mut self, record: &SafetyRecord) {
         let payload = &record.payload;
+        if payload.status == SafetyRecordStatus::Conflict {
+            if let (Some(event), Some(event_hash)) = (&payload.event, &payload.event_hash) {
+                self.conflicts.insert((
+                    payload.tenant_id,
+                    payload.chain.clone(),
+                    event.source_epoch,
+                    event.source_seq,
+                    event_hash.clone(),
+                ));
+            }
+            return;
+        }
         if !payload.status.is_first_event() {
             return;
         }
@@ -2064,6 +2100,23 @@ impl EventLookup for MemoryLookup {
             .first
             .get(&(tenant_id, chain.to_owned(), source_epoch, source_seq))
             .cloned())
+    }
+
+    fn conflict_recorded(
+        &mut self,
+        tenant_id: Uuid,
+        chain: &str,
+        source_epoch: u64,
+        source_seq: u64,
+        event_hash: &str,
+    ) -> Result<bool, Self::Error> {
+        Ok(self.conflicts.contains(&(
+            tenant_id,
+            chain.to_owned(),
+            source_epoch,
+            source_seq,
+            event_hash.to_owned(),
+        )))
     }
 }
 
