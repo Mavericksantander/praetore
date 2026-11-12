@@ -206,6 +206,22 @@
   `GatewayReceipt::is_final()` and `non_final_reason()`; Python:
   `verify_final_gateway_receipt` and `gateway_receipt_finality`. The signed
   format and the result of signature verification are unchanged.
+- **Approvals inbox in `praetore-console` (P-002 D2).** With
+  `PRAETORE_CONSOLE_GATEWAY_URL` (a loopback `http://IP:port`),
+  `PRAETORE_CONSOLE_APPROVER_KEY_ID`, `PRAETORE_CONSOLE_APPROVER_KEY_FILE`
+  and `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE` (owner-only files, the
+  `approver.key` / `approver-api.token` formats of `praetore init`) the
+  console lists the requests held for approval, read from the journal with
+  its read-only connection, and lets the operator approve, reject, or run
+  the single dispatch of an approved request. The console signs on this
+  computer, as `praetore approve` does, only after it checks that the
+  gateway challenge commits to the action read from the signed journal
+  evidence; the gateway verifies, records and dispatches. The browser gets
+  opaque references, never keys, journal ids or raw evidence. Actions need
+  the console's own `Origin` and an `x-praetore-consola` header besides the
+  session cookie. A partial set of the four variables is a startup error;
+  none of them leaves the console as before (history only). The gateway
+  API is unchanged.
 
 ### Changed
 

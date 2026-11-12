@@ -7,7 +7,8 @@
 //! "pendiente de aprobación", "rechazado", and "expirado".
 
 use crate::{
-    HistoryError, HistoryPage, HistoryStore, ListRequest,
+    HistoryError, HistoryPage, HistoryStore, InboxPage, InboxStore, ListRequest,
+    bandeja::{INBOX_LIMIT, PendingColumns, PendingKind, pending_from_columns},
     historia::{JournalColumns, facts_from_columns, parse_journal_timestamp},
 };
 use postgres::{Client, Row};
@@ -127,6 +128,86 @@ impl HistoryStore for PostgresHistory {
     }
 }
 
+impl InboxStore for PostgresHistory {
+    /// Requests that wait for the operator, oldest first. Same SELECT-only
+    /// role and tenant context as the history; nothing is written.
+    fn pending(&self) -> Result<InboxPage, HistoryError> {
+        let mut client = self.client.lock().map_err(|_| HistoryError::Unavailable)?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| HistoryError::Unavailable)?;
+        transaction
+            .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .map_err(|_| HistoryError::Unavailable)?;
+        set_tenant_context(&mut transaction, self.tenant_id)
+            .map_err(|_| HistoryError::Unavailable)?;
+        let rows = transaction
+            .query(
+                &format!(
+                    "SELECT j.agent_id, j.request_id, j.execution_status, j.evidence_json, \
+                            to_char(j.created_at AT TIME ZONE 'UTC', \
+                                'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
+                       FROM praetore.execution_journal j \
+                      WHERE j.tenant_id = $1 AND (({INBOX_SQL})) \
+                      ORDER BY j.created_at ASC, j.agent_id, j.request_id \
+                      LIMIT $2"
+                ),
+                &[&self.tenant_id, &i64::from(INBOX_LIMIT)],
+            )
+            .map_err(|_| HistoryError::Unavailable)?;
+        let mut items = Vec::with_capacity(rows.len());
+        let mut unreadable = 0u32;
+        for row in rows {
+            let kind = match row.get::<_, String>(2).as_str() {
+                "approved_pending_dispatch" => PendingKind::ApprovedPendingExecution,
+                "not_dispatched" => PendingKind::AwaitingApproval,
+                _ => return Err(HistoryError::Invalid),
+            };
+            let created_at = parse_journal_timestamp(&row.get::<_, String>(4))
+                .map_err(|_| HistoryError::Invalid)?;
+            match pending_from_columns(
+                self.tenant_id,
+                PendingColumns {
+                    created_at,
+                    agent_id: row.get(0),
+                    request_id: row.get(1),
+                    kind,
+                    evidence_json: row.get(3),
+                },
+            ) {
+                Ok(facts) => items.push(facts),
+                // Never offered for a decision. Counted so the page can say so.
+                Err(()) => unreadable += 1,
+            }
+        }
+        let agents = transaction
+            .query(
+                "SELECT DISTINCT agent_id FROM praetore.execution_journal ORDER BY agent_id",
+                &[],
+            )
+            .map_err(|_| HistoryError::Unavailable)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        transaction
+            .commit()
+            .map_err(|_| HistoryError::Unavailable)?;
+        Ok(InboxPage {
+            items,
+            unreadable,
+            agents,
+        })
+    }
+}
+
+/// Rows the operator can still act on: a hold with no decision yet, or an
+/// approval whose single dispatch has not been claimed.
+const INBOX_SQL: &str = "(j.authorization_status = 'requires_approval' \
+       AND j.execution_status = 'not_dispatched' \
+       AND j.not_dispatched_reason IS NULL) \
+     OR (j.authorization_status = 'requires_approval' \
+       AND j.execution_status = 'approved_pending_dispatch')";
+
 const TIME_FILTER: &str = "($1::timestamptz IS NULL OR j.created_at >= $1) \
      AND ($2::timestamptz IS NULL OR j.created_at < $2)";
 
@@ -239,6 +320,15 @@ fn parse_attested(value: Option<String>) -> Result<Option<AttestedExecution>, Hi
 mod tests {
     use super::*;
     use crate::historia::Situation;
+
+    #[test]
+    fn inbox_sql_is_fixed_and_only_names_actionable_rows() {
+        assert!(!INBOX_SQL.contains('$'));
+        assert!(INBOX_SQL.contains("approved_pending_dispatch"));
+        assert!(INBOX_SQL.contains("not_dispatched_reason IS NULL"));
+        assert!(!INBOX_SQL.contains("allowed"));
+        assert!(!INBOX_SQL.contains("denied"));
+    }
 
     #[test]
     fn situation_sql_is_fixed_and_names_awaiting_approval_as_a_hold() {

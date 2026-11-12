@@ -1107,10 +1107,12 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 name = "praetore-cli"
 version = "0.3.3"
 dependencies = [
+ "axum",
  "ed25519-dalek",
  "hex",
  "libc",
  "postgres",
+ "praetore-console",
  "praetore-core",
  "praetore-gateway",
  "praetore-replay-postgres",
@@ -1122,6 +1124,7 @@ dependencies = [
  "serde_json",
  "time",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -1132,11 +1135,13 @@ name = "praetore-console"
 version = "0.3.3"
 dependencies = [
  "axum",
+ "ed25519-dalek",
  "hex",
  "postgres",
  "praetore-core",
  "praetore-gateway",
  "praetore-replay-postgres",
+ "reqwest",
  "serde",
  "serde_json",
  "subtle",

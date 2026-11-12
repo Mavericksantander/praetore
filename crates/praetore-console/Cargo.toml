@@ -7,23 +7,26 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
-description = "Local operator console that reads a PRÆTORE journal and retells receipts in plain language."
+description = "Local operator console: a PRÆTORE journal retold in plain language and an approvals inbox signed on this computer."
 
 [dependencies]
 axum = "0.8"
+ed25519-dalek = "2"
 hex = "0.4.3"
 praetore-core = { path = "../praetore-core" }
 praetore-gateway = { path = "../praetore-gateway" }
 praetore-replay-postgres = { path = "../praetore-replay-postgres" }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 postgres = { version = "0.19", features = ["with-time-0_3", "with-uuid-1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 subtle = "2.6"
-time = { version = "0.3", features = ["parsing"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["serde"] }
 
 [dev-dependencies]
+time = { version = "0.3", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }

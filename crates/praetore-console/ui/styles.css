@@ -66,6 +66,14 @@ h2 { margin-bottom: 20px; font-size: 28px; letter-spacing: -.02em; }
 .recibo { width: 100%; display: grid; gap: 2px; padding: 16px 18px; border-radius: var(--radius); background: var(--surface); box-shadow: 0 0 0 1px var(--line); text-align: left; }
 .recibo strong { font-size: 16px; font-weight: 600; }
 .recibo span { color: var(--muted); font-size: 14px; }
+.bandeja { margin-bottom: 72px; }
+.titulo-seccion { margin: 0; font-size: clamp(32px, 5vw, 44px); letter-spacing: -.035em; }
+.solicitud { display: grid; gap: 4px; padding: 18px 20px; border-radius: var(--radius); background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
+.solicitud strong { font-size: 16px; font-weight: 600; }
+.solicitud span { color: var(--muted); font-size: 14px; }
+.solicitud .acciones { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+.solicitud .resultado { margin: 8px 0 0; color: var(--text); font-size: 14px; }
+.solicitud button.aprobar { background: var(--text); color: var(--bg); }
 .vacio { padding: 48px 8px; color: var(--muted); text-align: center; }
 
 .detail-panel { margin-top: 24px; padding: clamp(20px, 3vw, 36px); border-radius: var(--radius); background: var(--surface); box-shadow: 0 0 0 1px var(--line); }

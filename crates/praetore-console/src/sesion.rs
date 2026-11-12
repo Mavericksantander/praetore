@@ -139,7 +139,7 @@ fn create(path: &Path) -> Result<LocalSession, SessionError> {
     }
 }
 
-fn random_bytes() -> Result<[u8; 32], SessionError> {
+pub(crate) fn random_bytes() -> Result<[u8; 32], SessionError> {
     let mut secret = [0u8; 32];
     let mut source = fs::File::open("/dev/urandom").map_err(|_| SessionError::Io)?;
     source

@@ -1,5 +1,21 @@
+//! `praetore-console`: local operator console. Linux first.
+//!
+//! Required: `PRAETORE_CONSOLE_TENANT_ID`, `PRAETORE_CONSOLE_DATABASE_URL`
+//! (read-only journal access). Optional: `PRAETORE_CONSOLE_BIND` (loopback
+//! only, default `127.0.0.1:8090`), `PRAETORE_CONSOLE_SESSION_FILE`,
+//! `PRAETORE_CONSOLE_AGENT_NAMES_FILE`.
+//!
+//! Approvals inbox (D2), all four or none:
+//! - `PRAETORE_CONSOLE_GATEWAY_URL`: `http://127.0.0.1:<port>` of the gateway;
+//! - `PRAETORE_CONSOLE_APPROVER_KEY_ID`: the approver key id the gateway pins;
+//! - `PRAETORE_CONSOLE_APPROVER_KEY_FILE`: owner-only file, 32 bytes in hex
+//!   (`approver.key` of `praetore init`);
+//! - `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE`: owner-only file with the
+//!   gateway's `approver` bearer token (`approver-api.token`).
+
 use praetore_console::{
-    ConsoleState, LocalSession, PostgresHistory, parse_agent_names, validate_bind_address,
+    ApproverSigner, ConsoleState, HttpApprovalGateway, Inbox, LocalSession, PostgresHistory,
+    parse_agent_names, parse_gateway_address, read_token_file, validate_bind_address,
 };
 use praetore_replay_postgres::{DatabaseConnector, RuntimeRoleOptions, verify_runtime_role_with};
 use std::{
@@ -44,12 +60,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_runtime_role_with(&mut client, &options)?;
     let history = PostgresHistory::from_client(client, tenant_id)
         .map_err(|_| "no se pudo preparar la lectura del registro")?;
-    let state = Arc::new(ConsoleState::new(Arc::new(history), session, names));
+    let history = Arc::new(history);
+    let mut state = ConsoleState::new(history.clone(), session, names);
+    let inbox = approver_settings()?;
+    match inbox {
+        Some((gateway, signer)) => {
+            state = state.with_inbox(Inbox::new(history, Arc::new(gateway), signer, address));
+            tracing::info!("bandeja de aprobaciones activa");
+        }
+        None => tracing::info!("bandeja de aprobaciones sin configurar: solo historial"),
+    }
+    let state = Arc::new(state);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind(address))?;
-    tracing::info!(%address, "consola local de historial escuchando");
+    tracing::info!(%address, "consola local escuchando");
     let served = runtime.block_on(
         axum::serve(listener, ConsoleState::router_from(Arc::clone(&state))).into_future(),
     );
@@ -57,6 +83,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(state);
     served?;
     Ok(())
+}
+
+/// D2 is on only when all four settings are present; a partial set is an
+/// error, so a typo never leaves the operator with a silent read-only page.
+fn approver_settings()
+-> Result<Option<(HttpApprovalGateway, ApproverSigner)>, Box<dyn std::error::Error>> {
+    const NAMES: [&str; 4] = [
+        "PRAETORE_CONSOLE_GATEWAY_URL",
+        "PRAETORE_CONSOLE_APPROVER_KEY_ID",
+        "PRAETORE_CONSOLE_APPROVER_KEY_FILE",
+        "PRAETORE_CONSOLE_APPROVER_TOKEN_FILE",
+    ];
+    let mut values = Vec::with_capacity(NAMES.len());
+    for name in NAMES {
+        match env::var(name) {
+            Ok(value) if !value.trim().is_empty() => values.push(Some(value)),
+            Ok(_) | Err(env::VarError::NotPresent) => values.push(None),
+            Err(_) => return Err(format!("{name} no se pudo leer").into()),
+        }
+    }
+    if values.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let [Some(url), Some(key_id), Some(key_file), Some(token_file)] =
+        <[Option<String>; 4]>::try_from(values).map_err(|_| "configuración incompleta")?
+    else {
+        return Err(format!(
+            "la bandeja de aprobaciones necesita las cuatro variables: {}",
+            NAMES.join(", ")
+        )
+        .into());
+    };
+    let address = parse_gateway_address(&url)?;
+    let signer = ApproverSigner::from_file(&key_id, &PathBuf::from(key_file))?;
+    let token = read_token_file(&PathBuf::from(token_file))?;
+    Ok(Some((HttpApprovalGateway::new(address, token), signer)))
 }
 
 fn default_session_path() -> Result<PathBuf, Box<dyn std::error::Error>> {

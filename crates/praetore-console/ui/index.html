@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Historial · PRÆTORE</title>
+  <title>Consola · PRÆTORE</title>
   <link rel="stylesheet" href="styles.css">
   <script defer src="app.js"></script>
 </head>
@@ -14,8 +14,19 @@
     <div class="environment"><i></i>Solo en este computador</div>
   </header>
   <main>
-    <div class="section-head">
-      <h1>Historial</h1>
+    <section id="bandeja" class="bandeja" aria-labelledby="bandeja-titulo">
+      <div class="section-head">
+        <h1 id="bandeja-titulo">Bandeja</h1>
+        <div class="pager">
+          <button id="recargar-bandeja" type="button">Volver a cargar</button>
+        </div>
+      </div>
+      <p id="bandeja-aviso" class="aviso">Aprobar deja la solicitud aprobada y pendiente de ejecución; ejecutar la lleva a cabo una sola vez. Rechazar es final. La firma y el registro los hace el sistema, no esta página.</p>
+      <p id="bandeja-estado" class="estado" role="status">Leyendo la bandeja…</p>
+      <ul id="solicitudes" class="lista"></ul>
+    </section>
+    <div class="section-head historial-head">
+      <h2 class="titulo-seccion">Historial</h2>
       <div class="pager">
         <button id="anterior" type="button">Anteriores</button>
         <span id="pagina">Página 1</span>

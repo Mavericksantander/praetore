@@ -1,12 +1,19 @@
 //! Local operator console for a PRÆTORE journal.
 //!
 //! A separate surface from `praetore-observe`: loopback, a session file the
-//! page never shows, and receipts retold in plain language. It does not
-//! approve, dispatch, or export a compliance package.
+//! page never shows, and receipts retold in plain language (D1). With an
+//! approver configured it also shows the approvals inbox (D2): the console
+//! signs the operator's decision on this computer, as `praetore approve`
+//! does, and the gateway verifies, records and dispatches it. It does not
+//! export a compliance package.
 
+mod aprobador;
+mod bandeja;
 mod historia;
 mod lectura;
 mod sesion;
+#[cfg(test)]
+mod tests_bandeja;
 
 use axum::{
     Json, Router,
@@ -15,8 +22,9 @@ use axum::{
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
+use bandeja::{PendingFacts, References, readable_deadline, time_left};
 use historia::{
     ListRequest, NOTICE, RawQuery, ReceiptFacts, agent_label, page_window, prepare_detail_query,
     prepare_query, readable_time, situation, story, visible_target, visible_wanted,
@@ -25,6 +33,11 @@ use serde::Serialize;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use uuid::Uuid;
 
+pub use aprobador::{
+    ActOutcome, ApprovalGateway, ApproverConfigError, ApproverSigner, GatewayReply,
+    HttpApprovalGateway, parse_gateway_address, read_token_file,
+};
+pub use bandeja::{PendingKind, PendingRef};
 pub use historia::{NamesError, parse_agent_names};
 pub use lectura::PostgresHistory;
 pub use sesion::LocalSession;
@@ -37,6 +50,52 @@ pub struct ConsoleState {
     store: Arc<dyn HistoryStore>,
     session: LocalSession,
     names: HashMap<Uuid, String>,
+    inbox: Option<Inbox>,
+}
+
+/// D2. Present only when the console has an approver key, its gateway token
+/// and the gateway address.
+pub struct Inbox {
+    store: Arc<dyn InboxStore>,
+    gateway: Arc<dyn ApprovalGateway>,
+    signer: Arc<ApproverSigner>,
+    references: References,
+    /// `http://host:port` values a mutating request may come from.
+    origins: Vec<String>,
+}
+
+impl Inbox {
+    /// `bind` is the console's own address: mutations are accepted only
+    /// from a page served by it.
+    pub fn new(
+        store: Arc<dyn InboxStore>,
+        gateway: Arc<dyn ApprovalGateway>,
+        signer: ApproverSigner,
+        bind: SocketAddr,
+    ) -> Self {
+        let mut origins = vec![format!("http://{bind}")];
+        if bind.ip().is_loopback() && bind.is_ipv4() {
+            origins.push(format!("http://localhost:{}", bind.port()));
+        }
+        Self {
+            store,
+            gateway,
+            signer: Arc::new(signer),
+            references: References::default(),
+            origins,
+        }
+    }
+}
+
+pub trait InboxStore: Send + Sync + 'static {
+    fn pending(&self) -> Result<InboxPage, HistoryError>;
+}
+
+pub struct InboxPage {
+    pub items: Vec<PendingFacts>,
+    /// Pending rows whose receipt does not check out. Never offered.
+    pub unreadable: u32,
+    pub agents: Vec<Uuid>,
 }
 
 impl std::fmt::Debug for ConsoleState {
@@ -94,7 +153,13 @@ impl ConsoleState {
             store,
             session,
             names,
+            inbox: None,
         }
+    }
+
+    pub fn with_inbox(mut self, inbox: Inbox) -> Self {
+        self.inbox = Some(inbox);
+        self
     }
 
     pub fn router(self) -> Router {
@@ -106,6 +171,10 @@ impl ConsoleState {
         let api = Router::new()
             .route("/historial", get(list_receipts))
             .route("/historial/{numero}", get(receipt_detail))
+            .route("/bandeja", get(list_inbox))
+            .route("/bandeja/{referencia}/aprobar", post(approve))
+            .route("/bandeja/{referencia}/rechazar", post(reject))
+            .route("/bandeja/{referencia}/ejecutar", post(execute))
             .route_layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_session,
@@ -128,14 +197,39 @@ async fn require_session(
         .headers()
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok());
-    if state.session.accepts(cookie) {
-        next.run(request).await
-    } else {
-        api_message(
+    if !state.session.accepts(cookie) {
+        return api_message(
             StatusCode::UNAUTHORIZED,
             "Hay que abrir esta página en este computador.",
-        )
+        );
     }
+    next.run(request).await
+}
+
+/// Header the console page sends on every action. A page from another
+/// origin cannot add it without a preflight the console never answers.
+pub const ACTION_HEADER: &str = "x-praetore-consola";
+
+/// A mutation must come from the console's own page: exact `Origin`, the
+/// action header, and, when the browser sends it, `Sec-Fetch-Site:
+/// same-origin`. The cookie alone is not enough: another local port is the
+/// same site for `SameSite=Strict`.
+fn same_page(inbox: &Inbox, headers: &HeaderMap) -> bool {
+    let single = |name: &str| {
+        let mut values = headers.get_all(name).iter();
+        match (values.next(), values.next()) {
+            (Some(value), None) => value.to_str().ok(),
+            _ => None,
+        }
+    };
+    let origin_ok = single(header::ORIGIN.as_str())
+        .is_some_and(|origin| inbox.origins.iter().any(|allowed| allowed == origin));
+    let marker_ok = single(ACTION_HEADER) == Some("1");
+    let fetch_site_ok = match headers.get("sec-fetch-site") {
+        None => true,
+        Some(value) => value.as_bytes() == b"same-origin",
+    };
+    origin_ok && marker_ok && fetch_site_ok
 }
 
 async fn list_receipts(
@@ -213,6 +307,135 @@ async fn receipt_detail(
             relato: story(facts),
         },
     )
+}
+
+const INBOX_OFF: &str = "La bandeja de aprobaciones no está configurada en esta consola.";
+const INBOX_NOTICE: &str = "Aprobar deja la solicitud aprobada y pendiente de ejecución; ejecutar la lleva a cabo una sola vez. Rechazar es final. La firma y el registro los hace el sistema, no esta página.";
+
+async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
+    let Some(inbox) = &state.inbox else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
+    };
+    let store = Arc::clone(&inbox.store);
+    let page = match tokio::task::spawn_blocking(move || store.pending()).await {
+        Ok(Ok(page)) => page,
+        Ok(Err(error)) => return storage_error(error),
+        Err(_) => return storage_error(HistoryError::Unavailable),
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let mut solicitudes = Vec::with_capacity(page.items.len());
+    let mut vencidas = 0u32;
+    for facts in &page.items {
+        // A window that closed is not offered: the gateway would refuse it,
+        // and it records the expiry when it next sees the request.
+        if facts.expires_at <= now {
+            vencidas += 1;
+            continue;
+        }
+        let Some(referencia) = inbox.references.reference_for(facts) else {
+            return storage_error(HistoryError::Unavailable);
+        };
+        solicitudes.push(InboxItemView {
+            referencia,
+            situacion: facts.kind.phrase(),
+            pedida: readable_time(facts.created_at),
+            agente: agent_label(facts.key.agent_id, &state.names, &page.agents),
+            queria: if facts.wanted.is_empty() {
+                "no se muestra".to_owned()
+            } else {
+                facts.wanted.clone()
+            },
+            sobre: facts
+                .target
+                .clone()
+                .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
+            vale_hasta: readable_deadline(facts.expires_at),
+            queda: time_left(facts.expires_at, now),
+            puede_decidir: facts.kind == PendingKind::AwaitingApproval,
+            puede_ejecutar: facts.kind == PendingKind::ApprovedPendingExecution,
+        });
+    }
+    api_json(
+        StatusCode::OK,
+        InboxView {
+            aviso: INBOX_NOTICE,
+            solicitudes,
+            vencidas,
+            ilegibles: page.unreadable,
+        },
+    )
+}
+
+async fn approve(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    let what = Act::Decide(praetore_gateway::HumanApprovalOutcome::Approve);
+    act(state, headers, referencia, what).await
+}
+
+async fn reject(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    let what = Act::Decide(praetore_gateway::HumanApprovalOutcome::Reject);
+    act(state, headers, referencia, what).await
+}
+
+async fn execute(
+    state: State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    referencia: Path<String>,
+) -> Response {
+    act(state, headers, referencia, Act::Dispatch).await
+}
+
+#[derive(Clone, Copy)]
+enum Act {
+    Decide(praetore_gateway::HumanApprovalOutcome),
+    Dispatch,
+}
+
+async fn act(
+    State(state): State<Arc<ConsoleState>>,
+    headers: HeaderMap,
+    Path(referencia): Path<String>,
+    what: Act,
+) -> Response {
+    let Some(inbox) = &state.inbox else {
+        return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
+    };
+    if !same_page(inbox, &headers) {
+        return api_message(
+            StatusCode::FORBIDDEN,
+            "Esta acción solo se acepta desde la página de la consola.",
+        );
+    }
+    let Some(pending) = inbox.references.resolve(&referencia) else {
+        return api_message(
+            StatusCode::NOT_FOUND,
+            "Esa solicitud ya no está en la bandeja. Vuelve a cargarla.",
+        );
+    };
+    let gateway = Arc::clone(&inbox.gateway);
+    let signer = Arc::clone(&inbox.signer);
+    let result = tokio::task::spawn_blocking(move || match what {
+        Act::Decide(outcome) => aprobador::decide(gateway.as_ref(), &signer, &pending, outcome),
+        Act::Dispatch => aprobador::dispatch(gateway.as_ref(), &pending),
+    })
+    .await;
+    match result {
+        Ok(outcome) => api_json(StatusCode::OK, outcome),
+        Err(_) => {
+            tracing::error!(failure = "gateway_worker", "console action failed");
+            api_message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.",
+            )
+        }
+    }
 }
 
 async fn read_page(
@@ -329,6 +552,30 @@ struct DetailView {
     sobre: String,
     situacion: &'static str,
     relato: &'static str,
+}
+
+#[derive(Serialize)]
+struct InboxView {
+    aviso: &'static str,
+    solicitudes: Vec<InboxItemView>,
+    /// Pending in the journal, window already closed: not offered.
+    vencidas: u32,
+    /// Pending in the journal, receipt does not check out: not offered.
+    ilegibles: u32,
+}
+
+#[derive(Serialize)]
+struct InboxItemView {
+    referencia: String,
+    situacion: &'static str,
+    pedida: String,
+    agente: String,
+    queria: String,
+    sobre: String,
+    vale_hasta: String,
+    queda: String,
+    puede_decidir: bool,
+    puede_ejecutar: bool,
 }
 
 fn set_security_headers(headers: &mut HeaderMap) {
@@ -512,6 +759,7 @@ mod tests {
         let html = body_text(response).await;
         assert!(!html.contains(&secret));
         assert!(html.contains("Historial"));
+        assert!(html.contains("Bandeja"));
         assert!(html.contains(NOTICE));
         assert!(html.contains("pendiente de aprobación"));
         assert!(html.contains("aprobado, pendiente de ejecución"));
@@ -520,7 +768,6 @@ mod tests {
         assert!(!html.contains("RFC"));
         assert!(!html.contains("UUID"));
         assert!(!html.contains("awaiting_approval"));
-        assert!(!html.to_lowercase().contains("aprobar"));
         assert!(!html.contains("descargar"));
         let script = app
             .oneshot(
@@ -533,7 +780,8 @@ mod tests {
             .unwrap();
         let script = body_text(script).await;
         assert!(!script.contains("innerHTML"));
-        assert!(!script.contains("POST"));
+        assert!(script.contains(ACTION_HEADER));
+        assert!(!script.contains("localStorage"));
         assert!(!script.contains(&secret));
         assert!(!script.contains(sesion::COOKIE_NAME));
     }
