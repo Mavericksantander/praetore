@@ -183,6 +183,16 @@
 
 ### Changed
 
+- **Adopting a legacy 0009 baseline checks trigger-function bodies.** Each
+  function migrations 0001-0009 install for a trigger must have a `prosrc`
+  whose SHA-256 equals the body of the last `CREATE OR REPLACE FUNCTION`
+  for that name in those files. Nothing is rewritten before hashing:
+  `prosrc` is the stored source, which PostgreSQL 15, 16 and 17 keep as
+  written, while `pg_get_functiondef` does not render the same statement
+  on those versions (CI runs PostgreSQL 16). A different body, a missing
+  function, or a fingerprint that cannot be read is refused and the error
+  names the function. The migration files are unchanged.
+
 - **Migration `0021_journal_insert_rules` (T-016).** The execution journal
   accepts on INSERT only the initial states the gateway writes (`authorized`
   for `allowed`, `not_dispatched` otherwise, with no output, reason or

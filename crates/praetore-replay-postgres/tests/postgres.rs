@@ -3249,6 +3249,102 @@ fn assert_tampered_baseline_refused(tamper: &str, object: &str) {
     );
 }
 
+fn trigger_function_prosrc(client: &mut Client, name: &str) -> String {
+    client
+        .query_one(
+            "SELECT p.prosrc FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'praetore' AND p.proname = $1 \
+               AND pg_catalog.pg_get_function_identity_arguments(p.oid) = ''",
+            &[&name],
+        )
+        .unwrap_or_else(|error| panic!("read prosrc of {name}: {error}"))
+        .get(0)
+}
+
+/// The eight 0001-0009 trigger functions, as stored, match the fingerprints
+/// derived from the bundled migration text.
+fn assert_baseline_trigger_fingerprints(client: &mut Client) {
+    let expected = praetore_replay_postgres::baseline_trigger_function_fingerprints();
+    assert_eq!(expected.len(), 8);
+    for (name, digest) in &expected {
+        let prosrc = trigger_function_prosrc(client, name);
+        assert_eq!(
+            praetore_replay_postgres::trigger_function_body_fingerprint(&prosrc),
+            *digest,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_genuine_0009_baseline_is_adopted() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    assert_baseline_trigger_fingerprints(&mut client);
+    let applied = adopt_legacy_baseline(&mut client).expect("a genuine 0009 baseline is adopted");
+    assert_eq!(
+        applied.len(),
+        praetore_replay_postgres::MIGRATIONS.len() - 9,
+        "0001-0009 are recorded, not executed: {applied:?}"
+    );
+    assert_eq!(applied[0], "0010_approved_pending_dispatch");
+    assert_eq!(recorded_versions(&mut client), all_versions());
+    assert_baseline_trigger_fingerprints(&mut client);
+    let adoption = praetore_replay_postgres::legacy_baseline_adoption(&mut client)
+        .unwrap()
+        .expect("the adoption is recorded");
+    assert_eq!(adoption.structure_sha256.len(), 64);
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_replaced_trigger_function_body_is_rejected() {
+    // Same name and signature (`()` RETURNS trigger, LANGUAGE plpgsql);
+    // the body no longer rejects the mutation.
+    assert_tampered_baseline_refused(
+        "CREATE OR REPLACE FUNCTION praetore.reject_human_approval_mutation() \
+         RETURNS TRIGGER LANGUAGE plpgsql AS $$\nBEGIN\n    RETURN NEW;\nEND;\n$$;",
+        "function praetore.reject_human_approval_mutation() differs from 0009 in: body (sha256 ",
+    );
+}
+
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_migrations_trigger_function_fingerprints_match_0001_to_0009() {
+    let scratch = ScratchDatabase::create();
+    let mut client = scratch.connect();
+    apply_legacy_migrations_through(&mut client, 9);
+    assert_baseline_trigger_fingerprints(&mut client);
+    let expected = praetore_replay_postgres::baseline_trigger_function_fingerprints();
+    let mut expected_names: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+    expected_names.sort_unstable();
+    let live: Vec<String> = client
+        .query(
+            "SELECT DISTINCT p.proname::text \
+             FROM pg_catalog.pg_trigger g \
+             JOIN pg_catalog.pg_proc p ON p.oid = g.tgfoid \
+             JOIN pg_catalog.pg_class c ON c.oid = g.tgrelid \
+             JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'praetore' AND NOT g.tgisinternal \
+             ORDER BY 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        live,
+        expected_names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_migrations_baseline_changed_function_body_fails_closed() {

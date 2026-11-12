@@ -11,8 +11,15 @@
 //! match is live against live (`check_0009_baseline`): 0001-0009 are applied
 //! into a scratch schema in a transaction that is rolled back, and a
 //! canonical dump of both schemas (definitions, owners, ACLs, rules,
-//! inheritance, dependents) must be identical. Any other pre-existing
-//! `praetore` schema is
+//! inheritance, dependents) must be identical. Each trigger function those
+//! migrations install is also checked on its own: the SHA-256 of `prosrc`
+//! must equal the SHA-256 of the body of the last `CREATE OR REPLACE
+//! FUNCTION` in 0001-0009. `prosrc` is the body text the server stores, so
+//! the digest does not depend on how `pg_get_functiondef` renders a
+//! statement (that rendering differs across PostgreSQL 15, 16 and 17; CI
+//! runs 16). A different body, a missing function, or a fingerprint that
+//! cannot be read refuses adoption and names the function. Any other
+//! pre-existing `praetore` schema is
 //! refused (fail closed). A control table that records a version this binary
 //! does not know is refused too, so an older binary never runs against a
 //! newer schema.
@@ -697,6 +704,16 @@ fn apply_locked(
             // while this transaction waits, for example on CREATE TABLE
             // above. Compare again immediately before COMMIT; what remains is
             // the window between this query and the COMMIT itself.
+            check_baseline_trigger_function_bodies(&mut transaction).map_err(
+                |error| match error {
+                    MigrationError::UnrecognizedSchema(detail) => {
+                        MigrationError::UnrecognizedSchema(format!(
+                            "changed while it was being recorded: {detail}"
+                        ))
+                    }
+                    other => other,
+                },
+            )?;
             let mut live = schema_dump(&mut transaction, "praetore", "praetore")?;
             live.retain(|key, _| !is_control_table_key(key) && !is_storage_records_key(key));
             let differences = dump_differences(&live, expected);
@@ -1003,6 +1020,147 @@ fn check_session_fires_triggers(client: &mut Client) -> Result<(), MigrationErro
     Ok(())
 }
 
+/// Trigger functions migrations 0001-0009 install and that their triggers
+/// call. The body is not copied here: it is the last `CREATE OR REPLACE
+/// FUNCTION` of that name in the bundled text, whose checksums are pinned.
+const BASELINE_TRIGGER_FUNCTIONS: &[&str] = &[
+    "enforce_approval_resolution_exclusive",
+    "record_execution_journal_transition",
+    "reject_execution_attestation_mutation",
+    "reject_execution_journal_event_mutation",
+    "reject_human_approval_expiration_mutation",
+    "reject_human_approval_mutation",
+    "restrict_journal_delete_with_expiration",
+    "validate_execution_journal_transition",
+];
+
+/// SHA-256 (lowercase hex) of a trigger-function body.
+///
+/// `body` is `pg_proc.prosrc`, or the same text taken from the migration
+/// file. No characters are rewritten. `prosrc` is stored as the source
+/// string of a PL/pgSQL function, byte for byte, on PostgreSQL 15, 16 and
+/// 17. Hashing `pg_get_functiondef` instead would mix in a reconstructed
+/// `CREATE FUNCTION` statement: attribute order, dollar-quote tags and
+/// schema-qualified types in that statement are not stable across those
+/// versions, and CI runs PostgreSQL 16. Whitespace is significant: one
+/// extra space is a different body.
+pub fn trigger_function_body_fingerprint(body: &str) -> String {
+    hex::encode(Sha256::digest(body.as_bytes()))
+}
+
+/// Expected fingerprints of the 0001-0009 trigger functions, derived from
+/// the bundled migration text. A name whose body cannot be read from those
+/// files is omitted; adopting a baseline then fails closed for that name.
+pub fn baseline_trigger_function_fingerprints() -> Vec<(&'static str, String)> {
+    BASELINE_TRIGGER_FUNCTIONS
+        .iter()
+        .filter_map(|name| {
+            let body = baseline_trigger_function_body(name)?;
+            Some((*name, trigger_function_body_fingerprint(body)))
+        })
+        .collect()
+}
+
+/// Body (the text between the `$$` delimiters) of the last
+/// `CREATE OR REPLACE FUNCTION praetore.<name>()` in 0001-0009.
+fn baseline_trigger_function_body(name: &str) -> Option<&'static str> {
+    let header = format!("CREATE OR REPLACE FUNCTION praetore.{name}()");
+    let mut body = None;
+    for (version, sql) in MIGRATIONS {
+        for (start, end) in top_level_statements(sql) {
+            let statement = skip_leading_comments(&sql[start..end]);
+            if let Some(rest) = statement.strip_prefix(&header) {
+                body = dollar_quoted_body(rest);
+            }
+        }
+        if version == BASELINE_VERSION {
+            break;
+        }
+    }
+    body
+}
+
+/// Text between the first `$$` pair. The 0001-0009 functions are written
+/// with `$$`, and their bodies do not contain `$$`.
+fn dollar_quoted_body(sql: &str) -> Option<&str> {
+    let open = sql.find("$$")? + 2;
+    let close = open + sql[open..].find("$$")?;
+    Some(&sql[open..close])
+}
+
+/// Refuses a 0009 baseline whose trigger-function bodies are not the ones
+/// in migrations 0001-0009. The error names the function.
+fn check_baseline_trigger_function_bodies(
+    transaction: &mut postgres::Transaction<'_>,
+) -> Result<(), MigrationError> {
+    let mut problems = Vec::new();
+    for name in BASELINE_TRIGGER_FUNCTIONS {
+        if let Err(problem) = trigger_function_body_problem(transaction, name) {
+            problems.push(problem);
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(MigrationError::UnrecognizedSchema(problems.join("; ")))
+    }
+}
+
+fn trigger_function_body_problem(
+    transaction: &mut postgres::Transaction<'_>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(expected_body) = baseline_trigger_function_body(name) else {
+        return Err(format!(
+            "function praetore.{name}() body fingerprint could not be calculated: \
+             migrations 0001-0009 have no body for it"
+        ));
+    };
+    let expected = trigger_function_body_fingerprint(expected_body);
+    let rows = transaction
+        .query(
+            "SELECT p.prosrc \
+             FROM pg_catalog.pg_proc p \
+             JOIN pg_catalog.pg_namespace n \
+               ON n.oid OPERATOR(pg_catalog.=) p.pronamespace \
+             WHERE n.nspname OPERATOR(pg_catalog.=) 'praetore' \
+               AND p.proname OPERATOR(pg_catalog.=) $1 \
+               AND pg_catalog.pg_get_function_identity_arguments(p.oid) \
+                   OPERATOR(pg_catalog.=) ''",
+            &[&name],
+        )
+        .map_err(|error| {
+            format!(
+                "function praetore.{name}() body fingerprint could not be calculated: {}",
+                database_cause(&error)
+            )
+        })?;
+    if rows.is_empty() {
+        return Err(format!("function praetore.{name}() is missing"));
+    }
+    if rows.len() != 1 {
+        return Err(format!(
+            "function praetore.{name}() body fingerprint could not be calculated: \
+             {} functions have that name and no arguments",
+            rows.len()
+        ));
+    }
+    let prosrc: Option<String> = rows[0].get(0);
+    let Some(prosrc) = prosrc else {
+        return Err(format!(
+            "function praetore.{name}() body fingerprint could not be calculated: prosrc is null"
+        ));
+    };
+    let found = trigger_function_body_fingerprint(&prosrc);
+    if found == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "function praetore.{name}() differs from 0009 in: body (sha256 {found}, expected {expected})"
+        ))
+    }
+}
+
 /// The 0009 baseline check.
 ///
 /// In one transaction that is always rolled back, 0001-0009 are applied into
@@ -1011,8 +1169,14 @@ fn check_session_fires_triggers(client: &mut Client) -> Result<(), MigrationErro
 /// of `praetore` and of the scratch schema. Both are rendered by the same
 /// server under `SAFE_SEARCH_PATH` with the schema names normalized, so the
 /// expected values come from this server and not from constants that a
-/// PostgreSQL version could render differently. Any difference fails with
-/// `UnrecognizedSchema` naming the objects. A few properties that the dump
+/// PostgreSQL version could render differently. Before that, each trigger
+/// function from 0001-0009 is checked by fingerprint: SHA-256 of `prosrc`
+/// against the body in the bundled migration text (`prosrc`, not
+/// `pg_get_functiondef`, so the digest does not follow version-specific
+/// rendering). A different body, a missing function, or a fingerprint that
+/// cannot be read fails with `UnrecognizedSchema` naming the function. Any
+/// other difference fails with `UnrecognizedSchema` naming the objects. A
+/// few properties that the dump
 /// cannot express (they are not per-schema) are checked on the live
 /// database only: event triggers, per-database or per-role settings that
 /// change search_path, row_security or session_replication_role, default
@@ -1056,6 +1220,7 @@ fn check_0009_baseline(
     if !live_problems.is_empty() {
         return Err(MigrationError::UnrecognizedSchema(live_problems.join("; ")));
     }
+    check_baseline_trigger_function_bodies(transaction)?;
     let scratch = format!("praetore_baseline_{}", uuid::Uuid::new_v4().simple());
     let mut savepoint = transaction.savepoint("praetore_baseline_scratch")?;
     for (version, sql) in MIGRATIONS {
@@ -2309,6 +2474,123 @@ mod tests {
             transactional_body(MIGRATIONS[9].0, MIGRATIONS[9].1).unwrap(),
             MIGRATIONS[9].1,
             "0010 is executed unchanged"
+        );
+    }
+
+    /// `CREATE OR REPLACE FUNCTION praetore.<name>()` statements in 0001-0009.
+    fn baseline_function_statements(name: &str) -> Vec<&'static str> {
+        let header = format!("CREATE OR REPLACE FUNCTION praetore.{name}()");
+        let mut found = Vec::new();
+        for (version, sql) in MIGRATIONS {
+            for (start, end) in top_level_statements(sql) {
+                let statement = skip_leading_comments(&sql[start..end]);
+                if statement.starts_with(&header) {
+                    found.push(statement);
+                }
+            }
+            if version == BASELINE_VERSION {
+                break;
+            }
+        }
+        found
+    }
+
+    /// Function names executed by `CREATE TRIGGER` in 0001-0009.
+    fn trigger_functions_in_0001_to_0009() -> Vec<&'static str> {
+        let mut names = Vec::new();
+        for (version, sql) in MIGRATIONS {
+            for (start, end) in top_level_statements(sql) {
+                let statement = skip_leading_comments(&sql[start..end]);
+                let Some(rest) = statement
+                    .split_once("EXECUTE FUNCTION praetore.")
+                    .or_else(|| statement.split_once("EXECUTE PROCEDURE praetore."))
+                    .map(|(_, rest)| rest)
+                else {
+                    continue;
+                };
+                let name = rest
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                assert!(!name.is_empty(), "{statement}");
+                names.push(name);
+            }
+            if version == BASELINE_VERSION {
+                break;
+            }
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    #[test]
+    fn baseline_trigger_functions_are_exactly_those_used_by_0001_to_0009() {
+        let mut created = Vec::new();
+        for (version, sql) in MIGRATIONS {
+            for (start, end) in top_level_statements(sql) {
+                let statement = skip_leading_comments(&sql[start..end]);
+                if let Some(rest) = statement.strip_prefix("CREATE OR REPLACE FUNCTION praetore.") {
+                    let name = rest
+                        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap();
+                    created.push(name);
+                }
+                assert!(
+                    !statement.starts_with("CREATE FUNCTION "),
+                    "{version} creates a function that is not CREATE OR REPLACE"
+                );
+            }
+            if version == BASELINE_VERSION {
+                break;
+            }
+        }
+        created.sort_unstable();
+        created.dedup();
+        let mut listed: Vec<&str> = BASELINE_TRIGGER_FUNCTIONS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(created, listed);
+        assert_eq!(trigger_functions_in_0001_to_0009(), listed);
+        for name in BASELINE_TRIGGER_FUNCTIONS {
+            let statements = baseline_function_statements(name);
+            assert!(!statements.is_empty(), "{name}");
+            let body = baseline_trigger_function_body(name).unwrap();
+            assert!(
+                statements.last().unwrap().contains(&format!("$${body}$$")),
+                "{name}"
+            );
+            assert!(!body.contains("$$"), "{name}");
+            assert!(
+                body.contains("BEGIN"),
+                "{name} body is not the PL/pgSQL source"
+            );
+            let fingerprint = trigger_function_body_fingerprint(body);
+            assert_eq!(fingerprint.len(), 64);
+            assert_ne!(
+                trigger_function_body_fingerprint(&format!("{body} ")),
+                fingerprint,
+                "a trailing space must change the fingerprint"
+            );
+        }
+        let validate =
+            baseline_trigger_function_body("validate_execution_journal_transition").unwrap();
+        assert!(
+            validate.contains("NEW.tenant_id <> OLD.tenant_id"),
+            "the fingerprint must use 0007's body, not 0002's or 0006's"
+        );
+        let fingerprints = baseline_trigger_function_fingerprints();
+        assert_eq!(fingerprints.len(), BASELINE_TRIGGER_FUNCTIONS.len());
+        let mut digests: Vec<&str> = fingerprints
+            .iter()
+            .map(|(_, digest)| digest.as_str())
+            .collect();
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(
+            digests.len(),
+            fingerprints.len(),
+            "each body hashes differently"
         );
     }
 
