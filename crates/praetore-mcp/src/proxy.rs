@@ -646,7 +646,8 @@ pub fn handle_client_line(
             Mode::Enforce => refuse_unparseable(&mut out, "an ambiguous", &reason, raw),
             Mode::Observe => {
                 out.warnings.push(format!(
-                    "praetore-mcp: WARNING ambiguous client line ({reason}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
+                    "praetore-mcp: WARNING ambiguous client line ({reason}; {}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
+                    fingerprint(raw),
                     candidates.len()
                 ));
                 let mut refused = None;
@@ -939,6 +940,33 @@ mod tests {
         assert_eq!(reply["id"], Value::Null);
         assert!(out.warnings[0].contains(&digest), "{:?}", out.warnings);
         assert!(eval.calls.is_empty());
+    }
+
+    /// Ambiguous client lines in observe: the warning names the raw line by
+    /// its SHA-256 and length, the same fingerprint as the other line notices.
+    #[test]
+    fn observe_ambiguous_line_warning_includes_sha256() {
+        let raw = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"Method\":\"tools/call\",\"params\":{\"name\":\"rm\"}}\n";
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(raw));
+        assert!(matches!(
+            classify(raw),
+            Classified::Ambiguous {
+                unparsed: false,
+                ..
+            }
+        ));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
+        assert!(out.to_client.is_none());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let warning = &out.warnings[0];
+        assert!(warning.contains("ambiguous client line"), "{warning}");
+        assert!(warning.contains("(observe)"), "{warning}");
+        assert!(
+            warning.contains(&format!("sha256 {digest}, {} bytes", raw.len())),
+            "{warning}"
+        );
     }
 
     fn nested_call(name: &str, depth: usize) -> Vec<u8> {

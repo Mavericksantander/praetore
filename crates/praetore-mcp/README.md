@@ -526,7 +526,8 @@ Things to know:
   JSON-RPC error `-32700` (`id: null`). Observe forwards them unchanged.
 * **Ambiguous lines** are lines that this proxy and the server could split or
   read differently. Enforce refuses them with `-32700` (`id: null`). Observe
-  forwards them unchanged, warns, and evaluates and records **every**
+  forwards them unchanged, warns with the SHA-256 and the length of the
+  line, and evaluates and records **every**
   `tools/call` reading it can find. Two kinds are detected:
   * **Bare carriage returns.** The proxy frames on `\n`, and JSON treats
     `\r` as whitespace. Universal-newline readers end a line at `\r`, `\n`
