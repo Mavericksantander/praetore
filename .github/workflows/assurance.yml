@@ -336,6 +336,9 @@ jobs:
           output="$(cargo test --manifest-path examples/claude-code-hook/Cargo.toml --locked tests_high_assurance -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
           grep -Eq "test result: ok\. [0-9]+ passed; 0 failed" <<<"$output" || { echo "::error::the HighAssurance hook tests failed"; exit 1; }
+          # Parallel runs can concatenate harness lines (`test a ... oktest b ... ok`).
+          # Match the success phrase anywhere on the line. A missing test has no
+          # phrase; a failure says FAILED, which does not contain `... ok`.
           for test in every_receipt_records_a_signed_decision_time \
             declared_safety_tool_gets_no_receipt_and_no_claim \
             state_without_a_replay_store_is_refused_with_a_pointer_to_init \
@@ -350,7 +353,7 @@ jobs:
             guard::concurrent_claims_of_one_request_succeed_exactly_once \
             guard::concurrent_hook_calls_each_claim_their_own_request \
             guard::directory_owned_by_another_user_is_refused; do
-            grep -q "^test tests_high_assurance::$test \.\.\. ok$" <<<"$output" || { echo "::error::$test did not run or failed"; exit 1; }
+            grep -qF "test tests_high_assurance::$test ... ok" <<<"$output" || { echo "::error::$test did not run or failed"; exit 1; }
           done
       # SAF-14: two agents sign with different issued identities, and no
       # edit of index.json or of the receipt re-attributes a receipt.
