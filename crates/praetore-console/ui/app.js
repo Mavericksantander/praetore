@@ -370,6 +370,52 @@ async function cargarBandeja() {
   for (const solicitud of data.solicitudes) solicitudes.append(pintarSolicitud(solicitud));
 }
 
+async function descargarPaquete() {
+  const boton = document.getElementById("descargar-paquete");
+  const estadoPaquete = document.getElementById("paquete-estado");
+  boton.disabled = true;
+  estadoPaquete.textContent = "Armando el paquete…";
+  try {
+    let response;
+    try {
+      response = await fetch("/api/paquete", {
+        credentials: "same-origin",
+        headers: { "x-praetore-consola": "1" },
+      });
+    } catch (_error) {
+      estadoPaquete.textContent = "No se pudo pedir el paquete.";
+      return;
+    }
+    if (response.status === 401) {
+      estadoPaquete.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
+      return;
+    }
+    if (!response.ok) {
+      let data = null;
+      try {
+        data = await response.json();
+      } catch (_error) {
+        data = null;
+      }
+      estadoPaquete.textContent = data && typeof data.mensaje === "string" ? data.mensaje : "No se pudo armar el paquete. No se generó ningún paquete.";
+      return;
+    }
+    const archivo = await response.blob();
+    const enlace = document.createElement("a");
+    enlace.href = URL.createObjectURL(archivo);
+    enlace.download = "praetore-compliance.tar.gz";
+    document.body.append(enlace);
+    enlace.click();
+    enlace.remove();
+    setTimeout(() => URL.revokeObjectURL(enlace.href), 60000);
+    estadoPaquete.textContent = "Paquete descargado: praetore-compliance.tar.gz. Las instrucciones para verificarlo están en LEEME.txt, dentro del paquete.";
+  } finally {
+    boton.disabled = false;
+  }
+}
+
+document.getElementById("descargar-paquete").addEventListener("click", descargarPaquete);
+
 document.getElementById("recargar-bandeja").addEventListener("click", () => {
   cargarBandeja();
   cargar();

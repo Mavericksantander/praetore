@@ -107,6 +107,14 @@ impl ApproverSigner {
         signer
     }
 
+    /// True when `candidate` is this approver's public key or its secret:
+    /// such a value must never be written as an attester pin.
+    pub(crate) fn is_key_material(&self, candidate: &[u8; 32]) -> bool {
+        use subtle::ConstantTimeEq;
+        let public = self.key.verifying_key().to_bytes();
+        bool::from(public.ct_eq(candidate) | self.key.as_bytes().ct_eq(candidate))
+    }
+
     pub fn sign(
         &self,
         view: ApprovalChallengeView,

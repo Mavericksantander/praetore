@@ -104,3 +104,8 @@ footer small { font-size: 10px; letter-spacing: .08em; }
   .section-head { align-items: flex-start; flex-direction: column; }
   .filters input, .filters label, .filters select { width: 100%; }
 }
+
+.paquete { margin: 0 0 56px; }
+.paquete h2 { margin-bottom: 12px; }
+.paquete .aviso { margin-bottom: 16px; }
+.paquete .estado { margin: 12px 0 0; }

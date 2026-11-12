@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 mod connection;
 mod execution;
+pub mod journal_export;
 mod migrations;
 mod observability;
 mod safety;

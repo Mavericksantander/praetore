@@ -11,6 +11,10 @@
 //! not offered, and approving its old reference gets "expirado". The journal
 //! must show two executions, one signed rejection and one signed expiry.
 //!
+//! D3: the compliance package of a tenant with real decisions, unpacked
+//! with the system's `tar` and checked with `praetore-verify` built from
+//! this workspace.
+//!
 //! Needs `PRAETORE_TEST_DATABASE_URL` (a role that can CREATE ROLE). The
 //! gateway helpers mirror `journal_export_postgres.rs`.
 
@@ -21,8 +25,8 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use praetore_console::{
-    ACTION_HEADER, ApproverSigner, ConsoleState, HttpApprovalGateway, Inbox, InboxStore,
-    LocalSession, PendingKind, PostgresHistory, read_token_file,
+    ACTION_HEADER, ApproverSigner, CompliancePack, ConsoleState, HttpApprovalGateway, Inbox,
+    InboxStore, LocalSession, PackSettings, PendingKind, PostgresHistory, read_token_file,
 };
 use std::{
     collections::HashMap,
@@ -469,6 +473,344 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
             Some("approval_expired".to_owned())
         )
     );
+    drop(gateway);
+    drop(state);
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The `praetore-verify` this workspace builds, found the same way as the
+/// CLI's own tests find it.
+#[path = "../src/sibling_binary.rs"]
+mod sibling_binary;
+
+fn run(command: &mut Command, what: &str) -> Output {
+    ok(command.output().unwrap(), what)
+}
+
+/// `sha256sum -c` where it exists (Linux), `shasum -a 256 -c` otherwise.
+fn check_sums(dir: &Path) -> Output {
+    let mut sha256sum = Command::new("sha256sum");
+    sha256sum.args(["-c", "SHA256SUMS"]).current_dir(dir);
+    match sha256sum.output() {
+        Ok(output) => output,
+        Err(_) => Command::new("shasum")
+            .args(["-a", "256", "-c", "SHA256SUMS"])
+            .current_dir(dir)
+            .output()
+            .unwrap(),
+    }
+}
+
+fn pack_request() -> Request<Body> {
+    Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
+        .uri("/api/paquete")
+        .header(header::COOKIE, cookie())
+        .header(ACTION_HEADER, "1")
+        .header("sec-fetch-site", "same-origin")
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// D3 end to end: real decisions through the gateway (one approved and
+/// executed, one rejected, one left pending), then the console's compliance
+/// package. Its journal must be byte for byte what `praetore journal-export
+/// --tenant` writes for the same database, and the unpacked package must
+/// verify with the workspace's `praetore-verify` (journal, policy digest,
+/// `--policy`, `--expected-head`) and with `sha256sum -c`. No key file of
+/// `praetore init` may appear in it.
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
+    let admin_url = std::env::var("PRAETORE_TEST_DATABASE_URL")
+        .expect("PRAETORE_TEST_DATABASE_URL is required");
+    let runtime_url = provision(&admin_url);
+    let root = std::env::temp_dir().join(format!("praetore-console-pack-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let dir = root.join("demo");
+    ok(
+        praetore(&[
+            "init",
+            dir.to_str().unwrap(),
+            "--port",
+            &free_port().to_string(),
+        ]),
+        "praetore init",
+    );
+    let tenant = Uuid::parse_str(config(&dir)["tenant_id"].as_str().unwrap()).unwrap();
+    let mut policy: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("policy.json")).unwrap()).unwrap();
+    policy["rules"][0]["effect"] = "RequireApproval".into();
+    fs::write(dir.join("policy.json"), policy.to_string()).unwrap();
+    // The attester's public key, as an operator would hand it out.
+    let secret: [u8; 32] = hex::decode(
+        fs::read_to_string(dir.join("evidence-attester.key"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let pin = root.join("attester-public-key.hex");
+    fs::write(
+        &pin,
+        hex::encode(
+            praetore_core::EvidenceAttesterKey::from_secret_bytes(&secret)
+                .public_key()
+                .unwrap()
+                .as_bytes(),
+        ) + "\n",
+    )
+    .unwrap();
+
+    let gateway = Gateway::start(&dir, &admin_url, &runtime_url);
+    let port = config(&dir)["port"].as_u64().unwrap() as u16;
+    held_demo(&dir, "aprobar");
+    held_demo(&dir, "rechazar");
+
+    let client = postgres::Client::connect(&runtime_url, postgres::NoTls).unwrap();
+    let history = Arc::new(PostgresHistory::from_client(client, tenant).unwrap());
+    let state = Arc::new(
+        ConsoleState::new(
+            history.clone(),
+            LocalSession::from_secret([0x21; 32]),
+            HashMap::new(),
+        )
+        .with_inbox(Inbox::new(
+            history.clone(),
+            Arc::new(HttpApprovalGateway::new(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+                read_token_file(&dir.join("approver-api.token")).unwrap(),
+            )),
+            ApproverSigner::from_file("local-approver", &dir.join("approver.key")).unwrap(),
+        ))
+        .with_compliance_pack(CompliancePack::new(
+            PackSettings::new(dir.join("policy.json"), vec![pin.clone()]).unwrap(),
+            history.clone(),
+        )),
+    );
+    let app = ConsoleState::router_from(Arc::clone(&state));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pack, missing_policy) = runtime.block_on(async {
+        let (_, list, text) = call(&app, inbox_request()).await;
+        let items = list["solicitudes"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "{text}");
+        let first = items[1]["referencia"].as_str().unwrap().to_owned();
+        let second = items[0]["referencia"].as_str().unwrap().to_owned();
+        let (_, approved, text) =
+            call(&app, action(&format!("/api/bandeja/{first}/aprobar"))).await;
+        assert_eq!(
+            approved["situacion"], "aprobado, pendiente de ejecución",
+            "{text}"
+        );
+        let (_, executed, text) =
+            call(&app, action(&format!("/api/bandeja/{first}/ejecutar"))).await;
+        assert_eq!(executed["situacion"], "aprobado", "{text}");
+        let (_, rejected, text) =
+            call(&app, action(&format!("/api/bandeja/{second}/rechazar"))).await;
+        assert_eq!(rejected["situacion"], "rechazado", "{text}");
+        // One more left pending: its receipt is in the journal too.
+        held_demo(&dir, "pendiente");
+
+        let response = app.clone().oneshot(pack_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/gzip");
+        let pack = to_bytes(response.into_body(), 64 << 20)
+            .await
+            .unwrap()
+            .to_vec();
+
+        // A piece missing: no package, a plain message.
+        fs::rename(dir.join("policy.json"), root.join("policy.json.aside")).unwrap();
+        let response = app.clone().oneshot(pack_request()).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        fs::rename(root.join("policy.json.aside"), dir.join("policy.json")).unwrap();
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (pack, (status, message))
+    });
+    drop(runtime);
+    drop(app);
+    assert_eq!(missing_policy.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        missing_policy.1["mensaje"],
+        "No se pudo leer la política configurada en la consola. No se generó ningún paquete."
+    );
+
+    // Unpacked with the system's tar.
+    let archive = root.join("praetore-compliance.tar.gz");
+    fs::write(&archive, &pack).unwrap();
+    let unpacked = root.join("unpacked");
+    fs::create_dir_all(&unpacked).unwrap();
+    run(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&unpacked),
+        "tar -xzf",
+    );
+    let pack_dir = unpacked.join("praetore-compliance");
+    let mut names: Vec<String> = fs::read_dir(&pack_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "LEEME.txt",
+            "SHA256SUMS",
+            "attester-pin-1.hex",
+            "export.json",
+            "journal.jsonl",
+            "policy-digest.txt",
+            "policy.json",
+        ]
+    );
+    let sums = check_sums(&pack_dir);
+    assert!(
+        sums.status.success(),
+        "SHA256SUMS: {}{}",
+        String::from_utf8_lossy(&sums.stdout),
+        String::from_utf8_lossy(&sums.stderr)
+    );
+
+    // The same chain `praetore journal-export --tenant` writes.
+    let cli_export = root.join("cli-export.jsonl");
+    run(
+        Command::new(PRAETORE)
+            .args(["journal-export", "--tenant", &tenant.to_string()])
+            .arg("--attester-pin")
+            .arg(&pin)
+            .arg("--output")
+            .arg(&cli_export)
+            .env("PRAETORE_GATEWAY_DATABASE_URL", &runtime_url),
+        "praetore journal-export --tenant",
+    );
+    let journal = fs::read(pack_dir.join("journal.jsonl")).unwrap();
+    assert_eq!(journal, fs::read(&cli_export).unwrap());
+
+    let export: serde_json::Value =
+        serde_json::from_slice(&fs::read(pack_dir.join("export.json")).unwrap()).unwrap();
+    assert_eq!(export["tenant_id"], tenant.to_string());
+    let head = export["journal"]["head"].as_str().unwrap().to_owned();
+
+    // `praetore-verify` built from this workspace, inside the package.
+    let verify = sibling_binary::sibling_binary("praetore-verify");
+    let verified = run(
+        Command::new(&verify)
+            .args([
+                "journal",
+                "--journal",
+                "journal.jsonl",
+                "--attester-pin",
+                "attester-pin-1.hex",
+                "--format",
+                "json",
+            ])
+            .current_dir(&pack_dir),
+        "praetore-verify journal",
+    );
+    let verified: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(
+        verified["details"]["tenant_id"],
+        tenant.to_string(),
+        "{verified}"
+    );
+    assert_eq!(
+        verified["details"]["entries"], export["journal"]["entries"],
+        "{verified}"
+    );
+    // Approved and executed, rejected, pending: at least three receipts.
+    assert!(
+        export["journal"]["entries"].as_u64().unwrap() >= 3,
+        "{export}"
+    );
+    let anchored = run(
+        Command::new(&verify)
+            .args([
+                "journal",
+                "--journal",
+                "journal.jsonl",
+                "--attester-pin",
+                "attester-pin-1.hex",
+                "--expected-head",
+                &head,
+                "--policy",
+                "policy.json",
+                "--format",
+                "json",
+            ])
+            .current_dir(&pack_dir),
+        "praetore-verify journal --expected-head --policy",
+    );
+    let anchored: serde_json::Value = serde_json::from_slice(&anchored.stdout).unwrap();
+    assert_eq!(anchored["ok"], true, "{anchored}");
+    let digest = run(
+        Command::new(&verify)
+            .args([
+                "policy-digest",
+                "--policy",
+                "policy.json",
+                "--format",
+                "json",
+            ])
+            .current_dir(&pack_dir),
+        "praetore-verify policy-digest",
+    );
+    let digest: serde_json::Value = serde_json::from_slice(&digest.stdout).unwrap();
+    assert_eq!(
+        format!("{}\n", digest["details"]["digest"].as_str().unwrap()),
+        fs::read_to_string(pack_dir.join("policy-digest.txt")).unwrap()
+    );
+    // An altered journal no longer verifies.
+    let mut altered = String::from_utf8(journal.clone()).unwrap();
+    let at = altered.find("demo:set_value").unwrap();
+    altered.replace_range(at..at + 4, "dema");
+    fs::write(pack_dir.join("altered.jsonl"), altered).unwrap();
+    let refused = Command::new(&verify)
+        .args([
+            "journal",
+            "--journal",
+            "altered.jsonl",
+            "--attester-pin",
+            "attester-pin-1.hex",
+        ])
+        .current_dir(&pack_dir)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+
+    // No secret of `praetore init` is in the package.
+    let mut everything = Vec::new();
+    for name in &names {
+        everything.extend(fs::read(pack_dir.join(name)).unwrap());
+    }
+    let everything = String::from_utf8(everything).unwrap();
+    for secret_file in [
+        "approver.key",
+        "evidence-attester.key",
+        "execution-attester.key",
+        "approver-api.token",
+        "agent-api.token",
+    ] {
+        let path = dir.join(secret_file);
+        let Ok(value) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let value = value.trim();
+        assert!(value.len() >= 32, "{secret_file}");
+        assert!(
+            !everything.contains(value),
+            "{secret_file} is in the package"
+        );
+    }
+
     drop(gateway);
     drop(state);
     let _ = fs::remove_dir_all(&root);

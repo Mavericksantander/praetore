@@ -449,6 +449,15 @@ jobs:
           output="$(cargo test -p praetore-cli --locked --test console_inbox_postgres -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
           grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
+      - name: Console compliance package verified with praetore-verify (P-002 D3)
+        run: |
+          set -euo pipefail
+          # Runs target/debug/praetore-verify, built by an earlier step of
+          # this job.
+          name=postgres_console_compliance_pack_verifies_with_praetore_verify
+          output="$(cargo test -p praetore-cli --locked --test console_inbox_postgres -- --ignored --exact "$name" 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok. 1 passed" <<<"$output" || { echo "::error::$name did not run"; exit 1; }
       - name: G1 safety ingestion against PostgreSQL (binary, flood, sender check, export, verify)
         run: |
           set -euo pipefail

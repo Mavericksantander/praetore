@@ -257,6 +257,39 @@
   console's own `Host` (DNS rebinding). Agent-chosen text in the history
   is shown with the same characters escaped. Action: open the printed
   link after each start.
+- **Compliance package in `praetore-console` (P-002 D3).** With
+  `PRAETORE_CONSOLE_POLICY_FILE` and `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`
+  (one to 16 public-key files, separated like `PATH`) the page offers
+  "Descargar paquete de compliance": a `praetore-compliance.tar.gz` built on
+  this computer with `journal.jsonl` (the tenant's chain, produced by the
+  same code as `praetore journal-export --tenant`), `policy.json` as read,
+  `policy-digest.txt` (the digest `praetore-verify policy-digest`
+  computes), `attester-pin-N.hex`, `export.json`, `SHA256SUMS` over every
+  other file, and `LEEME.txt` with the `praetore-verify` commands and what
+  the package does not show: a path around the gateway, anything before
+  the first record or after the export, completeness without an anchored
+  head, whether a held request was approved, rejected or executed (the
+  chain carries the policy decision only; approval and execution receipts
+  are not included), and that the v0.3.3 verifier rejects schema v5
+  receipts. The download is a `GET` that needs the session cookie, the
+  console's `Host`, the `x-praetore-consola` header and, when the browser
+  sends it, `Sec-Fetch-Site: same-origin`; it writes nothing. Pins are
+  parsed and written back as public keys only; a pin equal to the
+  approver's public key or secret (with the inbox configured) is refused,
+  and so is any pin that verified no entry of the export, so a secret key
+  file listed by mistake is never copied. Every piece is read again at
+  each download; if one is missing or does not check out (policy, pins,
+  or the export) no package is produced and the page says what failed
+  (for a failed export, the possible causes). One variable without the
+  other is a startup error. New dependencies of the console: `tar` and
+  `flate2` (Rust backend).
+- **`praetore_replay_postgres::journal_export` (P-002 D3).** The tenant
+  export of `praetore journal-export` (`export_tenant`: receipts and
+  storage records in one read-only, repeatable-read snapshot, then the
+  chain) moved from the CLI to this module, so the CLI and the console run
+  the same code. The CLI's output and errors are unchanged. New in
+  `praetore_core::journal_chain`: `ChainExporter::unused_attesters`, the
+  pins that verified no entry.
 
 ### Changed
 
