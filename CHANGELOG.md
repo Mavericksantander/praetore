@@ -220,8 +220,16 @@
   opaque references, never keys, journal ids or raw evidence. Actions need
   the console's own `Origin` and an `x-praetore-consola` header besides the
   session cookie. A partial set of the four variables is a startup error;
-  none of them leaves the console as before (history only). The gateway
-  API is unchanged.
+  none of them leaves the console without the inbox (history only). The
+  gateway API is unchanged.
+- **`praetore-console` hands out its session only through the opening link
+  (P-002 D2).** At startup the console prints `http://<bind>/?abrir=<code>`
+  to its terminal; the session cookie is set only for that link, and `/`
+  alone no longer sets it, so another local process that asks for the page
+  gets nothing. Every request must carry the console's own `Host` (DNS
+  rebinding). Agent-chosen action and target text is shown with control and
+  bidirectional characters escaped. Action: open the printed link once per
+  browser session.
 
 ### Changed
 

@@ -74,7 +74,7 @@ async function cargar() {
     return;
   }
   if (response.status === 401) {
-    estado.textContent = "No se pudo abrir la sesión local. Vuelve a cargar la página.";
+    estado.textContent = "Abre la consola con el enlace que mostró al arrancar en la terminal.";
     return;
   }
   if (!response.ok) {
@@ -180,7 +180,7 @@ function pintarSolicitud(solicitud) {
   }
 
   function mostrar(data) {
-    situacion.textContent = data.situacion === "sin cambios" ? situacion.textContent : data.situacion;
+    if (data.situacion !== "sin cambios") situacion.textContent = data.situacion;
     resultado.textContent = data.mensaje;
     acciones.replaceChildren();
     if (data.puede_ejecutar) acciones.append(botonEjecutar("Reintentar ejecución"));
@@ -255,6 +255,11 @@ async function cargarBandeja() {
   } catch (_error) {
     data = null;
   }
+  if (response.status === 401) {
+    solicitudes.replaceChildren();
+    bandejaEstado.textContent = "Abre la consola con el enlace que mostró al arrancar en la terminal.";
+    return;
+  }
   if (!response.ok || !data) {
     solicitudes.replaceChildren();
     bandejaEstado.textContent = data && typeof data.mensaje === "string" ? data.mensaje : "No se pudo leer la bandeja.";
@@ -265,6 +270,7 @@ async function cargarBandeja() {
   const partes = [];
   partes.push(data.solicitudes.length === 1 ? "1 solicitud espera" : data.solicitudes.length + " solicitudes esperan");
   if (data.vencidas) partes.push(data.vencidas === 1 ? "1 venció sin decisión" : data.vencidas + " vencieron sin decisión");
+  if (data.hay_mas) partes.push("hay más esperando: se muestran las 200 más recientes");
   if (data.ilegibles) partes.push(data.ilegibles === 1 ? "1 no se puede leer y no se ofrece" : data.ilegibles + " no se pueden leer y no se ofrecen");
   bandejaEstado.textContent = partes.join(" · ");
   if (!data.solicitudes.length) {

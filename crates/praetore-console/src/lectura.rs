@@ -149,15 +149,18 @@ impl InboxStore for PostgresHistory {
                                 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') \
                        FROM praetore.execution_journal j \
                       WHERE j.tenant_id = $1 AND (({INBOX_SQL})) \
-                      ORDER BY j.created_at ASC, j.agent_id, j.request_id \
+                      ORDER BY j.created_at DESC, j.agent_id, j.request_id \
                       LIMIT $2"
                 ),
-                &[&self.tenant_id, &i64::from(INBOX_LIMIT)],
+                &[&self.tenant_id, &(i64::from(INBOX_LIMIT) + 1)],
             )
             .map_err(|_| HistoryError::Unavailable)?;
+        // Newest first: old holds whose window closed (the gateway records
+        // the expiry only when it next sees them) cannot push new ones out.
+        let truncated = rows.len() > INBOX_LIMIT as usize;
         let mut items = Vec::with_capacity(rows.len());
         let mut unreadable = 0u32;
-        for row in rows {
+        for row in rows.into_iter().take(INBOX_LIMIT as usize) {
             let kind = match row.get::<_, String>(2).as_str() {
                 "approved_pending_dispatch" => PendingKind::ApprovedPendingExecution,
                 "not_dispatched" => PendingKind::AwaitingApproval,
@@ -195,6 +198,7 @@ impl InboxStore for PostgresHistory {
         Ok(InboxPage {
             items,
             unreadable,
+            truncated,
             agents,
         })
     }

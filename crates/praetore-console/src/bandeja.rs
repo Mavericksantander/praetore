@@ -11,7 +11,7 @@ use std::{collections::HashMap, sync::Mutex};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-/// How many pending requests one inbox read returns, oldest first.
+/// How many pending requests one inbox read returns, newest first.
 pub const INBOX_LIMIT: u32 = 200;
 /// Opaque references kept in memory before the table is reset.
 const MAX_REFERENCES: usize = 4096;
@@ -48,6 +48,9 @@ pub struct PendingFacts {
     /// Digest of the action read from the signed journal evidence. The
     /// challenge the gateway hands back must commit to this same digest.
     pub action_digest: String,
+    /// The challenge the gateway must hand back, rebuilt from the evidence
+    /// exactly as the gateway builds it.
+    pub expected: ApprovalChallenge,
     pub expires_at: OffsetDateTime,
 }
 
@@ -76,6 +79,7 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
         return Err(());
     }
     let expires_at = OffsetDateTime::parse(&challenge.expires_at, &Rfc3339).map_err(|_| ())?;
+    let challenge = challenge.clone();
     let target = evidence.action.target.filter(|target| !target.is_empty());
     Ok(PendingFacts {
         created_at: columns.created_at,
@@ -88,6 +92,7 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
         wanted: evidence.action.action_type,
         target,
         action_digest: digest,
+        expected: challenge,
         expires_at,
     })
 }
@@ -134,6 +139,17 @@ pub fn time_left(expires_at: OffsetDateTime, now: OffsetDateTime) -> String {
 pub struct PendingRef {
     pub key: ExecutionKey,
     pub action_digest: String,
+    pub expected: ApprovalChallenge,
+}
+
+impl From<&PendingFacts> for PendingRef {
+    fn from(facts: &PendingFacts) -> Self {
+        Self {
+            key: facts.key,
+            action_digest: facts.action_digest.clone(),
+            expected: facts.expected.clone(),
+        }
+    }
 }
 
 /// Opaque references for pending requests. A reference is random, stable
@@ -157,7 +173,10 @@ impl References {
         if let Some(existing) = table.by_key.get(&key).cloned()
             && let Some(known) = table.by_reference.get(&existing)
         {
-            if known.action_digest == facts.action_digest && known.key == facts.key {
+            if known.action_digest == facts.action_digest
+                && known.key == facts.key
+                && known.expected == facts.expected
+            {
                 return Some(existing);
             }
             // Same journal key, different action: never reuse the reference.
@@ -174,13 +193,9 @@ impl References {
                 break candidate;
             }
         };
-        table.by_reference.insert(
-            reference.clone(),
-            PendingRef {
-                key: facts.key,
-                action_digest: facts.action_digest.clone(),
-            },
-        );
+        table
+            .by_reference
+            .insert(reference.clone(), PendingRef::from(facts));
         table.by_key.insert(key, reference.clone());
         Some(reference)
     }
@@ -198,6 +213,11 @@ pub fn valid_reference(reference: &str) -> bool {
         && reference
             .bytes()
             .all(|byte| REFERENCE_ALPHABET.contains(&byte))
+}
+
+/// A random code from the reference alphabet: not hex, not a UUID.
+pub fn random_code() -> Option<String> {
+    new_reference()
 }
 
 fn new_reference() -> Option<String> {
@@ -227,6 +247,17 @@ mod tests {
             wanted: "borrar_archivo".into(),
             target: Some("informe".into()),
             action_digest: digest.into(),
+            expected: ApprovalChallenge {
+                schema_version: 1,
+                tenant_id: Uuid::from_u128(1),
+                agent_id: Uuid::from_u128(2),
+                request_id: Uuid::from_u128(request),
+                evidence_id: Uuid::from_u128(request),
+                evidence_hash: String::new(),
+                action_digest: digest.into(),
+                policy_digest: String::new(),
+                expires_at: String::new(),
+            },
             expires_at: datetime!(2026-11-12 10:05:09 UTC),
         }
     }

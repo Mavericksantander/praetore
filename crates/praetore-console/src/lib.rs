@@ -51,7 +51,19 @@ pub struct ConsoleState {
     session: LocalSession,
     names: HashMap<Uuid, String>,
     inbox: Option<Inbox>,
+    address: SocketAddr,
+    /// `Host` values the console answers to (DNS rebinding).
+    hosts: Vec<String>,
+    /// `http://host:port` values a mutating request may come from.
+    origins: Vec<String>,
+    /// Code of the opening link printed in the terminal. The session cookie
+    /// is handed out only to a request that carries it, so another local
+    /// process that just asks for the page gets no cookie. `None` fails
+    /// closed: nobody can open the console.
+    opener: Option<String>,
 }
+
+const DEFAULT_ADDRESS: &str = "127.0.0.1:8090";
 
 /// D2. Present only when the console has an approver key, its gateway token
 /// and the gateway address.
@@ -60,29 +72,19 @@ pub struct Inbox {
     gateway: Arc<dyn ApprovalGateway>,
     signer: Arc<ApproverSigner>,
     references: References,
-    /// `http://host:port` values a mutating request may come from.
-    origins: Vec<String>,
 }
 
 impl Inbox {
-    /// `bind` is the console's own address: mutations are accepted only
-    /// from a page served by it.
     pub fn new(
         store: Arc<dyn InboxStore>,
         gateway: Arc<dyn ApprovalGateway>,
         signer: ApproverSigner,
-        bind: SocketAddr,
     ) -> Self {
-        let mut origins = vec![format!("http://{bind}")];
-        if bind.ip().is_loopback() && bind.is_ipv4() {
-            origins.push(format!("http://localhost:{}", bind.port()));
-        }
         Self {
             store,
             gateway,
             signer: Arc::new(signer),
             references: References::default(),
-            origins,
         }
     }
 }
@@ -95,6 +97,8 @@ pub struct InboxPage {
     pub items: Vec<PendingFacts>,
     /// Pending rows whose receipt does not check out. Never offered.
     pub unreadable: u32,
+    /// More rows wait than one read returns.
+    pub truncated: bool,
     pub agents: Vec<Uuid>,
 }
 
@@ -149,12 +153,45 @@ impl ConsoleState {
         session: LocalSession,
         names: HashMap<Uuid, String>,
     ) -> Self {
-        Self {
+        let mut state = Self {
             store,
             session,
             names,
             inbox: None,
+            address: DEFAULT_ADDRESS.parse().expect("fixed address"),
+            hosts: Vec::new(),
+            origins: Vec::new(),
+            opener: bandeja::random_code(),
+        };
+        state.set_address(state.address);
+        state
+    }
+
+    /// The console's own address: the page and its actions are answered
+    /// only under it (and `localhost` on the same port for 127.0.0.1).
+    pub fn with_address(mut self, address: SocketAddr) -> Self {
+        self.set_address(address);
+        self
+    }
+
+    fn set_address(&mut self, address: SocketAddr) {
+        self.address = address;
+        self.hosts = vec![address.to_string()];
+        if address.ip() == std::net::IpAddr::from([127, 0, 0, 1]) {
+            self.hosts.push(format!("localhost:{}", address.port()));
         }
+        self.origins = self
+            .hosts
+            .iter()
+            .map(|host| format!("http://{host}"))
+            .collect();
+    }
+
+    /// The link the operator opens; print it only to the operator's terminal.
+    pub fn opening_link(&self) -> Option<String> {
+        self.opener
+            .as_ref()
+            .map(|code| format!("http://{}/?abrir={code}", self.address))
     }
 
     pub fn with_inbox(mut self, inbox: Inbox) -> Self {
@@ -184,6 +221,10 @@ impl ConsoleState {
             .route("/app.js", get(app_js))
             .route("/styles.css", get(app_css))
             .nest("/api", api)
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_own_host,
+            ))
             .with_state(state)
     }
 }
@@ -206,6 +247,28 @@ async fn require_session(
     next.run(request).await
 }
 
+/// Refuses a request whose `Host` is not the console's own address: a page
+/// whose name was re-pointed at 127.0.0.1 (DNS rebinding) reads nothing.
+async fn require_own_host(
+    State(state): State<Arc<ConsoleState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let mut values = request.headers().get_all(header::HOST).iter();
+    let host = match (values.next(), values.next()) {
+        (Some(value), None) => value.to_str().ok(),
+        _ => None,
+    };
+    if host.is_some_and(|host| state.hosts.iter().any(|own| own == host)) {
+        next.run(request).await
+    } else {
+        api_message(
+            StatusCode::MISDIRECTED_REQUEST,
+            "Esta consola no atiende ese nombre.",
+        )
+    }
+}
+
 /// Header the console page sends on every action. A page from another
 /// origin cannot add it without a preflight the console never answers.
 pub const ACTION_HEADER: &str = "x-praetore-consola";
@@ -214,7 +277,7 @@ pub const ACTION_HEADER: &str = "x-praetore-consola";
 /// action header, and, when the browser sends it, `Sec-Fetch-Site:
 /// same-origin`. The cookie alone is not enough: another local port is the
 /// same site for `SameSite=Strict`.
-fn same_page(inbox: &Inbox, headers: &HeaderMap) -> bool {
+fn same_page(state: &ConsoleState, headers: &HeaderMap) -> bool {
     let single = |name: &str| {
         let mut values = headers.get_all(name).iter();
         match (values.next(), values.next()) {
@@ -223,7 +286,7 @@ fn same_page(inbox: &Inbox, headers: &HeaderMap) -> bool {
         }
     };
     let origin_ok = single(header::ORIGIN.as_str())
-        .is_some_and(|origin| inbox.origins.iter().any(|allowed| allowed == origin));
+        .is_some_and(|origin| state.origins.iter().any(|allowed| allowed == origin));
     let marker_ok = single(ACTION_HEADER) == Some("1");
     let fetch_site_ok = match headers.get("sec-fetch-site") {
         None => true,
@@ -310,7 +373,7 @@ async fn receipt_detail(
 }
 
 const INBOX_OFF: &str = "La bandeja de aprobaciones no está configurada en esta consola.";
-const INBOX_NOTICE: &str = "Aprobar deja la solicitud aprobada y pendiente de ejecución; ejecutar la lleva a cabo una sola vez. Rechazar es final. La firma y el registro los hace el sistema, no esta página.";
+const INBOX_NOTICE: &str = "«Aprobar y ejecutar» registra la aprobación y pide la única ejecución. Si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.";
 
 async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
     let Some(inbox) = &state.inbox else {
@@ -343,11 +406,12 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             queria: if facts.wanted.is_empty() {
                 "no se muestra".to_owned()
             } else {
-                facts.wanted.clone()
+                historia::plain_text(&facts.wanted)
             },
             sobre: facts
                 .target
-                .clone()
+                .as_deref()
+                .map(historia::plain_text)
                 .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
             vale_hasta: readable_deadline(facts.expires_at),
             queda: time_left(facts.expires_at, now),
@@ -362,6 +426,7 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             solicitudes,
             vencidas,
             ilegibles: page.unreadable,
+            hay_mas: page.truncated,
         },
     )
 }
@@ -407,7 +472,7 @@ async fn act(
     let Some(inbox) = &state.inbox else {
         return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
     };
-    if !same_page(inbox, &headers) {
+    if !same_page(&state, &headers) {
         return api_message(
             StatusCode::FORBIDDEN,
             "Esta acción solo se acepta desde la página de la consola.",
@@ -486,8 +551,35 @@ fn storage_error(error: HistoryError) -> Response {
     )
 }
 
-async fn index(State(state): State<Arc<ConsoleState>>) -> Response {
-    let mut response = static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+#[derive(serde::Deserialize)]
+struct OpenQuery {
+    abrir: Option<String>,
+}
+
+/// The page itself holds no secret. The session cookie is set only when the
+/// request carries the opening link's code; the browser is then sent to `/`
+/// so the code leaves the address bar.
+async fn index(
+    State(state): State<Arc<ConsoleState>>,
+    query: Result<Query<OpenQuery>, QueryRejection>,
+) -> Response {
+    let offered = query.ok().and_then(|Query(query)| query.abrir);
+    let Some(offered) = offered else {
+        return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+    };
+    let accepted = state.opener.as_deref().is_some_and(|code| {
+        code.len() == offered.len()
+            && bool::from(subtle::ConstantTimeEq::ct_eq(
+                code.as_bytes(),
+                offered.as_bytes(),
+            ))
+    });
+    if !accepted {
+        tracing::warn!(failure = "opening_code", "console opening link refused");
+        return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+    }
+    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    set_security_headers(response.headers_mut());
     if let Ok(cookie) = HeaderValue::from_str(&state.session.cookie_header()) {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
@@ -562,6 +654,8 @@ struct InboxView {
     vencidas: u32,
     /// Pending in the journal, receipt does not check out: not offered.
     ilegibles: u32,
+    /// Older requests wait beyond what one read shows.
+    hay_mas: bool,
 }
 
 #[derive(Serialize)]
@@ -675,6 +769,7 @@ mod tests {
 
     fn authed(uri: &str) -> Request<Body> {
         Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
             .uri(uri)
             .header(
                 header::COOKIE,
@@ -738,14 +833,54 @@ mod tests {
 
     #[tokio::test]
     async fn the_page_does_not_ask_for_a_token_and_sets_a_local_cookie() {
-        let (app, _) = app(Vec::new());
-        let response = app
+        let state = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            session(),
+            HashMap::new(),
+        );
+        let link = state.opening_link().unwrap();
+        let code = link.split_once("?abrir=").unwrap().1.to_owned();
+        assert!(link.starts_with("http://127.0.0.1:8090/?abrir="));
+        assert!(Uuid::parse_str(&code).is_err());
+        assert!(!code.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let app = state.router();
+        // Asking for the page is not enough to get the session.
+        for uri in [
+            "/".to_owned(),
+            "/?abrir=otro".to_owned(),
+            format!("/?abrir={code}x"),
+        ] {
+            let plain = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .header(header::HOST, "127.0.0.1:8090")
+                        .uri(&uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(plain.status(), StatusCode::OK, "{uri}");
+            assert!(plain.headers().get(header::SET_COOKIE).is_none(), "{uri}");
+        }
+        let opened = app
             .clone()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .uri(format!("/?abrir={code}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let cookie = response
+        assert_eq!(opened.status(), StatusCode::SEE_OTHER);
+        assert_eq!(opened.headers().get(header::LOCATION).unwrap(), "/");
+        let cookie = opened
             .headers()
             .get(header::SET_COOKIE)
             .unwrap()
@@ -756,6 +891,17 @@ mod tests {
         assert!(cookie.contains("SameSite=Strict"));
         let secret = hex::encode([0x11; 32]);
         assert!(cookie.contains(&secret));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         let html = body_text(response).await;
         assert!(!html.contains(&secret));
         assert!(html.contains("Historial"));
@@ -772,6 +918,7 @@ mod tests {
         let script = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/app.js")
                     .body(Body::empty())
                     .unwrap(),
@@ -932,6 +1079,7 @@ mod tests {
                 .clone()
                 .oneshot(
                     Request::builder()
+                        .header(header::HOST, "127.0.0.1:8090")
                         .method(method)
                         .uri(uri)
                         .header(
@@ -959,6 +1107,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
                     .body(Body::empty())
                     .unwrap(),
@@ -973,6 +1122,7 @@ mod tests {
         let wrong = app
             .oneshot(
                 Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
                     .header(
                         header::COOKIE,

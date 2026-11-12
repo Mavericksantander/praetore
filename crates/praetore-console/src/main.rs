@@ -61,21 +61,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let history = PostgresHistory::from_client(client, tenant_id)
         .map_err(|_| "no se pudo preparar la lectura del registro")?;
     let history = Arc::new(history);
-    let mut state = ConsoleState::new(history.clone(), session, names);
+    let mut state = ConsoleState::new(history.clone(), session, names).with_address(address);
     let inbox = approver_settings()?;
     match inbox {
         Some((gateway, signer)) => {
-            state = state.with_inbox(Inbox::new(history, Arc::new(gateway), signer, address));
+            state = state.with_inbox(Inbox::new(history, Arc::new(gateway), signer));
             tracing::info!("bandeja de aprobaciones activa");
         }
         None => tracing::info!("bandeja de aprobaciones sin configurar: solo historial"),
     }
+    let link = state
+        .opening_link()
+        .ok_or("no se pudo crear el enlace de apertura de la consola")?;
     let state = Arc::new(state);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let listener = runtime.block_on(tokio::net::TcpListener::bind(address))?;
     tracing::info!(%address, "consola local escuchando");
+    // Only to this terminal: whoever has the link gets the session.
+    eprintln!("Abre la consola en este computador con este enlace:\n  {link}");
     let served = runtime.block_on(
         axum::serve(listener, ConsoleState::router_from(Arc::clone(&state))).into_future(),
     );

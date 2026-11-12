@@ -254,6 +254,25 @@ pub fn readable_time(moment: OffsetDateTime) -> String {
     )
 }
 
+/// Text the agent chose, made safe to read: control and bidirectional
+/// override characters are shown as `\u{...}` instead of acting on the
+/// page (a target like `informe\u{202e}fdp.exe` cannot disguise itself).
+pub fn plain_text(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        let bidi = matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        );
+        if character.is_control() || bidi {
+            safe.push_str(&format!("\\u{{{:04x}}}", character as u32));
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
 pub fn visible_target(facts: &ReceiptFacts) -> String {
     if !facts.legible {
         return "no se muestra".to_owned();
@@ -262,6 +281,7 @@ pub fn visible_target(facts: &ReceiptFacts) -> String {
         .target
         .clone()
         .filter(|target| !target.is_empty())
+        .map(|target| plain_text(&target))
         .unwrap_or_else(|| "sin objetivo indicado".to_owned())
 }
 
@@ -269,7 +289,7 @@ pub fn visible_wanted(facts: &ReceiptFacts) -> String {
     if !facts.legible || facts.wanted.is_empty() {
         "no se muestra".to_owned()
     } else {
-        facts.wanted.clone()
+        plain_text(&facts.wanted)
     }
 }
 
@@ -474,6 +494,16 @@ mod tests {
             wanted: "escribir_archivo".into(),
             target: Some("informe-trimestral".into()),
         }
+    }
+
+    #[test]
+    fn agent_text_cannot_hide_behind_bidi_or_control_characters() {
+        assert_eq!(
+            plain_text("informe\u{202e}fdp.exe"),
+            "informe\\u{202e}fdp.exe"
+        );
+        assert_eq!(plain_text("a\nb\u{0007}"), "a\\u{000a}b\\u{0007}");
+        assert_eq!(plain_text("informe-trimestral"), "informe-trimestral");
     }
 
     #[test]

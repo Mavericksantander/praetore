@@ -1142,6 +1142,7 @@ dependencies = [
  "praetore-gateway",
  "praetore-replay-postgres",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "subtle",

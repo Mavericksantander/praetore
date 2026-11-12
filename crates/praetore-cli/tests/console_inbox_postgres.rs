@@ -194,6 +194,7 @@ fn held_demo(dir: &Path, key: &str) -> Uuid {
 
 fn action(uri: &str) -> Request<Body> {
     Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri(uri)
         .header(header::COOKIE, cookie())
@@ -275,7 +276,6 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
             token,
         )),
         signer,
-        "127.0.0.1:8090".parse().unwrap(),
     );
     let state = Arc::new(
         ConsoleState::new(
@@ -292,6 +292,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         .unwrap();
     runtime.block_on(async {
         let list = Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
             .uri("/api/bandeja")
             .header(header::COOKIE, cookie())
             .body(Body::empty())
@@ -302,9 +303,9 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         assert!(!text.contains(&tenant.to_string()));
         let items = list["solicitudes"].as_array().unwrap();
         assert_eq!(items.len(), 2);
-        // Oldest first: the first `praetore demo` is the first item.
-        let first = items[0]["referencia"].as_str().unwrap().to_owned();
-        let second = items[1]["referencia"].as_str().unwrap().to_owned();
+        // Newest first: the first `praetore demo` is the second item.
+        let first = items[1]["referencia"].as_str().unwrap().to_owned();
+        let second = items[0]["referencia"].as_str().unwrap().to_owned();
 
         let (_, approved, text) =
             call(&app, action(&format!("/api/bandeja/{first}/aprobar"))).await;
@@ -327,6 +328,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         assert_eq!(after["puede_ejecutar"], false);
 
         let list = Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
             .uri("/api/bandeja")
             .header(header::COOKIE, cookie())
             .body(Body::empty())

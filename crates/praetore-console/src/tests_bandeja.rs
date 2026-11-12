@@ -117,6 +117,7 @@ impl InboxStore for MemoryInbox {
         Ok(InboxPage {
             items: self.items.clone(),
             unreadable: self.unreadable,
+            truncated: false,
             agents,
         })
     }
@@ -262,12 +263,7 @@ impl ApprovalGateway for FakeGateway {
 
 fn console(items: Vec<PendingFacts>, unreadable: u32, gateway: Arc<FakeGateway>) -> Router {
     let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
-    let inbox = Inbox::new(
-        Arc::new(MemoryInbox { items, unreadable }),
-        gateway,
-        signer,
-        "127.0.0.1:8090".parse().unwrap(),
-    );
+    let inbox = Inbox::new(Arc::new(MemoryInbox { items, unreadable }), gateway, signer);
     ConsoleState::new(
         Arc::new(NoHistory),
         LocalSession::from_secret([0x11; 32]),
@@ -283,6 +279,7 @@ fn cookie() -> String {
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
         .uri(uri)
         .header(header::COOKIE, cookie())
         .body(Body::empty())
@@ -291,6 +288,7 @@ fn get(uri: &str) -> Request<Body> {
 
 fn post(uri: &str) -> Request<Body> {
     Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri(uri)
         .header(header::COOKIE, cookie())
@@ -588,10 +586,7 @@ fn nothing_is_signed_when_the_challenge_commits_to_another_action_than_the_one_s
     other.agent = shown.agent.clone();
     let gateway = FakeGateway::new(&other);
     let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
-    let pending = PendingRef {
-        key: facts.key,
-        action_digest: facts.action_digest.clone(),
-    };
+    let pending = PendingRef::from(&facts);
     let outcome = aprobador::decide(
         &gateway,
         &signer,
@@ -628,6 +623,7 @@ async fn actions_need_the_console_page_and_a_known_reference() {
         (Some(ORIGIN), Some("1"), Some("cross-site")),
     ] {
         let mut request = Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
             .method("POST")
             .uri(&uri)
             .header(header::COOKIE, cookie());
@@ -647,6 +643,7 @@ async fn actions_need_the_console_page_and_a_known_reference() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
     let no_cookie = Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri(&uri)
         .header(header::ORIGIN, ORIGIN)
@@ -659,6 +656,7 @@ async fn actions_need_the_console_page_and_a_known_reference() {
     );
     // `localhost` on the console's port is the same page.
     let localhost = Request::builder()
+        .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri("/api/bandeja/abcdefghjkmnpqrstuvw/aprobar")
         .header(header::COOKIE, cookie())
@@ -724,14 +722,12 @@ fn outcomes_never_offer_a_second_decision() {
             self.0.lock().unwrap().remove(0)
         }
     }
-    let pending = PendingRef {
-        key: ExecutionKey {
-            tenant_id: TENANT,
-            agent_id: Uuid::from_u128(2),
-            request_id: Uuid::from_u128(3),
-        },
-        action_digest: "aa".into(),
-    };
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    let pending = PendingRef::from(&facts_for(&evidence, json, PendingKind::AwaitingApproval));
     let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
     for reply in [
         GatewayReply::NotSent,
@@ -753,31 +749,70 @@ fn outcomes_never_offer_a_second_decision() {
         assert!(!outcome.puede_ejecutar, "{outcome:?}");
         assert!(gateway.0.lock().unwrap().is_empty());
     }
-    for (reply, retry) in [
-        (GatewayReply::NotSent, true),
-        (GatewayReply::Unconfirmed, true),
+    const STILL: &str = "aprobado, pendiente de ejecución";
+    for (reply, retry, situacion) in [
+        (GatewayReply::NotSent, true, STILL),
         (
             answered(503, json!({"code": "dispatch_temporarily_refused"})),
             true,
+            STILL,
+        ),
+        (
+            answered(503, json!({"code": "authorization_unavailable"})),
+            true,
+            STILL,
+        ),
+        // These may come after the effect: never "sin ejecutar". Retrying
+        // is safe, the gateway claims the dispatch once.
+        (GatewayReply::Unconfirmed, true, "sin confirmar"),
+        (
+            answered(503, json!({"code": "execution_state_unavailable"})),
+            true,
+            "sin confirmar",
+        ),
+        (
+            answered(503, json!({"code": "gateway_unavailable"})),
+            true,
+            "sin confirmar",
+        ),
+        (
+            answered(500, json!({"code": "gateway_configuration_error"})),
+            true,
+            "sin confirmar",
         ),
         (
             answered(403, json!({"code": "action_not_dispatchable"})),
             false,
+            "no se ejecutó",
         ),
         (
             answered(502, json!({"code": "action_effect_failed"})),
             false,
+            "aprobado",
         ),
         (
             answered(409, json!({"code": "execution_state_conflict"})),
             false,
+            "sin cambios",
         ),
-        (answered(410, json!({"code": "approval_expired"})), false),
-        (answered(200, json!({"execution": "failed"})), false),
+        (
+            answered(410, json!({"code": "approval_expired"})),
+            false,
+            "expirado",
+        ),
+        (
+            answered(200, json!({"execution": "failed"})),
+            false,
+            "aprobado",
+        ),
     ] {
         let gateway = Scripted(Mutex::new(vec![reply]));
         let outcome = aprobador::dispatch(&gateway, &pending);
         assert_eq!(outcome.puede_ejecutar, retry, "{outcome:?}");
+        assert_eq!(outcome.situacion, situacion, "{outcome:?}");
+        if situacion == "sin confirmar" {
+            assert!(!outcome.mensaje.contains("sin ejecutar"), "{outcome:?}");
+        }
     }
 }
 
@@ -818,4 +853,119 @@ fn a_receipt_from_another_tenant_or_without_a_window_is_not_offered() {
         .sign(&EvidenceAttesterKey::from_secret_bytes(&[0x52; 32]))
         .unwrap();
     assert!(columns(TENANT, agent, no_window.to_json().unwrap()).is_err());
+}
+
+#[tokio::test]
+async fn another_host_name_reads_nothing() {
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    let gateway = Arc::new(FakeGateway::new(&evidence));
+    let app = console(
+        vec![facts_for(&evidence, json, PendingKind::AwaitingApproval)],
+        0,
+        gateway.clone(),
+    );
+    for host in [
+        None,
+        Some("evil.example:8090"),
+        Some("127.0.0.1:9999"),
+        Some("localhost:8091"),
+    ] {
+        for uri in ["/", "/api/bandeja", "/api/historial"] {
+            let mut request = Request::builder().uri(uri).header(header::COOKIE, cookie());
+            if let Some(host) = host {
+                request = request.header(header::HOST, host);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::MISDIRECTED_REQUEST,
+                "{host:?} {uri}"
+            );
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+        }
+    }
+    let localhost = Request::builder()
+        .uri("/api/bandeja")
+        .header(header::HOST, "localhost:8090")
+        .header(header::COOKIE, cookie())
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(localhost).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(gateway.calls().is_empty());
+}
+
+#[tokio::test]
+async fn agent_text_is_shown_inert_and_a_cut_list_says_so() {
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe\u{202e}fdp.exe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    let facts = facts_for(&evidence, json, PendingKind::AwaitingApproval);
+    struct Cut(PendingFacts);
+    impl InboxStore for Cut {
+        fn pending(&self) -> Result<InboxPage, HistoryError> {
+            Ok(InboxPage {
+                items: vec![self.0.clone()],
+                unreadable: 0,
+                truncated: true,
+                agents: vec![self.0.key.agent_id],
+            })
+        }
+    }
+    let app = ConsoleState::new(
+        Arc::new(NoHistory),
+        LocalSession::from_secret([0x11; 32]),
+        HashMap::new(),
+    )
+    .with_inbox(Inbox::new(
+        Arc::new(Cut(facts)),
+        Arc::new(FakeGateway::new(&evidence)),
+        ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap(),
+    ))
+    .router();
+    let (_, list, text) = json_of(app.oneshot(get("/api/bandeja")).await.unwrap()).await;
+    assert_eq!(list["hay_mas"], true);
+    assert_eq!(list["solicitudes"][0]["sobre"], "informe\\u{202e}fdp.exe");
+    assert!(!text.contains('\u{202e}'));
+}
+
+#[test]
+fn nothing_is_signed_when_any_part_of_the_challenge_differs() {
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    let pending = PendingRef::from(&facts_for(&evidence, json, PendingKind::AwaitingApproval));
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    let edits: [fn(&mut ApprovalChallenge); 4] = [
+        |challenge| challenge.expires_at = "2099-01-01T00:00:00Z".into(),
+        |challenge| challenge.policy_digest = "00".repeat(32),
+        |challenge| challenge.evidence_hash = "11".repeat(32),
+        |challenge| challenge.evidence_id = Uuid::from_u128(77),
+    ];
+    for edit in edits {
+        let mut gateway = FakeGateway::new(&evidence);
+        edit(&mut gateway.view.challenge);
+        let outcome = aprobador::decide(
+            &gateway,
+            &signer,
+            &pending,
+            praetore_gateway::HumanApprovalOutcome::Approve,
+        );
+        assert_eq!(outcome.situacion, "sin cambios");
+        assert_eq!(gateway.calls(), vec!["challenge"]);
+    }
 }

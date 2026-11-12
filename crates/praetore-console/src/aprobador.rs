@@ -95,9 +95,16 @@ impl ApproverSigner {
     /// Same file format as `approver.key` from `praetore init`.
     pub fn from_file(key_id: &str, path: &Path) -> Result<Self, ApproverConfigError> {
         let text = read_private_text(path, 128).map_err(|()| ApproverConfigError::KeyFile)?;
-        let bytes = hex::decode(text.trim()).map_err(|_| ApproverConfigError::KeyFile)?;
-        let secret: [u8; 32] = bytes.try_into().map_err(|_| ApproverConfigError::KeyFile)?;
-        Self::new(key_id, secret)
+        let decoded = hex::decode(text.trim());
+        let mut text = text.into_bytes();
+        text.iter_mut().for_each(|byte| *byte = 0);
+        let mut bytes = decoded.map_err(|_| ApproverConfigError::KeyFile)?;
+        let secret = <[u8; 32]>::try_from(bytes.as_slice());
+        bytes.iter_mut().for_each(|byte| *byte = 0);
+        let mut secret = secret.map_err(|_| ApproverConfigError::KeyFile)?;
+        let signer = Self::new(key_id, secret);
+        secret.iter_mut().for_each(|byte| *byte = 0);
+        signer
     }
 
     pub fn sign(
@@ -138,25 +145,39 @@ pub fn read_token_file(path: &Path) -> Result<String, ApproverConfigError> {
     Ok(token.to_owned())
 }
 
+/// Opens without following a final symlink and checks the open file: a
+/// regular file owned by this user, no group or other bits, at most `max`
+/// bytes. The bytes read are cleared after decoding.
+#[cfg(unix)]
 fn read_private_text(path: &Path, max: u64) -> Result<String, ()> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
-    if !metadata.file_type().is_file() || metadata.len() > max || !owner_only(&metadata) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC).bits() as i32)
+        .open(path)
+        .map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
+    let euid = rustix::process::geteuid().as_raw();
+    if !metadata.file_type().is_file()
+        || metadata.len() > max
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != euid
+    {
         return Err(());
     }
-    fs::read_to_string(path).map_err(|_| ())
+    let mut bytes = Vec::with_capacity(usize::try_from(max).unwrap_or(0));
+    let read = file.take(max + 1).read_to_end(&mut bytes);
+    let text = match read {
+        Ok(_) if bytes.len() as u64 <= max => std::str::from_utf8(&bytes).map(str::to_owned).ok(),
+        _ => None,
+    };
+    bytes.iter_mut().for_each(|byte| *byte = 0);
+    text.ok_or(())
 }
 
-fn owner_only(metadata: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o077 == 0
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        false
-    }
+#[cfg(not(unix))]
+fn read_private_text(_path: &Path, _max: u64) -> Result<String, ()> {
+    Err(())
 }
 
 /// `http://127.0.0.1:8080` or `http://[::1]:8080`. Names are not resolved:
@@ -327,11 +348,10 @@ pub fn decide(
             return unchanged("No se pudo hablar con el sistema. No se firmó nada.");
         }
     };
-    let challenge = &view.challenge;
-    if challenge.tenant_id != pending.key.tenant_id
-        || challenge.agent_id != pending.key.agent_id
-        || challenge.request_id != pending.key.request_id
-        || challenge.action_digest != pending.action_digest
+    // The whole challenge must be the one rebuilt from the journal evidence
+    // the operator was shown: same key, evidence, action, policy and window.
+    if view.challenge != pending.expected
+        || view.challenge.action_digest != pending.action_digest
         || !view.action_matches_challenge()
     {
         tracing::warn!(failure = "challenge_mismatch", "console refused to sign");
@@ -464,21 +484,34 @@ pub fn dispatch(gateway: &dyn ApprovalGateway, pending: &PendingRef) -> ActOutco
                 "Ya no está pendiente de ejecución. Revisa el historial.",
             ),
             (404, _) => unchanged("Esta solicitud ya no está."),
+            // Refused before the claim: nothing ran.
+            (503, Some("dispatch_temporarily_refused" | "authorization_unavailable")) => {
+                retry_dispatch(
+                    "Sigue aprobado, sin ejecutar. El sistema no pudo ejecutarlo ahora; puedes reintentar la ejecución.",
+                )
+            }
             (401 | 403, _) => ActOutcome {
                 situacion: APPROVED_PENDING,
                 mensaje: "El sistema no reconoce a esta consola como aprobadora. Sigue aprobado, sin ejecutar.",
                 puede_ejecutar: false,
             },
-            _ => retry_dispatch(
-                "Sigue aprobado, sin ejecutar. El sistema no pudo ejecutarlo ahora; puedes reintentar la ejecución.",
-            ),
+            // Any other failure may come after the effect (for example the
+            // outcome could not be recorded): never say it did not run.
+            // Retrying is safe, the gateway claims the dispatch only once.
+            _ => unconfirmed_dispatch(),
         },
         GatewayReply::NotSent => retry_dispatch(
             "Sigue aprobado, sin ejecutar. No se pudo hablar con el sistema; puedes reintentar la ejecución.",
         ),
-        GatewayReply::Unconfirmed => retry_dispatch(
-            "No se pudo confirmar si se ejecutó. Revisa el historial; si sigue pendiente, puedes reintentar la ejecución.",
-        ),
+        GatewayReply::Unconfirmed => unconfirmed_dispatch(),
+    }
+}
+
+fn unconfirmed_dispatch() -> ActOutcome {
+    ActOutcome {
+        situacion: "sin confirmar",
+        mensaje: "No se pudo confirmar si se ejecutó. Revisa el historial; si sigue pendiente de ejecución, puedes reintentar.",
+        puede_ejecutar: true,
     }
 }
 
