@@ -6,6 +6,7 @@ use crate::{aprobador::ApproverSigner, paquete::*, *};
 use axum::body::to_bytes;
 use ed25519_dalek::SigningKey;
 use praetore_core::{VerifiedPublicKey, journal_chain::verify_chain, policy::RecordedPolicy};
+use praetore_receipt::outcomes::Outcome;
 use praetore_replay_postgres::journal_export::{
     TenantExport, chain_receipts, export_with_database_head, parse_attester_pin,
 };
@@ -52,6 +53,10 @@ fn attester_pin() -> VerifiedPublicKey {
 struct SetExport {
     calls: AtomicUsize,
     fail: bool,
+    /// The receipts chained (set 04's, or D3.1's held ones).
+    receipts: Vec<String>,
+    /// D3.1: the approval and execution records the export returns.
+    outcomes: Vec<Outcome>,
 }
 
 impl JournalExportStore for SetExport {
@@ -59,19 +64,25 @@ impl JournalExportStore for SetExport {
         TENANT
     }
 
-    fn export_tenant(&self, attesters: &[VerifiedPublicKey]) -> Result<TenantExport, String> {
+    fn export_tenant(
+        &self,
+        attesters: &[VerifiedPublicKey],
+    ) -> Result<(TenantExport, Vec<Outcome>), String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.fail {
             return Err("database unavailable".into());
         }
-        let (text, head, unused_attesters) = chain_receipts(&receipts_of_set_04(), None, attesters)
-            .map_err(|error| error.to_string())?;
-        Ok(TenantExport {
-            text,
-            head,
-            database_head: None,
-            unused_attesters,
-        })
+        let (text, head, unused_attesters) =
+            chain_receipts(&self.receipts, None, attesters).map_err(|error| error.to_string())?;
+        Ok((
+            TenantExport {
+                text,
+                head,
+                database_head: None,
+                unused_attesters,
+            },
+            self.outcomes.clone(),
+        ))
     }
 }
 
@@ -173,6 +184,8 @@ fn store() -> Arc<SetExport> {
     Arc::new(SetExport {
         calls: AtomicUsize::new(0),
         fail: false,
+        receipts: receipts_of_set_04(),
+        outcomes: Vec::new(),
     })
 }
 
@@ -233,6 +246,7 @@ fn text<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> &'a str {
     std::str::from_utf8(file(files, name)).unwrap()
 }
 
+/// The D3 package: no execution or approver pin configured.
 const EXPECTED_NAMES: [&str; 8] = [
     "praetore-compliance/",
     "praetore-compliance/LEEME.txt",
@@ -315,6 +329,12 @@ async fn the_package_has_fixed_names_and_the_cli_export_policy_and_pins() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(!readme.contains("recibos de ejecución, que este paquete no trae"));
+    assert_eq!(
+        export["outcomes"],
+        serde_json::json!({"included": false, "note": NOT_CONFIGURED_NOTE})
+    );
+    assert_eq!(export["execution_pins"], serde_json::json!([]));
+    assert_eq!(export["approver_pins"], serde_json::json!([]));
     for needed in [
         "praetore-verify journal --journal journal.jsonl --attester-pin attester-pin-1.hex",
         "praetore-verify policy-digest --policy policy.json",
@@ -324,13 +344,32 @@ async fn the_package_has_fixed_names_and_the_cli_export_policy_and_pins() {
         "Use praetore-verify construido desde main. El praetore-verify de v0.3.3 también acepta este journal.jsonl, pero no muestra tenant_id ni avisa head_not_anchored, que el paso 3 usa. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y las razones approved_claim_expired y approval_rejected; esos recibos no van en este paquete.",
         "Tiene 8 recibos de decisión. Cada línea encadena",
         "desde main, en un commit que incluya este paquete de compliance (P-002 D3), o desde un release posterior a v0.3.3",
-        "No muestra si una solicitud retenida fue aprobada, rechazada, venció o se ejecutó",
+        "No trae la aprobación o el rechazo de una persona ni el resultado de la ejecución: esta consola no está configurada para incluir esos recibos en el paquete.",
+        "No muestra si una solicitud retenida fue aprobada, rechazada, venció o se ejecutó: journal.jsonl trae solo la decisión de la política. Esta consola no está configurada para incluir los recibos de aprobación y de ejecución en el paquete.",
+        "head de la cadena y digest de la política. SHA256SUMS",
         "sha256sum -c SHA256SUMS",
         &digest,
         &head.head.to_hex(),
         &TENANT.to_string(),
     ] {
         assert!(readme.contains(needed), "LEEME.txt lacks {needed:?}");
+    }
+    for absent in [
+        "approvals.jsonl",
+        "praetore-verify outcomes",
+        "5. Cómo terminó",
+    ] {
+        assert!(!readme.contains(absent), "LEEME.txt has {absent:?}");
+    }
+    // Blank lines as in D3: no section is left with an empty gap.
+    {
+        let t = text(&files, "LEEME.txt");
+        let i = t.find("\n\n\n\n");
+        assert!(
+            i.is_none(),
+            "{}",
+            &t[i.unwrap_or(0).saturating_sub(300)..(i.unwrap_or(0) + 100).min(t.len())]
+        );
     }
 }
 
@@ -524,6 +563,8 @@ async fn a_missing_piece_gives_a_plain_error_and_no_package() {
         Arc::new(SetExport {
             calls: AtomicUsize::new(0),
             fail: true,
+            receipts: receipts_of_set_04(),
+            outcomes: Vec::new(),
         }),
         PackError::Journal,
     )
@@ -641,6 +682,19 @@ fn the_page_offers_the_download_in_words_without_ids() {
     let page = include_str!("../ui/index.html");
     assert!(page.contains(">Descargar paquete de compliance</button>"));
     assert!(page.contains("No trae claves privadas"));
+    let section =
+        &page[page.find("id=\"paquete\"").unwrap()..page.find("id=\"descargar-paquete\"").unwrap()];
+    for needed in [
+        "approvals.jsonl",
+        "las claves públicas de ejecución y de aprobador",
+        "Incluye la salida de cada acción ejecutada, que puede tener datos sensibles: revísela antes de entregar el paquete.",
+    ] {
+        assert!(section.contains(needed), "{needed}");
+    }
+    let words = section.split("<p class=\"aviso\">").nth(1).unwrap();
+    // No ids, hex or numbers; "SHA-256" is the name of the digest.
+    let words = words.replace("SHA-256", "");
+    assert!(!words.chars().any(|c| c.is_ascii_digit()), "{words}");
     let script = include_str!("../ui/app.js");
     assert!(script.contains("\"/api/paquete\""));
     assert!(script.contains("\"x-praetore-consola\": \"1\""));
@@ -666,7 +720,7 @@ fn a_pin_that_verified_nothing_is_refused_so_no_secret_slips_in() {
     let second = setup.dir.join("evidence-attester.key");
     fs::write(&second, hex::encode(secret) + "\n").unwrap();
     let store = store();
-    let export = store
+    let (export, _) = store
         .export_tenant(&[
             attester_pin(),
             parse_attester_pin(&hex::encode(secret)).unwrap(),
@@ -735,6 +789,7 @@ fn a_database_head_reference_is_reported_and_said_to_be_unchecked_here() {
         policy: RecordedPolicy::from_json(&policy_json).unwrap(),
         policy_json,
         pins: vec![pin],
+        outcomes: Some(PackOutcomes::default()),
     };
     let files = pack_files(&contents).unwrap();
     let get = |name: &str| {
@@ -916,4 +971,794 @@ async fn the_page_learns_whether_the_package_is_configured() {
         .unwrap();
     let response = app(None, store(), false).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// D3.1: approvals.jsonl, its execution and approver pins, all or nothing.
+
+use praetore_core::{
+    Action, AgentId, AgentKeyPair, Authority, AuthorizationIntentV2, Decision, Evidence,
+    EvidenceAttesterKey,
+};
+use praetore_gateway::{
+    ApprovalChallenge, AttestedOutcome, AuthorizationStatus, ExecutionAttestation, GatewayReceipt,
+    HumanApprovalDecision, HumanApprovalOutcome, NotDispatchedReason,
+};
+use praetore_receipt::outcomes::{KeyPin, OutcomeKeys, verify_outcomes, write_outcomes};
+
+const EXECUTION_SECRET: [u8; 32] = [0x55; 32];
+const EXECUTION_KEY_ID: &str = "test-execution-v1";
+const HELD_ATTESTER_SECRET: [u8; 32] = [0x52; 32];
+const HELD_TENANT: Uuid = Uuid::from_u128(1);
+
+struct TestExecutionSigner(SigningKey);
+
+impl praetore_gateway::ExecutionAttestationSigner for TestExecutionSigner {
+    fn key_id(&self) -> &str {
+        EXECUTION_KEY_ID
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, praetore_gateway::ExecutionAttestationError> {
+        use ed25519_dalek::Signer;
+        Ok(self.0.sign(message).to_bytes().to_vec())
+    }
+}
+
+fn key_pin(secret: [u8; 32], key_id: &str) -> KeyPin {
+    KeyPin {
+        key_id: key_id.into(),
+        public_key: VerifiedPublicKey::from_bytes(
+            &SigningKey::from_bytes(&secret).verifying_key().to_bytes(),
+        )
+        .unwrap(),
+    }
+}
+
+fn execution_pin() -> KeyPin {
+    key_pin(EXECUTION_SECRET, EXECUTION_KEY_ID)
+}
+
+/// The console's own approver ("approver-1"): its public key is a valid
+/// approver pin.
+fn approver_pin() -> KeyPin {
+    key_pin(APPROVER_SECRET, "approver-1")
+}
+
+/// A request the policy held for approval, with the HighAssurance shape a
+/// gateway hold carries (as in the D2 tests), signed by the held attester.
+fn held_evidence(target: &str) -> Evidence {
+    let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .replace_nanosecond(0)
+        .unwrap();
+    let agent = AgentKeyPair::from_secret_bytes(&[0x51; 32]).identity(AgentId::new());
+    let authority = Authority::new(
+        agent.id.clone(),
+        "consola-test",
+        vec!["archivo:borrar".into()],
+    )
+    .with_constraint("tenant_id", HELD_TENANT.to_string());
+    let authority_digest = authority.content_digest().unwrap();
+    let action = Action::new("archivo:borrar", Some(target.into()), serde_json::json!({}))
+        .unwrap()
+        .with_capability("archivo:borrar");
+    let mut evidence = Evidence::new_with_context(
+        Uuid::new_v4(),
+        agent,
+        authority,
+        action,
+        Decision::require_approval("motivo", praetore_core::DecidedBy::rule("regla")),
+        None,
+        std::collections::BTreeMap::new(),
+    )
+    .unwrap();
+    let rfc3339 = |at: time::OffsetDateTime| {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    evidence.intent_v2 = Some(AuthorizationIntentV2 {
+        audience: "consola-test".into(),
+        issued_at: rfc3339(expires_at - time::Duration::minutes(10)),
+        expires_at: rfc3339(expires_at),
+        policy_digest: "cd".repeat(32),
+    });
+    evidence.freshness_valid_until = Some(rfc3339(expires_at));
+    evidence.decided_at = Some(rfc3339(expires_at - time::Duration::minutes(10)));
+    evidence.evaluation_mode = Some("high_assurance".into());
+    evidence.authority_digest = Some(authority_digest);
+    evidence.semantics_version = Some(2);
+    evidence.agent_signature = Some("ef".repeat(64));
+    evidence.bind_policy_digest("cd".repeat(32)).unwrap();
+    evidence
+        .sign(&EvidenceAttesterKey::from_secret_bytes(
+            &HELD_ATTESTER_SECRET,
+        ))
+        .unwrap();
+    evidence
+}
+
+fn attested(evidence: &Evidence, outcome: AttestedOutcome) -> Outcome {
+    let attestation = ExecutionAttestation::create(
+        evidence,
+        AuthorizationStatus::RequiresApproval,
+        &outcome,
+        time::OffsetDateTime::now_utc(),
+        &TestExecutionSigner(SigningKey::from_bytes(&EXECUTION_SECRET)),
+    )
+    .unwrap();
+    Outcome::ExecutionReceipt(Box::new(GatewayReceipt {
+        evidence: evidence.clone(),
+        authorization: attestation.authorization,
+        execution: attestation.execution,
+        output: outcome.output().cloned(),
+        execution_attestation: attestation,
+    }))
+}
+
+fn decided(evidence: &Evidence, outcome: HumanApprovalOutcome) -> Outcome {
+    use ed25519_dalek::Signer;
+    let challenge = ApprovalChallenge::from_evidence(
+        evidence,
+        &praetore_gateway::action_digest(&evidence.action).unwrap(),
+    )
+    .unwrap();
+    let mut decision = HumanApprovalDecision {
+        schema_version: 1,
+        approval_id: Uuid::new_v4(),
+        approver_key_id: "approver-1".into(),
+        challenge,
+        outcome,
+        signature: String::new(),
+    };
+    decision.signature = hex::encode(
+        SigningKey::from_bytes(&APPROVER_SECRET)
+            .sign(&decision.signing_message().unwrap())
+            .to_bytes(),
+    );
+    Outcome::HumanDecision(decision)
+}
+
+/// Three held requests, as the gateway records them: approved and executed,
+/// rejected, and still pending.
+fn held_set() -> (Vec<String>, Vec<Outcome>) {
+    let executed = held_evidence("/tmp/aprobada");
+    let rejected = held_evidence("/tmp/rechazada");
+    let pending = held_evidence("/tmp/pendiente");
+    let outcomes = vec![
+        attested(&executed, AttestedOutcome::AwaitingApproval),
+        decided(&executed, HumanApprovalOutcome::Approve),
+        attested(
+            &executed,
+            AttestedOutcome::Executed(serde_json::json!({"borrado": true})),
+        ),
+        attested(&rejected, AttestedOutcome::AwaitingApproval),
+        decided(&rejected, HumanApprovalOutcome::Reject),
+        attested(
+            &rejected,
+            AttestedOutcome::NotDispatched(Some(NotDispatchedReason::ApprovalRejected)),
+        ),
+        attested(&pending, AttestedOutcome::AwaitingApproval),
+    ];
+    let receipts = [executed, rejected, pending]
+        .iter()
+        .map(|evidence| evidence.to_json().unwrap())
+        .collect();
+    (receipts, outcomes)
+}
+
+fn held_store_of(receipts: Vec<String>, outcomes: Vec<Outcome>) -> Arc<SetExport> {
+    Arc::new(SetExport {
+        calls: AtomicUsize::new(0),
+        fail: false,
+        receipts,
+        outcomes,
+    })
+}
+
+impl Setup {
+    /// Like [`Setup::new`], with the held attester's pin.
+    fn held(name: &str) -> Self {
+        let setup = Self::new(name);
+        let public = EvidenceAttesterKey::from_secret_bytes(&HELD_ATTESTER_SECRET)
+            .public_key()
+            .unwrap();
+        fs::write(&setup.pin, hex::encode(public.as_bytes()) + "\n").unwrap();
+        setup
+    }
+
+    /// A pin file in the scratch folder.
+    fn key_pin(&self, name: &str, pin: &KeyPin) -> PathBuf {
+        let path = self.dir.join(name);
+        fs::write(&path, pin.to_json()).unwrap();
+        path
+    }
+
+    fn with_pins(&self, execution: Vec<PathBuf>, approvers: Vec<PathBuf>) -> PackSettings {
+        self.settings()
+            .with_outcome_pins(execution, approvers)
+            .unwrap()
+    }
+
+    /// The execution pin and the console approver's pin.
+    fn both_pins(&self) -> PackSettings {
+        let execution = self.key_pin("execution.json", &execution_pin());
+        let approver = self.key_pin("approver.json", &approver_pin());
+        self.with_pins(vec![execution], vec![approver])
+    }
+}
+
+fn generate_with(
+    settings: PackSettings,
+    store: Arc<SetExport>,
+    approver: Option<&ApproverSigner>,
+) -> Result<Vec<u8>, PackError> {
+    generate(
+        &CompliancePack::new(settings, store),
+        approver,
+        time::OffsetDateTime::now_utc(),
+    )
+}
+
+#[tokio::test]
+async fn approvals_jsonl_carries_each_outcome_its_pins_and_its_counts() {
+    let setup = Setup::held("d31-contents");
+    let (receipts, outcomes) = held_set();
+    let response = app(
+        Some(setup.both_pins()),
+        held_store_of(receipts, outcomes.clone()),
+        true,
+    )
+    .oneshot(download())
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let files = unpack(&body(response).await);
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "praetore-compliance/",
+            "praetore-compliance/LEEME.txt",
+            "praetore-compliance/journal.jsonl",
+            "praetore-compliance/approvals.jsonl",
+            "praetore-compliance/policy.json",
+            "praetore-compliance/policy-digest.txt",
+            "praetore-compliance/attester-pin-1.hex",
+            "praetore-compliance/execution-pin-1.json",
+            "praetore-compliance/approver-pin-1.json",
+            "praetore-compliance/export.json",
+            "praetore-compliance/SHA256SUMS",
+        ]
+    );
+    // The records, one per line, in the verifier's own format.
+    let approvals = text(&files, "approvals.jsonl");
+    assert_eq!(approvals, write_outcomes(&outcomes).unwrap());
+    assert_eq!(approvals.lines().count(), 7);
+    // Pins: public keys re-encoded with their key id; nothing else.
+    let execution = KeyPin::from_json(text(&files, "execution-pin-1.json")).unwrap();
+    let approver = KeyPin::from_json(text(&files, "approver-pin-1.json")).unwrap();
+    assert_eq!(execution, execution_pin());
+    assert_eq!(approver, approver_pin());
+
+    // The package verifies with the code `praetore-verify outcomes` runs,
+    // from its own files only, and each outcome is its request's.
+    let attesters = [parse_attester_pin(text(&files, "attester-pin-1.hex")).unwrap()];
+    let (_, journal) = praetore_core::journal_chain::verify_journal_receipts(
+        text(&files, "journal.jsonl"),
+        &attesters,
+        None,
+    )
+    .unwrap();
+    let report = verify_outcomes(
+        approvals,
+        &journal,
+        &OutcomeKeys {
+            evidence_attesters: &attesters,
+            execution: &[execution],
+            approvers: &[approver],
+        },
+    )
+    .unwrap();
+    let ends: Vec<(&str, Uuid)> = report
+        .held
+        .iter()
+        .map(|held| (held.outcome.as_str(), held.request_id))
+        .collect();
+    assert_eq!(
+        ends,
+        vec![
+            ("approved_executed", journal[0].request_id),
+            ("rejected", journal[1].request_id),
+            ("pending", journal[2].request_id),
+        ]
+    );
+
+    let export: serde_json::Value = serde_json::from_str(text(&files, "export.json")).unwrap();
+    assert_eq!(
+        export["outcomes"],
+        serde_json::json!({
+            "included": true,
+            "file": "approvals.jsonl",
+            "records": 7,
+            "approvals": 1,
+            "rejections": 1,
+            "expirations": 0,
+            "execution_receipts": 5,
+            "execution_receipts_by_state": {
+                "awaiting_approval": 3,
+                "executed": 1,
+                "not_dispatched": 1,
+            },
+            "held_requests": 3,
+            "held_by_outcome": {
+                "approved_executed": 1,
+                "pending": 1,
+                "rejected": 1,
+            },
+            "omitted_execution_pins": 0,
+            "omitted_approver_pins": 0,
+        })
+    );
+    assert_eq!(
+        export["execution_pins"],
+        serde_json::json!(["execution-pin-1.json"])
+    );
+    assert_eq!(
+        export["approver_pins"],
+        serde_json::json!(["approver-pin-1.json"])
+    );
+    // SHA256SUMS covers the new files.
+    let sums = text(&files, "SHA256SUMS");
+    for name in [
+        "approvals.jsonl",
+        "execution-pin-1.json",
+        "approver-pin-1.json",
+    ] {
+        assert!(
+            sums.contains(&format!(
+                "{}  {name}\n",
+                hex::encode(Sha256::digest(file(&files, name)))
+            )),
+            "{name}"
+        );
+    }
+    let readme = text(&files, "LEEME.txt")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needed in [
+        "Tiene 7 registros: 1 aprobaciones, 1 rechazos, 0 vencimientos y 5 recibos de ejecución.",
+        "praetore-verify outcomes --outcomes approvals.jsonl --journal journal.jsonl --attester-pin attester-pin-1.hex --execution-pin execution-pin-1.json --approver-pin approver-pin-1.json",
+        "Esta exportación tiene 3 solicitudes retenidas: 1 approved_executed, 1 pending, 1 rejected.",
+        "Los recibos de ejecución traen la salida del adaptador",
+        "busque su request_id (o su evidence_id) en held",
+        "No prueba que approvals.jsonl esté completo.",
+        "puede aparecer como pending, approved_pending_dispatch o not_dispatched.",
+        "puede seguir pendiente o haber vencido sin que el gateway lo haya registrado todavía",
+        "El orden de las líneas de approvals.jsonl no se verifica",
+        "no hace fallar el comando: sale en unused_execution_pins o unused_approver_pins.",
+        "esos recibos van en approvals.jsonl",
+        "y no tiene el comando outcomes del paso 5. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y las razones approved_claim_expired y approval_rejected, que approvals.jsonl puede traer.",
+        "paquete de compliance con approvals.jsonl (P-002 D3.1), o desde un release posterior a v0.3.3",
+    ] {
+        assert!(readme.contains(needed), "LEEME.txt lacks {needed:?}");
+    }
+    assert!(!readme.contains("no está configurada"));
+    {
+        let t = text(&files, "LEEME.txt");
+        let i = t.find("\n\n\n\n");
+        assert!(
+            i.is_none(),
+            "{}",
+            &t[i.unwrap_or(0).saturating_sub(300)..(i.unwrap_or(0) + 100).min(t.len())]
+        );
+    }
+}
+
+/// With no execution or approver pin configured, a tenant with
+/// approvals and executions gets the D3 package; with only one of the two
+/// variables, D3.1's all or nothing applies.
+#[test]
+fn without_execution_or_approver_pins_the_package_is_the_d3_one() {
+    let setup = Setup::held("d31-mode");
+    let (receipts, outcomes) = held_set();
+    let files = unpack(
+        &generate_with(
+            setup.settings(),
+            held_store_of(receipts.clone(), outcomes.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, EXPECTED_NAMES);
+    let export: serde_json::Value = serde_json::from_str(text(&files, "export.json")).unwrap();
+    assert_eq!(export["outcomes"]["included"], false);
+    assert_eq!(export["journal"]["entries"], 3);
+    let readme = text(&files, "LEEME.txt");
+    assert!(!readme.contains("approvals.jsonl"));
+    assert!(readme.contains("No muestra si una solicitud retenida fue aprobada"));
+    // One variable alone is the D3.1 mode: its records must all verify.
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    let execution = setup.key_pin("execution.json", &execution_pin());
+    for (execution, approvers) in [(Vec::new(), vec![approver]), (vec![execution], Vec::new())] {
+        assert_eq!(
+            generate_with(
+                setup.with_pins(execution, approvers),
+                held_store_of(receipts.clone(), outcomes.clone()),
+                None
+            )
+            .err(),
+            Some(PackError::OutcomeKeyMissing)
+        );
+    }
+}
+
+#[test]
+fn a_record_signed_by_a_key_that_is_not_configured_yields_no_package() {
+    let setup = Setup::held("d31-missing-key");
+    let (receipts, outcomes) = held_set();
+    // The right key under another key id is not the key the records name.
+    let other_id = setup.key_pin("execution.json", &key_pin(EXECUTION_SECRET, "other-id"));
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    assert_eq!(
+        generate_with(
+            setup.with_pins(vec![other_id], vec![approver.clone()]),
+            held_store_of(receipts.clone(), outcomes.clone()),
+            None
+        )
+        .err(),
+        Some(PackError::OutcomeKeyMissing)
+    );
+    // Without the approver pin the decisions cannot be checked.
+    let execution = setup.key_pin("execution.json", &execution_pin());
+    assert_eq!(
+        generate_with(
+            setup.with_pins(vec![execution], Vec::new()),
+            held_store_of(receipts.clone(), outcomes),
+            None
+        )
+        .err(),
+        Some(PackError::OutcomeKeyMissing)
+    );
+}
+
+#[test]
+fn a_record_that_does_not_verify_or_does_not_fit_yields_no_package() {
+    let setup = Setup::held("d31-bad-record");
+    let settings = setup.both_pins();
+    let (receipts, outcomes) = held_set();
+    let mut cases: Vec<Vec<Outcome>> = Vec::new();
+    // The adapter output changed after signing.
+    let mut changed = outcomes.clone();
+    let Outcome::ExecutionReceipt(receipt) = &mut changed[2] else {
+        unreachable!()
+    };
+    receipt.output = Some(serde_json::json!({"borrado": false}));
+    cases.push(changed);
+    // A decision flipped after signing.
+    let mut flipped = outcomes.clone();
+    let Outcome::HumanDecision(decision) = &mut flipped[4] else {
+        unreachable!()
+    };
+    decision.outcome = HumanApprovalOutcome::Approve;
+    cases.push(flipped);
+    // The execution without its approval.
+    let mut unapproved = outcomes.clone();
+    unapproved.remove(1);
+    cases.push(unapproved);
+    // A record for a request that is not in the journal.
+    let mut foreign = outcomes.clone();
+    foreign.push(attested(
+        &held_evidence("/tmp/otra"),
+        AttestedOutcome::AwaitingApproval,
+    ));
+    cases.push(foreign);
+    for case in cases {
+        assert_eq!(
+            generate_with(
+                settings.clone(),
+                held_store_of(receipts.clone(), case),
+                None
+            )
+            .err(),
+            Some(PackError::Outcomes)
+        );
+    }
+    // Another key under the execution key id.
+    let wrong = setup.key_pin("wrong.json", &key_pin([0x66; 32], EXECUTION_KEY_ID));
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    assert_eq!(
+        generate_with(
+            setup.with_pins(vec![wrong], vec![approver]),
+            held_store_of(receipts, outcomes),
+            None
+        )
+        .err(),
+        Some(PackError::Outcomes)
+    );
+}
+
+/// What a package's pins and export.json say about omitted pins.
+fn pack_pins(files: &[(String, Vec<u8>)]) -> (Vec<KeyPin>, Vec<KeyPin>, serde_json::Value) {
+    let pins = |prefix: &str| {
+        files
+            .iter()
+            .filter(|(name, _)| name.starts_with(&format!("{PACK_DIR}/{prefix}")))
+            .map(|(_, bytes)| KeyPin::from_json(std::str::from_utf8(bytes).unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let export: serde_json::Value = serde_json::from_str(text(files, "export.json")).unwrap();
+    (
+        pins("execution-pin-"),
+        pins("approver-pin-"),
+        serde_json::json!([
+            export["outcomes"]["omitted_execution_pins"],
+            export["outcomes"]["omitted_approver_pins"],
+            export["execution_pins"].as_array().unwrap().len(),
+            export["approver_pins"].as_array().unwrap().len(),
+        ]),
+    )
+}
+
+#[test]
+fn an_execution_or_approver_pin_that_verified_nothing_is_left_out_and_counted() {
+    let setup = Setup::held("d31-unused");
+    let execution = setup.key_pin("execution.json", &execution_pin());
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    let spare = setup.key_pin("spare.json", &key_pin([0x66; 32], "spare"));
+    let third = setup.key_pin("third.json", &key_pin([0x67; 32], "third"));
+    let (receipts, outcomes) = held_set();
+    let pack = |execution: Vec<PathBuf>, approvers: Vec<PathBuf>, outcomes: Vec<Outcome>| {
+        unpack(
+            &generate_with(
+                setup.with_pins(execution, approvers),
+                held_store_of(receipts.clone(), outcomes),
+                None,
+            )
+            .unwrap(),
+        )
+    };
+    // A tenant with no human decision: the approver pin is left out.
+    let undecided: Vec<Outcome> = outcomes
+        .iter()
+        .filter(|record| {
+            matches!(record, Outcome::ExecutionReceipt(receipt)
+            if receipt.execution == praetore_receipt::AttestedExecution::AwaitingApproval)
+        })
+        .cloned()
+        .collect();
+    let files = pack(vec![execution.clone()], vec![approver.clone()], undecided);
+    assert!(
+        !files
+            .iter()
+            .any(|(name, _)| name.ends_with("approver-pin-1.json"))
+    );
+    assert_eq!(
+        pack_pins(&files),
+        (
+            vec![execution_pin()],
+            Vec::new(),
+            serde_json::json!([0, 1, 1, 0])
+        )
+    );
+    let readme = text(&files, "LEEME.txt")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(readme.contains("Una clave configurada en la consola no verificó ningún registro de approvals.jsonl y no va en el paquete"), "{readme}");
+    assert!(!readme.contains("--approver-pin"));
+    // No records at all: every pin is left out, approvals.jsonl is empty.
+    let files = pack(vec![execution.clone()], vec![approver.clone()], Vec::new());
+    assert_eq!(text(&files, "approvals.jsonl"), "");
+    assert_eq!(
+        pack_pins(&files),
+        (Vec::new(), Vec::new(), serde_json::json!([1, 1, 0, 0]))
+    );
+    // The second execution pin and the first and third approver pins signed
+    // nothing: only the ones that did go in, numbered from one.
+    let files = pack(
+        vec![execution, spare.clone()],
+        vec![spare, approver, third],
+        outcomes,
+    );
+    assert_eq!(
+        pack_pins(&files),
+        (
+            vec![execution_pin()],
+            vec![approver_pin()],
+            serde_json::json!([1, 2, 1, 1])
+        )
+    );
+    assert!(
+        text(&files, "LEEME.txt")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Más de una clave configuradas en la consola no verificó")
+    );
+}
+
+#[test]
+fn no_private_key_passes_as_an_execution_or_approver_pin() {
+    let setup = Setup::held("d31-private");
+    // This console's approver: a secret whose bytes also decode as a public
+    // key, so only the approver check can stop it as a pin.
+    let console_secret = (1u8..=255)
+        .map(|byte| [byte; 32])
+        .find(|bytes| VerifiedPublicKey::from_bytes(bytes).is_ok())
+        .unwrap();
+    let signer = ApproverSigner::new("approver-1", console_secret).unwrap();
+    let approver_public = SigningKey::from_bytes(&console_secret)
+        .verifying_key()
+        .to_bytes();
+    let raw_pin = |bytes: [u8; 32], key_id: &str| KeyPin {
+        key_id: key_id.into(),
+        public_key: VerifiedPublicKey::from_bytes(&bytes).unwrap(),
+    };
+    let (receipts, outcomes) = held_set();
+    let execution = setup.key_pin("execution.json", &execution_pin());
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    // The approver's secret as an approver pin.
+    let secret = setup.key_pin("secret.json", &raw_pin(console_secret, "approver-2"));
+    assert_eq!(
+        generate_with(
+            setup.with_pins(
+                vec![execution.clone()],
+                vec![approver.clone(), secret.clone()]
+            ),
+            held_store_of(receipts.clone(), outcomes.clone()),
+            Some(&signer)
+        )
+        .err(),
+        Some(PackError::KeyPinIsApproverKey {
+            role: PinRole::Approver
+        })
+    );
+    // Its public key or its secret as an execution pin.
+    for bytes in [approver_public, console_secret] {
+        let wrong = setup.key_pin("wrong.json", &raw_pin(bytes, "x"));
+        assert_eq!(
+            generate_with(
+                setup.with_pins(vec![execution.clone(), wrong], vec![approver.clone()]),
+                held_store_of(receipts.clone(), outcomes.clone()),
+                Some(&signer)
+            )
+            .err(),
+            Some(PackError::KeyPinIsApproverKey {
+                role: PinRole::Execution
+            })
+        );
+    }
+    // Without the inbox configured, the secret verifies nothing: it is left
+    // out of the package.
+    let files = unpack(
+        &generate_with(
+            setup.with_pins(vec![execution.clone()], vec![approver.clone(), secret]),
+            held_store_of(receipts.clone(), outcomes.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        pack_pins(&files),
+        (
+            vec![execution_pin()],
+            vec![approver_pin()],
+            serde_json::json!([0, 1, 1, 1])
+        )
+    );
+    for (name, bytes) in &files {
+        assert!(
+            !bytes.windows(32).any(|window| window == console_secret),
+            "{name}"
+        );
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(&hex::encode(console_secret)),
+            "{name}"
+        );
+    }
+    // A bare hex key instead of a JSON pin, or a repeated key id.
+    let bare = setup.dir.join("bare.hex");
+    fs::write(&bare, hex::encode(approver_public)).unwrap();
+    let again = setup.key_pin("again.json", &key_pin([0x66; 32], EXECUTION_KEY_ID));
+    for pins in [vec![bare], vec![execution.clone(), again]] {
+        assert_eq!(
+            generate_with(
+                setup.with_pins(pins, vec![approver.clone()]),
+                held_store_of(receipts.clone(), outcomes.clone()),
+                None
+            )
+            .err(),
+            Some(PackError::KeyPins {
+                role: PinRole::Execution
+            })
+        );
+    }
+    // With the right pins, the package is produced and holds no secret.
+    let files = unpack(
+        &generate_with(
+            setup.with_pins(vec![execution], vec![approver]),
+            held_store_of(receipts.clone(), outcomes),
+            Some(&signer),
+        )
+        .unwrap(),
+    );
+    for (name, bytes) in &files {
+        let text = String::from_utf8_lossy(bytes);
+        for secret in [
+            APPROVER_SECRET,
+            EXECUTION_SECRET,
+            HELD_ATTESTER_SECRET,
+            console_secret,
+        ] {
+            assert!(!text.contains(&hex::encode(secret)), "{name}");
+            assert!(!bytes.windows(32).any(|window| window == secret), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_d31_failure_shows_a_plain_message_and_no_package() {
+    let setup = Setup::held("d31-page");
+    let (receipts, outcomes) = held_set();
+    // Only the approver pin: the execution receipts have no key.
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    let response = app(
+        Some(setup.with_pins(Vec::new(), vec![approver])),
+        held_store_of(receipts, outcomes),
+        false,
+    )
+    .oneshot(download())
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let reply: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
+    let message = reply.to_string();
+    assert!(message.contains("está firmado con una clave que no está configurada"));
+    assert!(!message.contains(&HELD_TENANT.to_string()));
+}
+
+#[test]
+fn the_d31_messages_carry_no_ids_digits_or_hex() {
+    for error in [
+        PackError::KeyPins {
+            role: PinRole::Execution,
+        },
+        PackError::KeyPins {
+            role: PinRole::Approver,
+        },
+        PackError::KeyPinIsApproverKey {
+            role: PinRole::Execution,
+        },
+        PackError::KeyPinIsApproverKey {
+            role: PinRole::Approver,
+        },
+        PackError::OutcomeKeyMissing,
+        PackError::Outcomes,
+        PackError::OutcomesTooLarge,
+    ] {
+        let message = error.message();
+        assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
+        assert!(
+            message.ends_with("No se generó ningún paquete."),
+            "{message}"
+        );
+    }
+    let settings = PackSettings::new("p".into(), vec!["a".into()]).unwrap();
+    assert!(
+        settings
+            .clone()
+            .with_outcome_pins(vec!["e".into(); 16], vec!["a".into(); 16])
+            .is_ok()
+    );
+    assert!(
+        settings
+            .clone()
+            .with_outcome_pins(vec!["e".into(); 17], Vec::new())
+            .is_err()
+    );
+    assert!(
+        settings
+            .with_outcome_pins(Vec::new(), vec!["a".into(); 17])
+            .is_err()
+    );
 }

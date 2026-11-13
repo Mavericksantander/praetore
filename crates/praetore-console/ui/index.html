@@ -27,7 +27,7 @@
     </section>
     <section id="paquete" class="paquete" aria-labelledby="paquete-titulo">
       <h2 id="paquete-titulo" class="titulo-seccion">Paquete de compliance</h2>
-      <p class="aviso">Descarga un archivo comprimido (.tar.gz) para entregar a un auditor. Trae el registro firmado que lee esta consola, la política configurada y su digest, las claves públicas del atestador, las sumas SHA-256 de cada archivo y un LEEME.txt que explica cómo verificarlo con praetore-verify sin confiar en esta consola, y lo que el paquete no prueba. No trae claves privadas. Descargarlo no cambia nada.</p>
+      <p class="aviso">Descarga un archivo comprimido (.tar.gz) para entregar a un auditor. Trae el registro firmado que lee esta consola, la política configurada y su digest, las claves públicas del atestador, las sumas SHA-256 de cada archivo y un LEEME.txt que explica cómo verificarlo con praetore-verify sin confiar en esta consola, y lo que el paquete no prueba. Si la consola tiene configuradas claves de ejecución o de aprobador, trae también approvals.jsonl, con los recibos de aprobación, rechazo, vencimiento y ejecución de cada solicitud retenida, y las claves públicas de ejecución y de aprobador que los verifican. Incluye la salida de cada acción ejecutada, que puede tener datos sensibles: revísela antes de entregar el paquete. No trae claves privadas. Descargarlo no cambia nada.</p>
       <button id="descargar-paquete" type="button">Descargar paquete de compliance</button>
       <p id="paquete-estado" class="estado" role="status"></p>
     </section>

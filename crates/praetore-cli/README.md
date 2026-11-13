@@ -125,6 +125,17 @@ and its public pin (`approver-pin.json`, approver id `local-approver`). The
 gateway loads only the pin; without it, approval is disabled and every
 approval attempt is refused (`approval_not_configured`).
 
+`init` also writes `execution-pin.json`: the public pin of the execution key
+that signs execution receipts (`{"schema_version":1,"key_id":"local-demo-<public key hex>","public_key_hex":...}`,
+no secret). The console's compliance package
+(`PRAETORE_CONSOLE_EXECUTION_PIN_FILES`) and `praetore-verify outcomes
+--execution-pin` take it. For a directory initialized before `init` wrote
+it:
+
+```sh
+praetore execution-pin ./praetore-local   # reads execution-attester.key itself; never overwrites
+```
+
 When a policy rule has effect `RequireApproval`, `praetore demo` returns
 `requires_approval` / `not_dispatched` and prints the commands to resolve it:
 

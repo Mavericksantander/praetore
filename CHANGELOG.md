@@ -268,15 +268,15 @@
   other file, and `LEEME.txt` with the `praetore-verify` commands and what
   the package does not show: a path around the gateway, anything before
   the first record or after the export, completeness without an anchored
-  head, whether a held request was approved, rejected or executed (the
-  chain carries the policy decision only; approval and execution receipts
-  are not included). `LEEME.txt` asks for `praetore-verify` built from
-  `main`: the v0.3.3 verifier also accepts this `journal.jsonl`, but does
-  not report `tenant_id` nor warn `head_not_anchored`, which the
-  instructions use; v0.3.3 also rejects with `RECEIPT_INVALID` schema v5
-  execution receipts (`awaiting_approval`) and the reasons
-  `approved_claim_expired` and `approval_rejected`, none of which is in
-  the package. `LEEME.txt` counts the decision receipts apart from the
+  head (the chain carries the policy decision only; since D3.1 the
+  approval and execution receipts travel in `approvals.jsonl`, see below).
+  `LEEME.txt` asks for `praetore-verify` built from `main`: the v0.3.3
+  verifier also accepts this `journal.jsonl`, but does not report
+  `tenant_id` nor warn `head_not_anchored`, which the instructions use,
+  and has no `outcomes` command; v0.3.3 also rejects with
+  `RECEIPT_INVALID` schema v5 execution receipts (`awaiting_approval`) and
+  the reasons `approved_claim_expired` and `approval_rejected`, which
+  `approvals.jsonl` can carry. `LEEME.txt` counts the decision receipts apart from the
   `database_head` reference line, and has a section on completeness
   (`--expected-head`, and `--expected-database-head` when the chain
   references the database head). The download is a `GET` that needs the session cookie, the
@@ -297,6 +297,81 @@
   instead of offering the button. One variable without the other is a
   startup error. New dependencies of the console: `tar` and
   `flate2` (Rust backend).
+- **Approval and execution receipts in the compliance package (P-002
+  D3.1).** When at least one of the new settings below is configured, the
+  package adds `approvals.jsonl`: the tenant's human
+  decisions (approve, reject), approval-expiration receipts and execution
+  receipts (schema v1 to v5, the `GatewayReceipt` the gateway returned,
+  with the journal's evidence and, for `executed` and `confirmed`, the
+  adapter output its signature covers), one signed record per line, read
+  in the same read-only snapshot as `journal.jsonl`. New optional
+  settings `PRAETORE_CONSOLE_EXECUTION_PIN_FILES` and
+  `PRAETORE_CONSOLE_APPROVER_PIN_FILES` (0 to 16 each, only with the D3
+  settings) name the pins that verify them; with neither, the package is
+  the D3 one, and `LEEME.txt` and `export.json` (`"outcomes":
+  {"included": false, ...}`) say the console is not configured to include
+  those receipts. The pins use the JSON format of the
+  `approver-pin.json` that `praetore init` writes
+  (`{"schema_version":1,"key_id":...,"public_key_hex":...}`); they go in
+  the package as `execution-pin-N.json` and `approver-pin-N.json`,
+  re-encoded from the parsed key. Before anything is archived, every
+  record is verified with the code `praetore-verify outcomes` runs; a
+  record that does not verify, does not match its request of the journal
+  or contradicts another record of that request, or a record signed by a
+  key no pin names, means no package, and the page says so without ids or
+  hex; so does an `approvals.jsonl` over 32 MiB or 20,480 lines. An
+  execution pin equal to the approver's key, an approver pin equal to the
+  approver's secret, a file that is not a JSON pin, and a repeated key or
+  key id are refused. An execution or approver pin that verified no
+  record is left out of the package and logged with its position and path
+  (a tenant with no human decision gets no `approver-pin-1.json`).
+  `export.json` counts the records of each kind, the held requests by
+  outcome and the omitted pins (`omitted_execution_pins`,
+  `omitted_approver_pins`). `LEEME.txt` has a new step 5
+  (`praetore-verify outcomes`, how to find each held request of the
+  journal in its `held` list; the order of the lines is not verified, and
+  an unused pin is reported, not an error) and says what it does not
+  show: that `approvals.jsonl` is complete (its records are not chained,
+  so an approved or executed request can show as `pending`,
+  `approved_pending_dispatch` or `not_dispatched`), and that a
+  request shown as `pending` may also have expired without the gateway
+  having recorded it yet. The step 2 note on v0.3.3 now says that
+  `approvals.jsonl` can carry what v0.3.3 rejects. The page's notice on the
+  package names `approvals.jsonl` and the execution and approver public
+  keys, and asks to review the output of each executed action, which may
+  hold sensitive data, before handing the package over.
+- **`praetore init` writes `execution-pin.json`; `praetore execution-pin`
+  (P-002 D3.1).** `init` also writes the execution key's public pin
+  (`{"schema_version":1,"key_id":"local-demo-<public key hex>","public_key_hex":...}`),
+  the format of `approver-pin.json`, for the console's
+  `PRAETORE_CONSOLE_EXECUTION_PIN_FILES` and `praetore-verify outcomes
+  --execution-pin`. `praetore execution-pin <directory>` writes it for a
+  directory initialized before: it reads `execution-attester.key` itself
+  and never overwrites. No secret file changes.
+- **`praetore-verify outcomes` (P-002 D3.1).** Verifies a tenant's
+  approval and execution records (a JSONL file such as `approvals.jsonl`)
+  against its journal chain, which it verifies first: each human decision
+  against the challenge derived from its journal receipt and an
+  `--approver-pin`, each expiration and execution receipt against an
+  `--execution-pin` (both repeatable, up to 16, JSON pins), the evidence
+  embedded in each execution receipt against the journal's receipt for
+  that request, and that the records of one request agree. It reports
+  `counts`, `held` (every held request of the journal with its outcome:
+  `pending`, `rejected`, `expired`, `approved_pending_dispatch`,
+  `approved_executed`, `approved_failed`, `approved_outcome_unknown`,
+  `approved_not_dispatched` or `not_dispatched`), `held_by_outcome`, the
+  pins that verified nothing, and `head_not_anchored` without
+  `--expected-head`. New error codes `OUTCOME_MALFORMED`,
+  `OUTCOME_UNKNOWN_REQUEST`, `OUTCOME_EVIDENCE_MISMATCH`,
+  `OUTCOME_KEY_UNKNOWN`, `OUTCOME_SIGNATURE_INVALID`,
+  `OUTCOME_SELF_APPROVAL`, `OUTCOME_DUPLICATE`, `OUTCOME_INCONSISTENT`,
+  `OUTCOME_PIN_DUPLICATE`, `OUTCOMES_TOO_LARGE`. Before, the verifier
+  checked one execution receipt per run (`receipt`) and had no command for
+  human decisions or expiration receipts. The code is
+  `praetore_receipt::outcomes`; `praetore_core::journal_chain` adds
+  `verify_journal_receipts`, which also returns the verified receipts, and
+  `praetore_replay_postgres::journal_export` adds
+  `export_tenant_with_outcomes`.
 - **`praetore_replay_postgres::journal_export` (P-002 D3).** The tenant
   export of `praetore journal-export` (`export_tenant`: receipts and
   storage records in one read-only, repeatable-read snapshot, then the
@@ -306,6 +381,17 @@
   pins that verified no entry.
 
 ### Changed
+
+- **Approval types moved to `praetore-receipt` (P-002 D3.1).**
+  `ExecutionKey`, `ApprovalChallenge`, `HumanApprovalOutcome`,
+  `HumanApprovalDecision`, `ExpiredOutcome`, `ApprovalExpiredReceipt` and
+  `ApprovalError` moved from `praetore-gateway`, which re-exports them
+  unchanged, so offline verifiers can check decisions and expiration
+  receipts without server dependencies. What they sign and how they verify
+  is unchanged. New: `HumanApprovalDecision::verify_signature` and
+  `is_self_approval` (the checks the gateway already ran, now shared);
+  `ApprovalExpiredReceipt::create` is public behind the `signing` feature,
+  like `ExecutionAttestation::create`.
 
 - **Migration `0021_journal_insert_rules` (T-016).** The execution journal
   accepts on INSERT only the initial states the gateway writes (`authorized`

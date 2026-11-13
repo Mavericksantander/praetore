@@ -17,6 +17,7 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 hex = "0.4.3"
 praetore-core = { path = "../praetore-core" }
 praetore-gateway = { path = "../praetore-gateway" }
+praetore-receipt = { path = "../praetore-receipt" }
 praetore-replay-postgres = { path = "../praetore-replay-postgres" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 postgres = { version = "0.19", features = ["with-time-0_3", "with-uuid-1"] }

@@ -44,6 +44,10 @@ const EXECUTION_KEY_FILE: &str = "execution-attester.key";
 const CONFIG_FILE: &str = "config.json";
 const APPROVER_KEY_FILE: &str = "approver.key";
 const APPROVER_PIN_FILE: &str = "approver-pin.json";
+/// Public pin of the execution key, in the format of [`APPROVER_PIN_FILE`]:
+/// the compliance package (`PRAETORE_CONSOLE_EXECUTION_PIN_FILES`) and
+/// `praetore-verify outcomes --execution-pin` read it.
+const EXECUTION_PIN_FILE: &str = "execution-pin.json";
 const LOCAL_APPROVER_ID: &str = "local-approver";
 /// Bearer token the demo agent (`praetore demo`) presents to the gateway.
 const AGENT_TOKEN_FILE: &str = "agent-api.token";
@@ -138,6 +142,15 @@ struct LocalExecutionSigner {
 }
 
 impl LocalExecutionSigner {
+    /// The public pin of this key: its key id and public key, no secret.
+    fn pin(&self) -> ApproverPin {
+        ApproverPin {
+            schema_version: 1,
+            key_id: self.key_id.clone(),
+            public_key_hex: hex::encode(self.signing_key.verifying_key().to_bytes()),
+        }
+    }
+
     fn from_secret(secret: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(secret);
         let key_id = format!(
@@ -211,6 +224,11 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             let directory = required_argument(&mut args, "directory")?;
             ensure_no_arguments(args)?;
             doctor(Path::new(&directory))
+        }
+        "execution-pin" => {
+            let directory = required_argument(&mut args, "directory")?;
+            ensure_no_arguments(args)?;
+            export_execution_pin(Path::new(&directory))
         }
         "run" => {
             let directory = required_argument(&mut args, "directory")?;
@@ -364,6 +382,7 @@ fn print_usage() {
            praetore init <directory> [--port <port>] [--sandbox-root <absolute dir> | --dev-cooperative-exec]\n\
              (--dev-cooperative-exec: development only, no guarantee; the agent may run effects itself)\n\
            praetore doctor <directory>\n\
+           praetore execution-pin <directory>   (writes execution-pin.json if init did not; never overwrites)\n\
            praetore run <directory> [--adopt-legacy-baseline]\n\
            praetore demo <directory> set <key> <value>\n\
            praetore demo <directory> write <path> <content>   (needs sandbox_root)\n\
@@ -488,6 +507,7 @@ fn initialize_with_options(
         &directory.join(APPROVER_PIN_FILE),
         &serde_json::to_vec_pretty(&approver_pin)?,
     )?;
+    write_execution_pin(directory, &execution_key_bytes)?;
 
     println!("Initialized local demo at {}", directory.display());
     println!("Human approver id: {LOCAL_APPROVER_ID}");
@@ -496,6 +516,33 @@ fn initialize_with_options(
     println!("Then run: praetore doctor {}", directory.display());
     println!(
         "The loopback HTTP API requires the generated {AGENT_TOKEN_FILE} / {APPROVER_TOKEN_FILE} bearer tokens; this demo is not production key custody."
+    );
+    Ok(())
+}
+
+/// Writes [`EXECUTION_PIN_FILE`] from the execution secret; never
+/// overwrites.
+fn write_execution_pin(
+    directory: &Path,
+    execution_secret: &[u8; 32],
+) -> Result<ApproverPin, Box<dyn std::error::Error>> {
+    let pin = LocalExecutionSigner::from_secret(execution_secret).pin();
+    let path = directory.join(EXECUTION_PIN_FILE);
+    write_private_file(&path, &serde_json::to_vec_pretty(&pin)?)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    Ok(pin)
+}
+
+/// `praetore execution-pin <directory>`: writes the execution key's public
+/// pin for a directory initialized before `init` wrote it. Reads the secret
+/// itself, so nobody handles it; refuses to overwrite.
+fn export_execution_pin(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let secret = read_secret(directory, EXECUTION_KEY_FILE)?;
+    let pin = write_execution_pin(directory, &secret)?;
+    println!(
+        "Wrote {} (key_id {}). It holds only the public key.",
+        directory.join(EXECUTION_PIN_FILE).display(),
+        pin.key_id
     );
     Ok(())
 }
@@ -2038,6 +2085,47 @@ mod tests {
         for bad in ["", "Local", "a b", "x;drop", "../key", &"a".repeat(65)] {
             assert!(!valid_approver_id(bad), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn init_writes_the_execution_pin_and_execution_pin_rewrites_it_only_when_missing() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let written = fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap();
+        let pin: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let secret = read_secret(&directory, EXECUTION_KEY_FILE).unwrap();
+        let public = hex::encode(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
+        assert_eq!(
+            pin,
+            serde_json::json!({
+                "schema_version": 1,
+                "key_id": format!("local-demo-{public}"),
+                "public_key_hex": public,
+            })
+        );
+        // The key id is the one the gateway signs with.
+        assert_eq!(
+            pin["key_id"],
+            LocalExecutionSigner::from_secret(&secret).key_id()
+        );
+        // Public only: the secret is not in it, and the secret file is
+        // untouched.
+        assert!(!written.contains(&hex::encode(secret)));
+        assert_eq!(read_secret(&directory, EXECUTION_KEY_FILE).unwrap(), secret);
+        // Never overwritten.
+        assert!(export_execution_pin(&directory).is_err());
+        assert_eq!(
+            fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap(),
+            written
+        );
+        // A directory initialized before init wrote it gets the same file.
+        fs::remove_file(directory.join(EXECUTION_PIN_FILE)).unwrap();
+        export_execution_pin(&directory).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap(),
+            written
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

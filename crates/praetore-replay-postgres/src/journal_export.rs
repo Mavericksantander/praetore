@@ -11,6 +11,10 @@ use praetore_core::{
     Evidence, StorageRecord, VerifiedPublicKey,
     journal_chain::{ChainExporter, ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
 };
+use praetore_receipt::{
+    AttestedExecution, ExecutionAttestation, GatewayReceipt,
+    outcomes::{MAX_OUTCOME_LINES, Outcome},
+};
 use uuid::Uuid;
 
 pub type ExportResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -56,16 +60,110 @@ pub fn export_tenant(
     attesters: &[VerifiedPublicKey],
 ) -> ExportResult<TenantExport> {
     let (receipts, records) = read_tenant_export(client, tenant_id)?;
+    chain_tenant(&receipts, &records, attesters)
+}
+
+/// The tenant's human decisions, approval-expiration receipts and execution
+/// attestations, in journal order and, within a request, in recording
+/// order. An execution attestation becomes the [`GatewayReceipt`] the
+/// gateway returned for it: the journal's evidence, and the journal's output
+/// for `executed` and `confirmed`.
+const OUTCOMES_QUERY: &str = "SELECT record.kind, record.payload, \
+     CASE WHEN record.kind = 2 THEN journal.evidence_json END, \
+     CASE WHEN record.kind = 2 THEN journal.output_json END FROM ( \
+     SELECT 0 AS kind, decision_json AS payload, tenant_id, agent_id, request_id, created_at, \
+     approval_id::text AS id FROM praetore.human_approvals WHERE tenant_id = $1 \
+     UNION ALL \
+     SELECT 1, receipt_json, tenant_id, agent_id, request_id, created_at, receipt_id::text \
+     FROM praetore.human_approval_expirations WHERE tenant_id = $1 \
+     UNION ALL \
+     SELECT 2, attestation_json, tenant_id, agent_id, request_id, created_at, \
+     attestation_id::text FROM praetore.execution_attestations WHERE tenant_id = $1 \
+     ) record JOIN praetore.execution_journal journal \
+     ON journal.tenant_id = record.tenant_id AND journal.agent_id = record.agent_id \
+     AND journal.request_id = record.request_id \
+     ORDER BY journal.created_at, journal.request_id, journal.agent_id, record.created_at, \
+     record.kind, record.id LIMIT $2";
+
+/// [`export_tenant`], plus the tenant's approval and execution records
+/// ([`OUTCOMES_QUERY`]), all read in the same read-only, repeatable-read
+/// snapshot, so every record belongs to a request of the chain. The records
+/// are parsed, not verified: see `praetore_receipt::outcomes::verify_outcomes`.
+pub fn export_tenant_with_outcomes(
+    client: &mut Client,
+    tenant_id: Uuid,
+    attesters: &[VerifiedPublicKey],
+) -> ExportResult<(TenantExport, Vec<Outcome>)> {
+    let mut transaction = export_transaction(client, tenant_id)?;
+    let limit = (MAX_CHAIN_ENTRIES + 1) as i64;
+    let rows = transaction.query(JOURNAL_QUERY, &[&tenant_id, &limit])?;
+    let records = read_storage_records(&mut transaction)?;
+    let outcome_limit = (MAX_OUTCOME_LINES + 1) as i64;
+    let outcome_rows = transaction.query(OUTCOMES_QUERY, &[&tenant_id, &outcome_limit])?;
+    transaction.commit()?;
+    if rows.len() > MAX_CHAIN_ENTRIES {
+        return Err("too many journal rows for one export".into());
+    }
+    if outcome_rows.len() > MAX_OUTCOME_LINES {
+        return Err("too many approval and execution records for one export".into());
+    }
+    let receipts: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    let export = chain_tenant(&receipts, &records, attesters)?;
+    let mut outcomes = Vec::with_capacity(outcome_rows.len());
+    for (index, row) in outcome_rows.iter().enumerate() {
+        let kind: i32 = row.get(0);
+        let payload: serde_json::Value = row.get(1);
+        let outcome = match kind {
+            0 => serde_json::from_value(payload).map(Outcome::HumanDecision),
+            1 => serde_json::from_value(payload).map(Outcome::ApprovalExpired),
+            _ => serde_json::from_value::<ExecutionAttestation>(payload).and_then(|attestation| {
+                // Evidence and output come only with execution receipts.
+                let evidence = row
+                    .get::<_, Option<String>>(2)
+                    .ok_or_else(|| {
+                        serde_json::Error::io(std::io::Error::other("journal row has no evidence"))
+                    })
+                    .and_then(|json| {
+                        Evidence::from_json(&json)
+                            .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+                    })?;
+                let output = match attestation.execution {
+                    AttestedExecution::Executed | AttestedExecution::Confirmed => row
+                        .get::<_, Option<String>>(3)
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()?,
+                    _ => None,
+                };
+                Ok(Outcome::ExecutionReceipt(Box::new(GatewayReceipt {
+                    evidence,
+                    authorization: attestation.authorization,
+                    execution: attestation.execution,
+                    output,
+                    execution_attestation: attestation,
+                })))
+            }),
+        }
+        .map_err(|error| format!("approval or execution record {index}: {error}"))?;
+        outcomes.push(outcome);
+    }
+    Ok((export, outcomes))
+}
+
+fn chain_tenant(
+    receipts: &[String],
+    records: &[String],
+    attesters: &[VerifiedPublicKey],
+) -> ExportResult<TenantExport> {
     let mut used = vec![false; attesters.len()];
     let database_head = if records.is_empty() {
         None
     } else {
-        let (_, head, unused) = chain_storage_records(&records, attesters)
+        let (_, head, unused) = chain_storage_records(records, attesters)
             .map_err(|error| format!("database chain: {error} ({RECORD_PIN_HINT})"))?;
         mark_used(&mut used, &unused);
         Some(DatabaseHead::from(head))
     };
-    let (text, head, unused) = chain_receipts(&receipts, database_head, attesters)?;
+    let (text, head, unused) = chain_receipts(receipts, database_head, attesters)?;
     mark_used(&mut used, &unused);
     Ok(TenantExport {
         text,

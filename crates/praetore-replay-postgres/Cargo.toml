@@ -13,6 +13,7 @@ description = "PostgreSQL-backed durable replay guard for PRÆTORE HighAssurance
 postgres = { version = "0.19", features = ["with-time-0_3", "with-uuid-1", "with-serde_json-1"] }
 hex = "0.4.3"
 praetore-gateway = { path = "../praetore-gateway" }
+praetore-receipt = { path = "../praetore-receipt" }
 praetore-core = { path = "../praetore-core" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "1.0"
