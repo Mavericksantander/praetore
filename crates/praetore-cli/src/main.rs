@@ -40,6 +40,9 @@ const POLICY_FILE: &str = "policy.json";
 const ISSUER_PIN_FILE: &str = "issuer-pin.json";
 const ISSUER_KEY_FILE: &str = "issuer.key";
 const EVIDENCE_KEY_FILE: &str = "evidence-attester.key";
+/// The evidence attester's public key: 64 lowercase hex characters, the
+/// `--attester-pin` format of `praetore journal-export`. No secret.
+const ATTESTER_PIN_FILE: &str = "attester-public-key.hex";
 const EXECUTION_KEY_FILE: &str = "execution-attester.key";
 const CONFIG_FILE: &str = "config.json";
 const APPROVER_KEY_FILE: &str = "approver.key";
@@ -225,6 +228,11 @@ fn run_cli() -> Result<(), Box<dyn std::error::Error>> {
             ensure_no_arguments(args)?;
             doctor(Path::new(&directory))
         }
+        "attester-pin" => {
+            let directory = required_argument(&mut args, "directory")?;
+            ensure_no_arguments(args)?;
+            export_attester_pin(Path::new(&directory))
+        }
         "execution-pin" => {
             let directory = required_argument(&mut args, "directory")?;
             ensure_no_arguments(args)?;
@@ -383,6 +391,7 @@ fn print_usage() {
              (--dev-cooperative-exec: development only, no guarantee; the agent may run effects itself)\n\
            praetore doctor <directory>\n\
            praetore execution-pin <directory>   (writes execution-pin.json if init did not; never overwrites)\n\
+           praetore attester-pin <directory>    (writes attester-public-key.hex if init did not; never overwrites)\n\
            praetore run <directory> [--adopt-legacy-baseline]\n\
            praetore demo <directory> set <key> <value>\n\
            praetore demo <directory> write <path> <content>   (needs sandbox_root)\n\
@@ -508,6 +517,7 @@ fn initialize_with_options(
         &serde_json::to_vec_pretty(&approver_pin)?,
     )?;
     write_execution_pin(directory, &execution_key_bytes)?;
+    write_attester_pin(directory, &evidence_key_bytes)?;
 
     println!("Initialized local demo at {}", directory.display());
     println!("Human approver id: {LOCAL_APPROVER_ID}");
@@ -543,6 +553,41 @@ fn export_execution_pin(directory: &Path) -> Result<(), Box<dyn std::error::Erro
         "Wrote {} (key_id {}). It holds only the public key.",
         directory.join(EXECUTION_PIN_FILE).display(),
         pin.key_id
+    );
+    Ok(())
+}
+
+/// Writes [`ATTESTER_PIN_FILE`] from the evidence attester secret; never
+/// overwrites.
+fn write_attester_pin(
+    directory: &Path,
+    evidence_secret: &[u8; 32],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let public = hex::encode(
+        EvidenceAttesterKey::from_secret_bytes(evidence_secret)
+            .public_key()?
+            .as_bytes(),
+    );
+    let path = directory.join(ATTESTER_PIN_FILE);
+    write_private_file(&path, public.as_bytes())
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    Ok(public)
+}
+
+/// `praetore attester-pin <directory>`: writes the evidence attester's
+/// public pin for a directory initialized before `init` wrote it. Reads the
+/// secret itself, so nobody handles it; refuses to overwrite.
+fn export_attester_pin(directory: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let secret = read_secret(directory, EVIDENCE_KEY_FILE).map_err(|error| {
+        format!(
+            "could not read {}: {error}",
+            directory.join(EVIDENCE_KEY_FILE).display()
+        )
+    })?;
+    write_attester_pin(directory, &secret)?;
+    println!(
+        "Wrote {}. It holds only the public key.",
+        directory.join(ATTESTER_PIN_FILE).display()
     );
     Ok(())
 }
@@ -2125,6 +2170,81 @@ mod tests {
             fs::read_to_string(directory.join(EXECUTION_PIN_FILE)).unwrap(),
             written
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn init_writes_the_attester_pin_and_it_verifies_that_attester_s_evidence() {
+        use praetore_core::{Decision, Evidence};
+        use praetore_replay_postgres::journal_export::parse_attester_pin;
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let written = fs::read_to_string(directory.join(ATTESTER_PIN_FILE)).unwrap();
+        // Exactly the `--attester-pin` format: 64 lowercase hex and a newline.
+        assert_eq!(written.len(), 65);
+        assert!(written.ends_with('\n'));
+        assert!(
+            written
+                .trim_end()
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        let pin = parse_attester_pin(&written).unwrap();
+        let secret = read_secret(&directory, EVIDENCE_KEY_FILE).unwrap();
+        assert!(!written.contains(&hex::encode(secret)));
+        // Evidence signed with the attester key `praetore run` loads from
+        // evidence-attester.key verifies against the pin; another key's
+        // pin does not.
+        let agent = AgentKeyPair::from_secret_bytes(&[0x31; 32]).identity(AgentId::new());
+        let authority = Authority::new(agent.id.clone(), "cli-test", vec!["demo:write".into()]);
+        let action = Action::new(
+            "demo:set_value",
+            Some("demo-state".into()),
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .with_capability("demo:write");
+        let mut evidence = Evidence::new_with_context(
+            Uuid::new_v4(),
+            agent,
+            authority,
+            action,
+            Decision::allow("regla", praetore_core::DecidedBy::rule("regla")),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        evidence.bind_policy_digest("cd".repeat(32)).unwrap();
+        evidence
+            .sign(&EvidenceAttesterKey::from_secret_bytes(&secret))
+            .unwrap();
+        assert!(evidence.verify_attester_signature(&pin).is_ok());
+        let other = EvidenceAttesterKey::from_secret_bytes(&[0x77; 32])
+            .public_key()
+            .unwrap();
+        assert!(evidence.verify_attester_signature(&other).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn attester_pin_rewrites_the_pin_only_when_missing_and_needs_the_key() {
+        let directory = env::temp_dir().join(format!("praetore-cli-test-{}", Uuid::new_v4()));
+        initialize(&directory, 8080).unwrap();
+        let path = directory.join(ATTESTER_PIN_FILE);
+        let written = fs::read_to_string(&path).unwrap();
+        // Never overwritten.
+        assert!(export_attester_pin(&directory).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        // A directory initialized before init wrote it gets the same file.
+        fs::remove_file(&path).unwrap();
+        export_attester_pin(&directory).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        // Without evidence-attester.key: an error naming it, and no pin.
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(directory.join(EVIDENCE_KEY_FILE)).unwrap();
+        let error = export_attester_pin(&directory).unwrap_err().to_string();
+        assert!(error.contains(EVIDENCE_KEY_FILE), "{error}");
+        assert!(!path.exists());
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -38,7 +38,7 @@ Attester pins and local policy: both or none. One without the other is a startup
 | Variable | What |
 | --- | --- |
 | `PRAETORE_CONSOLE_POLICY_FILE` | The policy file the gateway loads (`policy.json` of `praetore init`). Regular file, at most 1 MiB. |
-| `PRAETORE_CONSOLE_ATTESTER_PIN_FILES` | One to 16 attester public-key files (64 lowercase hex characters each, the `--attester-pin` format of `praetore journal-export`), separated like `PATH` (`:` on Unix). After an attester key rotation, list the retired key too. |
+| `PRAETORE_CONSOLE_ATTESTER_PIN_FILES` | One to 16 attester public-key files (64 lowercase hex characters each, the `--attester-pin` format of `praetore journal-export`), separated like `PATH` (`:` on Unix). After an attester key rotation, list the retired key too. For `praetore run`, `praetore init` writes it as `attester-public-key.hex`; `praetore attester-pin <directory>` writes it for a directory initialized before. |
 
 Approval and execution receipts (D3.1): optional, and only with the two above. With neither of the two variables below the package is the D3 one, without `approvals.jsonl`: `LEEME.txt` and `export.json` say the console is not configured to include approval and execution receipts, and that the package does not show how each held request ended. With at least one of them, `approvals.jsonl` is in the package, all or nothing (below).
 
@@ -51,6 +51,7 @@ Each pin file is one JSON document, the format of the `approver-pin.json` that `
 
 Where the pins come from:
 
+- **Attester, `praetore run`:** `praetore init` writes `attester-public-key.hex` (the evidence attester's public key, 64 lowercase hex characters, no secret) next to `evidence-attester.key`. For a directory initialized before `init` wrote it, `praetore attester-pin <directory>` writes it: it reads `evidence-attester.key` itself and never overwrites an existing file.
 - **`praetore run`:** `praetore init` writes `execution-pin.json` (the execution key's public pin, key id `local-demo-<public key hex>`) next to `approver-pin.json`; neither holds a secret. For a directory initialized before `init` wrote it, `praetore execution-pin <directory>` writes it: it reads `execution-attester.key` itself, so nobody handles the secret, and it never overwrites an existing file.
 - **`praetore-gateway-demo`:** its execution key is the file `PRAETORE_GATEWAY_EXECUTION_ATTESTER_KEY_FILE` names, and its key id is `execution-attester-<public key hex>` (`docs/operations.md`). Record the public key when the key is generated, from the secret manager that holds it, and write the pin from it. Every execution receipt the gateway signed names that key id (`attestation_json ->> 'key_id'` in `praetore.execution_attestations`), so its hex suffix is the public key that receipt claims; a pin taken from there shows the records are consistent with that key, not that it is the gateway's: compare it with the one recorded at generation.
 - **Approvers:** the `approver-pin.json` of `praetore init`, or for `praetore-gateway-demo` the public keys of `PRAETORE_GATEWAY_APPROVER_BINDINGS_FILE` bound to this tenant, each written as a pin with the `key_id` it has there (the one decisions name in `approver_key_id`).
