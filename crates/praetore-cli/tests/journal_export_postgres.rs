@@ -321,25 +321,9 @@ fn postgres_cli_journal_export_tenant_end_to_end() {
         dir_b.join("evidence-attester.key"),
     )
     .unwrap();
-    let secret: [u8; 32] = hex::decode(
-        fs::read_to_string(dir_a.join("evidence-attester.key"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
+    // The pin `init` wrote in A; the one in B named B's replaced key.
     let pin = work.join("attester-public-key.hex");
-    fs::write(
-        &pin,
-        hex::encode(
-            praetore_core::EvidenceAttesterKey::from_secret_bytes(&secret)
-                .public_key()
-                .unwrap()
-                .as_bytes(),
-        ),
-    )
-    .unwrap();
+    fs::copy(dir_a.join("attester-public-key.hex"), &pin).unwrap();
 
     // Interleaved writes: A, B, A, B, A.
     let (mut ids_a, mut ids_b) = (Vec::new(), Vec::new());
@@ -574,9 +558,9 @@ fn postgres_cli_journal_export_after_attester_key_rotation() {
     .unwrap();
     let key_b = praetore_core::EvidenceAttesterKey::from_secret_bytes(&secret_b);
     assert_ne!(key_a.key_id(), key_b.key_id());
-    let (pin_a, pin_b) = (work.join("pin-a.hex"), work.join("pin-b.hex"));
+    // Key A predates this `init`; key B's pin is the one `init` wrote.
+    let (pin_a, pin_b) = (work.join("pin-a.hex"), dir.join("attester-public-key.hex"));
     write_pin(&pin_a, &key_a);
-    write_pin(&pin_b, &key_b);
     let ids = {
         let _gateway = Gateway::start(&dir, &admin_url, &runtime_url);
         vec![demo(&dir, "r0"), demo(&dir, "r1")]

@@ -236,32 +236,6 @@ async fn call(
     (status, serde_json::from_str(&text).unwrap(), text)
 }
 
-/// The attester's public key, as an operator would hand it out: `praetore
-/// init` writes the secret (`evidence-attester.key`), and the public key is
-/// derived from it.
-fn attester_pin(dir: &Path, root: &Path) -> PathBuf {
-    let secret: [u8; 32] = hex::decode(
-        fs::read_to_string(dir.join("evidence-attester.key"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let pin = root.join("attester-public-key.hex");
-    fs::write(
-        &pin,
-        hex::encode(
-            praetore_core::EvidenceAttesterKey::from_secret_bytes(&secret)
-                .public_key()
-                .unwrap()
-                .as_bytes(),
-        ) + "\n",
-    )
-    .unwrap();
-    pin
-}
-
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() {
@@ -290,7 +264,9 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
     // The policy the gateway loads and the attester's public key: what the
     // console checks the journal evidence against before offering a
     // decision.
-    let pin = attester_pin(&dir, &root);
+    // The attester pin `praetore init` wrote, as an operator would hand it out.
+    let pin = root.join("attester-public-key.hex");
+    fs::copy(dir.join("attester-public-key.hex"), &pin).unwrap();
     let trust =
         EvidenceTrust::load(&dir.join("policy.json"), std::slice::from_ref(&pin), None).unwrap();
 
@@ -609,7 +585,9 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         serde_json::from_slice(&fs::read(dir.join("policy.json")).unwrap()).unwrap();
     policy["rules"][0]["effect"] = "RequireApproval".into();
     fs::write(dir.join("policy.json"), policy.to_string()).unwrap();
-    let pin = attester_pin(&dir, &root);
+    // The attester pin `praetore init` wrote, as an operator would hand it out.
+    let pin = root.join("attester-public-key.hex");
+    fs::copy(dir.join("attester-public-key.hex"), &pin).unwrap();
     // D3.1: the execution and approver pins `praetore init` wrote, as an
     // operator would hand them out. The execution pin names the key id
     // `praetore run` signs with.

@@ -184,6 +184,15 @@
 
 ### Added
 
+- **`praetore init` writes `attester-public-key.hex`; `praetore
+  attester-pin`.** `init` also writes the evidence attester's public key,
+  64 lowercase hex characters (the `--attester-pin` format of `praetore
+  journal-export`), next to `evidence-attester.key`. The console's
+  `PRAETORE_CONSOLE_ATTESTER_PIN_FILES` and `praetore journal-export
+  --attester-pin` take it. `praetore attester-pin <directory>` writes it
+  for a directory initialized before: it reads `evidence-attester.key`
+  itself, fails without it, and never overwrites. No secret file changes.
+
 - **`praetore-verify journal` reports an unanchored head (T-016).** Without
   `--expected-head` it reports the `head_not_anchored` warning, on stderr
   and in `details.warnings`, as `safety-journal` does: a truncated or

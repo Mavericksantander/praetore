@@ -136,6 +136,16 @@ it:
 praetore execution-pin ./praetore-local   # reads execution-attester.key itself; never overwrites
 ```
 
+`init` also writes `attester-public-key.hex`: the public key of the evidence
+attester that signs the journal receipts, 64 lowercase hex characters (no
+secret). The console's `PRAETORE_CONSOLE_ATTESTER_PIN_FILES` and
+`praetore journal-export --attester-pin` take it. For a directory
+initialized before `init` wrote it:
+
+```sh
+praetore attester-pin ./praetore-local    # reads evidence-attester.key itself; never overwrites
+```
+
 When a policy rule has effect `RequireApproval`, `praetore demo` returns
 `requires_approval` / `not_dispatched` and prints the commands to resolve it:
 
