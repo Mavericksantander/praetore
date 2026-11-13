@@ -16,6 +16,10 @@ function cabeceras(extra) {
   return extra ? Object.assign(base, extra) : base;
 }
 
+function olvidarSiCaduco(response) {
+  if (response.status === 401) sessionStorage.removeItem(LLAVE_SESION);
+}
+
 function codigoDelHash() {
   const marca = "#abrir=";
   const hash = window.location.hash || "";
@@ -29,6 +33,7 @@ async function abrirSesion(codigo) {
       headers: { "x-praetore-consola": "1", "content-type": "application/json" },
       body: JSON.stringify({ codigo }),
     });
+    olvidarSiCaduco(response);
     if (!response.ok) return false;
     const data = await response.json();
     if (data && typeof data.token === "string") {
@@ -116,6 +121,7 @@ async function cargar() {
     estado.textContent = "No se pudo leer el registro.";
     return;
   }
+  olvidarSiCaduco(response);
   if (response.status === 401) {
     estado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
     return;
@@ -143,6 +149,7 @@ async function abrir(numero) {
     estado.textContent = "No se pudo abrir el recibo.";
     return;
   }
+  olvidarSiCaduco(response);
   if (!response.ok) {
     estado.textContent = "No se pudo abrir el recibo.";
     return;
@@ -190,6 +197,7 @@ async function actuar(referencia, accion) {
   } catch (_error) {
     return { situacion: "sin cambios", mensaje: "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.", puede_ejecutar: accion === "ejecutar" };
   }
+  olvidarSiCaduco(response);
   let data = null;
   try {
     data = await response.json();
@@ -378,6 +386,7 @@ async function cargarBandeja() {
     bandejaEstado.textContent = "No se pudo leer la bandeja.";
     return;
   }
+  olvidarSiCaduco(response);
   let data = null;
   try {
     data = await response.json();
@@ -427,6 +436,7 @@ async function descargarPaquete() {
       estadoPaquete.textContent = "No se pudo pedir el paquete.";
       return;
     }
+    olvidarSiCaduco(response);
     if (response.status === 401) {
       estadoPaquete.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
       return;
@@ -461,6 +471,7 @@ async function estadoPaquete() {
   let data = null;
   try {
     const response = await fetch("/api/paquete/estado", { headers: cabeceras() });
+    olvidarSiCaduco(response);
     if (response.ok) data = await response.json();
   } catch (_error) {
     data = null;

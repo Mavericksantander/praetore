@@ -1130,6 +1130,7 @@ mod tests {
         assert!(html.contains(NOTICE));
         assert!(html.contains("pendiente de aprobación"));
         assert!(html.contains("aprobado, pendiente de ejecución"));
+        assert!(!html.to_lowercase().contains("bearer"));
         assert!(!html.contains("password"));
         assert!(!html.contains("RFC"));
         assert!(!html.contains("UUID"));
@@ -1154,6 +1155,7 @@ mod tests {
         // sent as Authorization, never in localStorage or a cookie.
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("Authorization"));
+        assert!(script.contains("history.replaceState"));
         assert!(!script.contains("localStorage"));
         assert!(!script.contains("praetore_consola"));
         assert!(!script.contains("document.cookie"));
@@ -1208,6 +1210,56 @@ mod tests {
         .router();
         let stale = restarted.oneshot(read_with_token(&token)).await.unwrap();
         assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_opening_leaves_the_code_live() {
+        let state = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        );
+        let link = state.issue_opening_link().unwrap();
+        let code = link.split_once("/#abrir=").unwrap().1.to_owned();
+        let app = state.router();
+        let attempt = |origin: Option<&str>, marker: bool| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .header(header::HOST, "127.0.0.1:8090")
+                .header(header::CONTENT_TYPE, "application/json")
+                .uri("/api/sesion");
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            if marker {
+                builder = builder.header(ACTION_HEADER, "1");
+            }
+            builder
+                .body(Body::from(format!("{{\"codigo\":\"{code}\"}}")))
+                .unwrap()
+        };
+        let missing_origin = app.clone().oneshot(attempt(None, true)).await.unwrap();
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+        let foreign = app
+            .clone()
+            .oneshot(attempt(Some("http://127.0.0.1:1"), true))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        let missing_marker = app
+            .clone()
+            .oneshot(attempt(Some("http://127.0.0.1:8090"), false))
+            .await
+            .unwrap();
+        assert_eq!(missing_marker.status(), StatusCode::FORBIDDEN);
+        // same_page runs before redeem, so these refusals leave the code live.
+        let opened = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_text(opened).await).unwrap();
+        assert_eq!(body["token"].as_str().unwrap().len(), 64);
     }
 
     #[tokio::test]
@@ -1396,6 +1448,22 @@ mod tests {
         let text = body_text(missing).await;
         assert!(text.contains("este computador"));
         assert!(!text.to_lowercase().contains("bearer"));
+        // A cookie carrying the live token, with no Authorization header, is
+        // refused: there is no ambient cookie path.
+        let live = hex::encode([0x11; 32]);
+        let cookie_only = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .uri("/api/historial")
+                    .header(header::COOKIE, format!("praetore_consola={live}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
         // A bearer token that this run never minted is refused.
         let wrong = app
             .oneshot(

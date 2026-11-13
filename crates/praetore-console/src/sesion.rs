@@ -60,7 +60,8 @@ impl LocalSession {
         Ok(Self::new())
     }
 
-    /// Seeds the store with a known token. Tests only.
+    /// Seeds the store with one known token, live at the current time.
+    #[doc(hidden)]
     pub fn from_secret(secret: [u8; 32]) -> Self {
         let session = Self::new();
         if let Ok(mut tokens) = session.tokens.lock() {
@@ -102,12 +103,6 @@ impl LocalSession {
             matched |= bool::from(token.value.as_slice().ct_eq(offered.as_slice()));
         }
         matched
-    }
-
-    /// The first live token as hex, for tests. Empty-store returns zeros.
-    pub fn token_value(&self) -> String {
-        let tokens = self.tokens.lock().expect("token lock");
-        hex::encode(tokens.first().map(|token| token.value).unwrap_or([0u8; 32]))
     }
 }
 
