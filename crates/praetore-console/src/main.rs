@@ -92,9 +92,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         inbox.is_some(),
         env::var_os(POLICY_VARIABLE).as_deref(),
         env::var_os(PINS_VARIABLE).as_deref(),
-    )?;
+    )
+    .map_err(|error| error.to_string())?;
     let pack = pack_settings()?;
-    let trust = trust_settings(inbox.as_ref().map(|(_, signer)| signer))?;
+    let trust = trust_settings(inbox.as_ref().map(|(_, signer)| signer))
+        .map_err(|error| error.to_string())?;
 
     let mut client = database.connect().map_err(|_| "no se pudo abrir la base")?;
     let options = RuntimeRoleOptions::from_config(|name| env::var(name).ok())?;
@@ -120,6 +122,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             tracing::info!("bandeja de aprobaciones activa");
         }
+        // Defensive: `require_for_inbox` already refused an inbox without
+        // the policy and the pins, so this arm is not reached.
         (Some(_), None) => {
             return Err(
                 "la bandeja de aprobaciones necesita la política y los pins del atestador".into(),

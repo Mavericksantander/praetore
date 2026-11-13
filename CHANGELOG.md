@@ -232,10 +232,11 @@
   this computer, as `praetore approve` does, only after it checks that the
   gateway challenge is the one rebuilt from the journal evidence it read;
   it checks that evidence against the attester pins and the local policy
-  (see Changed). The gateway verifies, records and dispatches. The browser gets opaque
-  references, never keys, journal ids or raw evidence. Actions need the
-  console's own `Origin` and an `x-praetore-consola` header besides the
-  session cookie. A partial set of the four variables is a startup error;
+  (see Changed). The gateway verifies, records and dispatches. The browser
+  gets opaque references, never keys, journal ids or raw evidence.
+  Actions need the console's own `Origin` and an `x-praetore-consola`
+  header besides the session cookie. A partial set of the four variables
+  is a startup error;
   none of them leaves the console without the inbox (history only). The
   gateway API is unchanged. Limit: a process running as the same operating
   system user as the console can read `approver.key` (and the token file)
@@ -399,7 +400,11 @@
   once, at startup: a change takes effect on restart. After a policy
   change, requests held under the earlier policy are no longer offered in
   the inbox; `praetore approve` and `praetore reject` still decide them.
-  The compliance package is unchanged.
+  With the policy and the pins but no inbox (package only), the console
+  now reads those files at startup and does not start if one cannot be
+  read, is a symlink or is not a regular file; before, they were first
+  read at download, and the download still follows symlinks. The package
+  download is otherwise unchanged.
 
 - **`praetore-console` keeps its session per tab.** The opening link is now
   `http://<bind>/#abrir=<code>`; the page redeems the code once over
