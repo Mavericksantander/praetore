@@ -1,7 +1,8 @@
-//! Local session: a secret held only in this process that the browser
-//! stores as an HttpOnly cookie, and the single-use opening link that hands
-//! it out. The secret is new on every start, so a cookie from an earlier run
-//! stops working, and nothing is written to disk.
+//! Local session: a bearer token minted in this process and handed out once
+//! by the single-use opening link. The browser keeps it in `sessionStorage`,
+//! scoped to the opening tab's origin, and sends it as `Authorization:
+//! Bearer`. No ambient session cookie is used. A request without a live token
+//! is refused. Tokens expire, and the opening code is single use.
 
 use std::{
     fs,
@@ -11,13 +12,26 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
-pub const COOKIE_NAME: &str = "praetore_consola";
+/// A minted session token is valid for at most this long; an older one is
+/// refused (the session expires). Each opening mints a fresh token, so in
+/// practice the session also rotates.
+pub const SESSION_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// The longest an opening link is valid.
 pub const MAX_OPENING_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// At most this many live tokens at once; the oldest drops first. Bounds
+/// memory and lets a couple of re-opens coexist without unbounded growth.
+const MAX_LIVE_TOKENS: usize = 8;
+
+struct Live {
+    value: [u8; 32],
+    issued: Instant,
+}
+
 pub struct LocalSession {
-    secret: [u8; 32],
+    ttl: Duration,
+    tokens: Mutex<Vec<Live>>,
 }
 
 impl std::fmt::Debug for LocalSession {
@@ -26,57 +40,88 @@ impl std::fmt::Debug for LocalSession {
     }
 }
 
+impl Default for LocalSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LocalSession {
-    pub fn from_secret(secret: [u8; 32]) -> Self {
-        Self { secret }
+    pub fn new() -> Self {
+        Self {
+            ttl: SESSION_TTL,
+            tokens: Mutex::new(Vec::new()),
+        }
     }
 
-    /// A fresh secret for this run only.
+    /// A session with no secret kept on disk. The store starts empty: a token
+    /// only exists after the opening link is redeemed.
     pub fn random() -> Result<Self, SessionError> {
-        Ok(Self {
-            secret: random_bytes()?,
-        })
+        Ok(Self::new())
     }
 
-    pub fn cookie_header(&self) -> String {
-        format!(
-            "{COOKIE_NAME}={}; HttpOnly; SameSite=Strict; Path=/",
-            self.cookie_value()
-        )
+    /// Seeds the store with one known token, live at the current time.
+    #[doc(hidden)]
+    pub fn from_secret(secret: [u8; 32]) -> Self {
+        let session = Self::new();
+        if let Ok(mut tokens) = session.tokens.lock() {
+            tokens.push(Live {
+                value: secret,
+                issued: Instant::now(),
+            });
+        }
+        session
     }
 
-    pub fn cookie_value(&self) -> String {
-        hex::encode(self.secret)
+    /// Mints a fresh single session token, drops expired ones, and returns it
+    /// as hex. Called only when a live opening code is redeemed.
+    pub fn issue(&self) -> Option<String> {
+        let value = random_bytes()?;
+        let mut tokens = self.tokens.lock().ok()?;
+        let now = Instant::now();
+        tokens.retain(|token| now.duration_since(token.issued) < self.ttl);
+        if tokens.len() >= MAX_LIVE_TOKENS {
+            tokens.remove(0);
+        }
+        tokens.push(Live { value, issued: now });
+        Some(hex::encode(value))
     }
 
-    pub fn accepts(&self, cookie_header: Option<&str>) -> bool {
-        let Some(header) = cookie_header else {
+    /// True when the `Authorization` header carries a live, non-expired token
+    /// minted by this process. No cookie is read.
+    pub fn accepts(&self, authorization: Option<&str>) -> bool {
+        let Some(offered) = authorization.and_then(parse_bearer) else {
             return false;
         };
-        if header.len() > 4096 {
+        let Ok(mut tokens) = self.tokens.lock() else {
             return false;
+        };
+        let now = Instant::now();
+        tokens.retain(|token| now.duration_since(token.issued) < self.ttl);
+        let mut matched = false;
+        for token in tokens.iter() {
+            matched |= bool::from(token.value.as_slice().ct_eq(offered.as_slice()));
         }
-        for part in header.split(';') {
-            let Some((name, value)) = part.trim().split_once('=') else {
-                continue;
-            };
-            if name.trim() != COOKIE_NAME {
-                continue;
-            }
-            let value = value.trim();
-            if value.len() != 64 {
-                return false;
-            }
-            let Ok(bytes) = hex::decode(value) else {
-                return false;
-            };
-            let Ok(bytes) = <[u8; 32]>::try_from(bytes) else {
-                return false;
-            };
-            return bool::from(bytes.as_slice().ct_eq(self.secret.as_slice()));
-        }
-        false
+        matched
     }
+}
+
+/// Parses `Authorization: Bearer <64 hex>` into 32 bytes. Rejects anything
+/// else, including an over-long header.
+fn parse_bearer(header: &str) -> Option<[u8; 32]> {
+    if header.len() > 4096 {
+        return None;
+    }
+    let (scheme, value) = header.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let value = value.trim();
+    if value.len() != 64 {
+        return None;
+    }
+    let bytes = hex::decode(value).ok()?;
+    <[u8; 32]>::try_from(bytes).ok()
 }
 
 #[derive(Debug)]
@@ -94,13 +139,11 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
-pub(crate) fn random_bytes() -> Result<[u8; 32], SessionError> {
+pub(crate) fn random_bytes() -> Option<[u8; 32]> {
     let mut secret = [0u8; 32];
-    let mut source = fs::File::open("/dev/urandom").map_err(|_| SessionError::Io)?;
-    source
-        .read_exact(&mut secret)
-        .map_err(|_| SessionError::Io)?;
-    Ok(secret)
+    let mut source = fs::File::open("/dev/urandom").ok()?;
+    source.read_exact(&mut secret).ok()?;
+    Some(secret)
 }
 
 /// The opening link's code: single use, valid for at most five minutes.
@@ -154,13 +197,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_new_run_has_a_new_cookie() {
-        let first = LocalSession::random().unwrap();
-        let second = LocalSession::random().unwrap();
-        let header = format!("{COOKIE_NAME}={}", first.cookie_value());
-        assert!(first.accepts(Some(&header)));
-        assert!(!second.accepts(Some(&header)));
-        assert!(!second.accepts(None));
+    fn a_minted_token_is_accepted_and_a_foreign_one_is_not() {
+        let session = LocalSession::new();
+        assert!(!session.accepts(None));
+        let token = session.issue().unwrap();
+        let header = format!("Bearer {token}");
+        assert!(session.accepts(Some(&header)));
+        // A token minted by another process (another store) does not match.
+        let other = LocalSession::new();
+        let other_token = other.issue().unwrap();
+        assert!(!session.accepts(Some(&format!("Bearer {other_token}"))));
+        // No token at all, or a cookie, is refused.
+        assert!(!session.accepts(Some("Bearer")));
+        assert!(!session.accepts(Some(&format!("praetore_consola={token}"))));
+    }
+
+    #[test]
+    fn an_expired_token_is_refused() {
+        let session = LocalSession {
+            ttl: Duration::ZERO,
+            tokens: Mutex::new(Vec::new()),
+        };
+        let token = session.issue().unwrap();
+        assert!(!session.accepts(Some(&format!("Bearer {token}"))));
     }
 
     #[test]

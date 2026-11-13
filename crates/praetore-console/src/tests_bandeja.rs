@@ -283,15 +283,15 @@ fn console(items: Vec<PendingFacts>, unreadable: u32, gateway: Arc<FakeGateway>)
     .router()
 }
 
-fn cookie() -> String {
-    format!("{}={}", sesion::COOKIE_NAME, hex::encode([0x11; 32]))
+fn auth() -> String {
+    format!("Bearer {}", hex::encode([0x11; 32]))
 }
 
 fn get(uri: &str) -> Request<Body> {
     Request::builder()
         .header(header::HOST, "127.0.0.1:8090")
         .uri(uri)
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .body(Body::empty())
         .unwrap()
 }
@@ -301,7 +301,7 @@ fn post(uri: &str) -> Request<Body> {
         .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri(uri)
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .header(header::ORIGIN, ORIGIN)
         .header(ACTION_HEADER, "1")
         .header("sec-fetch-site", "same-origin")
@@ -643,7 +643,7 @@ async fn actions_need_the_console_page_and_a_known_reference() {
             .header(header::HOST, "127.0.0.1:8090")
             .method("POST")
             .uri(&uri)
-            .header(header::COOKIE, cookie());
+            .header(header::AUTHORIZATION, auth());
         if let Some(origin) = origin {
             request = request.header(header::ORIGIN, origin);
         }
@@ -676,7 +676,7 @@ async fn actions_need_the_console_page_and_a_known_reference() {
         .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri("/api/bandeja/abcdefghjkmnpqrstuvw/aprobar")
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .header(header::ORIGIN, "http://localhost:8090")
         .header(ACTION_HEADER, "1")
         .body(Body::empty())
@@ -892,7 +892,9 @@ async fn another_host_name_reads_nothing() {
         Some("localhost:8091"),
     ] {
         for uri in ["/", "/api/bandeja", "/api/historial"] {
-            let mut request = Request::builder().uri(uri).header(header::COOKIE, cookie());
+            let mut request = Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, auth());
             if let Some(host) = host {
                 request = request.header(header::HOST, host);
             }
@@ -912,7 +914,7 @@ async fn another_host_name_reads_nothing() {
     let localhost = Request::builder()
         .uri("/api/bandeja")
         .header(header::HOST, "localhost:8090")
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .body(Body::empty())
         .unwrap();
     assert_eq!(

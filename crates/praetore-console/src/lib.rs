@@ -71,9 +71,8 @@ pub struct ConsoleState {
     /// `http://host:port` values a mutating request may come from.
     origins: Vec<String>,
     /// Code of the opening link printed in the terminal: single use, five
-    /// minutes at most. The session cookie is handed out only to a request
-    /// that carries it, so another local process that just asks for the
-    /// page gets no cookie.
+    /// minutes at most. It travels in the URL fragment and is redeemed once
+    /// for a session token (see `open_session`).
     opener: sesion::Opener,
     /// Where opening links go: the console's stderr by default.
     printer: Arc<dyn Fn(&str) + Send + Sync>,
@@ -232,7 +231,7 @@ impl ConsoleState {
     }
 
     fn link_for(&self, code: String) -> String {
-        format!("http://{}/?abrir={code}", self.address)
+        format!("http://{}/#abrir={code}", self.address)
     }
 
     pub fn with_inbox(mut self, inbox: Inbox) -> Self {
@@ -264,11 +263,15 @@ impl ConsoleState {
                 Arc::clone(&state),
                 require_session,
             ));
+        // Redeeming the opening code mints the session token; it must run
+        // without a token (it is how the page gets one), so it sits outside
+        // the require_session layer but still under require_own_host.
+        let open = Router::new().route("/sesion", post(open_session));
         Router::new()
             .route("/", get(index))
             .route("/app.js", get(app_js))
             .route("/styles.css", get(app_css))
-            .nest("/api", api)
+            .nest("/api", api.merge(open))
             .layer(middleware::from_fn_with_state(
                 Arc::clone(&state),
                 require_own_host,
@@ -282,11 +285,11 @@ async fn require_session(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let cookie = request
+    let authorization = request
         .headers()
-        .get(header::COOKIE)
+        .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    if !state.session.accepts(cookie) {
+    if !state.session.accepts(authorization) {
         return api_message(
             StatusCode::UNAUTHORIZED,
             "Hay que abrir esta página en este computador.",
@@ -323,8 +326,7 @@ pub const ACTION_HEADER: &str = "x-praetore-consola";
 
 /// A mutation must come from the console's own page: exact `Origin`, the
 /// action header, and, when the browser sends it, `Sec-Fetch-Site:
-/// same-origin`. The cookie alone is not enough: another local port is the
-/// same site for `SameSite=Strict`.
+/// same-origin`. This runs on top of the session token (`require_session`).
 fn same_page(state: &ConsoleState, headers: &HeaderMap) -> bool {
     let single = |name: &str| {
         let mut values = headers.get_all(name).iter();
@@ -717,33 +719,56 @@ fn storage_error(error: HistoryError) -> Response {
     )
 }
 
-#[derive(serde::Deserialize)]
-struct OpenQuery {
-    abrir: Option<String>,
+/// The page holds no secret. The opening code travels in the URL fragment
+/// (`#abrir=`), which the browser never sends to the server; the page reads
+/// it and redeems it over `POST /api/sesion`. Asking for the page never
+/// issues a link: only the operator does (see `issue_opening_link`).
+async fn index() -> Response {
+    static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML)
 }
 
-/// The page itself holds no secret. The session cookie is set only when the
-/// request carries a live opening code, which is then consumed; the browser
-/// is sent to `/` so the code leaves the address bar. Asking for the page
-/// never issues a link: only the operator does (see `issue_opening_link`).
-async fn index(
+#[derive(serde::Deserialize)]
+struct OpenRequest {
+    codigo: String,
+}
+
+#[derive(Serialize)]
+struct OpenReply {
+    token: String,
+}
+
+/// Redeems the single-use opening code and mints the session token, returned
+/// once in the body for the page to keep in `sessionStorage`. No cookie is
+/// set. It must come from the console's own page (`Origin`, the action
+/// header, and `Sec-Fetch-Site` when the browser sends it).
+async fn open_session(
     State(state): State<Arc<ConsoleState>>,
-    query: Result<Query<OpenQuery>, QueryRejection>,
+    headers: HeaderMap,
+    payload: Result<Json<OpenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    let offered = query.ok().and_then(|Query(query)| query.abrir);
-    let Some(offered) = offered else {
-        return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+    if !same_page(&state, &headers) {
+        return api_message(
+            StatusCode::FORBIDDEN,
+            "La apertura solo se pide desde la página de esta consola.",
+        );
+    }
+    let Ok(Json(payload)) = payload else {
+        return api_message(StatusCode::BAD_REQUEST, "No se entiende la apertura.");
     };
-    if !state.opener.redeem(&offered) {
+    if payload.codigo.len() > 128 || !state.opener.redeem(&payload.codigo) {
         tracing::warn!(failure = "opening_code", "console opening link refused");
-        return static_response(StatusCode::OK, "text/html; charset=utf-8", INDEX_HTML);
+        return api_message(
+            StatusCode::UNAUTHORIZED,
+            "El enlace de apertura no es válido o ya se usó.",
+        );
     }
-    let mut response = (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
-    set_security_headers(response.headers_mut());
-    if let Ok(cookie) = HeaderValue::from_str(&state.session.cookie_header()) {
-        response.headers_mut().insert(header::SET_COOKIE, cookie);
-    }
-    response
+    let Some(token) = state.session.issue() else {
+        return api_message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "No se pudo abrir la sesión local.",
+        );
+    };
+    api_json(StatusCode::OK, OpenReply { token })
 }
 
 async fn app_js() -> Response {
@@ -960,8 +985,8 @@ mod tests {
             .header(header::HOST, "127.0.0.1:8090")
             .uri(uri)
             .header(
-                header::COOKIE,
-                format!("{}={}", sesion::COOKIE_NAME, hex::encode([0x11; 32])),
+                header::AUTHORIZATION,
+                format!("Bearer {}", hex::encode([0x11; 32])),
             )
             .body(Body::empty())
             .unwrap()
@@ -1019,8 +1044,20 @@ mod tests {
         assert!(validate_bind_address("0.0.0.0:8090".parse().unwrap()).is_err());
     }
 
+    fn open_request(code: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(header::ORIGIN, "http://127.0.0.1:8090")
+            .header(ACTION_HEADER, "1")
+            .header(header::CONTENT_TYPE, "application/json")
+            .uri("/api/sesion")
+            .body(Body::from(format!("{{\"codigo\":\"{code}\"}}")))
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn the_page_does_not_ask_for_a_token_and_sets_a_local_cookie() {
+    async fn the_page_hands_out_a_token_from_the_hash_link_only_once() {
         let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = printed.clone();
         let state = ConsoleState::new(
@@ -1028,14 +1065,16 @@ mod tests {
                 receipts: Vec::new(),
                 reads: AtomicUsize::new(0),
             }),
-            session(),
+            LocalSession::random().unwrap(),
             HashMap::new(),
         )
         .with_link_printer(move |link| sink.lock().unwrap().push(link.to_owned()));
         let link = state.issue_opening_link().unwrap();
         assert_eq!(*printed.lock().unwrap(), vec![link.clone()]);
-        let code = link.split_once("?abrir=").unwrap().1.to_owned();
-        assert!(link.starts_with("http://127.0.0.1:8090/?abrir="));
+        // The code travels in the URL fragment, never the query string.
+        let code = link.split_once("/#abrir=").unwrap().1.to_owned();
+        assert!(link.starts_with("http://127.0.0.1:8090/#abrir="));
+        assert!(!link.contains("?abrir="));
         assert!(Uuid::parse_str(&code).is_err());
         assert!(!code.bytes().all(|byte| byte.is_ascii_hexdigit()));
         let app = state.router();
@@ -1046,47 +1085,46 @@ mod tests {
                 .body(Body::empty())
                 .unwrap()
         };
-        // Asking for the page is not enough to get the session, and the
-        // live link is not replaced.
-        for uri in [
-            "/".to_owned(),
-            "/?abrir=otro".to_owned(),
-            format!("/?abrir={code}x"),
-        ] {
+        // Asking for the page never sets a cookie: there is no session cookie.
+        for uri in ["/".to_owned(), "/?abrir=otro".to_owned()] {
             let plain = app.clone().oneshot(page(uri.clone())).await.unwrap();
             assert_eq!(plain.status(), StatusCode::OK, "{uri}");
             assert!(plain.headers().get(header::SET_COOKIE).is_none(), "{uri}");
         }
-        assert_eq!(printed.lock().unwrap().len(), 1);
-        let opened = app
+        // A wrong code is refused and no token comes back.
+        let wrong = app
             .clone()
-            .oneshot(page(format!("/?abrir={code}")))
+            .oneshot(open_request(&format!("{code}x")))
             .await
             .unwrap();
-        assert_eq!(opened.status(), StatusCode::SEE_OTHER);
-        assert_eq!(opened.headers().get(header::LOCATION).unwrap(), "/");
-        let cookie = opened
-            .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        assert!(cookie.contains("HttpOnly"));
-        assert!(cookie.contains("SameSite=Strict"));
-        let secret = hex::encode([0x11; 32]);
-        assert!(cookie.contains(&secret));
-        // The link works once.
-        let again = app
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        // Redeeming the real code once mints a token; no cookie is set.
+        let opened = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        assert!(opened.headers().get(header::SET_COOKIE).is_none());
+        let body: Value = serde_json::from_str(&body_text(opened).await).unwrap();
+        let token = body["token"].as_str().unwrap().to_owned();
+        assert_eq!(token.len(), 64);
+        // The token works for a read.
+        let read = app
             .clone()
-            .oneshot(page(format!("/?abrir={code}")))
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .uri("/api/historial")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(again.status(), StatusCode::OK);
-        assert!(again.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(read.status(), StatusCode::OK);
+        // The code is single use: a second redemption yields nothing.
+        let again = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
         let response = app.clone().oneshot(page("/".to_owned())).await.unwrap();
         let html = body_text(response).await;
-        assert!(!html.contains(&secret));
+        assert!(!html.contains(&token));
         assert!(html.contains("Historial"));
         assert!(html.contains("Bandeja"));
         assert!(html.contains(NOTICE));
@@ -1113,13 +1151,27 @@ mod tests {
         let script = body_text(script).await;
         assert!(!script.contains("innerHTML"));
         assert!(script.contains(ACTION_HEADER));
+        // The token is kept in sessionStorage (per-origin, port included),
+        // sent as Authorization, never in localStorage or a cookie.
+        assert!(script.contains("sessionStorage"));
+        assert!(script.contains("Authorization"));
+        assert!(script.contains("history.replaceState"));
         assert!(!script.contains("localStorage"));
-        assert!(!script.contains(&secret));
-        assert!(!script.contains(sesion::COOKIE_NAME));
+        assert!(!script.contains("praetore_consola"));
+        assert!(!script.contains("document.cookie"));
+    }
+
+    fn read_with_token(token: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .uri("/api/historial")
+            .body(Body::empty())
+            .unwrap()
     }
 
     #[tokio::test]
-    async fn an_expired_link_is_refused_and_a_restart_drops_the_old_cookie() {
+    async fn an_expired_link_mints_no_token_and_tokens_do_not_cross_runs() {
         let printed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = printed.clone();
         let first = ConsoleState::new(
@@ -1135,33 +1187,18 @@ mod tests {
         let expired = first.issue_opening_link().unwrap();
         let first = Arc::new(first);
         let app = ConsoleState::router_from(Arc::clone(&first));
-        let request = |uri: &str, cookie: Option<&str>| {
-            let mut builder = Request::builder()
-                .header(header::HOST, "127.0.0.1:8090")
-                .uri(uri);
-            if let Some(cookie) = cookie {
-                builder = builder.header(header::COOKIE, cookie);
-            }
-            builder.body(Body::empty()).unwrap()
-        };
-        let path = expired.split_once("8090").unwrap().1.to_owned();
-        let refused = app.clone().oneshot(request(&path, None)).await.unwrap();
-        assert_eq!(refused.status(), StatusCode::OK);
+        let code = expired.split_once("/#abrir=").unwrap().1.to_owned();
+        // The opening link already expired: redeeming it mints no token.
+        let refused = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
         assert!(refused.headers().get(header::SET_COOKIE).is_none());
-        // Asking for the page never issues a link; nothing reaches the page.
-        let plain = app.clone().oneshot(request("/", None)).await.unwrap();
-        assert!(plain.headers().get(header::SET_COOKIE).is_none());
         assert_eq!(printed.lock().unwrap().len(), 1);
-        assert!(!body_text(refused).await.contains("abrir="));
 
-        // A cookie from one run does not open the next one.
-        let old_cookie = format!("{}={}", sesion::COOKIE_NAME, first.session.cookie_value());
-        let ok = app
-            .clone()
-            .oneshot(request("/api/historial", Some(&old_cookie)))
-            .await
-            .unwrap();
+        // A token minted in this run opens this run.
+        let token = first.session.issue().unwrap();
+        let ok = app.clone().oneshot(read_with_token(&token)).await.unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
+        // That same token does not open a fresh run (a new, independent store).
         let restarted = ConsoleState::new(
             Arc::new(MemoryHistory {
                 receipts: Vec::new(),
@@ -1171,11 +1208,58 @@ mod tests {
             HashMap::new(),
         )
         .router();
-        let stale = restarted
-            .oneshot(request("/api/historial", Some(&old_cookie)))
+        let stale = restarted.oneshot(read_with_token(&token)).await.unwrap();
+        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_opening_leaves_the_code_live() {
+        let state = ConsoleState::new(
+            Arc::new(MemoryHistory {
+                receipts: Vec::new(),
+                reads: AtomicUsize::new(0),
+            }),
+            LocalSession::random().unwrap(),
+            HashMap::new(),
+        );
+        let link = state.issue_opening_link().unwrap();
+        let code = link.split_once("/#abrir=").unwrap().1.to_owned();
+        let app = state.router();
+        let attempt = |origin: Option<&str>, marker: bool| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .header(header::HOST, "127.0.0.1:8090")
+                .header(header::CONTENT_TYPE, "application/json")
+                .uri("/api/sesion");
+            if let Some(origin) = origin {
+                builder = builder.header(header::ORIGIN, origin);
+            }
+            if marker {
+                builder = builder.header(ACTION_HEADER, "1");
+            }
+            builder
+                .body(Body::from(format!("{{\"codigo\":\"{code}\"}}")))
+                .unwrap()
+        };
+        let missing_origin = app.clone().oneshot(attempt(None, true)).await.unwrap();
+        assert_eq!(missing_origin.status(), StatusCode::FORBIDDEN);
+        let foreign = app
+            .clone()
+            .oneshot(attempt(Some("http://127.0.0.1:1"), true))
             .await
             .unwrap();
-        assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+        let missing_marker = app
+            .clone()
+            .oneshot(attempt(Some("http://127.0.0.1:8090"), false))
+            .await
+            .unwrap();
+        assert_eq!(missing_marker.status(), StatusCode::FORBIDDEN);
+        // same_page runs before redeem, so these refusals leave the code live.
+        let opened = app.clone().oneshot(open_request(&code)).await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&body_text(opened).await).unwrap();
+        assert_eq!(body["token"].as_str().unwrap().len(), 64);
     }
 
     #[tokio::test]
@@ -1328,8 +1412,8 @@ mod tests {
                         .method(method)
                         .uri(uri)
                         .header(
-                            header::COOKIE,
-                            format!("{}={}", sesion::COOKIE_NAME, hex::encode([0x11; 32])),
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", hex::encode([0x11; 32])),
                         )
                         .body(Body::from("{}"))
                         .unwrap(),
@@ -1346,7 +1430,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_api_requires_the_local_cookie() {
+    async fn the_api_requires_a_session_token() {
         let (app, store) = app(Vec::new());
         let missing = app
             .clone()
@@ -1364,15 +1448,29 @@ mod tests {
         let text = body_text(missing).await;
         assert!(text.contains("este computador"));
         assert!(!text.to_lowercase().contains("bearer"));
+        // A cookie carrying the live token, with no Authorization header, is
+        // refused: there is no ambient cookie path.
+        let live = hex::encode([0x11; 32]);
+        let cookie_only = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .header(header::HOST, "127.0.0.1:8090")
+                    .uri("/api/historial")
+                    .header(header::COOKIE, format!("praetore_consola={live}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cookie_only.status(), StatusCode::UNAUTHORIZED);
+        // A bearer token that this run never minted is refused.
         let wrong = app
             .oneshot(
                 Request::builder()
                     .header(header::HOST, "127.0.0.1:8090")
                     .uri("/api/historial")
-                    .header(
-                        header::COOKIE,
-                        format!("{}={}", sesion::COOKIE_NAME, "ab".repeat(32)),
-                    )
+                    .header(header::AUTHORIZATION, format!("Bearer {}", "ab".repeat(32)))
                     .body(Body::empty())
                     .unwrap(),
             )

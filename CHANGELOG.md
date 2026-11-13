@@ -382,6 +382,13 @@
 
 ### Changed
 
+- **`praetore-console` keeps its session per tab.** The opening link is now
+  `http://<bind>/#abrir=<code>`; the page redeems the code once over
+  `POST /api/sesion` and keeps the session token in `sessionStorage` for
+  that tab, sent as `Authorization: Bearer`. No session cookie is set. A
+  token expires after 12 hours and does not survive a restart; another tab
+  needs a new link. `PRAETORE_CONSOLE_*` variables are unchanged.
+
 - **Approval types moved to `praetore-receipt` (P-002 D3.1).**
   `ExecutionKey`, `ApprovalChallenge`, `HumanApprovalOutcome`,
   `HumanApprovalDecision`, `ExpiredOutcome`, `ApprovalExpiredReceipt` and
