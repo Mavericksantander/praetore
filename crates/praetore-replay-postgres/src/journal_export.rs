@@ -9,7 +9,10 @@
 use postgres::{Client, Transaction};
 use praetore_core::{
     Evidence, StorageRecord, VerifiedPublicKey,
-    journal_chain::{ChainExporter, ChainHead, DatabaseHead, MAX_CHAIN_ENTRIES},
+    journal_chain::{
+        ChainError, ChainExporter, ChainHead, ChainLink, DatabaseHead, MAX_CHAIN_ENTRIES,
+        receipt_link,
+    },
 };
 use praetore_receipt::{
     AttestedExecution, ExecutionAttestation, GatewayReceipt,
@@ -45,6 +48,118 @@ pub struct TenantExport {
 /// in an unspecified order, and two exports of the same journal could differ.
 pub const JOURNAL_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
      WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id LIMIT $2";
+
+/// [`JOURNAL_QUERY`] with no limit, read through a portal in batches: a
+/// range export reads the receipts before the range to compute its anchor,
+/// in the same order.
+const JOURNAL_RANGE_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
+     WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id";
+
+/// Rows fetched per round trip by a range export.
+const RANGE_BATCH: i32 = 512;
+
+/// One range of a tenant chain, as `praetore journal-export --tenant
+/// --from-seq N --limit M` writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantRange {
+    /// The JSONL file: for N > 0 the anchor (the receipt at `seq` N - 1)
+    /// first, then the range.
+    pub text: String,
+    /// The range's last link; `entries` counts from the chain's start.
+    pub head: ChainHead,
+    /// `seq` of the range's first receipt (N).
+    pub range_start: u64,
+    /// The anchor's link (the previous range's head); `None` when N is 0.
+    pub anchor: Option<ChainLink>,
+    /// Where the next range starts, or `None` at the end of the chain.
+    pub next_from_seq: Option<u64>,
+}
+
+/// One range of the tenant's chain of receipts, read in one read-only,
+/// repeatable-read snapshot, in the order of [`JOURNAL_QUERY`]. A range
+/// chains receipts only, from `seq` 0 for the first receipt: unlike
+/// [`export_tenant`], it carries no reference to the database chain, so
+/// that every range of one journal state is linked the same way however the
+/// database chain grows. The receipts before the range are read to compute
+/// the links up to the anchor (the receipt at `from_seq - 1`), whose full
+/// line opens the range. At most `max_entries` receipts (capped at
+/// [`MAX_CHAIN_ENTRIES`]) and [`praetore_core::journal_chain::MAX_CHAIN_BYTES`]
+/// per range, anchor included.
+pub fn export_tenant_range(
+    client: &mut Client,
+    tenant_id: Uuid,
+    attesters: &[VerifiedPublicKey],
+    from_seq: u64,
+    max_entries: usize,
+) -> ExportResult<TenantRange> {
+    let max_entries = max_entries.clamp(1, MAX_CHAIN_ENTRIES);
+    let mut transaction = export_transaction(client, tenant_id)?;
+    let portal = transaction.bind(JOURNAL_RANGE_QUERY, &[&tenant_id])?;
+    let mut seq = 0u64;
+    let mut prev = ChainLink::GENESIS;
+    let mut exporter = (from_seq == 0).then(|| ChainExporter::with_attesters(attesters));
+    let mut anchor = None;
+    let mut taken = 0usize;
+    let mut next_from_seq = None;
+    'rows: loop {
+        let rows = transaction.query_portal(&portal, RANGE_BATCH)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let json: String = row.get(0);
+            let evidence = Evidence::from_json(json.trim_end())
+                .map_err(|error| format!("receipt {seq}: {error}"))?;
+            if seq + 1 < from_seq {
+                // Before the anchor: only its link is needed.
+                prev = receipt_link(seq, &prev, &evidence)?;
+            } else if seq + 1 == from_seq {
+                exporter = Some(ChainExporter::resume_after(
+                    attesters, seq, prev, &evidence,
+                )?);
+                prev = receipt_link(seq, &prev, &evidence)?;
+                anchor = Some(prev);
+            } else {
+                let exporter = exporter.as_mut().ok_or("range export lost its exporter")?;
+                if taken == max_entries {
+                    next_from_seq = Some(seq);
+                    break 'rows;
+                }
+                match exporter.push(&evidence) {
+                    Ok(()) => taken += 1,
+                    // The size limit ends the range; the next one starts here.
+                    Err(ChainError::TooLarge) if taken > 0 => {
+                        next_from_seq = Some(seq);
+                        break 'rows;
+                    }
+                    Err(error) => return Err(format!("receipt {seq}: {error}").into()),
+                }
+            }
+            seq += 1;
+        }
+    }
+    drop(portal);
+    transaction.commit()?;
+    if from_seq > 0 && anchor.is_none() {
+        return Err(format!(
+            "tenant {tenant_id} has no receipt at seq {} to anchor the range",
+            from_seq - 1
+        )
+        .into());
+    }
+    if taken == 0 {
+        return Err(format!("tenant {tenant_id} has no receipt at or after seq {from_seq}").into());
+    }
+    let exporter = exporter.ok_or("range export has no exporter")?;
+    let (text, head) = exporter.finish()?;
+    Ok(TenantRange {
+        text,
+        head,
+        range_start: from_seq,
+        anchor,
+        next_from_seq,
+    })
+}
 
 /// Storage records in recording order (none before migration 0015).
 const STORAGE_RECORDS_QUERY: &str = "SELECT record_json FROM praetore.storage_records \
@@ -315,4 +430,19 @@ pub fn export_transaction(
         .start()?;
     crate::set_tenant_context(&mut transaction, tenant_id)?;
     Ok(transaction)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_range_reads_receipts_in_the_whole_export_s_order() {
+        let order = "ORDER BY created_at, request_id, agent_id";
+        assert!(JOURNAL_QUERY.contains(order));
+        assert_eq!(
+            JOURNAL_RANGE_QUERY,
+            JOURNAL_QUERY.strip_suffix(" LIMIT $2").unwrap()
+        );
+    }
 }

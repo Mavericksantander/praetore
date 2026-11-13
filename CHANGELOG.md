@@ -184,6 +184,20 @@
 
 ### Added
 
+- **Tenant journal in ranges.** `praetore journal-export --tenant` takes
+  `--from-seq N [--limit M]` and exports one range of the tenant's chain of
+  receipts, in the order of the whole export, printing `next_from_seq`.
+  Each range after the first starts with its anchor, the receipt at `seq`
+  N - 1, whose link is the head of the previous range.
+  `praetore-verify journal --range [--expected-anchor <head>]` verifies one
+  range (new in `praetore_core::journal_chain`: `verify_journal_range`,
+  `ChainExporter::resume_after`, `JournalReport::range`,
+  `ChainError::AnchorMismatch`). A whole tenant chain stays limited to 4096
+  entries and 8 MiB, and its format and the console's compliance package
+  are unchanged; when it is too large the export error names ranges.
+  Ranges carry no database reference, and an `evidence_id` repeated across
+  ranges is only detected by a whole-chain verification
+  (`docs/operations.md`).
 - **`praetore init` writes `attester-public-key.hex`; `praetore
   attester-pin`.** `init` also writes the evidence attester's public key,
   64 lowercase hex characters (the `--attester-pin` format of `praetore

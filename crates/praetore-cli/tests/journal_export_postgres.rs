@@ -713,3 +713,265 @@ fn postgres_cli_run_reports_a_port_in_use() {
     drop(taken);
     fs::remove_dir_all(&work).unwrap();
 }
+
+/// 10,000 signed receipts of one tenant, written straight to a throwaway
+/// database in groups of four that share a `created_at`. The whole-chain
+/// export refuses them (over 4096 entries) and names ranges; four ranges of
+/// at most 3,000 receipts verify chained with `--range --expected-anchor`,
+/// and the last head is the link of every receipt in `(created_at,
+/// request_id, agent_id)` order, so ties are broken the same way in every
+/// range. Prints the size of each table of the schema and the bytes per
+/// action (run with `--nocapture`).
+#[test]
+#[ignore = "requires PRAETORE_TEST_DATABASE_URL and a built praetore-verify"]
+fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
+    use praetore_core::{
+        Action, AgentId, AgentKeyPair, Authority, DecidedBy, Decision, Evidence,
+        EvidenceAttesterKey,
+        journal_chain::{ChainLink, receipt_link},
+    };
+    const RECEIPTS: usize = 10_000;
+    const LIMIT: u64 = 3_000;
+    let base_url = std::env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+    let scratch = ScratchDatabase::create(&base_url);
+    let runtime_url = provision(&scratch.url);
+    let work = fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("praetore-journal-ranges-{}", Uuid::new_v4()));
+    fs::create_dir(&work).unwrap();
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[67; 32]);
+    let pin = work.join("attester-public-key.hex");
+    write_pin(&pin, &attester);
+
+    let tenant = Uuid::new_v4();
+    let agent = AgentKeyPair::from_secret_bytes(&[68; 32]).identity(AgentId::new());
+    let agent_id = *agent.id.as_uuid();
+    let authority = Authority::new(agent.id.clone(), "ranges-test", vec!["demo:write".into()])
+        .with_constraint("tenant_id", tenant.to_string());
+    let base = time::OffsetDateTime::parse(
+        "2026-11-01T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let mut rows = Vec::with_capacity(RECEIPTS);
+    for index in 0..RECEIPTS {
+        let action = Action::new(
+            "demo:set_value",
+            Some("demo-state".into()),
+            serde_json::json!({ "key": format!("k{index}"), "value": index }),
+        )
+        .unwrap()
+        .with_capability("demo:write");
+        let mut evidence = Evidence::new_with_context(
+            Uuid::new_v4(),
+            agent.clone(),
+            authority.clone(),
+            action,
+            Decision::allow("allow-demo-set", DecidedBy::rule("allow-demo-set")),
+            None,
+            std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        evidence.bind_policy_digest("cd".repeat(32)).unwrap();
+        evidence.sign(&attester).unwrap();
+        // Four receipts per instant: the order between them is request_id.
+        let created_at = base + time::Duration::milliseconds((index / 4) as i64);
+        rows.push((created_at, evidence));
+    }
+    {
+        let mut admin = postgres::Client::connect(&scratch.url, postgres::NoTls).unwrap();
+        // Storage per table of the schema, before and after the receipts.
+        let sizes = |admin: &mut postgres::Client| -> Vec<(String, i64)> {
+            admin
+                .query(
+                    "SELECT c.relname::text, pg_total_relation_size(c.oid) \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = 'praetore' AND c.relkind = 'r' ORDER BY 1",
+                    &[],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect()
+        };
+        let before = sizes(&mut admin);
+        let mut transaction = admin.transaction().unwrap();
+        let claim = transaction
+            .prepare(
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3)",
+            )
+            .unwrap();
+        let journal = transaction
+            .prepare(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json, created_at, \
+                  updated_at) \
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                  $6::text::timestamptz, $6::text::timestamptz)",
+            )
+            .unwrap();
+        let digest = "ab".repeat(32);
+        for (created_at, evidence) in &rows {
+            let request = evidence.request_id;
+            let stamp = created_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            transaction
+                .execute(&claim, &[&tenant, &agent_id, &request])
+                .unwrap();
+            transaction
+                .execute(
+                    &journal,
+                    &[
+                        &tenant,
+                        &agent_id,
+                        &request,
+                        &digest,
+                        &evidence.to_json().unwrap(),
+                        &stamp,
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        admin.batch_execute("ANALYZE").unwrap();
+
+        let after = sizes(&mut admin);
+        let mut total = 0i64;
+        println!("pg_total_relation_size, growth for {RECEIPTS} receipts:");
+        for ((name, start), (_, end)) in before.iter().zip(&after) {
+            let grown = end - start;
+            total += grown;
+            if grown > 0 {
+                println!(
+                    "  praetore.{name}: {start} -> {end} bytes, +{grown} ({} bytes per action)",
+                    grown / RECEIPTS as i64
+                );
+            }
+        }
+        println!(
+            "  all praetore tables: +{total} bytes ({} bytes per action)",
+            total / RECEIPTS as i64
+        );
+        let evidence_bytes: i64 = admin
+            .query_one(
+                "SELECT avg(length(evidence_json))::bigint FROM praetore.execution_journal",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        println!("  average evidence_json length: {evidence_bytes} bytes");
+    }
+
+    // The whole chain does not fit one export, and the error says so.
+    let whole = work.join("whole.jsonl");
+    let refused = export(tenant, &pin, &whole, Some(&runtime_url));
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("--from-seq"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!whole.exists());
+
+    // The expected head: every receipt linked in the journal's order.
+    rows.sort_by(|left, right| {
+        (left.0, left.1.request_id, agent_id).cmp(&(right.0, right.1.request_id, agent_id))
+    });
+    let mut expected = ChainLink::GENESIS;
+    for (seq, (_, evidence)) in rows.iter().enumerate() {
+        expected = receipt_link(seq as u64, &expected, evidence).unwrap();
+    }
+
+    let tenant_text = tenant.to_string();
+    let mut from_seq = Some(0u64);
+    let mut previous_head: Option<String> = None;
+    let mut ranges = 0;
+    let mut chained_ids = Vec::new();
+    while let Some(from) = from_seq {
+        let output_path = work.join(format!("range-{ranges}.jsonl"));
+        let from_text = from.to_string();
+        let limit_text = LIMIT.to_string();
+        let summary = json(&ok(
+            praetore(
+                &[
+                    "journal-export",
+                    "--tenant",
+                    &tenant_text,
+                    "--attester-pin",
+                    pin.to_str().unwrap(),
+                    "--from-seq",
+                    &from_text,
+                    "--limit",
+                    &limit_text,
+                    "--output",
+                    output_path.to_str().unwrap(),
+                ],
+                Some(&runtime_url),
+            ),
+            "range export",
+        ));
+        assert_eq!(summary["range_start"], from);
+        let head = summary["head"].as_str().unwrap().to_owned();
+        let mut extra = vec!["--expected-head", head.as_str()];
+        let verified = match &previous_head {
+            None => {
+                assert_eq!(summary["anchor"], serde_json::Value::Null);
+                verify_with_pins(&output_path, &[&pin], &extra)
+            }
+            Some(anchor) => {
+                assert_eq!(summary["anchor"], anchor.as_str());
+                extra.extend(["--range", "--expected-anchor", anchor.as_str()]);
+                verify_with_pins(&output_path, &[&pin], &extra)
+            }
+        };
+        assert!(verified.status.success(), "{}", stderr(&verified));
+        let report = json(&verified);
+        assert_eq!(report["details"]["entries"], summary["entries"]);
+        assert!(summary["entries"].as_u64().unwrap() <= LIMIT);
+        let ids = chain_request_ids(&output_path);
+        chained_ids.extend(ids.into_iter().skip(usize::from(previous_head.is_some())));
+        // Chaining to any other head fails.
+        if previous_head.is_some() {
+            let wrong = verify_with_pins(
+                &output_path,
+                &[&pin],
+                &["--range", "--expected-anchor", &"0".repeat(64)],
+            );
+            assert!(!wrong.status.success());
+            assert_eq!(json(&wrong)["code"], "JOURNAL_HEAD_MISMATCH");
+        }
+        previous_head = Some(head);
+        from_seq = summary["next_from_seq"].as_u64();
+        ranges += 1;
+        assert!(ranges <= 5, "too many ranges");
+    }
+    assert_eq!(ranges, 4);
+    assert_eq!(previous_head.unwrap(), expected.to_hex());
+    let ordered: Vec<String> = rows
+        .iter()
+        .map(|(_, evidence)| evidence.request_id.to_string())
+        .collect();
+    assert_eq!(chained_ids, ordered);
+    // A range past the end, or one whose anchor does not exist, fails.
+    let past = work.join("past.jsonl");
+    let refused = praetore(
+        &[
+            "journal-export",
+            "--tenant",
+            &tenant_text,
+            "--attester-pin",
+            pin.to_str().unwrap(),
+            "--from-seq",
+            "20000",
+            "--output",
+            past.to_str().unwrap(),
+        ],
+        Some(&runtime_url),
+    );
+    assert!(!refused.status.success());
+    assert!(!past.exists());
+    let _ = fs::remove_dir_all(&work);
+}

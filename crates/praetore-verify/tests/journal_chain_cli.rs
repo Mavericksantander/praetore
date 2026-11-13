@@ -934,3 +934,127 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
         .into_mission()
         .expect("mission action")
 }
+
+impl Fixture {
+    /// Two ranges cut at seq 2: the first from genesis, the second with the
+    /// receipt at seq 1 as its anchor.
+    fn ranges(&self) -> (String, ChainHead, String) {
+        use praetore_core::journal_chain::{ChainLink, receipt_link};
+        let key = [attester().public_key().unwrap()];
+        let (first, first_head) = chain(&self.receipts[..2]);
+        let prev = receipt_link(0, &ChainLink::GENESIS, &self.receipts[0]).unwrap();
+        let mut second = ChainExporter::resume_after(&key, 1, prev, &self.receipts[1]).unwrap();
+        for evidence in &self.receipts[2..] {
+            second.push(evidence).unwrap();
+        }
+        (first, first_head, second.finish().unwrap().0)
+    }
+
+    fn verify_range(&self, text: &str, extra: &[&str]) -> Output {
+        let path = self.dir.write("range.jsonl", text);
+        let mut args = vec![
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &self.pin,
+            "--range",
+        ];
+        args.extend_from_slice(extra);
+        args.extend(["--format", "json"]);
+        Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+            .args(&args)
+            .output()
+            .unwrap()
+    }
+}
+
+#[test]
+fn two_ranges_verify_chained_with_expected_anchor() {
+    let fx = Fixture::new();
+    let (first, first_head, second) = fx.ranges();
+    let anchor = first_head.head.to_hex();
+    let whole = fx.expected();
+    let output = fx.verify_range(
+        &second,
+        &["--expected-anchor", &anchor, "--expected-head", &whole],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["entries"], 2);
+    assert_eq!(summary["details"]["range_start"], 2);
+    assert_eq!(summary["details"]["anchor"], anchor);
+    assert_eq!(summary["details"]["head"], whole);
+    assert_eq!(summary["details"]["expected_anchor_verified"], true);
+    // The first range is a plain chain.
+    let output = fx.verify(&first, Some(&anchor));
+    assert!(output.status.success());
+    // Without --expected-anchor the range verifies, with a warning.
+    let output = fx.verify_range(&second, &[]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("anchor_not_checked"));
+}
+
+#[test]
+fn a_range_with_a_wrong_anchor_or_truncated_fails() {
+    let fx = Fixture::new();
+    let (first, first_head, second) = fx.ranges();
+    // Chained to another head: the whole chain's, not the first range's.
+    assert_rejected(
+        &fx.verify_range(&second, &["--expected-anchor", &fx.expected()]),
+        "JOURNAL_HEAD_MISMATCH",
+    );
+    // Truncated: its last receipt dropped, checked against its head.
+    let mut lines: Vec<String> = second.lines().map(str::to_owned).collect();
+    lines.pop();
+    assert_rejected(
+        &fx.verify_range(
+            &join(&lines),
+            &[
+                "--expected-anchor",
+                &first_head.head.to_hex(),
+                "--expected-head",
+                &fx.expected(),
+            ],
+        ),
+        "JOURNAL_HEAD_MISMATCH",
+    );
+    // A whole chain is not a range: its first line is not an anchor to it.
+    assert_rejected(
+        &fx.verify_range(&first, &["--expected-anchor", &first_head.head.to_hex()]),
+        "JOURNAL_HEAD_MISMATCH",
+    );
+    // --expected-anchor needs --range; a range has no database reference.
+    let path = fx.dir.write("range.jsonl", &second);
+    for args in [
+        vec![
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &fx.pin,
+            "--expected-anchor",
+            "00",
+        ],
+        vec![
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &fx.pin,
+            "--range",
+            "--expected-database-head",
+            "00",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_ne!(output.status.code(), Some(0));
+    }
+}

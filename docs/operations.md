@@ -1059,6 +1059,58 @@ export of a database whose adoption record it signed then fails, because
 `journal-export --tenant` verifies that record before it references the
 database head (`docs/proposals/journal-chain-jsonl.md`).
 
+### Tenant journal in ranges
+
+A whole tenant chain export holds at most 4096 entries and 8 MiB; with
+receipts of about 2.6 KB the size bound comes first, at roughly 3,200
+receipts, and `praetore journal-export --tenant` then fails and names
+ranges. Export a longer chain in ranges, as for safety chains:
+`--from-seq 0 --limit N` writes the first range (`--limit` defaults to and
+is at most 4096; a range also ends before 8 MiB) and prints
+`next_from_seq`, which is `null` after the last range. Each later range
+(`--from-seq <next_from_seq>`) starts with its anchor: the full line of the
+receipt at `seq` N - 1, in the order of the whole export (`created_at`,
+`request_id`, `agent_id`), whose link is the head of the previous range.
+The exporter reads the receipts before the range, in one read-only
+snapshot, to compute that link. Verify each later range with `--range
+--expected-anchor <head of the previous range>`; the anchor's signature is
+checked and it is not counted. The last range's head is the chain's head,
+and it is the value to anchor outside the operator's control.
+
+Limits of ranges:
+
+- A range chains receipts only, from `seq` 0 for the first receipt, and has
+  no database reference: when the database has storage records, the ranges
+  of a tenant are not linked like its whole-chain export, and the database
+  chain is exported and verified on its own (`--database`).
+- Each range is verified alone: an `evidence_id` repeated from an earlier
+  range is not detected. Only a whole-chain verification sees every receipt.
+- The ranges of one journal state link only if the order of the receipts
+  before them did not change between exports. A row that lands in the past
+  of that order (for example a transaction that commits after later rows)
+  moves every later `seq`; the next range's anchor then does not match
+  `--expected-anchor` and verification fails. Export again from `--from-seq
+  0`.
+
+```sh
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq 0 --limit 3000 --output part-0.jsonl
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq <next_from_seq> --limit 3000 --output part-1.jsonl
+praetore-verify journal --journal part-0.jsonl --attester-pin attester-public-key.hex \
+  --expected-head <head of part-0> --format json
+praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-key.hex \
+  --range --expected-anchor <head of part-0> --format json
+```
+
+Measured with the ignored test
+`postgres_cli_journal_export_tenant_ranges_of_10000_receipts` (PostgreSQL
+16, 10,000 test receipts of 1,483 bytes of evidence JSON on average, smaller
+than real receipts): `pg_total_relation_size` grew by about 2,249 bytes per
+action for `praetore.execution_journal`, 317 for
+`praetore.execution_journal_events` and 182 for `praetore.replay_claims`,
+about 2,749 bytes per action in all.
+
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins
 expire): `--require-decision-time` becomes the default, with an explicit
