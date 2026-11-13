@@ -316,3 +316,131 @@ fn outcomes_usage_errors() {
         assert_eq!(summary["code"], "USAGE", "{args:?}");
     }
 }
+
+/// The fixture's tenant, read from its summary.
+fn fixture_tenant() -> String {
+    verify(&fixture(), &FULL).1["details"]["tenant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A delegation document with one root for the fixture's tenant, its pin,
+/// and a format 2 policy, written into `dir`.
+fn write_delegation_files(dir: &Dir) {
+    // A 32-byte Ed25519 public key that is not any key of the fixture.
+    let root_hex = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    dir.write(
+        "delegations.json",
+        &serde_json::json!({
+            "schema_version": 1,
+            "roots": [{"tenant_id": fixture_tenant(), "key_id": "tenant-root", "public_key_hex": root_hex}],
+        })
+        .to_string(),
+    );
+    dir.write(
+        "root-pin.json",
+        &serde_json::json!({"schema_version": 1, "key_id": "tenant-root", "public_key_hex": root_hex})
+            .to_string(),
+    );
+    dir.write(
+        "policy.json",
+        include_str!("../../../docs/golden/canonical-policy-v2.json"),
+    );
+}
+
+fn with_delegation_flags() -> Vec<&'static str> {
+    let mut args = FULL.to_vec();
+    args.extend([
+        "--delegation-root-pin",
+        "root-pin.json",
+        "--delegations",
+        "delegations.json",
+        "--policy",
+        "policy.json",
+    ]);
+    args
+}
+
+/// The fixture's first human decision, rewritten as a schema version 2
+/// decision by the tenant's root (`delegation_chain: []`). Its signature
+/// no longer verifies, but the verifier must stop before it.
+fn with_a_delegated_decision(dir: &Dir) {
+    let mut lines: Vec<String> = dir
+        .read("approvals.jsonl")
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let index = lines
+        .iter()
+        .position(|line| line.contains("\"human_decision\""))
+        .unwrap();
+    let mut line: serde_json::Value = serde_json::from_str(&lines[index]).unwrap();
+    line["human_decision"]["schema_version"] = 2.into();
+    line["human_decision"]["approver_key_id"] = "tenant-root".into();
+    line["human_decision"]["delegation_chain"] = serde_json::json!([]);
+    lines[index] = line.to_string();
+    dir.write("approvals.jsonl", &(lines.join("\n") + "\n"));
+}
+
+#[test]
+fn version_1_decisions_verify_as_before_with_or_without_the_delegation_flags() {
+    let dir = Dir::new();
+    write_delegation_files(&dir);
+    let (ok, without) = verify(&dir.0, &FULL);
+    assert!(ok, "{without}");
+    assert_eq!(without["details"]["delegation_checked"], false);
+    let (ok, with) = verify(&dir.0, &with_delegation_flags());
+    assert!(ok, "{with}");
+    assert_eq!(with["details"]["delegation_checked"], true);
+    assert_eq!(
+        with["details"]["delegated_decisions"],
+        serde_json::json!([])
+    );
+    assert_eq!(with["details"]["held"], without["details"]["held"]);
+    assert_eq!(with["details"]["counts"], without["details"]["counts"]);
+}
+
+#[test]
+fn a_delegated_decision_without_the_delegation_flags_fails_with_delegation_unverified() {
+    let dir = Dir::new();
+    with_a_delegated_decision(&dir);
+    let (ok, summary) = verify(&dir.0, &FULL);
+    assert!(!ok);
+    assert_eq!(summary["code"], "DELEGATION_UNVERIFIED", "{summary}");
+}
+
+#[test]
+fn a_delegated_decision_is_checked_against_the_given_policy() {
+    let dir = Dir::new();
+    write_delegation_files(&dir);
+    with_a_delegated_decision(&dir);
+    // The golden policy is not the policy the fixture's requests were
+    // decided under: its digest is not the challenge's.
+    let (ok, summary) = verify(&dir.0, &with_delegation_flags());
+    assert!(!ok);
+    assert_eq!(summary["code"], "DELEGATION_POLICY_MISMATCH", "{summary}");
+}
+
+#[test]
+fn the_delegation_flags_go_together() {
+    let dir = Dir::new();
+    write_delegation_files(&dir);
+    let full = with_delegation_flags();
+    // Drop one of the three flags (and its value) at a time.
+    for flag in ["--delegation-root-pin", "--delegations", "--policy"] {
+        let position = full.iter().position(|arg| *arg == flag).unwrap();
+        let mut args = full.clone();
+        args.drain(position..position + 2);
+        assert_eq!(verify(&dir.0, &args).1["code"], "USAGE", "{flag}");
+    }
+    // A malformed delegation document is reported with its own code.
+    dir.write(
+        "delegations.json",
+        "{\"schema_version\":1,\"roots\":[],\"extra\":1}",
+    );
+    assert_eq!(
+        verify(&dir.0, &full).1["code"],
+        "DELEGATION_DOCUMENT_INVALID"
+    );
+}

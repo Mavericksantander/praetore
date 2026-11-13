@@ -1164,6 +1164,7 @@ fn decided(evidence: &Evidence, outcome: HumanApprovalOutcome) -> Outcome {
         approver_key_id: "approver-1".into(),
         challenge,
         outcome,
+        delegation_chain: None,
         signature: String::new(),
     };
     decision.signature = hex::encode(
@@ -1312,6 +1313,7 @@ async fn approvals_jsonl_carries_each_outcome_its_pins_and_its_counts() {
             evidence_attesters: &attesters,
             execution: &[execution],
             approvers: &[approver],
+            delegation: None,
         },
     )
     .unwrap();

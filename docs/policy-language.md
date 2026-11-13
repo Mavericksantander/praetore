@@ -458,6 +458,29 @@ If no rule matches, the policy returns DENY. An ALLOW rule is therefore
 required for every allowed case; the engine never treats a missing policy
 match as permission.
 
+## Delegated approval option
+
+```json
+"approval_delegation": {"root_may_approve": false}
+```
+
+Optional. It decides whether a tenant's delegation root may sign a human
+decision in its own name (a schema version 2 decision with an empty
+`delegation_chain`); see
+[delegated authority to approve](proposals/approval-delegation.md). Unknown
+fields inside it are refused, and `root_may_approve` is required when the
+object is present.
+
+- Absent means `false`, and the policy's canonical form and digest are the
+  same as before the field existed.
+- An explicit `false` behaves like absent but is part of the canonical form,
+  so the digest differs. Pin the document you deploy.
+- The option holds no tenant ids: one policy serves every tenant of a
+  gateway, and the option applies to every tenant's root.
+
+The default is `false`: the root is meant to stay offline and delegate,
+not to approve day to day.
+
 ## Request context
 
 Request context is an explicit map, set by the caller on the

@@ -1,3 +1,4 @@
+use praetore_core::approval_delegation::DelegationConfig;
 use praetore_core::{
     PraetoreError,
     authority::Authority,
@@ -15,7 +16,7 @@ use praetore_core::{
     safety_namespace::SafetyNamespaceManifest,
 };
 use praetore_receipt::outcomes::{
-    KeyPin, MAX_OUTCOME_PINS, MAX_OUTCOMES_BYTES, OutcomeKeys, verify_outcomes,
+    KeyPin, MAX_OUTCOME_PINS, MAX_OUTCOMES_BYTES, OutcomeDelegation, OutcomeKeys, verify_outcomes,
 };
 use serde::Serialize;
 use std::{
@@ -96,6 +97,9 @@ enum Command {
         attester_pins: Vec<PathBuf>,
         execution_pins: Vec<PathBuf>,
         approver_pins: Vec<PathBuf>,
+        /// Delegated decisions: root pins, the delegation document and the
+        /// policy, all three or none.
+        delegation: Option<DelegationArgs>,
         expected_head: Option<String>,
     },
     Receipt {
@@ -134,7 +138,7 @@ fn main() {
     let result = env::args().skip(1).collect::<Vec<_>>();
     if matches!(result.as_slice(), [flag] if flag == "--help" || flag == "-h") {
         println!(
-            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--strict] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX | --range [--expected-anchor HEX]] [--require-anchored] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--require-final] [--format json|text]\n  praetore-verify outcomes --outcomes JSONL --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--execution-pin PIN_JSON ...] [--approver-pin PIN_JSON ...] [--expected-head HEX] [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n  praetore-verify safety-manifest --manifest PATH --pin HEX_FILE [--policy PATH] [--other-pin HEX_FILE]... [--format json|text]\n  praetore-verify safety-journal --journal JSONL --ingest-pin HEX_FILE [--ingest-pin HEX_FILE ...] [--source-pins JSONL] [--expected-head HEX] [--range [--expected-anchor HEX]] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (written before G7) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. authority_verified is always reported: false when no --issuer-pins were given (the embedded authority was then not checked). --strict runs every check of this command: it requires --issuer-pins and --policy (USAGE otherwise) and implies --require-intent and --require-decision-time. A receipt that is not HighAssurance does not record the engine mode that produced it, so no flag can show it. The receipt command reports final=false, with non_final_reason, for a receipt whose state can still change: awaiting_approval (schema v5: the receipt returned while an approval is pending; it stays so even after the request was approved and executed), awaiting_approval_or_legacy (requires_approval, not_dispatched and no signed not_dispatched_reason: a pending receipt written before schema v5, or one written before signed closing reasons existed) and outcome_unknown; --require-final then fails with RECEIPT_NOT_FINAL. Verifiers up to 0.3.3 reject schema v5 receipts and the reason approved_claim_expired (RECEIPT_INVALID). The outcomes command verifies a tenant's approval and execution records (one JSONL file, such as approvals.jsonl in the console's compliance package) against its journal chain, which it verifies first like the journal command: every human decision (approve or reject) against the challenge derived from the journal receipt of its request and an --approver-pin, every approval-expiration receipt and every execution receipt (schema v1 to v5) against an --execution-pin, the evidence embedded in each execution receipt against the journal's receipt, and that the records of one request agree (a dispatched held request was approved, approval_rejected has a reject decision). It reports how many records of each kind there are and, for every request the policy held for approval, its outcome: pending (no record yet; the window may also have closed without the gateway recording it), rejected, expired, approved_pending_dispatch, approved_executed, approved_failed, approved_outcome_unknown, approved_not_dispatched or not_dispatched. Pins that verified no record are listed by position. It shows what the gateway recorded, not that the action had an effect, and it does not show that no other request or record exists. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. Without --expected-head a truncated or re-linked chain also verifies: the command then reports the head_not_anchored warning (on stderr and in details.warnings), and with --require-anchored it fails with JOURNAL_NOT_ANCHORED (exit 1) after the chain verifies. Every receipt of a tenant chain must name the same tenant in its signed authority, reported as tenant_id (null when the receipts name none); a receipt for another tenant fails with JOURNAL_TENANT_MISMATCH. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head, reported as database_head_consistent; database_head_anchored is true only with --expected-database-head, because the head of a --database-journal file is not anchored by that file. --attester-pin may be repeated (up to 16 keys) for a chain that spans an attester key rotation: each entry must be signed by the pinned key its key id names, so pin the retired key as well as the current one. --policy applies to receipts; with a database journal it fails with INVALID_REQUEST. With --range the file is one range of a tenant chain from `praetore journal-export --tenant --from-seq N`: its first line is the anchor (the receipt before the range), whose signature is checked and whose link is the starting point, not counted; --expected-anchor requires that link to equal the head of the previous range. --from-seq counts receipts only: in a database without storage records the last range's head equals the head of the whole-chain export, but in a database with storage records the whole-chain export starts with a database_head line at seq 0 and ranges do not, so the head of a range and the head of the whole-chain export are not interchangeable. A range has no database reference, and an evidence_id repeated from an earlier range is not detected. It does not establish current authorization, freshness, replay state, or permission to execute an action. The safety-manifest command verifies a safety namespace manifest (from `praetore policy safety-manifest`) against the pinned namespace key; with --policy (format 2) it also requires the manifest to match that policy exactly (id, version, digest and the list of Safety names); each --other-pin (repeatable, alias --attester-pin) names the public key of another role (the attester or an issuer), and a namespace pin equal to any of them is refused (SAFETY_MANIFEST_SAME_KEY). The manifest file must be its canonical JSON followed by one newline. It shows namespace agreement at that policy digest; it authorizes nothing. The safety-journal command verifies one exported chain of post-hoc safety records (from `praetore journal-export --safety`, see docs/proposals/safety-ingestion-jsonl.md): every record's hash and signature against the pinned ingestion key(s), the hash chain (chain_seq, prev_record_hash), source_seq continuity (every gap covered by a signed loss record), the consistency of duplicate, conflict and late records, and with --source-pins every event's signature against its source key; with --expected-head the last record_hash must equal that value. It reports the count of each status. It shows what the ingester recorded, after the fact and by the source's clock; it does not show that an action ran or that nothing else ran, and without --expected-head a truncated chain still verifies (it then reports the head_not_anchored warning, on stderr and in details.warnings). With --range the file is one range from `praetore journal-export --safety --from-seq N`: its first line is the anchor (the record before the range), checked and used as the starting point but not counted; --expected-anchor requires its record_hash to equal the head of the previous range; duplicate, conflict and late records whose earlier record lies before the range are counted as unchecked_references.\n\nAttester and namespace pin files contain a lowercase 32-byte Ed25519 public-key hex value. Execution and approver pin files (outcomes) contain one JSON document {{\"schema_version\":1,\"key_id\":\"...\",\"public_key_hex\":\"<64 lowercase hex>\"}}, the format of the approver-pin.json that praetore init writes. Issuer pin files contain one compact exported pin JSON document per line."
+            "Usage:\n  praetore-verify evidence --evidence PATH --attester-pin HEX_FILE [--issuer-pins JSONL] [--require-intent] [--require-decision-time] [--policy PATH] [--strict] [--format json|text]\n  praetore-verify journal --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--expected-head HEX] [--policy PATH] [--database-journal JSONL | --expected-database-head HEX | --range [--expected-anchor HEX]] [--require-anchored] [--format json|text]\n  praetore-verify policy-digest --policy PATH [--format json|text]\n  praetore-verify receipt --receipt PATH --execution-pin HEX_FILE --key-id ID --evidence-attester-pin HEX_FILE [--require-final] [--format json|text]\n  praetore-verify outcomes --outcomes JSONL --journal JSONL --attester-pin HEX_FILE [--attester-pin HEX_FILE ...] [--execution-pin PIN_JSON ...] [--approver-pin PIN_JSON ...] [--delegation-root-pin PIN_JSON ... --delegations JSON --policy PATH] [--expected-head HEX] [--format json|text]\n  praetore-verify authority --authority PATH --issuer-pins JSONL [--agent PATH] [--now RFC3339] [--format json|text]\n  praetore-verify safety-manifest --manifest PATH --pin HEX_FILE [--policy PATH] [--other-pin HEX_FILE]... [--format json|text]\n  praetore-verify safety-journal --journal JSONL --ingest-pin HEX_FILE [--ingest-pin HEX_FILE ...] [--source-pins JSONL] [--expected-head HEX] [--range [--expected-anchor HEX]] [--format json|text]\n\nThe evidence command verifies a historical receipt's integrity and attester signature; with --policy it also requires the receipt to record that policy's digest (receipts without a digest fail). A --policy document may be policy format 1 (the earlier format, without action classes) or format 2; it is only digested and compared, never evaluated. With --issuer-pins it checks the embedded authority (issuer pin, signature, subject binding, not-before and expiry) at the receipt's signed decision time (decided_at, HighAssurance receipts) and reports it as authority_checked_at; receipts that record no decision time are checked at the verifier's current time (authority_checked_at_source=verifier_clock); with --require-decision-time such receipts fail with DECISION_TIME_MISSING instead. This shows the authority was valid when the decision was recorded, not that it is valid now, and the decision time is only as trustworthy as the attester key that signed it: the issuer pin is also checked at decided_at, and the attester pin has no validity window. authority_verified is always reported: false when no --issuer-pins were given (the embedded authority was then not checked). --strict runs every check of this command: it requires --issuer-pins and --policy (USAGE otherwise) and implies --require-intent and --require-decision-time. A receipt that is not HighAssurance does not record the engine mode that produced it, so no flag can show it. The receipt command reports final=false, with non_final_reason, for a receipt whose state can still change: awaiting_approval (schema v5: the receipt returned while an approval is pending; it stays so even after the request was approved and executed), awaiting_approval_or_legacy (requires_approval, not_dispatched and no signed not_dispatched_reason: a pending receipt written before schema v5, or one written before signed closing reasons existed) and outcome_unknown; --require-final then fails with RECEIPT_NOT_FINAL. Verifiers up to 0.3.3 reject schema v5 receipts and the reason approved_claim_expired (RECEIPT_INVALID). The outcomes command verifies a tenant's approval and execution records (one JSONL file, such as approvals.jsonl in the console's compliance package) against its journal chain, which it verifies first like the journal command: every human decision (approve or reject) against the challenge derived from the journal receipt of its request and an --approver-pin, every approval-expiration receipt and every execution receipt (schema v1 to v5) against an --execution-pin, the evidence embedded in each execution receipt against the journal's receipt, and that the records of one request agree (a dispatched held request was approved, approval_rejected has a reject decision). It reports how many records of each kind there are and, for every request the policy held for approval, its outcome: pending (no record yet; the window may also have closed without the gateway recording it), rejected, expired, approved_pending_dispatch, approved_executed, approved_failed, approved_outcome_unknown, approved_not_dispatched or not_dispatched. A delegated decision (schema version 2) is checked only with --delegation-root-pin (repeatable, one per tenant), --delegations (the gateway's delegation document) and --policy (format 2; its digest must be the challenge's policy_digest, and root_may_approve is read from it): its chain must verify from the tenant's pinned root to the key that signed it, with every delegation valid from the evidence's decided_at to the challenge's expires_at; a revocation effective at or before expires_at fails it with DELEGATION_REVOKED. Without those flags a delegated decision fails with DELEGATION_UNVERIFIED. details.delegated_decisions lists each with its delegation chain and root_approved. Pins that verified no record are listed by position. It shows what the gateway recorded, not that the action had an effect, and it does not show that no other request or record exists. The journal command verifies a hash-linked JSONL export (see docs/proposals/journal-chain-jsonl.md) and every receipt's signature; with --expected-head it also requires the final link to equal that value. Without --expected-head a truncated or re-linked chain also verifies: the command then reports the head_not_anchored warning (on stderr and in details.warnings), and with --require-anchored it fails with JOURNAL_NOT_ANCHORED (exit 1) after the chain verifies. Every receipt of a tenant chain must name the same tenant in its signed authority, reported as tenant_id (null when the receipts name none); a receipt for another tenant fails with JOURNAL_TENANT_MISMATCH. A database journal (storage records, from `praetore journal-export --database`) is verified the same way; with --database-journal (verified too) or --expected-database-head, a tenant journal must reference that database head, reported as database_head_consistent; database_head_anchored is true only with --expected-database-head, because the head of a --database-journal file is not anchored by that file. --attester-pin may be repeated (up to 16 keys) for a chain that spans an attester key rotation: each entry must be signed by the pinned key its key id names, so pin the retired key as well as the current one. --policy applies to receipts; with a database journal it fails with INVALID_REQUEST. With --range the file is one range of a tenant chain from `praetore journal-export --tenant --from-seq N`: its first line is the anchor (the receipt before the range), whose signature is checked and whose link is the starting point, not counted; --expected-anchor requires that link to equal the head of the previous range. --from-seq counts receipts only: in a database without storage records the last range's head equals the head of the whole-chain export, but in a database with storage records the whole-chain export starts with a database_head line at seq 0 and ranges do not, so the head of a range and the head of the whole-chain export are not interchangeable. A range has no database reference, and an evidence_id repeated from an earlier range is not detected. It does not establish current authorization, freshness, replay state, or permission to execute an action. The safety-manifest command verifies a safety namespace manifest (from `praetore policy safety-manifest`) against the pinned namespace key; with --policy (format 2) it also requires the manifest to match that policy exactly (id, version, digest and the list of Safety names); each --other-pin (repeatable, alias --attester-pin) names the public key of another role (the attester or an issuer), and a namespace pin equal to any of them is refused (SAFETY_MANIFEST_SAME_KEY). The manifest file must be its canonical JSON followed by one newline. It shows namespace agreement at that policy digest; it authorizes nothing. The safety-journal command verifies one exported chain of post-hoc safety records (from `praetore journal-export --safety`, see docs/proposals/safety-ingestion-jsonl.md): every record's hash and signature against the pinned ingestion key(s), the hash chain (chain_seq, prev_record_hash), source_seq continuity (every gap covered by a signed loss record), the consistency of duplicate, conflict and late records, and with --source-pins every event's signature against its source key; with --expected-head the last record_hash must equal that value. It reports the count of each status. It shows what the ingester recorded, after the fact and by the source's clock; it does not show that an action ran or that nothing else ran, and without --expected-head a truncated chain still verifies (it then reports the head_not_anchored warning, on stderr and in details.warnings). With --range the file is one range from `praetore journal-export --safety --from-seq N`: its first line is the anchor (the record before the range), checked and used as the starting point but not counted; --expected-anchor requires its record_hash to equal the head of the previous range; duplicate, conflict and late records whose earlier record lies before the range are counted as unchecked_references.\n\nAttester and namespace pin files contain a lowercase 32-byte Ed25519 public-key hex value. Execution and approver pin files (outcomes) contain one JSON document {{\"schema_version\":1,\"key_id\":\"...\",\"public_key_hex\":\"<64 lowercase hex>\"}}, the format of the approver-pin.json that praetore init writes. Issuer pin files contain one compact exported pin JSON document per line."
         );
         return;
     }
@@ -209,6 +213,14 @@ fn main() {
     }
 }
 
+/// `outcomes --delegation-root-pin ... --delegations FILE --policy PATH`.
+#[derive(Debug)]
+struct DelegationArgs {
+    root_pins: Vec<PathBuf>,
+    delegations: PathBuf,
+    policy: PathBuf,
+}
+
 fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
     let command_name = args.first().ok_or_else(CliError::usage)?;
     let mut values = BTreeMap::<String, Option<String>>::new();
@@ -218,6 +230,7 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
     // `outcomes` takes several execution and approver pins.
     let mut execution_pins = Vec::new();
     let mut approver_pins = Vec::new();
+    let mut delegation_root_pins = Vec::new();
     let mut index = 1;
     // `safety-manifest --other-pin` (alias `--attester-pin`) repeats.
     let mut other_pins = Vec::new();
@@ -273,12 +286,15 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
                 index += 1;
                 continue;
             }
-            if command_name == "outcomes" && (flag == "--execution-pin" || flag == "--approver-pin")
+            if command_name == "outcomes"
+                && (flag == "--execution-pin"
+                    || flag == "--approver-pin"
+                    || flag == "--delegation-root-pin")
             {
-                let pins = if flag == "--execution-pin" {
-                    &mut execution_pins
-                } else {
-                    &mut approver_pins
+                let pins = match flag.as_str() {
+                    "--execution-pin" => &mut execution_pins,
+                    "--approver-pin" => &mut approver_pins,
+                    _ => &mut delegation_root_pins,
                 };
                 if pins.len() == MAX_OUTCOME_PINS {
                     return Err(CliError::usage());
@@ -427,19 +443,36 @@ fn parse_command(args: &[String]) -> Result<(Command, OutputFormat), CliError> {
             }
         }
         "outcomes" => {
-            if values
-                .keys()
-                .any(|key| !matches!(key.as_str(), "--outcomes" | "--journal" | "--expected-head"))
-                || journal_pins.is_empty()
+            if values.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "--outcomes" | "--journal" | "--expected-head" | "--delegations" | "--policy"
+                )
+            }) || journal_pins.is_empty()
             {
                 return Err(CliError::usage());
             }
+            // Delegated decisions need all three, or none.
+            let delegation = match (
+                delegation_root_pins.is_empty(),
+                values.contains_key("--delegations"),
+                values.contains_key("--policy"),
+            ) {
+                (true, false, false) => None,
+                (false, true, true) => Some(DelegationArgs {
+                    root_pins: delegation_root_pins,
+                    delegations: path("--delegations")?,
+                    policy: path("--policy")?,
+                }),
+                _ => return Err(CliError::usage()),
+            };
             Command::Outcomes {
                 outcomes: path("--outcomes")?,
                 journal: path("--journal")?,
                 attester_pins: journal_pins,
                 execution_pins,
                 approver_pins,
+                delegation,
                 expected_head: match values.get("--expected-head") {
                     None => None,
                     Some(Some(value)) => Some(value.clone()),
@@ -921,6 +954,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             attester_pins,
             execution_pins,
             approver_pins,
+            delegation,
             expected_head,
         } => {
             let expected_head = expected_head
@@ -934,6 +968,7 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             let attesters = read_attester_pins(&attester_pins)?;
             let execution = read_key_pins(&execution_pins)?;
             let approvers = read_key_pins(&approver_pins)?;
+            let delegation = delegation.as_ref().map(read_delegation).transpose()?;
             // The records are bound to the receipts of a verified chain.
             let text = read_limited_to(&journal, MAX_CHAIN_BYTES)?;
             let (report, receipts) =
@@ -957,6 +992,12 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
                     evidence_attesters: &attesters,
                     execution: &execution,
                     approvers: &approvers,
+                    delegation: delegation.as_ref().map(|loaded| OutcomeDelegation {
+                        roots: &loaded.roots,
+                        delegations: &loaded.config,
+                        policy_digest: &loaded.policy_digest,
+                        root_may_approve: loaded.root_may_approve,
+                    }),
                 },
             )
             .map_err(|error| {
@@ -1027,6 +1068,30 @@ fn execute(command: Command, verifier_now: OffsetDateTime) -> Result<Summary, Cl
             details.insert(
                 "unused_approver_pins".into(),
                 positions(&outcomes.unused_approver_pins),
+            );
+            details.insert(
+                "delegation_checked".into(),
+                serde_json::Value::Bool(delegation.is_some()),
+            );
+            details.insert(
+                "delegated_decisions".into(),
+                serde_json::Value::Array(
+                    outcomes
+                        .delegated
+                        .iter()
+                        .map(|decision| {
+                            serde_json::json!({
+                                "agent_id": decision.agent_id.to_string(),
+                                "request_id": decision.request_id.to_string(),
+                                "approval_id": decision.approval_id.to_string(),
+                                "approver_key_id": decision.approver_key_id,
+                                "outcome": decision.outcome,
+                                "delegation_chain": decision.delegation_chain,
+                                "root_approved": decision.root_approved,
+                            })
+                        })
+                        .collect(),
+                ),
             );
             details.insert(
                 "verification_scope".into(),
@@ -1419,6 +1484,32 @@ fn read_attester_pins(paths: &[PathBuf]) -> Result<Vec<VerifiedPublicKey>, CliEr
 
 /// Execution or approver pins (`{"schema_version":1,"key_id":...,
 /// "public_key_hex":...}`); a repeated key or key id is refused.
+/// The trust for delegated decisions, read from the files of
+/// [`DelegationArgs`].
+struct LoadedDelegation {
+    roots: Vec<KeyPin>,
+    config: DelegationConfig,
+    policy_digest: String,
+    root_may_approve: bool,
+}
+
+fn read_delegation(args: &DelegationArgs) -> Result<LoadedDelegation, CliError> {
+    let roots = read_key_pins(&args.root_pins)?;
+    let config =
+        DelegationConfig::from_json(&read_limited(&args.delegations)?).map_err(|error| {
+            eprintln!("delegations: {error}");
+            CliError { code: error.code() }
+        })?;
+    // Format 2 only: the option is read from the policy, so it must load.
+    let policy = Policy::from_json(&read_limited(&args.policy)?).map_err(CliError::from_core)?;
+    Ok(LoadedDelegation {
+        roots,
+        config,
+        policy_digest: policy.digest().map_err(CliError::from_core)?,
+        root_may_approve: policy.root_may_approve(),
+    })
+}
+
 fn read_key_pins(paths: &[PathBuf]) -> Result<Vec<KeyPin>, CliError> {
     let mut pins: Vec<KeyPin> = Vec::with_capacity(paths.len());
     for path in paths {

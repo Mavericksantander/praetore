@@ -20,8 +20,9 @@ mod approval;
 pub mod outcomes;
 
 pub use approval::{
-    ApprovalChallenge, ApprovalError, ApprovalExpiredReceipt, ExecutionKey, ExpiredOutcome,
-    HumanApprovalDecision, HumanApprovalOutcome,
+    ApprovalChallenge, ApprovalError, ApprovalExpiredReceipt, DELEGATED_DECISION_SCHEMA_VERSION,
+    ExecutionKey, ExpiredOutcome, HumanApprovalDecision, HumanApprovalOutcome,
+    PINNED_DECISION_SCHEMA_VERSION,
 };
 
 const ACTION_DIGEST_DOMAIN: &[u8] = b"PRAETORE_EXECUTION_ACTION_V1\0";

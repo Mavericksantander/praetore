@@ -1726,6 +1726,7 @@ fn sign_decision(
         approver_key_id: approver_id.to_owned(),
         challenge,
         outcome,
+        delegation_chain: None,
         signature: String::new(),
     };
     decision.signature = hex::encode(signing_key.sign(&decision.signing_message()?).to_bytes());

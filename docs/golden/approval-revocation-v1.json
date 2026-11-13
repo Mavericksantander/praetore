@@ -1,0 +1,7 @@
+{
+  "domain": "PRAETORE_APPROVAL_REVOCATION_V1\\0",
+  "issuer_public_key_hex": "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12",
+  "revocation_json": "{\"schema_version\":1,\"tenant_id\":\"00000000-0000-0000-0000-000000000010\",\"delegation_hash\":\"54a026832f78628c28721657b0fa7402f56ccb9728a42471d6ff2662834b9156\",\"issuer_key_id\":\"golden-delegator\",\"effective_at\":\"2026-12-01T00:00:00Z\",\"signature\":\"6812d13fe951e383ecf20c3dadbcac84879f44101bc7940f82e14bc0c158411413163abe8cb7b294e865dd40377c799fd93e8a77418c4e6bb7bd4b8bc72fea08\"}",
+  "signature_hex": "6812d13fe951e383ecf20c3dadbcac84879f44101bc7940f82e14bc0c158411413163abe8cb7b294e865dd40377c799fd93e8a77418c4e6bb7bd4b8bc72fea08",
+  "signing_payload": "{\"delegation_hash\":\"54a026832f78628c28721657b0fa7402f56ccb9728a42471d6ff2662834b9156\",\"effective_at\":\"2026-12-01T00:00:00Z\",\"issuer_key_id\":\"golden-delegator\",\"schema_version\":1,\"tenant_id\":\"00000000-0000-0000-0000-000000000010\"}"
+}

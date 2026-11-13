@@ -431,6 +431,7 @@ fn collect_outcomes(
             evidence_attesters: pins,
             execution: &execution_pins,
             approvers: &approver_pins,
+            delegation: None,
         },
     )
     .map_err(|error| {

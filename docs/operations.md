@@ -122,6 +122,38 @@ the configured keys; removing a key before those are dispatched leaves them
 `Gateway::reconcile` (`crash_recovered`). The single-key environment variables are accepted
 only for the local demo or a gateway with exactly one issuer-bound tenant.
 
+## Delegated approvers
+
+`PRAETORE_GATEWAY_DELEGATION_FILE` (optional, at most 1 MiB) names one
+delegation root per tenant, the signed delegations and the signed
+revocations (format and rules in
+[the design note](proposals/approval-delegation.md)). Without it the gateway
+accepts only its pinned approvers. With it, the gateway also accepts schema
+version 2 decisions whose `delegation_chain` leads from the tenant's root to
+the signing key.
+
+The gateway does not start when the file is malformed (duplicate keys,
+unknown fields, uppercase hex, over the size limit), names a tenant without
+an issuer binding, holds a revocation signed by neither the delegation's
+issuer nor the root, or when a root key is another tenant's root, a pinned
+approver (key or key id), an authority issuer key or an attester key.
+
+- **Keep the root offline.** It signs delegations and revocations, not
+  day-to-day decisions. It approves in its own name only when the policy
+  sets `approval_delegation.root_may_approve` to `true`.
+- **Revoking needs a restart.** The file is read at startup. Sign the
+  revocation (by the delegation's issuer or the root), add it to
+  `revocations`, and restart the gateway; until then the revoked chain is
+  still accepted. Decisions already recorded and not yet dispatched are
+  re-verified when their dispatch is claimed and are refused once the
+  revocation is loaded; close them with `Gateway::reconcile`.
+- **Delegate key compromise.** Revoke that delegation (its descendants
+  fall with it) and restart. **Root compromise.** Replace the root in the
+  file with a new key, re-issue the delegations under it, and restart: every
+  chain under the old root stops verifying at once. Offline verification of
+  past decisions needs the old root pin and the delegation file they were
+  verified with; keep both.
+
 ## Freshness snapshot
 
 With the `http` and `sandbox` adapters the gateway requires
@@ -1263,6 +1295,23 @@ journal tenant's approvers: the gateway ties each approver to a tenant, the
 pin format does not. An execution receipt written before migration 0023,
 whose output digest the database did not check, fails if it does not match
 its output. Historical verification only (`current_authorization=false`).
+
+A schema version 2 decision (signed by a delegated approver, or by the
+tenant's root) needs three more arguments, all together:
+`--delegation-root-pin root-pin.json` (repeatable up to 16, the format of
+the approver pins), `--delegations delegations.json` (the gateway's
+delegation file) and `--policy policy.json` (the policy the request was
+decided under: its digest must equal the challenge's `policy_digest`, or
+`DELEGATION_POLICY_MISMATCH`; its `approval_delegation.root_may_approve` is
+read from it). The root the file names for the tenant must equal a pinned
+root (`DELEGATION_ROOT_UNPINNED`). Without the three arguments a version 2
+decision fails with `DELEGATION_UNVERIFIED`; version 1 decisions verify the
+same with or without them. The chain is checked as the gateway checks it,
+except for revocations: offline, a revocation counts when its
+`effective_at` is at or before the challenge's `expires_at`
+(`DELEGATION_REVOKED`). The report adds `delegation_checked` and
+`delegated_decisions`, one entry per version 2 decision with its
+`delegation_chain` and `root_approved`.
 
 A receipt that verifies is not always final: a later receipt for the same
 request can record another state. The verifier reports `details.final` and

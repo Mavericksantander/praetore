@@ -330,6 +330,9 @@ fn check_known_fields<'de, T: Deserialize<'de>>(object: &Value) -> Result<()> {
 /// typed error. Values of the wrong shape are left for serde to reject.
 fn check_policy_fields(document: &Value) -> Result<()> {
     check_known_fields::<Policy>(document)?;
+    if let Some(delegation) = document.get("approval_delegation") {
+        check_known_fields::<ApprovalDelegationPolicy>(delegation)?;
+    }
     let rules = document.get("rules").and_then(Value::as_array);
     for rule in rules.into_iter().flatten() {
         check_known_fields::<PolicyRule>(rule)?;
@@ -433,6 +436,23 @@ pub struct Policy {
     /// rejected. Omitted when `None`, so existing digests do not change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_approval_ms: Option<u64>,
+    /// Delegated approval: whether a tenant's delegation root may approve
+    /// held actions itself. Absent means it may not (it only delegates).
+    /// Omitted when `None`, so existing digests do not change. One policy
+    /// serves every tenant of a gateway, so the option applies to all of
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_delegation: Option<ApprovalDelegationPolicy>,
+}
+
+/// The policy's `approval_delegation` object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDelegationPolicy {
+    /// `true` lets a tenant's delegation root sign approvals itself, with an
+    /// empty delegation chain. `false` behaves as if the object were absent
+    /// (the document's digest differs).
+    pub root_may_approve: bool,
 }
 
 fn legacy_policy_semantics_version() -> u8 {
@@ -458,7 +478,15 @@ impl Policy {
             action_classes: BTreeMap::new(),
             rules,
             max_approval_ms: None,
+            approval_delegation: None,
         }
+    }
+
+    /// Whether a tenant's delegation root may approve held actions itself.
+    /// `false` when `approval_delegation` is absent.
+    pub fn root_may_approve(&self) -> bool {
+        self.approval_delegation
+            .is_some_and(|delegation| delegation.root_may_approve)
     }
 
     /// Declares the class of one exact action type.
@@ -973,6 +1001,7 @@ impl RecordedPolicy {
             action_classes: BTreeMap::new(),
             rules: document.rules.clone(),
             max_approval_ms: document.max_approval_ms,
+            approval_delegation: None,
         }
         .validate_body()?;
         let canonical = canonical_json(&document).map_err(policy_json_error)?;
