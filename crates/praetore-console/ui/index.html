@@ -4,65 +4,72 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <title>Consola · PRÆTORE</title>
+  <title data-i18n="page.title">Consola · PRÆTORE</title>
   <link rel="stylesheet" href="styles.css">
-  <script defer src="app.js"></script>
+  <script type="module" src="app.js"></script>
 </head>
 <body>
   <header class="topbar">
     <div class="brand">PRÆTORE</div>
-    <div class="environment"><i></i>Solo en este computador</div>
+    <div class="environment"><i></i><span data-i18n="topbar.environment">Solo en este computador</span></div>
+    <label class="idioma"><span data-i18n="topbar.language">Idioma</span>
+      <select id="idioma">
+        <option value="es" lang="es">Español</option>
+        <option value="en" lang="en">English</option>
+        <option value="pt" lang="pt-BR">Português</option>
+      </select>
+    </label>
   </header>
   <main>
     <section id="bandeja" class="bandeja" aria-labelledby="bandeja-titulo">
       <div class="section-head">
-        <h1 id="bandeja-titulo">Bandeja</h1>
+        <h1 id="bandeja-titulo" data-i18n="inbox.title">Bandeja</h1>
         <div class="pager">
-          <button id="recargar-bandeja" type="button">Volver a cargar</button>
+          <button id="recargar-bandeja" type="button" data-i18n="inbox.reload">Volver a cargar</button>
         </div>
       </div>
-      <p id="bandeja-aviso" class="aviso">Cada solicitud muestra sus parámetros: la firma los cubre. El primer clic muestra el resumen y el segundo firma una sola decisión. «Aprobar y ejecutar» registra la aprobación y pide la única ejecución; si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.</p>
-      <p id="bandeja-estado" class="estado" role="status">Leyendo la bandeja…</p>
+      <p id="bandeja-aviso" class="aviso" data-i18n="notice.inbox_how_it_works">Cada solicitud muestra sus parámetros: la firma los cubre. El primer clic muestra el resumen y el segundo firma una sola decisión. «Aprobar y ejecutar» registra la aprobación y pide la única ejecución; si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.</p>
+      <p id="bandeja-estado" class="estado" role="status" data-i18n="inbox.loading">Leyendo la bandeja…</p>
       <ul id="solicitudes" class="lista"></ul>
     </section>
     <section id="paquete" class="paquete" aria-labelledby="paquete-titulo">
-      <h2 id="paquete-titulo" class="titulo-seccion">Paquete de compliance</h2>
-      <p class="aviso">Descarga un archivo comprimido (.tar.gz) para entregar a un auditor. Trae el registro firmado que lee esta consola, la política configurada y su digest, las claves públicas del atestador, las sumas SHA-256 de cada archivo y un LEEME.txt que explica cómo verificarlo con praetore-verify sin confiar en esta consola, y lo que el paquete no prueba. Si la consola tiene configuradas claves de ejecución o de aprobador, trae también approvals.jsonl, con los recibos de aprobación, rechazo, vencimiento y ejecución de cada solicitud retenida, y las claves públicas de ejecución y de aprobador que los verifican. Incluye la salida de cada acción ejecutada, que puede tener datos sensibles: revísela antes de entregar el paquete. No trae claves privadas. Descargarlo no cambia nada.</p>
-      <button id="descargar-paquete" type="button">Descargar paquete de compliance</button>
+      <h2 id="paquete-titulo" class="titulo-seccion" data-i18n="pack.title">Paquete de compliance</h2>
+      <p class="aviso" data-i18n="pack.notice">Descarga un archivo comprimido (.tar.gz) para entregar a un auditor. Trae el registro firmado que lee esta consola, la política configurada y su digest, las claves públicas del atestador, las sumas SHA-256 de cada archivo y un LEEME.txt que explica cómo verificarlo con praetore-verify sin confiar en esta consola, y lo que el paquete no prueba. Si la consola tiene configuradas claves de ejecución o de aprobador, trae también approvals.jsonl, con los recibos de aprobación, rechazo, vencimiento y ejecución de cada solicitud retenida, y las claves públicas de ejecución y de aprobador que los verifican. Incluye la salida de cada acción ejecutada, que puede tener datos sensibles: revísela antes de entregar el paquete. No trae claves privadas. Descargarlo no cambia nada.</p>
+      <button id="descargar-paquete" type="button" data-i18n="pack.download">Descargar paquete de compliance</button>
       <p id="paquete-estado" class="estado" role="status"></p>
     </section>
     <div class="section-head historial-head">
-      <h2 class="titulo-seccion">Historial</h2>
+      <h2 class="titulo-seccion" data-i18n="history.title">Historial</h2>
       <div class="pager">
-        <button id="anterior" type="button">Anteriores</button>
+        <button id="anterior" type="button" data-i18n="history.previous">Anteriores</button>
         <span id="pagina">Página 1</span>
-        <button id="siguiente" type="button">Siguientes</button>
+        <button id="siguiente" type="button" data-i18n="history.next">Siguientes</button>
       </div>
     </div>
-    <p id="aviso" class="aviso">Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.</p>
-    <p id="estado" class="estado" role="status">Leyendo el registro…</p>
+    <p id="aviso" class="aviso" data-i18n="notice.receipt_not_authorization">Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.</p>
+    <p id="estado" class="estado" role="status" data-i18n="history.loading">Leyendo el registro…</p>
     <form id="filtros" class="filters">
-      <label>Situación
+      <label><span data-i18n="filter.situation">Situación</span>
         <select name="situacion">
-          <option value="">Cualquier situación</option>
-          <option>permitido</option>
-          <option>denegado</option>
-          <option>aprobado</option>
-          <option>rechazado</option>
-          <option>expirado</option>
-          <option>pendiente de aprobación</option>
-          <option>aprobado, pendiente de ejecución</option>
-          <option>no se ejecutó</option>
+          <option value="" data-i18n="filter.any">Cualquier situación</option>
+          <option value="permitted" data-i18n="situation.permitted">permitido</option>
+          <option value="denied" data-i18n="situation.denied">denegado</option>
+          <option value="approved" data-i18n="situation.approved">aprobado</option>
+          <option value="rejected" data-i18n="situation.rejected">rechazado</option>
+          <option value="expired" data-i18n="situation.expired">expirado</option>
+          <option value="awaiting_approval" data-i18n="situation.awaiting_approval">pendiente de aprobación</option>
+          <option value="approved_pending_execution" data-i18n="situation.approved_pending_execution">aprobado, pendiente de ejecución</option>
+          <option value="not_executed" data-i18n="situation.not_executed">no se ejecutó</option>
         </select>
       </label>
-      <label>Desde<input name="desde" type="date"></label>
-      <label>Hasta<input name="hasta" type="date"></label>
-      <button type="submit">Ver</button>
+      <label><span data-i18n="filter.from">Desde (día UTC)</span><input name="desde" type="date"></label>
+      <label><span data-i18n="filter.until">Hasta (día UTC)</span><input name="hasta" type="date"></label>
+      <button type="submit" data-i18n="filter.submit">Ver</button>
     </form>
     <ul id="lista" class="lista"></ul>
     <section id="detalle" class="detail-panel hidden" aria-live="polite"></section>
     <footer>
-      <p>Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.</p>
+      <p data-i18n="notice.receipt_not_authorization">Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.</p>
       <small>© 2026 PRÆTOR TECHNOLOGIES · CHILE</small>
     </footer>
   </main>

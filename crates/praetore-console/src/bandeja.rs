@@ -4,10 +4,7 @@
 //! and until when. The browser never receives the journal keys: each pending
 //! request gets an opaque reference that only this process can resolve.
 
-use crate::{
-    confianza::EvidenceTrust,
-    historia::{quoted_text, readable_time},
-};
+use crate::{confianza::EvidenceTrust, historia::quoted_text};
 use praetore_core::Evidence;
 use praetore_gateway::{ApprovalChallenge, ExecutionKey, action_digest};
 use std::{
@@ -35,10 +32,11 @@ pub enum PendingKind {
 }
 
 impl PendingKind {
-    pub fn phrase(self) -> &'static str {
+    /// The code the page words as this request's situation.
+    pub fn situation(self) -> crate::codigos::Situation {
         match self {
-            Self::AwaitingApproval => "pendiente de aprobación",
-            Self::ApprovedPendingExecution => "aprobado, pendiente de ejecución",
+            Self::AwaitingApproval => crate::codigos::Situation::AwaitingApproval,
+            Self::ApprovedPendingExecution => crate::codigos::Situation::ApprovedPendingExecution,
         }
     }
 }
@@ -243,43 +241,6 @@ pub fn verified_challenge(
     let digest = action_digest(&evidence.action).map_err(|_| ())?;
     let challenge = ApprovalChallenge::from_evidence(&evidence, &digest).map_err(|_| ())?;
     Ok((evidence, digest, challenge))
-}
-
-/// Expiry with seconds: windows can be short.
-pub fn readable_deadline(moment: OffsetDateTime) -> String {
-    let moment = moment.to_offset(time::UtcOffset::UTC);
-    let minutes = readable_time(moment);
-    // "12 de noviembre de 2026, 15:04 UTC" -> "..., 15:04:09 UTC"
-    match minutes.strip_suffix(" UTC") {
-        Some(base) => format!("{base}:{:02} UTC", moment.second()),
-        None => minutes,
-    }
-}
-
-/// Plain words for the time left, from the console's clock. Informational:
-/// the gateway decides with its trusted clock.
-pub fn time_left(expires_at: OffsetDateTime, now: OffsetDateTime) -> String {
-    let left = expires_at - now;
-    let seconds = left.whole_seconds();
-    if seconds <= 0 {
-        "la ventana ya cerró".to_owned()
-    } else if seconds < 60 {
-        "quedan menos de un minuto".to_owned()
-    } else if seconds < 3600 {
-        let minutes = seconds / 60;
-        if minutes == 1 {
-            "queda 1 minuto".to_owned()
-        } else {
-            format!("quedan {minutes} minutos")
-        }
-    } else {
-        let hours = seconds / 3600;
-        if hours == 1 {
-            "queda más de 1 hora".to_owned()
-        } else {
-            format!("quedan más de {hours} horas")
-        }
-    }
 }
 
 /// What a reference resolves to. Only this process knows the mapping.
@@ -580,28 +541,20 @@ mod tests {
         assert!(parameters_shown(&json!({"cafe\u{301}": 1})).is_none());
     }
 
+    /// The deadline goes to the page as RFC 3339 in UTC with its seconds
+    /// (windows can be short); the page shows it with seconds, in local time
+    /// and in UTC, and counts the time left with its own clock
+    /// (`tests-js/hora.test.mjs`).
     #[test]
-    fn deadlines_are_words_with_seconds() {
+    fn deadlines_keep_their_seconds_for_the_page() {
+        use crate::codigos::utc_instant;
         assert_eq!(
-            readable_deadline(datetime!(2026-11-12 10:05:09 UTC)),
-            "12 de noviembre de 2026, 10:05:09 UTC"
-        );
-        let now = datetime!(2026-11-12 10:00 UTC);
-        assert_eq!(
-            time_left(datetime!(2026-11-12 10:00:30 UTC), now),
-            "quedan menos de un minuto"
+            utc_instant(datetime!(2026-11-12 10:05:09 UTC)),
+            "2026-11-12T10:05:09Z"
         );
         assert_eq!(
-            time_left(datetime!(2026-11-12 10:05:09 UTC), now),
-            "quedan 5 minutos"
-        );
-        assert_eq!(
-            time_left(datetime!(2026-11-12 13:00 UTC), now),
-            "quedan más de 3 horas"
-        );
-        assert_eq!(
-            time_left(datetime!(2026-11-12 09:00 UTC), now),
-            "la ventana ya cerró"
+            utc_instant(datetime!(2026-11-12 07:05:09 -3)),
+            "2026-11-12T10:05:09Z"
         );
     }
 }

@@ -17,6 +17,7 @@
 
 mod aprobador;
 mod bandeja;
+mod codigos;
 mod confianza;
 mod historia;
 mod lectura;
@@ -24,6 +25,8 @@ mod paquete;
 mod sesion;
 #[cfg(test)]
 mod tests_bandeja;
+#[cfg(test)]
+mod tests_i18n;
 #[cfg(test)]
 mod tests_paquete;
 
@@ -36,10 +39,14 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bandeja::{PendingFacts, References, readable_deadline, time_left};
+use bandeja::{INBOX_LIMIT, PendingFacts, References};
+use codigos::{
+    AgentView, ApiMessage, MessageCode, Notice, Placeholder, ShownText, Situation, Story,
+    utc_instant,
+};
 use historia::{
     ListRequest, NOTICE, RawQuery, ReceiptFacts, agent_label, page_window, prepare_detail_query,
-    prepare_query, readable_time, situation, story, visible_target, visible_wanted,
+    prepare_query, situation, story, visible_target, visible_wanted,
 };
 use serde::Serialize;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -61,7 +68,17 @@ pub use sesion::LocalSession;
 
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.js");
+const I18N_JS: &str = include_str!("../ui/i18n.js");
+const HORA_JS: &str = include_str!("../ui/hora.js");
 const APP_CSS: &str = include_str!("../ui/styles.css");
+
+/// The page's catalogs, one per language it offers. Presentation only:
+/// nothing the console signs, records or exports reads them.
+const CATALOGS: [(&str, &str); 3] = [
+    ("es", include_str!("../ui/i18n/es.json")),
+    ("en", include_str!("../ui/i18n/en.json")),
+    ("pt", include_str!("../ui/i18n/pt.json")),
+];
 
 pub struct ConsoleState {
     store: Arc<dyn HistoryStore>,
@@ -286,6 +303,9 @@ impl ConsoleState {
         Router::new()
             .route("/", get(index))
             .route("/app.js", get(app_js))
+            .route("/i18n.js", get(i18n_js))
+            .route("/hora.js", get(hora_js))
+            .route("/i18n/{archivo}", get(catalog))
             .route("/styles.css", get(app_css))
             .nest("/api", api.merge(open))
             .layer(middleware::from_fn_with_state(
@@ -306,10 +326,7 @@ async fn require_session(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
     if !state.session.accepts(authorization) {
-        return api_message(
-            StatusCode::UNAUTHORIZED,
-            "Hay que abrir esta página en este computador.",
-        );
+        return api_message(StatusCode::UNAUTHORIZED, MessageCode::SessionRequired);
     }
     next.run(request).await
 }
@@ -329,10 +346,7 @@ async fn require_own_host(
     if host.is_some_and(|host| state.hosts.iter().any(|own| own == host)) {
         next.run(request).await
     } else {
-        api_message(
-            StatusCode::MISDIRECTED_REQUEST,
-            "Esta consola no atiende ese nombre.",
-        )
+        api_message(StatusCode::MISDIRECTED_REQUEST, MessageCode::WrongHost)
     }
 }
 
@@ -421,25 +435,25 @@ async fn receipt_detail(
         Err(error) => return storage_error(error),
     };
     let Some(facts) = page.receipts.first() else {
-        return api_message(StatusCode::NOT_FOUND, "Ese recibo no está.");
+        return api_message(StatusCode::NOT_FOUND, MessageCode::ReceiptGone);
     };
     api_json(
         StatusCode::OK,
         DetailView {
             aviso: NOTICE,
-            cuando: readable_time(facts.created_at),
-            actualizado: readable_time(facts.updated_at),
+            cuando_utc: utc_instant(facts.created_at),
+            actualizado_utc: utc_instant(facts.updated_at),
             agente: agent_label(facts.agent_id, &state.names, &page.agents),
             queria: visible_wanted(facts),
             sobre: visible_target(facts),
-            situacion: situation(facts).phrase(),
+            situacion: situation(facts),
             relato: story(facts),
         },
     )
 }
 
-const INBOX_OFF: &str = "La bandeja de aprobaciones no está configurada en esta consola.";
-const INBOX_NOTICE: &str = "Cada solicitud muestra sus parámetros: la firma los cubre. El primer clic muestra el resumen y el segundo firma una sola decisión. «Aprobar y ejecutar» registra la aprobación y pide la única ejecución; si la ejecución no se puede hacer, la solicitud queda aprobada, pendiente de ejecución, y solo se reintenta la ejecución. Rechazar es final. La firma la hace esta consola en este computador; el registro y la ejecución los hace el sistema.";
+const INBOX_OFF: MessageCode = MessageCode::InboxOff;
+const INBOX_NOTICE: Notice = Notice::InboxHowItWorks;
 
 async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
     let Some(inbox) = &state.inbox else {
@@ -468,21 +482,21 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
         };
         solicitudes.push(InboxItemView {
             referencia,
-            situacion: facts.kind.phrase(),
-            pedida: readable_time(facts.created_at),
+            situacion: facts.kind.situation(),
+            pedida_utc: utc_instant(facts.created_at),
             agente: agent_label(facts.key.agent_id, &state.names, &page.agents),
             queria: if facts.wanted.is_empty() {
-                "no se muestra".to_owned()
+                ShownText::placeholder(Placeholder::NotShown)
             } else {
-                historia::quoted_text(&facts.wanted)
+                ShownText::text(historia::quoted_text(&facts.wanted))
             },
-            sobre: facts
-                .target
-                .as_deref()
-                .map(historia::quoted_text)
-                .unwrap_or_else(|| "sin objetivo indicado".to_owned()),
-            vale_hasta: readable_deadline(facts.expires_at),
-            queda: time_left(facts.expires_at, now),
+            sobre: facts.target.as_deref().map_or_else(
+                || ShownText::placeholder(Placeholder::NoTarget),
+                |target| ShownText::text(historia::quoted_text(target)),
+            ),
+            // The page counts the time left from this and its own clock:
+            // informational only, the gateway decides with its clock.
+            vale_hasta_utc: utc_instant(facts.expires_at),
             parametros: facts
                 .parameters
                 .iter()
@@ -504,7 +518,8 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             puede_aprobar: awaiting && facts.parameters.is_some(),
             puede_rechazar: awaiting,
             puede_ejecutar: facts.kind == PendingKind::ApprovedPendingExecution,
-            nota: (awaiting && facts.parameters.is_none()).then_some(PARAMETERS_TOO_BIG),
+            nota: (awaiting && facts.parameters.is_none())
+                .then_some(ApiMessage::new(PARAMETERS_TOO_BIG)),
         });
     }
     api_json(
@@ -515,11 +530,12 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
             vencidas,
             ilegibles: page.unreadable,
             hay_mas: page.truncated,
+            limite: INBOX_LIMIT,
         },
     )
 }
 
-const PACK_OFF: &str = "El paquete de compliance no está configurado en esta consola.";
+const PACK_OFF: MessageCode = MessageCode::PackOff;
 
 /// D3: read only. Asked for by the console's own page (the action header,
 /// and `Sec-Fetch-Site: same-origin` when the browser sends it), so another
@@ -528,16 +544,13 @@ const PACK_OFF: &str = "El paquete de compliance no está configurado en esta co
 /// file.
 async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMap) -> Response {
     if !same_page_read(&headers) {
-        return api_message(
-            StatusCode::FORBIDDEN,
-            "La descarga solo se pide desde la página de esta consola.",
-        );
+        return api_message(StatusCode::FORBIDDEN, MessageCode::PackPageOnly);
     }
     let Some(pack) = state.pack.clone() else {
         return api_message(StatusCode::SERVICE_UNAVAILABLE, PACK_OFF);
     };
     let Ok(permit) = Arc::clone(&state.pack_gate).try_acquire_owned() else {
-        return api_text(StatusCode::TOO_MANY_REQUESTS, PackError::Busy.message());
+        return api_message(StatusCode::TOO_MANY_REQUESTS, PackError::Busy.api_message());
     };
     let signer = state.inbox.as_ref().map(|inbox| Arc::clone(&inbox.signer));
     let built = tokio::task::spawn_blocking(move || {
@@ -547,11 +560,11 @@ async fn download_pack(State(state): State<Arc<ConsoleState>>, headers: HeaderMa
     .await;
     let bytes = match built {
         Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => return api_text(StatusCode::SERVICE_UNAVAILABLE, error.message()),
+        Ok(Err(error)) => return api_message(StatusCode::SERVICE_UNAVAILABLE, error.api_message()),
         Err(_) => {
-            return api_text(
+            return api_message(
                 StatusCode::SERVICE_UNAVAILABLE,
-                PackError::Archive.message(),
+                PackError::Archive.api_message(),
             );
         }
     };
@@ -577,14 +590,14 @@ async fn pack_status(State(state): State<Arc<ConsoleState>>) -> Response {
     struct PackStatus {
         configurado: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
-        mensaje: Option<&'static str>,
+        mensaje: Option<ApiMessage>,
     }
     let configurado = state.pack.is_some();
     api_json(
         StatusCode::OK,
         PackStatus {
             configurado,
-            mensaje: (!configurado).then_some(PACK_OFF),
+            mensaje: (!configurado).then_some(ApiMessage::new(PACK_OFF)),
         },
     )
 }
@@ -644,16 +657,10 @@ async fn act(
         return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
     };
     if !same_page(&state, &headers) {
-        return api_message(
-            StatusCode::FORBIDDEN,
-            "Esta acción solo se acepta desde la página de la consola.",
-        );
+        return api_message(StatusCode::FORBIDDEN, MessageCode::ActionPageOnly);
     }
     let Some(pending) = inbox.references.resolve(&referencia) else {
-        return api_message(
-            StatusCode::NOT_FOUND,
-            "Esa solicitud ya no está en la bandeja. Vuelve a cargarla.",
-        );
+        return api_message(StatusCode::NOT_FOUND, MessageCode::RequestGone);
     };
     if matches!(
         what,
@@ -663,8 +670,8 @@ async fn act(
         return api_json(
             StatusCode::OK,
             ActOutcome {
-                situacion: "sin cambios",
-                mensaje: PARAMETERS_TOO_BIG,
+                situacion: codigos::OutcomeState::Unchanged,
+                mensaje: ApiMessage::new(PARAMETERS_TOO_BIG),
                 puede_ejecutar: false,
             },
         );
@@ -685,7 +692,7 @@ async fn act(
             tracing::error!(failure = "gateway_worker", "console action failed");
             api_message(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.",
+                MessageCode::OutcomeUnknownCheckHistory,
             )
         }
     }
@@ -713,16 +720,16 @@ fn receipt_view(
 ) -> ReceiptView {
     ReceiptView {
         abrir,
-        cuando: readable_time(facts.created_at),
+        cuando_utc: utc_instant(facts.created_at),
         agente: agent_label(facts.agent_id, names, agents),
         queria: visible_wanted(facts),
         sobre: visible_target(facts),
-        situacion: situation(facts).phrase(),
+        situacion: situation(facts),
     }
 }
 
 fn bad_query() -> Response {
-    api_message(StatusCode::BAD_REQUEST, "Esa consulta no se entiende.")
+    api_message(StatusCode::BAD_REQUEST, MessageCode::BadQuery)
 }
 
 fn storage_error(error: HistoryError) -> Response {
@@ -735,7 +742,7 @@ fn storage_error(error: HistoryError) -> Response {
     );
     api_message(
         StatusCode::SERVICE_UNAVAILABLE,
-        "No se pudo leer el registro.",
+        MessageCode::JournalUnreadable,
     )
 }
 
@@ -767,25 +774,19 @@ async fn open_session(
     payload: Result<Json<OpenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if !same_page(&state, &headers) {
-        return api_message(
-            StatusCode::FORBIDDEN,
-            "La apertura solo se pide desde la página de esta consola.",
-        );
+        return api_message(StatusCode::FORBIDDEN, MessageCode::OpeningPageOnly);
     }
     let Ok(Json(payload)) = payload else {
-        return api_message(StatusCode::BAD_REQUEST, "No se entiende la apertura.");
+        return api_message(StatusCode::BAD_REQUEST, MessageCode::OpeningUnreadable);
     };
     if payload.codigo.len() > 128 || !state.opener.redeem(&payload.codigo) {
         tracing::warn!(failure = "opening_code", "console opening link refused");
-        return api_message(
-            StatusCode::UNAUTHORIZED,
-            "El enlace de apertura no es válido o ya se usó.",
-        );
+        return api_message(StatusCode::UNAUTHORIZED, MessageCode::OpeningRefused);
     }
     let Some(token) = state.session.issue() else {
         return api_message(
             StatusCode::SERVICE_UNAVAILABLE,
-            "No se pudo abrir la sesión local.",
+            MessageCode::SessionUnavailable,
         );
     };
     api_json(StatusCode::OK, OpenReply { token })
@@ -793,6 +794,32 @@ async fn open_session(
 
 async fn app_js() -> Response {
     static_response(StatusCode::OK, "text/javascript; charset=utf-8", APP_JS)
+}
+
+async fn i18n_js() -> Response {
+    static_response(StatusCode::OK, "text/javascript; charset=utf-8", I18N_JS)
+}
+
+async fn hora_js() -> Response {
+    static_response(StatusCode::OK, "text/javascript; charset=utf-8", HORA_JS)
+}
+
+/// `GET /i18n/{es,en,pt}.json`: one of the embedded catalogs, with the same
+/// headers as the scripts. The name is only compared with the fixed list;
+/// it never becomes a file path. Anything else is 404.
+async fn catalog(Path(archivo): Path<String>) -> Response {
+    match catalog_for(&archivo) {
+        Some(body) => static_response(StatusCode::OK, "application/json; charset=utf-8", body),
+        None => static_response(StatusCode::NOT_FOUND, "text/plain; charset=utf-8", ""),
+    }
+}
+
+fn catalog_for(archivo: &str) -> Option<&'static str> {
+    let language = archivo.strip_suffix(".json")?;
+    CATALOGS
+        .iter()
+        .find(|(code, _)| *code == language)
+        .map(|(_, body)| *body)
 }
 
 async fn app_css() -> Response {
@@ -811,22 +838,23 @@ fn api_json<T: Serialize>(status: StatusCode, body: T) -> Response {
     response
 }
 
-fn api_message(status: StatusCode, mensaje: &'static str) -> Response {
-    api_text(status, mensaje.into())
-}
-
-fn api_text(status: StatusCode, mensaje: std::borrow::Cow<'static, str>) -> Response {
-    api_json(status, Message { mensaje })
+fn api_message(status: StatusCode, mensaje: impl Into<ApiMessage>) -> Response {
+    api_json(
+        status,
+        Message {
+            mensaje: mensaje.into(),
+        },
+    )
 }
 
 #[derive(Serialize)]
 struct Message {
-    mensaje: std::borrow::Cow<'static, str>,
+    mensaje: ApiMessage,
 }
 
 #[derive(Serialize)]
 struct ListView {
-    aviso: &'static str,
+    aviso: Notice,
     total: i64,
     pagina: u32,
     paginas: u32,
@@ -836,28 +864,28 @@ struct ListView {
 #[derive(Serialize)]
 struct ReceiptView {
     abrir: u64,
-    cuando: String,
-    agente: String,
-    queria: String,
-    sobre: String,
-    situacion: &'static str,
+    cuando_utc: String,
+    agente: AgentView,
+    queria: ShownText,
+    sobre: ShownText,
+    situacion: Situation,
 }
 
 #[derive(Serialize)]
 struct DetailView {
-    aviso: &'static str,
-    cuando: String,
-    actualizado: String,
-    agente: String,
-    queria: String,
-    sobre: String,
-    situacion: &'static str,
-    relato: &'static str,
+    aviso: Notice,
+    cuando_utc: String,
+    actualizado_utc: String,
+    agente: AgentView,
+    queria: ShownText,
+    sobre: ShownText,
+    situacion: Situation,
+    relato: Story,
 }
 
 #[derive(Serialize)]
 struct InboxView {
-    aviso: &'static str,
+    aviso: Notice,
     solicitudes: Vec<InboxItemView>,
     /// Pending in the journal, window already closed: not offered.
     vencidas: u32,
@@ -865,18 +893,19 @@ struct InboxView {
     ilegibles: u32,
     /// Older requests wait beyond what one read shows.
     hay_mas: bool,
+    /// How many requests one read shows.
+    limite: u32,
 }
 
 #[derive(Serialize)]
 struct InboxItemView {
     referencia: String,
-    situacion: &'static str,
-    pedida: String,
-    agente: String,
-    queria: String,
-    sobre: String,
-    vale_hasta: String,
-    queda: String,
+    situacion: Situation,
+    pedida_utc: String,
+    agente: AgentView,
+    queria: ShownText,
+    sobre: ShownText,
+    vale_hasta_utc: String,
     /// `clave: valor` lines, keys sorted. Empty with `parametros_visibles`
     /// false when they do not fit the inbox.
     parametros: Vec<ParameterView>,
@@ -885,7 +914,7 @@ struct InboxItemView {
     puede_rechazar: bool,
     puede_ejecutar: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    nota: Option<&'static str>,
+    nota: Option<ApiMessage>,
 }
 
 #[derive(Serialize)]
@@ -899,7 +928,7 @@ struct ParameterView {
     lista: Option<Vec<String>>,
 }
 
-const PARAMETERS_TOO_BIG: &str = "Los parámetros de esta solicitud no se pueden mostrar aquí sin ambigüedad (más de 20 líneas, valores de más de 200 caracteres, más de 2 niveles, claves con punto o repetidas, o texto Unicode no normalizado). Aquí solo se puede rechazar; para revisarla completa y aprobarla usa praetore approve en la terminal.";
+const PARAMETERS_TOO_BIG: MessageCode = MessageCode::ParametersNotShown;
 
 fn set_security_headers(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1145,16 +1174,41 @@ mod tests {
         let response = app.clone().oneshot(page("/".to_owned())).await.unwrap();
         let html = body_text(response).await;
         assert!(!html.contains(&token));
-        assert!(html.contains("Historial"));
-        assert!(html.contains("Bandeja"));
-        assert!(html.contains(NOTICE));
-        assert!(html.contains("pendiente de aprobación"));
-        assert!(html.contains("aprobado, pendiente de ejecución"));
+        // Spanish stays the page's initial text, so it reads even without a
+        // catalog; each text carries its key.
+        let es = crate::tests_i18n::es;
+        assert!(html.contains(&format!(">{}</h2>", es("history.title"))));
+        assert!(html.contains(&format!(">{}</h1>", es("inbox.title"))));
+        assert!(html.contains(&es("notice.receipt_not_authorization")));
+        assert!(html.contains("<html lang=\"es\">"));
+        // The filter sends codes; the option shows the words.
+        for situation in [
+            Situation::AwaitingApproval,
+            Situation::ApprovedPendingExecution,
+        ] {
+            let code = situation.code();
+            assert!(
+                html.contains(&format!(
+                    "<option value=\"{code}\" data-i18n=\"situation.{code}\">{}</option>",
+                    es(&format!("situation.{code}"))
+                )),
+                "{code}"
+            );
+        }
+        // The language selector, each name in its own language.
+        for option in [
+            "<option value=\"es\" lang=\"es\">Español</option>",
+            "<option value=\"en\" lang=\"en\">English</option>",
+            "<option value=\"pt\" lang=\"pt-BR\">Português</option>",
+        ] {
+            assert!(html.contains(option), "{option}");
+        }
+        assert!(html.contains("<script type=\"module\" src=\"app.js\"></script>"));
+        assert!(!html.contains("<script>"));
         assert!(!html.to_lowercase().contains("bearer"));
         assert!(!html.contains("password"));
         assert!(!html.contains("RFC"));
         assert!(!html.contains("UUID"));
-        assert!(!html.contains("awaiting_approval"));
         // The only download is D3's compliance package.
         assert_eq!(html.matches("<button").count(), 5, "{html}");
         assert!(html.contains(">Descargar paquete de compliance</button>"));
@@ -1169,16 +1223,146 @@ mod tests {
             .await
             .unwrap();
         let script = body_text(script).await;
-        assert!(!script.contains("innerHTML"));
         assert!(script.contains(ACTION_HEADER));
         // The token is kept in sessionStorage (per-origin, port included),
         // sent as Authorization, never in localStorage or a cookie.
         assert!(script.contains("sessionStorage"));
         assert!(script.contains("Authorization"));
         assert!(script.contains("history.replaceState"));
-        assert!(!script.contains("localStorage"));
         assert!(!script.contains("praetore_consola"));
-        assert!(!script.contains("document.cookie"));
+        // localStorage holds the language choice only, never the session.
+        let uses: Vec<&str> = script.split("localStorage.").skip(1).collect();
+        assert_eq!(uses.len(), 2, "{uses:?}");
+        for usage in uses {
+            assert!(
+                usage.starts_with("getItem(LLAVE_IDIOMA)")
+                    || usage.starts_with("setItem(LLAVE_IDIOMA, valor)"),
+                "{}",
+                &usage[..40.min(usage.len())]
+            );
+        }
+        assert!(I18N_JS.contains("export const LLAVE_IDIOMA = \"praetore_idioma\";"));
+        // No request carries the language.
+        assert!(!script.to_lowercase().contains("accept-language"));
+        for script in [script.as_str(), I18N_JS, HORA_JS] {
+            assert!(!script.contains("innerHTML"));
+            assert!(!script.contains("outerHTML"));
+            assert!(!script.contains("insertAdjacentHTML"));
+            assert!(!script.contains("createContextualFragment"));
+            assert!(!script.contains("DOMParser"));
+            assert!(!script.contains("setHTML"));
+            assert!(!script.contains("srcdoc"));
+            assert!(!script.contains("eval("));
+            assert!(!script.contains("new Function"));
+            assert!(!script.contains("document.write"));
+            assert!(!script.contains("document.cookie"));
+        }
+    }
+
+    fn plain_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::HOST, "127.0.0.1:8090")
+            .header(header::ACCEPT_LANGUAGE, "pt-BR,pt;q=0.9")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// The catalogs are served like the scripts: fixed bytes, the same
+    /// security headers, no cookie, no session needed. Only es, en and pt;
+    /// the name is compared with that list and never read as a path.
+    #[tokio::test]
+    async fn the_catalogs_are_served_like_the_scripts_and_nothing_else_is() {
+        let (app, store) = app(Vec::new());
+        let script = app.clone().oneshot(plain_get("/app.js")).await.unwrap();
+        let expected: Vec<(String, String)> = [
+            header::CACHE_CONTROL,
+            header::X_CONTENT_TYPE_OPTIONS,
+            header::REFERRER_POLICY,
+            header::CONTENT_SECURITY_POLICY,
+        ]
+        .iter()
+        .map(|name| {
+            (
+                name.to_string(),
+                script.headers()[name].to_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+        assert!(
+            expected
+                .iter()
+                .any(|(_, value)| value.contains("script-src 'self'"))
+        );
+        for (language, catalog) in CATALOGS {
+            let response = app
+                .clone()
+                .oneshot(plain_get(&format!("/i18n/{language}.json")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{language}");
+            for (name, value) in &expected {
+                assert_eq!(
+                    response.headers()[name.as_str()],
+                    value.as_str(),
+                    "{language} {name}"
+                );
+            }
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "application/json; charset=utf-8"
+            );
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            assert!(response.headers().get(header::CONTENT_LANGUAGE).is_none());
+            assert!(response.headers().get(header::VARY).is_none());
+            let body = body_text(response).await;
+            assert_eq!(body, catalog);
+            serde_json::from_str::<Value>(&body).unwrap();
+        }
+        for script in ["/i18n.js", "/hora.js"] {
+            let response = app.clone().oneshot(plain_get(script)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{script}");
+            for (name, value) in &expected {
+                assert_eq!(
+                    response.headers()[name.as_str()],
+                    value.as_str(),
+                    "{script}"
+                );
+            }
+        }
+        for uri in [
+            "/i18n/de.json",
+            "/i18n/../es.json",
+            "/i18n/..%2Fes.json",
+            "/i18n/%2E%2E%2Fes.json",
+            "/i18n/es",
+            "/i18n/es.json.json",
+            "/i18n/ES.json",
+            "/i18n/es.json%00",
+            "/i18n/.json",
+            "/i18n/",
+            "/i18n",
+            "/i18n/es.json/",
+            "/i18n/pt-BR.json",
+            "/ui/i18n/es.json",
+        ] {
+            let response = app.clone().oneshot(plain_get(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                response.headers().get(header::SET_COOKIE).is_none(),
+                "{uri}"
+            );
+            let body = body_text(response).await;
+            assert!(!body.contains("situation."), "{uri}");
+        }
+        // `de` and `es.json` in the route's own terms: not names it serves.
+        assert_eq!(catalog_for("de"), None);
+        assert_eq!(catalog_for("es"), None);
+        assert_eq!(catalog_for("es.json.json"), None);
+        assert_eq!(catalog_for(""), None);
+        assert_eq!(catalog_for("../es.json"), None);
+        assert_eq!(catalog_for("es.json"), Some(CATALOGS[0].1));
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
     }
 
     fn read_with_token(token: &str) -> Request<Body> {
@@ -1321,11 +1505,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let list: Value = serde_json::from_str(&body_text(response).await).unwrap();
         assert_eq!(list["total"], 2);
-        assert_eq!(list["recibos"][0]["situacion"], "permitido");
-        assert_eq!(list["recibos"][0]["sobre"], "informe-trimestral");
-        assert_eq!(list["recibos"][1]["situacion"], "no se puede leer");
-        assert_eq!(list["recibos"][1]["sobre"], "no se muestra");
-        assert_eq!(list["recibos"][1]["queria"], "no se muestra");
+        assert_eq!(list["recibos"][0]["situacion"], "permitted");
+        assert_eq!(
+            list["recibos"][0]["sobre"],
+            json!({"texto": "informe-trimestral"})
+        );
+        assert_eq!(list["recibos"][1]["situacion"], "unreadable");
+        assert_eq!(list["recibos"][1]["sobre"], json!({"codigo": "not_shown"}));
+        assert_eq!(list["recibos"][1]["queria"], json!({"codigo": "not_shown"}));
     }
 
     #[tokio::test]
@@ -1366,43 +1553,53 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let text = body_text(response).await;
         let list: Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(list["recibos"][0]["situacion"], "pendiente de aprobación");
-        assert_eq!(list["recibos"][0]["sobre"], "informe-trimestral");
-        assert_eq!(list["recibos"][0]["queria"], "escribir_archivo");
+        assert_eq!(list["recibos"][0]["situacion"], "awaiting_approval");
         assert_eq!(
-            list["recibos"][0]["cuando"],
-            "24 de octubre de 2026, 15:04 UTC"
+            list["recibos"][0]["sobre"],
+            json!({"texto": "informe-trimestral"})
         );
+        assert_eq!(
+            list["recibos"][0]["queria"],
+            json!({"texto": "escribir_archivo"})
+        );
+        // The instant, for the page to word in local time and UTC.
+        assert_eq!(list["recibos"][0]["cuando_utc"], "2026-10-24T15:04:00Z");
         assert_eq!(
             list["recibos"][1]["situacion"],
-            "aprobado, pendiente de ejecución"
+            "approved_pending_execution"
         );
-        assert_eq!(list["recibos"][1]["sobre"], "archivo-viejo");
-        assert_eq!(list["recibos"][2]["situacion"], "denegado");
-        assert!(text.contains(NOTICE));
+        assert_eq!(
+            list["recibos"][1]["sobre"],
+            json!({"texto": "archivo-viejo"})
+        );
+        assert_eq!(list["recibos"][2]["situacion"], "denied");
+        assert_eq!(list["aviso"], "receipt_not_authorization");
         assert!(!text.contains("parameter-secret"));
         assert!(!text.contains("context-secret"));
         assert!(!text.contains("motivo-interno"));
-        assert!(!text.contains("awaiting_approval"));
         assert!(!text.contains(&agent_id.to_string()));
         assert!(!text.contains(&request_id.to_string()));
-        assert!(!text.contains("2026-10-24T"));
         assert!(agent_label_is_plain(&list["recibos"][0]["agente"]));
 
-        let filtered = app
-            .clone()
-            .oneshot(authed(
-                "/api/historial?situacion=pendiente%20de%20aprobaci%C3%B3n",
-            ))
-            .await
-            .unwrap();
-        let filtered: Value = serde_json::from_str(&body_text(filtered).await).unwrap();
+        // The code the page sends and the Spanish phrase it sent before
+        // give the same answer.
+        let mut answers = Vec::new();
+        for uri in [
+            "/api/historial?situacion=awaiting_approval",
+            "/api/historial?situacion=pendiente%20de%20aprobaci%C3%B3n",
+        ] {
+            let response = app.clone().oneshot(authed(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            answers.push(body_text(response).await);
+        }
+        assert_eq!(answers[0], answers[1]);
+        let filtered: Value = serde_json::from_str(&answers[0]).unwrap();
         assert_eq!(filtered["total"], 1);
-        assert_eq!(filtered["recibos"][0]["sobre"], "informe-trimestral");
         assert_eq!(
-            filtered["recibos"][0]["situacion"],
-            "pendiente de aprobación"
+            filtered["recibos"][0]["sobre"],
+            json!({"texto": "informe-trimestral"})
         );
+        assert_eq!(filtered["recibos"][0]["situacion"], "awaiting_approval");
 
         let pending_execution = app
             .clone()
@@ -1415,10 +1612,13 @@ mod tests {
         let pending_execution: Value =
             serde_json::from_str(&body_text(pending_execution).await).unwrap();
         assert_eq!(pending_execution["total"], 1);
-        assert_eq!(pending_execution["recibos"][0]["sobre"], "archivo-viejo");
+        assert_eq!(
+            pending_execution["recibos"][0]["sobre"],
+            json!({"texto": "archivo-viejo"})
+        );
         assert_eq!(
             pending_execution["recibos"][0]["situacion"],
-            "aprobado, pendiente de ejecución"
+            "approved_pending_execution"
         );
 
         let approved_only = app
@@ -1437,27 +1637,28 @@ mod tests {
         assert_eq!(detail.status(), StatusCode::OK);
         let detail_text = body_text(detail).await;
         let detail: Value = serde_json::from_str(&detail_text).unwrap();
-        assert_eq!(detail["situacion"], "pendiente de aprobación");
-        assert_eq!(detail["sobre"], "informe-trimestral");
-        assert_eq!(detail["queria"], "escribir_archivo");
+        assert_eq!(detail["situacion"], "awaiting_approval");
+        assert_eq!(detail["sobre"], json!({"texto": "informe-trimestral"}));
+        assert_eq!(detail["queria"], json!({"texto": "escribir_archivo"}));
+        assert_eq!(detail["relato"], "awaiting_approval");
         assert!(
-            detail["relato"]
-                .as_str()
-                .unwrap()
-                .contains("pendiente de aprobación")
+            crate::tests_i18n::es("story.awaiting_approval").contains("pendiente de aprobación")
         );
-        assert_eq!(detail["aviso"], NOTICE);
+        assert_eq!(detail["aviso"], "receipt_not_authorization");
+        assert_eq!(detail["cuando_utc"], "2026-10-24T15:04:00Z");
+        assert_eq!(detail["actualizado_utc"], "2026-10-24T15:04:00Z");
         assert!(!detail_text.contains("parameter-secret"));
         assert!(!detail_text.contains(&agent_id.to_string()));
         assert!(!detail_text.contains(&request_id.to_string()));
-        assert_eq!(store.reads.load(Ordering::SeqCst), 5);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 6);
     }
 
     #[tokio::test]
     async fn technical_filters_and_mutations_are_refused() {
         let (app, store) = app(Vec::new());
         for uri in [
-            "/api/historial?situacion=awaiting_approval",
+            "/api/historial?situacion=unreadable",
+            "/api/historial?situacion=awaiting%20approval",
             "/api/historial?desde=2026-10-24T00:00:00Z&hasta=2026-10-25T00:00:00Z",
             "/api/historial?pagina=0",
             "/api/historial?tenant_id=1",
@@ -1514,7 +1715,8 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
         assert!(missing.headers().get(header::WWW_AUTHENTICATE).is_none());
         let text = body_text(missing).await;
-        assert!(text.contains("este computador"));
+        assert!(text.contains("\"codigo\":\"session_required\""), "{text}");
+        assert!(crate::tests_i18n::es("message.session_required").contains("este computador"));
         assert!(!text.to_lowercase().contains("bearer"));
         // A cookie carrying the live token, with no Authorization header, is
         // refused: there is no ambient cookie path.
@@ -1549,10 +1751,8 @@ mod tests {
     }
 
     fn agent_label_is_plain(value: &Value) -> bool {
-        let Some(label) = value.as_str() else {
-            return false;
-        };
-        label.starts_with("Agente") && Uuid::parse_str(label).is_err()
+        // A number for the page to word ("Agente 1"), never an id.
+        value.get("nombre").is_none() && value["numero"].as_u64().is_some_and(|n| n >= 1)
     }
 
     fn signed_evidence() -> (String, Uuid, Uuid) {

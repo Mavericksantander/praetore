@@ -366,15 +366,31 @@ async fn first_reference(app: &Router) -> String {
 }
 
 fn looks_technical(text: &str) -> bool {
-    // UUIDs, 32+ hex runs, RFC 3339 instants.
+    // UUIDs and 32+ hex runs: journal keys and digests never reach the page.
     let hex_run = text
         .split(|c: char| !c.is_ascii_hexdigit())
         .any(|run| run.len() >= 32);
     let uuid = text
         .split(|c: char| !(c.is_ascii_hexdigit() || c == '-'))
         .any(|word| Uuid::parse_str(word).is_ok());
-    let rfc3339 = text.contains("T") && text.contains("Z\"") && text.contains(":");
-    hex_run || uuid || rfc3339
+    hex_run || uuid || !instants_only_in_utc_fields(text)
+}
+
+/// RFC 3339 instants go to the page only in the `*_utc` fields, which the
+/// page words in local time and UTC.
+fn instants_only_in_utc_fields(text: &str) -> bool {
+    fn walk(key: &str, value: &Value) -> bool {
+        match value {
+            Value::String(text) => {
+                let instant = OffsetDateTime::parse(text, &Rfc3339).is_ok();
+                !instant || (key.ends_with("_utc") && text.ends_with('Z'))
+            }
+            Value::Array(items) => items.iter().all(|item| walk(key, item)),
+            Value::Object(fields) => fields.iter().all(|(key, value)| walk(key, value)),
+            _ => true,
+        }
+    }
+    serde_json::from_str::<Value>(text).is_ok_and(|value| walk("", &value))
 }
 
 #[tokio::test]
@@ -402,13 +418,29 @@ async fn the_inbox_says_who_what_on_what_and_until_when_in_plain_words() {
         json_of(app.clone().oneshot(get("/api/bandeja")).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK);
     let first = &list["solicitudes"][0];
-    assert_eq!(first["situacion"], "pendiente de aprobación");
-    assert_eq!(first["queria"], "\"borrar_archivo\"");
-    assert_eq!(first["sobre"], "\"informe-trimestral\"");
-    assert!(first["agente"].as_str().unwrap().starts_with("Agente"));
-    assert!(first["vale_hasta"].as_str().unwrap().ends_with(" UTC"));
-    assert!(first["vale_hasta"].as_str().unwrap().contains(" de "));
-    assert!(first["queda"].as_str().unwrap().starts_with("queda"));
+    // Codes and instants: the page words them in the operator's language.
+    assert_eq!(first["situacion"], "awaiting_approval");
+    assert_eq!(first["queria"], json!({"texto": "\"borrar_archivo\""}));
+    assert_eq!(first["sobre"], json!({"texto": "\"informe-trimestral\""}));
+    // Its number among the agents of this read; the page says "Agente N".
+    assert!(first["agente"].get("nombre").is_none());
+    assert!(
+        first["agente"]["numero"]
+            .as_u64()
+            .is_some_and(|number| (1..=3).contains(&number)),
+        "{}",
+        first["agente"]
+    );
+    let deadline = first["vale_hasta_utc"].as_str().unwrap();
+    assert_eq!(
+        OffsetDateTime::parse(deadline, &Rfc3339).unwrap(),
+        in_ten.replace_nanosecond(0).unwrap()
+    );
+    assert!(deadline.ends_with('Z'), "{deadline}");
+    assert!(first["pedida_utc"].as_str().unwrap().ends_with('Z'));
+    // The time left is counted by the page from its own clock.
+    assert!(first.get("queda").is_none());
+    assert!(first.get("vale_hasta").is_none());
     assert_eq!(first["puede_aprobar"], true);
     assert_eq!(first["puede_rechazar"], true);
     assert_eq!(first["parametros_visibles"], true);
@@ -419,16 +451,20 @@ async fn the_inbox_says_who_what_on_what_and_until_when_in_plain_words() {
     assert!(first.get("nota").is_none());
     assert_eq!(first["puede_ejecutar"], false);
     let second = &list["solicitudes"][1];
-    assert_eq!(second["situacion"], "aprobado, pendiente de ejecución");
+    assert_eq!(second["situacion"], "approved_pending_execution");
     assert_eq!(second["puede_aprobar"], false);
     assert_eq!(second["puede_rechazar"], false);
     assert_eq!(second["puede_ejecutar"], true);
     assert_eq!(list["solicitudes"].as_array().unwrap().len(), 2);
     assert_eq!(list["vencidas"], 1);
     assert_eq!(list["ilegibles"], 1);
+    assert_eq!(list["aviso"], "inbox_how_it_works");
+    assert_eq!(list["limite"], 200);
+    assert_eq!(list["hay_mas"], false);
     assert!(!text.contains("motivo-interno"));
-    assert!(!text.contains("awaiting_approval"));
+    // The gateway's own state names are not the page's codes.
     assert!(!text.contains("approved_pending_dispatch"));
+    assert!(!text.contains("requires_approval"));
     assert!(!looks_technical(&text), "{text}");
     // Reading the inbox never talks to the gateway.
     assert!(gateway.calls().is_empty());
@@ -457,7 +493,7 @@ async fn approve_then_execute_signs_once_on_the_server_and_dispatches_once() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(approved["situacion"], "aprobado, pendiente de ejecución");
+    assert_eq!(approved["situacion"], "approved_pending_execution");
     assert_eq!(approved["puede_ejecutar"], true);
     assert!(!looks_technical(&text));
     assert!(!text.contains("signature"));
@@ -477,12 +513,10 @@ async fn approve_then_execute_signs_once_on_the_server_and_dispatches_once() {
             .unwrap(),
     )
     .await;
-    assert_eq!(again["situacion"], "sin cambios");
+    assert_eq!(again["situacion"], "unchanged");
+    assert_eq!(again["mensaje"]["codigo"], "already_decided_nothing_signed");
     assert!(
-        again["mensaje"]
-            .as_str()
-            .unwrap()
-            .contains("ya tiene una decisión")
+        crate::tests_i18n::es_json_message(&again["mensaje"]).contains("ya tiene una decisión")
     );
     assert_eq!(gateway.state.lock().unwrap().decisions.len(), 1);
 
@@ -493,7 +527,7 @@ async fn approve_then_execute_signs_once_on_the_server_and_dispatches_once() {
             .unwrap(),
     )
     .await;
-    assert_eq!(executed["situacion"], "aprobado");
+    assert_eq!(executed["situacion"], "approved");
     assert_eq!(executed["puede_ejecutar"], false);
     assert_eq!(gateway.held(), Held::Dispatched);
 
@@ -538,7 +572,7 @@ async fn a_failed_dispatch_stays_approved_and_only_the_dispatch_is_retried() {
             .unwrap(),
     )
     .await;
-    assert_eq!(failed["situacion"], "aprobado, pendiente de ejecución");
+    assert_eq!(failed["situacion"], "approved_pending_execution");
     assert_eq!(failed["puede_ejecutar"], true);
     assert_eq!(gateway.held(), Held::Approved);
     let (_, retried, _) = json_of(
@@ -548,7 +582,7 @@ async fn a_failed_dispatch_stays_approved_and_only_the_dispatch_is_retried() {
             .unwrap(),
     )
     .await;
-    assert_eq!(retried["situacion"], "aprobado");
+    assert_eq!(retried["situacion"], "approved");
     assert_eq!(gateway.held(), Held::Dispatched);
     assert_eq!(
         gateway.calls(),
@@ -578,7 +612,7 @@ async fn a_rejection_is_final_and_never_executes() {
             .unwrap(),
     )
     .await;
-    assert_eq!(rejected["situacion"], "rechazado");
+    assert_eq!(rejected["situacion"], "rejected");
     assert_eq!(rejected["puede_ejecutar"], false);
     let (_, approve_after, _) = json_of(
         app.clone()
@@ -587,7 +621,7 @@ async fn a_rejection_is_final_and_never_executes() {
             .unwrap(),
     )
     .await;
-    assert_eq!(approve_after["situacion"], "sin cambios");
+    assert_eq!(approve_after["situacion"], "unchanged");
     let _ = app
         .clone()
         .oneshot(post(&format!("/api/bandeja/{reference}/ejecutar")))
@@ -621,13 +655,8 @@ async fn nothing_is_signed_when_the_gateway_shows_another_action() {
             .unwrap(),
     )
     .await;
-    assert_eq!(refused["situacion"], "sin cambios");
-    assert!(
-        refused["mensaje"]
-            .as_str()
-            .unwrap()
-            .contains("No se firmó nada")
-    );
+    assert_eq!(refused["situacion"], "unchanged");
+    assert!(crate::tests_i18n::es_json_message(&refused["mensaje"]).contains("No se firmó nada"));
     assert_eq!(gateway.calls(), vec!["challenge"]);
     assert_eq!(gateway.held(), Held::Pending);
 }
@@ -652,7 +681,7 @@ fn nothing_is_signed_when_the_challenge_commits_to_another_action_than_the_one_s
         &pending,
         praetore_gateway::HumanApprovalOutcome::Approve,
     );
-    assert_eq!(outcome.situacion, "sin cambios");
+    assert_eq!(outcome.situacion, codigos::OutcomeState::Unchanged);
     assert_eq!(gateway.calls(), vec!["challenge"]);
 }
 
@@ -754,12 +783,8 @@ async fn without_an_approver_the_inbox_is_off_and_nothing_mutates() {
     .router();
     let (status, body, _) = json_of(app.clone().oneshot(get("/api/bandeja")).await.unwrap()).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        body["mensaje"]
-            .as_str()
-            .unwrap()
-            .contains("no está configurada")
-    );
+    assert_eq!(body["mensaje"]["codigo"], "inbox_off");
+    assert!(crate::tests_i18n::es_json_message(&body["mensaje"]).contains("no está configurada"));
     let response = app
         .oneshot(post("/api/bandeja/abcdefghjkmnpqrstuvw/aprobar"))
         .await
@@ -809,7 +834,8 @@ fn outcomes_never_offer_a_second_decision() {
         assert!(!outcome.puede_ejecutar, "{outcome:?}");
         assert!(gateway.0.lock().unwrap().is_empty());
     }
-    const STILL: &str = "aprobado, pendiente de ejecución";
+    use codigos::OutcomeState;
+    const STILL: OutcomeState = OutcomeState::ApprovedPendingExecution;
     for (reply, retry, situacion) in [
         (GatewayReply::NotSent, true, STILL),
         (
@@ -824,54 +850,55 @@ fn outcomes_never_offer_a_second_decision() {
         ),
         // These may come after the effect: never "sin ejecutar". Retrying
         // is safe, the gateway claims the dispatch once.
-        (GatewayReply::Unconfirmed, true, "sin confirmar"),
+        (GatewayReply::Unconfirmed, true, OutcomeState::Unconfirmed),
         (
             answered(503, json!({"code": "execution_state_unavailable"})),
             true,
-            "sin confirmar",
+            OutcomeState::Unconfirmed,
         ),
         (
             answered(503, json!({"code": "gateway_unavailable"})),
             true,
-            "sin confirmar",
+            OutcomeState::Unconfirmed,
         ),
         (
             answered(500, json!({"code": "gateway_configuration_error"})),
             true,
-            "sin confirmar",
+            OutcomeState::Unconfirmed,
         ),
         (
             answered(403, json!({"code": "action_not_dispatchable"})),
             false,
-            "no se ejecutó",
+            OutcomeState::NotExecuted,
         ),
         (
             answered(502, json!({"code": "action_effect_failed"})),
             false,
-            "aprobado",
+            OutcomeState::Approved,
         ),
         (
             answered(409, json!({"code": "execution_state_conflict"})),
             false,
-            "sin cambios",
+            OutcomeState::Unchanged,
         ),
         (
             answered(410, json!({"code": "approval_expired"})),
             false,
-            "expirado",
+            OutcomeState::Expired,
         ),
         (
             answered(200, json!({"execution": "failed"})),
             false,
-            "aprobado",
+            OutcomeState::Approved,
         ),
     ] {
         let gateway = Scripted(Mutex::new(vec![reply]));
         let outcome = aprobador::dispatch(&gateway, &pending);
         assert_eq!(outcome.puede_ejecutar, retry, "{outcome:?}");
         assert_eq!(outcome.situacion, situacion, "{outcome:?}");
-        if situacion == "sin confirmar" {
-            assert!(!outcome.mensaje.contains("sin ejecutar"), "{outcome:?}");
+        if situacion == OutcomeState::Unconfirmed {
+            let said = crate::tests_i18n::es_message(&outcome.mensaje);
+            assert!(!said.contains("sin ejecutar"), "{outcome:?}");
         }
     }
 }
@@ -962,8 +989,12 @@ fn a_request_signed_by_an_attester_outside_the_pins_is_not_offered_or_signed() {
     ] {
         let gateway = FakeGateway::new(&evidence);
         let outcome = aprobador::decide(&gateway, &signer, &trust(), &pending, decision);
-        assert_eq!(outcome.situacion, "sin cambios");
-        assert!(outcome.mensaje.contains("no verifica"));
+        assert_eq!(outcome.situacion, codigos::OutcomeState::Unchanged);
+        assert_eq!(
+            outcome.mensaje.codigo,
+            codigos::MessageCode::EvidenceUnverified
+        );
+        assert!(crate::tests_i18n::es_message(&outcome.mensaje).contains("no verifica"));
         assert!(gateway.calls().is_empty());
     }
 }
@@ -994,7 +1025,7 @@ fn a_request_decided_under_another_policy_is_not_offered_or_signed() {
     ] {
         let gateway = FakeGateway::new(&evidence);
         let outcome = aprobador::decide(&gateway, &signer, &rotated, &pending, decision);
-        assert_eq!(outcome.situacion, "sin cambios");
+        assert_eq!(outcome.situacion, codigos::OutcomeState::Unchanged);
         assert!(gateway.calls().is_empty());
     }
 }
@@ -1029,7 +1060,10 @@ fn a_request_signed_by_a_pin_under_the_local_policy_is_offered_and_signed() {
         &PendingRef::from(&facts),
         praetore_gateway::HumanApprovalOutcome::Approve,
     );
-    assert_eq!(outcome.situacion, "aprobado, pendiente de ejecución");
+    assert_eq!(
+        outcome.situacion,
+        codigos::OutcomeState::ApprovedPendingExecution
+    );
     assert_eq!(gateway.calls(), vec!["challenge", "decide"]);
 }
 
@@ -1237,7 +1271,7 @@ async fn agent_text_is_shown_inert_and_a_cut_list_says_so() {
     assert_eq!(list["hay_mas"], true);
     assert_eq!(
         list["solicitudes"][0]["sobre"],
-        "\"informe\\u{202e}fdp.exe\""
+        json!({"texto": "\"informe\\u{202e}fdp.exe\""})
     );
     assert!(!text.contains('\u{202e}'));
 }
@@ -1267,7 +1301,7 @@ fn nothing_is_signed_when_any_part_of_the_challenge_differs() {
             &pending,
             praetore_gateway::HumanApprovalOutcome::Approve,
         );
-        assert_eq!(outcome.situacion, "sin cambios");
+        assert_eq!(outcome.situacion, codigos::OutcomeState::Unchanged);
         assert_eq!(gateway.calls(), vec!["challenge"]);
     }
 }
@@ -1346,7 +1380,8 @@ async fn only_rejecting(parameters: Value) {
     assert_eq!(item["parametros"], json!([]));
     assert_eq!(item["puede_aprobar"], false);
     assert_eq!(item["puede_rechazar"], true);
-    assert!(item["nota"].as_str().unwrap().contains("praetore approve"));
+    assert_eq!(item["nota"], json!({"codigo": "parameters_not_shown"}));
+    assert!(crate::tests_i18n::es_json_message(&item["nota"]).contains("praetore approve"));
     let reference = item["referencia"].as_str().unwrap().to_owned();
     // Refused server side even if the page asked anyway.
     let (_, refused, _) = json_of(
@@ -1356,7 +1391,7 @@ async fn only_rejecting(parameters: Value) {
             .unwrap(),
     )
     .await;
-    assert_eq!(refused["situacion"], "sin cambios");
+    assert_eq!(refused["situacion"], "unchanged");
     assert!(gateway.calls().is_empty());
     let (_, rejected, _) = json_of(
         app.oneshot(post(&format!("/api/bandeja/{reference}/rechazar")))
@@ -1364,7 +1399,7 @@ async fn only_rejecting(parameters: Value) {
             .unwrap(),
     )
     .await;
-    assert_eq!(rejected["situacion"], "rechazado");
+    assert_eq!(rejected["situacion"], "rejected");
     assert_eq!(gateway.held(), Held::Rejected);
 }
 
@@ -1431,8 +1466,105 @@ async fn an_action_or_target_that_spells_a_placeholder_is_quoted() {
     );
     let (_, list, _) = json_of(app.oneshot(get("/api/bandeja")).await.unwrap()).await;
     let item = &list["solicitudes"][0];
-    assert_eq!(item["queria"], "\"no se muestra\"");
-    assert_eq!(item["sobre"], "\"sin objetivo indicado\"");
-    assert_ne!(item["queria"], "no se muestra");
-    assert_ne!(item["sobre"], "sin objetivo indicado");
+    // Agent text that spells the console's placeholders is text, quoted;
+    // a placeholder is a code, never text.
+    assert_eq!(item["queria"], json!({"texto": "\"no se muestra\""}));
+    assert_eq!(item["sobre"], json!({"texto": "\"sin objetivo indicado\""}));
+    assert_ne!(item["queria"], json!({"codigo": "not_shown"}));
+    assert_ne!(item["sobre"], json!({"codigo": "no_target"}));
+}
+
+/// The page's language never reaches what the console signs: the same
+/// request, approved (and rejected) with the browser asking for Spanish,
+/// English or Portuguese, gets the same signed message and the same
+/// signature, byte for byte. Only `approval_id` is random per decision, so
+/// it is fixed here.
+#[tokio::test]
+async fn the_signed_decision_is_the_same_whatever_the_page_language() {
+    fn fixed_id() -> Uuid {
+        Uuid::from_u128(0x5eed)
+    }
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    let facts = facts_for(&evidence, json, PendingKind::AwaitingApproval);
+    for (route, outcome) in [
+        ("aprobar", praetore_gateway::HumanApprovalOutcome::Approve),
+        ("rechazar", praetore_gateway::HumanApprovalOutcome::Reject),
+    ] {
+        let mut signed = Vec::new();
+        for language in [None, Some("es"), Some("en"), Some("pt-BR,pt;q=0.9")] {
+            let gateway = Arc::new(FakeGateway::new(&evidence));
+            let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET)
+                .unwrap()
+                .with_approval_ids(fixed_id);
+            let app = ConsoleState::new(
+                Arc::new(NoHistory),
+                LocalSession::from_secret([0x11; 32]),
+                HashMap::new(),
+            )
+            .with_inbox(Inbox::new(
+                Arc::new(MemoryInbox {
+                    items: vec![facts.clone()],
+                    unreadable: 0,
+                }),
+                gateway.clone(),
+                signer,
+                trust(),
+            ))
+            .router();
+            let reference = first_reference(&app).await;
+            let mut request = post(&format!("/api/bandeja/{reference}/{route}"));
+            if let Some(language) = language {
+                request.headers_mut().insert(
+                    header::ACCEPT_LANGUAGE,
+                    header::HeaderValue::from_static(language),
+                );
+            }
+            let response = app.oneshot(request).await.unwrap();
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            let (status, answer, _) = json_of(response).await;
+            assert_eq!(status, StatusCode::OK, "{language:?} {answer}");
+            let state = gateway.state.lock().unwrap();
+            assert_eq!(state.decisions.len(), 1);
+            let decision = &state.decisions[0];
+            assert_eq!(decision.outcome, outcome);
+            assert_eq!(decision.approval_id, fixed_id());
+            signed.push((
+                decision.signing_message().unwrap(),
+                decision.signature.clone(),
+                serde_json::to_string(decision).unwrap(),
+            ));
+        }
+        for other in &signed[1..] {
+            assert_eq!(&signed[0], other, "{route}");
+        }
+    }
+}
+
+/// Without `with_approval_ids`, each decision the console signs gets a fresh
+/// random (version 4) `approval_id`: two decisions never share one.
+#[test]
+fn each_signed_decision_gets_its_own_random_approval_id() {
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    let expires = OffsetDateTime::now_utc() + Duration::minutes(10);
+    let ids: Vec<Uuid> = ["informe-1", "informe-2"]
+        .into_iter()
+        .map(|target| {
+            let (evidence, _) = pending_evidence("borrar_archivo", target, expires);
+            let view = FakeGateway::new(&evidence).view;
+            signer
+                .sign(view, praetore_gateway::HumanApprovalOutcome::Reject)
+                .unwrap()
+                .approval_id
+        })
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    for id in &ids {
+        assert!(!id.is_nil());
+        assert_eq!(id.get_version_num(), 4, "{id}");
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122, "{id}");
+    }
 }

@@ -36,6 +36,8 @@ body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(
 .brand { font-size: 19px; font-weight: 600; letter-spacing: -.02em; }
 .environment { display: flex; align-items: center; color: var(--muted); font-size: 13px; }
 .environment i { width: 6px; height: 6px; margin-right: 8px; border-radius: 50%; background: var(--good); }
+.idioma { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.idioma select { padding: 6px 10px; font-size: 13px; }
 
 main { max-width: 880px; margin: 0 auto; padding: 56px clamp(20px, 4vw, 48px) 80px; }
 

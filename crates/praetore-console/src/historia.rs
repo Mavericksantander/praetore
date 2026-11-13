@@ -12,24 +12,27 @@ use std::collections::HashMap;
 use time::{Date, Duration, Month, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
-/// What the console says a past receipt was. Not a current authorization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Situation {
-    Permitted,
-    Denied,
-    Approved,
-    Rejected,
-    Expired,
-    AwaitingApproval,
-    ApprovedPendingExecution,
-    NotExecuted,
-    Unreadable,
-}
+use crate::codigos::{AgentView, Placeholder, ShownText};
+pub use crate::codigos::{Notice, Situation, Story};
 
 impl Situation {
-    /// The words on the screen.
-    pub fn phrase(self) -> &'static str {
-        match self {
+    /// A history filter: the code (`awaiting_approval`) or, as the page sent
+    /// it before codes, the Spanish phrase (`pendiente de aprobación`).
+    /// `unreadable` is not a filter.
+    pub fn parse(value: &str) -> Option<Self> {
+        let parsed = Self::from_code(value).or_else(|| {
+            Self::ALL
+                .iter()
+                .copied()
+                .find(|situation| situation.legacy_phrase() == Some(value))
+        })?;
+        (parsed != Self::Unreadable).then_some(parsed)
+    }
+
+    /// The Spanish phrase the filter used to send, accepted for
+    /// compatibility. Never shown: the page words each code itself.
+    fn legacy_phrase(self) -> Option<&'static str> {
+        Some(match self {
             Self::Permitted => "permitido",
             Self::Denied => "denegado",
             Self::Approved => "aprobado",
@@ -38,41 +41,13 @@ impl Situation {
             Self::AwaitingApproval => "pendiente de aprobación",
             Self::ApprovedPendingExecution => "aprobado, pendiente de ejecución",
             Self::NotExecuted => "no se ejecutó",
-            Self::Unreadable => "no se puede leer",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "permitido" => Self::Permitted,
-            "denegado" => Self::Denied,
-            "aprobado" => Self::Approved,
-            "rechazado" => Self::Rejected,
-            "expirado" => Self::Expired,
-            "pendiente de aprobación" => Self::AwaitingApproval,
-            "aprobado, pendiente de ejecución" => Self::ApprovedPendingExecution,
-            "no se ejecutó" => Self::NotExecuted,
-            _ => return None,
+            Self::Unreadable => return None,
         })
     }
 }
 
-pub const NOTICE: &str = "Esto es un recibo de lo que ya ocurrió. No es una autorización vigente ni prueba de un efecto fuera de este registro.";
-
-const MONTHS: [&str; 12] = [
-    "enero",
-    "febrero",
-    "marzo",
-    "abril",
-    "mayo",
-    "junio",
-    "julio",
-    "agosto",
-    "septiembre",
-    "octubre",
-    "noviembre",
-    "diciembre",
-];
+/// The notice under the history: a receipt is not a current authorization.
+pub const NOTICE: Notice = Notice::ReceiptNotAuthorization;
 
 /// One journal row, already reduced to what the console is allowed to say.
 #[derive(Debug, Clone)]
@@ -208,74 +183,39 @@ pub fn situation(facts: &ReceiptFacts) -> Situation {
     Situation::Unreadable
 }
 
-pub fn story(facts: &ReceiptFacts) -> &'static str {
+pub fn story(facts: &ReceiptFacts) -> Story {
     match situation(facts) {
-        Situation::Unreadable => {
-            "Este recibo no cuadra, así que no se muestra qué se pidió ni sobre qué."
-        }
-        Situation::Denied => "La decisión fue denegar. No se ejecutó.",
-        Situation::Rejected => "Una persona lo rechazó. El rechazo es final y no se ejecutó.",
+        Situation::Unreadable => Story::Unreadable,
+        Situation::Denied => Story::Denied,
+        Situation::Rejected => Story::Rejected,
         Situation::Expired => match facts.reason {
-            Some(NotDispatchedReason::ApprovedClaimExpired) => {
-                "Se había aprobado, y la ventana cerró antes de ejecutarlo."
-            }
-            _ => "La ventana de aprobación cerró sin una decisión. No se ejecutó.",
+            Some(NotDispatchedReason::ApprovedClaimExpired) => Story::ExpiredAfterApproval,
+            _ => Story::ExpiredWithoutDecision,
         },
-        Situation::AwaitingApproval => {
-            "Está pendiente de aprobación. Todavía no hay una decisión de una persona."
-        }
-        Situation::ApprovedPendingExecution => {
-            "Una persona lo aprobó y falta ejecutarlo. La aprobación no se reutiliza."
-        }
+        Situation::AwaitingApproval => Story::AwaitingApproval,
+        Situation::ApprovedPendingExecution => Story::ApprovedPendingExecution,
         Situation::Permitted => match facts.execution {
-            ExecutionStatus::Executed | ExecutionStatus::Confirmed => {
-                "La decisión fue permitir, y el registro dice que se ejecutó."
-            }
-            ExecutionStatus::Failed => "La decisión fue permitir. La ejecución falló.",
-            ExecutionStatus::OutcomeUnknown => {
-                "La decisión fue permitir. No quedó claro si llegó a ocurrir."
-            }
-            ExecutionStatus::Dispatched => {
-                "La decisión fue permitir. Se inició y no quedó cerrado qué ocurrió después."
-            }
-            ExecutionStatus::NotDispatched => "La decisión fue permitir. No se ejecutó.",
+            ExecutionStatus::Executed | ExecutionStatus::Confirmed => Story::PermittedExecuted,
+            ExecutionStatus::Failed => Story::PermittedFailed,
+            ExecutionStatus::OutcomeUnknown => Story::PermittedOutcomeUnknown,
+            ExecutionStatus::Dispatched => Story::PermittedDispatched,
+            ExecutionStatus::NotDispatched => Story::PermittedNotExecuted,
             ExecutionStatus::Authorized | ExecutionStatus::ApprovedPendingDispatch => {
-                "La decisión fue permitir. El registro no dice que ya se haya ejecutado."
+                Story::PermittedNotYetExecuted
             }
         },
         Situation::Approved => match facts.execution {
-            ExecutionStatus::Executed | ExecutionStatus::Confirmed => {
-                "Una persona lo aprobó y el registro dice que se ejecutó."
-            }
-            ExecutionStatus::Failed => "Una persona lo aprobó. La ejecución falló.",
-            ExecutionStatus::OutcomeUnknown => {
-                "Una persona lo aprobó. No quedó claro si llegó a ocurrir."
-            }
-            ExecutionStatus::Dispatched => {
-                "Una persona lo aprobó. Se inició y no quedó cerrado qué ocurrió después."
-            }
-            _ => "Una persona lo aprobó.",
+            ExecutionStatus::Executed | ExecutionStatus::Confirmed => Story::ApprovedExecuted,
+            ExecutionStatus::Failed => Story::ApprovedFailed,
+            ExecutionStatus::OutcomeUnknown => Story::ApprovedOutcomeUnknown,
+            ExecutionStatus::Dispatched => Story::ApprovedDispatched,
+            _ => Story::Approved,
         },
         Situation::NotExecuted => match facts.reason {
-            Some(NotDispatchedReason::DispatchRefused) => {
-                "No se ejecutó. El sistema se negó antes de tocar el objetivo."
-            }
-            _ => "No se ejecutó.",
+            Some(NotDispatchedReason::DispatchRefused) => Story::NotExecutedRefused,
+            _ => Story::NotExecuted,
         },
     }
-}
-
-pub fn readable_time(moment: OffsetDateTime) -> String {
-    let moment = moment.to_offset(time::UtcOffset::UTC);
-    let month = usize::from(u8::from(moment.month()) - 1);
-    format!(
-        "{} de {} de {}, {:02}:{:02} UTC",
-        moment.day(),
-        MONTHS[month],
-        moment.year(),
-        moment.hour(),
-        moment.minute()
-    )
 }
 
 /// Text the agent chose, made safe to read: control and bidirectional
@@ -356,33 +296,41 @@ fn push_inert(safe: &mut String, character: char) {
     }
 }
 
-pub fn visible_target(facts: &ReceiptFacts) -> String {
+pub fn visible_target(facts: &ReceiptFacts) -> ShownText {
     if !facts.legible {
-        return "no se muestra".to_owned();
+        return ShownText::placeholder(Placeholder::NotShown);
     }
     facts
         .target
         .clone()
         .filter(|target| !target.is_empty())
-        .map(|target| plain_text(&target))
-        .unwrap_or_else(|| "sin objetivo indicado".to_owned())
+        .map(|target| ShownText::text(plain_text(&target)))
+        .unwrap_or_else(|| ShownText::placeholder(Placeholder::NoTarget))
 }
 
-pub fn visible_wanted(facts: &ReceiptFacts) -> String {
+pub fn visible_wanted(facts: &ReceiptFacts) -> ShownText {
     if !facts.legible || facts.wanted.is_empty() {
-        "no se muestra".to_owned()
+        ShownText::placeholder(Placeholder::NotShown)
     } else {
-        plain_text(&facts.wanted)
+        ShownText::text(plain_text(&facts.wanted))
     }
 }
 
-pub fn agent_label(agent_id: Uuid, names: &HashMap<Uuid, String>, order: &[Uuid]) -> String {
+/// The configured name, or the agent's place among the agents of this read
+/// (the page says "Agent N").
+pub fn agent_label(agent_id: Uuid, names: &HashMap<Uuid, String>, order: &[Uuid]) -> AgentView {
     if let Some(name) = names.get(&agent_id) {
-        return name.clone();
+        return AgentView {
+            nombre: Some(name.clone()),
+            numero: None,
+        };
     }
-    match order.iter().position(|agent| *agent == agent_id) {
-        Some(index) => format!("Agente {}", index + 1),
-        None => "Agente".to_owned(),
+    AgentView {
+        nombre: None,
+        numero: order
+            .iter()
+            .position(|agent| *agent == agent_id)
+            .and_then(|index| u32::try_from(index + 1).ok()),
     }
 }
 
@@ -589,11 +537,15 @@ mod tests {
         assert_eq!(plain_text("informe-trimestral"), "informe-trimestral");
     }
 
+    /// The console sends each instant as RFC 3339 in UTC, seconds kept; the
+    /// page words it (local time with its offset, and UTC beside it; see
+    /// `tests-js/hora.test.mjs`).
     #[test]
-    fn dates_are_calendar_words_not_rfc3339() {
-        let text = readable_time(moment());
-        assert_eq!(text, "24 de octubre de 2026, 12:34 UTC");
-        assert!(!text.contains("2026-10-24"));
+    fn instants_are_sent_as_rfc3339_utc_for_the_page_to_word() {
+        let text = crate::codigos::utc_instant(moment());
+        assert_eq!(text, "2026-10-24T12:34:56Z");
+        let offset = OffsetDateTime::parse("2026-10-24T09:34:56-03:00", &Rfc3339).unwrap();
+        assert_eq!(crate::codigos::utc_instant(offset), "2026-10-24T12:34:56Z");
     }
 
     #[test]
@@ -605,9 +557,13 @@ mod tests {
             None,
         );
         assert_eq!(situation(&pending), Situation::AwaitingApproval);
-        assert_eq!(situation(&pending).phrase(), "pendiente de aprobación");
-        assert!(story(&pending).contains("pendiente de aprobación"));
-        assert!(!situation(&pending).phrase().contains("awaiting_approval"));
+        assert_eq!(situation(&pending).code(), "awaiting_approval");
+        assert_eq!(story(&pending), Story::AwaitingApproval);
+        // The page says it in plain words, never the code.
+        let es = crate::tests_i18n::es;
+        assert_eq!(es("situation.awaiting_approval"), "pendiente de aprobación");
+        assert!(es("story.awaiting_approval").contains("pendiente de aprobación"));
+        assert!(!es("situation.awaiting_approval").contains("awaiting_approval"));
     }
 
     #[test]
@@ -618,7 +574,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(situation(&legacy).phrase(), "pendiente de aprobación");
+        assert_eq!(situation(&legacy), Situation::AwaitingApproval);
     }
 
     #[test]
@@ -631,7 +587,7 @@ mod tests {
                     None,
                     None,
                 ),
-                "permitido",
+                Situation::Permitted,
             ),
             (
                 facts(
@@ -640,7 +596,7 @@ mod tests {
                     Some(AttestedExecution::NotDispatched),
                     None,
                 ),
-                "denegado",
+                Situation::Denied,
             ),
             (
                 facts(
@@ -649,7 +605,7 @@ mod tests {
                     None,
                     None,
                 ),
-                "aprobado, pendiente de ejecución",
+                Situation::ApprovedPendingExecution,
             ),
             (
                 facts(
@@ -658,7 +614,7 @@ mod tests {
                     Some(AttestedExecution::Executed),
                     None,
                 ),
-                "aprobado",
+                Situation::Approved,
             ),
             (
                 facts(
@@ -667,7 +623,7 @@ mod tests {
                     Some(AttestedExecution::NotDispatched),
                     Some(NotDispatchedReason::ApprovalRejected),
                 ),
-                "rechazado",
+                Situation::Rejected,
             ),
             (
                 facts(
@@ -676,7 +632,7 @@ mod tests {
                     Some(AttestedExecution::NotDispatched),
                     Some(NotDispatchedReason::ApprovalExpired),
                 ),
-                "expirado",
+                Situation::Expired,
             ),
             (
                 facts(
@@ -685,7 +641,7 @@ mod tests {
                     Some(AttestedExecution::NotDispatched),
                     Some(NotDispatchedReason::ApprovedClaimExpired),
                 ),
-                "expirado",
+                Situation::Expired,
             ),
             (
                 facts(
@@ -694,11 +650,11 @@ mod tests {
                     Some(AttestedExecution::NotDispatched),
                     Some(NotDispatchedReason::DispatchRefused),
                 ),
-                "no se ejecutó",
+                Situation::NotExecuted,
             ),
         ];
-        for (facts, phrase) in cases {
-            assert_eq!(situation(&facts).phrase(), phrase);
+        for (facts, expected) in cases {
+            assert_eq!(situation(&facts), expected);
         }
     }
 
@@ -710,7 +666,7 @@ mod tests {
             Some(AttestedExecution::AwaitingApproval),
             Some(NotDispatchedReason::ApprovalRejected),
         );
-        assert_eq!(situation(&rejected).phrase(), "rechazado");
+        assert_eq!(situation(&rejected), Situation::Rejected);
     }
 
     #[test]
@@ -724,9 +680,10 @@ mod tests {
         broken.legible = false;
         broken.target = Some("no-mostrar".into());
         broken.wanted = "escribir_archivo".into();
-        assert_eq!(situation(&broken).phrase(), "no se puede leer");
-        assert_eq!(visible_target(&broken), "no se muestra");
-        assert_eq!(visible_wanted(&broken), "no se muestra");
+        assert_eq!(situation(&broken), Situation::Unreadable);
+        let hidden = ShownText::placeholder(Placeholder::NotShown);
+        assert_eq!(visible_target(&broken), hidden);
+        assert_eq!(visible_wanted(&broken), hidden);
     }
 
     #[test]
@@ -792,8 +749,9 @@ mod tests {
         assert_eq!(receipts[0].target.as_deref(), Some("informe-trimestral"));
         assert!(!receipts[1].legible);
         assert_eq!(situation(&receipts[1]), Situation::Unreadable);
-        assert_eq!(visible_target(&receipts[1]), "no se muestra");
-        assert_eq!(visible_wanted(&receipts[1]), "no se muestra");
+        let hidden = ShownText::placeholder(Placeholder::NotShown);
+        assert_eq!(visible_target(&receipts[1]), hidden);
+        assert_eq!(visible_wanted(&receipts[1]), hidden);
         assert_eq!(receipts[1].target, None);
         assert_eq!(situation(&receipts[0]), Situation::Permitted);
     }
@@ -832,8 +790,28 @@ mod tests {
         let other = Uuid::from_u128(9);
         let names = parse_agent_names(&format!("{named} = lector\n")).unwrap();
         let order = [other, named];
-        assert_eq!(agent_label(named, &names, &order), "lector");
-        assert_eq!(agent_label(other, &names, &order), "Agente 1");
+        assert_eq!(
+            agent_label(named, &names, &order),
+            AgentView {
+                nombre: Some("lector".into()),
+                numero: None
+            }
+        );
+        // The number; the page says "Agente 1", "Agent 1"...
+        assert_eq!(
+            agent_label(other, &names, &order),
+            AgentView {
+                nombre: None,
+                numero: Some(1)
+            }
+        );
+        assert_eq!(
+            agent_label(Uuid::from_u128(77), &names, &order),
+            AgentView {
+                nombre: None,
+                numero: None
+            }
+        );
         assert!(parse_agent_names(&format!("{named} = {named}\n")).is_err());
         assert!(parse_agent_names(&format!("{named} = {}\n", "ab".repeat(16))).is_err());
         assert!(parse_agent_names(&format!("{named} = lector\n{named} = otro\n")).is_err());
@@ -851,15 +829,25 @@ mod tests {
         assert_eq!(query.situation, Some(Situation::AwaitingApproval));
         assert_eq!(query.offset, 25);
         assert_eq!(query.limit, 25);
-        assert!(
-            prepare_query(RawQuery {
-                situacion: Some("awaiting_approval".into()),
-                desde: None,
-                hasta: None,
-                pagina: None,
-            })
-            .is_err()
-        );
+        // Not filters: the unreadable situation, in either form, and words
+        // that are neither a code nor the former phrase.
+        for value in [
+            "unreadable",
+            "no se puede leer",
+            "awaiting approval",
+            "AWAITING_APPROVAL",
+        ] {
+            assert!(
+                prepare_query(RawQuery {
+                    situacion: Some(value.into()),
+                    desde: None,
+                    hasta: None,
+                    pagina: None,
+                })
+                .is_err(),
+                "{value}"
+            );
+        }
         assert!(
             prepare_query(RawQuery {
                 situacion: None,
@@ -887,6 +875,34 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    /// The filter takes the code the page sends now and, for a page or a
+    /// link from before codes, the Spanish phrase: each gives the same
+    /// situation, for every situation that can be filtered.
+    #[test]
+    fn the_situation_filter_takes_the_code_and_the_former_phrase() {
+        let filterable: Vec<Situation> = Situation::ALL
+            .iter()
+            .copied()
+            .filter(|situation| *situation != Situation::Unreadable)
+            .collect();
+        assert_eq!(filterable.len(), 8);
+        for situation in filterable {
+            assert_eq!(Situation::parse(situation.code()), Some(situation));
+            let phrase = situation.legacy_phrase().unwrap();
+            assert_eq!(Situation::parse(phrase), Some(situation), "{phrase}");
+            // The former phrase is what the Spanish catalog shows.
+            assert_eq!(
+                crate::tests_i18n::es(&format!("situation.{}", situation.code())),
+                phrase
+            );
+        }
+        assert_eq!(
+            Situation::parse("pendiente de aprobación"),
+            Situation::parse("awaiting_approval")
+        );
+        assert_eq!(Situation::parse("unreadable"), None);
     }
 
     fn signed_evidence(target: &str) -> (String, Uuid, Uuid) {
