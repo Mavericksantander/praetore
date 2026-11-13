@@ -1069,8 +1069,8 @@ ranges. Export a longer chain in ranges, as for safety chains:
 is at most 4096; a range also ends before 8 MiB) and prints
 `next_from_seq`, which is `null` after the last range. Each later range
 (`--from-seq <next_from_seq>`) starts with its anchor: the full line of the
-receipt at `seq` N - 1, in the order of the whole export (`created_at`,
-`request_id`, `agent_id`), whose link is the head of the previous range.
+receipt at `seq` N - 1, in the order of the whole export (`chain_seq`,
+below), whose link is the head of the previous range.
 The exporter reads the receipts before the range, in one read-only
 snapshot, to compute that link. Verify each later range with `--range
 --expected-anchor <head of the previous range>`; the anchor's signature is
@@ -1092,17 +1092,10 @@ Limits of ranges:
   chain is exported and verified on its own (`--database`).
 - Each range is verified alone: an `evidence_id` repeated from an earlier
   range is not detected. Only a whole-chain verification sees every receipt.
-- The ranges of one journal state link only if the order of the receipts
-  before them did not change between exports. `created_at` is set by
-  `clock_timestamp()` when the row is inserted, but the row becomes visible
-  only when its transaction commits; a transaction that commits after later
-  rows were exported, or a step back of the database clock, lands a row in
-  the past of that order. Every later `seq` then moves: the next range's
-  anchor does not match `--expected-anchor` and verification fails, and a
-  head of that prefix anchored earlier can no longer be reproduced. Export
-  ranges of settled history only (receipts older than any transaction that
-  may still be open, on a database clock that does not step back), and
-  after a mismatch export again from `--from-seq 0`.
+- Rows that were out of commit order before migration 0024 keep that
+  order (see below): a head anchored over a prefix that such a row later
+  changed cannot be reproduced; after a mismatch, export again from
+  `--from-seq 0`.
 
 ```sh
 praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
@@ -1116,7 +1109,7 @@ praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-ke
 ```
 
 Storage: about 3.7 KB per action in the database for receipts of about
-2.6 KB. One run of the ignored test
+2.6 KB, before migration 0024. One run of the ignored test
 `postgres_cli_journal_export_tenant_ranges_of_10000_receipts` (PostgreSQL
 16, 10,000 test receipts of 2,581 bytes of evidence JSON on average, padded
 with random hex) grew `pg_total_relation_size` by 37,322,752 bytes: for
@@ -1124,7 +1117,72 @@ example 32,464,896 for `praetore.execution_journal`, 3,104,768 for
 `praetore.execution_journal_events` and 1,753,088 for
 `praetore.replay_claims`. The figures depend on the receipts and on
 PostgreSQL's compression of them. In the same run the default `--limit`
-ranges held 3,131 and 3,129 receipts, ended by the 8 MiB bound.
+ranges held 3,131 and 3,129 receipts, ended by the 8 MiB bound. With
+migration 0024 one run of the same test grew it by 38,535,168 bytes:
+33,021,952 for `praetore.execution_journal` (with `chain_seq` and its
+unique index), and 557,056 for `praetore.journal_positions`, which holds
+one row per tenant; that size is the dead row versions of 10,000 updates
+made in one transaction, which VACUUM makes reusable.
+
+### Order of a tenant chain (migration 0024)
+
+The chain of a tenant follows the order in which its journal rows commit.
+Every row takes its tenant's next position, `execution_journal.chain_seq`,
+in the transaction that writes it: a trigger takes the position from
+`praetore.journal_positions` and holds that row lock until the transaction
+commits, so the writers of one tenant are serialized and a snapshot that
+sees a position sees every earlier one. A transaction that rolls back
+returns its position, so there is no gap. The `seq` of a receipt in a
+tenant chain or range is its `chain_seq`.
+
+Until 0024 the order came from `created_at`, which `clock_timestamp()` sets
+when the row is inserted while the row becomes visible only when its
+transaction commits. A transaction that inserted before another and
+committed after it, or a step back of the database clock, placed a row in
+front of rows already exported: every later `seq` moved, the next range's
+anchor no longer matched `--expected-anchor`, and a head anchored over that
+prefix could no longer be reproduced. For rows written after the migration
+this is resolved, and exporting only settled history is no longer needed.
+
+- Rows written before 0024 were numbered in the order exports used until
+  then (`created_at`, `request_id`, `agent_id`): every whole-chain export
+  and every range of an existing journal is the same, byte for byte, as
+  before the migration, and a head anchored before it is still reproduced.
+  Rows that were already out of commit order before the migration keep
+  that order; they cannot be reordered without changing heads that may
+  already be anchored.
+- `chain_seq` is immutable: the runtime role cannot update it, a value that
+  an INSERT sends is replaced by the trigger, and an UPDATE by the schema
+  owner fails. An export fails, naming the expected and the found
+  position, when the positions of a tenant do not run from 0 without a gap:
+  a row deleted from the middle of the chain, or a position written by
+  hand that jumps. The check sees only gaps and jumps. Deleting the newest
+  rows of a tenant, or all of them, leaves the remaining positions
+  contiguous and is not detected, and neither is a consistent renumbering
+  by whoever can write to the database.
+- This does not make the journal tamper-proof: whoever can write to the
+  database (the schema owner, a superuser) can still rewrite rows and
+  positions consistently. Only a head anchored outside the operator's
+  control shows such a change, or the loss of the newest rows.
+- Writers of one tenant wait for each other from the journal INSERT to the
+  COMMIT; writers of different tenants do not. The journal INSERT is the
+  last statement before that COMMIT.
+- The gateway writes the journal row in a READ COMMITTED transaction,
+  whatever `default_transaction_isolation` the database sets: under
+  REPEATABLE READ or SERIALIZABLE, a writer that waited for another writer
+  of its tenant would fail with a serialization error when the other
+  commits.
+- Applying 0024 holds ACCESS EXCLUSIVE on `praetore.execution_journal`
+  until the migration commits: every reader and writer of the journal
+  waits, and the time grows with the number of rows. Apply it with every
+  gateway stopped, or in a maintenance window. In one run on an Apple M1
+  (8 GB, PostgreSQL 16.15), the migration's SQL took 409 ms on 10,000 rows
+  of 10 tenants, and the whole runner, with its schema checks, 548 ms;
+  that is one measurement, not a capacity figure.
+- Manual rollback: `docs/rollback/0024-journal-commit-order-position.sql`.
+  It also takes ACCESS EXCLUSIVE on the journal (with a `lock_timeout` of
+  5 s), so run it with every gateway stopped too. It drops the column and
+  the table, so exports order rows by `created_at` again.
 
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins

@@ -8,9 +8,11 @@ límites de "Qué NO prueba", que siguen vigentes.
 - Productor: `praetore journal-export (--receipts-dir DIR | --tenant UUID)
   --attester-pin HEX_FILE --output NUEVO`. Desde un directorio encadena los
   `*.json` en orden de nombre; desde el journal lee las filas del tenant en
-  `praetore.execution_journal` ordenadas por `(created_at, request_id,
-  agent_id)` (`agent_id` desempata dos agentes que reusan un `request_id`;
-  los UUID se comparan byte a byte, igual que su texto hex en minúsculas).
+  `praetore.execution_journal` ordenadas por `chain_seq`, la posición que
+  la migración 0024 asigna a cada fila del tenant en orden de commit (las
+  filas anteriores a 0024 se numeraron en el orden que se usaba hasta
+  entonces, `(created_at, request_id, agent_id)`, así que sus exports no
+  cambian). Falla si las posiciones no son contiguas desde 0.
   Verifica cada recibo contra la clave fijada antes de encadenarlo y nunca
   sobrescribe el archivo de salida.
 - Verificador: `praetore-verify journal --journal JSONL --attester-pin
@@ -185,8 +187,9 @@ productor** (publicado en otro lugar) y el verificador lo compara con
   recibos, y eso lo impide la firma de cada recibo, no la cadena.
 - Tampoco prueba que el export esté completo respecto del journal, ni que el
   orden registrado sea el orden real de las decisiones (el export desde el
-  journal ordena por `created_at`), ni nada sobre la autorización vigente,
-  la frescura o el estado de replay.
+  journal ordena por `chain_seq`, el orden de commit de cada tenant desde la
+  migración 0024; las filas anteriores conservan el orden por `created_at`),
+  ni nada sobre la autorización vigente, la frescura o el estado de replay.
 
 ## Qué falta para que un tercero pruebe que no se borró nada
 

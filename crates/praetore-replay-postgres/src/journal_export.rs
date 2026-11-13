@@ -43,17 +43,46 @@ pub struct TenantExport {
     pub unused_attesters: Vec<usize>,
 }
 
-/// Total order of one tenant's rows. Without `agent_id`, two agents of the
-/// same tenant reusing a `request_id` with equal `created_at` would come back
-/// in an unspecified order, and two exports of the same journal could differ.
-pub const JOURNAL_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
-     WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id LIMIT $2";
+/// Total order of one tenant's rows: `chain_seq`, the position migration
+/// 0024 assigns in commit order (rows written before 0024 were numbered in
+/// the earlier `created_at, request_id, agent_id` order). The second column
+/// is that position; every reader checks with [`check_position`] that the
+/// positions run from 0 without a gap.
+pub const JOURNAL_QUERY: &str = "SELECT evidence_json, chain_seq FROM praetore.execution_journal \
+     WHERE tenant_id = $1 ORDER BY chain_seq LIMIT $2";
 
 /// [`JOURNAL_QUERY`] with no limit, read through a portal in batches: a
 /// range export reads the receipts before the range to compute its anchor,
 /// in the same order.
-const JOURNAL_RANGE_QUERY: &str = "SELECT evidence_json FROM praetore.execution_journal \
-     WHERE tenant_id = $1 ORDER BY created_at, request_id, agent_id";
+const JOURNAL_RANGE_QUERY: &str = "SELECT evidence_json, chain_seq FROM praetore.execution_journal \
+     WHERE tenant_id = $1 ORDER BY chain_seq";
+
+/// The `index`-th receipt of a tenant (from 0) must have `chain_seq` equal
+/// to `index`: the positions are assigned without gaps and never change, so
+/// a gap or a jump means that a row was deleted, or written or changed by
+/// hand, by someone with write access to the database.
+pub fn check_position(index: u64, chain_seq: i64) -> ExportResult<()> {
+    if u64::try_from(chain_seq).ok() == Some(index) {
+        Ok(())
+    } else {
+        Err(format!(
+            "journal positions are not contiguous: expected chain_seq {index}, found {chain_seq} \
+             (a row was deleted, or written or changed outside the gateway)"
+        )
+        .into())
+    }
+}
+
+/// The receipts of [`JOURNAL_QUERY`] rows, after [`check_position`].
+pub fn receipts_in_chain_order(rows: &[postgres::Row]) -> ExportResult<Vec<String>> {
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            check_position(index as u64, row.get(1))?;
+            Ok(row.get(0))
+        })
+        .collect()
+}
 
 /// Rows fetched per round trip by a range export.
 const RANGE_BATCH: i32 = 512;
@@ -76,7 +105,8 @@ pub struct TenantRange {
 }
 
 /// One range of the tenant's chain of receipts, read in one read-only,
-/// repeatable-read snapshot, in the order of [`JOURNAL_QUERY`]. A range
+/// repeatable-read snapshot, in the order of [`JOURNAL_QUERY`]: the `seq` of
+/// every receipt is its `chain_seq` ([`check_position`]). A range
 /// chains receipts only, from `seq` 0 for the first receipt: unlike
 /// [`export_tenant`], it carries no reference to the database chain, so
 /// that every range of one journal state is linked the same way however the
@@ -108,6 +138,7 @@ pub fn export_tenant_range(
         }
         for row in rows {
             let json: String = row.get(0);
+            check_position(seq, row.get(1))?;
             let evidence = Evidence::from_json(json.trim_end())
                 .map_err(|error| format!("receipt {seq}: {error}"))?;
             if seq + 1 < from_seq {
@@ -179,7 +210,7 @@ pub fn export_tenant(
 }
 
 /// The tenant's human decisions, approval-expiration receipts and execution
-/// attestations, in journal order and, within a request, in recording
+/// attestations, in chain order (`chain_seq`) and, within a request, in recording
 /// order. An execution attestation becomes the [`GatewayReceipt`] the
 /// gateway returned for it: the journal's evidence, and the journal's output
 /// for `executed` and `confirmed`.
@@ -197,8 +228,7 @@ const OUTCOMES_QUERY: &str = "SELECT record.kind, record.payload, \
      ) record JOIN praetore.execution_journal journal \
      ON journal.tenant_id = record.tenant_id AND journal.agent_id = record.agent_id \
      AND journal.request_id = record.request_id \
-     ORDER BY journal.created_at, journal.request_id, journal.agent_id, record.created_at, \
-     record.kind, record.id LIMIT $2";
+     ORDER BY journal.chain_seq, record.created_at, record.kind, record.id LIMIT $2";
 
 /// [`export_tenant`], plus the tenant's approval and execution records
 /// ([`OUTCOMES_QUERY`]), all read in the same read-only, repeatable-read
@@ -222,7 +252,7 @@ pub fn export_tenant_with_outcomes(
     if outcome_rows.len() > MAX_OUTCOME_LINES {
         return Err("too many approval and execution records for one export".into());
     }
-    let receipts: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+    let receipts = receipts_in_chain_order(&rows)?;
     let export = chain_tenant(&receipts, &records, attesters)?;
     let mut outcomes = Vec::with_capacity(outcome_rows.len());
     for (index, row) in outcome_rows.iter().enumerate() {
@@ -387,7 +417,7 @@ pub fn read_tenant_export(
     if rows.len() > MAX_CHAIN_ENTRIES {
         return Err("too many journal rows for one export".into());
     }
-    Ok((rows.iter().map(|row| row.get(0)).collect(), records))
+    Ok((receipts_in_chain_order(&rows)?, records))
 }
 
 /// Every storage record of the database (for `journal-export --database`).
@@ -438,11 +468,27 @@ mod tests {
 
     #[test]
     fn a_range_reads_receipts_in_the_whole_export_s_order() {
-        let order = "ORDER BY created_at, request_id, agent_id";
-        assert!(JOURNAL_QUERY.contains(order));
+        // Commit order: the position of migration 0024, not created_at.
+        assert!(JOURNAL_QUERY.contains("ORDER BY chain_seq LIMIT"));
+        assert!(!JOURNAL_QUERY.contains("created_at"));
+        assert!(OUTCOMES_QUERY.contains("ORDER BY journal.chain_seq, record.created_at"));
         assert_eq!(
             JOURNAL_RANGE_QUERY,
             JOURNAL_QUERY.strip_suffix(" LIMIT $2").unwrap()
         );
+    }
+
+    #[test]
+    fn a_gap_or_a_jump_in_the_positions_is_refused() {
+        check_position(0, 0).unwrap();
+        check_position(7, 7).unwrap();
+        for (index, found) in [(0, 1), (3, 2), (3, 5), (0, -1)] {
+            let error = check_position(index, found).unwrap_err().to_string();
+            assert!(
+                error.contains(&format!("expected chain_seq {index}")),
+                "{error}"
+            );
+            assert!(error.contains(&format!("found {found}")), "{error}");
+        }
     }
 }

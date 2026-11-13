@@ -429,7 +429,7 @@ jobs:
           for test in \
             "--bin praetore journal_export::tests::postgres_export_reads_only_the_tenant_rows_in_insert_order" \
             "--bin praetore journal_export::tests::postgres_export_as_runtime_role_is_confined_by_row_level_security" \
-            "--bin praetore journal_export::tests::postgres_export_orders_by_created_at_then_request_id_then_agent_id" \
+            "--bin praetore journal_export::tests::postgres_export_orders_by_commit_position_not_created_at" \
             "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end" \
             "--test journal_export_postgres postgres_cli_journal_export_after_attester_key_rotation" \
             "--test journal_export_postgres postgres_cli_run_reports_a_port_in_use" \

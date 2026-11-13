@@ -61,6 +61,9 @@ impl VerifyWithTestEvidenceAttester for praetore_gateway::GatewayReceipt {
 }
 
 static TEST_DATABASE_SETUP: OnceLock<()> = OnceLock::new();
+/// Migration 0024 is the newest: every older rollback runs after it.
+const ROLLBACK_0024: &str =
+    include_str!("../../../docs/rollback/0024-journal-commit-order-position.sql");
 const TEST_NOW: &str = "2026-06-01T12:00:00Z";
 const TEST_TENANT_ID: Uuid = Uuid::from_u128(1);
 
@@ -3142,12 +3145,12 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
         let policies = client
             .query(
                 // The policies 0008 creates (0016 to 0019 add theirs on
-                // the safety tables).
+                // the safety tables, 0024 on journal_positions).
                 "SELECT p.oid FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid \
                  JOIN pg_namespace n ON n.oid = c.relnamespace \
                  WHERE n.nspname = 'praetore' \
                    AND c.relname NOT IN ('safety_records', 'safety_ingest_tenants', \
-                                         'safety_audit_tenants') \
+                                         'safety_audit_tenants', 'journal_positions') \
                  ORDER BY c.relname",
                 &[],
             )
@@ -3175,7 +3178,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -7138,7 +7142,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     assert!(again.is_empty());
@@ -7493,6 +7498,7 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     // The held request is signed `awaiting_approval` (0022): the 0022
     // rollback refuses while that row exists and changes nothing.
     // 0023 is newer, so roll it back first.
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
         .batch_execute(ROLLBACK_0022)
@@ -7546,7 +7552,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7576,6 +7583,7 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     // With such rows the rollback fails as a whole and 0020 stays (0021 is
     // rolled back first, so only the row guard can refuse it).
     forget_awaiting_approval_attestations();
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
@@ -7591,7 +7599,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
         vec![
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7676,6 +7685,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), up);
 
     // Down (0021 first): the columns, their constraints and grant are gone.
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
@@ -7691,7 +7701,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
             "0020_approval_close_reasons",
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7850,6 +7861,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
 
     // With classified rows the rollback fails as a whole and 0020 stays
     // (0021 is rolled back first, so only the row guard can refuse it).
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
     connect_client().batch_execute(ROLLBACK_0021).unwrap();
@@ -7865,7 +7877,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
         vec![
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -8515,6 +8528,7 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     // 0023 replaces the v2 attestation trigger this count includes.
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state(), (2, 2, true));
     assert!(p1(&mut admin).is_err());
@@ -8541,7 +8555,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
         vec![
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -10565,6 +10580,7 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     // This test checks 0022. 0023 only replaces the attestation insert trigger.
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let initial = state();
     assert_eq!((&initial.0, &initial.2, initial.3), (&up.0, &up.1, up.2));
@@ -10613,10 +10629,12 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
         applied,
         vec![
             "0022_awaiting_approval_state",
-            "0023_attestation_output_digest"
+            "0023_attestation_output_digest",
+            "0024_journal_commit_order_position"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state().0, up.0);
     assert_eq!(state().1, older_functions);
@@ -10628,6 +10646,7 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let late = approved_pending(&fixture);
+    connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
         .batch_execute(ROLLBACK_0022)
@@ -10653,4 +10672,1017 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     assert_eq!(state().0, up.0);
     assert!(state().3);
     assert_eq!(fixture.adapter.invocation_count(), 0);
+}
+
+/// Migration 0024: every journal row takes its tenant's next position
+/// (`chain_seq`) in the transaction that writes it, so the chain follows the
+/// commit order and an exported prefix never changes.
+mod journal_position {
+    use super::*;
+    use praetore_core::{
+        DecidedBy, Decision, Evidence,
+        journal_chain::{
+            ChainExporter, ChainLink, MAX_CHAIN_ENTRIES, receipt_link, verify_journal_range,
+        },
+    };
+    use praetore_replay_postgres::journal_export::{
+        TenantRange, chain_receipts, export_tenant, export_tenant_range,
+    };
+    use std::{
+        collections::BTreeMap,
+        sync::mpsc,
+        time::{Duration as StdDuration, Instant},
+    };
+
+    const TENANT_A: Uuid = Uuid::from_u128(0x0a);
+    const TENANT_B: Uuid = Uuid::from_u128(0x0b);
+
+    fn attester() -> EvidenceAttesterKey {
+        EvidenceAttesterKey::from_secret_bytes(&[91; 32])
+    }
+
+    fn pins() -> [VerifiedPublicKey; 1] {
+        [attester().public_key().unwrap()]
+    }
+
+    /// A signed receipt naming `tenant` (or no tenant for the nil tenant).
+    fn receipt(tenant: Uuid, agent_id: Option<Uuid>, request_id: Option<Uuid>) -> Evidence {
+        // A newtype over the UUID: a chosen id for the tie-break cases.
+        let agent_id: AgentId = agent_id.map_or_else(AgentId::new, |id| {
+            serde_json::from_value(json!(id.to_string())).unwrap()
+        });
+        let agent = AgentKeyPair::from_secret_bytes(&[92; 32]).identity(agent_id);
+        let mut authority =
+            Authority::new(agent.id.clone(), "position-test", vec!["demo:write".into()]);
+        if !tenant.is_nil() {
+            authority = authority.with_constraint("tenant_id", tenant.to_string());
+        }
+        let action = Action::new(
+            "demo:set_value",
+            Some("demo-state".into()),
+            json!({ "k": 1 }),
+        )
+        .unwrap()
+        .with_capability("demo:write");
+        let mut evidence = Evidence::new_with_context(
+            request_id.unwrap_or_else(Uuid::new_v4),
+            agent,
+            authority,
+            action,
+            Decision::allow("allow-demo-set", DecidedBy::rule("allow-demo-set")),
+            None,
+            BTreeMap::new(),
+        )
+        .unwrap();
+        evidence.bind_policy_digest("cd".repeat(32)).unwrap();
+        evidence.sign(&attester()).unwrap();
+        evidence
+    }
+
+    /// Writes the replay claim and the journal row of `evidence` the way
+    /// the gateway does, in `transaction`. It names no column of 0024, so
+    /// the late-commit test runs unchanged against a database without it.
+    fn insert(
+        transaction: &mut postgres::Transaction<'_>,
+        tenant: Uuid,
+        evidence: &Evidence,
+        created_at: Option<&str>,
+    ) -> Result<(), postgres::Error> {
+        transaction.execute(
+            "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+            &[&tenant.to_string()],
+        )?;
+        let agent = *evidence.agent.id.as_uuid();
+        transaction.execute(
+            "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+             VALUES ($1, $2, $3)",
+            &[&tenant, &agent, &evidence.request_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO praetore.execution_journal \
+             (tenant_id, agent_id, request_id, request_digest, action_digest, \
+              authorization_status, execution_status, evidence_json, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                     COALESCE($6::text::timestamptz, clock_timestamp()), \
+                     COALESCE($6::text::timestamptz, clock_timestamp()))",
+            &[
+                &tenant,
+                &agent,
+                &evidence.request_id,
+                &"ab".repeat(32),
+                &evidence.to_json().unwrap(),
+                &created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The position of the row of `request_id`, read by `client`.
+    fn position(client: &mut impl postgres::GenericClient, request_id: Uuid) -> i64 {
+        client
+            .query_one(
+                "SELECT chain_seq FROM praetore.execution_journal WHERE request_id = $1",
+                &[&request_id],
+            )
+            .unwrap()
+            .get(0)
+    }
+
+    fn insert_committed(client: &mut Client, tenant: Uuid, evidence: &Evidence) -> i64 {
+        let mut transaction = client.transaction().unwrap();
+        insert(&mut transaction, tenant, evidence, None).unwrap();
+        // Inside the transaction: the tenant context (and so row level
+        // security for the runtime role) ends with it.
+        let assigned = position(&mut transaction, evidence.request_id);
+        transaction.commit().unwrap();
+        assigned
+    }
+
+    fn config(scratch: &ScratchDatabase) -> postgres::Config {
+        let url = env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
+        let mut config: postgres::Config = url.parse().unwrap();
+        config.dbname(&scratch.name);
+        config
+    }
+
+    /// Brings an empty database to 0023, recorded by the runner as if it
+    /// had applied it, so that `apply_migrations` applies only 0024.
+    fn at_0023(admin: &mut Client) {
+        let end = praetore_replay_postgres::MIGRATIONS
+            .iter()
+            .position(|(version, _)| *version == "0024_journal_commit_order_position")
+            .expect("0024 is registered");
+        admin
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS praetore; \
+                 CREATE TABLE praetore.schema_migrations (\
+                     version TEXT PRIMARY KEY, \
+                     checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
+                     applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
+            )
+            .unwrap();
+        apply_legacy_migrations_through(admin, end);
+        for (version, sql) in &praetore_replay_postgres::MIGRATIONS[..end] {
+            admin
+                .execute(
+                    "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
+                    &[version, &migration_checksum(sql)],
+                )
+                .unwrap();
+        }
+    }
+
+    fn migrated() -> ScratchDatabase {
+        let scratch = ScratchDatabase::create();
+        praetore_replay_postgres::apply_migrations(&mut scratch.connect()).unwrap();
+        scratch
+    }
+
+    /// One range from `from`, or `None` when the tenant has no receipt at or
+    /// after it.
+    fn range(
+        scratch: &ScratchDatabase,
+        tenant: Uuid,
+        from: u64,
+        limit: usize,
+    ) -> Option<TenantRange> {
+        match export_tenant_range(&mut scratch.connect(), tenant, &pins(), from, limit) {
+            Ok(range) => Some(range),
+            Err(error) if error.to_string().contains("no receipt at or after") => None,
+            Err(error) => panic!("range export from {from}: {error}"),
+        }
+    }
+
+    fn evidence_ids(text: &str) -> Vec<String> {
+        text.lines()
+            .map(|line| {
+                let entry: Value = serde_json::from_str(line).unwrap();
+                entry["evidence"]["evidence_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// A writer on its own connection and thread: it writes `evidence` for
+    /// `tenant` and commits. Returns its backend pid and the thread.
+    fn spawn_writer(
+        config: postgres::Config,
+        tenant: Uuid,
+        evidence: Evidence,
+    ) -> (i32, thread::JoinHandle<Result<(), String>>) {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut client = config.connect(NoTls).map_err(|error| error.to_string())?;
+            let pid: i32 = client
+                .query_one("SELECT pg_catalog.pg_backend_pid()", &[])
+                .map_err(|error| error.to_string())?
+                .get(0);
+            sender.send(pid).unwrap();
+            let mut transaction = client.transaction().map_err(|error| error.to_string())?;
+            insert(&mut transaction, tenant, &evidence, None).map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())
+        });
+        let pid = receiver.recv_timeout(StdDuration::from_secs(30)).unwrap();
+        (pid, handle)
+    }
+
+    /// Whether the writer `pid` waits on a lock (`pg_stat_activity`) before
+    /// it finishes: polls until one of the two is seen, up to 30 s. Prints
+    /// the lock it waits for (`pg_locks`).
+    fn waits_on_a_lock(
+        observer: &mut Client,
+        pid: i32,
+        writer: &thread::JoinHandle<Result<(), String>>,
+    ) -> bool {
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            if writer.is_finished() {
+                return false;
+            }
+            let row = observer
+                .query_one(
+                    "SELECT a.wait_event_type IS NOT DISTINCT FROM 'Lock', \
+                            (SELECT pg_catalog.string_agg(l.locktype || ' ' || l.mode, ', ') \
+                             FROM pg_catalog.pg_locks l WHERE l.pid = a.pid AND NOT l.granted) \
+                     FROM pg_catalog.pg_stat_activity a WHERE a.pid = $1",
+                    &[&pid],
+                )
+                .unwrap();
+            if row.get::<_, bool>(0) {
+                println!(
+                    "writer {pid} waits: wait_event_type = Lock, not granted: {}",
+                    row.get::<_, Option<String>>(1).unwrap_or_default()
+                );
+                return true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the writer neither waited on a lock nor finished within 30 s"
+            );
+            thread::sleep(StdDuration::from_millis(10));
+        }
+    }
+
+    /// The reproduced case: T1 writes a receipt and commits late; T2 writes
+    /// one after it and tries to commit first. Before 0024, T2 committed, an
+    /// export in between saw it at the end of the chain, and after T1's
+    /// commit T1 took T2's place: the exported prefix (and its head) could
+    /// no longer be reproduced. Now T2 waits for T1's position, an export in
+    /// between sees neither, and the prefix never changes.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_late_commit_does_not_reorder_an_exported_prefix() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        let first = receipt(TENANT_A, None, None);
+        // No column of 0024 is read before the prefix check below.
+        let mut transaction = admin.transaction().unwrap();
+        insert(&mut transaction, TENANT_A, &first, None).unwrap();
+        transaction.commit().unwrap();
+
+        // T1: written, not committed.
+        let late = receipt(TENANT_A, None, None);
+        let mut t1_client = scratch.connect();
+        let mut t1 = t1_client.transaction().unwrap();
+        insert(&mut t1, TENANT_A, &late, None).unwrap();
+        // T2: written after T1 (a later created_at), on its own connection.
+        let early = receipt(TENANT_A, None, None);
+        let (t2_pid, t2) = spawn_writer(config(&scratch), TENANT_A, early.clone());
+        let t2_waited = waits_on_a_lock(&mut admin, t2_pid, &t2);
+
+        // An export while T1 is open.
+        let middle = range(&scratch, TENANT_A, 0, MAX_CHAIN_ENTRIES).unwrap();
+        let exported = middle.head.entries.get();
+        println!(
+            "export while T1 is open: {exported} receipt(s), head {}",
+            middle.head.head.to_hex()
+        );
+
+        t1.commit().unwrap();
+        t2.join().unwrap().unwrap();
+
+        // The same prefix again: byte for byte, with the same head.
+        let again = range(&scratch, TENANT_A, 0, exported as usize).unwrap();
+        assert_eq!(
+            again.head.head.to_hex(),
+            middle.head.head.to_hex(),
+            "the head exported while T1 was open is not reproduced after T1's commit"
+        );
+        assert_eq!(again.text, middle.text);
+        // The next range is anchored to that head.
+        let next = range(&scratch, TENANT_A, exported, MAX_CHAIN_ENTRIES).unwrap();
+        verify_journal_range(&next.text, &pins(), None, Some(&middle.head.head), None).unwrap();
+
+        assert!(t2_waited, "T2 must wait for T1's position");
+        // The export in between saw neither T1 nor T2.
+        assert_eq!(
+            evidence_ids(&middle.text),
+            vec![first.evidence_id.to_string()]
+        );
+        // Commit order: T1 before T2, in the table and in the export.
+        assert_eq!(
+            (
+                position(&mut admin, late.request_id),
+                position(&mut admin, early.request_id)
+            ),
+            (1, 2)
+        );
+        let created: Vec<bool> = admin
+            .query(
+                "SELECT (SELECT created_at FROM praetore.execution_journal WHERE request_id = $1) \
+                      < (SELECT created_at FROM praetore.execution_journal WHERE request_id = $2)",
+                &[&late.request_id, &early.request_id],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(created, vec![true], "T1 was written before T2");
+        let whole = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
+        assert_eq!(
+            evidence_ids(&whole.text),
+            [&first, &late, &early].map(|evidence| evidence.evidence_id.to_string())
+        );
+        assert_eq!(whole.head, next.head);
+    }
+
+    /// Writers of different tenants do not wait for each other; writers of
+    /// the same tenant do.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_does_not_block_another_tenant() {
+        let scratch = migrated();
+        let mut t1_client = scratch.connect();
+        let mut t1 = t1_client.transaction().unwrap();
+        insert(&mut t1, TENANT_A, &receipt(TENANT_A, None, None), None).unwrap();
+
+        // Tenant B while A's writer is open: no lock wait (lock_timeout
+        // would end any).
+        let mut other = scratch.connect();
+        other.batch_execute("SET lock_timeout = '2s'").unwrap();
+        let mut transaction = other.transaction().unwrap();
+        let other_receipt = receipt(TENANT_B, None, None);
+        insert(&mut transaction, TENANT_B, &other_receipt, None)
+            .expect("tenant B must not wait for tenant A");
+        assert_eq!(position(&mut transaction, other_receipt.request_id), 0);
+        transaction.commit().unwrap();
+
+        // Tenant A again from another session: it waits, and lock_timeout
+        // ends it.
+        let mut same = scratch.connect();
+        same.batch_execute("SET lock_timeout = '500ms'").unwrap();
+        let mut transaction = same.transaction().unwrap();
+        let error = insert(
+            &mut transaction,
+            TENANT_A,
+            &receipt(TENANT_A, None, None),
+            None,
+        )
+        .expect_err("a second writer of tenant A must wait for the first");
+        assert_eq!(
+            error.code(),
+            Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+            "{error}"
+        );
+        drop(transaction);
+        t1.commit().unwrap();
+    }
+
+    /// A position taken by a transaction that rolls back is taken again by
+    /// the next row: no gap.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_rollback_leaves_no_gap() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        assert_eq!(
+            insert_committed(&mut admin, TENANT_A, &receipt(TENANT_A, None, None)),
+            0
+        );
+        let mut transaction = admin.transaction().unwrap();
+        let rolled_back = receipt(TENANT_A, None, None);
+        insert(&mut transaction, TENANT_A, &rolled_back, None).unwrap();
+        assert_eq!(position(&mut transaction, rolled_back.request_id), 1);
+        transaction.rollback().unwrap();
+        let next = receipt(TENANT_A, None, None);
+        assert_eq!(insert_committed(&mut admin, TENANT_A, &next), 1);
+        let next_seq: i64 = admin
+            .query_one(
+                "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                &[&TENANT_A],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(next_seq, 2);
+        let whole = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
+        assert_eq!(whole.head.entries.get(), 2);
+        assert_eq!(evidence_ids(&whole.text)[1], next.evidence_id.to_string());
+    }
+
+    /// chain_seq cannot be chosen or changed: the trigger overwrites the
+    /// value an INSERT sends, the runtime role has no UPDATE on the column,
+    /// and an UPDATE by the schema owner fails. The runtime role still
+    /// passes its startup check, and holds no privilege on journal_positions.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_is_assigned_and_immutable() {
+        let role = TestRole::create("LOGIN NOBYPASSRLS");
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        admin
+            .batch_execute(&format!("GRANT praetore_runtime TO {}", role.name))
+            .unwrap();
+        let mut runtime = connect_scratch_as(&scratch, &role.name);
+        verify_runtime_role(&mut runtime).unwrap();
+
+        insert_committed(&mut runtime, TENANT_A, &receipt(TENANT_A, None, None));
+        let chosen = receipt(TENANT_A, None, None);
+        let mut transaction = runtime.transaction().unwrap();
+        transaction
+            .execute(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&TENANT_A.to_string()],
+            )
+            .unwrap();
+        let agent = *chosen.agent.id.as_uuid();
+        transaction
+            .execute(
+                "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                 VALUES ($1, $2, $3)",
+                &[&TENANT_A, &agent, &chosen.request_id],
+            )
+            .unwrap();
+        let assigned: i64 = transaction
+            .query_one(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json, chain_seq) \
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, 999) \
+                 RETURNING chain_seq",
+                &[
+                    &TENANT_A,
+                    &agent,
+                    &chosen.request_id,
+                    &"ab".repeat(32),
+                    &chosen.to_json().unwrap(),
+                ],
+            )
+            .unwrap()
+            .get(0);
+        transaction.commit().unwrap();
+        assert_eq!(
+            assigned, 1,
+            "the trigger assigns the position, not the INSERT"
+        );
+
+        // Runtime: no UPDATE privilege on chain_seq, and none on the table
+        // of positions.
+        for statement in [
+            "UPDATE praetore.execution_journal SET chain_seq = 5",
+            "SELECT * FROM praetore.journal_positions",
+            "UPDATE praetore.journal_positions SET next_seq = 0",
+        ] {
+            let mut transaction = runtime.transaction().unwrap();
+            transaction
+                .execute(
+                    "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                    &[&TENANT_A.to_string()],
+                )
+                .unwrap();
+            let error = transaction.batch_execute(statement).unwrap_err();
+            assert_eq!(
+                error.code(),
+                Some(&postgres::error::SqlState::INSUFFICIENT_PRIVILEGE),
+                "{statement}: {error}"
+            );
+        }
+        // The schema owner (here the superuser that migrated): the trigger
+        // refuses any change of chain_seq, and only that.
+        for statement in [
+            "UPDATE praetore.execution_journal SET chain_seq = chain_seq + 10",
+            "UPDATE praetore.execution_journal SET chain_seq = 0 WHERE chain_seq = 1",
+        ] {
+            let error = admin.batch_execute(statement).unwrap_err();
+            assert!(
+                db_message(error).contains("chain_seq is immutable"),
+                "{statement}"
+            );
+        }
+        admin
+            .batch_execute("UPDATE praetore.execution_journal SET updated_at = updated_at")
+            .unwrap();
+        let positions: Vec<i64> = admin
+            .query(
+                "SELECT chain_seq FROM praetore.execution_journal ORDER BY chain_seq",
+                &[],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    /// A position deleted, or moved with the triggers off, by someone with
+    /// write access to the database: every export fails and names the
+    /// expected and the found position.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_export_refuses_a_gap_in_the_positions() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        for tenant in [TENANT_A, TENANT_B] {
+            for _ in 0..3 {
+                insert_committed(&mut admin, tenant, &receipt(tenant, None, None));
+            }
+        }
+        // A: the row at position 1 deleted. B: the last row moved to 7.
+        admin
+            .batch_execute(&format!(
+                "SET session_replication_role = replica; \
+                 DELETE FROM praetore.execution_journal \
+                     WHERE tenant_id = '{TENANT_A}' AND chain_seq = 1; \
+                 UPDATE praetore.execution_journal SET chain_seq = 7 \
+                     WHERE tenant_id = '{TENANT_B}' AND chain_seq = 2; \
+                 SET session_replication_role = origin"
+            ))
+            .unwrap();
+        for (tenant, expected, found) in [(TENANT_A, 1, 2), (TENANT_B, 2, 7)] {
+            let message = format!("expected chain_seq {expected}, found {found}");
+            let whole = export_tenant(&mut admin, tenant, &pins()).unwrap_err();
+            assert!(whole.to_string().contains(&message), "{whole}");
+            let ranged =
+                export_tenant_range(&mut admin, tenant, &pins(), 0, MAX_CHAIN_ENTRIES).unwrap_err();
+            assert!(ranged.to_string().contains(&message), "{ranged}");
+            // Also behind the range: the anchor's prefix is checked too.
+            let later = export_tenant_range(&mut admin, tenant, &pins(), 3, 1).unwrap_err();
+            assert!(later.to_string().contains(&message), "{later}");
+        }
+    }
+
+    /// Migration 0024 on a journal written before it: the positions follow
+    /// the order exports used until then (created_at, request_id, agent_id;
+    /// ties of created_at and request_id broken by agent_id), every tenant
+    /// (the nil tenant of 0007 included) gets next_seq = its row count, no
+    /// event is written, and the whole-chain export and every range are the
+    /// same, byte for byte, as before.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_backfill_keeps_every_export() {
+        let scratch = ScratchDatabase::create();
+        let mut admin = scratch.connect();
+        at_0023(&mut admin);
+
+        // Rows inserted out of order, with explicit created_at: ties of
+        // created_at, and of created_at and request_id with two agents.
+        let id = |text: &str| Uuid::parse_str(text).unwrap();
+        let shared_request = id("55555555-0000-4000-8000-000000000000");
+        let (agent_low, agent_high) = (
+            id("01000000-0000-4000-8000-000000000000"),
+            id("ff000000-0000-4000-8000-000000000000"),
+        );
+        let t = |micros: u32| format!("2026-01-01T00:00:00.{micros:06}Z");
+        let mut rows: Vec<(Uuid, String, Evidence)> = Vec::new();
+        for (tenant, micros, agent, request) in [
+            (TENANT_A, 5, None, None),
+            (TENANT_A, 2, Some(agent_high), Some(shared_request)),
+            (TENANT_A, 9, None, None),
+            (TENANT_A, 2, Some(agent_low), Some(shared_request)),
+            (TENANT_A, 1, None, None),
+            (TENANT_A, 5, None, None),
+            (TENANT_A, 7, None, None),
+            (TENANT_B, 3, None, None),
+            (TENANT_B, 1, None, None),
+            (Uuid::nil(), 4, None, None),
+            (Uuid::nil(), 2, None, None),
+        ] {
+            rows.push((tenant, t(micros), receipt(tenant, agent, request)));
+        }
+        {
+            let mut transaction = admin.transaction().unwrap();
+            for (tenant, created_at, evidence) in &rows {
+                transaction
+                    .execute(
+                        "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+                         VALUES ($1, $2, $3)",
+                        &[tenant, evidence.agent.id.as_uuid(), &evidence.request_id],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO praetore.execution_journal \
+                         (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                          authorization_status, execution_status, evidence_json, created_at, \
+                          updated_at) \
+                         VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                                 $6::text::timestamptz, $6::text::timestamptz)",
+                        &[
+                            tenant,
+                            evidence.agent.id.as_uuid(),
+                            &evidence.request_id,
+                            &"ab".repeat(32),
+                            &evidence.to_json().unwrap(),
+                            created_at,
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        // Before 0024: what the export produced, from the order it used
+        // (`ORDER BY created_at, request_id, agent_id`) and the same chain
+        // producer (`chain_receipts`, `ChainExporter`).
+        let before_order = |admin: &mut Client, tenant: Uuid| -> Vec<String> {
+            admin
+                .query(
+                    "SELECT evidence_json FROM praetore.execution_journal WHERE tenant_id = $1 \
+                     ORDER BY created_at, request_id, agent_id",
+                    &[&tenant],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        };
+        const LIMIT: usize = 3;
+        let mut before = BTreeMap::new();
+        let pinned = pins();
+        for tenant in [TENANT_A, TENANT_B, Uuid::nil()] {
+            let receipts = before_order(&mut admin, tenant);
+            let (whole, head, _) = chain_receipts(&receipts, None, &pins()).unwrap();
+            let evidence: Vec<Evidence> = receipts
+                .iter()
+                .map(|json| Evidence::from_json(json).unwrap())
+                .collect();
+            let mut ranges = Vec::new();
+            let mut prev = ChainLink::GENESIS;
+            let mut links = Vec::new();
+            for (seq, receipt) in evidence.iter().enumerate() {
+                prev = receipt_link(seq as u64, &prev, receipt).unwrap();
+                links.push(prev);
+            }
+            for start in (0..evidence.len()).step_by(LIMIT) {
+                let mut exporter = if start == 0 {
+                    ChainExporter::with_attesters(&pinned)
+                } else {
+                    let anchor_prev = if start >= 2 {
+                        links[start - 2]
+                    } else {
+                        ChainLink::GENESIS
+                    };
+                    ChainExporter::resume_after(
+                        &pinned,
+                        start as u64 - 1,
+                        anchor_prev,
+                        &evidence[start - 1],
+                    )
+                    .unwrap()
+                };
+                for receipt in evidence.iter().skip(start).take(LIMIT) {
+                    exporter.push(receipt).unwrap();
+                }
+                ranges.push(exporter.finish().unwrap().0);
+            }
+            before.insert(tenant, (whole, head, ranges, receipts));
+        }
+        let events_before: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal_events",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+
+        let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+        assert_eq!(applied, vec!["0024_journal_commit_order_position"]);
+        praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+
+        let events_after: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal_events",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(events_after, events_before, "the backfill writes no event");
+        for (tenant, (whole, head, ranges, receipts)) in &before {
+            // The positions follow the former order.
+            let positioned: Vec<String> = admin
+                .query(
+                    "SELECT evidence_json, chain_seq FROM praetore.execution_journal \
+                     WHERE tenant_id = $1 ORDER BY chain_seq",
+                    &[tenant],
+                )
+                .unwrap()
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    assert_eq!(row.get::<_, i64>(1), index as i64);
+                    row.get(0)
+                })
+                .collect();
+            assert_eq!(&positioned, receipts, "tenant {tenant}");
+            let next_seq: i64 = admin
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[tenant],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(next_seq, receipts.len() as i64, "tenant {tenant}");
+            // The same files, byte for byte.
+            let export = export_tenant(&mut admin, *tenant, &pins()).unwrap();
+            assert_eq!(&export.text, whole, "tenant {tenant}");
+            assert_eq!(&export.head, head, "tenant {tenant}");
+            for (index, expected) in ranges.iter().enumerate() {
+                let from = (index * LIMIT) as u64;
+                let range = export_tenant_range(&mut admin, *tenant, &pins(), from, LIMIT).unwrap();
+                assert_eq!(&range.text, expected, "tenant {tenant}, range from {from}");
+            }
+        }
+        // The tie of created_at and request_id: agent_id decided, as before.
+        let tied: Vec<(Uuid, i64)> = admin
+            .query(
+                "SELECT agent_id, chain_seq FROM praetore.execution_journal \
+                 WHERE request_id = $1 ORDER BY chain_seq",
+                &[&shared_request],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect();
+        assert_eq!(tied, vec![(agent_low, 1), (agent_high, 2)]);
+        // The next row of a tenant continues after the backfilled ones.
+        assert_eq!(
+            insert_committed(&mut admin, TENANT_B, &receipt(TENANT_B, None, None)),
+            2
+        );
+        assert_eq!(
+            insert_committed(
+                &mut admin,
+                Uuid::from_u128(0xc),
+                &receipt(Uuid::from_u128(0xc), None, None)
+            ),
+            0
+        );
+    }
+
+    /// The manual rollback of 0024 removes the column, the table and the
+    /// triggers, and the runner applies 0024 again (numbering the rows in
+    /// created_at order).
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_migration_rolls_back_and_applies_again() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        for _ in 0..3 {
+            insert_committed(&mut admin, TENANT_A, &receipt(TENANT_A, None, None));
+        }
+        let before = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
+        let objects = |admin: &mut Client| -> i64 {
+            admin
+                .query_one(
+                    "SELECT (SELECT count(*) FROM information_schema.columns \
+                             WHERE table_schema = 'praetore' AND table_name = 'execution_journal' \
+                               AND column_name = 'chain_seq') \
+                          + (SELECT count(*) FROM pg_class WHERE relname = 'journal_positions') \
+                          + (SELECT count(*) FROM pg_trigger \
+                             WHERE tgname LIKE 'execution_journal_position%')",
+                    &[],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(objects(&mut admin), 4);
+        admin.batch_execute(ROLLBACK_0024).unwrap();
+        assert_eq!(objects(&mut admin), 0);
+        // Not recorded any more: a second run refuses and changes nothing.
+        assert!(scratch.connect().batch_execute(ROLLBACK_0024).is_err());
+        let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
+        assert_eq!(applied, vec!["0024_journal_commit_order_position"]);
+        praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+        assert_eq!(objects(&mut admin), 4);
+        let after = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
+        assert_eq!(after.text, before.text);
+    }
+
+    /// Row level security, SECURITY DEFINER and privileges of 0024 as the
+    /// catalog records them after the runner migrates.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_catalog_after_migration() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        for table in ["praetore.journal_positions", "praetore.execution_journal"] {
+            let row = admin
+                .query_one(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_catalog.pg_class \
+                     WHERE oid = pg_catalog.to_regclass($1::text)",
+                    &[&table],
+                )
+                .unwrap();
+            assert!(row.get::<_, bool>(0), "{table}: row level security enabled");
+            assert!(row.get::<_, bool>(1), "{table}: row level security forced");
+        }
+        let row = admin
+            .query_one(
+                "SELECT p.prosecdef, p.proconfig, \
+                        pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE'), \
+                        pg_catalog.has_function_privilege('praetore_runtime', p.oid, 'EXECUTE') \
+                 FROM pg_catalog.pg_proc p \
+                 WHERE p.oid = 'praetore.assign_execution_journal_position_v1()'::regprocedure",
+                &[],
+            )
+            .unwrap();
+        assert!(row.get::<_, bool>(0), "the assignment is SECURITY DEFINER");
+        assert_eq!(
+            row.get::<_, Option<Vec<String>>>(1),
+            Some(vec!["search_path=pg_catalog, praetore, pg_temp".to_owned()]),
+            "the assignment pins its search_path"
+        );
+        assert!(
+            !row.get::<_, bool>(2),
+            "PUBLIC cannot execute the assignment"
+        );
+        assert!(
+            !row.get::<_, bool>(3),
+            "praetore_runtime cannot execute the assignment"
+        );
+    }
+
+    /// 0024 applied by a schema owner that is neither superuser nor
+    /// BYPASSRLS, as on a managed database: the backfill sees every row of
+    /// the journal despite FORCE ROW LEVEL SECURITY, numbers them in the
+    /// former order, FORCE is back afterwards, and a runtime login gets the
+    /// next position.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_applies_as_an_owner_without_superuser() {
+        let scratch = ScratchDatabase::create();
+        let mut admin = scratch.connect();
+        at_0023(&mut admin);
+        let t = |micros: u32| format!("2026-01-01T00:00:00.{micros:06}Z");
+        let rows: Vec<(Uuid, String, Evidence)> = [
+            (TENANT_A, 5),
+            (TENANT_A, 1),
+            (TENANT_B, 3),
+            (TENANT_A, 3),
+            (TENANT_B, 2),
+        ]
+        .into_iter()
+        .map(|(tenant, micros)| (tenant, t(micros), receipt(tenant, None, None)))
+        .collect();
+        {
+            let mut transaction = admin.transaction().unwrap();
+            for (tenant, created_at, evidence) in &rows {
+                insert(&mut transaction, *tenant, evidence, Some(created_at)).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        let owner_role = TestRole::create("LOGIN NOSUPERUSER NOBYPASSRLS");
+        admin
+            .batch_execute(&format!(
+                "{} GRANT CREATE ON DATABASE {} TO {};",
+                transfer_praetore_ownership(&owner_role.name),
+                scratch.name,
+                owner_role.name
+            ))
+            .unwrap();
+        let mut owner = connect_scratch_as(&scratch, &owner_role.name);
+        let applied = praetore_replay_postgres::apply_migrations(&mut owner)
+            .expect("0024 applies as an owner without superuser or BYPASSRLS");
+        assert_eq!(applied, ["0024_journal_commit_order_position"]);
+        drop(owner);
+
+        // The former order: created_at within each tenant.
+        for (index, expected) in [(1, 0), (3, 1), (0, 2), (4, 0), (2, 1)] {
+            assert_eq!(
+                position(&mut admin, rows[index].2.request_id),
+                expected,
+                "row {index}"
+            );
+        }
+        for table in ["praetore.journal_positions", "praetore.execution_journal"] {
+            let forced: bool = admin
+                .query_one(
+                    "SELECT relforcerowsecurity FROM pg_catalog.pg_class \
+                     WHERE oid = pg_catalog.to_regclass($1::text)",
+                    &[&table],
+                )
+                .unwrap()
+                .get(0);
+            assert!(forced, "{table}: FORCE ROW LEVEL SECURITY after 0024");
+        }
+
+        let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+        admin
+            .batch_execute(&format!("GRANT praetore_runtime TO {}", runtime.name))
+            .unwrap();
+        let mut client = connect_scratch_as(&scratch, &runtime.name);
+        assert_eq!(
+            insert_committed(&mut client, TENANT_A, &receipt(TENANT_A, None, None)),
+            3
+        );
+        assert_eq!(
+            insert_committed(&mut client, TENANT_B, &receipt(TENANT_B, None, None)),
+            2
+        );
+    }
+
+    /// With the database's default isolation at REPEATABLE READ, two
+    /// gateway writes of one tenant that wait for its position row both
+    /// commit, through `commit_authorization`, with consecutive positions.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_writers_wait_under_a_repeatable_read_default() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        admin
+            .batch_execute(&format!(
+                "ALTER DATABASE {} SET default_transaction_isolation = 'repeatable read'",
+                scratch.name
+            ))
+            .unwrap();
+        let mut first = config(&scratch).connect(NoTls).unwrap();
+        let isolation: String = first
+            .query_one("SHOW default_transaction_isolation", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(isolation, "repeatable read");
+        assert_eq!(
+            insert_committed(
+                &mut first,
+                TEST_TENANT_ID,
+                &receipt(TEST_TENANT_ID, None, None)
+            ),
+            0
+        );
+        // Another writer of the tenant holds its position row.
+        let mut holder = config(&scratch).connect(NoTls).unwrap();
+        let mut held = holder.transaction().unwrap();
+        insert(
+            &mut held,
+            TEST_TENANT_ID,
+            &receipt(TEST_TENANT_ID, None, None),
+            None,
+        )
+        .unwrap();
+
+        let writers: Vec<_> = [Uuid::new_v4(), Uuid::new_v4()]
+            .into_iter()
+            .map(|request_id| {
+                let fixture = create_postgres_gateway(request_id);
+                let (engine, request) = (fixture.engine.clone(), fixture.request.clone());
+                let journal = scratch_journal(&scratch);
+                thread::spawn(move || {
+                    engine
+                        .evaluate_with_atomic_commit(request, &journal)
+                        .map(|evidence| evidence.request_id)
+                        .map_err(|error| format!("{error:?}"))
+                })
+            })
+            .collect();
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            let waiting: i64 = admin
+                .query_one(
+                    "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                     WHERE datname = pg_catalog.current_database() \
+                       AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            if waiting == 2 {
+                break;
+            }
+            assert!(
+                writers.iter().all(|writer| !writer.is_finished()),
+                "a writer finished before the position row was released"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the writers did not both wait within 30 s"
+            );
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        held.commit().unwrap();
+
+        let mut positions: Vec<i64> = writers
+            .into_iter()
+            .map(|writer| {
+                let request_id = writer
+                    .join()
+                    .unwrap()
+                    .expect("a writer that waited for the position row commits");
+                position(&mut admin, request_id)
+            })
+            .collect();
+        positions.sort_unstable();
+        assert_eq!(positions, [2, 3]);
+    }
 }

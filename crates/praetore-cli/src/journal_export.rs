@@ -367,7 +367,7 @@ fn read_journal_rows(client: &mut postgres::Client, tenant_id: Uuid) -> CliResul
     if rows.len() > MAX_CHAIN_ENTRIES {
         return Err("too many journal rows for one export".into());
     }
-    Ok(rows.iter().map(|row| row.get(0)).collect())
+    lift(shared::receipts_in_chain_order(&rows))
 }
 
 #[cfg(test)]
@@ -927,7 +927,7 @@ mod tests {
     /// equal `created_at` and an equal `(created_at, request_id)` pair.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL pointing to a disposable local PostgreSQL"]
-    fn postgres_export_orders_by_created_at_then_request_id_then_agent_id() {
+    fn postgres_export_orders_by_commit_position_not_created_at() {
         let admin_url = test_url();
         let runtime_url = runtime_url(&admin_url);
         let set = set("04-sesion-real-bloqueada-web-fetch");
@@ -948,12 +948,16 @@ mod tests {
             id("ff000000-0000-4000-8000-000000000000"),
         );
         let (t0, t1) = ("2026-01-01T00:00:00.000001Z", "2026-01-01T00:00:00.000002Z");
-        // (created_at, request_id, agent_id), in insert order.
+        // (created_at, request_id, agent_id), in insert order. Until
+        // migration 0024 the export ordered them by created_at, request_id,
+        // agent_id (2, 3, 1, 0); now each row takes the next position of its
+        // tenant when it is written, so the export follows the insert (and
+        // commit) order whatever created_at and the ids say.
         let inserts = [
-            (t1, req_a0, agent_00), // expected 3rd
-            (t1, req_0a, agent_ff), // expected 2nd: same t1 and request as the next one
-            (t0, req_ff, agent_01), // expected 0th: earliest, despite the largest ids
-            (t1, req_0a, agent_01), // expected 1st
+            (t1, req_a0, agent_00),
+            (t1, req_0a, agent_ff),
+            (t0, req_ff, agent_01), // earliest created_at, still third
+            (t1, req_0a, agent_01),
         ];
         let mut admin = crate::connect_local_database(&admin_url).unwrap();
         for (index, (created_at, request_id, agent_id)) in inserts.iter().enumerate() {
@@ -964,7 +968,19 @@ mod tests {
                 Some(created_at),
             );
         }
-        let expected: Vec<String> = [2, 3, 1, 0].map(|i| receipts[i].clone()).to_vec();
+        let expected: Vec<String> = [0, 1, 2, 3].map(|i| receipts[i].clone()).to_vec();
+        let positions: Vec<i64> = admin
+            .query(
+                "SELECT chain_seq FROM praetore.execution_journal WHERE tenant_id = $1 \
+                 ORDER BY created_at, request_id, agent_id",
+                &[&tenant],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        // In the former order the positions are those of the insert order.
+        assert_eq!(positions, vec![2, 3, 1, 0]);
         let uuid_matches_text: bool = admin
             .query_one(
                 "WITH v (a, b, c) AS (SELECT $1::text, $2::text, $3::text) \
@@ -985,7 +1001,7 @@ mod tests {
         assert_eq!(read_journal(&admin_url, tenant).unwrap(), expected);
         // With index scans off the rows come from the heap in insert order, so
         // the result depends only on ORDER BY, not on which index the planner
-        // picks (the primary key is already sorted by agent_id).
+        // picks (the unique index on tenant_id, chain_seq is already sorted).
         let mut runtime = crate::connect_local_database(&runtime_url).unwrap();
         runtime
             .batch_execute("SET enable_indexscan = off; SET enable_bitmapscan = off")
