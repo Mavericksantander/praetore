@@ -7480,6 +7480,20 @@ mod delegated_approval {
         ));
     }
 
+    #[test]
+    fn a_root_cannot_revoke_another_tenants_delegation() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        // The other tenant's root signs a revocation of this tenant's
+        // delegation, under its own tenant id.
+        let mut forged = revocation(OTHER_ROOT, &alice, "2026-06-01T12:00:00Z");
+        forged.tenant_id = OTHER_TENANT;
+        forged.sign(&pair(OTHER_ROOT)).unwrap();
+        assert_eq!(
+            DelegationConfig::from_json(&document(&[&alice], &[&forged])).unwrap_err(),
+            DelegationError::InvalidRevocation
+        );
+    }
+
     // --- Attenuation: one test per rule ------------------------------------
 
     #[test]
@@ -7739,6 +7753,32 @@ mod delegated_approval {
             ApprovalError::SelfApproval,
             "OUTCOME_SELF_APPROVAL",
         );
+    }
+
+    #[test]
+    fn the_agent_key_cannot_be_the_root_of_a_chain() {
+        // A document whose root is the requesting agent's key: the agent
+        // delegates to another key it holds and approves through it.
+        let mut alice = Grant::approver(AGENT, None, ALICE).sign();
+        alice.issuer_key_id = key_id(ROOT);
+        alice.sign(&pair(AGENT)).unwrap();
+        let agent_root = json!({
+            "schema_version": 1,
+            "roots": [{"tenant_id": TEST_TENANT_ID, "key_id": key_id(ROOT), "public_key_hex": public_hex(AGENT)}],
+            "delegations": [&alice],
+        })
+        .to_string();
+        let held = held_on(&agent_root);
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        match held.gateway.resolve_human_approval(decision) {
+            Err(GatewayError::Approval(error)) => assert_eq!(error, ApprovalError::SelfApproval),
+            other => panic!("expected SelfApproval, got {other:?}"),
+        }
+        assert_eq!(
+            held.journal.get(held.key).unwrap().unwrap().human_approval,
+            None
+        );
+        assert_eq!(held.tool.invocations(), 0);
     }
 
     // --- Compatibility ---------------------------------------------------

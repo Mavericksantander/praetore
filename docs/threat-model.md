@@ -461,7 +461,7 @@ who may sign a human decision; enforcement stays cooperative.
 | Cross-tenant use | Each link must be for the root's tenant and the challenge's tenant; roots are unique across tenants | Depends on the gateway's issuer bindings and the delegation file being provisioned correctly |
 | The requesting agent approves itself | No key of the chain, nor the root approving alone, may be the agent's key | An agent that holds another key in a chain is not detected |
 | A decision is replayed onto another request or policy | The chain is inside the signed payload, the challenge binds the evidence and the `policy_digest`, and the gateway refuses a root decision when its policy is not the evidence's | None beyond the existing approval checks |
-| Offline verification and revocations | Offline, a revocation effective by the challenge's `expires_at` fails the decision | No signed decision time: a decision made before a revocation inside its window also fails offline (conservative). A revocation the verifier is not given is not seen |
+| Offline verification and revocations | Offline, a revocation effective by the challenge's `expires_at` fails the decision | No signed decision time: a decision made before a revocation inside its window also fails offline (conservative). A revocation the verifier is not given is not seen: whoever supplies the delegation file can leave revocations out |
 
 ## Operational response
 

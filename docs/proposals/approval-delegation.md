@@ -114,6 +114,12 @@ the gateway still accepts decisions from the revoked chain. An operator who
 needs a revocation to take effect at once must restart the gateway, or
 remove the approver's chain from the file, or stop the gateway.
 
+Offline, the verifier sees only the revocations in the `--delegations` file
+it is given. Delegations are authenticated by the pinned root, but nothing
+shows that a file is the latest one: a file without a revocation makes a
+revoked chain verify. Obtain the delegation file from the operator's
+records, not from the party whose decisions are being checked.
+
 ## 4. The time rule
 
 A delegation must be valid for the whole window from the evidence's signed
@@ -194,6 +200,11 @@ the option from the given policy, whose digest must equal the challenge's
   `DELEGATION_UNVERIFIED`. The JSON report lists every version 2 decision
   in `delegated_decisions`, with its verified `delegation_chain` and
   `root_approved`.
+- The console's compliance package verifies its outcomes without
+  delegation data, so a tenant with any version 2 decision cannot be
+  packaged by the console in this step (the export fails with the
+  `DELEGATION_UNVERIFIED` error). Verify such a tenant with
+  `praetore-verify outcomes` and the delegation arguments.
 - No migration: decisions are stored as JSON, and a version 2 decision is
   stored as it was signed.
 - Rust API: `HumanApprovalDecision` gains `delegation_chain`,
@@ -209,6 +220,8 @@ the option from the given policy, whose digest must equal the challenge's
 - **Issuing and revoking from the console**, and a command line tool to
   sign delegations and revocations. Today they are signed out of band and
   placed in the file.
+- **Delegation data in the console's package**, so a tenant with
+  delegated decisions can be packaged.
 - **Revocation without restart** (section 3), and the signed decision time
   of section 4.
 - **Single sign-on** for approvers.

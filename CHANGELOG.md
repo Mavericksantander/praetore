@@ -219,7 +219,10 @@
   approves in its own name only when the policy sets
   `approval_delegation.root_may_approve`; absent, the policy digest is
   unchanged. Revocations are read at startup: a new one needs a restart.
-  Version 1 decisions, existing policies and the console are unchanged.
+  Version 1 decisions and existing policies are unchanged. The console
+  still signs version 1 decisions only, and its compliance package fails
+  for a tenant with version 2 decisions; verify those with
+  `praetore-verify outcomes`.
   Design: `docs/proposals/approval-delegation.md`.
 - **Console language and local time.** The console page can be read in
   Spanish, English or Portuguese (Brazil), chosen with a selector at the top

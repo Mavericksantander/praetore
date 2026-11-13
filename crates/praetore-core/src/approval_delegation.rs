@@ -499,6 +499,14 @@ impl DelegationConfig {
             .get(&revocation.tenant_id)
             .ok_or(DelegationError::InvalidRevocation)?;
         let signer = if revocation.issuer_key_id == root.key_id {
+            // The root revokes only its own tenant's delegations.
+            if self
+                .delegations
+                .get(&revocation.delegation_hash)
+                .is_some_and(|delegation| delegation.tenant_id != revocation.tenant_id)
+            {
+                return Err(DelegationError::InvalidRevocation);
+            }
             root.public_key.clone()
         } else {
             let delegation = self
@@ -534,9 +542,10 @@ impl DelegationConfig {
         self.roots.values()
     }
 
-    fn revoked(&self, hash: &str, rule: RevocationRule) -> bool {
+    fn revoked(&self, tenant_id: Uuid, hash: &str, rule: RevocationRule) -> bool {
         self.revocations.iter().any(|(revocation, effective_at)| {
-            revocation.delegation_hash == hash
+            revocation.tenant_id == tenant_id
+                && revocation.delegation_hash == hash
                 && match rule {
                     RevocationRule::Loaded => true,
                     RevocationRule::EffectiveBy(deadline) => *effective_at <= deadline,
@@ -637,6 +646,10 @@ pub fn verify_approval_chain(
     if chain.len() > MAX_DELEGATION_CHAIN {
         return Err(DelegationError::ChainTooLong);
     }
+    // The root signs the first link: it may not be the agent's key either.
+    if root.public_key.as_bytes().as_slice() == context.agent_public_key {
+        return Err(DelegationError::SelfApproval);
+    }
     let mut parent = Link {
         key_id: &root.key_id,
         key: root.public_key.clone(),
@@ -692,7 +705,7 @@ pub fn verify_approval_chain(
         if subject.as_bytes().as_slice() == context.agent_public_key {
             return Err(DelegationError::SelfApproval);
         }
-        if config.revoked(hash, context.revocations) {
+        if config.revoked(delegation.tenant_id, hash, context.revocations) {
             return Err(DelegationError::Revoked);
         }
         if validity.0 > context.window_start || validity.1 < context.window_end {

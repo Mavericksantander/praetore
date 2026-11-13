@@ -1311,7 +1311,10 @@ except for revocations: offline, a revocation counts when its
 `effective_at` is at or before the challenge's `expires_at`
 (`DELEGATION_REVOKED`). The report adds `delegation_checked` and
 `delegated_decisions`, one entry per version 2 decision with its
-`delegation_chain` and `root_approved`.
+`delegation_chain` and `root_approved`. Revocations count only if they are
+in the given file: take it from the gateway's own configuration records.
+The console's compliance package does not carry delegation data yet, so it
+cannot package a tenant that has version 2 decisions.
 
 A receipt that verifies is not always final: a later receipt for the same
 request can record another state. The verifier reports `details.final` and
