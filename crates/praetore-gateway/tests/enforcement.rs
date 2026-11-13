@@ -1297,6 +1297,286 @@ async fn http_gateway_returns_denials_without_dispatch() {
     assert_eq!(fixture.tool.invocations(), 0);
 }
 
+/// Two `POST /v1/execute` 403 responses for `fs:write_file`.
+///
+/// An allow rule with `PathPrefix` `/srv/agent` denies an absolute path
+/// outside that prefix. The body is `authorization_denied` and has no
+/// `reason`. The execution stays `not_dispatched` and the sandbox writes
+/// nothing.
+///
+/// The same action, allowed with no path condition and sent as `../escape`,
+/// is refused by `SandboxDispatcher`. The body is `action_not_dispatchable`
+/// with `reason` `path_traversal` and a signed `dispatch_refused` receipt.
+/// Nothing is written outside the sandbox root.
+#[cfg(unix)]
+#[tokio::test]
+async fn http_path_prefix_denial_is_distinct_from_sandbox_refusal() {
+    use praetore_core::PolicyCondition;
+    use praetore_gateway::sandbox::{WRITE_ACTION, WRITE_CAPABILITY};
+
+    let denied_dirs = http_sandbox_dirs();
+    let outside = denied_dirs.outside.join("secret");
+    assert!(outside.is_absolute());
+    assert!(!outside.starts_with("/srv/agent"));
+    let outside_path = outside.to_str().expect("utf-8 sandbox path");
+    let prefix_rule = PolicyRule::new("write-under-prefix", WRITE_ACTION, PolicyEffect::Allow)
+        .with_capability(WRITE_CAPABILITY)
+        .with_parameter_condition(PolicyCondition::path_prefix("path", "/srv/agent"));
+    let denied = fs_write_gateway(vec![prefix_rule], outside_path, &denied_dirs.root);
+    let inside = mission(fs_write_action("/srv/agent/notes.txt"));
+    assert_eq!(
+        denied
+            .gateway
+            .policy()
+            .evaluate(&denied.request.agent, &denied.request.authority, &inside)
+            .unwrap()
+            .outcome,
+        DecisionOutcome::Allow,
+        "a path inside the prefix is allowed"
+    );
+    assert_eq!(
+        denied
+            .gateway
+            .policy()
+            .evaluate(
+                &denied.request.agent,
+                &denied.request.authority,
+                &denied.request.action
+            )
+            .unwrap()
+            .outcome,
+        DecisionOutcome::Deny,
+        "a path outside the prefix is denied"
+    );
+    let (status, denied_body) = post_execute(denied.gateway, &denied.request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(denied_body["code"], "authorization_denied");
+    assert!(
+        denied_body.get("reason").is_none(),
+        "policy denial must not carry reason: {denied_body}"
+    );
+    assert!(
+        denied_body.get("receipt").is_none(),
+        "policy denial must not carry a dispatch receipt: {denied_body}"
+    );
+    assert_eq!(denied_body["authorization"], "denied");
+    assert_eq!(denied_body["execution"], "not_dispatched");
+    assert_eq!(
+        denied_body["request_id"],
+        denied.request.request_id.to_string()
+    );
+    let denied_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *denied.request.agent.id.as_uuid(),
+        request_id: denied.request.request_id,
+    };
+    let denied_entry = denied.journal.entry(denied_key).unwrap();
+    assert_eq!(denied_entry.authorization, AuthorizationStatus::Denied);
+    assert_eq!(denied_entry.execution, ExecutionStatus::NotDispatched);
+    assert!(denied_entry.output.is_none());
+    assert!(!denied_entry.states.contains(&ExecutionStatus::Dispatched));
+    assert_eq!(
+        denied_entry
+            .execution_attestation
+            .unwrap()
+            .not_dispatched_reason,
+        None
+    );
+    assert_sandbox_untouched(&denied_dirs);
+
+    let refused_dirs = http_sandbox_dirs();
+    let allow_rule = PolicyRule::new("write-file", WRITE_ACTION, PolicyEffect::Allow)
+        .with_capability(WRITE_CAPABILITY);
+    let refused = fs_write_gateway(vec![allow_rule], "../escape", &refused_dirs.root);
+    assert_eq!(
+        refused
+            .gateway
+            .policy()
+            .evaluate(
+                &refused.request.agent,
+                &refused.request.authority,
+                &refused.request.action
+            )
+            .unwrap()
+            .outcome,
+        DecisionOutcome::Allow,
+        "the sandbox refusal is not a policy denial"
+    );
+    let (status, refused_body) = post_execute(refused.gateway, &refused.request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_ne!(denied_body["code"], refused_body["code"]);
+    assert_eq!(refused_body["code"], "action_not_dispatchable");
+    assert_eq!(refused_body["reason"], "path_traversal");
+    let receipt: praetore_gateway::GatewayReceipt =
+        serde_json::from_value(refused_body["receipt"].clone()).unwrap();
+    assert_eq!(receipt.authorization, AuthorizationStatus::Allowed);
+    assert_eq!(receipt.execution, AttestedExecution::NotDispatched);
+    assert_eq!(
+        receipt.execution_attestation.not_dispatched_reason,
+        Some(NotDispatchedReason::DispatchRefused)
+    );
+    assert_eq!(
+        refused_body["receipt"]["execution_attestation"]["not_dispatched_reason"],
+        "dispatch_refused"
+    );
+    receipt
+        .verify_with_test_evidence_attester(
+            &execution_attester_public_key(),
+            "test-execution-attester-v1",
+        )
+        .unwrap();
+    let refused_key = ExecutionKey {
+        tenant_id: TEST_TENANT_ID,
+        agent_id: *refused.request.agent.id.as_uuid(),
+        request_id: refused.request.request_id,
+    };
+    let refused_entry = refused.journal.entry(refused_key).unwrap();
+    assert_eq!(refused_entry.authorization, AuthorizationStatus::Allowed);
+    assert_eq!(refused_entry.execution, ExecutionStatus::NotDispatched);
+    assert_eq!(refused_entry.states, vec![ExecutionStatus::NotDispatched]);
+    assert_eq!(
+        refused_entry
+            .execution_attestation
+            .unwrap()
+            .not_dispatched_reason,
+        Some(NotDispatchedReason::DispatchRefused)
+    );
+    assert_sandbox_untouched(&refused_dirs);
+}
+
+#[cfg(unix)]
+struct HttpSandboxDirs {
+    base: std::path::PathBuf,
+    root: std::path::PathBuf,
+    outside: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for HttpSandboxDirs {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+#[cfg(unix)]
+fn http_sandbox_dirs() -> HttpSandboxDirs {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("praetore-gateway-http-{}", Uuid::new_v4()));
+    let root = base.join("root");
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    HttpSandboxDirs {
+        base,
+        root,
+        outside,
+    }
+}
+
+#[cfg(unix)]
+fn assert_sandbox_untouched(dirs: &HttpSandboxDirs) {
+    let names = |path: &std::path::Path| {
+        let mut names = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    assert_eq!(names(&dirs.root), Vec::<String>::new(), "sandbox root");
+    assert_eq!(names(&dirs.outside), Vec::<String>::new(), "outside root");
+    assert_eq!(
+        names(&dirs.base),
+        vec!["outside".to_string(), "root".to_string()],
+        "nothing written beside the sandbox root"
+    );
+}
+
+#[cfg(unix)]
+fn fs_write_action(path: &str) -> Action {
+    use praetore_gateway::sandbox::{DEFAULT_TARGET, WRITE_ACTION, WRITE_CAPABILITY};
+
+    Action::new(
+        WRITE_ACTION,
+        Some(DEFAULT_TARGET.into()),
+        json!({"content": "not-written", "path": path}),
+    )
+    .unwrap()
+    .with_capability(WRITE_CAPABILITY)
+}
+
+#[cfg(unix)]
+struct FsHttpGateway {
+    gateway: Gateway,
+    request: AuthorizationRequest,
+    journal: Arc<MemoryJournal>,
+}
+
+#[cfg(unix)]
+fn fs_write_gateway(rules: Vec<PolicyRule>, path: &str, root: &std::path::Path) -> FsHttpGateway {
+    let agent_key = AgentKeyPair::from_secret_bytes(&[11; 32]);
+    let issuer_key = AgentKeyPair::from_secret_bytes(&[12; 32]);
+    let attester = EvidenceAttesterKey::from_secret_bytes(&[13; 32]);
+    let agent = agent_key.identity(AgentId::new());
+    let mut authority = Authority::new(
+        agent.id.clone(),
+        "local-test-issuer",
+        vec![praetore_gateway::sandbox::WRITE_CAPABILITY.into()],
+    )
+    .with_validity(long_validity())
+    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    authority.sign_for_agent(&issuer_key, &agent).unwrap();
+
+    let policy = mission_policy(Policy::new_v2("fs-write-http", 1, rules));
+    let now = FixedClock::try_new(NOW).unwrap().now();
+    let mut request =
+        AuthorizationRequest::new(agent, authority, mission(fs_write_action(path))).unwrap();
+    request
+        .sign_intent_v2(
+            &agent_key,
+            "local-test-gateway",
+            now - Duration::seconds(1),
+            now + Duration::minutes(1),
+            policy.digest().unwrap(),
+        )
+        .unwrap();
+
+    let engine = production_engine(
+        policy,
+        issuer_key.public_key(),
+        attester,
+        Arc::new(MemoryReplayGuard::default()),
+    );
+    let journal = Arc::new(MemoryJournal::default());
+    let dispatcher: Arc<dyn ActionDispatcher> =
+        Arc::new(praetore_gateway::sandbox::SandboxDispatcher::open(root).unwrap());
+    let gateway = Gateway::new(engine, journal.clone(), dispatcher, execution_attester()).unwrap();
+    FsHttpGateway {
+        gateway,
+        request,
+        journal,
+    }
+}
+
+#[cfg(unix)]
+async fn post_execute(gateway: Gateway, request: &AuthorizationRequest) -> (StatusCode, Value) {
+    let app = http_api::router(
+        Arc::new(gateway),
+        http_api::ApiAuth::UnauthenticatedLoopbackDemo,
+    );
+    let response = app
+        .oneshot(http_request(serde_json::to_string(request).unwrap()))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 262_144).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
 #[tokio::test]
 async fn http_gateway_returns_approval_receipt_without_dispatch() {
     let fixture = fixture(Some(PolicyEffect::RequireApproval), false);
