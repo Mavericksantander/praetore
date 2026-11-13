@@ -30,6 +30,17 @@ fn set_04() -> PathBuf {
         .join("../../examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch")
 }
 
+/// The pin and the policy of set 04, as the console loads them at startup.
+fn set_04_trust() -> EvidenceTrust {
+    let pin = fs::read_to_string(set_04().join("attester-public-key.hex")).unwrap();
+    let policy = fs::read_to_string(set_04().join("policy.json")).unwrap();
+    EvidenceTrust::new(
+        vec![parse_attester_pin(&pin).unwrap()],
+        RecordedPolicy::from_json(&policy).unwrap(),
+    )
+    .unwrap()
+}
+
 fn receipts_of_set_04() -> Vec<String> {
     let dir = set_04().join("evidence");
     let mut names: Vec<_> = fs::read_dir(&dir)
@@ -101,7 +112,7 @@ impl HistoryStore for NoHistory {
 struct NoInbox;
 
 impl InboxStore for NoInbox {
-    fn pending(&self) -> Result<InboxPage, HistoryError> {
+    fn pending(&self, _trust: &EvidenceTrust) -> Result<InboxPage, HistoryError> {
         Ok(InboxPage {
             items: Vec::new(),
             unreadable: 0,
@@ -172,6 +183,7 @@ fn app(settings: Option<PackSettings>, store: Arc<SetExport>, with_inbox: bool) 
             Arc::new(NoInbox),
             Arc::new(NoGateway),
             ApproverSigner::new("approver-1", APPROVER_SECRET).unwrap(),
+            set_04_trust(),
         ));
     }
     if let Some(settings) = settings {

@@ -24,7 +24,7 @@ Optional:
 | `PRAETORE_CONSOLE_BIND` | Loopback address, default `127.0.0.1:8090`. A non-loopback address is refused. |
 | `PRAETORE_CONSOLE_AGENT_NAMES_FILE` | `agent-uuid = nombre` lines, so agents show by name. |
 
-Approvals inbox: all four or none. A partial set is a startup error.
+Approvals inbox: all four or none. A partial set is a startup error. The inbox also requires `PRAETORE_CONSOLE_POLICY_FILE` and `PRAETORE_CONSOLE_ATTESTER_PIN_FILES` (below): without them the console does not start, and the error names the missing variables. As a consequence, a console with the inbox also offers the compliance package.
 
 | Variable | What |
 | --- | --- |
@@ -33,7 +33,7 @@ Approvals inbox: all four or none. A partial set is a startup error.
 | `PRAETORE_CONSOLE_APPROVER_KEY_FILE` | File with the approver Ed25519 secret, 32 bytes in hex (`approver.key` of `praetore init`). It must be a regular file owned by this user, with no group or other permissions, and not a symlink. |
 | `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE` | The gateway's `approver` bearer token (`approver-api.token`), with the same file rules. |
 
-Compliance package: both or none. One without the other is a startup error.
+Attester pins and local policy: both or none. One without the other is a startup error. With them, the compliance package is available, the history checks attester signatures, and the inbox (when configured) can verify the evidence it offers. The inbox and the history read these files once, at startup: a change takes effect when the console is restarted. The compliance package reads them again at each download. The console opens them without following a final symlink and without waiting on a FIFO, and requires a regular file. This also applies with the policy and the pins but no inbox (package only): the console reads them at startup and does not start if one cannot be read, is a symlink or is not a regular file. Before, they were first read at download; the download itself is unchanged and still follows symlinks.
 
 | Variable | What |
 | --- | --- |
@@ -88,8 +88,9 @@ Abre la consola en este computador con este enlace (vale una vez, 5 minutos):
 
   To approve such a request, review it in full with `praetore approve`.
 - **Confirmation:** "Aprobar y ejecutar" and "Rechazar" each ask for a confirmation inside the same card before anything is signed. The confirmation repeats the agent, the action, the target, each parameter and the deadline.
-- **Before signing**, the console fetches the gateway challenge and requires it to be identical to the one rebuilt from the journal evidence it showed: same key, evidence, action, policy and window.
-  - It checks that evidence's **integrity hash**, not its attester signature against a pin, and it does not compare the policy with a local copy. The gateway verifies the decision's signature.
+- **Before showing a request, and again before signing**, the console checks its journal evidence: the integrity hash, the attester signature against one of the configured pins (`PRAETORE_CONSOLE_ATTESTER_PIN_FILES`), and the policy digest the evidence records against the local policy (`PRAETORE_CONSOLE_POLICY_FILE`). A request that fails any of these is not offered, to approve or to reject, and the page only counts it. It then fetches the gateway challenge and requires it to be identical to the one rebuilt from that evidence: same key, evidence, action, policy and window. The gateway verifies the decision's signature.
+  - **Policy change:** after the local policy file changes (and the console restarts), requests held under the earlier policy record its digest, so the inbox no longer offers them. They can still be decided with `praetore approve` or `praetore reject`.
+  - **History:** with pins, a receipt counts as readable only when its attester signature verifies against one of them; the current policy is not required, so receipts decided under an earlier policy stay readable. A receipt that does not verify is shown as unreadable, and the rest of the page is shown. Without pins (history only, no policy or pins configured), the history checks the integrity hash only, not who signed it.
 - **A rejection is final.** An approval is never resent. If the dispatch fails, only the dispatch is offered again.
 
 ## The compliance package

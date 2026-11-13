@@ -53,8 +53,8 @@ pub const OUTCOMES_FILE: &str = "approvals.jsonl";
 
 /// Most attester pins, as `praetore journal-export`.
 pub const MAX_ATTESTER_PINS: usize = 16;
-const MAX_POLICY_BYTES: u64 = 1024 * 1024;
-const MAX_PIN_BYTES: u64 = 4096;
+pub(crate) const MAX_POLICY_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_PIN_BYTES: u64 = 4096;
 
 /// `attester-pin-1.hex`, `attester-pin-2.hex`, ... in configuration order.
 pub fn pin_file_name(index: usize) -> String {

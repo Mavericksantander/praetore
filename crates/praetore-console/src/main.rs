@@ -26,18 +26,23 @@
 //! - `PRAETORE_CONSOLE_APPROVER_TOKEN_FILE`: owner-only file with the
 //!   gateway's `approver` bearer token (`approver-api.token`).
 //!
-//! Compliance package (D3), both or none:
+//! Attester pins and local policy (D3), both or none, and both required
+//! when the inbox is configured:
 //! - `PRAETORE_CONSOLE_POLICY_FILE`: the policy file the gateway loads;
 //! - `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`: one or more attester public-key
 //!   files (lowercase hex), separated like `PATH` (`:` on Unix).
 //!
-//! Both are read again at every download, so the package carries the files
-//! as they are at that moment.
+//! They are read once at startup for the inbox and the history: the inbox
+//! offers a request only when its evidence is signed by one of the pins and
+//! records the local policy's digest; the history checks the signature.
+//! A change to these files takes effect on restart. With them the
+//! compliance package is also available, and it reads them again at every
+//! download, so the package carries the files as they are at that moment.
 
 use praetore_console::{
-    ApproverSigner, CompliancePack, ConsoleState, HttpApprovalGateway, Inbox, LocalSession,
-    PackSettings, PostgresHistory, parse_agent_names, parse_gateway_address, read_token_file,
-    validate_bind_address,
+    ApproverSigner, CompliancePack, ConsoleState, EvidenceTrust, HttpApprovalGateway, Inbox,
+    LocalSession, PINS_VARIABLE, POLICY_VARIABLE, PackSettings, PostgresHistory, parse_agent_names,
+    parse_gateway_address, read_token_file, require_for_inbox, validate_bind_address,
 };
 use praetore_replay_postgres::{DatabaseConnector, RuntimeRoleOptions, verify_runtime_role_with};
 use std::io::IsTerminal;
@@ -80,22 +85,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => return Err("PRAETORE_CONSOLE_AGENT_NAMES_FILE no se pudo leer".into()),
     };
 
+    // Configuration first: an inbox without the pins and the policy that
+    // verify its evidence never starts.
+    let inbox = approver_settings()?;
+    require_for_inbox(
+        inbox.is_some(),
+        env::var_os(POLICY_VARIABLE).as_deref(),
+        env::var_os(PINS_VARIABLE).as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
+    let pack = pack_settings()?;
+    let trust = trust_settings(inbox.as_ref().map(|(_, signer)| signer))
+        .map_err(|error| error.to_string())?;
+
     let mut client = database.connect().map_err(|_| "no se pudo abrir la base")?;
     let options = RuntimeRoleOptions::from_config(|name| env::var(name).ok())?;
     verify_runtime_role_with(&mut client, &options)?;
-    let history = PostgresHistory::from_client(client, tenant_id)
+    let mut history = PostgresHistory::from_client(client, tenant_id)
         .map_err(|_| "no se pudo preparar la lectura del registro")?;
+    match &trust {
+        Some(trust) => {
+            history = history.with_attester_pins(trust.pins());
+            tracing::info!("historial: firma del atestador verificada con los pins configurados");
+        }
+        None => tracing::info!("historial: sin pins del atestador, solo hash de integridad"),
+    }
     let history = Arc::new(history);
     let mut state = ConsoleState::new(history.clone(), session, names).with_address(address);
-    let inbox = approver_settings()?;
-    match inbox {
-        Some((gateway, signer)) => {
-            state = state.with_inbox(Inbox::new(history.clone(), Arc::new(gateway), signer));
+    match (inbox, trust) {
+        (Some((gateway, signer)), Some(trust)) => {
+            state = state.with_inbox(Inbox::new(
+                history.clone(),
+                Arc::new(gateway),
+                signer,
+                trust,
+            ));
             tracing::info!("bandeja de aprobaciones activa");
         }
-        None => tracing::info!("bandeja de aprobaciones sin configurar: solo historial"),
+        // Defensive: `require_for_inbox` already refused an inbox without
+        // the policy and the pins, so this arm is not reached.
+        (Some(_), None) => {
+            return Err(
+                "la bandeja de aprobaciones necesita la política y los pins del atestador".into(),
+            );
+        }
+        (None, _) => tracing::info!("bandeja de aprobaciones sin configurar: solo historial"),
     }
-    match pack_settings()? {
+    match pack {
         Some(settings) => {
             state = state.with_compliance_pack(CompliancePack::new(settings, history.clone()));
             tracing::info!("paquete de compliance disponible");
@@ -196,6 +232,24 @@ fn pack_settings() -> Result<Option<PackSettings>, Box<dyn std::error::Error>> {
         )
         .into()),
     }
+}
+
+/// The attester pins and the policy, read once, when both are set (a set
+/// with only one of them is refused by `pack_settings`).
+fn trust_settings(
+    approver: Option<&ApproverSigner>,
+) -> Result<Option<EvidenceTrust>, Box<dyn std::error::Error>> {
+    let (Some(policy), Some(pins)) = (
+        env::var_os(POLICY_VARIABLE).filter(|value| !value.is_empty()),
+        env::var_os(PINS_VARIABLE).filter(|value| !value.is_empty()),
+    ) else {
+        return Ok(None);
+    };
+    let pins: Vec<PathBuf> = env::split_paths(&pins)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect();
+    let trust = EvidenceTrust::load(&PathBuf::from(policy), &pins, approver)?;
+    Ok(Some(trust))
 }
 
 /// True when stdin and stderr are a terminal and this process is in that

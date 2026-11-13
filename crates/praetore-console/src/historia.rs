@@ -3,7 +3,7 @@
 //! The words an operator sees are decided here. Technical state names stay in
 //! this module and are not the product face.
 
-use praetore_core::Evidence;
+use praetore_core::{Evidence, VerifiedPublicKey};
 use praetore_gateway::{
     AttestedExecution, AuthorizationStatus, ExecutionStatus, NotDispatchedReason,
 };
@@ -103,9 +103,26 @@ pub struct JournalColumns {
     pub evidence_json: String,
 }
 
-pub fn facts_from_columns(columns: JournalColumns) -> Result<ReceiptFacts, ()> {
-    let action = public_action(&columns.evidence_json)?;
-    Ok(ReceiptFacts {
+/// A receipt whose evidence does not check out is kept as unreadable
+/// (`legible: false`, no action or target): one bad receipt does not hide
+/// the rest of the page. With `pins`, the evidence must also be signed by
+/// one of them; the current policy is not required, so a receipt decided
+/// under an earlier policy stays readable. Without pins, integrity only.
+pub fn facts_from_columns(
+    columns: JournalColumns,
+    pins: Option<&[VerifiedPublicKey]>,
+) -> ReceiptFacts {
+    let (legible, action) = match public_action(&columns.evidence_json, pins) {
+        Ok(action) => (true, action),
+        Err(()) => (
+            false,
+            PublicAction {
+                wanted: String::new(),
+                target: None,
+            },
+        ),
+    };
+    ReceiptFacts {
         created_at: columns.created_at,
         updated_at: columns.updated_at,
         agent_id: columns.agent_id,
@@ -114,10 +131,10 @@ pub fn facts_from_columns(columns: JournalColumns) -> Result<ReceiptFacts, ()> {
         execution: columns.execution,
         attested: columns.attested,
         reason: columns.reason,
-        legible: true,
+        legible,
         wanted: action.wanted,
         target: action.target,
-    })
+    }
 }
 
 pub struct PublicAction {
@@ -125,13 +142,20 @@ pub struct PublicAction {
     pub target: Option<String>,
 }
 
-/// Action type and target when the receipt still checks out.
-/// Parameters, context, and the raw JSON are dropped.
-pub fn public_action(evidence_json: &str) -> Result<PublicAction, ()> {
+/// Action type and target when the receipt still checks out: integrity,
+/// and with `pins` the attester signature of one of them. Parameters,
+/// context, and the raw JSON are dropped.
+pub fn public_action(
+    evidence_json: &str,
+    pins: Option<&[VerifiedPublicKey]>,
+) -> Result<PublicAction, ()> {
     let evidence = Evidence::from_json(evidence_json).map_err(|_| ())?;
     // `from_json` already refuses a receipt that does not check out. A second
     // check keeps a tampered target from being copied if that ever changes.
     if !evidence.verify_integrity() {
+        return Err(());
+    }
+    if pins.is_some_and(|pins| !crate::confianza::signed_by_a_pin(&evidence, pins)) {
         return Err(());
     }
     let target = evidence.action.target.filter(|target| !target.is_empty());
@@ -710,7 +734,7 @@ mod tests {
         let (json, _agent, _request) = signed_evidence("informe-trimestral");
         assert!(json.contains("parameter-secret"));
         assert!(json.contains("context-secret"));
-        let action = public_action(&json).unwrap();
+        let action = public_action(&json, None).unwrap();
         assert_eq!(action.wanted, "escribir_archivo");
         assert_eq!(action.target.as_deref(), Some("informe-trimestral"));
         let rendered = format!("{} {}", action.wanted, action.target.unwrap_or_default());
@@ -723,7 +747,83 @@ mod tests {
         let (json, _, _) = signed_evidence("informe-trimestral");
         let tampered = json.replace("informe-trimestral", "objetivo-alterado");
         assert!(tampered.contains("objetivo-alterado"));
-        assert!(public_action(&tampered).is_err());
+        assert!(public_action(&tampered, None).is_err());
+    }
+
+    fn columns(evidence_json: String, agent_id: Uuid, request_id: Uuid) -> JournalColumns {
+        JournalColumns {
+            created_at: moment(),
+            updated_at: moment(),
+            agent_id,
+            request_id,
+            authorization: AuthorizationStatus::Allowed,
+            execution: ExecutionStatus::Executed,
+            attested: Some(AttestedExecution::Executed),
+            reason: None,
+            evidence_json,
+        }
+    }
+
+    fn pin(secret: &[u8; 32]) -> VerifiedPublicKey {
+        EvidenceAttesterKey::from_secret_bytes(secret)
+            .public_key()
+            .unwrap()
+    }
+
+    #[test]
+    fn with_pins_a_receipt_signed_by_another_attester_is_unreadable_and_the_rest_is_shown() {
+        let pins = [pin(&[0x32; 32])];
+        let (good, agent, request) = signed_evidence("informe-trimestral");
+        let (foreign, foreign_agent, foreign_request) =
+            signed_evidence_by("informe-ajeno", &[0x33; 32], &"cd".repeat(32));
+        // The foreign receipt's integrity hash checks out: only its signer
+        // is not one of the pins.
+        assert!(public_action(&foreign, None).is_ok());
+        let receipts: Vec<ReceiptFacts> = [
+            columns(good.clone(), agent, request),
+            columns(foreign, foreign_agent, foreign_request),
+            columns(good, agent, request),
+        ]
+        .into_iter()
+        .map(|row| facts_from_columns(row, Some(&pins)))
+        .collect();
+        assert_eq!(receipts.len(), 3);
+        assert!(receipts[0].legible && receipts[2].legible);
+        assert_eq!(receipts[0].target.as_deref(), Some("informe-trimestral"));
+        assert!(!receipts[1].legible);
+        assert_eq!(situation(&receipts[1]), Situation::Unreadable);
+        assert_eq!(visible_target(&receipts[1]), "no se muestra");
+        assert_eq!(visible_wanted(&receipts[1]), "no se muestra");
+        assert_eq!(receipts[1].target, None);
+        assert_eq!(situation(&receipts[0]), Situation::Permitted);
+    }
+
+    #[test]
+    fn with_pins_a_receipt_of_an_earlier_policy_stays_readable() {
+        // Signed by the pinned attester under a policy whose digest is not
+        // the one the console has loaded: the history does not require the
+        // current policy.
+        let pins = [pin(&[0x32; 32])];
+        let (earlier, agent, request) =
+            signed_evidence_by("informe-viejo", &[0x32; 32], &"ab".repeat(32));
+        let facts = facts_from_columns(columns(earlier, agent, request), Some(&pins));
+        assert!(facts.legible);
+        assert_eq!(facts.target.as_deref(), Some("informe-viejo"));
+        assert_eq!(situation(&facts), Situation::Permitted);
+    }
+
+    #[test]
+    fn without_pins_the_history_checks_the_integrity_hash_only() {
+        let (foreign, agent, request) =
+            signed_evidence_by("informe-ajeno", &[0x33; 32], &"cd".repeat(32));
+        let facts = facts_from_columns(columns(foreign.clone(), agent, request), None);
+        assert!(facts.legible);
+        assert_eq!(facts.target.as_deref(), Some("informe-ajeno"));
+        // A tampered receipt is still unreadable, without failing the read.
+        let tampered = foreign.replace("informe-ajeno", "informe-otro");
+        let facts = facts_from_columns(columns(tampered, agent, request), None);
+        assert!(!facts.legible);
+        assert_eq!(facts.target, None);
     }
 
     #[test]
@@ -790,6 +890,14 @@ mod tests {
     }
 
     fn signed_evidence(target: &str) -> (String, Uuid, Uuid) {
+        signed_evidence_by(target, &[0x32; 32], &"cd".repeat(32))
+    }
+
+    fn signed_evidence_by(
+        target: &str,
+        attester_secret: &[u8; 32],
+        policy_digest: &str,
+    ) -> (String, Uuid, Uuid) {
         let agent_key = AgentKeyPair::from_secret_bytes(&[0x31; 32]);
         let agent = agent_key.identity(AgentId::new());
         let agent_id = *agent.id.as_uuid();
@@ -818,8 +926,10 @@ mod tests {
             context,
         )
         .unwrap();
-        evidence.bind_policy_digest("cd".repeat(32)).unwrap();
-        let attester = EvidenceAttesterKey::from_secret_bytes(&[0x32; 32]);
+        evidence
+            .bind_policy_digest(policy_digest.to_owned())
+            .unwrap();
+        let attester = EvidenceAttesterKey::from_secret_bytes(attester_secret);
         evidence.sign(&attester).unwrap();
         let json = evidence.to_json().unwrap();
         (json, agent_id, evidence.request_id)

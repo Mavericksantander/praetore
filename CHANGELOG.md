@@ -231,11 +231,12 @@
   card that repeats the parameters and the deadline. The console signs on
   this computer, as `praetore approve` does, only after it checks that the
   gateway challenge is the one rebuilt from the journal evidence it read;
-  it checks that evidence's integrity hash, not its attester signature. The
-  gateway verifies, records and dispatches. The browser gets opaque
-  references, never keys, journal ids or raw evidence. Actions need the
-  console's own `Origin` and an `x-praetore-consola` header besides the
-  session cookie. A partial set of the four variables is a startup error;
+  it checks that evidence against the attester pins and the local policy
+  (see Changed). The gateway verifies, records and dispatches. The browser
+  gets opaque references, never keys, journal ids or raw evidence.
+  Actions need the console's own `Origin` and an `x-praetore-consola`
+  header besides the session cookie. A partial set of the four variables
+  is a startup error;
   none of them leaves the console without the inbox (history only). The
   gateway API is unchanged. Limit: a process running as the same operating
   system user as the console can read `approver.key` (and the token file)
@@ -381,6 +382,29 @@
   pins that verified no entry.
 
 ### Changed
+
+- **`praetore-console` checks journal evidence against the attester pins
+  and the local policy before it offers a decision.** The approvals inbox
+  now requires `PRAETORE_CONSOLE_POLICY_FILE` and
+  `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`; without them the console does not
+  start, and the error names what is missing, so a console with the inbox
+  also offers the compliance package. A held request is shown, and can be
+  approved or rejected, only when its evidence is signed by one of the pins
+  and records the local policy's digest; the console checks again just
+  before signing, and still requires the gateway challenge to match the
+  evidence. A request that does not verify is only counted. With pins, the
+  history also checks each receipt's attester signature, not the current
+  policy; a receipt that does not verify is shown as unreadable instead of
+  failing the page. Without pins, the history checks the integrity hash
+  only, as before. The inbox and the history read the pins and the policy
+  once, at startup: a change takes effect on restart. After a policy
+  change, requests held under the earlier policy are no longer offered in
+  the inbox; `praetore approve` and `praetore reject` still decide them.
+  With the policy and the pins but no inbox (package only), the console
+  now reads those files at startup and does not start if one cannot be
+  read, is a symlink or is not a regular file; before, they were first
+  read at download, and the download still follows symlinks. The package
+  download is otherwise unchanged.
 
 - **`praetore-console` keeps its session per tab.** The opening link is now
   `http://<bind>/#abrir=<code>`; the page redeems the code once over

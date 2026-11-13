@@ -4,10 +4,16 @@
 //! and until when. The browser never receives the journal keys: each pending
 //! request gets an opaque reference that only this process can resolve.
 
-use crate::historia::{quoted_text, readable_time};
+use crate::{
+    confianza::EvidenceTrust,
+    historia::{quoted_text, readable_time},
+};
 use praetore_core::Evidence;
 use praetore_gateway::{ApprovalChallenge, ExecutionKey, action_digest};
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 use uuid::Uuid;
@@ -46,9 +52,10 @@ pub struct PendingFacts {
     pub kind: PendingKind,
     pub wanted: String,
     pub target: Option<String>,
-    /// Digest of the action read from the journal evidence (hash checked,
-    /// attester signature not checked). The challenge the gateway hands
-    /// back must commit to this same digest.
+    /// Digest of the action read from the journal evidence (integrity hash,
+    /// attester signature against the pins and the local policy digest
+    /// checked). The challenge the gateway hands back must commit to this
+    /// same digest.
     pub action_digest: String,
     /// The challenge the gateway must hand back, rebuilt from the evidence
     /// exactly as the gateway builds it.
@@ -59,6 +66,8 @@ pub struct PendingFacts {
     /// them, so a request whose parameters cannot be shown cannot be
     /// approved here.
     pub parameters: Option<Vec<Parameter>>,
+    /// The journal evidence as read, checked again just before signing.
+    pub evidence_json: Arc<str>,
 }
 
 /// One shown parameter: `clave` and a text or a list of texts.
@@ -185,15 +194,15 @@ pub struct PendingColumns {
     pub evidence_json: String,
 }
 
-/// Fails closed on any receipt that does not verify, belongs to another
-/// tenant or key, or has no approval window.
-pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<PendingFacts, ()> {
-    let evidence = Evidence::from_json(&columns.evidence_json).map_err(|_| ())?;
-    if !evidence.verify_integrity() {
-        return Err(());
-    }
-    let digest = action_digest(&evidence.action).map_err(|_| ())?;
-    let challenge = ApprovalChallenge::from_evidence(&evidence, &digest).map_err(|_| ())?;
+/// Fails closed on any receipt that does not verify (integrity hash,
+/// attester signature against one of the pins, local policy digest),
+/// belongs to another tenant or key, or has no approval window.
+pub fn pending_from_columns(
+    tenant_id: Uuid,
+    columns: PendingColumns,
+    trust: &EvidenceTrust,
+) -> Result<PendingFacts, ()> {
+    let (evidence, digest, challenge) = verified_challenge(&columns.evidence_json, trust)?;
     if challenge.tenant_id != tenant_id
         || challenge.agent_id != columns.agent_id
         || challenge.request_id != columns.request_id
@@ -201,7 +210,6 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
         return Err(());
     }
     let expires_at = OffsetDateTime::parse(&challenge.expires_at, &Rfc3339).map_err(|_| ())?;
-    let challenge = challenge.clone();
     let parameters = parameters_shown(&evidence.action.parameters);
     let target = evidence.action.target.filter(|target| !target.is_empty());
     Ok(PendingFacts {
@@ -218,7 +226,23 @@ pub fn pending_from_columns(tenant_id: Uuid, columns: PendingColumns) -> Result<
         expected: challenge,
         expires_at,
         parameters,
+        evidence_json: columns.evidence_json.into(),
     })
+}
+
+/// The evidence, its action digest and the challenge the gateway must hand
+/// back, only when the evidence passes the inbox checks of `trust`.
+pub fn verified_challenge(
+    evidence_json: &str,
+    trust: &EvidenceTrust,
+) -> Result<(Evidence, String, ApprovalChallenge), ()> {
+    let evidence = Evidence::from_json(evidence_json).map_err(|_| ())?;
+    if !evidence.verify_integrity() || !trust.admits_pending(&evidence) {
+        return Err(());
+    }
+    let digest = action_digest(&evidence.action).map_err(|_| ())?;
+    let challenge = ApprovalChallenge::from_evidence(&evidence, &digest).map_err(|_| ())?;
+    Ok((evidence, digest, challenge))
 }
 
 /// Expiry with seconds: windows can be short.
@@ -267,6 +291,8 @@ pub struct PendingRef {
     /// False when the parameters could not be shown: approving is refused
     /// server side, rejecting is not.
     pub approvable: bool,
+    /// The journal evidence the operator was shown.
+    pub evidence_json: Arc<str>,
 }
 
 impl From<&PendingFacts> for PendingRef {
@@ -276,6 +302,7 @@ impl From<&PendingFacts> for PendingRef {
             action_digest: facts.action_digest.clone(),
             expected: facts.expected.clone(),
             approvable: facts.parameters.is_some(),
+            evidence_json: Arc::clone(&facts.evidence_json),
         }
     }
 }
@@ -305,6 +332,7 @@ impl References {
                 && known.key == facts.key
                 && known.expected == facts.expected
                 && known.approvable == facts.parameters.is_some()
+                && known.evidence_json == facts.evidence_json
             {
                 return Some(existing);
             }
@@ -389,6 +417,7 @@ mod tests {
             },
             expires_at: datetime!(2026-11-12 10:05:09 UTC),
             parameters: Some(Vec::new()),
+            evidence_json: "{}".into(),
         }
     }
 
