@@ -7,7 +7,10 @@
 //! saw, sign, send. The gateway verifies the signature, records the decision
 //! and runs the single dispatch; the console decides nothing.
 
-use crate::bandeja::PendingRef;
+use crate::{
+    bandeja::{PendingRef, verified_challenge},
+    confianza::EvidenceTrust,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use praetore_gateway::{
     ApprovalChallengeView, ExecutionKey, HumanApprovalDecision, HumanApprovalOutcome, http_api,
@@ -341,12 +344,26 @@ fn unchanged(mensaje: &'static str) -> ActOutcome {
 }
 
 /// Approve or reject: one signed decision, never resent by the console.
+/// Before asking the gateway, the evidence the operator was shown is
+/// checked again against the attester pins and the local policy, and must
+/// still yield the challenge the request was listed with.
 pub fn decide(
     gateway: &dyn ApprovalGateway,
     signer: &ApproverSigner,
+    trust: &EvidenceTrust,
     pending: &PendingRef,
     decision: HumanApprovalOutcome,
 ) -> ActOutcome {
+    match verified_challenge(&pending.evidence_json, trust) {
+        Ok((_, digest, challenge))
+            if challenge == pending.expected && digest == pending.action_digest => {}
+        _ => {
+            tracing::warn!(failure = "evidence_unverified", "console refused to sign");
+            return unchanged(
+                "La evidencia de esta solicitud no verifica con las claves o la política configuradas. No se firmó nada.",
+            );
+        }
+    }
     let view = match gateway.challenge(&pending.key) {
         GatewayReply::Answered { status: 200, body } => {
             match ApprovalChallengeView::from_json(&body) {

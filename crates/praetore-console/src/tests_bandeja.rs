@@ -11,7 +11,7 @@ use axum::body::to_bytes;
 use ed25519_dalek::{Signature, SigningKey, Verifier};
 use praetore_core::{
     Action, AgentId, AgentKeyPair, Authority, AuthorizationIntentV2, Decision, Evidence,
-    EvidenceAttesterKey,
+    EvidenceAttesterKey, policy::RecordedPolicy,
 };
 use praetore_gateway::{
     ApprovalChallenge, ApprovalChallengeView, ExecutionKey, HumanApprovalDecision, action_digest,
@@ -28,6 +28,41 @@ use uuid::Uuid;
 const TENANT: Uuid = Uuid::from_u128(1);
 const ORIGIN: &str = "http://127.0.0.1:8090";
 const APPROVER_SECRET: [u8; 32] = [0x44; 32];
+const ATTESTER_SECRET: [u8; 32] = [0x52; 32];
+
+/// The local policy the test console loads: the evidence below records its
+/// digest.
+fn local_policy() -> RecordedPolicy {
+    RecordedPolicy::from_json(include_str!(
+        "../../../docs/golden/canonical-policy-v1.json"
+    ))
+    .unwrap()
+}
+
+/// Another valid policy, with another digest.
+fn other_policy() -> RecordedPolicy {
+    RecordedPolicy::from_json(include_str!(
+        "../../../examples/claude-code-hook/evidence/04-sesion-real-bloqueada-web-fetch/policy.json"
+    ))
+    .unwrap()
+}
+
+fn policy_digest() -> String {
+    local_policy().digest().to_owned()
+}
+
+/// The attester pin and the local policy of the test console.
+fn trust() -> EvidenceTrust {
+    EvidenceTrust::new(
+        vec![
+            EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET)
+                .public_key()
+                .unwrap(),
+        ],
+        local_policy(),
+    )
+    .unwrap()
+}
 
 fn pending_evidence(
     action_type: &str,
@@ -78,7 +113,7 @@ fn pending_evidence_with(
             .format(&Rfc3339)
             .unwrap(),
         expires_at: stamp.clone(),
-        policy_digest: "cd".repeat(32),
+        policy_digest: policy_digest(),
     });
     evidence.freshness_valid_until = Some(stamp);
     // The rest of the HighAssurance shape a gateway hold carries.
@@ -92,9 +127,9 @@ fn pending_evidence_with(
     evidence.semantics_version = Some(2);
     evidence.agent_signature = Some("ef".repeat(64));
     // Recomputes the integrity hash over the fields set above.
-    evidence.bind_policy_digest("cd".repeat(32)).unwrap();
+    evidence.bind_policy_digest(policy_digest()).unwrap();
     evidence
-        .sign(&EvidenceAttesterKey::from_secret_bytes(&[0x52; 32]))
+        .sign(&EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET))
         .unwrap();
     let json = evidence.to_json().unwrap();
     (evidence, json)
@@ -110,6 +145,7 @@ fn facts_for(evidence: &Evidence, json: String, kind: PendingKind) -> PendingFac
             kind,
             evidence_json: json,
         },
+        &trust(),
     )
     .unwrap()
 }
@@ -120,7 +156,7 @@ struct MemoryInbox {
 }
 
 impl InboxStore for MemoryInbox {
-    fn pending(&self) -> Result<InboxPage, HistoryError> {
+    fn pending(&self, _trust: &EvidenceTrust) -> Result<InboxPage, HistoryError> {
         let mut agents: Vec<Uuid> = self.items.iter().map(|f| f.key.agent_id).collect();
         agents.sort();
         agents.dedup();
@@ -273,7 +309,12 @@ impl ApprovalGateway for FakeGateway {
 
 fn console(items: Vec<PendingFacts>, unreadable: u32, gateway: Arc<FakeGateway>) -> Router {
     let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
-    let inbox = Inbox::new(Arc::new(MemoryInbox { items, unreadable }), gateway, signer);
+    let inbox = Inbox::new(
+        Arc::new(MemoryInbox { items, unreadable }),
+        gateway,
+        signer,
+        trust(),
+    );
     ConsoleState::new(
         Arc::new(NoHistory),
         LocalSession::from_secret([0x11; 32]),
@@ -607,6 +648,7 @@ fn nothing_is_signed_when_the_challenge_commits_to_another_action_than_the_one_s
     let outcome = aprobador::decide(
         &gateway,
         &signer,
+        &trust(),
         &pending,
         praetore_gateway::HumanApprovalOutcome::Approve,
     );
@@ -760,6 +802,7 @@ fn outcomes_never_offer_a_second_decision() {
         let outcome = aprobador::decide(
             &gateway,
             &signer,
+            &trust(),
             &pending,
             praetore_gateway::HumanApprovalOutcome::Approve,
         );
@@ -850,6 +893,7 @@ fn a_receipt_from_another_tenant_or_without_a_window_is_not_offered() {
                 kind: PendingKind::AwaitingApproval,
                 evidence_json: json,
             },
+            &trust(),
         )
     };
     let agent = *evidence.agent.id.as_uuid();
@@ -865,11 +909,245 @@ fn a_receipt_from_another_tenant_or_without_a_window_is_not_offered() {
     no_window.freshness_valid_until = None;
     no_window.authority_digest = None;
     no_window.semantics_version = None;
-    no_window.bind_policy_digest("cd".repeat(32)).unwrap();
+    no_window.bind_policy_digest(policy_digest()).unwrap();
     no_window
-        .sign(&EvidenceAttesterKey::from_secret_bytes(&[0x52; 32]))
+        .sign(&EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET))
         .unwrap();
     assert!(columns(TENANT, agent, no_window.to_json().unwrap()).is_err());
+}
+
+fn pending_columns(evidence: &Evidence, json: String) -> PendingColumns {
+    PendingColumns {
+        created_at: OffsetDateTime::now_utc(),
+        agent_id: *evidence.agent.id.as_uuid(),
+        request_id: evidence.request_id,
+        kind: PendingKind::AwaitingApproval,
+        evidence_json: json,
+    }
+}
+
+#[test]
+fn a_request_signed_by_an_attester_outside_the_pins_is_not_offered_or_signed() {
+    let (mut evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    // Signed by the pinned attester under the local policy: offered.
+    assert!(pending_from_columns(TENANT, pending_columns(&evidence, json), &trust()).is_ok());
+    // Same receipt, integrity intact, signed by another attester.
+    let foreign_attester = EvidenceAttesterKey::from_secret_bytes(&[0x53; 32]);
+    evidence.sign(&foreign_attester).unwrap();
+    assert!(evidence.verify_integrity());
+    let foreign = evidence.to_json().unwrap();
+    assert!(
+        pending_from_columns(
+            TENANT,
+            pending_columns(&evidence, foreign.clone()),
+            &trust()
+        )
+        .is_err()
+    );
+    // Listed by a console that trusted that attester, then decided by one
+    // that does not: nothing is asked of the gateway, nothing is signed.
+    let elsewhere =
+        EvidenceTrust::new(vec![foreign_attester.public_key().unwrap()], local_policy()).unwrap();
+    let pending = PendingRef::from(
+        &pending_from_columns(TENANT, pending_columns(&evidence, foreign), &elsewhere).unwrap(),
+    );
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    for decision in [
+        praetore_gateway::HumanApprovalOutcome::Approve,
+        praetore_gateway::HumanApprovalOutcome::Reject,
+    ] {
+        let gateway = FakeGateway::new(&evidence);
+        let outcome = aprobador::decide(&gateway, &signer, &trust(), &pending, decision);
+        assert_eq!(outcome.situacion, "sin cambios");
+        assert!(outcome.mensaje.contains("no verifica"));
+        assert!(gateway.calls().is_empty());
+    }
+}
+
+#[test]
+fn a_request_decided_under_another_policy_is_not_offered_or_signed() {
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    // Signed by the pinned attester, but the console loaded another policy.
+    let pin = EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET)
+        .public_key()
+        .unwrap();
+    let rotated = EvidenceTrust::new(vec![pin], other_policy()).unwrap();
+    assert_ne!(other_policy().digest(), policy_digest());
+    assert!(
+        pending_from_columns(TENANT, pending_columns(&evidence, json.clone()), &rotated).is_err()
+    );
+    let pending = PendingRef::from(
+        &pending_from_columns(TENANT, pending_columns(&evidence, json), &trust()).unwrap(),
+    );
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    for decision in [
+        praetore_gateway::HumanApprovalOutcome::Approve,
+        praetore_gateway::HumanApprovalOutcome::Reject,
+    ] {
+        let gateway = FakeGateway::new(&evidence);
+        let outcome = aprobador::decide(&gateway, &signer, &rotated, &pending, decision);
+        assert_eq!(outcome.situacion, "sin cambios");
+        assert!(gateway.calls().is_empty());
+    }
+}
+
+#[test]
+fn a_request_signed_by_a_pin_under_the_local_policy_is_offered_and_signed() {
+    let (evidence, json) = pending_evidence(
+        "borrar_archivo",
+        "informe",
+        OffsetDateTime::now_utc() + Duration::minutes(10),
+    );
+    // A second, unrelated pin does not get in the way.
+    let trust = EvidenceTrust::new(
+        vec![
+            EvidenceAttesterKey::from_secret_bytes(&[0x53; 32])
+                .public_key()
+                .unwrap(),
+            EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET)
+                .public_key()
+                .unwrap(),
+        ],
+        local_policy(),
+    )
+    .unwrap();
+    let facts = pending_from_columns(TENANT, pending_columns(&evidence, json), &trust).unwrap();
+    let gateway = FakeGateway::new(&evidence);
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    let outcome = aprobador::decide(
+        &gateway,
+        &signer,
+        &trust,
+        &PendingRef::from(&facts),
+        praetore_gateway::HumanApprovalOutcome::Approve,
+    );
+    assert_eq!(outcome.situacion, "aprobado, pendiente de ejecución");
+    assert_eq!(gateway.calls(), vec!["challenge", "decide"]);
+}
+
+#[test]
+fn the_trust_refuses_no_pins_repeated_pins_and_too_many() {
+    let pin = EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET)
+        .public_key()
+        .unwrap();
+    assert_eq!(
+        EvidenceTrust::new(Vec::new(), local_policy()).unwrap_err(),
+        TrustError::NoPins
+    );
+    assert_eq!(
+        EvidenceTrust::new(vec![pin.clone(), pin], local_policy()).unwrap_err(),
+        TrustError::Pin(2)
+    );
+    let many = (0..=MAX_ATTESTER_PINS as u8)
+        .map(|seed| {
+            EvidenceAttesterKey::from_secret_bytes(&[seed + 1; 32])
+                .public_key()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        EvidenceTrust::new(many, local_policy()).unwrap_err(),
+        TrustError::TooManyPins
+    );
+}
+
+#[test]
+fn an_inbox_without_the_policy_or_the_pins_does_not_start() {
+    use std::ffi::OsStr;
+    let policy = Some(OsStr::new("/etc/praetore/policy.json"));
+    let pins = Some(OsStr::new("/etc/praetore/attester.hex"));
+    assert!(require_for_inbox(true, policy, pins).is_ok());
+    // Without the inbox, D1 alone or the package alone stay as they were.
+    assert!(require_for_inbox(false, None, None).is_ok());
+    assert!(require_for_inbox(false, policy, pins).is_ok());
+    for (policy, pins, missing) in [
+        (None, None, vec![POLICY_VARIABLE, PINS_VARIABLE]),
+        (policy, None, vec![PINS_VARIABLE]),
+        (None, pins, vec![POLICY_VARIABLE]),
+        (Some(OsStr::new("")), pins, vec![POLICY_VARIABLE]),
+    ] {
+        let error = require_for_inbox(true, policy, pins).unwrap_err();
+        assert_eq!(error, TrustError::MissingForInbox(missing.clone()));
+        let message = error.to_string();
+        for name in [POLICY_VARIABLE, PINS_VARIABLE] {
+            assert_eq!(message.contains(name), missing.contains(&name), "{message}");
+        }
+    }
+}
+
+#[test]
+fn the_trust_files_are_read_as_regular_files_only() {
+    let dir = std::env::temp_dir().join(format!("praetore-console-trust-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("policy.json");
+    std::fs::write(
+        &policy,
+        include_str!("../../../docs/golden/canonical-policy-v1.json"),
+    )
+    .unwrap();
+    let pin = dir.join("attester.hex");
+    let public = EvidenceAttesterKey::from_secret_bytes(&ATTESTER_SECRET)
+        .public_key()
+        .unwrap();
+    std::fs::write(&pin, format!("{}\n", hex::encode(public.as_bytes()))).unwrap();
+    let loaded = EvidenceTrust::load(&policy, std::slice::from_ref(&pin), None).unwrap();
+    assert_eq!(loaded.pins(), std::slice::from_ref(&public));
+    // The approver's own key is never an attester pin.
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    let approver_pin = dir.join("approver.hex");
+    std::fs::write(
+        &approver_pin,
+        hex::encode(
+            SigningKey::from_bytes(&APPROVER_SECRET)
+                .verifying_key()
+                .to_bytes(),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        EvidenceTrust::load(&policy, &[pin.clone(), approver_pin], Some(&signer)).unwrap_err(),
+        TrustError::PinIsApproverKey(2)
+    );
+    // Missing, a directory, not a policy.
+    assert_eq!(
+        EvidenceTrust::load(&dir.join("nope.json"), std::slice::from_ref(&pin), None).unwrap_err(),
+        TrustError::Policy
+    );
+    assert_eq!(
+        EvidenceTrust::load(&dir, std::slice::from_ref(&pin), None).unwrap_err(),
+        TrustError::Policy
+    );
+    assert_eq!(
+        EvidenceTrust::load(&pin, std::slice::from_ref(&pin), None).unwrap_err(),
+        TrustError::Policy
+    );
+    #[cfg(unix)]
+    {
+        // A symlink is not followed; a FIFO is not waited on.
+        let link = dir.join("link.hex");
+        std::os::unix::fs::symlink(&pin, &link).unwrap();
+        assert_eq!(
+            EvidenceTrust::load(&policy, &[link], None).unwrap_err(),
+            TrustError::Pin(1)
+        );
+        let fifo = dir.join("fifo.hex");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `path` is a valid NUL-terminated string for the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert_eq!(
+            EvidenceTrust::load(&policy, &[fifo], None).unwrap_err(),
+            TrustError::Pin(1)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -934,7 +1212,7 @@ async fn agent_text_is_shown_inert_and_a_cut_list_says_so() {
     let facts = facts_for(&evidence, json, PendingKind::AwaitingApproval);
     struct Cut(PendingFacts);
     impl InboxStore for Cut {
-        fn pending(&self) -> Result<InboxPage, HistoryError> {
+        fn pending(&self, _trust: &EvidenceTrust) -> Result<InboxPage, HistoryError> {
             Ok(InboxPage {
                 items: vec![self.0.clone()],
                 unreadable: 0,
@@ -952,6 +1230,7 @@ async fn agent_text_is_shown_inert_and_a_cut_list_says_so() {
         Arc::new(Cut(facts)),
         Arc::new(FakeGateway::new(&evidence)),
         ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap(),
+        trust(),
     ))
     .router();
     let (_, list, text) = json_of(app.oneshot(get("/api/bandeja")).await.unwrap()).await;
@@ -984,6 +1263,7 @@ fn nothing_is_signed_when_any_part_of_the_challenge_differs() {
         let outcome = aprobador::decide(
             &gateway,
             &signer,
+            &trust(),
             &pending,
             praetore_gateway::HumanApprovalOutcome::Approve,
         );

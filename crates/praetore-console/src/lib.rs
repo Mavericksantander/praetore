@@ -8,9 +8,16 @@
 //! file and attester pins configured it also builds the compliance package
 //! (D3), read only: the tenant's signed journal, the policy and its digest,
 //! the pins, `SHA256SUMS` and instructions for a third party.
+//!
+//! The inbox requires that policy and those pins: a pending request is shown
+//! and offered only when its evidence is signed by one of the pins and
+//! records the local policy's digest. With pins, the history also checks the
+//! attester signature (not the current policy); without them it checks the
+//! integrity hash only.
 
 mod aprobador;
 mod bandeja;
+mod confianza;
 mod historia;
 mod lectura;
 mod paquete;
@@ -43,6 +50,7 @@ pub use aprobador::{
     HttpApprovalGateway, parse_gateway_address, read_token_file,
 };
 pub use bandeja::{PendingKind, PendingRef};
+pub use confianza::{EvidenceTrust, PINS_VARIABLE, POLICY_VARIABLE, TrustError, require_for_inbox};
 pub use historia::{NamesError, parse_agent_names};
 pub use lectura::PostgresHistory;
 pub use paquete::{
@@ -86,6 +94,9 @@ pub struct Inbox {
     store: Arc<dyn InboxStore>,
     gateway: Arc<dyn ApprovalGateway>,
     signer: Arc<ApproverSigner>,
+    /// Attester pins and local policy: checked when listing and again just
+    /// before signing.
+    trust: EvidenceTrust,
     references: References,
 }
 
@@ -94,23 +105,28 @@ impl Inbox {
         store: Arc<dyn InboxStore>,
         gateway: Arc<dyn ApprovalGateway>,
         signer: ApproverSigner,
+        trust: EvidenceTrust,
     ) -> Self {
         Self {
             store,
             gateway,
             signer: Arc::new(signer),
+            trust,
             references: References::default(),
         }
     }
 }
 
 pub trait InboxStore: Send + Sync + 'static {
-    fn pending(&self) -> Result<InboxPage, HistoryError>;
+    /// Pending requests whose evidence `trust` admits; the others are only
+    /// counted in `unreadable`.
+    fn pending(&self, trust: &EvidenceTrust) -> Result<InboxPage, HistoryError>;
 }
 
 pub struct InboxPage {
     pub items: Vec<PendingFacts>,
-    /// Pending rows whose receipt does not check out. Never offered.
+    /// Pending rows whose receipt does not check out (integrity, attester
+    /// pins or local policy). Never offered.
     pub unreadable: u32,
     /// More rows wait than one read returns.
     pub truncated: bool,
@@ -430,7 +446,8 @@ async fn list_inbox(State(state): State<Arc<ConsoleState>>) -> Response {
         return api_message(StatusCode::SERVICE_UNAVAILABLE, INBOX_OFF);
     };
     let store = Arc::clone(&inbox.store);
-    let page = match tokio::task::spawn_blocking(move || store.pending()).await {
+    let trust = inbox.trust.clone();
+    let page = match tokio::task::spawn_blocking(move || store.pending(&trust)).await {
         Ok(Ok(page)) => page,
         Ok(Err(error)) => return storage_error(error),
         Err(_) => return storage_error(HistoryError::Unavailable),
@@ -654,8 +671,11 @@ async fn act(
     }
     let gateway = Arc::clone(&inbox.gateway);
     let signer = Arc::clone(&inbox.signer);
+    let trust = inbox.trust.clone();
     let result = tokio::task::spawn_blocking(move || match what {
-        Act::Decide(outcome) => aprobador::decide(gateway.as_ref(), &signer, &pending, outcome),
+        Act::Decide(outcome) => {
+            aprobador::decide(gateway.as_ref(), &signer, &trust, &pending, outcome)
+        }
         Act::Dispatch => aprobador::dispatch(gateway.as_ref(), &pending),
     })
     .await;
@@ -1263,20 +1283,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_pins_a_receipt_signed_by_another_attester_does_not_take_the_page_down() {
+        let (json, agent_id, request_id) = signed_evidence();
+        let mut foreign = Evidence::from_json(&json).unwrap();
+        foreign
+            .sign(&EvidenceAttesterKey::from_secret_bytes(&[0x33; 32]))
+            .unwrap();
+        let pins = [EvidenceAttesterKey::from_secret_bytes(&[0x32; 32])
+            .public_key()
+            .unwrap()];
+        let row = |evidence_json: String, request_id: Uuid, moment: &str| {
+            facts_from_columns(
+                JournalColumns {
+                    created_at: at(moment),
+                    updated_at: at(moment),
+                    agent_id,
+                    request_id,
+                    authorization: AuthorizationStatus::Allowed,
+                    execution: ExecutionStatus::Executed,
+                    attested: Some(AttestedExecution::Executed),
+                    reason: None,
+                    evidence_json,
+                },
+                Some(&pins),
+            )
+        };
+        let receipts = vec![
+            row(json, request_id, "2026-10-24T15:04:00Z"),
+            row(
+                foreign.to_json().unwrap(),
+                Uuid::from_u128(70),
+                "2026-10-23T15:04:00Z",
+            ),
+        ];
+        let (app, _) = app(receipts);
+        let response = app.oneshot(authed("/api/historial")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let list: Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(list["total"], 2);
+        assert_eq!(list["recibos"][0]["situacion"], "permitido");
+        assert_eq!(list["recibos"][0]["sobre"], "informe-trimestral");
+        assert_eq!(list["recibos"][1]["situacion"], "no se puede leer");
+        assert_eq!(list["recibos"][1]["sobre"], "no se muestra");
+        assert_eq!(list["recibos"][1]["queria"], "no se muestra");
+    }
+
+    #[tokio::test]
     async fn history_lists_plain_words_target_and_hides_the_evidence() {
         let (json, agent_id, request_id) = signed_evidence();
-        let pending = facts_from_columns(JournalColumns {
-            created_at: at("2026-10-24T15:04:00Z"),
-            updated_at: at("2026-10-24T15:04:00Z"),
-            agent_id,
-            request_id,
-            authorization: AuthorizationStatus::RequiresApproval,
-            execution: ExecutionStatus::NotDispatched,
-            attested: Some(AttestedExecution::AwaitingApproval),
-            reason: None,
-            evidence_json: json,
-        })
-        .unwrap();
+        let pending = facts_from_columns(
+            JournalColumns {
+                created_at: at("2026-10-24T15:04:00Z"),
+                updated_at: at("2026-10-24T15:04:00Z"),
+                agent_id,
+                request_id,
+                authorization: AuthorizationStatus::RequiresApproval,
+                execution: ExecutionStatus::NotDispatched,
+                attested: Some(AttestedExecution::AwaitingApproval),
+                reason: None,
+                evidence_json: json,
+            },
+            None,
+        );
         let approved = manual(
             "2026-10-23T09:00:00Z",
             4,

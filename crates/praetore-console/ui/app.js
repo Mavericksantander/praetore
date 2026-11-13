@@ -409,7 +409,7 @@ async function cargarBandeja() {
   partes.push(data.solicitudes.length === 1 ? "1 solicitud espera" : data.solicitudes.length + " solicitudes esperan");
   if (data.vencidas) partes.push(data.vencidas === 1 ? "1 venció sin decisión" : data.vencidas + " vencieron sin decisión");
   if (data.hay_mas) partes.push("hay más esperando: se muestran las 200 más recientes");
-  if (data.ilegibles) partes.push(data.ilegibles === 1 ? "1 no se puede leer y no se ofrece" : data.ilegibles + " no se pueden leer y no se ofrecen");
+  if (data.ilegibles) partes.push(data.ilegibles === 1 ? "1 no se ofrece porque su evidencia no verifica con las claves o la política configuradas" : data.ilegibles + " no se ofrecen porque su evidencia no verifica con las claves o la política configuradas");
   bandejaEstado.textContent = partes.join(" · ");
   if (!data.solicitudes.length) {
     const vacio = document.createElement("li");

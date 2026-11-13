@@ -25,8 +25,9 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use praetore_console::{
-    ACTION_HEADER, ApproverSigner, CompliancePack, ConsoleState, HttpApprovalGateway, Inbox,
-    InboxStore, LocalSession, PackSettings, PendingKind, PostgresHistory, read_token_file,
+    ACTION_HEADER, ApproverSigner, CompliancePack, ConsoleState, EvidenceTrust,
+    HttpApprovalGateway, Inbox, InboxStore, LocalSession, PackSettings, PendingKind,
+    PostgresHistory, read_token_file,
 };
 use std::{
     collections::HashMap,
@@ -235,6 +236,32 @@ async fn call(
     (status, serde_json::from_str(&text).unwrap(), text)
 }
 
+/// The attester's public key, as an operator would hand it out: `praetore
+/// init` writes the secret (`evidence-attester.key`), and the public key is
+/// derived from it.
+fn attester_pin(dir: &Path, root: &Path) -> PathBuf {
+    let secret: [u8; 32] = hex::decode(
+        fs::read_to_string(dir.join("evidence-attester.key"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap()
+    .try_into()
+    .unwrap();
+    let pin = root.join("attester-public-key.hex");
+    fs::write(
+        &pin,
+        hex::encode(
+            praetore_core::EvidenceAttesterKey::from_secret_bytes(&secret)
+                .public_key()
+                .unwrap()
+                .as_bytes(),
+        ) + "\n",
+    )
+    .unwrap();
+    pin
+}
+
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
 fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() {
@@ -260,14 +287,55 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
     policy["rules"][0]["effect"] = "RequireApproval".into();
     fs::write(dir.join("policy.json"), policy.to_string()).unwrap();
 
+    // The policy the gateway loads and the attester's public key: what the
+    // console checks the journal evidence against before offering a
+    // decision.
+    let pin = attester_pin(&dir, &root);
+    let trust =
+        EvidenceTrust::load(&dir.join("policy.json"), std::slice::from_ref(&pin), None).unwrap();
+
     let gateway = Gateway::start(&dir, &admin_url, &runtime_url);
     let port = config(&dir)["port"].as_u64().unwrap() as u16;
     let approve_id = held_demo(&dir, "aprobar");
     let reject_id = held_demo(&dir, "rechazar");
 
     let client = postgres::Client::connect(&runtime_url, postgres::NoTls).unwrap();
-    let history = Arc::new(PostgresHistory::from_client(client, tenant).unwrap());
-    let pending = history.pending().unwrap();
+    let history = Arc::new(
+        PostgresHistory::from_client(client, tenant)
+            .unwrap()
+            .with_attester_pins(trust.pins()),
+    );
+    // Another attester, or another local policy: nothing is offered and
+    // both holds are counted as unreadable.
+    let foreign = root.join("foreign-attester.hex");
+    fs::write(
+        &foreign,
+        hex::encode(
+            praetore_core::EvidenceAttesterKey::from_secret_bytes(&[0x5a; 32])
+                .public_key()
+                .unwrap()
+                .as_bytes(),
+        ),
+    )
+    .unwrap();
+    let foreign_trust = EvidenceTrust::load(
+        &dir.join("policy.json"),
+        std::slice::from_ref(&foreign),
+        None,
+    )
+    .unwrap();
+    let mut other_policy = policy.clone();
+    other_policy["rules"][0]["effect"] = "Allow".into();
+    let other_policy_file = root.join("other-policy.json");
+    fs::write(&other_policy_file, other_policy.to_string()).unwrap();
+    let rotated_trust =
+        EvidenceTrust::load(&other_policy_file, std::slice::from_ref(&pin), None).unwrap();
+    for refused in [&foreign_trust, &rotated_trust] {
+        let pending = history.pending(refused).unwrap();
+        assert!(pending.items.is_empty());
+        assert_eq!(pending.unreadable, 2);
+    }
+    let pending = history.pending(&trust).unwrap();
     assert_eq!(pending.items.len(), 2);
     assert_eq!(pending.unreadable, 0);
     assert!(
@@ -287,6 +355,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
             token,
         )),
         signer,
+        trust.clone(),
     );
     let state = Arc::new(
         ConsoleState::new(
@@ -378,6 +447,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
                     read_token_file(&dir.join("approver-api.token")).unwrap(),
                 )),
                 ApproverSigner::from_file("local-approver", &dir.join("approver.key")).unwrap(),
+                trust.clone(),
             )),
         );
         let fresh_app = ConsoleState::router_from(Arc::clone(&fresh));
@@ -539,26 +609,7 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         serde_json::from_slice(&fs::read(dir.join("policy.json")).unwrap()).unwrap();
     policy["rules"][0]["effect"] = "RequireApproval".into();
     fs::write(dir.join("policy.json"), policy.to_string()).unwrap();
-    // The attester's public key, as an operator would hand it out.
-    let secret: [u8; 32] = hex::decode(
-        fs::read_to_string(dir.join("evidence-attester.key"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let pin = root.join("attester-public-key.hex");
-    fs::write(
-        &pin,
-        hex::encode(
-            praetore_core::EvidenceAttesterKey::from_secret_bytes(&secret)
-                .public_key()
-                .unwrap()
-                .as_bytes(),
-        ) + "\n",
-    )
-    .unwrap();
+    let pin = attester_pin(&dir, &root);
     // D3.1: the execution and approver pins `praetore init` wrote, as an
     // operator would hand them out. The execution pin names the key id
     // `praetore run` signs with.
@@ -573,8 +624,14 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
     let rejected_id = held_demo(&dir, "rechazar");
     let not_run_id = held_demo(&dir, "aprobar-sin-ejecutar");
 
+    let trust =
+        EvidenceTrust::load(&dir.join("policy.json"), std::slice::from_ref(&pin), None).unwrap();
     let client = postgres::Client::connect(&runtime_url, postgres::NoTls).unwrap();
-    let history = Arc::new(PostgresHistory::from_client(client, tenant).unwrap());
+    let history = Arc::new(
+        PostgresHistory::from_client(client, tenant)
+            .unwrap()
+            .with_attester_pins(trust.pins()),
+    );
     let state = Arc::new(
         ConsoleState::new(
             history.clone(),
@@ -588,6 +645,7 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
                 read_token_file(&dir.join("approver-api.token")).unwrap(),
             )),
             ApproverSigner::from_file("local-approver", &dir.join("approver.key")).unwrap(),
+            trust.clone(),
         ))
         .with_compliance_pack(CompliancePack::new(
             PackSettings::new(dir.join("policy.json"), vec![pin.clone()])

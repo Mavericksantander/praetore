@@ -22,6 +22,9 @@ use uuid::Uuid;
 pub struct PostgresHistory {
     client: Mutex<Client>,
     tenant_id: Uuid,
+    /// Attester pins the history checks signatures with; `None` checks the
+    /// integrity hash only.
+    attester_pins: Option<Vec<praetore_core::VerifiedPublicKey>>,
 }
 
 impl PostgresHistory {
@@ -36,7 +39,15 @@ impl PostgresHistory {
         Ok(Self {
             client: Mutex::new(client),
             tenant_id,
+            attester_pins: None,
         })
+    }
+
+    /// The history also checks each receipt's attester signature against
+    /// these pins (loaded once at startup).
+    pub fn with_attester_pins(mut self, pins: &[praetore_core::VerifiedPublicKey]) -> Self {
+        self.attester_pins = Some(pins.to_vec());
+        self
     }
 }
 
@@ -130,7 +141,7 @@ impl HistoryStore for PostgresHistory {
             .map_err(|_| HistoryError::Unavailable)?;
         let mut receipts = Vec::with_capacity(rows.len());
         for row in rows {
-            let facts = parse_row(row)?;
+            let facts = parse_row(row, self.attester_pins.as_deref())?;
             if query
                 .situation
                 .is_some_and(|wanted| crate::historia::situation(&facts) != wanted)
@@ -163,7 +174,7 @@ impl InboxStore for PostgresHistory {
     /// Requests that wait for the operator, newest first. Same connection
     /// and tenant context as the history, in a transaction opened read only;
     /// nothing is written.
-    fn pending(&self) -> Result<InboxPage, HistoryError> {
+    fn pending(&self, trust: &crate::EvidenceTrust) -> Result<InboxPage, HistoryError> {
         let mut client = self.client.lock().map_err(|_| HistoryError::Unavailable)?;
         let mut transaction = client
             .transaction()
@@ -209,6 +220,7 @@ impl InboxStore for PostgresHistory {
                     kind,
                     evidence_json: row.get(3),
                 },
+                trust,
             ) {
                 Ok(facts) => items.push(facts),
                 // Never offered for a decision. Counted so the page can say so.
@@ -276,7 +288,12 @@ fn situation_sql(situation: crate::historia::Situation) -> &'static str {
     }
 }
 
-fn parse_row(row: Row) -> Result<crate::historia::ReceiptFacts, HistoryError> {
+/// A column the console cannot read is an error; evidence that does not
+/// check out is a receipt marked unreadable.
+fn parse_row(
+    row: Row,
+    pins: Option<&[praetore_core::VerifiedPublicKey]>,
+) -> Result<crate::historia::ReceiptFacts, HistoryError> {
     let authorization = parse_authorization(&row.get::<_, String>(2))?;
     let execution = parse_execution(&row.get::<_, String>(3))?;
     let reason = parse_reason(row.get(4))?;
@@ -285,18 +302,20 @@ fn parse_row(row: Row) -> Result<crate::historia::ReceiptFacts, HistoryError> {
         parse_journal_timestamp(&row.get::<_, String>(6)).map_err(|_| HistoryError::Invalid)?;
     let updated_at =
         parse_journal_timestamp(&row.get::<_, String>(7)).map_err(|_| HistoryError::Invalid)?;
-    facts_from_columns(JournalColumns {
-        created_at,
-        updated_at,
-        agent_id: row.get(0),
-        request_id: row.get(1),
-        authorization,
-        execution,
-        attested,
-        reason,
-        evidence_json: row.get(5),
-    })
-    .map_err(|_| HistoryError::Invalid)
+    Ok(facts_from_columns(
+        JournalColumns {
+            created_at,
+            updated_at,
+            agent_id: row.get(0),
+            request_id: row.get(1),
+            authorization,
+            execution,
+            attested,
+            reason,
+            evidence_json: row.get(5),
+        },
+        pins,
+    ))
 }
 
 fn parse_authorization(value: &str) -> Result<AuthorizationStatus, HistoryError> {
