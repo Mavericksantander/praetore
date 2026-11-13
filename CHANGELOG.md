@@ -195,8 +195,10 @@
   `ChainError::AnchorMismatch`). A whole tenant chain stays limited to 4096
   entries and 8 MiB, and its format and the console's compliance package
   are unchanged; when it is too large the export error names ranges.
-  Ranges carry no database reference, and an `evidence_id` repeated across
-  ranges is only detected by a whole-chain verification
+  Ranges carry no database reference and `--from-seq` counts receipts, so
+  in a database with storage records the head of a range and the head of
+  the whole-chain export are not interchangeable; an `evidence_id` repeated
+  across ranges is only detected by a whole-chain verification
   (`docs/operations.md`).
 - **`praetore init` writes `attester-public-key.hex`; `praetore
   attester-pin`.** `init` also writes the evidence attester's public key,

@@ -714,24 +714,37 @@ fn postgres_cli_run_reports_a_port_in_use() {
     fs::remove_dir_all(&work).unwrap();
 }
 
-/// 10,000 signed receipts of one tenant, written straight to a throwaway
-/// database in groups of four that share a `created_at`. The whole-chain
-/// export refuses them (over 4096 entries) and names ranges; four ranges of
-/// at most 3,000 receipts verify chained with `--range --expected-anchor`,
-/// and the last head is the link of every receipt in `(created_at,
-/// request_id, agent_id)` order, so ties are broken the same way in every
-/// range. Prints the size of each table of the schema and the bytes per
-/// action (run with `--nocapture`).
+/// 10,000 signed receipts of one tenant, of about 2.6 KB of evidence JSON
+/// each (padded parameters), written straight to a throwaway database in
+/// groups of four that share a `created_at`. The whole-chain export refuses
+/// them and names ranges. The first two ranges use the default `--limit`
+/// (4096), so the 8 MiB bound ends them: fewer than 4096 entries, a file of
+/// at most 8 MiB, and `next_from_seq` right after their last receipt. The
+/// later ranges use `--limit 2000`. Every range verifies chained with
+/// `--range --expected-anchor`, and the last head is the link of every
+/// receipt in `(created_at, request_id, agent_id)` order, so ties are broken
+/// the same way in every range. Prints the size of each table of the schema
+/// and the bytes per action (run with `--nocapture`).
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL and a built praetore-verify"]
 fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
     use praetore_core::{
         Action, AgentId, AgentKeyPair, Authority, DecidedBy, Decision, Evidence,
         EvidenceAttesterKey,
-        journal_chain::{ChainLink, receipt_link},
+        journal_chain::{ChainLink, MAX_CHAIN_BYTES, MAX_CHAIN_ENTRIES, receipt_link},
     };
     const RECEIPTS: usize = 10_000;
-    const LIMIT: u64 = 3_000;
+    // Ranges after the first two: bounded by entries, not by size.
+    const LIMIT: u64 = 2_000;
+    const SIZE_BOUND_RANGES: usize = 2;
+    // Brings the evidence JSON to about 2.6 KB, the size of real receipts,
+    // with random hex (like the digests and signatures of a receipt) so
+    // that PostgreSQL's compression does not shrink it below that.
+    let padding = || -> String {
+        (0..34)
+            .map(|_| Uuid::new_v4().simple().to_string())
+            .collect()
+    };
     let base_url = std::env::var("PRAETORE_TEST_DATABASE_URL").unwrap();
     let scratch = ScratchDatabase::create(&base_url);
     let runtime_url = provision(&scratch.url);
@@ -758,7 +771,7 @@ fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
         let action = Action::new(
             "demo:set_value",
             Some("demo-state".into()),
-            serde_json::json!({ "key": format!("k{index}"), "value": index }),
+            serde_json::json!({ "key": format!("k{index}"), "value": index, "note": padding() }),
         )
         .unwrap()
         .with_capability("demo:write");
@@ -863,6 +876,10 @@ fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
             .unwrap()
             .get(0);
         println!("  average evidence_json length: {evidence_bytes} bytes");
+        assert!(
+            (2_400..=2_800).contains(&evidence_bytes),
+            "receipts of about 2.6 KB expected, got {evidence_bytes}"
+        );
     }
 
     // The whole chain does not fit one export, and the error says so.
@@ -894,25 +911,36 @@ fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
         let output_path = work.join(format!("range-{ranges}.jsonl"));
         let from_text = from.to_string();
         let limit_text = LIMIT.to_string();
+        let size_bound = ranges < SIZE_BOUND_RANGES;
+        let mut export_args = vec![
+            "journal-export",
+            "--tenant",
+            &tenant_text,
+            "--attester-pin",
+            pin.to_str().unwrap(),
+            "--from-seq",
+            &from_text,
+            "--output",
+            output_path.to_str().unwrap(),
+        ];
+        if !size_bound {
+            export_args.extend(["--limit", &limit_text]);
+        }
         let summary = json(&ok(
-            praetore(
-                &[
-                    "journal-export",
-                    "--tenant",
-                    &tenant_text,
-                    "--attester-pin",
-                    pin.to_str().unwrap(),
-                    "--from-seq",
-                    &from_text,
-                    "--limit",
-                    &limit_text,
-                    "--output",
-                    output_path.to_str().unwrap(),
-                ],
-                Some(&runtime_url),
-            ),
+            praetore(&export_args, Some(&runtime_url)),
             "range export",
         ));
+        let entries = summary["entries"].as_u64().unwrap();
+        let file_bytes = fs::metadata(&output_path).unwrap().len();
+        assert!(file_bytes <= MAX_CHAIN_BYTES as u64, "{file_bytes} bytes");
+        if size_bound {
+            // The default limit: the 8 MiB bound ends the range.
+            assert!(entries < MAX_CHAIN_ENTRIES as u64, "{entries} entries");
+            assert_eq!(summary["next_from_seq"], from + entries);
+            println!("range {ranges} (default --limit): {entries} receipts, {file_bytes} bytes");
+        } else {
+            assert!(entries <= LIMIT);
+        }
         assert_eq!(summary["range_start"], from);
         let head = summary["head"].as_str().unwrap().to_owned();
         let mut extra = vec!["--expected-head", head.as_str()];
@@ -930,7 +958,9 @@ fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
         assert!(verified.status.success(), "{}", stderr(&verified));
         let report = json(&verified);
         assert_eq!(report["details"]["entries"], summary["entries"]);
-        assert!(summary["entries"].as_u64().unwrap() <= LIMIT);
+        if let Some(next) = summary["next_from_seq"].as_u64() {
+            assert_eq!(next, from + entries);
+        }
         let ids = chain_request_ids(&output_path);
         chained_ids.extend(ids.into_iter().skip(usize::from(previous_head.is_some())));
         // Chaining to any other head fails.
@@ -946,9 +976,9 @@ fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
         previous_head = Some(head);
         from_seq = summary["next_from_seq"].as_u64();
         ranges += 1;
-        assert!(ranges <= 5, "too many ranges");
+        assert!(ranges <= 8, "too many ranges");
     }
-    assert_eq!(ranges, 4);
+    assert!(ranges > SIZE_BOUND_RANGES, "{ranges} ranges");
     assert_eq!(previous_head.unwrap(), expected.to_hex());
     let ordered: Vec<String> = rows
         .iter()

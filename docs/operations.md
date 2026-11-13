@@ -1062,7 +1062,7 @@ database head (`docs/proposals/journal-chain-jsonl.md`).
 ### Tenant journal in ranges
 
 A whole tenant chain export holds at most 4096 entries and 8 MiB; with
-receipts of about 2.6 KB the size bound comes first, at roughly 3,200
+receipts of about 2.6 KB the size bound comes first, at roughly 3,100
 receipts, and `praetore journal-export --tenant` then fails and names
 ranges. Export a longer chain in ranges, as for safety chains:
 `--from-seq 0 --limit N` writes the first range (`--limit` defaults to and
@@ -1074,8 +1074,15 @@ receipt at `seq` N - 1, in the order of the whole export (`created_at`,
 The exporter reads the receipts before the range, in one read-only
 snapshot, to compute that link. Verify each later range with `--range
 --expected-anchor <head of the previous range>`; the anchor's signature is
-checked and it is not counted. The last range's head is the chain's head,
-and it is the value to anchor outside the operator's control.
+checked and it is not counted. `--from-seq` counts receipts only. In a
+database without storage records, the last range's head equals the head of
+the tenant's whole-chain export. In a database with storage records, the
+whole-chain export opens with a `database_head` line at `seq` 0 and ranges
+do not, so the same receipt has `seq` N + 1 there and N in a range: the
+head of a range and the head of the whole-chain export are then not
+interchangeable. Anchor the last range's head, outside the operator's
+control, as the head of the ranges, and compare it only with heads of
+ranges.
 
 Limits of ranges:
 
@@ -1086,11 +1093,16 @@ Limits of ranges:
 - Each range is verified alone: an `evidence_id` repeated from an earlier
   range is not detected. Only a whole-chain verification sees every receipt.
 - The ranges of one journal state link only if the order of the receipts
-  before them did not change between exports. A row that lands in the past
-  of that order (for example a transaction that commits after later rows)
-  moves every later `seq`; the next range's anchor then does not match
-  `--expected-anchor` and verification fails. Export again from `--from-seq
-  0`.
+  before them did not change between exports. `created_at` is set by
+  `clock_timestamp()` when the row is inserted, but the row becomes visible
+  only when its transaction commits; a transaction that commits after later
+  rows were exported, or a step back of the database clock, lands a row in
+  the past of that order. Every later `seq` then moves: the next range's
+  anchor does not match `--expected-anchor` and verification fails, and a
+  head of that prefix anchored earlier can no longer be reproduced. Export
+  ranges of settled history only (receipts older than any transaction that
+  may still be open, on a database clock that does not step back), and
+  after a mismatch export again from `--from-seq 0`.
 
 ```sh
 praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
@@ -1103,13 +1115,16 @@ praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-ke
   --range --expected-anchor <head of part-0> --format json
 ```
 
-Measured with the ignored test
+Storage: about 3.7 KB per action in the database for receipts of about
+2.6 KB. One run of the ignored test
 `postgres_cli_journal_export_tenant_ranges_of_10000_receipts` (PostgreSQL
-16, 10,000 test receipts of 1,483 bytes of evidence JSON on average, smaller
-than real receipts): `pg_total_relation_size` grew by about 2,249 bytes per
-action for `praetore.execution_journal`, 317 for
-`praetore.execution_journal_events` and 182 for `praetore.replay_claims`,
-about 2,749 bytes per action in all.
+16, 10,000 test receipts of 2,581 bytes of evidence JSON on average, padded
+with random hex) grew `pg_total_relation_size` by 37,322,752 bytes: for
+example 32,464,896 for `praetore.execution_journal`, 3,104,768 for
+`praetore.execution_journal_events` and 1,753,088 for
+`praetore.replay_claims`. The figures depend on the receipts and on
+PostgreSQL's compression of them. In the same run the default `--limit`
+ranges held 3,131 and 3,129 receipts, ended by the 8 MiB bound.
 
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins

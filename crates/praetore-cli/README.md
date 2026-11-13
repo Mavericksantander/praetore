@@ -125,8 +125,12 @@ entries and 8 MiB. For a longer one, export ranges: `--from-seq 0 [--limit
 N]` writes the first and prints `next_from_seq`; each later range starts
 with its anchor (the receipt just before it) and is verified with
 `praetore-verify journal --range --expected-anchor <head of the previous
-range>`. The last range's head is the chain's head. Ranges carry receipts
-only, with no database reference, and a range never overwrites a file. See
+range>`. Ranges carry receipts only, with no database reference, and
+`--from-seq` counts receipts. In a database without storage records the
+last range's head is the head of the whole-chain export; in a database with
+storage records the whole-chain export opens with a `database_head` line at
+`seq` 0, so the same receipt has another `seq` there and the two heads are
+not interchangeable. A range never overwrites a file. See
 [docs/operations.md](../../docs/operations.md#tenant-journal-in-ranges).
 
 ```sh
