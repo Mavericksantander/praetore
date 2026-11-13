@@ -76,6 +76,12 @@ impl Home {
     pub fn attester_key(&self) -> PathBuf {
         self.keys_dir().join("attester.local-dev.key")
     }
+    /// Local approver key, distinct from the issuer, agent and attester.
+    /// Not part of [`Self::is_initialized`]: a home from v0.3.3 does not
+    /// have it until `init` is run again.
+    pub fn approver_key(&self) -> PathBuf {
+        self.keys_dir().join("approver.local-dev.key")
+    }
     pub fn agent(&self) -> PathBuf {
         self.root.join("agent.json")
     }
@@ -87,6 +93,9 @@ impl Home {
     }
     pub fn attester_pin(&self) -> PathBuf {
         self.root.join("attester-public-key.hex")
+    }
+    pub fn approver_pin(&self) -> PathBuf {
+        self.root.join("approver-public-key.hex")
     }
     pub fn policy(&self) -> PathBuf {
         self.root.join("policy.json")
@@ -125,13 +134,20 @@ struct KeyFile {
 pub enum InitOutcome {
     Created,
     AlreadyInitialized,
+    /// The home already had its issuer, agent and attester keys. Only the
+    /// approver key was added. Receipts and the other keys were not touched.
+    ApproverKeyAdded,
 }
 
 /// Creates the home. Never overwrites: a fully initialized home is left
 /// untouched; a partially initialized one is an error.
 pub fn init(home: &Home) -> Result<InitOutcome, String> {
     if home.is_initialized() {
-        return Ok(InitOutcome::AlreadyInitialized);
+        return if ensure_approver_key(home)? {
+            Ok(InitOutcome::ApproverKeyAdded)
+        } else {
+            Ok(InitOutcome::AlreadyInitialized)
+        };
     }
     let existing: Vec<String> = home
         .all_files()
@@ -194,7 +210,67 @@ pub fn init(home: &Home) -> Result<InitOutcome, String> {
         0o644,
     )?;
     write_new(&home.policy(), &to_pretty(&policy)?, 0o644)?;
+    // Last, so a crash before this line leaves a home `init` can finish
+    // by adding only the approver key.
+    let approver_secret = random_secret();
+    if public_matches_existing(
+        home,
+        &AgentKeyPair::from_secret_bytes(&approver_secret).public_key(),
+    )? {
+        return Err("refusing to write an approver key that matches an existing key".into());
+    }
+    write_approver_pair(home, &approver_secret)?;
     Ok(InitOutcome::Created)
+}
+
+/// Adds the approver key when it is absent. Returns whether a key was written.
+fn ensure_approver_key(home: &Home) -> Result<bool, String> {
+    match (home.approver_key().exists(), home.approver_pin().exists()) {
+        (true, true) => Ok(false),
+        (true, false) | (false, true) => Err(format!(
+            "approver key is incomplete ({} and {} must both exist, or neither). Nothing was overwritten; move the leftover file away and run init again",
+            home.approver_key().display(),
+            home.approver_pin().display()
+        )),
+        (false, false) => {
+            let secret = random_secret();
+            let public = AgentKeyPair::from_secret_bytes(&secret).public_key();
+            if public_matches_existing(home, &public)? {
+                return Err(
+                    "refusing to write an approver key that matches an existing key".into(),
+                );
+            }
+            write_approver_pair(home, &secret)?;
+            Ok(true)
+        }
+    }
+}
+
+fn public_matches_existing(
+    home: &Home,
+    public: &praetore_core::VerifiedPublicKey,
+) -> Result<bool, String> {
+    for (path, role) in [
+        (home.issuer_key(), "issuer"),
+        (home.agent_key(), "agent"),
+        (home.attester_key(), "evidence-attester"),
+    ] {
+        let secret = read_secret(&path, role)?;
+        if AgentKeyPair::from_secret_bytes(&secret).public_key() == *public {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn write_approver_pair(home: &Home, secret: &[u8; 32]) -> Result<(), String> {
+    let public = AgentKeyPair::from_secret_bytes(secret).public_key();
+    write_secret(home.approver_key(), "approver", secret)?;
+    write_new(
+        &home.approver_pin(),
+        &format!("{}\n", hex::encode(public.as_bytes())),
+        0o644,
+    )
 }
 
 /// The default policy (format 2, semantics v2): one ALLOW rule for every
@@ -368,6 +444,14 @@ fn check_secret_permissions(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn check_secret_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+pub(crate) fn approver_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String> {
+    read_secret(&home.approver_key(), "approver")
+}
+
+pub(crate) fn attester_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String> {
+    read_secret(&home.attester_key(), "evidence-attester")
 }
 
 pub fn read_attester_pin(path: &Path) -> Result<praetore_core::VerifiedPublicKey, String> {

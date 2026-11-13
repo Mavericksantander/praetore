@@ -249,7 +249,7 @@ fn enforce_blocks_deny_and_approval_and_allows_the_rest() {
         held["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("requires human approval (not supported by praetore-mcp yet)")
+            .contains("waiting for local human approval")
     );
 
     assert!(!stderr.contains("EXECUTED delete_file"), "{stderr}");
@@ -482,7 +482,7 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
         held["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("requires human approval")
+            .contains("waiting for local human approval")
     );
     assert_eq!(stderr.matches("EXECUTED").count(), 1, "{stderr}");
 

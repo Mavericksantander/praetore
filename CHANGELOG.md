@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- **praetore-mcp 0.3.4: local approval for `REQUIRE_APPROVAL`.** In enforce
+  mode a matching `tools/call` is not forwarded. The proxy writes a pending
+  file under the praetore-mcp home and returns the approval id plus the
+  exact `praetore-mcp approve <id> --dir <home>` command. `approvals` lists
+  pending calls, `approve` and `reject` sign the decision with a new local
+  approver key (`init` creates it; running `init` again adds it to an
+  existing home and does not replace keys or receipts). `approve` reads a
+  confirmation code from an interactive terminal. That check is cooperative.
+  An approval is bound to the server, tool and canonical arguments, expires
+  (default 10 minutes, `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or
+  `approvals/ttl-seconds`), and authorizes one later matching call. The
+  decision and that execution are appended to `approvals/journal.jsonl`.
+  `verify` checks the approver signature, the binding, the expiry and that
+  the approval was not used twice. `receipts` shows the state. Observe mode
+  still forwards, and the receipt list says enforce would ask. Receipt
+  lines in `receipts/*.jsonl` are unchanged, so journals written by v0.3.3
+  and by current main keep verifying. No tag and no release.
+
 ### Breaking
 
 - **The console's JSON API sends codes and UTC instants instead of Spanish

@@ -10,9 +10,10 @@ full reference is the [README](README.md).
 `praetore-mcp` sits between an MCP client (Claude Desktop, Cursor, VS Code)
 and a stdio MCP server. For every `tools/call` that goes **through a wrapped
 MCP server**, it evaluates your policy with the PRÆTORE engine and writes an
-Ed25519-signed receipt. In `enforce` mode, DENY and REQUIRE_APPROVAL calls
-are not forwarded; the client gets an MCP tool error with the rule and the
-evidence id.
+Ed25519-signed receipt. In `enforce` mode, DENY calls are not forwarded.
+A REQUIRE_APPROVAL call is not forwarded until a person approves that
+exact call from a terminal (`praetore-mcp approve`). The client gets an
+MCP tool error.
 
 What was run end to end (macOS arm64, 2026-10-30): `cargo install --git`,
 `init`, a `deny` rule for `write_file`, `install --mode enforce` into the real
@@ -53,7 +54,18 @@ praetore-mcp receipts --tail 5   # one ALLOW, one DENY deny-write
 praetore-mcp verify              # OK N receipts: N verified, 0 failed; prints the journal head
 ```
 
-The evidence id in the chat matches the `EVIDENCE ID` column. To undo:
+To hold a call until someone at the machine approves it:
+
+```sh
+praetore-mcp policy require-approval --id approve-write --server filesystem --tool write_file
+# restart the client, attempt the write, then:
+praetore-mcp approvals
+praetore-mcp approve <id>    # interactive terminal; type the code it prints
+```
+
+The agent retries the same call. It is forwarded once. Limits of that flow
+are in point 3 below. The evidence id in the chat matches the `EVIDENCE ID`
+column. To undo:
 `praetore-mcp uninstall --client claude-desktop`, or restore the
 `.praetore-backup-*` file next to the config.
 
@@ -72,15 +84,31 @@ Read these before relying on anything above.
    no receipt for it, it did not go through `praetore-mcp`, or (observe only)
    `praetore-mcp` could not parse the line and forwarded it with a stderr
    warning that names its SHA-256.
-2. **The keys are LOCAL/DEV keys for one machine.** `init` creates three
-   Ed25519 keys under `~/.praetore/mcp/keys/` (0600). There is no PKI, no key
-   rotation, no hardware key storage and no revocation. Anyone who can read
-   that directory can sign receipts as this installation. A receipt shows
-   what this installation recorded; it does not prove anything about who
-   controls the machine.
-3. **REQUIRE_APPROVAL has no approval flow.** A matching call is blocked in
-   enforce mode, with the text "requires human approval (not supported by
-   praetore-mcp yet)". There is no way to approve it and let it run.
+2. **The keys are LOCAL/DEV keys for one machine.** `init` creates four
+   Ed25519 keys under `~/.praetore/mcp/keys/` (0600): issuer, agent,
+   attester and approver. There is no PKI, no key rotation, no hardware
+   key storage and no revocation. Anyone who can read that directory can
+   sign receipts and approvals as this installation. A receipt shows what
+   this installation recorded; it does not prove anything about who
+   controls the machine. An older home gets the approver key from a second
+   `praetore-mcp init`. That run does not replace the other keys or the
+   receipts.
+3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
+   call is not forwarded. The tool error names an approval id and the
+   command to run, for example `praetore-mcp approve <id> --dir <home>`.
+   `praetore-mcp approvals` lists pending calls (server, tool, a short form
+   of the arguments, expiry). `approve` works only in an interactive
+   terminal: it prints a short code and continues only if that code is
+   typed back. `reject <id>` records a rejection and the call is not
+   forwarded. The approval matches one server, one tool and the canonical
+   arguments, expires after 10 minutes unless
+   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says
+   otherwise (1 to 86400 seconds), and is consumed by one later call. A
+   second identical call asks again. Different arguments do not match.
+   A process that can act as this user can open a terminal and approve.
+   That is not a guarantee that a person reviewed the call. Observe mode
+   does not hold the call; `praetore-mcp receipts` shows
+   `enforce would ask` on that receipt.
 4. **Path arguments must resolve to themselves.** For an argument that a
    `--arg-path-prefix` rule covers, `wrap` resolves symlinks first. If the
    path goes through a symlink, has `.`/`..`, or its parent does not exist,
