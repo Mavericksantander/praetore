@@ -28,8 +28,26 @@ what it does not cover, and has a troubleshooting table.
 ## Install
 
 To install `praetore-mcp` v0.3.3 without Rust and without cloning the
-repository, use the binaries from the published v0.3.3 release:
-[Install from the v0.3.3 release](../../docs/install-prebuilt.md).
+repository, download one archive and `SHA256SUMS` from the published
+[v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3)
+(commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`, not a build of the
+current `main` branch):
+
+- macOS Apple silicon: `praetore-mcp-v0.3.3-aarch64-apple-darwin.tar.gz`
+- macOS Intel: `praetore-mcp-v0.3.3-x86_64-apple-darwin.tar.gz`
+- Linux x86_64: `praetore-mcp-v0.3.3-x86_64-unknown-linux-gnu.tar.gz`
+
+v0.3.3 has no Windows binary and no Linux ARM binary, and there is no brew
+installer. Check the archive before you unpack it
+(`shasum -a 256 -c SHA256SUMS --ignore-missing` on macOS,
+`sha256sum -c SHA256SUMS --ignore-missing` on Linux). The published digests
+are in [Install from the v0.3.3 release](../../docs/install-prebuilt.md).
+If `SHA256SUMS` does not match that list, stop. Unpack with `tar -xzf`,
+then move `praetore-mcp` to a directory on your `PATH` that you will keep,
+for example `~/.local/bin`, before you run `install`. `install` records
+the absolute path of the binary that is running. Moving or replacing that
+file later leaves the client config pointing at the old path. Run
+`install` again after you move it.
 
 The commands below are the from-source path. `praetore-mcp` is not published
 on crates.io. The workspace declares `rust-version = "1.88"` (checked with
@@ -68,21 +86,42 @@ re-checks the archives and writes one `SHA256SUMS` covering the three archives a
 as the `release-assets-<tag>` artifact.
 
 For a `v*` tag, CI also signs `SHA256SUMS` with Sigstore keyless signing
-(`SHA256SUMS.sigstore.json`) and publishes everything as a GitHub Release;
-the steps to verify a download are in
+(`SHA256SUMS.sigstore.json`) and publishes the archives, `SHA256SUMS` and
+the signature as a GitHub Release. The v0.3.3 files are on
+[the v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3)
+(commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`). That release has no
+Windows binary and no Linux ARM binary.
+
+The install check is the digest. Download `SHA256SUMS` and the one archive
+for this machine, then run the `shasum` or `sha256sum` command below. The
+published digests are listed in
+[Install from the v0.3.3 release](../../docs/install-prebuilt.md). If the
+file does not match, stop.
+
+Checking the Sigstore signature is optional for that install. It needs
+`cosign`. For v0.3.3, pass
+`--certificate-github-workflow-sha 0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`
+instead of `git rev-parse`, which needs a clone. The command and what the
+signature does prove are in
 [`docs/operations.md`](../../docs/operations.md#release-artifact-integrity).
+
 Builds from other runs are workflow artifacts, and downloading them needs a
-GitHub login. The macOS binaries are **not signed or notarized**:
+GitHub login. Check those against the `.sha256` next to the artifact. The
+macOS binaries are **not signed or notarized**:
 Gatekeeper blocks a downloaded copy until you remove the quarantine
 attribute (`xattr -d com.apple.quarantine praetore-mcp`). Check the archive
-first, against `SHA256SUMS` from a release (after verifying its signature as
-in `docs/operations.md`) or the `.sha256` next to a workflow artifact:
+first:
 
 ```sh
-shasum -a 256 -c SHA256SUMS --ignore-missing          # release
+shasum -a 256 -c SHA256SUMS --ignore-missing          # release, macOS
+sha256sum -c SHA256SUMS --ignore-missing              # release, Linux
 shasum -a 256 -c praetore-mcp-<version>-<target>.tar.gz.sha256  # workflow artifact
 tar -xzf praetore-mcp-<version>-<target>.tar.gz
 ```
+
+Move `praetore-mcp` onto a `PATH` directory you will keep, for example
+`~/.local/bin`, before `install`. `install` writes that absolute path into
+the client config.
 
 The Linux binary is built on GitHub's `ubuntu-latest` runner and needs a
 glibc at least as new as that image's; build it yourself on older systems.
@@ -120,6 +159,7 @@ praetore-mcp verify
 # 7. Add rules (no JSON editing), check them, then restart the client
 praetore-mcp policy deny --id deny-delete --server filesystem --tool delete_file
 praetore-mcp policy require-approval --id approve-ssh --tool read_file --arg-path-prefix path=/Users/me/.ssh
+# v0.3.3 has no approval. From 0.3.4 the flow is in "Local approval".
 praetore-mcp policy list
 praetore-mcp policy check
 
@@ -128,10 +168,30 @@ praetore-mcp uninstall --client claude-desktop --yes
 praetore-mcp install --client claude-desktop --mode enforce --yes
 ```
 
+`install --mode enforce` on an entry that is already wrapped prints
+`nothing to change` and exits 0. The mode already in the config stays.
+Switch by uninstalling and installing again, as above, then restart the
+client. You can also edit `--mode` in the client config and restart.
+`install` does not rewrite `--mode` on a wrapped entry.
+
+In a terminal, `install` and `uninstall` ask
+`Apply these changes to <file>? [y/N]` when you omit `--yes`. Without a
+terminal they exit 1 and print
+`not modifying <file> without confirmation; re-run with --yes`, and they
+do not change the file. A later `praetore-mcp verify` that prints
+`OK 0 receipts` means the journal is empty.
+
+A rule names one tool. `policy deny --tool write_file` on
+`@modelcontextprotocol/server-filesystem@2.3.0` does not make that server
+read-only: `append_file`, `edit_file`, `create_directory`, `move_file` and
+`copy_file` still write. Restart the client after every policy change. A
+running `wrap` keeps the `policy.json` it loaded at start. v0.3.3 has no
+approval. From 0.3.4 the flow is in "Local approval".
+
 `install` turns each stdio entry such as
 
 ```json
-"filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me"], "env": {"X": "1"} }
+"filesystem": { "command": "/absolute/path/to/npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@2.3.0", "/absolute/path/to/test-dir"], "env": {"X": "1"} }
 ```
 
 into
@@ -139,15 +199,19 @@ into
 ```json
 "filesystem": { "command": "/abs/path/praetore-mcp",
   "args": ["wrap", "--dir", "/Users/me/.praetore/mcp", "--name", "filesystem", "--mode", "observe",
-           "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/Users/me"],
+           "--", "/absolute/path/to/npx", "-y", "@modelcontextprotocol/server-filesystem@2.3.0", "/absolute/path/to/test-dir"],
   "env": {"X": "1"} }
 ```
 
-`env` and any other fields stay as they are, and so does the key order.
+Use an absolute path to a test folder with no real data. Do not point
+`server-filesystem` at your home directory or a project folder. `env` and
+any other fields stay as they are, and so does the key order.
 `praetore-mcp uninstall [--client ...] [--yes]` restores the original
-entries exactly. Use `install --mode enforce` to wrap in enforce mode. To
-change the mode later, edit `--mode` in the client config, or uninstall and
-install again.
+entries exactly. Pass `--mode enforce` on the first `install` when you
+want to start in enforce mode. Observe is the default. To change the mode
+later, edit `--mode` in the client config, or uninstall and install again.
+`install` on an already wrapped entry prints `nothing to change` and
+exits 0.
 
 You can also wrap a server by hand:
 
@@ -166,7 +230,7 @@ with `--help`. `praetore-mcp --version` prints the version.
 | Exit code | Meaning |
 |---|---|
 | 0 | Success, including `--help` and `--version`. |
-| 1 | The command ran and found a problem: `verify` found a failed receipt, `policy check` found an invalid policy or engine, or `install`/`uninstall` could not read, parse or write a config, or the change was not confirmed. |
+| 1 | The command ran and found a problem: `verify` found a failed receipt, `policy check` found an invalid policy or engine, or `install`/`uninstall` could not read, parse or write a config, or the change was not confirmed (including when stdin is not a terminal and `--yes` was omitted). |
 | 2 | Usage error, or the command could not run (the reason is on stderr). |
 | `wrap` | The MCP server's own exit code; 127 if the server cannot be started; 1 if it was killed by a signal. |
 
@@ -633,8 +697,12 @@ canonical arguments), `created_at <= decided_at <= expires_at`,
 Decisions live in `approvals/journal.jsonl`, not in `receipts/*.jsonl`, so
 the receipt line format is unchanged. A home with no approval journal
 (v0.3.3, or current main before any approval) verifies as before. The
-approval journal is hash-linked. As with receipts, removing the tail is
-only visible if you kept the head `verify` prints.
+approval journal is hash-linked. Deleting or truncating
+`approvals/journal.jsonl` lets an approval be used again. `verify` does
+not notice: a missing file is `approval journal: none` and still exits 0.
+There is no flag for an expected approval head. The only check is to
+compare, by hand, the approval head that `verify` prints with a copy kept
+somewhere else.
 
 `praetore-verify` does not read this approval journal. It still verifies
 each evidence receipt on its own.
@@ -679,7 +747,10 @@ each evidence receipt on its own.
   `DIR/approvals/`, and approve. That is not a guarantee that a person
   reviewed the call. The approval expires (default 10 minutes) and is
   consumed by one later call with the same server, tool and canonical
-  arguments. See Local approval.
+  arguments. Deleting or truncating `approvals/journal.jsonl` lets that
+  approval be used again. `verify` does not detect that unless you compare,
+  by hand, the approval head it prints. There is no flag for that head.
+  See Local approval.
 * The keys are LOCAL/DEV keys. See the trust model.
 * Observe is not enforcement. Observe receipts are labeled with the signed
   `praetore.mode: observe`.

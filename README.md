@@ -120,6 +120,9 @@ This section is for a person who wants an assistant to install the published
 [Install from the v0.3.3 release](docs/install-prebuilt.md). Copy the prompt
 below and paste it into the assistant. The assistant should explain every
 step and wait for an explicit yes before it changes anything on the computer.
+When no stdio server is configured, the prompt can add one test filesystem
+server. It can then add one `write_file` deny rule and, if you ask, switch
+from observe to enforce. Each of those waits for its own yes.
 
 The prebuilt binaries come from the published
 [v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3),
@@ -146,26 +149,42 @@ Do not clone the repository to get it. The steps below are complete.
 Ground rules
 - Explain each step in plain language before you run it, and wait for my
   explicit "yes" before you download anything, copy a binary onto PATH,
-  run `praetore-mcp init`, or change any MCP client configuration. If I
-  do not answer, do not continue.
+  run `praetore-mcp init`, create or edit any MCP client configuration, or
+  change policy. If I do not answer, do not continue.
+- After I say yes to an install or uninstall, add `--yes` to that command.
+  `praetore-mcp install` and `praetore-mcp uninstall` ask
+  `Apply these changes to <file>? [y/N]` only when stdin is a terminal.
+  Without a terminal they exit 1, print
+  `not modifying <file> without confirmation; re-run with --yes`, and
+  change nothing. Piping `y` into the command does not make stdin a
+  terminal. Show me the exit code.
 - Never use sudo. The binary goes in ~/.local/bin. Keys, policy and
-  receipts stay in ~/.praetore/mcp.
+  receipts stay in ~/.praetore/mcp. `install` records the absolute path
+  of the binary that is running. Do not move that file after install.
 - Never disable, uninstall, bypass or weaken PRÆTORE for yourself, and
   never edit its policy or my client config without asking me first.
   Do not turn off Gatekeeper or any other system check. On macOS, the
   only quarantine command is `xattr -d com.apple.quarantine praetore-mcp`,
   and only after the checksum matches.
-- Do not install Rust or Cargo. Do not clone the repository (`git clone`)
-  and do not build from source (`cargo install`, including
+- Do not install Rust, Cargo, or Node. Do not clone the repository
+  (`git clone`) and do not build from source (`cargo install`, including
   `cargo install --git`). Do not download or run `praetore-verify`. On
   macOS that file is a Linux ELF x86_64 binary. Verification is
   `praetore-mcp verify` only.
+- Do not install cosign, and do not verify the Sigstore signature, unless
+  I ask. That check is optional. The required check is the SHA256 list in
+  step 3. If I ask, pass
+  `--certificate-github-workflow-sha 0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`
+  literally. Do not clone the repository to run `git rev-parse`.
 - Only use commands and flags shown by `praetore-mcp --help` and
   `praetore-mcp <command> --help`. If something you need is not there,
   stop and tell me.
-- There is no public Linux ARM binary and no brew installer. If this
-  machine is not macOS (Apple silicon or Intel) or Linux x86_64, stop
-  and tell me.
+- v0.3.3 has no Windows binary and no Linux ARM binary, and there is no
+  brew installer. If this machine is not macOS (Apple silicon or Intel)
+  or Linux x86_64, stop and tell me.
+- Never point a filesystem MCP server at my home directory or at a
+  project folder. A test server may use only a new folder created for
+  this install, and only after I say yes.
 
 Steps
 1. Choose the one archive that matches this machine. Stop if none matches.
@@ -196,7 +215,9 @@ Steps
    the program cannot be opened or is from an unidentified developer. Do
    not change Gatekeeper any other way. If the attribute is already absent,
    say so and continue. Skip this step on Linux.
-6. Put the binary on PATH without sudo:
+6. Put the binary on PATH without sudo, in a directory you will keep.
+   Moving or replacing that file later leaves the client config pointing
+   at the old path, because `install` records its absolute path.
      mkdir -p "$HOME/.local/bin"
      cp praetore-mcp "$HOME/.local/bin/praetore-mcp"
    On macOS, a copy can still carry the quarantine attribute. From
@@ -209,41 +230,120 @@ Steps
    Do not print private keys.
 8. Find my MCP client. `praetore-mcp install` supports
    `--client claude-desktop`, `--client cursor` and `--client vscode`.
-   If my client is not one of these, stop and tell me. If no server is
-   configured to wrap, stop and tell me. Do not add a server unless I ask.
+   If my client is not one of these, stop and tell me. Config files it
+   reads, when that file already exists:
+     claude-desktop on macOS: ~/Library/Application Support/Claude/claude_desktop_config.json
+     claude-desktop on Linux: $XDG_CONFIG_HOME/Claude/claude_desktop_config.json
+       when XDG_CONFIG_HOME is set, otherwise ~/.config/Claude/claude_desktop_config.json
+     cursor: ~/.cursor/mcp.json (and .cursor/mcp.json in the current directory)
+     vscode on macOS: ~/Library/Application Support/Code/User/mcp.json
+     vscode on Linux: $XDG_CONFIG_HOME/Code/User/mcp.json when XDG_CONFIG_HOME
+       is set, otherwise ~/.config/Code/User/mcp.json
+       (and .vscode/mcp.json in the current directory)
+   Run `praetore-mcp install --client <client> --dry-run` from my home
+   directory, so a project config is not picked up by accident.
+   If that dry-run shows a `+` line for a stdio server, continue at
+   step 9. Do not add another server.
+   If it prints `no MCP client configuration found`, or it finds no
+   stdio server to wrap (`(no MCP servers found)`, or only skipped
+   entries and `nothing to change`), do not stop yet. Offer to add one
+   test server. Only if I say yes:
+   - Create a new empty folder ~/praetore-test. If that path already
+     exists, stop. Put one file in it, hello.txt. Take its absolute path
+     with `cd "$HOME/praetore-test" && pwd -P`. Do not write `~` in JSON.
+   - Run `command -v npx`. If it does not print one absolute path, stop
+     and tell me Node is missing. Do not install Node.
+   - Show me the exact JSON you will write, and wait for another yes
+     before you write it.
+     Cursor and Claude Desktop, under "mcpServers":
+       "filesystem": {"command": "<output of command -v npx>", "args": ["-y", "@modelcontextprotocol/server-filesystem@2.3.0", "<absolute path of ~/praetore-test>"]}
+     VS Code user mcp.json, under "servers", with "type": "stdio" on that
+     entry.
+     Write the user config listed above, not a project .cursor/mcp.json
+     or .vscode/mcp.json. The folder must contain no real data. Never
+     point the server at my home directory or a project folder.
+   - Then continue with step 9.
 9. Back up the client config yourself (copy it to a file next to it with a
    date in the name), in addition to the backup praetore-mcp writes.
 10. Show me the diff before applying anything:
       praetore-mcp install --client <client> --mode observe --dry-run
-    Explain each change. Only after I say yes, apply it in observe mode:
-      praetore-mcp install --client <client> --mode observe
-    Then tell me to restart the client.
+    Explain each change. The `+` line must contain the absolute path of
+    ~/.local/bin/praetore-mcp followed by the argument `wrap`. Only after
+    I say yes, apply it:
+      praetore-mcp install --client <client> --mode observe --yes
+    Show me the exit code. Then re-run the same dry-run. It should report
+    `skipped: already wrapped by praetore-mcp` and `nothing to change`,
+    and exit 0. Show me the config entry. Its `command` must be the
+    absolute path of ~/.local/bin/praetore-mcp, and its args must start
+    with `wrap`. If `command` is still the original server program, stop.
+    The install did not apply. `praetore-mcp verify` can still print
+    `OK 0 receipts` in that case, which is an empty journal, not a
+    successful install.
+    Tell me to restart the client. A running client keeps the old config.
     If a wrapped server does not start and wrap exits 127, the client
     could not find the server command (often `npx`) on the PATH a desktop
-    app receives. Put the absolute path to `npx` in the client config, for
-    example `/opt/homebrew/bin/npx` on Apple silicon Homebrew (`which npx`).
-    Show me the diff, wait for yes, and run install again. Do not install
-    Node unless I ask.
-11. Ask me to make one harmless `tools/call` through a wrapped MCP server
-    (for example, listing a directory). The client's own built-in tools are
-    not governed and will not produce a receipt. Show me the receipt with
-    `praetore-mcp receipts --tail 5`.
+    app receives. Put the absolute path from `command -v npx` in the
+    client config. Show me the diff, wait for yes, and run install again
+    with `--yes`. Do not install Node. npm may print `EBADENGINE` because
+    `@modelcontextprotocol/server-filesystem@2.3.0` declares `node >= 24`.
+    That warning is from npm. If the server still answers the tool call,
+    continue. If it does not start, stop and tell me the Node version.
+    Do not install or upgrade Node.
+11. Ask me to make one harmless `tools/call` through the wrapped MCP server
+    (for example, listing ~/praetore-test). The client's own built-in
+    tools are not governed and will not produce a receipt. Show me the
+    receipt with `praetore-mcp receipts --tail 5`.
 12. Run `praetore-mcp verify` and show me the output. That command checks
     this installation's receipt journal (integrity, signatures, mode
     binding). In observe, a receipt records a decision that was not
-    enforced. Do not download or run `praetore-verify`.
-13. Explain how to roll back:
+    enforced. Do not download or run `praetore-verify`. `OK 0 receipts`
+    means the journal is empty.
+13. First rule, only if I say yes, and only if a wrapped server is named
+    `filesystem` (the test server, or one I already had under that name).
+    If the wrapped server has another name, do not invent this rule. Tell
+    me the server name and skip to step 14.
+      praetore-mcp policy deny --id first-rule --server filesystem --tool write_file
+      praetore-mcp policy check
+    A policy change is loaded when `wrap` starts. Tell me to restart the
+    client before the next call. The `policy` command prints that reminder.
+    v0.3.3 has no approval flow. REQUIRE_APPROVAL is not supported. In
+    enforce mode it is treated like DENY, with the text "requires human
+    approval (not supported by praetore-mcp yet)". Do not add a
+    require-approval rule.
+    If the server is the test server on ~/praetore-test, ask me to write
+    a new file there with the `write_file` tool of `filesystem`. If it
+    points anywhere else, do not call `write_file`.
+    Show `praetore-mcp receipts --tail 5`. It must show `DENY` and
+    `first-rule`. In observe the file is still written. The chat text for
+    a DENY, once you switch to enforce, is
+    `Denied by PRÆTORE. Evidence id: ...`. The rule id is in the receipt,
+    not in that sentence.
+    This blocks one tool. It does not make the server read-only. On
+    @modelcontextprotocol/server-filesystem@2.3.0, `append_file`,
+    `edit_file`, `create_directory`, `move_file` and `copy_file` still
+    write.
+14. Explain how to roll back. Do not run uninstall as part of the install.
+    Run it only if I ask to remove the wrapper. If I do, show the dry-run,
+    and only after I say yes:
       praetore-mcp uninstall --client <client> --dry-run
-      praetore-mcp uninstall --client <client>
+      praetore-mcp uninstall --client <client> --yes
     or restore the backup file, then restart the client. Remove
     ~/.local/bin/praetore-mcp if I ask to remove the program.
     ~/.praetore/mcp holds my keys and receipts; delete it only if I ask.
-14. Do not switch to enforce mode unless I ask. If I do, use
-    `praetore-mcp uninstall --client <client>` and then
-    `praetore-mcp install --client <client> --mode enforce`, showing me
-    the `--dry-run` diff first. Observe mode is the arrival mode: a DENY
-    receipt records what enforce would have blocked, but the call still
-    runs.
+15. Ask me whether I want to switch from observe to enforce. Do not switch
+    unless I say yes. `install --mode enforce` on an entry that is already
+    wrapped prints `nothing to change` and exits 0. That leaves the mode
+    already in the config. It does not switch to enforce.
+    Show the dry-run, and only after I say yes run, in this order:
+      praetore-mcp uninstall --client <client> --yes
+      praetore-mcp install --client <client> --mode enforce --dry-run
+      praetore-mcp install --client <client> --mode enforce --yes
+    The enforce dry-run must show `wrap` with `--mode enforce` before you
+    pass `--yes`. Then tell me to restart the client. In enforce, the same
+    `write_file` call is refused and the file is not written. The receipt
+    shows `DENY` and `first-rule` with mode `enforce`.
+    Observe mode is the arrival mode: a DENY receipt records what enforce
+    would have blocked, but the call still runs.
 ```
 
 ### What the agent must explain to you
@@ -268,27 +368,54 @@ plain language:
   what enforce would have blocked, but the call still runs.
 - **What `praetore-mcp verify` checks.** This installation's receipt journal
   (integrity, signatures, mode binding). In observe, a receipt records a
-  decision that was not enforced. On macOS, do not download or run the
-  release's `praetore-verify` binary. It is a Linux ELF x86_64 file.
+  decision that was not enforced. `OK 0 receipts` means the journal is
+  empty. It does not mean a server was wrapped. On macOS, do not download
+  or run the release's `praetore-verify` binary. It is a Linux ELF x86_64
+  file. The Sigstore check of `SHA256SUMS` is optional and needs `cosign`.
+  For v0.3.3 the workflow commit is the literal value in the prompt. The
+  required check is the SHA256 list.
+- **Confirmation without a terminal.** `install` and `uninstall` change a
+  file only after `[y/N]` on a terminal, or when you pass `--yes` after you
+  have accepted the dry-run. Without a terminal and without `--yes` they
+  exit 1 and leave the file as it was.
+- **A test server, when you have none.** One filesystem server on a new
+  `~/praetore-test` folder, using the absolute path from `command -v npx`
+  and `@modelcontextprotocol/server-filesystem@2.3.0`. The folder holds no
+  real data. It is not your home directory and not a project folder. The
+  assistant does not install Node.
+- **One deny rule is one tool.** `policy deny --id first-rule --server filesystem --tool write_file`
+  blocks `write_file` only. On that server, `append_file`, `edit_file`,
+  `create_directory`, `move_file` and `copy_file` still write. In observe
+  the denied call still runs. Restart the client after the policy change,
+  then read `praetore-mcp receipts`. The rule id is in the receipt.
+- **Switching to enforce.** `install --mode enforce` on an entry that is
+  already wrapped prints `nothing to change` and exits 0. The mode already
+  in the config stays. The switch is `uninstall --yes`, then
+  `install --mode enforce --yes`, then a client restart.
 - **Enforcement is still cooperative.** Someone who can edit the client
   config can remove the wrapper.
 - **macOS.** The binaries are not signed or notarized. After the checksum,
   the quarantine command is `xattr -d com.apple.quarantine praetore-mcp`.
-- **Platforms.** There is no public Linux ARM binary and no brew installer.
+- **Platforms.** v0.3.3 has no Windows binary and no Linux ARM binary, and
+  there is no brew installer.
 - **Where things live.** The program is `~/.local/bin/praetore-mcp`. Keys,
   policy and receipts are in `~/.praetore/mcp` (or `$PRAETORE_MCP_HOME`).
   The private keys are in `~/.praetore/mcp/keys/`. Do not share them or
   paste them anywhere. Anyone who can read them can create receipts that
-  verify.
+  verify. `install` records the absolute path of the binary. Moving that
+  file later leaves the client config pointing at the old path.
 - **Which files change.** The MCP client config, with a backup next to it.
-  New files in `~/.praetore/mcp`. One binary on `PATH`.
-- **How to roll back.** `praetore-mcp uninstall --client <client>` restores
-  the wrapped entries, or you can restore the backup file. Removing
+  New files in `~/.praetore/mcp`. One binary on `PATH`. A new
+  `~/praetore-test` folder only if you agreed to the test server.
+- **How to roll back.** `praetore-mcp uninstall --client <client> --yes`
+  restores the wrapped entries, or you can restore the backup file. Removing
   `~/.local/bin/praetore-mcp` removes the program.
 - **Other limits that remain.** Path checks are point-in-time: a file or
   symlink can change after the decision and before the server uses it.
-  REQUIRE_APPROVAL has no approval flow in `praetore-mcp` yet. Policy
-  changes need a client restart.
+  REQUIRE_APPROVAL has no approval flow in `praetore-mcp` yet. In v0.3.3
+  it is not supported. In enforce mode it is treated like DENY, with the
+  text "requires human approval (not supported by praetore-mcp yet)".
+  Policy changes need a client restart.
 - **You decide.** You approve each step. The assistant should not continue
   without your explicit yes.
 
