@@ -58,7 +58,7 @@ The `Assurance gates` workflow builds `praetore-mcp` with `--release
 `praetore-mcp-<version>-<target>.tar.gz` (the binary, `LICENSE`, `NOTICE`),
 writes its `.sha256` and uploads both as workflow artifacts; it installs no
 Node tooling. A separate smoke job downloads that archive, checks the
-`.sha256`, installs `@modelcontextprotocol/server-filesystem@2.1.0` with
+`.sha256`, installs `@modelcontextprotocol/server-filesystem@2.3.0` with
 `npm ci` from `scripts/mcp-smoke/package-lock.json` and runs
 `scripts/mcp-smoke.py`: one allowed `read_text_file` and one denied
 `write_file`, then `verify`. `Release checksums` waits for both jobs, then

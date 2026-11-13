@@ -799,7 +799,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24"
-      # @modelcontextprotocol/server-filesystem@2.1.0 and its dependencies
+      # @modelcontextprotocol/server-filesystem@2.3.0 and its dependencies
       # exactly as in scripts/mcp-smoke/package-lock.json.
       - run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/mcp-smoke
       # A real tools/call allowed and one denied, then `verify`.

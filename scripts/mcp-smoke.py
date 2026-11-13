@@ -24,7 +24,7 @@ import tempfile
 import threading
 
 SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem"
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.3.0"
 SERVER_BIN = "mcp-server-filesystem"
 NODE_PROJECT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mcp-smoke")
 TIMEOUT_SECONDS = 180

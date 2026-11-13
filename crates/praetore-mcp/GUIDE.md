@@ -37,7 +37,7 @@ praetore-mcp policy check
 # Add a filesystem server to your client first, e.g. in Claude Desktop's
 # claude_desktop_config.json:
 #   "mcpServers": {"filesystem": {"command": "npx",
-#     "args": ["-y", "@modelcontextprotocol/server-filesystem@2.1.0", "/path/to/test-dir"]}}
+#     "args": ["-y", "@modelcontextprotocol/server-filesystem@2.3.0", "/path/to/test-dir"]}}
 
 praetore-mcp install --mode enforce --dry-run
 praetore-mcp install --client claude-desktop --mode enforce   # backup written first

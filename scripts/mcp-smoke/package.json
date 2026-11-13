@@ -5,6 +5,6 @@
   "description": "MCP server used by scripts/mcp-smoke.py. Install with npm ci --ignore-scripts.",
   "license": "SEE LICENSE IN ../../LICENSE",
   "dependencies": {
-    "@modelcontextprotocol/server-filesystem": "2.1.0"
+    "@modelcontextprotocol/server-filesystem": "2.3.0"
   }
 }
