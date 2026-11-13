@@ -298,7 +298,8 @@
   startup error. New dependencies of the console: `tar` and
   `flate2` (Rust backend).
 - **Approval and execution receipts in the compliance package (P-002
-  D3.1).** The package adds `approvals.jsonl`: the tenant's human
+  D3.1).** When at least one of the new settings below is configured, the
+  package adds `approvals.jsonl`: the tenant's human
   decisions (approve, reject), approval-expiration receipts and execution
   receipts (schema v1 to v5, the `GatewayReceipt` the gateway returned,
   with the journal's evidence and, for `executed` and `confirmed`, the
@@ -306,7 +307,10 @@
   in the same read-only snapshot as `journal.jsonl`. New optional
   settings `PRAETORE_CONSOLE_EXECUTION_PIN_FILES` and
   `PRAETORE_CONSOLE_APPROVER_PIN_FILES` (0 to 16 each, only with the D3
-  settings) name the pins that verify them, in the JSON format of the
+  settings) name the pins that verify them; with neither, the package is
+  the D3 one, and `LEEME.txt` and `export.json` (`"outcomes":
+  {"included": false, ...}`) say the console is not configured to include
+  those receipts. The pins use the JSON format of the
   `approver-pin.json` that `praetore init` writes
   (`{"schema_version":1,"key_id":...,"public_key_hex":...}`); they go in
   the package as `execution-pin-N.json` and `approver-pin-N.json`,
@@ -315,17 +319,35 @@
   record that does not verify, does not match its request of the journal
   or contradicts another record of that request, or a record signed by a
   key no pin names, means no package, and the page says so without ids or
-  hex. An execution pin equal to the approver's key, an approver pin equal
-  to the approver's secret, and any execution or approver pin that
-  verified no record are refused (the page names the unused one in words
-  by its place in its variable). `export.json` counts the records of each
-  kind and the held requests by outcome. `LEEME.txt` has a new step 5
+  hex; so does an `approvals.jsonl` over 32 MiB or 20,480 lines. An
+  execution pin equal to the approver's key, an approver pin equal to the
+  approver's secret, a file that is not a JSON pin, and a repeated key or
+  key id are refused. An execution or approver pin that verified no
+  record is left out of the package and logged with its position and path
+  (a tenant with no human decision gets no `approver-pin-1.json`).
+  `export.json` counts the records of each kind, the held requests by
+  outcome and the omitted pins (`omitted_execution_pins`,
+  `omitted_approver_pins`). `LEEME.txt` has a new step 5
   (`praetore-verify outcomes`, how to find each held request of the
-  journal in its `held` list) and says what it does not show: that
-  `approvals.jsonl` is complete (its records are not chained), and that a
+  journal in its `held` list; the order of the lines is not verified, and
+  an unused pin is reported, not an error) and says what it does not
+  show: that `approvals.jsonl` is complete (its records are not chained,
+  so an approved or executed request can show as `pending`,
+  `approved_pending_dispatch` or `not_dispatched`), and that a
   request shown as `pending` may also have expired without the gateway
   having recorded it yet. The step 2 note on v0.3.3 now says that
-  `approvals.jsonl` can carry what v0.3.3 rejects.
+  `approvals.jsonl` can carry what v0.3.3 rejects. The page's notice on the
+  package names `approvals.jsonl` and the execution and approver public
+  keys, and asks to review the output of each executed action, which may
+  hold sensitive data, before handing the package over.
+- **`praetore init` writes `execution-pin.json`; `praetore execution-pin`
+  (P-002 D3.1).** `init` also writes the execution key's public pin
+  (`{"schema_version":1,"key_id":"local-demo-<public key hex>","public_key_hex":...}`),
+  the format of `approver-pin.json`, for the console's
+  `PRAETORE_CONSOLE_EXECUTION_PIN_FILES` and `praetore-verify outcomes
+  --execution-pin`. `praetore execution-pin <directory>` writes it for a
+  directory initialized before: it reads `execution-attester.key` itself
+  and never overwrites. No secret file changes.
 - **`praetore-verify outcomes` (P-002 D3.1).** Verifies a tenant's
   approval and execution records (a JSONL file such as `approvals.jsonl`)
   against its journal chain, which it verifies first: each human decision

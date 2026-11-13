@@ -68,8 +68,9 @@ pub fn export_tenant(
 /// order. An execution attestation becomes the [`GatewayReceipt`] the
 /// gateway returned for it: the journal's evidence, and the journal's output
 /// for `executed` and `confirmed`.
-const OUTCOMES_QUERY: &str = "SELECT record.kind, record.payload, journal.evidence_json, \
-     journal.output_json FROM ( \
+const OUTCOMES_QUERY: &str = "SELECT record.kind, record.payload, \
+     CASE WHEN record.kind = 2 THEN journal.evidence_json END, \
+     CASE WHEN record.kind = 2 THEN journal.output_json END FROM ( \
      SELECT 0 AS kind, decision_json AS payload, tenant_id, agent_id, request_id, created_at, \
      approval_id::text AS id FROM praetore.human_approvals WHERE tenant_id = $1 \
      UNION ALL \
@@ -116,8 +117,16 @@ pub fn export_tenant_with_outcomes(
             0 => serde_json::from_value(payload).map(Outcome::HumanDecision),
             1 => serde_json::from_value(payload).map(Outcome::ApprovalExpired),
             _ => serde_json::from_value::<ExecutionAttestation>(payload).and_then(|attestation| {
-                let evidence = Evidence::from_json(&row.get::<_, String>(2))
-                    .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))?;
+                // Evidence and output come only with execution receipts.
+                let evidence = row
+                    .get::<_, Option<String>>(2)
+                    .ok_or_else(|| {
+                        serde_json::Error::io(std::io::Error::other("journal row has no evidence"))
+                    })
+                    .and_then(|json| {
+                        Evidence::from_json(&json)
+                            .map_err(|error| serde_json::Error::io(std::io::Error::other(error)))
+                    })?;
                 let output = match attestation.execution {
                     AttestedExecution::Executed | AttestedExecution::Confirmed => row
                         .get::<_, Option<String>>(3)

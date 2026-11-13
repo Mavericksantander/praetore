@@ -246,11 +246,11 @@ fn text<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> &'a str {
     std::str::from_utf8(file(files, name)).unwrap()
 }
 
-const EXPECTED_NAMES: [&str; 9] = [
+/// The D3 package: no execution or approver pin configured.
+const EXPECTED_NAMES: [&str; 8] = [
     "praetore-compliance/",
     "praetore-compliance/LEEME.txt",
     "praetore-compliance/journal.jsonl",
-    "praetore-compliance/approvals.jsonl",
     "praetore-compliance/policy.json",
     "praetore-compliance/policy-digest.txt",
     "praetore-compliance/attester-pin-1.hex",
@@ -329,10 +329,10 @@ async fn the_package_has_fixed_names_and_the_cli_export_policy_and_pins() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(!readme.contains("recibos de ejecución, que este paquete no trae"));
-    assert!(!readme.contains("no van en este paquete"));
-    assert_eq!(text(&files, "approvals.jsonl"), "");
-    assert_eq!(export["outcomes"]["records"], 0);
-    assert_eq!(export["outcomes"]["held_requests"], 0);
+    assert_eq!(
+        export["outcomes"],
+        serde_json::json!({"included": false, "note": NOT_CONFIGURED_NOTE})
+    );
     assert_eq!(export["execution_pins"], serde_json::json!([]));
     assert_eq!(export["approver_pins"], serde_json::json!([]));
     for needed in [
@@ -341,21 +341,35 @@ async fn the_package_has_fixed_names_and_the_cli_export_policy_and_pins() {
         "cargo build --release --locked -p praetore-verify",
         "No prueba que el agente no tuvo un camino fuera del gateway",
         "No prueba nada de lo ocurrido antes del primer registro ni después de la exportación",
-        "Use praetore-verify construido desde main. El praetore-verify de v0.3.3 también acepta este journal.jsonl, pero no muestra tenant_id ni avisa head_not_anchored, que el paso 3 usa, y no tiene el comando outcomes del paso 5. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y las razones approved_claim_expired y approval_rejected, que approvals.jsonl puede traer.",
+        "Use praetore-verify construido desde main. El praetore-verify de v0.3.3 también acepta este journal.jsonl, pero no muestra tenant_id ni avisa head_not_anchored, que el paso 3 usa. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y las razones approved_claim_expired y approval_rejected; esos recibos no van en este paquete.",
         "Tiene 8 recibos de decisión. Cada línea encadena",
-        "desde main, en un commit que incluya este paquete de compliance con approvals.jsonl (P-002 D3.1), o desde un release posterior a v0.3.3",
-        "esos recibos van en approvals.jsonl",
-        "Este tenant no tiene ninguno: el archivo está vacío.",
-        "praetore-verify outcomes --outcomes approvals.jsonl --journal journal.jsonl --attester-pin attester-pin-1.hex",
-        "Esta exportación no tiene solicitudes retenidas.",
-        "No prueba que approvals.jsonl esté completo.",
-        "puede seguir pendiente o haber vencido sin que el gateway lo haya registrado todavía",
+        "desde main, en un commit que incluya este paquete de compliance (P-002 D3), o desde un release posterior a v0.3.3",
+        "No trae la aprobación o el rechazo de una persona ni el resultado de la ejecución: esta consola no está configurada para incluir esos recibos en el paquete.",
+        "No muestra si una solicitud retenida fue aprobada, rechazada, venció o se ejecutó: journal.jsonl trae solo la decisión de la política. Esta consola no está configurada para incluir los recibos de aprobación y de ejecución en el paquete.",
+        "head de la cadena y digest de la política. SHA256SUMS",
         "sha256sum -c SHA256SUMS",
         &digest,
         &head.head.to_hex(),
         &TENANT.to_string(),
     ] {
         assert!(readme.contains(needed), "LEEME.txt lacks {needed:?}");
+    }
+    for absent in [
+        "approvals.jsonl",
+        "praetore-verify outcomes",
+        "5. Cómo terminó",
+    ] {
+        assert!(!readme.contains(absent), "LEEME.txt has {absent:?}");
+    }
+    // Blank lines as in D3: no section is left with an empty gap.
+    {
+        let t = text(&files, "LEEME.txt");
+        let i = t.find("\n\n\n\n");
+        assert!(
+            i.is_none(),
+            "{}",
+            &t[i.unwrap_or(0).saturating_sub(300)..(i.unwrap_or(0) + 100).min(t.len())]
+        );
     }
 }
 
@@ -668,6 +682,19 @@ fn the_page_offers_the_download_in_words_without_ids() {
     let page = include_str!("../ui/index.html");
     assert!(page.contains(">Descargar paquete de compliance</button>"));
     assert!(page.contains("No trae claves privadas"));
+    let section =
+        &page[page.find("id=\"paquete\"").unwrap()..page.find("id=\"descargar-paquete\"").unwrap()];
+    for needed in [
+        "approvals.jsonl",
+        "las claves públicas de ejecución y de aprobador",
+        "Incluye la salida de cada acción ejecutada, que puede tener datos sensibles: revísela antes de entregar el paquete.",
+    ] {
+        assert!(section.contains(needed), "{needed}");
+    }
+    let words = section.split("<p class=\"aviso\">").nth(1).unwrap();
+    // No ids, hex or numbers; "SHA-256" is the name of the digest.
+    let words = words.replace("SHA-256", "");
+    assert!(!words.chars().any(|c| c.is_ascii_digit()), "{words}");
     let script = include_str!("../ui/app.js");
     assert!(script.contains("\"/api/paquete\""));
     assert!(script.contains("\"x-praetore-consola\": \"1\""));
@@ -762,7 +789,7 @@ fn a_database_head_reference_is_reported_and_said_to_be_unchecked_here() {
         policy: RecordedPolicy::from_json(&policy_json).unwrap(),
         policy_json,
         pins: vec![pin],
-        outcomes: PackOutcomes::default(),
+        outcomes: Some(PackOutcomes::default()),
     };
     let files = pack_files(&contents).unwrap();
     let get = |name: &str| {
@@ -1248,6 +1275,7 @@ async fn approvals_jsonl_carries_each_outcome_its_pins_and_its_counts() {
     assert_eq!(
         export["outcomes"],
         serde_json::json!({
+            "included": true,
             "file": "approvals.jsonl",
             "records": 7,
             "approvals": 1,
@@ -1265,6 +1293,8 @@ async fn approvals_jsonl_carries_each_outcome_its_pins_and_its_counts() {
                 "pending": 1,
                 "rejected": 1,
             },
+            "omitted_execution_pins": 0,
+            "omitted_approver_pins": 0,
         })
     );
     assert_eq!(
@@ -1301,8 +1331,64 @@ async fn approvals_jsonl_carries_each_outcome_its_pins_and_its_counts() {
         "Los recibos de ejecución traen la salida del adaptador",
         "busque su request_id (o su evidence_id) en held",
         "No prueba que approvals.jsonl esté completo.",
+        "puede aparecer como pending, approved_pending_dispatch o not_dispatched.",
+        "puede seguir pendiente o haber vencido sin que el gateway lo haya registrado todavía",
+        "El orden de las líneas de approvals.jsonl no se verifica",
+        "no hace fallar el comando: sale en unused_execution_pins o unused_approver_pins.",
+        "esos recibos van en approvals.jsonl",
+        "y no tiene el comando outcomes del paso 5. Además, v0.3.3 rechaza con RECEIPT_INVALID los recibos de ejecución schema v5 (awaiting_approval) y las razones approved_claim_expired y approval_rejected, que approvals.jsonl puede traer.",
+        "paquete de compliance con approvals.jsonl (P-002 D3.1), o desde un release posterior a v0.3.3",
     ] {
         assert!(readme.contains(needed), "LEEME.txt lacks {needed:?}");
+    }
+    assert!(!readme.contains("no está configurada"));
+    {
+        let t = text(&files, "LEEME.txt");
+        let i = t.find("\n\n\n\n");
+        assert!(
+            i.is_none(),
+            "{}",
+            &t[i.unwrap_or(0).saturating_sub(300)..(i.unwrap_or(0) + 100).min(t.len())]
+        );
+    }
+}
+
+/// With no execution or approver pin configured, a tenant with
+/// approvals and executions gets the D3 package; with only one of the two
+/// variables, D3.1's all or nothing applies.
+#[test]
+fn without_execution_or_approver_pins_the_package_is_the_d3_one() {
+    let setup = Setup::held("d31-mode");
+    let (receipts, outcomes) = held_set();
+    let files = unpack(
+        &generate_with(
+            setup.settings(),
+            held_store_of(receipts.clone(), outcomes.clone()),
+            None,
+        )
+        .unwrap(),
+    );
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, EXPECTED_NAMES);
+    let export: serde_json::Value = serde_json::from_str(text(&files, "export.json")).unwrap();
+    assert_eq!(export["outcomes"]["included"], false);
+    assert_eq!(export["journal"]["entries"], 3);
+    let readme = text(&files, "LEEME.txt");
+    assert!(!readme.contains("approvals.jsonl"));
+    assert!(readme.contains("No muestra si una solicitud retenida fue aprobada"));
+    // One variable alone is the D3.1 mode: its records must all verify.
+    let approver = setup.key_pin("approver.json", &approver_pin());
+    let execution = setup.key_pin("execution.json", &execution_pin());
+    for (execution, approvers) in [(Vec::new(), vec![approver]), (vec![execution], Vec::new())] {
+        assert_eq!(
+            generate_with(
+                setup.with_pins(execution, approvers),
+                held_store_of(receipts.clone(), outcomes.clone()),
+                None
+            )
+            .err(),
+            Some(PackError::OutcomeKeyMissing)
+        );
     }
 }
 
@@ -1310,16 +1396,6 @@ async fn approvals_jsonl_carries_each_outcome_its_pins_and_its_counts() {
 fn a_record_signed_by_a_key_that_is_not_configured_yields_no_package() {
     let setup = Setup::held("d31-missing-key");
     let (receipts, outcomes) = held_set();
-    // No execution or approver pin at all.
-    assert_eq!(
-        generate_with(
-            setup.settings(),
-            held_store_of(receipts.clone(), outcomes.clone()),
-            None
-        )
-        .err(),
-        Some(PackError::OutcomeKeyMissing)
-    );
     // The right key under another key id is not the key the records name.
     let other_id = setup.key_pin("execution.json", &key_pin(EXECUTION_SECRET, "other-id"));
     let approver = setup.key_pin("approver.json", &approver_pin());
@@ -1401,68 +1477,104 @@ fn a_record_that_does_not_verify_or_does_not_fit_yields_no_package() {
     );
 }
 
+/// What a package's pins and export.json say about omitted pins.
+fn pack_pins(files: &[(String, Vec<u8>)]) -> (Vec<KeyPin>, Vec<KeyPin>, serde_json::Value) {
+    let pins = |prefix: &str| {
+        files
+            .iter()
+            .filter(|(name, _)| name.starts_with(&format!("{PACK_DIR}/{prefix}")))
+            .map(|(_, bytes)| KeyPin::from_json(std::str::from_utf8(bytes).unwrap()).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let export: serde_json::Value = serde_json::from_str(text(files, "export.json")).unwrap();
+    (
+        pins("execution-pin-"),
+        pins("approver-pin-"),
+        serde_json::json!([
+            export["outcomes"]["omitted_execution_pins"],
+            export["outcomes"]["omitted_approver_pins"],
+            export["execution_pins"].as_array().unwrap().len(),
+            export["approver_pins"].as_array().unwrap().len(),
+        ]),
+    )
+}
+
 #[test]
-fn an_execution_or_approver_pin_that_verified_nothing_is_refused_and_named() {
+fn an_execution_or_approver_pin_that_verified_nothing_is_left_out_and_counted() {
     let setup = Setup::held("d31-unused");
     let execution = setup.key_pin("execution.json", &execution_pin());
     let approver = setup.key_pin("approver.json", &approver_pin());
     let spare = setup.key_pin("spare.json", &key_pin([0x66; 32], "spare"));
-    let (receipts, outcomes) = held_set();
-    // No records at all: an execution pin has nothing to verify.
-    assert_eq!(
-        generate_with(
-            setup.with_pins(vec![execution.clone()], Vec::new()),
-            held_store_of(receipts.clone(), Vec::new()),
-            None
-        )
-        .err(),
-        Some(PackError::KeyPinUnused {
-            role: PinRole::Execution,
-            index: 0,
-            more: false
-        })
-    );
-    // The second execution pin signed nothing.
-    assert_eq!(
-        generate_with(
-            setup.with_pins(
-                vec![execution.clone(), spare.clone()],
-                vec![approver.clone()]
-            ),
-            held_store_of(receipts.clone(), outcomes.clone()),
-            None
-        )
-        .err(),
-        Some(PackError::KeyPinUnused {
-            role: PinRole::Execution,
-            index: 1,
-            more: false
-        })
-    );
-    // The first and third approver pins signed nothing.
     let third = setup.key_pin("third.json", &key_pin([0x67; 32], "third"));
-    let error = generate_with(
-        setup.with_pins(vec![execution], vec![spare, approver, third]),
-        held_store_of(receipts.clone(), outcomes),
-        None,
-    )
-    .unwrap_err();
-    assert_eq!(
-        error,
-        PackError::KeyPinUnused {
-            role: PinRole::Approver,
-            index: 0,
-            more: true
-        }
-    );
-    let message = error.message();
+    let (receipts, outcomes) = held_set();
+    let pack = |execution: Vec<PathBuf>, approvers: Vec<PathBuf>, outcomes: Vec<Outcome>| {
+        unpack(
+            &generate_with(
+                setup.with_pins(execution, approvers),
+                held_store_of(receipts.clone(), outcomes),
+                None,
+            )
+            .unwrap(),
+        )
+    };
+    // A tenant with no human decision: the approver pin is left out.
+    let undecided: Vec<Outcome> = outcomes
+        .iter()
+        .filter(|record| {
+            matches!(record, Outcome::ExecutionReceipt(receipt)
+            if receipt.execution == praetore_receipt::AttestedExecution::AwaitingApproval)
+        })
+        .cloned()
+        .collect();
+    let files = pack(vec![execution.clone()], vec![approver.clone()], undecided);
     assert!(
-        message.starts_with(
-            "La primera clave configurada como clave pública de aprobador (en el orden de PRAETORE_CONSOLE_APPROVER_PIN_FILES) no verifica ningún recibo"
-        ),
-        "{message}"
+        !files
+            .iter()
+            .any(|(name, _)| name.ends_with("approver-pin-1.json"))
     );
-    assert!(message.contains("Puede haber más claves en la misma situación."));
+    assert_eq!(
+        pack_pins(&files),
+        (
+            vec![execution_pin()],
+            Vec::new(),
+            serde_json::json!([0, 1, 1, 0])
+        )
+    );
+    let readme = text(&files, "LEEME.txt")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(readme.contains("Una clave configurada en la consola no verificó ningún registro de approvals.jsonl y no va en el paquete"), "{readme}");
+    assert!(!readme.contains("--approver-pin"));
+    // No records at all: every pin is left out, approvals.jsonl is empty.
+    let files = pack(vec![execution.clone()], vec![approver.clone()], Vec::new());
+    assert_eq!(text(&files, "approvals.jsonl"), "");
+    assert_eq!(
+        pack_pins(&files),
+        (Vec::new(), Vec::new(), serde_json::json!([1, 1, 0, 0]))
+    );
+    // The second execution pin and the first and third approver pins signed
+    // nothing: only the ones that did go in, numbered from one.
+    let files = pack(
+        vec![execution, spare.clone()],
+        vec![spare, approver, third],
+        outcomes,
+    );
+    assert_eq!(
+        pack_pins(&files),
+        (
+            vec![execution_pin()],
+            vec![approver_pin()],
+            serde_json::json!([1, 2, 1, 1])
+        )
+    );
+    assert!(
+        text(&files, "LEEME.txt")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains("Más de una clave configuradas en la consola no verificó")
+    );
 }
 
 #[test]
@@ -1516,20 +1628,34 @@ fn no_private_key_passes_as_an_execution_or_approver_pin() {
             })
         );
     }
-    // Without the inbox configured, the secret verifies nothing and is
-    // refused as such.
-    assert!(matches!(
-        generate_with(
+    // Without the inbox configured, the secret verifies nothing: it is left
+    // out of the package.
+    let files = unpack(
+        &generate_with(
             setup.with_pins(vec![execution.clone()], vec![approver.clone(), secret]),
             held_store_of(receipts.clone(), outcomes.clone()),
-            None
-        ),
-        Err(PackError::KeyPinUnused {
-            role: PinRole::Approver,
-            index: 1,
-            ..
-        })
-    ));
+            None,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        pack_pins(&files),
+        (
+            vec![execution_pin()],
+            vec![approver_pin()],
+            serde_json::json!([0, 1, 1, 1])
+        )
+    );
+    for (name, bytes) in &files {
+        assert!(
+            !bytes.windows(32).any(|window| window == console_secret),
+            "{name}"
+        );
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(&hex::encode(console_secret)),
+            "{name}"
+        );
+    }
     // A bare hex key instead of a JSON pin, or a repeated key id.
     let bare = setup.dir.join("bare.hex");
     fs::write(&bare, hex::encode(approver_public)).unwrap();
@@ -1574,8 +1700,10 @@ fn no_private_key_passes_as_an_execution_or_approver_pin() {
 async fn a_d31_failure_shows_a_plain_message_and_no_package() {
     let setup = Setup::held("d31-page");
     let (receipts, outcomes) = held_set();
+    // Only the approver pin: the execution receipts have no key.
+    let approver = setup.key_pin("approver.json", &approver_pin());
     let response = app(
-        Some(setup.settings()),
+        Some(setup.with_pins(Vec::new(), vec![approver])),
         held_store_of(receipts, outcomes),
         false,
     )
@@ -1603,11 +1731,6 @@ fn the_d31_messages_carry_no_ids_digits_or_hex() {
         },
         PackError::KeyPinIsApproverKey {
             role: PinRole::Approver,
-        },
-        PackError::KeyPinUnused {
-            role: PinRole::Execution,
-            index: 15,
-            more: true,
         },
         PackError::OutcomeKeyMissing,
         PackError::Outcomes,

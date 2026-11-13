@@ -564,33 +564,11 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         ) + "\n",
     )
     .unwrap();
-    // D3.1: the gateway's execution key (key id as `praetore run` names it)
-    // and the approver pin `praetore init` wrote, as an operator would hand
-    // them out.
-    let execution_secret: [u8; 32] = hex::decode(
-        fs::read_to_string(dir.join("execution-attester.key"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap()
-    .try_into()
-    .unwrap();
-    let execution_public = hex::encode(
-        ed25519_dalek::SigningKey::from_bytes(&execution_secret)
-            .verifying_key()
-            .to_bytes(),
-    );
+    // D3.1: the execution and approver pins `praetore init` wrote, as an
+    // operator would hand them out. The execution pin names the key id
+    // `praetore run` signs with.
     let execution_pin = root.join("execution-pin.json");
-    fs::write(
-        &execution_pin,
-        serde_json::json!({
-            "schema_version": 1,
-            "key_id": format!("local-demo-{execution_public}"),
-            "public_key_hex": execution_public,
-        })
-        .to_string(),
-    )
-    .unwrap();
+    fs::copy(dir.join("execution-pin.json"), &execution_pin).unwrap();
     let approver_pin = root.join("approver-pin.json");
     fs::copy(dir.join("approver-pin.json"), &approver_pin).unwrap();
 
@@ -629,7 +607,21 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         .enable_all()
         .build()
         .unwrap();
-    let (pack, missing_policy, pending_id) = runtime.block_on(async {
+    // The same database through a console with no execution or approver
+    // pin configured gets the D3 package.
+    let d3_state = Arc::new(
+        ConsoleState::new(
+            history.clone(),
+            LocalSession::from_secret([0x21; 32]),
+            HashMap::new(),
+        )
+        .with_compliance_pack(CompliancePack::new(
+            PackSettings::new(dir.join("policy.json"), vec![pin.clone()]).unwrap(),
+            history.clone(),
+        )),
+    );
+    let d3_app = ConsoleState::router_from(Arc::clone(&d3_state));
+    let (pack, missing_policy, pending_id, d3_pack) = runtime.block_on(async {
         let (_, list, text) = call(&app, inbox_request()).await;
         let items = list["solicitudes"].as_array().unwrap();
         assert_eq!(items.len(), 3, "{text}");
@@ -673,10 +665,18 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
         fs::rename(root.join("policy.json.aside"), dir.join("policy.json")).unwrap();
         let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        (pack, (status, message), pending_id)
+
+        let response = d3_app.clone().oneshot(pack_request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let d3_pack = to_bytes(response.into_body(), 64 << 20)
+            .await
+            .unwrap()
+            .to_vec();
+        (pack, (status, message), pending_id, d3_pack)
     });
     drop(runtime);
     drop(app);
+    drop(d3_app);
     assert_eq!(missing_policy.0, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         missing_policy.1["mensaje"],
@@ -968,6 +968,76 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
     let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert_eq!(refused["code"], "OUTCOME_KEY_UNKNOWN", "{refused}");
 
+    // The console without execution or approver pins: the D3 package,
+    // the same journal, no approvals.jsonl, and it still verifies.
+    let d3_archive = root.join("d3.tar.gz");
+    fs::write(&d3_archive, &d3_pack).unwrap();
+    let d3_unpacked = root.join("d3");
+    fs::create_dir_all(&d3_unpacked).unwrap();
+    run(
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(&d3_archive)
+            .arg("-C")
+            .arg(&d3_unpacked),
+        "tar -xzf (D3)",
+    );
+    let d3_dir = d3_unpacked.join("praetore-compliance");
+    let mut d3_names: Vec<String> = fs::read_dir(&d3_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    d3_names.sort();
+    assert_eq!(
+        d3_names,
+        [
+            "LEEME.txt",
+            "SHA256SUMS",
+            "attester-pin-1.hex",
+            "export.json",
+            "journal.jsonl",
+            "policy-digest.txt",
+            "policy.json",
+        ]
+    );
+    assert!(check_sums(&d3_dir).status.success());
+    assert_eq!(fs::read(d3_dir.join("journal.jsonl")).unwrap(), journal);
+    let d3_export: serde_json::Value =
+        serde_json::from_slice(&fs::read(d3_dir.join("export.json")).unwrap()).unwrap();
+    assert_eq!(d3_export["outcomes"]["included"], false, "{d3_export}");
+    let d3_readme = fs::read_to_string(d3_dir.join("LEEME.txt")).unwrap();
+    assert!(!d3_readme.contains("approvals.jsonl"));
+    assert!(d3_readme.contains("No muestra si una solicitud retenida fue aprobada"));
+    let d3_verified = run(
+        Command::new(&verify)
+            .args([
+                "journal",
+                "--journal",
+                "journal.jsonl",
+                "--attester-pin",
+                "attester-pin-1.hex",
+                "--expected-head",
+                &head,
+                "--format",
+                "json",
+            ])
+            .current_dir(&d3_dir),
+        "praetore-verify journal (D3 package)",
+    );
+    let d3_verified: serde_json::Value = serde_json::from_slice(&d3_verified.stdout).unwrap();
+    assert_eq!(d3_verified["ok"], true, "{d3_verified}");
+    assert_eq!(export["outcomes"]["included"], true);
+    assert_eq!(export["outcomes"]["omitted_execution_pins"], 0);
+    assert_eq!(export["outcomes"]["omitted_approver_pins"], 0);
+    // The execution pin in the package is the one `praetore init` wrote.
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(
+            &fs::read(pack_dir.join("execution-pin-1.json")).unwrap()
+        )
+        .unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&execution_pin).unwrap()).unwrap()
+    );
+
     // No secret of `praetore init` is in the package.
     let mut everything = Vec::new();
     for name in &names {
@@ -995,5 +1065,6 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
 
     drop(gateway);
     drop(state);
+    drop(d3_state);
     let _ = fs::remove_dir_all(&root);
 }

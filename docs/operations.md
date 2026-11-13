@@ -95,6 +95,14 @@ Legacy baseline adoption (`praetore-gateway-demo migrate` with
 variable.
 
 Execution receipts carry the key id `execution-attester-<public key hex>`.
+The compliance package of `praetore-console` and `praetore-verify outcomes`
+take this key as a JSON pin `{"schema_version":1,"key_id":"execution-attester-<public key hex>","public_key_hex":"<public key hex>"}`:
+record the public key when the key is generated and write the pin from it.
+The key id in each signed attestation names the public key it claims, so a
+pin taken from there shows consistency with that key, not that it is this
+gateway's. For `praetore run`, `praetore init` writes `execution-pin.json`
+(key id `local-demo-<public key hex>`); `praetore execution-pin <directory>`
+writes it for a directory initialized before.
 Generate each key with a CSPRNG, for example
 `umask 077 && openssl rand -hex 32 > evidence-attester.key`, and deliver the
 files through the secret manager of the gateway workload.
@@ -1120,7 +1128,12 @@ request; the records of one request must agree (a dispatched held request was
 approved, `approval_rejected` has a reject decision). The command reports
 `counts`, `held` (every held request of the journal with its `outcome`) and
 `held_by_outcome`. The records are not chained: a removed record leaves no
-trace, so the output does not show that the file is complete. Pin only the
+trace, so the output does not show that the file is complete; an approved
+or executed request can show as `pending`, `approved_pending_dispatch` or
+`not_dispatched`. The order of the lines is not verified: the outcomes do
+not depend on it. A pin that verified no record does not fail the command:
+it is reported in `unused_execution_pins` or `unused_approver_pins`. The
+file may hold at most 32 MiB and 20,480 lines (`OUTCOMES_TOO_LARGE`). Pin only the
 journal tenant's approvers: the gateway ties each approver to a tenant, the
 pin format does not. An execution receipt written before migration 0023,
 whose output digest the database did not check, fails if it does not match
