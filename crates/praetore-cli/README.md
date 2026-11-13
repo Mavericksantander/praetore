@@ -118,6 +118,30 @@ exports one source's chain (or `--source _unattributed`) after verifying it,
 never overwriting, and verifies it offline. Format:
 [docs/proposals/safety-ingestion-jsonl.md](../../docs/proposals/safety-ingestion-jsonl.md).
 
+### Tenant journal in ranges
+
+`praetore journal-export --tenant` exports a whole chain of at most 4096
+entries and 8 MiB. For a longer one, export ranges: `--from-seq 0 [--limit
+N]` writes the first and prints `next_from_seq`; each later range starts
+with its anchor (the receipt just before it) and is verified with
+`praetore-verify journal --range --expected-anchor <head of the previous
+range>`. Ranges carry receipts only, with no database reference, and
+`--from-seq` counts receipts. In a database without storage records the
+last range's head is the head of the whole-chain export; in a database with
+storage records the whole-chain export opens with a `database_head` line at
+`seq` 0, so the same receipt has another `seq` there and the two heads are
+not interchangeable. A range never overwrites a file. See
+[docs/operations.md](../../docs/operations.md#tenant-journal-in-ranges).
+
+```sh
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq 0 --limit 3000 --output part-0.jsonl
+praetore journal-export --tenant <uuid> --attester-pin attester-public-key.hex \
+  --from-seq <next_from_seq> --limit 3000 --output part-1.jsonl
+praetore-verify journal --journal part-1.jsonl --attester-pin attester-public-key.hex \
+  --range --expected-anchor <head of part-0>
+```
+
 ### Human approval
 
 `init` also creates a local human approver key (`approver.key`, owner-only)

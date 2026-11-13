@@ -934,3 +934,238 @@ fn mission(action: praetore_core::Action) -> praetore_core::MissionAction {
         .into_mission()
         .expect("mission action")
 }
+
+impl Fixture {
+    /// Two ranges cut at seq 2: the first from genesis, the second with the
+    /// receipt at seq 1 as its anchor.
+    fn ranges(&self) -> (String, ChainHead, String) {
+        use praetore_core::journal_chain::{ChainLink, receipt_link};
+        let key = [attester().public_key().unwrap()];
+        let (first, first_head) = chain(&self.receipts[..2]);
+        let prev = receipt_link(0, &ChainLink::GENESIS, &self.receipts[0]).unwrap();
+        let mut second = ChainExporter::resume_after(&key, 1, prev, &self.receipts[1]).unwrap();
+        for evidence in &self.receipts[2..] {
+            second.push(evidence).unwrap();
+        }
+        (first, first_head, second.finish().unwrap().0)
+    }
+
+    fn verify_range(&self, text: &str, extra: &[&str]) -> Output {
+        let path = self.dir.write("range.jsonl", text);
+        let mut args = vec![
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &self.pin,
+            "--range",
+        ];
+        args.extend_from_slice(extra);
+        args.extend(["--format", "json"]);
+        Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+            .args(&args)
+            .output()
+            .unwrap()
+    }
+}
+
+#[test]
+fn two_ranges_verify_chained_with_expected_anchor() {
+    let fx = Fixture::new();
+    let (first, first_head, second) = fx.ranges();
+    let anchor = first_head.head.to_hex();
+    let whole = fx.expected();
+    let output = fx.verify_range(
+        &second,
+        &["--expected-anchor", &anchor, "--expected-head", &whole],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["details"]["entries"], 2);
+    assert_eq!(summary["details"]["range_start"], 2);
+    assert_eq!(summary["details"]["anchor"], anchor);
+    assert_eq!(summary["details"]["head"], whole);
+    assert_eq!(summary["details"]["expected_anchor_verified"], true);
+    // The first range is a plain chain.
+    let output = fx.verify(&first, Some(&anchor));
+    assert!(output.status.success());
+    // Without --expected-anchor the range verifies, with a warning.
+    let output = fx.verify_range(&second, &[]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("anchor_not_checked"));
+}
+
+#[test]
+fn a_range_with_a_wrong_anchor_or_truncated_fails() {
+    let fx = Fixture::new();
+    let (first, first_head, second) = fx.ranges();
+    // Chained to another head: the whole chain's, not the first range's.
+    assert_rejected(
+        &fx.verify_range(&second, &["--expected-anchor", &fx.expected()]),
+        "JOURNAL_HEAD_MISMATCH",
+    );
+    // Truncated: its last receipt dropped, checked against its head.
+    let mut lines: Vec<String> = second.lines().map(str::to_owned).collect();
+    lines.pop();
+    assert_rejected(
+        &fx.verify_range(
+            &join(&lines),
+            &[
+                "--expected-anchor",
+                &first_head.head.to_hex(),
+                "--expected-head",
+                &fx.expected(),
+            ],
+        ),
+        "JOURNAL_HEAD_MISMATCH",
+    );
+    // A whole chain is not a range: its first line is not an anchor to it.
+    assert_rejected(
+        &fx.verify_range(&first, &["--expected-anchor", &first_head.head.to_hex()]),
+        "JOURNAL_HEAD_MISMATCH",
+    );
+    // --expected-anchor needs --range; a range has no database reference.
+    let path = fx.dir.write("range.jsonl", &second);
+    for args in [
+        vec![
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &fx.pin,
+            "--expected-anchor",
+            "00",
+        ],
+        vec![
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &fx.pin,
+            "--range",
+            "--expected-database-head",
+            "00",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_ne!(output.status.code(), Some(0));
+    }
+}
+
+/// The anchor's signature is checked: a valid range behind an anchor whose
+/// attester signature was changed fails, with and without --expected-anchor.
+#[test]
+fn a_range_whose_anchor_signature_is_invalid_fails() {
+    use praetore_core::journal_chain::verify_journal_range;
+    let fx = Fixture::new();
+    let (_, first_head, second) = fx.ranges();
+    let key = [attester().public_key().unwrap()];
+    // The same range with its anchor intact verifies.
+    verify_journal_range(&second, &key, None, Some(&first_head.head), None).unwrap();
+    let (anchor, rest) = second.split_once('\n').unwrap();
+    let mut entry: Value = serde_json::from_str(anchor).unwrap();
+    let signature = entry["evidence"]["attester_signature"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let flipped = if signature.ends_with('0') { "1" } else { "0" };
+    entry["evidence"]["attester_signature"] =
+        Value::String(format!("{}{flipped}", &signature[..signature.len() - 1]));
+    let forged = format!("{entry}\n{rest}");
+    for expected in [None, Some(&first_head.head)] {
+        let error = verify_journal_range(&forged, &key, None, expected, None).unwrap_err();
+        assert!(
+            !matches!(
+                error,
+                praetore_core::journal_chain::ChainError::AnchorMismatch { .. }
+            ),
+            "the signature must fail before the link is compared: {error}"
+        );
+    }
+    let output = fx.verify_range(&forged, &[]);
+    assert_ne!(output.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["ok"],
+        false
+    );
+}
+
+/// The anchor sets the range's tenant: receipts of tenant A behind an
+/// anchor of tenant B, linked correctly, fail with TenantMismatch at the
+/// first receipt of the range (seq 2).
+#[test]
+fn a_range_whose_anchor_is_of_another_tenant_fails() {
+    use praetore_core::journal_chain::{ChainError, ChainLink, receipt_link, verify_journal_range};
+    let key = [attester().public_key().unwrap()];
+    let (tenant_a, tenant_b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let anchor = receipt_for_tenant(9, Some(tenant_b));
+    let receipts: Vec<_> = (0..2)
+        .map(|index| receipt_for_tenant(index, Some(tenant_a)))
+        .collect();
+    let mut prev = ChainLink::GENESIS;
+    let mut text = String::new();
+    let entries = std::iter::once((1u64, &anchor)).chain((2u64..).zip(&receipts));
+    for (seq, evidence) in entries {
+        let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        text.push_str(
+            &json!({ "seq": seq, "prev": prev.to_hex(), "evidence": evidence_json }).to_string(),
+        );
+        text.push('\n');
+        prev = receipt_link(seq, &prev, evidence).unwrap();
+    }
+    let error = verify_journal_range(&text, &key, None, None, None).unwrap_err();
+    assert!(
+        matches!(error, ChainError::TenantMismatch { line: 2 }),
+        "{error}"
+    );
+    assert_eq!(error.code(), "JOURNAL_TENANT_MISMATCH");
+    // The same receipts behind an anchor of their own tenant verify.
+    let own = receipt_for_tenant(9, Some(tenant_a));
+    let mut prev = ChainLink::GENESIS;
+    let mut text = String::new();
+    let entries = std::iter::once((1u64, &own)).chain((2u64..).zip(&receipts));
+    for (seq, evidence) in entries {
+        let evidence_json: Value = serde_json::from_str(&evidence.to_json().unwrap()).unwrap();
+        text.push_str(
+            &json!({ "seq": seq, "prev": prev.to_hex(), "evidence": evidence_json }).to_string(),
+        );
+        text.push('\n');
+        prev = receipt_link(seq, &prev, evidence).unwrap();
+    }
+    verify_journal_range(&text, &key, None, None, None).unwrap();
+}
+
+/// --expected-anchor without --range is a usage error, even on a file that
+/// verifies as a whole chain.
+#[test]
+fn expected_anchor_without_range_is_a_usage_error() {
+    let fx = Fixture::new();
+    assert!(fx.verify(&fx.text, None).status.success());
+    let path = fx.dir.write("whole.jsonl", &fx.text);
+    let anchor = fx.expected();
+    let output = Command::new(env!("CARGO_BIN_EXE_praetore-verify"))
+        .args([
+            "journal",
+            "--journal",
+            &path,
+            "--attester-pin",
+            &fx.pin,
+            "--expected-anchor",
+            &anchor,
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(output.status.code(), Some(0));
+    let summary: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["ok"], false);
+    assert_eq!(summary["code"], "USAGE");
+}

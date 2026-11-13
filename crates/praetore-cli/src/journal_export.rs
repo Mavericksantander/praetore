@@ -2,6 +2,14 @@
 //! `docs/proposals/journal-chain-jsonl.md`. The chain itself is built by
 //! `praetore_core::journal_chain::ChainExporter`, the same code the verifier
 //! uses, so producer and verifier cannot disagree on the link.
+//!
+//! With `--tenant`, `--from-seq N [--limit M]` exports one range of the
+//! tenant's chain of receipts: for N > 0 the anchor (the receipt at `seq`
+//! N - 1) on the first line, then up to M receipts (default and most
+//! `MAX_CHAIN_ENTRIES`) within `MAX_CHAIN_BYTES`; the output names
+//! `next_from_seq` for the next range. Verify a later range with
+//! `praetore-verify journal --range --expected-anchor <head of the previous
+//! range>`.
 
 #[cfg(test)]
 use praetore_core::Evidence;
@@ -52,6 +60,8 @@ pub struct ExportArgs {
     /// rotation, pin the retired key as well as the current one.
     pub attester_pins: Vec<PathBuf>,
     pub output: PathBuf,
+    /// `Some((from_seq, limit))` for a range of a `--tenant` chain.
+    pub range: Option<(u64, usize)>,
 }
 
 pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
@@ -60,6 +70,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
     let mut attester_pins = Vec::new();
     let mut output = None;
     let mut database = false;
+    let (mut from_seq, mut limit) = (None, None);
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         if flag == "--database" {
@@ -80,6 +91,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
             "--receipts-dir" => &mut receipts_dir,
             "--tenant" => &mut tenant,
             "--output" => &mut output,
+            "--from-seq" => &mut from_seq,
+            "--limit" => &mut limit,
             _ => return Err(format!("unexpected argument: {flag}").into()),
         };
         let value = args.next().ok_or(format!("missing value for {flag}"))?;
@@ -98,10 +111,34 @@ pub fn parse(args: impl Iterator<Item = String>) -> CliResult<ExportArgs> {
     if attester_pins.is_empty() {
         return Err("missing --attester-pin".into());
     }
+    let range = match (from_seq, limit) {
+        (None, None) => None,
+        (None, Some(_)) => return Err("--limit needs --from-seq".into()),
+        (Some(_), _) if !matches!(source, Source::Database { .. }) => {
+            return Err("--from-seq applies to --tenant only".into());
+        }
+        (Some(from), limit) => {
+            let from = from
+                .parse::<u64>()
+                .ok()
+                .filter(|seq| *seq < (1 << 53))
+                .ok_or("--from-seq must be a seq (0 or more)")?;
+            let limit = match limit {
+                None => MAX_CHAIN_ENTRIES,
+                Some(value) => value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| (1..=MAX_CHAIN_ENTRIES).contains(limit))
+                    .ok_or(format!("--limit must be between 1 and {MAX_CHAIN_ENTRIES}"))?,
+            };
+            Some((from, limit))
+        }
+    };
     Ok(ExportArgs {
         source,
         attester_pins,
         output: output.ok_or("missing --output")?.into(),
+        range,
     })
 }
 
@@ -126,6 +163,32 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
         std::env::var("PRAETORE_GATEWAY_DATABASE_URL")
             .map_err(|_| "PRAETORE_GATEWAY_DATABASE_URL must point to local PostgreSQL")
     };
+    if let (Source::Database { tenant_id }, Some((from_seq, limit))) = (&args.source, args.range) {
+        let mut client = connect_for_tenant_export(&url()?)?;
+        let range = lift(shared::export_tenant_range(
+            &mut client,
+            *tenant_id,
+            attester,
+            from_seq,
+            limit,
+        ))?;
+        write_new(&args.output, &range.text)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "command": "journal-export",
+                "kind": "tenant",
+                "range_start": range.range_start,
+                "entries": range.head.entries.get() - range.range_start,
+                "head": range.head.head.to_hex(),
+                "anchor": range.anchor.map(|anchor| anchor.to_hex()),
+                "next_from_seq": range.next_from_seq,
+                "database_head": serde_json::Value::Null,
+            })
+        );
+        return Ok(());
+    }
     let (text, head, kind, database_head) = match &args.source {
         Source::ReceiptsDir(dir) => {
             let (text, head) = export(&read_receipts_dir(dir)?, attester)?;
@@ -133,7 +196,18 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
         }
         Source::Database { tenant_id } => {
             let mut client = connect_for_tenant_export(&url()?)?;
-            let export = lift(shared::export_tenant(&mut client, *tenant_id, attester))?;
+            let export = lift(shared::export_tenant(&mut client, *tenant_id, attester)).map_err(
+                |error| {
+                    let text = error.to_string();
+                    if text.contains("too many journal rows")
+                        || text.contains("exceeds the size or entry limit")
+                    {
+                        format!("{text}: export it in ranges with --from-seq 0 [--limit N]").into()
+                    } else {
+                        error
+                    }
+                },
+            )?;
             (export.text, export.head, "tenant", export.database_head)
         }
         Source::StorageRecords => {
@@ -145,14 +219,7 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             (text, head, "database", None)
         }
     };
-    // Never overwrite: an existing file may be an anchored export.
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&args.output)
-        .map_err(|error| format!("cannot create {}: {error}", args.output.display()))?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()?;
+    write_new(&args.output, &text)?;
     println!(
         "{}",
         serde_json::json!({
@@ -167,6 +234,18 @@ pub fn run(args: ExportArgs) -> CliResult<()> {
             })),
         })
     );
+    Ok(())
+}
+
+/// Never overwrite: an existing file may be an anchored export.
+fn write_new(path: &Path, text: &str) -> CliResult<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("cannot create {}: {error}", path.display()))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -300,6 +379,50 @@ mod tests {
     }
 
     #[test]
+    fn a_range_needs_a_tenant_and_a_valid_from_seq_and_limit() {
+        let tenant = "00000000-0000-0000-0000-000000000001";
+        let with = |extra: &[&str]| {
+            let mut all = vec!["--tenant", tenant, "--attester-pin", "p", "--output", "o"];
+            all.extend_from_slice(extra);
+            args(&all)
+        };
+        assert_eq!(with(&[]).unwrap().range, None);
+        assert_eq!(
+            with(&["--from-seq", "0"]).unwrap().range,
+            Some((0, MAX_CHAIN_ENTRIES))
+        );
+        assert_eq!(
+            with(&["--from-seq", "4096", "--limit", "10"])
+                .unwrap()
+                .range,
+            Some((4096, 10))
+        );
+        for bad in [
+            &["--limit", "10"][..],
+            &["--from-seq", "-1"],
+            &["--from-seq", "x"],
+            &["--from-seq", "0", "--limit", "0"],
+            &["--from-seq", "0", "--limit", "4097"],
+            &["--from-seq", "0", "--from-seq", "1"],
+        ] {
+            assert!(with(bad).is_err(), "{bad:?}");
+        }
+        // Ranges are for tenant chains only.
+        assert!(
+            args(&[
+                "--database",
+                "--attester-pin",
+                "p",
+                "--output",
+                "o",
+                "--from-seq",
+                "0"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn exactly_one_source_is_required() {
         assert!(args(&["--attester-pin", "p", "--output", "o"]).is_err());
         assert!(
@@ -343,6 +466,7 @@ mod tests {
                 source: Source::ReceiptsDir("d".into()),
                 attester_pins: vec!["p".into()],
                 output: "o".into(),
+                range: None,
             }
         );
         // Repeated pins (a chain across an attester key rotation).

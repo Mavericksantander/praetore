@@ -400,6 +400,7 @@ fn print_usage() {
            praetore reject <directory> <request_id> --approver <id> [--agent <agent_id>] [--yes]\n\
            praetore dispatch <directory> <request_id> [--agent <agent_id>]\n\
            praetore journal-export (--receipts-dir <dir> | --tenant <uuid> | --database) --attester-pin <hex file> [--attester-pin <hex file> ...] --output <new file>\n\
+           praetore journal-export --tenant <uuid> --attester-pin <hex file> [--attester-pin <hex file> ...] --from-seq <n> [--limit <m>] --output <new file>\n\
            praetore journal-export --safety --tenant <uuid> --source <id> --ingest-pin <hex file> [--ingest-pin <hex file> ...] [--source-pins <jsonl>] [--from-seq <n> [--limit <m>]] --output <new file>\n\
              (one safety chain of praetore-safety-ingest; reads PRAETORE_SAFETY_DATABASE_URL)\n\
            praetore policy classify --policy <path>   (proposes action_classes; never writes)\n\

@@ -433,6 +433,7 @@ jobs:
             "--test journal_export_postgres postgres_cli_journal_export_tenant_end_to_end" \
             "--test journal_export_postgres postgres_cli_journal_export_after_attester_key_rotation" \
             "--test journal_export_postgres postgres_cli_run_reports_a_port_in_use" \
+            "--test journal_export_postgres postgres_cli_journal_export_tenant_ranges_of_10000_receipts" \
             "--bin praetore journal_export::tests::postgres_database_export_and_tenant_reference" \
             "--bin praetore tests::postgres_find_pending_agent_ignores_hostile_search_path"; do
             read -r flag target name <<<"$test"
