@@ -420,9 +420,16 @@
   order, so existing exports and anchored heads are unchanged, byte for
   byte; rows already out of commit order keep that order. `chain_seq` is
   immutable, and an export fails, naming the expected and found position,
-  when a tenant's positions are not contiguous from 0. Writers of one
-  tenant now wait for each other until COMMIT; writers of different
-  tenants do not. `JOURNAL_QUERY` returns `chain_seq` as a second column
+  when a tenant's positions are not contiguous from 0 (a gap or a jump).
+  Deleting a tenant's newest rows, or all of them, leaves the positions
+  contiguous and is not detected, and neither is a consistent renumbering
+  by whoever can write to the database; only a head anchored outside the
+  operator's control shows those changes. Writers of one tenant now wait
+  for each other until COMMIT; writers of different tenants do not. The
+  gateway writes the journal row in a READ COMMITTED transaction whatever
+  the database's default isolation. Applying 0024 holds ACCESS EXCLUSIVE
+  on `praetore.execution_journal` until it commits: apply it with the
+  gateways stopped or in a maintenance window. `JOURNAL_QUERY` returns `chain_seq` as a second column
   (new: `journal_export::check_position`, `receipts_in_chain_order`). The
   JSONL format is unchanged. Manual rollback:
   `docs/rollback/0024-journal-commit-order-position.sql`.

@@ -10805,6 +10805,33 @@ mod journal_position {
         config
     }
 
+    /// Brings an empty database to 0023, recorded by the runner as if it
+    /// had applied it, so that `apply_migrations` applies only 0024.
+    fn at_0023(admin: &mut Client) {
+        let end = praetore_replay_postgres::MIGRATIONS
+            .iter()
+            .position(|(version, _)| *version == "0024_journal_commit_order_position")
+            .expect("0024 is registered");
+        admin
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS praetore; \
+                 CREATE TABLE praetore.schema_migrations (\
+                     version TEXT PRIMARY KEY, \
+                     checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
+                     applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
+            )
+            .unwrap();
+        apply_legacy_migrations_through(admin, end);
+        for (version, sql) in &praetore_replay_postgres::MIGRATIONS[..end] {
+            admin
+                .execute(
+                    "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
+                    &[version, &migration_checksum(sql)],
+                )
+                .unwrap();
+        }
+    }
+
     fn migrated() -> ScratchDatabase {
         let scratch = ScratchDatabase::create();
         praetore_replay_postgres::apply_migrations(&mut scratch.connect()).unwrap();
@@ -11206,29 +11233,7 @@ mod journal_position {
     fn postgres_journal_position_backfill_keeps_every_export() {
         let scratch = ScratchDatabase::create();
         let mut admin = scratch.connect();
-        let end = praetore_replay_postgres::MIGRATIONS
-            .iter()
-            .position(|(version, _)| *version == "0024_journal_commit_order_position")
-            .expect("0024 is registered");
-        // A database at 0023, recorded by the runner.
-        admin
-            .batch_execute(
-                "CREATE SCHEMA IF NOT EXISTS praetore; \
-                 CREATE TABLE praetore.schema_migrations (\
-                     version TEXT PRIMARY KEY, \
-                     checksum CHAR(64) NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'), \
-                     applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp())",
-            )
-            .unwrap();
-        apply_legacy_migrations_through(&mut admin, end);
-        for (version, sql) in &praetore_replay_postgres::MIGRATIONS[..end] {
-            admin
-                .execute(
-                    "INSERT INTO praetore.schema_migrations (version, checksum) VALUES ($1, $2)",
-                    &[version, &migration_checksum(sql)],
-                )
-                .unwrap();
-        }
+        at_0023(&mut admin);
 
         // Rows inserted out of order, with explicit created_at: ties of
         // created_at, and of created_at and request_id with two agents.
@@ -11462,5 +11467,222 @@ mod journal_position {
         assert_eq!(objects(&mut admin), 4);
         let after = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
         assert_eq!(after.text, before.text);
+    }
+
+    /// Row level security, SECURITY DEFINER and privileges of 0024 as the
+    /// catalog records them after the runner migrates.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_catalog_after_migration() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        for table in ["praetore.journal_positions", "praetore.execution_journal"] {
+            let row = admin
+                .query_one(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_catalog.pg_class \
+                     WHERE oid = pg_catalog.to_regclass($1::text)",
+                    &[&table],
+                )
+                .unwrap();
+            assert!(row.get::<_, bool>(0), "{table}: row level security enabled");
+            assert!(row.get::<_, bool>(1), "{table}: row level security forced");
+        }
+        let row = admin
+            .query_one(
+                "SELECT p.prosecdef, p.proconfig, \
+                        pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE'), \
+                        pg_catalog.has_function_privilege('praetore_runtime', p.oid, 'EXECUTE') \
+                 FROM pg_catalog.pg_proc p \
+                 WHERE p.oid = 'praetore.assign_execution_journal_position_v1()'::regprocedure",
+                &[],
+            )
+            .unwrap();
+        assert!(row.get::<_, bool>(0), "the assignment is SECURITY DEFINER");
+        assert_eq!(
+            row.get::<_, Option<Vec<String>>>(1),
+            Some(vec!["search_path=pg_catalog, praetore, pg_temp".to_owned()]),
+            "the assignment pins its search_path"
+        );
+        assert!(
+            !row.get::<_, bool>(2),
+            "PUBLIC cannot execute the assignment"
+        );
+        assert!(
+            !row.get::<_, bool>(3),
+            "praetore_runtime cannot execute the assignment"
+        );
+    }
+
+    /// 0024 applied by a schema owner that is neither superuser nor
+    /// BYPASSRLS, as on a managed database: the backfill sees every row of
+    /// the journal despite FORCE ROW LEVEL SECURITY, numbers them in the
+    /// former order, FORCE is back afterwards, and a runtime login gets the
+    /// next position.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_applies_as_an_owner_without_superuser() {
+        let scratch = ScratchDatabase::create();
+        let mut admin = scratch.connect();
+        at_0023(&mut admin);
+        let t = |micros: u32| format!("2026-01-01T00:00:00.{micros:06}Z");
+        let rows: Vec<(Uuid, String, Evidence)> = [
+            (TENANT_A, 5),
+            (TENANT_A, 1),
+            (TENANT_B, 3),
+            (TENANT_A, 3),
+            (TENANT_B, 2),
+        ]
+        .into_iter()
+        .map(|(tenant, micros)| (tenant, t(micros), receipt(tenant, None, None)))
+        .collect();
+        {
+            let mut transaction = admin.transaction().unwrap();
+            for (tenant, created_at, evidence) in &rows {
+                insert(&mut transaction, *tenant, evidence, Some(created_at)).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
+        let owner_role = TestRole::create("LOGIN NOSUPERUSER NOBYPASSRLS");
+        admin
+            .batch_execute(&format!(
+                "{} GRANT CREATE ON DATABASE {} TO {};",
+                transfer_praetore_ownership(&owner_role.name),
+                scratch.name,
+                owner_role.name
+            ))
+            .unwrap();
+        let mut owner = connect_scratch_as(&scratch, &owner_role.name);
+        let applied = praetore_replay_postgres::apply_migrations(&mut owner)
+            .expect("0024 applies as an owner without superuser or BYPASSRLS");
+        assert_eq!(applied, ["0024_journal_commit_order_position"]);
+        drop(owner);
+
+        // The former order: created_at within each tenant.
+        for (index, expected) in [(1, 0), (3, 1), (0, 2), (4, 0), (2, 1)] {
+            assert_eq!(
+                position(&mut admin, rows[index].2.request_id),
+                expected,
+                "row {index}"
+            );
+        }
+        for table in ["praetore.journal_positions", "praetore.execution_journal"] {
+            let forced: bool = admin
+                .query_one(
+                    "SELECT relforcerowsecurity FROM pg_catalog.pg_class \
+                     WHERE oid = pg_catalog.to_regclass($1::text)",
+                    &[&table],
+                )
+                .unwrap()
+                .get(0);
+            assert!(forced, "{table}: FORCE ROW LEVEL SECURITY after 0024");
+        }
+
+        let runtime = TestRole::create("LOGIN NOBYPASSRLS");
+        admin
+            .batch_execute(&format!("GRANT praetore_runtime TO {}", runtime.name))
+            .unwrap();
+        let mut client = connect_scratch_as(&scratch, &runtime.name);
+        assert_eq!(
+            insert_committed(&mut client, TENANT_A, &receipt(TENANT_A, None, None)),
+            3
+        );
+        assert_eq!(
+            insert_committed(&mut client, TENANT_B, &receipt(TENANT_B, None, None)),
+            2
+        );
+    }
+
+    /// With the database's default isolation at REPEATABLE READ, two
+    /// gateway writes of one tenant that wait for its position row both
+    /// commit, through `commit_authorization`, with consecutive positions.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_writers_wait_under_a_repeatable_read_default() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        admin
+            .batch_execute(&format!(
+                "ALTER DATABASE {} SET default_transaction_isolation = 'repeatable read'",
+                scratch.name
+            ))
+            .unwrap();
+        let mut first = config(&scratch).connect(NoTls).unwrap();
+        let isolation: String = first
+            .query_one("SHOW default_transaction_isolation", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(isolation, "repeatable read");
+        assert_eq!(
+            insert_committed(
+                &mut first,
+                TEST_TENANT_ID,
+                &receipt(TEST_TENANT_ID, None, None)
+            ),
+            0
+        );
+        // Another writer of the tenant holds its position row.
+        let mut holder = config(&scratch).connect(NoTls).unwrap();
+        let mut held = holder.transaction().unwrap();
+        insert(
+            &mut held,
+            TEST_TENANT_ID,
+            &receipt(TEST_TENANT_ID, None, None),
+            None,
+        )
+        .unwrap();
+
+        let writers: Vec<_> = [Uuid::new_v4(), Uuid::new_v4()]
+            .into_iter()
+            .map(|request_id| {
+                let fixture = create_postgres_gateway(request_id);
+                let (engine, request) = (fixture.engine.clone(), fixture.request.clone());
+                let journal = scratch_journal(&scratch);
+                thread::spawn(move || {
+                    engine
+                        .evaluate_with_atomic_commit(request, &journal)
+                        .map(|evidence| evidence.request_id)
+                        .map_err(|error| format!("{error:?}"))
+                })
+            })
+            .collect();
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            let waiting: i64 = admin
+                .query_one(
+                    "SELECT count(*) FROM pg_catalog.pg_stat_activity \
+                     WHERE datname = pg_catalog.current_database() \
+                       AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            if waiting == 2 {
+                break;
+            }
+            assert!(
+                writers.iter().all(|writer| !writer.is_finished()),
+                "a writer finished before the position row was released"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the writers did not both wait within 30 s"
+            );
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        held.commit().unwrap();
+
+        let mut positions: Vec<i64> = writers
+            .into_iter()
+            .map(|writer| {
+                let request_id = writer
+                    .join()
+                    .unwrap()
+                    .expect("a writer that waited for the position row commits");
+                position(&mut admin, request_id)
+            })
+            .collect();
+        positions.sort_unstable();
+        assert_eq!(positions, [2, 3]);
     }
 }

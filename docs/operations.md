@@ -1154,18 +1154,35 @@ this is resolved, and exporting only settled history is no longer needed.
 - `chain_seq` is immutable: the runtime role cannot update it, a value that
   an INSERT sends is replaced by the trigger, and an UPDATE by the schema
   owner fails. An export fails, naming the expected and the found
-  position, when the positions of a tenant do not run from 0 without a gap
-  (a row deleted, or a position written by hand).
+  position, when the positions of a tenant do not run from 0 without a gap:
+  a row deleted from the middle of the chain, or a position written by
+  hand that jumps. The check sees only gaps and jumps. Deleting the newest
+  rows of a tenant, or all of them, leaves the remaining positions
+  contiguous and is not detected, and neither is a consistent renumbering
+  by whoever can write to the database.
 - This does not make the journal tamper-proof: whoever can write to the
   database (the schema owner, a superuser) can still rewrite rows and
   positions consistently. Only a head anchored outside the operator's
-  control shows such a change.
+  control shows such a change, or the loss of the newest rows.
 - Writers of one tenant wait for each other from the journal INSERT to the
   COMMIT; writers of different tenants do not. The journal INSERT is the
   last statement before that COMMIT.
+- The gateway writes the journal row in a READ COMMITTED transaction,
+  whatever `default_transaction_isolation` the database sets: under
+  REPEATABLE READ or SERIALIZABLE, a writer that waited for another writer
+  of its tenant would fail with a serialization error when the other
+  commits.
+- Applying 0024 holds ACCESS EXCLUSIVE on `praetore.execution_journal`
+  until the migration commits: every reader and writer of the journal
+  waits, and the time grows with the number of rows. Apply it with every
+  gateway stopped, or in a maintenance window. In one run on an Apple M1
+  (8 GB, PostgreSQL 16.15), the migration's SQL took 409 ms on 10,000 rows
+  of 10 tenants, and the whole runner, with its schema checks, 548 ms;
+  that is one measurement, not a capacity figure.
 - Manual rollback: `docs/rollback/0024-journal-commit-order-position.sql`.
-  It drops the column and the table, so exports order rows by `created_at`
-  again.
+  It also takes ACCESS EXCLUSIVE on the journal (with a `lock_timeout` of
+  5 s), so run it with every gateway stopped too. It drops the column and
+  the table, so exports order rows by `created_at` again.
 
 Planned, when evidence sets 04 and 05 are re-recorded with HighAssurance
 receipts (required before 2027-01-29, when their authorities and issuer pins
