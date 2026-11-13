@@ -408,6 +408,24 @@
 
 ### Changed
 
+- **A tenant's journal chain follows the commit order (migration 0024).**
+  Every journal row takes its tenant's next position,
+  `execution_journal.chain_seq`, in the transaction that writes it (table
+  `praetore.journal_positions`, BEFORE INSERT trigger, row lock held until
+  COMMIT). `praetore journal-export --tenant`, its ranges, the console's
+  compliance package and its approval records are ordered by `chain_seq`
+  instead of `created_at`, so a transaction that commits late, or a step
+  back of the database clock, no longer moves a row in front of receipts
+  already exported. Rows written before 0024 are numbered in the former
+  order, so existing exports and anchored heads are unchanged, byte for
+  byte; rows already out of commit order keep that order. `chain_seq` is
+  immutable, and an export fails, naming the expected and found position,
+  when a tenant's positions are not contiguous from 0. Writers of one
+  tenant now wait for each other until COMMIT; writers of different
+  tenants do not. `JOURNAL_QUERY` returns `chain_seq` as a second column
+  (new: `journal_export::check_position`, `receipts_in_chain_order`). The
+  JSONL format is unchanged. Manual rollback:
+  `docs/rollback/0024-journal-commit-order-position.sql`.
 - **`praetore-console` checks journal evidence against the attester pins
   and the local policy before it offers a decision.** The approvals inbox
   now requires `PRAETORE_CONSOLE_POLICY_FILE` and

@@ -722,8 +722,9 @@ fn postgres_cli_run_reports_a_port_in_use() {
 /// at most 8 MiB, and `next_from_seq` right after their last receipt. The
 /// later ranges use `--limit 2000`. Every range verifies chained with
 /// `--range --expected-anchor`, and the last head is the link of every
-/// receipt in `(created_at, request_id, agent_id)` order, so ties are broken
-/// the same way in every range. Prints the size of each table of the schema
+/// receipt in insert order: each row takes its tenant's next position
+/// (`chain_seq`, migration 0024) when it is written, so receipts that share a
+/// `created_at` keep that order in every range. Prints the size of each table of the schema
 /// and the bytes per action (run with `--nocapture`).
 #[test]
 #[ignore = "requires PRAETORE_TEST_DATABASE_URL and a built praetore-verify"]
@@ -893,10 +894,8 @@ fn postgres_cli_journal_export_tenant_ranges_of_10000_receipts() {
     );
     assert!(!whole.exists());
 
-    // The expected head: every receipt linked in the journal's order.
-    rows.sort_by(|left, right| {
-        (left.0, left.1.request_id, agent_id).cmp(&(right.0, right.1.request_id, agent_id))
-    });
+    // The expected head: every receipt linked in insert order (the order of
+    // `rows`), not sorted by created_at and request_id as before 0024.
     let mut expected = ChainLink::GENESIS;
     for (seq, (_, evidence)) in rows.iter().enumerate() {
         expected = receipt_link(seq as u64, &expected, evidence).unwrap();
