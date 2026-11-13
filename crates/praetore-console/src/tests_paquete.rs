@@ -514,10 +514,15 @@ async fn a_missing_piece_gives_a_plain_error_and_no_package() {
                 .is_none()
         );
         let message: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
-        let message = message["mensaje"].as_str().unwrap();
-        assert_eq!(message, expected.message());
-        assert!(message.contains("No se generó ningún paquete"));
-        assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
+        let message = &message["mensaje"];
+        assert_eq!(
+            message,
+            &serde_json::to_value(expected.api_message()).unwrap()
+        );
+        // The page words the code; in Spanish, as before.
+        let words = crate::tests_i18n::es_json_message(message);
+        assert!(words.contains("No se generó ningún paquete"));
+        assert!(!words.chars().any(|c| c.is_ascii_digit()), "{words}");
     }
 
     let setup = Setup::new("missing");
@@ -675,6 +680,10 @@ async fn without_configuration_the_console_says_so() {
     let message: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
     assert_eq!(
         message["mensaje"],
+        serde_json::json!({"codigo": "pack_off"})
+    );
+    assert_eq!(
+        crate::tests_i18n::es_json_message(&message["mensaje"]),
         "El paquete de compliance no está configurado en esta consola."
     );
 }
@@ -700,13 +709,44 @@ fn the_page_offers_the_download_in_words_without_ids() {
     ] {
         assert!(section.contains(needed), "{needed}");
     }
-    let words = section.split("<p class=\"aviso\">").nth(1).unwrap();
+    let words = section
+        .split("<p class=\"aviso\" data-i18n=\"pack.notice\">")
+        .nth(1)
+        .unwrap();
+    let shown = words.split("</p>").next().unwrap().to_owned();
     // No ids, hex or numbers; "SHA-256" is the name of the digest.
     let words = words.replace("SHA-256", "");
     assert!(!words.chars().any(|c| c.is_ascii_digit()), "{words}");
     let script = include_str!("../ui/app.js");
     assert!(script.contains("\"/api/paquete\""));
     assert!(script.contains("\"x-praetore-consola\": \"1\""));
+    // The same notice in every language: what the package holds, that it
+    // may hold sensitive output and no private keys, and no numbers.
+    for (language, words) in [
+        ("es", crate::tests_i18n::es("pack.notice")),
+        ("en", catalog_text("en", "pack.notice")),
+        ("pt", catalog_text("pt", "pack.notice")),
+    ] {
+        for needed in ["approvals.jsonl", "LEEME.txt", "praetore-verify", ".tar.gz"] {
+            assert!(words.contains(needed), "{language}: {needed}");
+        }
+        let words = words.replace("SHA-256", "");
+        assert!(
+            !words.chars().any(|c| c.is_ascii_digit()),
+            "{language}: {words}"
+        );
+    }
+    assert_eq!(crate::tests_i18n::es("pack.notice"), shown);
+}
+
+fn catalog_text(language: &str, key: &str) -> String {
+    let catalog = crate::CATALOGS
+        .iter()
+        .find(|(code, _)| *code == language)
+        .unwrap()
+        .1;
+    let catalog: serde_json::Value = serde_json::from_str(catalog).unwrap();
+    catalog[key].as_str().unwrap().to_owned()
 }
 
 #[test]
@@ -862,15 +902,19 @@ async fn the_second_pin_unused_is_named_in_words() {
             .is_none()
     );
     let message: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
-    let message = message["mensaje"].as_str().unwrap();
+    // The place goes as a number, from 1; the page words it.
+    assert_eq!(
+        message["mensaje"],
+        serde_json::json!({"codigo": "pack_attester_pin_unused", "posicion": 2})
+    );
+    let message = crate::tests_i18n::es_json_message(&message["mensaje"]);
     assert!(
-        message.starts_with("La segunda clave configurada como clave pública del atestador"),
+        message.starts_with("La clave n.º 2 configurada como clave pública del atestador"),
         "{message}"
     );
     assert!(message.contains("PRAETORE_CONSOLE_ATTESTER_PIN_FILES"));
     assert!(message.contains("No se generó ningún paquete"));
     assert!(!message.contains("Puede haber más"));
-    assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
 
     // First and third unused: the first is named, and the page says there
     // may be more.
@@ -896,30 +940,31 @@ async fn the_second_pin_unused_is_named_in_words() {
             more: true
         }
     );
-    let message = error.message();
-    assert!(message.starts_with("La primera clave"), "{message}");
-    assert!(message.contains("Puede haber más claves"));
-    assert!(!message.chars().any(|c| c.is_ascii_digit()));
+    // The page gets the pin's place, from 1, and words it.
+    let message = error.api_message();
+    assert_eq!(
+        message,
+        ApiMessage::with_position(MessageCode::PackAttesterPinsUnused, 1)
+    );
+    let words = crate::tests_i18n::es_message(&message);
+    assert!(words.starts_with("La clave n.º 1 "), "{words}");
+    assert!(words.contains("Puede haber más claves"));
 }
 
 #[test]
 fn every_pin_position_has_a_word() {
+    // Every place a pin can have is sent as its number from 1, the only
+    // number in the words.
     for index in 0..MAX_ATTESTER_PINS {
-        let message = PackError::PinUnused { index, more: false }.message();
-        assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
-        assert!(!message.contains("última"), "{index}");
+        let message = PackError::PinUnused { index, more: false }.api_message();
+        assert_eq!(message.posicion, Some(u32::try_from(index + 1).unwrap()));
+        let words = crate::tests_i18n::es_message(&message);
+        let digits: String = words.chars().filter(char::is_ascii_digit).collect();
+        assert_eq!(digits, (index + 1).to_string(), "{words}");
     }
-    assert!(
-        !PackError::Journal
-            .message()
-            .chars()
-            .any(|c| c.is_ascii_digit())
-    );
-    assert!(
-        PackError::Journal
-            .message()
-            .contains("el registro es demasiado grande para una exportación")
-    );
+    let journal = crate::tests_i18n::es_message(&PackError::Journal.api_message());
+    assert!(!journal.chars().any(|c| c.is_ascii_digit()));
+    assert!(journal.contains("el registro es demasiado grande para una exportación"));
 }
 
 #[tokio::test]
@@ -941,6 +986,10 @@ async fn one_package_at_a_time() {
     let message: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
     assert_eq!(
         message["mensaje"],
+        serde_json::json!({"codigo": "pack_busy"})
+    );
+    assert_eq!(
+        crate::tests_i18n::es_json_message(&message["mensaje"]),
         "Ya se está armando un paquete. Espera a que termine."
     );
     assert_eq!(store.calls.load(Ordering::SeqCst), 0);
@@ -1721,9 +1770,13 @@ async fn a_d31_failure_shows_a_plain_message_and_no_package() {
     .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let reply: serde_json::Value = serde_json::from_slice(&body(response).await).unwrap();
-    let message = reply.to_string();
+    assert_eq!(
+        reply["mensaje"],
+        serde_json::json!({"codigo": "pack_outcome_key_missing"})
+    );
+    let message = crate::tests_i18n::es_json_message(&reply["mensaje"]);
     assert!(message.contains("está firmado con una clave que no está configurada"));
-    assert!(!message.contains(&HELD_TENANT.to_string()));
+    assert!(!reply.to_string().contains(&HELD_TENANT.to_string()));
 }
 
 #[test]
@@ -1745,7 +1798,7 @@ fn the_d31_messages_carry_no_ids_digits_or_hex() {
         PackError::Outcomes,
         PackError::OutcomesTooLarge,
     ] {
-        let message = error.message();
+        let message = crate::tests_i18n::es_message(&error.api_message());
         assert!(!message.chars().any(|c| c.is_ascii_digit()), "{message}");
         assert!(
             message.ends_with("No se generó ningún paquete."),
@@ -1770,4 +1823,72 @@ fn the_d31_messages_carry_no_ids_digits_or_hex() {
             .with_outcome_pins(Vec::new(), vec!["a".into(); 17])
             .is_err()
     );
+}
+
+/// The page's language never reaches the package: downloaded with the
+/// browser asking for Spanish, English or Portuguese, it holds the same
+/// files with the same bytes (LEEME.txt included); built at a fixed instant
+/// (the archive's mtime), it is the same archive byte for byte. The pack
+/// takes no language to begin with (`signing_recording_and_exporting_do_not_depend_on_the_language`).
+#[tokio::test]
+async fn the_package_is_the_same_bytes_whatever_the_page_language() {
+    let setup = Setup::held("idiomas");
+    let (receipts, outcomes) = held_set();
+    let store = held_store_of(receipts, outcomes);
+    // The package names the second it was built; downloads that straddle a
+    // second are taken again.
+    let built_at = |files: &[(String, Vec<u8>)]| {
+        let leeme = String::from_utf8(file(files, "LEEME.txt").to_vec()).unwrap();
+        leeme
+            .lines()
+            .find(|line| {
+                line.ends_with("(UTC), para el tenant 00000000-0000-0000-0000-0000000000d3.")
+            })
+            .map(str::to_owned)
+    };
+    let mut downloads = Vec::new();
+    for _ in 0..5 {
+        downloads.clear();
+        for language in ["es", "en", "pt-BR,pt;q=0.9", "de-DE"] {
+            let mut request = download();
+            request.headers_mut().insert(
+                header::ACCEPT_LANGUAGE,
+                header::HeaderValue::from_static(language),
+            );
+            let response = app(Some(setup.both_pins()), store.clone(), true)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{language}");
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            assert!(response.headers().get(header::CONTENT_LANGUAGE).is_none());
+            downloads.push(unpack(&body(response).await));
+        }
+        let first = built_at(&downloads[0]);
+        assert!(first.is_some());
+        if downloads.iter().all(|files| built_at(files) == first) {
+            break;
+        }
+    }
+    assert_eq!(downloads[0].len(), 11);
+    for other in &downloads[1..] {
+        assert_eq!(&downloads[0], other);
+    }
+    let leeme = String::from_utf8(file(&downloads[0], "LEEME.txt").to_vec()).unwrap();
+    assert!(leeme.contains("praetore-verify"));
+
+    let fixed = time::macros::datetime!(2026-09-06 04:00:00 UTC);
+    let signer = ApproverSigner::new("approver-1", APPROVER_SECRET).unwrap();
+    let archives: Vec<Vec<u8>> = (0..3)
+        .map(|_| {
+            let pack = CompliancePack::new(setup.both_pins(), store.clone());
+            generate(&pack, Some(&signer), fixed).unwrap()
+        })
+        .collect();
+    assert_eq!(archives[0], archives[1]);
+    assert_eq!(archives[0], archives[2]);
+    let names = |files: &[(String, Vec<u8>)]| -> Vec<String> {
+        files.iter().map(|(name, _)| name.clone()).collect()
+    };
+    assert_eq!(names(&unpack(&archives[0])), names(&downloads[0]));
 }

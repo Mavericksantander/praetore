@@ -18,7 +18,10 @@
 //! key's bytes can decode as a public key, but cannot verify its own
 //! signatures).
 
-use crate::ApproverSigner;
+use crate::{
+    ApproverSigner,
+    codigos::{ApiMessage, MessageCode},
+};
 use praetore_core::{
     VerifiedPublicKey, journal_chain::verify_journal_receipts, policy::RecordedPolicy,
 };
@@ -233,58 +236,42 @@ pub enum PackError {
 }
 
 impl PackError {
-    pub fn message(self) -> std::borrow::Cow<'static, str> {
-        match self {
-            Self::PinUnused { index, more } => format!(
-                "La {} clave configurada como clave pública del atestador (en el orden de PRAETORE_CONSOLE_ATTESTER_PIN_FILES) no verifica ningún registro: sobra o es un archivo equivocado.{} No se generó ningún paquete.",
-                ordinal(index),
-                if more { " Puede haber más claves en la misma situación." } else { "" }
-            )
-            .into(),
-            Self::KeyPins { role } => format!(
-                "No se pudieron leer las claves configuradas en {}: cada archivo debe ser un pin JSON con key_id y public_key_hex, sin repetir clave ni key_id. No se generó ningún paquete.",
-                role.variable()
-            )
-            .into(),
-            Self::KeyPinIsApproverKey { role: PinRole::Execution } => {
-                "Una de las claves configuradas como clave pública de ejecución del gateway es la clave del aprobador. No se generó ningún paquete.".into()
+    /// The code the page words this failure with. `posicion` is the
+    /// unused pin's place (from 1) in `PRAETORE_CONSOLE_ATTESTER_PIN_FILES`.
+    pub fn api_message(self) -> ApiMessage {
+        let code = match self {
+            Self::PinUnused { index, more } => {
+                let posicion = u32::try_from(index + 1).unwrap_or(u32::MAX);
+                let code = if more {
+                    MessageCode::PackAttesterPinsUnused
+                } else {
+                    MessageCode::PackAttesterPinUnused
+                };
+                return ApiMessage::with_position(code, posicion);
             }
-            Self::KeyPinIsApproverKey { role: PinRole::Approver } => {
-                "Una de las claves configuradas como clave pública de aprobador es la clave privada del aprobador de esta consola. No se generó ningún paquete.".into()
-            }
-            other => other.fixed_message().into(),
-        }
-    }
-
-    fn fixed_message(self) -> &'static str {
-        match self {
-            Self::Policy => {
-                "No se pudo leer la política configurada en la consola. No se generó ningún paquete."
-            }
-            Self::Pins => {
-                "No se pudieron leer las claves públicas del atestador configuradas en la consola. No se generó ningún paquete."
-            }
-            Self::PinIsApproverKey => {
-                "Una de las claves configuradas como clave pública del atestador es la clave del aprobador. No se generó ningún paquete."
-            }
-            Self::PinUnused { .. } | Self::KeyPins { .. } | Self::KeyPinIsApproverKey { .. } => {
-                unreachable!("message() words it")
-            }
-            Self::OutcomeKeyMissing => {
-                "Un recibo de aprobación o de ejecución está firmado con una clave que no está configurada: agrégala en PRAETORE_CONSOLE_EXECUTION_PIN_FILES o PRAETORE_CONSOLE_APPROVER_PIN_FILES. No se generó ningún paquete."
-            }
-            Self::Outcomes => {
-                "Un recibo de aprobación, rechazo, vencimiento o ejecución no verifica con las claves configuradas, no corresponde a su solicitud del registro o contradice otro recibo de la misma solicitud. No se generó ningún paquete."
-            }
-            Self::OutcomesTooLarge => {
-                "Los recibos de aprobación y de ejecución son demasiado grandes para un paquete. No se generó ningún paquete."
-            }
-            Self::Busy => "Ya se está armando un paquete. Espera a que termine.",
-            Self::Journal => {
-                "No se pudo exportar el registro firmado: la base no respondió, no hay registros, el registro es demasiado grande para una exportación, o alguna firma no corresponde a las claves del atestador configuradas. No se generó ningún paquete."
-            }
-            Self::Archive => "No se pudo armar el paquete. No se generó ningún paquete.",
-        }
+            Self::Policy => MessageCode::PackPolicy,
+            Self::Pins => MessageCode::PackAttesterPins,
+            Self::PinIsApproverKey => MessageCode::PackAttesterPinIsApproverKey,
+            Self::KeyPins {
+                role: PinRole::Execution,
+            } => MessageCode::PackExecutionPins,
+            Self::KeyPins {
+                role: PinRole::Approver,
+            } => MessageCode::PackApproverPins,
+            Self::KeyPinIsApproverKey {
+                role: PinRole::Execution,
+            } => MessageCode::PackExecutionPinIsApproverKey,
+            Self::KeyPinIsApproverKey {
+                role: PinRole::Approver,
+            } => MessageCode::PackApproverPinIsApproverSecret,
+            Self::OutcomeKeyMissing => MessageCode::PackOutcomeKeyMissing,
+            Self::Outcomes => MessageCode::PackOutcomes,
+            Self::OutcomesTooLarge => MessageCode::PackOutcomesTooLarge,
+            Self::Busy => MessageCode::PackBusy,
+            Self::Journal => MessageCode::PackJournal,
+            Self::Archive => MessageCode::PackArchive,
+        };
+        ApiMessage::new(code)
     }
 
     fn log_name(self) -> &'static str {
@@ -1108,30 +1095,6 @@ fn held_by_outcome(report: &OutcomeReport) -> std::collections::BTreeMap<&'stati
         *counts.entry(held.outcome.as_str()).or_default() += 1;
     }
     counts
-}
-
-/// "primera", "segunda", ... for a position counted from zero, up to
-/// [`MAX_ATTESTER_PINS`]: the page names a pin without digits.
-pub fn ordinal(index: usize) -> &'static str {
-    const NAMES: [&str; MAX_ATTESTER_PINS] = [
-        "primera",
-        "segunda",
-        "tercera",
-        "cuarta",
-        "quinta",
-        "sexta",
-        "séptima",
-        "octava",
-        "novena",
-        "décima",
-        "undécima",
-        "duodécima",
-        "decimotercera",
-        "decimocuarta",
-        "decimoquinta",
-        "decimosexta",
-    ];
-    NAMES.get(index).copied().unwrap_or("última")
 }
 
 /// Decision receipts in the chain: every line but the database reference.

@@ -370,20 +370,20 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         let (_, approved, text) =
             call(&app, action(&format!("/api/bandeja/{first}/aprobar"))).await;
         assert_eq!(
-            approved["situacion"], "aprobado, pendiente de ejecución",
+            approved["situacion"], "approved_pending_execution",
             "{text}"
         );
         assert_eq!(approved["puede_ejecutar"], true);
         let (_, executed, text) =
             call(&app, action(&format!("/api/bandeja/{first}/ejecutar"))).await;
-        assert_eq!(executed["situacion"], "aprobado", "{text}");
+        assert_eq!(executed["situacion"], "approved", "{text}");
         assert_eq!(executed["puede_ejecutar"], false);
         let (_, again, _) = call(&app, action(&format!("/api/bandeja/{first}/aprobar"))).await;
-        assert_eq!(again["situacion"], "sin cambios");
+        assert_eq!(again["situacion"], "unchanged");
 
         let (_, rejected, text) =
             call(&app, action(&format!("/api/bandeja/{second}/rechazar"))).await;
-        assert_eq!(rejected["situacion"], "rechazado", "{text}");
+        assert_eq!(rejected["situacion"], "rejected", "{text}");
         let (_, after, _) = call(&app, action(&format!("/api/bandeja/{second}/ejecutar"))).await;
         assert_eq!(after["puede_ejecutar"], false);
 
@@ -407,7 +407,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         let (_, approved, text) =
             call(&app, action(&format!("/api/bandeja/{reload}/aprobar"))).await;
         assert_eq!(
-            approved["situacion"], "aprobado, pendiente de ejecución",
+            approved["situacion"], "approved_pending_execution",
             "{text}"
         );
         let fresh = Arc::new(
@@ -430,7 +430,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         let (_, list, text) = call(&fresh_app, inbox_request()).await;
         let items = list["solicitudes"].as_array().unwrap();
         assert_eq!(items.len(), 1, "{text}");
-        assert_eq!(items[0]["situacion"], "aprobado, pendiente de ejecución");
+        assert_eq!(items[0]["situacion"], "approved_pending_execution");
         assert_eq!(items[0]["puede_aprobar"], false);
         assert_eq!(items[0]["puede_rechazar"], false);
         assert_eq!(items[0]["puede_ejecutar"], true);
@@ -445,13 +445,13 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         assert_eq!(stale, StatusCode::NOT_FOUND);
         let (_, refused, _) =
             call(&fresh_app, action(&format!("/api/bandeja/{again}/aprobar"))).await;
-        assert_eq!(refused["situacion"], "sin cambios");
+        assert_eq!(refused["situacion"], "unchanged");
         let (_, executed, text) = call(
             &fresh_app,
             action(&format!("/api/bandeja/{again}/ejecutar")),
         )
         .await;
-        assert_eq!(executed["situacion"], "aprobado", "{text}");
+        assert_eq!(executed["situacion"], "approved", "{text}");
 
         // Expiry: the window (30 s in the demo) closes with no decision.
         let expire_id = held_demo(&dir, "vencer");
@@ -466,7 +466,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         assert_eq!(list["vencidas"], 1, "{text}");
         let (_, expired, text) =
             call(&fresh_app, action(&format!("/api/bandeja/{late}/aprobar"))).await;
-        assert_eq!(expired["situacion"], "expirado", "{text}");
+        assert_eq!(expired["situacion"], "expired", "{text}");
         assert_eq!(expired["puede_ejecutar"], false);
         // The gateway recorded the expiry: it is no longer pending at all.
         let (_, list, _) = call(&fresh_app, inbox_request()).await;
@@ -662,20 +662,20 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
         let (_, approved, text) =
             call(&app, action(&format!("/api/bandeja/{first}/aprobar"))).await;
         assert_eq!(
-            approved["situacion"], "aprobado, pendiente de ejecución",
+            approved["situacion"], "approved_pending_execution",
             "{text}"
         );
         let (_, executed, text) =
             call(&app, action(&format!("/api/bandeja/{first}/ejecutar"))).await;
-        assert_eq!(executed["situacion"], "aprobado", "{text}");
+        assert_eq!(executed["situacion"], "approved", "{text}");
         let (_, rejected, text) =
             call(&app, action(&format!("/api/bandeja/{second}/rechazar"))).await;
-        assert_eq!(rejected["situacion"], "rechazado", "{text}");
+        assert_eq!(rejected["situacion"], "rejected", "{text}");
         // Approved, never executed.
         let (_, approved, text) =
             call(&app, action(&format!("/api/bandeja/{third}/aprobar"))).await;
         assert_eq!(
-            approved["situacion"], "aprobado, pendiente de ejecución",
+            approved["situacion"], "approved_pending_execution",
             "{text}"
         );
         // One more left pending: its receipt is in the journal too.
@@ -709,9 +709,10 @@ fn postgres_console_compliance_pack_verifies_with_praetore_verify() {
     drop(app);
     drop(d3_app);
     assert_eq!(missing_policy.0, StatusCode::SERVICE_UNAVAILABLE);
+    // A code; the page words it in its language.
     assert_eq!(
         missing_policy.1["mensaje"],
-        "No se pudo leer la política configurada en la consola. No se generó ningún paquete."
+        serde_json::json!({"codigo": "pack_policy"})
     );
 
     // Unpacked with the system's tar.

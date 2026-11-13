@@ -9,6 +9,7 @@
 
 use crate::{
     bandeja::{PendingRef, verified_challenge},
+    codigos::{ApiMessage, MessageCode, OutcomeState},
     confianza::EvidenceTrust,
 };
 use ed25519_dalek::{Signer, SigningKey};
@@ -76,6 +77,9 @@ impl std::error::Error for ApproverConfigError {}
 pub struct ApproverSigner {
     key_id: String,
     key: SigningKey,
+    /// Where each decision's `approval_id` comes from: a random UUID, or a
+    /// fixed one in tests that compare signed decisions byte for byte.
+    approval_ids: fn() -> Uuid,
 }
 
 impl std::fmt::Debug for ApproverSigner {
@@ -92,6 +96,7 @@ impl ApproverSigner {
         Ok(Self {
             key_id: key_id.to_owned(),
             key: SigningKey::from_bytes(&secret),
+            approval_ids: Uuid::new_v4,
         })
     }
 
@@ -125,6 +130,13 @@ impl ApproverSigner {
         bool::from(self.key.as_bytes().ct_eq(candidate))
     }
 
+    /// Tests only: every decision gets the `approval_id` `ids` returns.
+    #[cfg(test)]
+    pub(crate) fn with_approval_ids(mut self, ids: fn() -> Uuid) -> Self {
+        self.approval_ids = ids;
+        self
+    }
+
     pub fn sign(
         &self,
         view: ApprovalChallengeView,
@@ -132,7 +144,7 @@ impl ApproverSigner {
     ) -> Option<HumanApprovalDecision> {
         let mut decision = HumanApprovalDecision {
             schema_version: 1,
-            approval_id: Uuid::new_v4(),
+            approval_id: (self.approval_ids)(),
             approver_key_id: self.key_id.clone(),
             challenge: view.challenge,
             outcome,
@@ -324,23 +336,23 @@ impl ApprovalGateway for HttpApprovalGateway {
 /// a decision is never offered again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ActOutcome {
-    pub situacion: &'static str,
-    pub mensaje: &'static str,
+    pub situacion: OutcomeState,
+    pub mensaje: ApiMessage,
     pub puede_ejecutar: bool,
 }
 
-const APPROVED_PENDING: &str = "aprobado, pendiente de ejecución";
+const APPROVED_PENDING: OutcomeState = OutcomeState::ApprovedPendingExecution;
 
-fn outcome(situacion: &'static str, mensaje: &'static str) -> ActOutcome {
+fn outcome(situacion: OutcomeState, mensaje: MessageCode) -> ActOutcome {
     ActOutcome {
         situacion,
-        mensaje,
+        mensaje: ApiMessage::new(mensaje),
         puede_ejecutar: false,
     }
 }
 
-fn unchanged(mensaje: &'static str) -> ActOutcome {
-    outcome("sin cambios", mensaje)
+fn unchanged(mensaje: MessageCode) -> ActOutcome {
+    outcome(OutcomeState::Unchanged, mensaje)
 }
 
 /// Approve or reject: one signed decision, never resent by the console.
@@ -359,9 +371,7 @@ pub fn decide(
             if challenge == pending.expected && digest == pending.action_digest => {}
         _ => {
             tracing::warn!(failure = "evidence_unverified", "console refused to sign");
-            return unchanged(
-                "La evidencia de esta solicitud no verifica con las claves o la política configuradas. No se firmó nada.",
-            );
+            return unchanged(MessageCode::EvidenceUnverified);
         }
     }
     let view = match gateway.challenge(&pending.key) {
@@ -369,15 +379,13 @@ pub fn decide(
             match ApprovalChallengeView::from_json(&body) {
                 Ok(view) => view,
                 Err(_) => {
-                    return unchanged(
-                        "El sistema respondió algo que no se entiende. No se firmó nada.",
-                    );
+                    return unchanged(MessageCode::GatewayUnintelligible);
                 }
             }
         }
         GatewayReply::Answered { status, .. } => return challenge_refusal(status),
         GatewayReply::NotSent | GatewayReply::Unconfirmed => {
-            return unchanged("No se pudo hablar con el sistema. No se firmó nada.");
+            return unchanged(MessageCode::GatewayUnreachableNothingSigned);
         }
     };
     // The whole challenge must be the one rebuilt from the journal evidence
@@ -387,15 +395,13 @@ pub fn decide(
         || !view.action_matches_challenge()
     {
         tracing::warn!(failure = "challenge_mismatch", "console refused to sign");
-        return unchanged(
-            "Lo que el sistema pide firmar no es lo que se mostró. No se firmó nada.",
-        );
+        return unchanged(MessageCode::ChallengeMismatch);
     }
     let Some(signed) = signer.sign(view, decision) else {
-        return unchanged("No se pudo firmar. No se envió nada.");
+        return unchanged(MessageCode::SignFailed);
     };
     let Ok(json) = serde_json::to_string(&signed) else {
-        return unchanged("No se pudo firmar. No se envió nada.");
+        return unchanged(MessageCode::SignFailed);
     };
     match gateway.decide(&pending.key, &json) {
         GatewayReply::Answered { status: 200, body } => {
@@ -410,65 +416,51 @@ pub fn decide(
             match (decision, status.as_deref()) {
                 (HumanApprovalOutcome::Approve, Some("approved_pending_dispatch")) => ActOutcome {
                     situacion: APPROVED_PENDING,
-                    mensaje: "Quedó aprobado. Todavía no se ejecutó.",
+                    mensaje: ApiMessage::new(MessageCode::ApprovedNotYetExecuted),
                     puede_ejecutar: true,
                 },
-                (HumanApprovalOutcome::Reject, Some("rejected")) => outcome(
-                    "rechazado",
-                    "Quedó rechazado. El rechazo es final y no se ejecutó.",
-                ),
+                (HumanApprovalOutcome::Reject, Some("rejected")) => {
+                    outcome(OutcomeState::Rejected, MessageCode::RejectedFinal)
+                }
                 _ => unconfirmed_decision(),
             }
         }
         GatewayReply::Answered { status, body } => decision_refusal(status, &body),
-        GatewayReply::NotSent => {
-            unchanged("No se pudo hablar con el sistema. No quedó ninguna decisión registrada.")
-        }
+        GatewayReply::NotSent => unchanged(MessageCode::GatewayUnreachableNoDecision),
         GatewayReply::Unconfirmed => unconfirmed_decision(),
     }
 }
 
 fn unconfirmed_decision() -> ActOutcome {
-    unchanged(
-        "No se pudo confirmar si la decisión quedó registrada. Revisa el historial antes de seguir.",
-    )
+    unchanged(MessageCode::DecisionUnconfirmed)
 }
 
 fn challenge_refusal(status: u16) -> ActOutcome {
     match status {
-        404 => unchanged("Esta solicitud ya no está."),
-        409 => unchanged("Esta solicitud ya tiene una decisión. No se firmó nada."),
-        410 => outcome(
-            "expirado",
-            "La ventana de aprobación cerró sin una decisión. No se ejecutó.",
-        ),
-        401 | 403 => unchanged("El sistema no reconoce a esta consola como aprobadora."),
-        _ => unchanged("El sistema no pudo atender ahora. No se firmó nada."),
+        404 => unchanged(MessageCode::RequestNoLongerThere),
+        409 => unchanged(MessageCode::AlreadyDecidedNothingSigned),
+        410 => outcome(OutcomeState::Expired, MessageCode::ApprovalWindowClosed),
+        401 | 403 => unchanged(MessageCode::NotAnApprover),
+        _ => unchanged(MessageCode::GatewayBusyNothingSigned),
     }
 }
 
 fn decision_refusal(status: u16, body: &str) -> ActOutcome {
     match (status, error_code(body).as_deref()) {
-        (409, _) => unchanged("Esta solicitud ya tiene una decisión. No se registró otra."),
+        (409, _) => unchanged(MessageCode::AlreadyDecidedNoOther),
         (410, _) => outcome(
-            "expirado",
-            "La ventana de aprobación cerró antes de registrar la decisión. No se ejecutó.",
+            OutcomeState::Expired,
+            MessageCode::WindowClosedBeforeDecision,
         ),
         (403, Some("action_not_dispatchable")) => outcome(
-            "no se ejecutó",
-            "El sistema se negó a ejecutarlo antes de tocar el objetivo. La solicitud quedó cerrada.",
+            OutcomeState::NotExecuted,
+            MessageCode::DispatchRefusedClosed,
         ),
-        (403, Some("self_approval_forbidden")) => {
-            unchanged("Esta llave pertenece al agente que lo pidió y no puede aprobarlo.")
-        }
-        (401 | 403, _) => {
-            unchanged("El sistema no aceptó la firma de esta consola. No quedó ninguna decisión.")
-        }
-        (404, _) => unchanged("Esta solicitud ya no está."),
-        (503, Some("approval_not_configured")) => {
-            unchanged("El sistema no tiene aprobadores configurados.")
-        }
-        (400, _) => unchanged("El sistema no aceptó la decisión. No quedó registrada."),
+        (403, Some("self_approval_forbidden")) => unchanged(MessageCode::SelfApprovalForbidden),
+        (401 | 403, _) => unchanged(MessageCode::SignatureRefused),
+        (404, _) => unchanged(MessageCode::RequestNoLongerThere),
+        (503, Some("approval_not_configured")) => unchanged(MessageCode::NoApprovers),
+        (400, _) => unchanged(MessageCode::DecisionRefused),
         _ => unconfirmed_decision(),
     }
 }
@@ -488,43 +480,39 @@ pub fn dispatch(gateway: &dyn ApprovalGateway, pending: &PendingRef) -> ActOutco
                 });
             match execution.as_deref() {
                 Some("executed" | "confirmed") => {
-                    outcome("aprobado", "Se ejecutó. El registro dice que ocurrió.")
+                    outcome(OutcomeState::Approved, MessageCode::Executed)
                 }
-                Some("failed") => outcome("aprobado", "Se intentó y falló."),
-                Some("outcome_unknown") => outcome(
-                    "aprobado",
-                    "Se inició y no quedó claro si llegó a ocurrir. Revisa el historial.",
+                Some("failed") => outcome(OutcomeState::Approved, MessageCode::ExecutionFailed),
+                Some("outcome_unknown") => {
+                    outcome(OutcomeState::Approved, MessageCode::ExecutionOutcomeUnknown)
+                }
+                _ => outcome(
+                    OutcomeState::Approved,
+                    MessageCode::GatewayAnsweredCheckHistory,
                 ),
-                _ => outcome("aprobado", "El sistema respondió. Revisa el historial."),
             }
         }
         GatewayReply::Answered { status, body } => match (status, error_code(&body).as_deref()) {
-            (403, Some("action_not_dispatchable")) => outcome(
-                "no se ejecutó",
-                "El sistema se negó a ejecutarlo antes de tocar el objetivo.",
-            ),
-            (502, _) => outcome(
-                "aprobado",
-                "Se intentó y falló. Puede haber quedado un efecto parcial.",
-            ),
+            (403, Some("action_not_dispatchable")) => {
+                outcome(OutcomeState::NotExecuted, MessageCode::DispatchRefused)
+            }
+            (502, _) => outcome(OutcomeState::Approved, MessageCode::ExecutionFailedPartial),
             (410, _) => outcome(
-                "expirado",
-                "Se había aprobado, y la ventana cerró antes de ejecutarlo.",
+                OutcomeState::Expired,
+                MessageCode::WindowClosedBeforeExecution,
             ),
             (409, _) => outcome(
-                "sin cambios",
-                "Ya no está pendiente de ejecución. Revisa el historial.",
+                OutcomeState::Unchanged,
+                MessageCode::NoLongerPendingExecution,
             ),
-            (404, _) => unchanged("Esta solicitud ya no está."),
+            (404, _) => unchanged(MessageCode::RequestNoLongerThere),
             // Refused before the claim: nothing ran.
             (503, Some("dispatch_temporarily_refused" | "authorization_unavailable")) => {
-                retry_dispatch(
-                    "Sigue aprobado, sin ejecutar. El sistema no pudo ejecutarlo ahora; puedes reintentar la ejecución.",
-                )
+                retry_dispatch(MessageCode::StillApprovedRetryBusy)
             }
             (401 | 403, _) => ActOutcome {
                 situacion: APPROVED_PENDING,
-                mensaje: "El sistema no reconoce a esta consola como aprobadora. Sigue aprobado, sin ejecutar.",
+                mensaje: ApiMessage::new(MessageCode::StillApprovedNotAnApprover),
                 puede_ejecutar: false,
             },
             // Any other failure may come after the effect (for example the
@@ -532,25 +520,23 @@ pub fn dispatch(gateway: &dyn ApprovalGateway, pending: &PendingRef) -> ActOutco
             // Retrying is safe, the gateway claims the dispatch only once.
             _ => unconfirmed_dispatch(),
         },
-        GatewayReply::NotSent => retry_dispatch(
-            "Sigue aprobado, sin ejecutar. No se pudo hablar con el sistema; puedes reintentar la ejecución.",
-        ),
+        GatewayReply::NotSent => retry_dispatch(MessageCode::StillApprovedRetryUnreachable),
         GatewayReply::Unconfirmed => unconfirmed_dispatch(),
     }
 }
 
 fn unconfirmed_dispatch() -> ActOutcome {
     ActOutcome {
-        situacion: "sin confirmar",
-        mensaje: "No se pudo confirmar si se ejecutó. Revisa el historial; si sigue pendiente de ejecución, puedes reintentar.",
+        situacion: OutcomeState::Unconfirmed,
+        mensaje: ApiMessage::new(MessageCode::ExecutionUnconfirmed),
         puede_ejecutar: true,
     }
 }
 
-fn retry_dispatch(mensaje: &'static str) -> ActOutcome {
+fn retry_dispatch(mensaje: MessageCode) -> ActOutcome {
     ActOutcome {
         situacion: APPROVED_PENDING,
-        mensaje,
+        mensaje: ApiMessage::new(mensaje),
         puede_ejecutar: true,
     }
 }

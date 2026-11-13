@@ -4,6 +4,19 @@
 
 ### Breaking
 
+- **The console's JSON API sends codes and UTC instants instead of Spanish
+  text.** `situacion`, `relato`, `aviso`, `mensaje` and `nota` are stable
+  English `snake_case` codes (`"awaiting_approval"`,
+  `{"codigo": "request_gone"}`, `{"codigo": "inbox_truncated", "limite": 200}`);
+  `queria` and `sobre` are `{"texto": ...}` or `{"codigo": "not_shown"}`;
+  `agente` is `{"nombre": ...}` or `{"numero": N}`. Times are RFC 3339 UTC
+  in `cuando_utc`, `actualizado_utc`, `pedida_utc` and `vale_hasta_utc`;
+  `cuando`, `actualizado`, `pedida`, `vale_hasta` and `queda` are gone (the
+  page counts the time left itself). The history filter takes the code and
+  still accepts the earlier Spanish phrase. An unused attester pin is now
+  named by its number ("La clave n.º 2 …") instead of an ordinal word.
+  Action: a script that read the console's API compares codes instead of
+  phrases. Nothing signed, recorded or exported changes.
 - **`praetore-gateway-demo` requires `PRAETORE_GATEWAY_ADAPTER` (T-016).**
   The service no longer falls back to `local-demo` when the variable is
   missing or empty: it exits before it connects to PostgreSQL and names the
@@ -184,6 +197,19 @@
 
 ### Added
 
+- **Console language and local time.** The console page can be read in
+  Spanish, English or Portuguese (Brazil), chosen with a selector at the top
+  and kept in the browser (`localStorage`, key `praetore_idioma`); without a
+  saved choice it follows the browser's languages, then Spanish. The
+  catalogs are embedded and served at `GET /i18n/{es,en,pt}.json`; the
+  Content-Security-Policy is unchanged and the server never reads
+  `Accept-Language`. Every time is shown in the browser's zone with its
+  offset and in UTC beside it; deadlines with seconds. Presentation only:
+  tests check that the signed decision and the compliance package are the
+  same bytes in all three languages. The page's logic has Node built-in
+  tests (`crates/praetore-console/tests-js/`), run in CI with no npm
+  packages. The console's terminal messages and `LEEME.txt` stay in
+  Spanish.
 - **Tenant journal in ranges.** `praetore journal-export --tenant` takes
   `--from-seq N [--limit M]` and exports one range of the tenant's chain of
   receipts, in the order of the whole export, printing `next_from_seq`.
