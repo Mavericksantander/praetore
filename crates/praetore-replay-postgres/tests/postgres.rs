@@ -11791,20 +11791,22 @@ mod delegated_approval_postgres {
         decision
     }
 
-    /// `target/<profile>/praetore-verify`, next to this test's `deps/`.
+    /// `praetore-verify` in the nearest ancestor directory of this test
+    /// binary that holds it (`target/<profile>/`, whatever layout cargo
+    /// uses for test binaries).
     fn verifier() -> PathBuf {
+        let name = format!("praetore-verify{}", env::consts::EXE_SUFFIX);
         let exe = env::current_exe().unwrap();
-        let path = exe
-            .parent()
-            .and_then(|deps| deps.parent())
-            .unwrap()
-            .join(format!("praetore-verify{}", env::consts::EXE_SUFFIX));
-        assert!(
-            path.is_file(),
-            "{} is missing: run `cargo build -p praetore-verify --locked` first",
-            path.display()
-        );
-        path
+        exe.ancestors()
+            .skip(1)
+            .map(|dir| dir.join(&name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "praetore-verify not found above {}: run `cargo build -p praetore-verify --locked` first",
+                    exe.display()
+                )
+            })
     }
 
     fn pending(fixture: &PostgresApprovalFixture, tenant_id: Uuid) -> ExecutionKey {
