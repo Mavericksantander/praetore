@@ -434,6 +434,13 @@
 
 ### Changed
 
+- **The CI smoke test of `praetore-mcp` uses
+  `@modelcontextprotocol/server-filesystem@2.3.0`** (was 2.1.0), pinned in
+  `scripts/mcp-smoke/package.json`, its lockfile and `scripts/mcp-smoke.py`.
+  This takes `glob` 13.0.7 (GHSA-3g3m-2fjr-6pw4) and `minimatch` 10.2.6
+  (GHSA-g3hv-75wg-m249) out of the test lockfile. Those npm packages are only
+  installed by the smoke job; they are not published and are not inside any
+  binary. The binaries do not change.
 - **A tenant's journal chain follows the commit order (migration 0024).**
   Every journal row takes its tenant's next position,
   `execution_journal.chain_seq`, in the transaction that writes it (table
