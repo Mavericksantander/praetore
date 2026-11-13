@@ -5,14 +5,18 @@
 //! Optional: `PRAETORE_CONSOLE_BIND` (loopback
 //! only, default `127.0.0.1:8090`), `PRAETORE_CONSOLE_AGENT_NAMES_FILE`.
 //!
-//! Opening: at startup the console writes a link `http://<bind>/?abrir=<code>`
-//! to stderr. Under systemd stderr goes to the journal, so whoever can read
-//! that journal can open the console while the link is live. The link works
-//! once and for at most five minutes. A new link is issued only by the
-//! operator: when stdin and stderr are a terminal, pressing Enter there
-//! writes a new one (and the earlier one stops working); otherwise, restart
-//! the console. Asking for the page never issues a link. The session secret
-//! is new on every start and is never written to disk.
+//! Opening: at startup the console writes a link `http://<bind>/#abrir=<code>`
+//! to stderr. The code travels in the URL fragment, which the browser never
+//! sends to the server; the page reads it and redeems it for a session token
+//! over `POST /api/sesion`. Under systemd stderr goes to the journal, so
+//! whoever can read that journal can open the console while the link is live.
+//! The link works once and for at most five minutes. A new link is issued
+//! only by the operator: when stdin and stderr are a terminal, pressing Enter
+//! there writes a new one (and the earlier one stops working); otherwise,
+//! restart the console. Asking for the page never issues a link. The session
+//! token is kept only in the browser tab (sessionStorage, per origin and
+//! port) and sent as `Authorization: Bearer`; no session cookie is set, and
+//! no secret is written to disk.
 //!
 //! Approvals inbox (D2), all four or none:
 //! - `PRAETORE_CONSOLE_GATEWAY_URL`: `http://127.0.0.1:<port>` of the gateway;
@@ -68,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "PRAETORE_CONSOLE_SESSION_FILE ya no se usa: la sesión es nueva en cada arranque"
         );
     }
-    // New on every start: a cookie from an earlier run stops working.
+    // New on every start: a token from an earlier run stops working.
     let session = LocalSession::random()?;
     let names = match env::var("PRAETORE_CONSOLE_AGENT_NAMES_FILE") {
         Ok(path) => parse_agent_names(&fs::read_to_string(path)?)?,

@@ -350,7 +350,7 @@ pub fn random_code() -> Option<String> {
 }
 
 fn new_reference() -> Option<String> {
-    let bytes = crate::sesion::random_bytes().ok()?;
+    let bytes = crate::sesion::random_bytes()?;
     Some(
         bytes[..REFERENCE_LEN]
             .iter()

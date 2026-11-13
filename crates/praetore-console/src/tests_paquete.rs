@@ -194,8 +194,8 @@ fn download() -> Request<Body> {
         .uri("/api/paquete")
         .header(header::HOST, "127.0.0.1:8090")
         .header(
-            header::COOKIE,
-            LocalSession::from_secret(SESSION_SECRET).cookie_header(),
+            header::AUTHORIZATION,
+            format!("Bearer {}", hex::encode(SESSION_SECRET)),
         )
         .header(ACTION_HEADER, "1")
         .header("sec-fetch-site", "same-origin")
@@ -593,17 +593,14 @@ async fn the_download_needs_the_session_and_the_page() {
     let store = store();
     let router = app(Some(setup.settings()), store.clone(), false);
 
-    // No cookie, or a cookie from another run.
-    for cookie in [
-        None,
-        Some(LocalSession::from_secret([0x22; 32]).cookie_header()),
-    ] {
+    // No token, or a token from another run.
+    for token in [None, Some(hex::encode([0x22; 32]))] {
         let mut request = Request::builder()
             .uri("/api/paquete")
             .header(header::HOST, "127.0.0.1:8090")
             .header(ACTION_HEADER, "1");
-        if let Some(cookie) = cookie {
-            request = request.header(header::COOKIE, cookie);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
         }
         let response = router
             .clone()
@@ -948,8 +945,8 @@ async fn the_page_learns_whether_the_package_is_configured() {
             .uri("/api/paquete/estado")
             .header(header::HOST, "127.0.0.1:8090")
             .header(
-                header::COOKIE,
-                LocalSession::from_secret(SESSION_SECRET).cookie_header(),
+                header::AUTHORIZATION,
+                format!("Bearer {}", hex::encode(SESSION_SECRET)),
             )
             .body(Body::empty())
             .unwrap();

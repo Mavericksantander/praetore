@@ -204,7 +204,7 @@ fn action(uri: &str) -> Request<Body> {
         .header(header::HOST, "127.0.0.1:8090")
         .method("POST")
         .uri(uri)
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .header(header::ORIGIN, CONSOLE)
         .header(ACTION_HEADER, "1")
         .body(Body::empty())
@@ -215,18 +215,13 @@ fn inbox_request() -> Request<Body> {
     Request::builder()
         .header(header::HOST, "127.0.0.1:8090")
         .uri("/api/bandeja")
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .body(Body::empty())
         .unwrap()
 }
 
-fn cookie() -> String {
-    LocalSession::from_secret([0x21; 32])
-        .cookie_header()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_owned()
+fn auth() -> String {
+    format!("Bearer {}", hex::encode([0x21; 32]))
 }
 
 async fn call(
@@ -310,7 +305,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         let list = Request::builder()
             .header(header::HOST, "127.0.0.1:8090")
             .uri("/api/bandeja")
-            .header(header::COOKIE, cookie())
+            .header(header::AUTHORIZATION, auth())
             .body(Body::empty())
             .unwrap();
         let (status, list, text) = call(&app, list).await;
@@ -350,7 +345,7 @@ fn postgres_console_inbox_approves_dispatches_and_rejects_through_the_gateway() 
         let list = Request::builder()
             .header(header::HOST, "127.0.0.1:8090")
             .uri("/api/bandeja")
-            .header(header::COOKIE, cookie())
+            .header(header::AUTHORIZATION, auth())
             .body(Body::empty())
             .unwrap();
         let (_, list, _) = call(&app, list).await;
@@ -505,7 +500,7 @@ fn pack_request() -> Request<Body> {
     Request::builder()
         .header(header::HOST, "127.0.0.1:8090")
         .uri("/api/paquete")
-        .header(header::COOKIE, cookie())
+        .header(header::AUTHORIZATION, auth())
         .header(ACTION_HEADER, "1")
         .header("sec-fetch-site", "same-origin")
         .body(Body::empty())

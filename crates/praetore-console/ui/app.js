@@ -1,3 +1,46 @@
+// Session: the token is minted by the console and handed out once through the
+// opening link's URL fragment (`#abrir=`), which the browser never sends to
+// the server. It is kept in sessionStorage, scoped to the opening tab's
+// origin, and sent as `Authorization: Bearer` on every request. No cookie
+// carries the session.
+const LLAVE_SESION = "praetore_sesion";
+
+function tokenSesion() {
+  return sessionStorage.getItem(LLAVE_SESION);
+}
+
+function cabeceras(extra) {
+  const base = { "x-praetore-consola": "1" };
+  const token = tokenSesion();
+  if (token) base["Authorization"] = "Bearer " + token;
+  return extra ? Object.assign(base, extra) : base;
+}
+
+function codigoDelHash() {
+  const marca = "#abrir=";
+  const hash = window.location.hash || "";
+  return hash.startsWith(marca) ? hash.slice(marca.length) : null;
+}
+
+async function abrirSesion(codigo) {
+  try {
+    const response = await fetch("/api/sesion", {
+      method: "POST",
+      headers: { "x-praetore-consola": "1", "content-type": "application/json" },
+      body: JSON.stringify({ codigo }),
+    });
+    if (!response.ok) return false;
+    const data = await response.json();
+    if (data && typeof data.token === "string") {
+      sessionStorage.setItem(LLAVE_SESION, data.token);
+      return true;
+    }
+  } catch (_error) {
+    return false;
+  }
+  return false;
+}
+
 const estado = document.getElementById("estado");
 const aviso = document.getElementById("aviso");
 const lista = document.getElementById("lista");
@@ -68,7 +111,7 @@ async function cargar() {
   parametros.set("pagina", String(pagina));
   let response;
   try {
-    response = await fetch("/api/historial?" + parametros.toString(), { credentials: "same-origin" });
+    response = await fetch("/api/historial?" + parametros.toString(), { headers: cabeceras() });
   } catch (_error) {
     estado.textContent = "No se pudo leer el registro.";
     return;
@@ -94,7 +137,7 @@ async function abrir(numero) {
   let response;
   try {
     response = await fetch("/api/historial/" + numero + "?" + parametros.toString(), {
-      credentials: "same-origin",
+      headers: cabeceras(),
     });
   } catch (_error) {
     estado.textContent = "No se pudo abrir el recibo.";
@@ -142,8 +185,7 @@ async function actuar(referencia, accion) {
   try {
     response = await fetch("/api/bandeja/" + encodeURIComponent(referencia) + "/" + accion, {
       method: "POST",
-      credentials: "same-origin",
-      headers: { "x-praetore-consola": "1" },
+      headers: cabeceras(),
     });
   } catch (_error) {
     return { situacion: "sin cambios", mensaje: "No se pudo confirmar qué pasó. Revisa el historial antes de seguir.", puede_ejecutar: accion === "ejecutar" };
@@ -331,7 +373,7 @@ async function cargarBandeja() {
   bandejaEstado.textContent = "Leyendo la bandeja…";
   let response;
   try {
-    response = await fetch("/api/bandeja", { credentials: "same-origin" });
+    response = await fetch("/api/bandeja", { headers: cabeceras() });
   } catch (_error) {
     bandejaEstado.textContent = "No se pudo leer la bandeja.";
     return;
@@ -379,8 +421,7 @@ async function descargarPaquete() {
     let response;
     try {
       response = await fetch("/api/paquete", {
-        credentials: "same-origin",
-        headers: { "x-praetore-consola": "1" },
+        headers: cabeceras(),
       });
     } catch (_error) {
       estadoPaquete.textContent = "No se pudo pedir el paquete.";
@@ -419,7 +460,7 @@ async function estadoPaquete() {
   const estado = document.getElementById("paquete-estado");
   let data = null;
   try {
-    const response = await fetch("/api/paquete/estado", { credentials: "same-origin" });
+    const response = await fetch("/api/paquete/estado", { headers: cabeceras() });
     if (response.ok) data = await response.json();
   } catch (_error) {
     data = null;
@@ -455,6 +496,20 @@ document.getElementById("siguiente").addEventListener("click", () => {
     cargar();
   }
 });
-cargar();
-cargarBandeja();
-estadoPaquete();
+async function iniciar() {
+  const codigo = codigoDelHash();
+  if (codigo) {
+    await abrirSesion(codigo);
+    // Clear the fragment so the one-time code does not linger in the URL.
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+  }
+  if (!tokenSesion()) {
+    estado.textContent = "Abre el enlace que la consola muestra en su terminal (vale una vez y 5 minutos). Si ya venció o se usó, pulsa Enter en esa terminal para otro, o reinicia la consola.";
+    bandejaEstado.textContent = "";
+    return;
+  }
+  cargar();
+  cargarBandeja();
+  estadoPaquete();
+}
+iniciar();
