@@ -200,6 +200,67 @@ pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
     Ok(listed)
 }
 
+/// What `approve` prints before it asks for the confirmation code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCall {
+    pub server: String,
+    pub tool: String,
+    pub expires_at: String,
+    /// Canonical JSON of the arguments, not truncated.
+    pub arguments_canonical: String,
+}
+
+/// Reads one pending file. Does not sign or delete it.
+pub fn pending_call(home: &Home, approval_id: &str) -> Result<PendingCall, String> {
+    if !valid_id(approval_id) {
+        return Err(format!(
+            "approval id {approval_id:?} is not a 64-character lowercase hex id"
+        ));
+    }
+    let path = pending_path(home, approval_id);
+    let text = fs::read_to_string(&path).map_err(|_| {
+        format!("no pending approval {approval_id} (unknown id, or already decided)")
+    })?;
+    let pending: Value =
+        serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+    let info = pending_info(&pending)?;
+    if info.approval_id != approval_id {
+        return Err(format!("{} does not match its approval id", path.display()));
+    }
+    let arguments = pending
+        .get("arguments")
+        .cloned()
+        .ok_or("pending approval has no arguments")?;
+    let canonical = String::from_utf8(canonical_bytes(&arguments)?)
+        .map_err(|_| "canonical arguments are not UTF-8".to_owned())?;
+    Ok(PendingCall {
+        server: info.server,
+        tool: info.tool,
+        expires_at: info.expires_at,
+        arguments_canonical: canonical,
+    })
+}
+
+fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, String> {
+    let attester = store::read_attester_pin(&home.attester_pin())?;
+    let pins = store::read_issuer_pins(&home.issuer_pins())?;
+    for line in crate::receipts::read_journal(home)? {
+        let parsed = crate::journal::parse_line(&line.text)
+            .map_err(|error| format!("{}:{}: {error}", line.file.display(), line.line_number))?;
+        if parsed.evidence.evidence_id.to_string() != evidence_id {
+            continue;
+        }
+        return crate::receipts::verify_line(&line.text, &attester, &pins).map_err(|error| {
+            format!(
+                "pending evidence {evidence_id} does not verify ({error}); nothing was signed and the pending file was kept"
+            )
+        });
+    }
+    Err(format!(
+        "pending evidence {evidence_id} is not in the receipts journal; nothing was signed and the pending file was kept"
+    ))
+}
+
 /// Signs a decision for a pending id and appends it to the approval journal.
 /// The `approve` command is what requires an interactive terminal.
 pub fn decide(home: &Home, approval_id: &str, outcome: HumanOutcome) -> Result<Decided, String> {
@@ -233,6 +294,13 @@ pub fn decide(home: &Home, approval_id: &str, outcome: HumanOutcome) -> Result<D
                 info.expires_at
             ));
         }
+        // The pending file is not signed. Refuse to sign it unless it still
+        // matches the receipt written when the call was held.
+        let binding = binding_from_pending(&pending)?;
+        let evidence = load_signed_receipt(home, &info.evidence_id)?;
+        binding_matches_evidence(&binding, &evidence).map_err(|error| {
+            format!("{error}; nothing was signed and the pending file was kept")
+        })?;
         let approver = store::approver_secret(home)?;
         let approver_key_id = public_hex(&approver);
         let pin = read_approver_pin(home)?;

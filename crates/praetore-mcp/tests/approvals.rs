@@ -228,10 +228,11 @@ fn approve_on_tty(home: &Home, id: &str) -> Output {
             );
         }
         if let Some(status) = child.try_wait().unwrap() {
-            panic!(
-                "approve exited {status} before prompting:\n{}",
-                String::from_utf8_lossy(&buf)
-            );
+            return Output {
+                status,
+                stdout: buf,
+                stderr: Vec::new(),
+            };
         }
         thread::sleep(Duration::from_millis(20));
     };
@@ -437,6 +438,12 @@ fn approved_call_forwards_once_and_a_second_retry_asks_again() {
     let approved = approve_on_tty(&home, &id);
     let approved_text = String::from_utf8_lossy(&approved.stdout);
     assert!(approved.status.success(), "{approved_text}");
+    let before_code = approved_text.split("confirmation:").next().unwrap();
+    assert!(
+        before_code.contains("tool") && before_code.contains("echo"),
+        "{before_code}"
+    );
+    assert!(before_code.contains("\"a\":2"), "{before_code}");
     assert!(
         approved_text.contains(&format!("approve {id}")),
         "{approved_text}"
@@ -704,4 +711,73 @@ fn an_evidence_only_journal_still_verifies() {
         "{report}"
     );
     assert!(report.contains("approval journal: none"), "{report}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn edited_pending_is_not_signed_and_the_edited_call_is_not_forwarded() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(echo(7, json!({"note": "benign"}))),
+        &[],
+    );
+    assert!(!stderr.contains("EXECUTED echo"), "{stderr}");
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{id}.json"));
+    let original = fs::read_to_string(&path).unwrap();
+    let edited = original.replace("\"benign\"", "\"EVIL\"");
+    assert_ne!(edited, original);
+    fs::write(&path, &edited).unwrap();
+
+    let approved = approve_on_tty(&home, &id);
+    let text = String::from_utf8_lossy(&approved.stdout);
+    assert!(!approved.status.success(), "{text}");
+    assert!(
+        text.contains("nothing was signed") && text.contains("kept"),
+        "{text}"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(echo(8, json!({"note": "EVIL"}))),
+        &[],
+    );
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 0, "{stderr}");
+    assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
+    assert!(!home.root.join("approvals").join("journal.jsonl").exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn verify_rejects_an_execution_after_the_approval_window() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "4")];
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    let approved = approve_on_tty(&home, &id);
+    assert!(
+        approved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approved.stdout)
+    );
+    thread::sleep(Duration::from_secs(5));
+    let held = evidence(&home)
+        .into_iter()
+        .find(|item| item.decision.outcome == DecisionOutcome::RequireApproval)
+        .unwrap();
+    praetore_mcp::approvals::record_duplicate_execution(&home, &id, &held).unwrap();
+    let checked = verify(&home);
+    let report = String::from_utf8_lossy(&checked.stdout);
+    assert_eq!(checked.status.code(), Some(1), "{report}");
+    assert!(report.contains("outside the approval window"), "{report}");
 }

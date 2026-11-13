@@ -692,7 +692,7 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
         );
     }
     if outcome == crate::approvals::HumanOutcome::Approve {
-        confirm_approval(&id)?;
+        confirm_approval(&home, &id)?;
     }
     let decided = crate::approvals::decide(&home, &id, outcome)?;
     println!(
@@ -717,7 +717,13 @@ fn interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
-fn confirm_approval(id: &str) -> Result<(), String> {
+fn confirm_approval(home: &Home, id: &str) -> Result<(), String> {
+    let pending = crate::approvals::pending_call(home, id)?;
+    let show = praetore_core::display::escape_for_display;
+    eprintln!("server     {}", show(&pending.server));
+    eprintln!("tool       {}", show(&pending.tool));
+    eprintln!("expires    {}", pending.expires_at);
+    eprintln!("arguments  {}", show(&pending.arguments_canonical));
     let code = confirmation_code();
     eprintln!("Type {code} to approve {id}.");
     eprintln!(
