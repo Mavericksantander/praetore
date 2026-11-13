@@ -87,10 +87,16 @@ async function leerCatalogo(valor) {
   }
 }
 
+// Each request for a language gets a number; only the latest one is used,
+// so two quick changes cannot leave the page in one language and the
+// selector in another.
+let ultimoPedidoDeIdioma = 0;
+
 // Without a catalog the Spanish already in the page stays.
 async function usarIdioma(valor) {
+  const turno = ++ultimoPedidoDeIdioma;
   const catalogo = await leerCatalogo(valor);
-  if (!catalogo) return false;
+  if (!catalogo || turno !== ultimoPedidoDeIdioma) return false;
   idioma = valor;
   t = crearTraductor(catalogo, valor);
   document.documentElement.setAttribute("lang", valor === "pt" ? "pt-BR" : valor);

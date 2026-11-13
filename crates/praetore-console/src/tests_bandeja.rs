@@ -1543,3 +1543,28 @@ async fn the_signed_decision_is_the_same_whatever_the_page_language() {
         }
     }
 }
+
+/// Without `with_approval_ids`, each decision the console signs gets a fresh
+/// random (version 4) `approval_id`: two decisions never share one.
+#[test]
+fn each_signed_decision_gets_its_own_random_approval_id() {
+    let signer = ApproverSigner::new("consola-aprobador", APPROVER_SECRET).unwrap();
+    let expires = OffsetDateTime::now_utc() + Duration::minutes(10);
+    let ids: Vec<Uuid> = ["informe-1", "informe-2"]
+        .into_iter()
+        .map(|target| {
+            let (evidence, _) = pending_evidence("borrar_archivo", target, expires);
+            let view = FakeGateway::new(&evidence).view;
+            signer
+                .sign(view, praetore_gateway::HumanApprovalOutcome::Reject)
+                .unwrap()
+                .approval_id
+        })
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    for id in &ids {
+        assert!(!id.is_nil());
+        assert_eq!(id.get_version_num(), 4, "{id}");
+        assert_eq!(id.get_variant(), uuid::Variant::RFC4122, "{id}");
+    }
+}

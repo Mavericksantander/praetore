@@ -155,7 +155,7 @@ const SOLICITUD = {
 let vez = 0;
 
 // Loads app.js afresh on a new page; returns the page and the requests made.
-async function abrirPagina({ guardado, navegador = ["es-CL"] }) {
+async function abrirPagina({ guardado, navegador = ["es-CL"], esperas = {} }) {
   const pedidos = [];
   const document = documentoDePagina();
   const local = almacen(guardado ? { praetore_idioma: guardado } : {});
@@ -175,7 +175,10 @@ async function abrirPagina({ guardado, navegador = ["es-CL"] }) {
       const metodo = opciones.method || "GET";
       pedidos.push({ metodo, url, cabeceras: opciones.headers || {} });
       const catalogo = /^\/i18n\/(es|en|pt)\.json$/.exec(url);
-      if (catalogo) return respuesta(200, catalogos[catalogo[1]]);
+      if (catalogo) {
+        if (esperas[catalogo[1]]) await esperas[catalogo[1]];
+        return respuesta(200, catalogos[catalogo[1]]);
+      }
       if (url.startsWith("/api/historial")) {
         return respuesta(200, { pagina: 1, paginas: 1, total: 0, recibos: [], aviso: "receipt_not_authorization" });
       }
@@ -293,6 +296,27 @@ test("a change of language with a confirmation open cancels it, and nothing is s
   // The static texts follow the language.
   const titulo = document.querySelectorAll("[data-i18n]").find((nodo) => nodo.getAttribute("data-i18n") === "inbox.title");
   assert.equal(titulo.textContent, catalogos.en["inbox.title"]);
+});
+
+test("two quick changes of language: the page and the selector end in the last one", async () => {
+  let soltarIngles;
+  const esperas = { en: new Promise((listo) => (soltarIngles = listo)) };
+  const { document, local } = await abrirPagina({ guardado: "es", esperas });
+  const selector = document.getElementById("idioma");
+  selector.value = "en";
+  selector.disparar("change");
+  selector.value = "pt";
+  selector.disparar("change");
+  await calma();
+  // The English catalog arrives after the Portuguese one, and is ignored.
+  soltarIngles();
+  await calma();
+  assert.equal(selector.value, "pt");
+  assert.equal(local.datos.get("praetore_idioma"), "pt");
+  assert.equal(document.documentElement.getAttribute("lang"), "pt-BR");
+  const titulo = document.querySelectorAll("[data-i18n]").find((nodo) => nodo.getAttribute("data-i18n") === "inbox.title");
+  assert.equal(titulo.textContent, catalogos.pt["inbox.title"]);
+  assert.ok(tarjeta(document).textContent.includes(catalogos.pt["button.reject"]));
 });
 
 test("the language comes from the browser when nothing is saved, and an unknown saved value is ignored", async () => {

@@ -1248,6 +1248,10 @@ mod tests {
             assert!(!script.contains("innerHTML"));
             assert!(!script.contains("outerHTML"));
             assert!(!script.contains("insertAdjacentHTML"));
+            assert!(!script.contains("createContextualFragment"));
+            assert!(!script.contains("DOMParser"));
+            assert!(!script.contains("setHTML"));
+            assert!(!script.contains("srcdoc"));
             assert!(!script.contains("eval("));
             assert!(!script.contains("new Function"));
             assert!(!script.contains("document.write"));

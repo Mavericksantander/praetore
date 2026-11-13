@@ -398,3 +398,24 @@ fn signing_recording_and_exporting_do_not_depend_on_the_language() {
         }
     }
 }
+
+/// The history's day filter takes UTC days (`historia.rs`, `parse_day`),
+/// while the page shows times in local time: the labels have to say UTC, in
+/// every language and in the Spanish already in the page.
+#[test]
+fn the_day_filter_labels_say_utc_in_every_language() {
+    for language in LANGUAGES {
+        let catalog = catalog(language);
+        for key in ["filter.from", "filter.until"] {
+            let text = catalog[key].as_str().unwrap();
+            assert!(text.contains("UTC"), "{language}.json: {key} is {text:?}");
+        }
+    }
+    let page = include_str!("../ui/index.html");
+    for key in ["filter.from", "filter.until"] {
+        let marker = format!("data-i18n=\"{key}\">");
+        let start = page.find(&marker).unwrap() + marker.len();
+        let initial = &page[start..start + page[start..].find('<').unwrap()];
+        assert_eq!(initial, es(key), "index.html: {key}");
+    }
+}
