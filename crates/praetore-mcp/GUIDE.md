@@ -31,21 +31,21 @@ macOS arm64 run on 2026-10-30 did not include local approval.
 ### Without Rust
 
 Download one archive and `SHA256SUMS` from the published
-[v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3)
-(commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`). That release is not a
+[v0.3.4 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4)
+(commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`). That release is not a
 build of the current `main` branch. You do not clone the repository.
 
 | Machine | Archive |
 | --- | --- |
-| macOS Apple silicon | `praetore-mcp-v0.3.3-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `praetore-mcp-v0.3.3-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `praetore-mcp-v0.3.3-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz` |
 
-v0.3.3 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.4 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you open it. On macOS:
 `shasum -a 256 -c SHA256SUMS --ignore-missing`. On Linux:
 `sha256sum -c SHA256SUMS --ignore-missing`. The published digests are in
-[Install from the v0.3.3 release](../../docs/install-prebuilt.md). If
+[Install from the v0.3.4 release](../../docs/install-prebuilt.md). If
 `SHA256SUMS` does not match that list, stop. Then `tar -xzf` the archive.
 It contains a directory of the same name with `praetore-mcp`, `LICENSE` and
 `NOTICE`.
@@ -57,8 +57,8 @@ later leaves the client config pointing at the old path. Run `install`
 again after you move it.
 
 Checking the Sigstore signature of `SHA256SUMS` is optional. It needs
-`cosign`. For v0.3.3, pass
-`--certificate-github-workflow-sha 0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`
+`cosign`. For v0.3.4, pass
+`--certificate-github-workflow-sha a606c111d788bfb927a8c5b953e30bf1d8c37421`
 so the check does not need a clone. See
 [Release artifact integrity](../../docs/operations.md#release-artifact-integrity).
 The required check is the digest command above.
@@ -151,11 +151,9 @@ wrapped.
 
 Add one deny rule for the server named `filesystem`. A policy change is
 loaded when `wrap` starts, so restart the client after this. The `policy`
-command prints that reminder. The published v0.3.3 release has no
-approval. In enforce, REQUIRE_APPROVAL is treated like DENY, with the text
-"requires human approval (not supported by praetore-mcp yet)". From 0.3.4,
-which today is installed only from source, the flow is "Local approval"
-below.
+command prints that reminder. The published v0.3.4 release can hold a
+REQUIRE_APPROVAL call. That optional step is after the switch to enforce,
+below. Do not add it with this deny rule. In observe the call is not held.
 
 ```sh
 praetore-mcp policy deny --id first-rule --server filesystem --tool write_file
@@ -192,18 +190,42 @@ praetore-mcp receipts --tail 5
 praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
 ```
 
-From 0.3.4, to hold a call until someone at the machine approves it:
+The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. A 0.3.4
+journal line is `{"seq","prev","evidence"}`. v0.3.3 reads each line as a
+bare evidence document. This release's `praetore-mcp verify` still reads a
+v0.3.3 journal: those lines are unchained and may only come before the
+first chained entry.
+
+Optional, after the install is in enforce, and only for the test server
+named `filesystem`. In observe a REQUIRE_APPROVAL call is not held. Add
+the rule, restart the client, and ask to create a directory in the test
+folder (`~/praetore-test` when that is the folder you created) with the
+`create_directory` tool of `filesystem`. The call is held.
 
 ```sh
 praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory
-# restart the client, attempt create_directory, then:
 praetore-mcp approvals
-praetore-mcp approve <id>    # interactive terminal; type the code it prints
 ```
 
-A DENY rule on the same tool wins: the call is refused and approval is not
-asked. The agent retries the same call. It is forwarded once. Limits of
-that flow are in point 3 below. The evidence id in the chat matches the `EVIDENCE ID`
+`approvals` lists the pending call. Run `approve` yourself in a terminal.
+An assistant must not run it. `approve` needs an interactive terminal
+(stdin and stderr are both terminals) and the confirmation code you type.
+Without a terminal it signs nothing.
+
+```sh
+praetore-mcp approvals
+praetore-mcp approve <id>
+```
+
+After you approve, ask for the same call again. It is forwarded once.
+`praetore-mcp reject <id>` records a rejection, and that call is not
+forwarded. A pending call expires after 10 minutes by default. The
+terminal check is cooperative: a process that can act as this user can
+open a terminal and approve. It is not a guarantee that a person reviewed
+the call. Deleting or truncating `approvals/journal.jsonl` lets an
+approval be used again. A DENY rule on the same tool wins: the call is
+refused and approval is not asked. Limits of that flow are in point 3
+below. The evidence id in the chat matches the `EVIDENCE ID`
 column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
@@ -246,10 +268,12 @@ Read these before relying on anything above.
    otherwise (1 to 86400 seconds), and is consumed by one later call. A
    second identical call asks again. Different arguments do not match.
    A process that can act as this user can open a terminal and approve.
-   That is not a guarantee that a person reviewed the call. Deleting or
-   truncating `approvals/journal.jsonl` lets an approval be used again.
-   `verify` does not detect that unless you compare, by hand, the approval
-   head it prints. There is no flag for that head. Observe mode
+   That is not a guarantee that a person reviewed the call. The terminal
+   check is cooperative. Deleting or truncating `approvals/journal.jsonl`
+   lets an approval be used again. `verify` does not detect that deletion
+   or truncation unless you compare, by hand, the approval head it prints.
+   There is no flag for that head. The v0.3.3 `praetore-mcp verify` does
+   not read 0.3.4 receipts. Observe mode
    does not hold the call; `praetore-mcp receipts` shows
    `enforce would ask` on that receipt.
 4. **Path arguments must resolve to themselves.** For an argument that a
