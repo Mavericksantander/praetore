@@ -18,8 +18,9 @@ Rust code.
   without a receipt (G7). If the home cannot be loaded at startup (not initialized, or
   invalid keys, pins or policy), no receipt can be written, so every
   `tools/call` is refused in observe as well (see Limitations).
-* **enforce**: ALLOW is forwarded. DENY and REQUIRE_APPROVAL are not
-  forwarded; the client gets an MCP tool error instead.
+* **enforce**: ALLOW is forwarded. DENY is not forwarded; the client gets
+  an MCP tool error. REQUIRE_APPROVAL is not forwarded until a person
+  approves that exact call with `praetore-mcp approve` (see Local approval).
 
 New to praetore-mcp? [GUIDE.md](GUIDE.md) walks through a first run, lists
 what it does not cover, and has a troubleshooting table.
@@ -158,7 +159,7 @@ praetore-mcp verify
 # 7. Add rules (no JSON editing), check them, then restart the client
 praetore-mcp policy deny --id deny-delete --server filesystem --tool delete_file
 praetore-mcp policy require-approval --id approve-ssh --tool read_file --arg-path-prefix path=/Users/me/.ssh
-# v0.3.3 has no approval flow: in enforce this is blocked like a DENY
+# v0.3.3 has no approval. From 0.3.4 the flow is in "Local approval".
 praetore-mcp policy list
 praetore-mcp policy check
 
@@ -185,9 +186,7 @@ A rule names one tool. `policy deny --tool write_file` on
 read-only: `append_file`, `edit_file`, `create_directory`, `move_file` and
 `copy_file` still write. Restart the client after every policy change. A
 running `wrap` keeps the `policy.json` it loaded at start. v0.3.3 has no
-approval flow. REQUIRE_APPROVAL is not supported. In enforce mode it is
-treated like DENY, with the text "requires human approval (not supported
-by praetore-mcp yet)".
+approval. From 0.3.4 the flow is in "Local approval".
 
 `install` turns each stdio entry such as
 
@@ -643,6 +642,74 @@ Things to know:
   The same `safety*` rule applies to a line with bare `\r` separators when
   one of its parts cannot be parsed.
 
+## Local approval
+
+A `require-approval` rule matches in enforce mode before the call is
+forwarded. The client receives an MCP tool error that a person can read
+and that an agent can follow. It contains the approval id and the exact
+command:
+
+```sh
+praetore-mcp policy require-approval --id approve-ssh --tool read_file \
+  --arg-path-prefix path=/Users/me/.ssh
+# restart the MCP client, then let it attempt the call
+
+praetore-mcp approvals
+praetore-mcp approve <id> --dir ~/.praetore/mcp
+praetore-mcp reject <id> --dir ~/.praetore/mcp
+```
+
+`approve` prints the server, the tool, the UTC expiry, and the full
+canonical arguments, then a short code, and waits for that code on stdin.
+It does this only when stdin and stderr are both terminals. The code is
+not stored. If the pending file changes after that print, `approve` does
+not sign it.
+The check is cooperative: any process that can act as this user can open a
+terminal and approve. It is not a guarantee that a person reviewed the call.
+
+What is signed, with the approver key from `init`:
+
+* the approval id (32 random bytes, hex)
+* approve or reject, the approver key id, and the time
+* the server, the tool and the canonical arguments of the pending call
+* when the pending call was created and when it expires
+
+Default expiry is 10 minutes from the hold. Set
+`PRAETORE_MCP_APPROVAL_TTL_SECONDS` (an integer from 1 to 86400) for one
+process, or write that integer to `DIR/approvals/ttl-seconds` for the home.
+The environment variable wins.
+
+After `approve`, the agent retries the same `tools/call`. The proxy
+forwards it once, then appends an execution record signed with the
+attester key. A second retry asks for a new approval. A different argument
+value does not match, including a different JSON value for the same field.
+Key order in the argument object does not matter: the binding is canonical
+JSON. A rejected or expired approval does not forward the call.
+
+`praetore-mcp receipts` prints an `APPROVAL` column: `pending`,
+`approve by <key id prefix>`, `reject by …`, `executed once`, or, in
+observe mode, `enforce would ask`. Observe still forwards the call. The
+signed receipt is the usual `REQUIRE_APPROVAL` evidence with
+`praetore.mode` `observe`; the column is how `receipts` shows that.
+
+`praetore-mcp verify` checks the approval journal as well as the receipts
+journal: approver signature, approver key id against
+`approver-public-key.hex`, binding to the held receipt (server, tool,
+canonical arguments), `created_at <= decided_at <= expires_at`,
+`decided_at <= executed_at <= expires_at`, and one execution per approval.
+Decisions live in `approvals/journal.jsonl`, not in `receipts/*.jsonl`, so
+the receipt line format is unchanged. A home with no approval journal
+(v0.3.3, or current main before any approval) verifies as before. The
+approval journal is hash-linked. Deleting or truncating
+`approvals/journal.jsonl` lets an approval be used again. `verify` does
+not notice: a missing file is `approval journal: none` and still exits 0.
+There is no flag for an expected approval head. The only check is to
+compare, by hand, the approval head that `verify` prints with a copy kept
+somewhere else.
+
+`praetore-verify` does not read this approval journal. It still verifies
+each evidence receipt on its own.
+
 ## Trust model
 
 * **The proxy's own LOCAL/DEV agent key signs each request.** A receipt
@@ -650,12 +717,14 @@ Things to know:
   authorized (enforce) this tool call under this policy*. It does **not** show
   that the upstream agent, LLM or user signed or intended the call. The
   client is not authenticated.
-* `init` creates three LOCAL/DEV Ed25519 keys under `DIR/keys/` (mode 0600,
+* `init` creates four LOCAL/DEV Ed25519 keys under `DIR/keys/` (mode 0600,
   never printed): an issuer, which signs the authority; an agent, which signs
-  intents; and an evidence attester, which signs receipts. All three live on
-  the same machine, so anyone who can read `DIR/keys` can mint receipts that
-  verify. Use them for local adoption and demos, not as a production trust
-  anchor.
+  intents; an evidence attester, which signs receipts; and an approver, which
+  signs `approve` / `reject`. They live on the same machine, so anyone who
+  can read `DIR/keys` can mint receipts and approvals that verify. Use them
+  for local adoption and demos, not as a production trust anchor. A home
+  created before the approver key existed gets that key from a later
+  `init`; the other keys and the receipts journal are left in place.
 * The replay guard is in-memory per wrapper process. Request ids are fresh
   UUIDv4s minted by the proxy, and the guard refuses rather than evicts when
   full. It is not durable across restarts.
@@ -675,8 +744,16 @@ Things to know:
   is not detected, nor is a filesystem mounted, or a policy prefix created,
   in between (filesystem sensitivity and identities are read at decision
   time too). Arguments no `PathPrefix` rule covers are never resolved.
-* REQUIRE_APPROVAL is not supported. In enforce mode it is treated like DENY,
-  with the text "requires human approval (not supported by praetore-mcp yet)".
+* Local approval is cooperative. `approve` refuses to run unless stdin and
+  stderr are terminals, and it asks the person to type a short code.
+  A process that can act as this user can open a terminal, read
+  `DIR/approvals/`, and approve. That is not a guarantee that a person
+  reviewed the call. The approval expires (default 10 minutes) and is
+  consumed by one later call with the same server, tool and canonical
+  arguments. Deleting or truncating `approvals/journal.jsonl` lets that
+  approval be used again. `verify` does not detect that unless you compare,
+  by hand, the approval head it prints. There is no flag for that head.
+  See Local approval.
 * The keys are LOCAL/DEV keys. See the trust model.
 * Observe is not enforcement. Observe receipts are labeled with the signed
   `praetore.mode: observe`.
@@ -713,10 +790,14 @@ Things to know:
 
 | Path | Content |
 | --- | --- |
-| `keys/{issuer,agent,attester}.local-dev.key` | LOCAL/DEV Ed25519 secrets (0600) |
+| `keys/{issuer,agent,attester,approver}.local-dev.key` | LOCAL/DEV Ed25519 secrets (0600) |
 | `agent.json`, `authority.json` | agent identity and its signed authority (`mcp:tools/call`) |
 | `issuer-pins.jsonl` | issuer pin (`praetore-verify --issuer-pins`) |
 | `attester-public-key.hex` | attester public key (`praetore-verify --attester-pin`) |
+| `approver-public-key.hex` | approver public key. `praetore-mcp verify` checks approval signatures against it |
+| `approvals/pending/<id>.json` | one held call waiting for `approve` or `reject` (0600) |
+| `approvals/journal.jsonl` | hash-linked approval decisions and the one execution that consumed each approval |
+| `approvals/ttl-seconds` | optional lifetime, in seconds, used when `PRAETORE_MCP_APPROVAL_TTL_SECONDS` is unset |
 | `policy.json` | v2 policy |
 | `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
 | `receipts/.journal.lock` | lock held while one entry is appended |

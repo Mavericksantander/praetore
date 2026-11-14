@@ -65,11 +65,18 @@ fn truncate(value: &str, width: usize) -> String {
 
 /// Renders the last `tail` receipts as a compact table. Lines are parsed
 /// (integrity-checked) but not signature-verified; use `verify` for that.
-pub fn render_table(lines: &[JournalLine], tail: usize) -> String {
+/// `approval_status` is keyed by evidence id (`pending`, `approve by …`,
+/// `executed once`). An observe `REQUIRE_APPROVAL` receipt with no entry
+/// is labeled `enforce would ask`.
+pub fn render_table(
+    lines: &[JournalLine],
+    tail: usize,
+    approval_status: &BTreeMap<String, String>,
+) -> String {
     let start = lines.len().saturating_sub(tail);
     let mut out = format!(
-        "{:<20} {:<7} {:<16} {:<22} {:<16} {:<24} {}\n",
-        "TIME (UTC)", "MODE", "SERVER", "TOOL", "DECISION", "RULE", "EVIDENCE ID"
+        "{:<20} {:<7} {:<16} {:<22} {:<18} {:<24} {:<36} {}\n",
+        "TIME (UTC)", "MODE", "SERVER", "TOOL", "DECISION", "RULE", "EVIDENCE ID", "APPROVAL"
     );
     for line in &lines[start..] {
         match journal::parse_line(&line.text) {
@@ -98,10 +105,23 @@ pub fn render_table(lines: &[JournalLine], tail: usize) -> String {
                     .map(|c| c.rule_id.as_str())
                     .collect::<Vec<_>>()
                     .join(",");
+                let mode = mode_of(&evidence).unwrap_or("?");
+                let approval = approval_status
+                    .get(&evidence.evidence_id.to_string())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        if outcome == DecisionOutcome::RequireApproval && mode == "observe" {
+                            "enforce would ask".into()
+                        } else if outcome == DecisionOutcome::RequireApproval {
+                            "held".into()
+                        } else {
+                            "-".into()
+                        }
+                    });
                 out.push_str(&format!(
-                    "{:<20} {:<7} {:<16} {:<22} {:<16} {:<24} {}\n",
+                    "{:<20} {:<7} {:<16} {:<22} {:<18} {:<24} {:<36} {}\n",
                     time,
-                    mode_of(&evidence).unwrap_or("?"),
+                    mode,
                     truncate(evidence.action.target.as_deref().unwrap_or("-"), 16),
                     truncate(&tool, 22),
                     decision_label(outcome),
@@ -113,7 +133,8 @@ pub fn render_table(lines: &[JournalLine], tail: usize) -> String {
                         },
                         24
                     ),
-                    evidence.evidence_id
+                    evidence.evidence_id,
+                    truncate(&approval, 40)
                 ));
             }
             Err(error) => out.push_str(&format!(
@@ -142,6 +163,9 @@ pub struct VerifyReport {
     pub head: Option<Position>,
     pub by_mode: BTreeMap<String, usize>,
     pub by_decision: BTreeMap<&'static str, usize>,
+    pub approval_decisions: usize,
+    pub approval_executions: usize,
+    pub approval_head: Option<String>,
 }
 
 /// Verifies one journal line against the local pins. Returns the evidence.
@@ -213,6 +237,7 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     let mut report = VerifyReport::default();
     let mut chain = ChainCheck::default();
+    let mut parsed_evidence = Vec::new();
     for line in read_journal(home)? {
         report.total += 1;
         let at = format!("{}:{}", line.file.display(), line.line_number);
@@ -224,6 +249,7 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
                 continue;
             }
         };
+        parsed_evidence.push(entry.evidence.clone());
         let order = chain.push(&entry);
         match verify_evidence(&entry.evidence, &attester, &pins) {
             Ok(()) if order.is_none() => {
@@ -261,5 +287,10 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
             )),
         }
     }
+    let approvals = crate::approvals::verify(home, &parsed_evidence)?;
+    report.failures.extend(approvals.failures);
+    report.approval_decisions = approvals.decisions;
+    report.approval_executions = approvals.executions;
+    report.approval_head = approvals.head;
     Ok(report)
 }
