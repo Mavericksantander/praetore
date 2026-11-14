@@ -10,7 +10,10 @@
 //!   tool names of `@modelcontextprotocol/server-filesystem@2.3.0`, in its
 //!   order; `FAKE_SERVER_PAGE_SIZE=N` splits that list into pages linked by
 //!   `nextCursor`.
-//! - `FAKE_SERVER_EXIT_AT_START=1` exits at once without answering.
+//! - `FAKE_SERVER_EXIT_AT_START=1` exits without answering. On Unix it
+//!   closes stdout first and writes `exiting without answering` to stderr a
+//!   moment later, so a client sees the end of stdout before that line is
+//!   written, as with a server that fails while still writing to stderr.
 
 /// `tools/list` of `@modelcontextprotocol/server-filesystem@2.3.0`.
 const FILESYSTEM_2_3_0: [&str; 16] = [
@@ -71,6 +74,13 @@ use std::io::{BufRead, Write};
 fn main() {
     eprintln!("fake_server: started");
     if env_set("FAKE_SERVER_EXIT_AT_START").is_some() {
+        #[cfg(unix)]
+        {
+            // SAFETY: closes this process's own stdout, which nothing else
+            // in this branch uses.
+            unsafe { libc::close(1) };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
         eprintln!("fake_server: exiting without answering");
         return;
     }

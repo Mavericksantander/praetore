@@ -275,10 +275,6 @@ fn write_approver_pair(home: &Home, secret: &[u8; 32]) -> Result<(), String> {
     )
 }
 
-/// The default policy (format 2, semantics v2): one ALLOW rule for every
-/// `tools/call`, with `mcp.tools/call` declared Mission, gated on the
-/// explicit `mcp:tools/call` capability. Users add DENY / REQUIRE_APPROVAL
-/// rules keyed on `server`, `tool`, `arguments` and `arguments.<key>`.
 /// The policy `init` writes: no rules, so every `tools/call` is denied by
 /// default (in enforce mode; observe never blocks). Only `tools/call` is
 /// evaluated, so `initialize`, `tools/list` and every other message reach
