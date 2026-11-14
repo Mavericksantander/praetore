@@ -11511,6 +11511,47 @@ mod journal_position {
             !row.get::<_, bool>(3),
             "praetore_runtime cannot execute the assignment"
         );
+        let rejection = admin
+            .query_one(
+                "SELECT pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE'), \
+                        pg_catalog.has_function_privilege('praetore_runtime', p.oid, 'EXECUTE') \
+                 FROM pg_catalog.pg_proc p \
+                 WHERE p.oid = \
+                     'praetore.reject_execution_journal_position_change_v1()'::regprocedure",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !rejection.get::<_, bool>(0),
+            "PUBLIC cannot execute reject_execution_journal_position_change_v1"
+        );
+        assert!(
+            !rejection.get::<_, bool>(1),
+            "praetore_runtime cannot execute reject_execution_journal_position_change_v1"
+        );
+        let privileges = admin
+            .query_one(
+                "SELECT pg_catalog.has_table_privilege(\
+                     'praetore_runtime', 'praetore.journal_positions', 'INSERT'), \
+                        pg_catalog.has_table_privilege(\
+                     'praetore_runtime', 'praetore.journal_positions', 'DELETE'), \
+                        pg_catalog.has_column_privilege(\
+                     'praetore_runtime', 'praetore.execution_journal', 'chain_seq', 'UPDATE')",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !privileges.get::<_, bool>(0),
+            "praetore_runtime cannot INSERT into praetore.journal_positions"
+        );
+        assert!(
+            !privileges.get::<_, bool>(1),
+            "praetore_runtime cannot DELETE from praetore.journal_positions"
+        );
+        assert!(
+            !privileges.get::<_, bool>(2),
+            "praetore_runtime cannot UPDATE praetore.execution_journal.chain_seq"
+        );
     }
 
     /// 0024 applied by a schema owner that is neither superuser nor
@@ -11684,5 +11725,317 @@ mod journal_position {
             .collect();
         positions.sort_unstable();
         assert_eq!(positions, [2, 3]);
+    }
+
+    const CONCURRENT_WRITERS: usize = 8;
+    const TRANSACTIONS_PER_WRITER: usize = 25;
+    /// The writer plan (tenant, rollback, sleep) is the same on every run.
+    const WRITER_PLAN_SEED: u32 = 0x0024_1550;
+
+    /// 32-bit Numerical Recipes LCG. The plan is drawn before any thread
+    /// starts, so scheduling does not change which transactions roll back.
+    struct PlanRng(u32);
+
+    impl PlanRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0
+        }
+    }
+
+    struct WriterStep {
+        tenant: Uuid,
+        rollback: bool,
+        sleep_ms: i32,
+    }
+
+    fn writer_plan() -> Vec<Vec<WriterStep>> {
+        let mut rng = PlanRng(WRITER_PLAN_SEED);
+        (0..CONCURRENT_WRITERS)
+            .map(|_| {
+                (0..TRANSACTIONS_PER_WRITER)
+                    .map(|_| {
+                        let tenant = if rng.next_u32().is_multiple_of(2) {
+                            TENANT_A
+                        } else {
+                            TENANT_B
+                        };
+                        // One draw in five: about 20% of the transactions.
+                        let rollback = rng.next_u32().is_multiple_of(5);
+                        let sleep_ms = i32::try_from(rng.next_u32() % 21).unwrap();
+                        WriterStep {
+                            tenant,
+                            rollback,
+                            sleep_ms,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `count` and `max(chain_seq)` of one tenant in one snapshot.
+    type TenantCounts = (i64, Option<i64>);
+
+    /// Sets the flag on drop, including when a writer panics, so the reader
+    /// cannot keep running after the writers have stopped.
+    struct StopReader<'a>(&'a AtomicBool);
+
+    impl Drop for StopReader<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Eight threads, two tenants, about one transaction in five rolled
+    /// back, and `pg_sleep` of 0 to 20 ms between INSERT and COMMIT. A
+    /// repeatable-read reader takes snapshots for the whole run. Per tenant
+    /// the committed `chain_seq` values are `0..n-1`, `next_seq` is `n`, and
+    /// `export_tenant` succeeds. Every snapshot is a prefix:
+    /// `max(chain_seq) = count - 1` (an empty snapshot has no max).
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_many_writers_are_contiguous_in_commit_order() {
+        let scratch = migrated();
+        let base = config(&scratch);
+        let plan = writer_plan();
+        let stop = AtomicBool::new(false);
+        let snapshots: Mutex<Vec<[TenantCounts; 2]>> = Mutex::new(Vec::new());
+
+        let committed = thread::scope(|scope| {
+            let stop_flag = &stop;
+            let recorded = &snapshots;
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let reader_config = base.clone();
+            let reader = scope.spawn(move || {
+                let mut client = reader_config
+                    .connect(NoTls)
+                    .expect("repeatable-read reader connects");
+                ready_tx.send(()).expect("reader is connected");
+                while !stop_flag.load(Ordering::Acquire) {
+                    let mut transaction = client
+                        .build_transaction()
+                        .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                        .start()
+                        .expect("repeatable-read snapshot");
+                    let mut shot: [TenantCounts; 2] = [(0, None), (0, None)];
+                    for (index, tenant) in [TENANT_A, TENANT_B].into_iter().enumerate() {
+                        let row = transaction
+                            .query_one(
+                                "SELECT count(*)::bigint, max(chain_seq) \
+                                 FROM praetore.execution_journal WHERE tenant_id = $1",
+                                &[&tenant],
+                            )
+                            .expect("read one snapshot");
+                        let count: i64 = row.get(0);
+                        let max_seq: Option<i64> = row.get(1);
+                        shot[index] = (count, max_seq);
+                    }
+                    transaction.commit().expect("end the snapshot");
+                    recorded.lock().expect("record the snapshot").push(shot);
+                    thread::sleep(StdDuration::from_millis(2));
+                }
+            });
+            let release_reader = StopReader(&stop);
+            ready_rx
+                .recv_timeout(StdDuration::from_secs(30))
+                .expect("the reader did not connect within 30 s");
+
+            let mut totals = [0_i64, 0_i64];
+            let writers: Vec<_> = plan
+                .into_iter()
+                .map(|steps| {
+                    let writer_config = base.clone();
+                    scope.spawn(move || {
+                        let mut client = writer_config.connect(NoTls).expect("writer connects");
+                        let mut committed = [0_i64, 0_i64];
+                        for step in steps {
+                            let evidence = receipt(step.tenant, None, None);
+                            let mut transaction = client
+                                .build_transaction()
+                                .isolation_level(postgres::IsolationLevel::ReadCommitted)
+                                .start()
+                                .expect("writer transaction");
+                            insert(&mut transaction, step.tenant, &evidence, None)
+                                .expect("journal insert");
+                            if step.rollback {
+                                transaction
+                                    .rollback()
+                                    .expect("rollback returns the position");
+                            } else {
+                                let seconds = f64::from(step.sleep_ms) / 1000.0;
+                                transaction
+                                    .execute("SELECT pg_catalog.pg_sleep($1)", &[&seconds])
+                                    .expect("pg_sleep between insert and commit");
+                                transaction.commit().expect("commit");
+                                if step.tenant == TENANT_A {
+                                    committed[0] += 1;
+                                } else {
+                                    committed[1] += 1;
+                                }
+                            }
+                        }
+                        committed
+                    })
+                })
+                .collect();
+            for writer in writers {
+                let committed = writer.join().expect("writer thread");
+                totals[0] += committed[0];
+                totals[1] += committed[1];
+            }
+            drop(release_reader);
+            reader.join().expect("repeatable-read reader");
+            totals
+        });
+
+        let snapshots = snapshots.into_inner().expect("snapshots");
+        assert!(
+            !snapshots.is_empty(),
+            "the repeatable-read reader took no snapshot"
+        );
+        println!(
+            "seed={WRITER_PLAN_SEED:#x}, committed A={} B={}, snapshots {}",
+            committed[0],
+            committed[1],
+            snapshots.len()
+        );
+        for snapshot in &snapshots {
+            for (tenant, &(count, max_seq)) in [TENANT_A, TENANT_B].into_iter().zip(snapshot) {
+                assert_eq!(
+                    max_seq,
+                    (count > 0).then_some(count - 1),
+                    "tenant {tenant}: max(chain_seq) = count - 1 \
+                     (count {count}, max {max_seq:?})"
+                );
+            }
+        }
+
+        let mut admin = scratch.connect();
+        for (tenant, committed) in [(TENANT_A, committed[0]), (TENANT_B, committed[1])] {
+            assert!(
+                committed > 0,
+                "tenant {tenant} had no committed transaction"
+            );
+            let positions: Vec<i64> = admin
+                .query(
+                    "SELECT chain_seq FROM praetore.execution_journal \
+                     WHERE tenant_id = $1 ORDER BY chain_seq",
+                    &[&tenant],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let expected: Vec<i64> = (0..committed).collect();
+            assert_eq!(
+                positions, expected,
+                "tenant {tenant}: chain_seq is 0..n-1 for n committed transactions"
+            );
+            let next_seq: i64 = admin
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&tenant],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(next_seq, committed, "tenant {tenant}: next_seq = n");
+            let exported = export_tenant(&mut admin, tenant, &pins()).unwrap();
+            assert_eq!(exported.head.entries.get(), committed as u64);
+        }
+    }
+
+    /// An INSERT the initial-state rules refuse (`allowed` / `executed`)
+    /// takes no position. `next_seq` is unchanged, and while that transaction
+    /// is still open another writer of the same tenant, with `lock_timeout`
+    /// of 200 ms, is not refused with `lock_not_available`.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_refused_initial_state_takes_no_position() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        assert_eq!(
+            insert_committed(&mut admin, TENANT_A, &receipt(TENANT_A, None, None)),
+            0
+        );
+        let next_seq = |client: &mut Client| -> i64 {
+            client
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .get(0)
+        };
+        let before = next_seq(&mut admin);
+
+        let refused = receipt(TENANT_A, None, None);
+        let mut holder = scratch.connect();
+        let mut open = holder.transaction().unwrap();
+        open.execute(
+            "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+            &[&TENANT_A.to_string()],
+        )
+        .unwrap();
+        let agent = *refused.agent.id.as_uuid();
+        open.execute(
+            "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+             VALUES ($1, $2, $3)",
+            &[&TENANT_A, &agent, &refused.request_id],
+        )
+        .unwrap();
+        let error = open
+            .execute(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json, output_json) \
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'executed', $5, '{}')",
+                &[
+                    &TENANT_A,
+                    &agent,
+                    &refused.request_id,
+                    &"ab".repeat(32),
+                    &refused.to_json().unwrap(),
+                ],
+            )
+            .unwrap_err();
+        let message = db_message(error);
+        assert!(
+            message.contains("invalid initial execution journal state"),
+            "{message}"
+        );
+        assert_eq!(
+            next_seq(&mut admin),
+            before,
+            "a refused insert leaves next_seq unchanged"
+        );
+        let visible: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal WHERE request_id = $1",
+                &[&refused.request_id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(visible, 0, "the refused row is not in the journal");
+
+        // The refused transaction is still open across this writer.
+        let mut other = scratch.connect();
+        other.batch_execute("SET lock_timeout = '200ms'").unwrap();
+        let followed = receipt(TENANT_A, None, None);
+        let mut transaction = other.transaction().unwrap();
+        let inserted = insert(&mut transaction, TENANT_A, &followed, None);
+        if let Err(error) = &inserted {
+            assert_ne!(
+                error.code(),
+                Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+                "the refused insert must not hold the tenant position: {error}"
+            );
+        }
+        inserted.expect("a writer of the same tenant inserts while the refused insert is open");
+        assert_eq!(position(&mut transaction, followed.request_id), before);
+        transaction.commit().unwrap();
+        assert_eq!(next_seq(&mut admin), before + 1);
+
+        open.rollback().unwrap();
     }
 }
