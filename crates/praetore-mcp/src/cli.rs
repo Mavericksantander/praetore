@@ -180,15 +180,28 @@ Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
 cannot be read.";
 
 const DASHBOARD_HELP: &str =
-    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]
+    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--approvals]
 
-Serves a read-only page over the receipts journal at http://127.0.0.1:N/
-(127.0.0.1 only, never another address). It shows the decisions, each
-receipt (full JSON, path_check, the agent, attester and authority
-signatures with their key ids) and the result of the same checks `verify`
-runs, per receipt and for the whole journal, with the journal head. The
-page is embedded in the binary and loads nothing from the network. Nothing
-is written under DIR. Each reload reads DIR again. Stop it with Ctrl-C.
+Serves a local page at http://127.0.0.1:N/ (127.0.0.1 only, never another
+address). It shows the decisions, each receipt (full JSON, path_check, the
+agent, attester and authority signatures with their key ids), the result of
+the same checks `verify` runs, per receipt and for the whole journal, with
+the journal head, the pending approvals and the rules of the active policy.
+The page refreshes itself every few seconds while it is visible. It is
+embedded in the binary and loads nothing from the network. Each refresh
+reads DIR again. Stop it with Ctrl-C.
+
+Without --approvals the server is read-only: only GET, and nothing is
+written under DIR. Pending approvals are listed with the `approve` command
+to run in a terminal.
+
+With --approvals the page can also approve or reject a pending call. It
+signs on this computer with the approver key, through the same code as
+`approve` / `reject`: the call shown is bound to the decision, and nothing
+is signed if the pending call changed. The terminal prints a link with a
+session token after #s=; only a tab opened from that link can decide. The
+token lives in this process and in that tab, not on disk. Like `approve`,
+this is cooperative: a process that can act as this user can still decide.
 
 Any local process of any user can open the page and read what it shows
 (tool names and arguments included): run it only while you use it.
@@ -196,6 +209,7 @@ Any local process of any user can open the page and read what it shows
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --port N             TCP port on 127.0.0.1 (default 8787; 0 picks a free port)
   --expected-head HEX  passed to the same check as `verify --expected-head`
+  --approvals          let the page approve and reject pending calls (see above)
 
 Exit code: 2 on a usage error or if the port cannot be opened; otherwise it
 runs until stopped.";
@@ -682,7 +696,12 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
-    let parsed = parse(args, &["--dir", "--port", "--expected-head"], &[], false)?;
+    let parsed = parse(
+        args,
+        &["--dir", "--port", "--expected-head"],
+        &["--approvals"],
+        false,
+    )?;
     let port = match parsed.value("--port") {
         None => crate::dashboard::DEFAULT_PORT,
         Some(value) => value
@@ -700,10 +719,23 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
     let address = listener
         .local_addr()
         .map_err(|e| format!("cannot read the listening address: {e}"))?;
-    println!("praetore-mcp dashboard (read-only): http://{address}/");
+    let session = parsed
+        .flag("--approvals")
+        .then(crate::dashboard::Session::random);
+    match &session {
+        None => println!("praetore-mcp dashboard (read-only): http://{address}/"),
+        Some(session) => {
+            println!("praetore-mcp dashboard (approvals enabled): http://{address}/");
+            println!(
+                "open this link to approve or reject from the page (keep it private):\n  http://{address}/#s={}",
+                session.token_hex()
+            );
+        }
+    }
     println!("home: {}", home.root.display());
     println!("listening on 127.0.0.1 only; stop with Ctrl-C");
-    crate::dashboard::serve(&listener, &home, expected_head, None)?;
+    let _ = std::io::stdout().flush();
+    crate::dashboard::serve_with(&listener, &home, expected_head, session.as_ref(), None)?;
     Ok(0)
 }
 

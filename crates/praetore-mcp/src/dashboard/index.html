@@ -21,6 +21,7 @@
         <option value="pt">Português</option>
       </select>
     </label>
+    <label class="inline"><input id="live" type="checkbox" checked> <span id="live-label"></span><span class="live-dot" aria-hidden="true"></span></label>
     <button id="reload" type="button" data-i18n="reload"></button>
   </div>
 </header>
@@ -28,9 +29,19 @@
   <p id="load-error" class="banner bad" hidden></p>
   <section id="policy-warning" class="banner bad" hidden></section>
   <section class="cards" id="cards"></section>
+  <section class="panel" id="pending">
+    <h2 data-i18n="pending"></h2>
+    <div id="pending-body"></div>
+  </section>
   <section class="panel">
     <h2 data-i18n="verification"></h2>
     <div id="verify"></div>
+  </section>
+  <section class="panel">
+    <details id="policy-panel">
+      <summary><h2 id="policy-title"></h2></summary>
+      <div id="policy-body"></div>
+    </details>
   </section>
   <section class="panel">
     <h2 data-i18n="decisions"></h2>
