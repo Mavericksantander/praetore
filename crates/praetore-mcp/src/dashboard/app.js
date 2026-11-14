@@ -31,6 +31,13 @@ const TOOLS = {
 
 const I18N = {
   es: {
+    nav_operation: "Operación", nav_info: "Información",
+    sub_operation: "Lo que tu agente está haciendo, en tiempo real",
+    sub_info: "Registro, reglas y verificación de todo lo que hizo tu agente",
+    sec_decide: "Por decidir", decide_none: "Nada por decidir.",
+    sec_live: "En vivo", see_log: "Ver registro completo →",
+    it_log: "Registro", it_approvals: "Aprobaciones", it_policy: "Reglas", it_integrity: "Verificación", it_stats: "Estadísticas",
+    tech_details: "Datos técnicos", home_dir: "Carpeta de datos",
     nav_overview: "Resumen", nav_approvals: "Aprobaciones", nav_activity: "Actividad",
     nav_policy: "Política", nav_integrity: "Integridad",
     sub_overview: "Qué hizo tu agente y qué decidió PRÆTORE",
@@ -41,15 +48,15 @@ const I18N = {
     live: "En vivo", updated: (s) => `Actualizado ${s}`,
     mode_readonly: "Solo lectura", mode_approvals: "Aprobaciones activas",
     hero_ok_t: "Todo en orden.",
-    hero_ok_d: (n) => `${n} decisiones firmadas y verificadas. El journal está íntegro.`,
+    hero_ok_d: (n) => `${n} acciones de tu agente registradas, firmadas y verificadas.`,
     hero_bad_t: "Algo no cuadra.",
-    hero_bad_d: (f) => `verify encontró ${f} falla(s) en el journal.`,
-    hero_err_t: "No se pudo verificar el journal",
+    hero_bad_d: (f) => `La verificación del registro encontró ${f} problema(s).`,
+    hero_err_t: "No pudimos verificar el registro.",
     hero_empty_t: "En silencio, por ahora.",
     hero_empty_d: "Cuando tu agente use una herramienta, la decisión aparecerá aquí.",
-    see_integrity: "Ver integridad",
+    see_integrity: "Ver detalles",
     cta_pending: (n) => n === 1 ? "Una acción espera tu decisión." : `${n} acciones esperan tu decisión.`,
-    cta_sub: "El agente no la ejecutó y espera tu decisión.",
+    cta_sub: "Tu agente está en pausa hasta que la apruebes o la rechaces.",
     review: "Revisar",
     k_total: "Decisiones", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pidieron aprobación",
     pct: (p) => `${p}% del total`, k_total_foot: (n) => `${n} en modo enforce`,
@@ -64,7 +71,7 @@ const I18N = {
     agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
     expires_in: (m, s) => `Vence en ${m}:${String(s).padStart(2, "0")}`,
     expired: "Vencida: ya no se puede aprobar",
-    exact_args: "Argumentos exactos",
+    exact_args: "Lo que hará exactamente",
     exact_args_hint: "Esto es exactamente lo que se firma y lo único que el agente podrá ejecutar.",
     approve: "Aprobar", reject: "Rechazar", view_receipt: "Ver recibo",
     history: "Historial", history_sub: "Llamadas que pidieron aprobación y cómo terminaron",
@@ -87,7 +94,7 @@ const I18N = {
     c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
     default_deny: "Bloqueo por defecto",
     empty_filter_t: "Sin resultados", empty_filter_d: "Prueba con otro filtro.",
-    tab_summary: "Resumen", tab_signatures: "Firmas", tab_paths: "Rutas", tab_json: "JSON",
+    tab_summary: "Resumen", tab_signatures: "Verificación", tab_paths: "Rutas", tab_json: "Datos técnicos",
     f_decision: "Decisión", f_rule: "Regla", f_mode: "Modo", f_server: "Servidor", f_tool: "Herramienta",
     f_local: "Hora local", f_utc: "UTC", f_approval: "Aprobación", f_policy: "Política (digest)",
     f_location: "Ubicación", args: "Argumentos", omitted: (b, h) => `(omitidos: ${b} bytes, sha256 ${h})`,
@@ -131,13 +138,20 @@ const I18N = {
     ],
     observe_note: "Un recibo observe registra una decisión que NO se aplicó.",
     verify_error: "verify no pudo correr",
-    warn_allow_all: (rules, n) => `La política tiene una regla que permite todo (${rules}) y hay ${n} recibos en modo enforce: esa regla deja pasar cualquier llamada que no cubra una regla de bloqueo o de aprobación.`,
+    warn_allow_all: (rules, n) => `Tus reglas incluyen una que permite todo (${rules}): cualquier acción que no tenga una regla de bloqueo o de aprobación pasa sin control.`,
     note_allow_all: (rules) => `La política tiene una regla que permite todo (${rules}). Por ahora no hay recibos en modo enforce.`,
     policy_error: "No se pudo leer la política",
     load_error: "No se pudo cargar /api/state",
     unreadable: "Línea ilegible",
   },
   en: {
+    nav_operation: "Operation", nav_info: "Information",
+    sub_operation: "What your agent is doing, in real time",
+    sub_info: "Log, rules and verification of everything your agent did",
+    sec_decide: "To decide", decide_none: "Nothing to decide.",
+    sec_live: "Live", see_log: "See the full log →",
+    it_log: "Log", it_approvals: "Approvals", it_policy: "Rules", it_integrity: "Verification", it_stats: "Statistics",
+    tech_details: "Technical data", home_dir: "Data folder",
     nav_overview: "Overview", nav_approvals: "Approvals", nav_activity: "Activity",
     nav_policy: "Policy", nav_integrity: "Integrity",
     sub_overview: "What your agent did and what PRÆTORE decided",
@@ -148,15 +162,15 @@ const I18N = {
     live: "Live", updated: (s) => `Updated ${s}`,
     mode_readonly: "Read-only", mode_approvals: "Approvals enabled",
     hero_ok_t: "All in order.",
-    hero_ok_d: (n) => `${n} signed and verified decisions. The journal is intact.`,
+    hero_ok_d: (n) => `${n} actions by your agent recorded, signed and verified.`,
     hero_bad_t: "Something does not add up.",
-    hero_bad_d: (f) => `verify found ${f} failure(s) in the journal.`,
-    hero_err_t: "The journal could not be verified",
+    hero_bad_d: (f) => `Verifying the log found ${f} problem(s).`,
+    hero_err_t: "We could not verify the log.",
     hero_empty_t: "Quiet, for now.",
     hero_empty_d: "When your agent uses a tool, the decision will show up here.",
-    see_integrity: "View integrity",
+    see_integrity: "See details",
     cta_pending: (n) => n === 1 ? "One action is waiting for you." : `${n} actions are waiting for you.`,
-    cta_sub: "The agent did not run it and is waiting for your decision.",
+    cta_sub: "Your agent is paused until you approve or reject it.",
     review: "Review",
     k_total: "Decisions", k_allow: "Allowed", k_deny: "Blocked", k_ask: "Asked for approval",
     pct: (p) => `${p}% of total`, k_total_foot: (n) => `${n} in enforce mode`,
@@ -171,7 +185,7 @@ const I18N = {
     agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
     expires_in: (m, s) => `Expires in ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expired: it can no longer be approved",
-    exact_args: "Exact arguments",
+    exact_args: "Exactly what it will do",
     exact_args_hint: "This is exactly what gets signed and the only call the agent will be able to run.",
     approve: "Approve", reject: "Reject", view_receipt: "View receipt",
     history: "History", history_sub: "Calls that asked for approval and how they ended",
@@ -194,7 +208,7 @@ const I18N = {
     c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
     default_deny: "Default deny",
     empty_filter_t: "No results", empty_filter_d: "Try another filter.",
-    tab_summary: "Summary", tab_signatures: "Signatures", tab_paths: "Paths", tab_json: "JSON",
+    tab_summary: "Summary", tab_signatures: "Verification", tab_paths: "Paths", tab_json: "Technical data",
     f_decision: "Decision", f_rule: "Rule", f_mode: "Mode", f_server: "Server", f_tool: "Tool",
     f_local: "Local time", f_utc: "UTC", f_approval: "Approval", f_policy: "Policy (digest)",
     f_location: "Location", args: "Arguments", omitted: (b, h) => `(omitted: ${b} bytes, sha256 ${h})`,
@@ -238,13 +252,20 @@ const I18N = {
     ],
     observe_note: "An observe receipt records a decision that was NOT enforced.",
     verify_error: "verify could not run",
-    warn_allow_all: (rules, n) => `The policy has an allow-all rule (${rules}) and there are ${n} enforce receipts: that rule lets through any call no block or approval rule covers.`,
+    warn_allow_all: (rules, n) => `Your rules include one that allows everything (${rules}): any action without a block or approval rule goes through unchecked.`,
     note_allow_all: (rules) => `The policy has an allow-all rule (${rules}). There are no enforce receipts yet.`,
     policy_error: "Cannot read the policy",
     load_error: "Cannot load /api/state",
     unreadable: "Unreadable line",
   },
   pt: {
+    nav_operation: "Operação", nav_info: "Informação",
+    sub_operation: "O que seu agente está fazendo, em tempo real",
+    sub_info: "Registro, regras e verificação de tudo o que seu agente fez",
+    sec_decide: "Para decidir", decide_none: "Nada para decidir.",
+    sec_live: "Ao vivo", see_log: "Ver registro completo →",
+    it_log: "Registro", it_approvals: "Aprovações", it_policy: "Regras", it_integrity: "Verificação", it_stats: "Estatísticas",
+    tech_details: "Dados técnicos", home_dir: "Pasta de dados",
     nav_overview: "Resumo", nav_approvals: "Aprovações", nav_activity: "Atividade",
     nav_policy: "Política", nav_integrity: "Integridade",
     sub_overview: "O que seu agente fez e o que o PRÆTORE decidiu",
@@ -255,15 +276,15 @@ const I18N = {
     live: "Ao vivo", updated: (s) => `Atualizado ${s}`,
     mode_readonly: "Somente leitura", mode_approvals: "Aprovações ativas",
     hero_ok_t: "Tudo em ordem.",
-    hero_ok_d: (n) => `${n} decisões assinadas e verificadas. O journal está íntegro.`,
+    hero_ok_d: (n) => `${n} ações do seu agente registradas, assinadas e verificadas.`,
     hero_bad_t: "Algo não confere.",
-    hero_bad_d: (f) => `o verify encontrou ${f} falha(s) no journal.`,
-    hero_err_t: "Não foi possível verificar o journal",
+    hero_bad_d: (f) => `A verificação do registro encontrou ${f} problema(s).`,
+    hero_err_t: "Não conseguimos verificar o registro.",
     hero_empty_t: "Em silêncio, por enquanto.",
     hero_empty_d: "Quando seu agente usar uma ferramenta, a decisão aparecerá aqui.",
-    see_integrity: "Ver integridade",
+    see_integrity: "Ver detalhes",
     cta_pending: (n) => n === 1 ? "Uma ação aguarda sua decisão." : `${n} ações aguardam sua decisão.`,
-    cta_sub: "O agente não a executou e aguarda sua decisão.",
+    cta_sub: "Seu agente está em pausa até você aprovar ou rejeitar.",
     review: "Revisar",
     k_total: "Decisões", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pediram aprovação",
     pct: (p) => `${p}% do total`, k_total_foot: (n) => `${n} em modo enforce`,
@@ -278,7 +299,7 @@ const I18N = {
     agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
     expires_in: (m, s) => `Expira em ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expirada: não pode mais ser aprovada",
-    exact_args: "Argumentos exatos",
+    exact_args: "O que fará exatamente",
     exact_args_hint: "Isto é exatamente o que é assinado e a única chamada que o agente poderá executar.",
     approve: "Aprovar", reject: "Rejeitar", view_receipt: "Ver recibo",
     history: "Histórico", history_sub: "Chamadas que pediram aprovação e como terminaram",
@@ -301,7 +322,7 @@ const I18N = {
     c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
     default_deny: "Bloqueio padrão",
     empty_filter_t: "Sem resultados", empty_filter_d: "Tente outro filtro.",
-    tab_summary: "Resumo", tab_signatures: "Assinaturas", tab_paths: "Caminhos", tab_json: "JSON",
+    tab_summary: "Resumo", tab_signatures: "Verificação", tab_paths: "Caminhos", tab_json: "Dados técnicos",
     f_decision: "Decisão", f_rule: "Regra", f_mode: "Modo", f_server: "Servidor", f_tool: "Ferramenta",
     f_local: "Hora local", f_utc: "UTC", f_approval: "Aprovação", f_policy: "Política (digest)",
     f_location: "Localização", args: "Argumentos", omitted: (b, h) => `(omitidos: ${b} bytes, sha256 ${h})`,
@@ -345,7 +366,7 @@ const I18N = {
     ],
     observe_note: "Um recibo observe registra uma decisão que NÃO foi aplicada.",
     verify_error: "o verify não pôde rodar",
-    warn_allow_all: (rules, n) => `A política tem uma regra que permite tudo (${rules}) e há ${n} recibos em modo enforce: essa regra deixa passar qualquer chamada que nenhuma regra de bloqueio ou aprovação cubra.`,
+    warn_allow_all: (rules, n) => `Suas regras incluem uma que permite tudo (${rules}): qualquer ação sem regra de bloqueio ou aprovação passa sem controle.`,
     note_allow_all: (rules) => `A política tem uma regra que permite tudo (${rules}). Ainda não há recibos em modo enforce.`,
     policy_error: "Não foi possível ler a política",
     load_error: "Não foi possível carregar /api/state",
@@ -353,14 +374,16 @@ const I18N = {
   },
 };
 
-const VIEWS = ["overview", "approvals", "activity", "policy", "integrity"];
+const VIEWS = ["operation", "info"];
+const INFO_TABS = ["log", "approvals", "policy", "integrity", "stats"];
 const SESSION_KEY = "praetore-mcp-dashboard-session";
 const LIVE_KEY = "praetore-mcp-dashboard-live";
 const LANG_KEY = "praetore-mcp-dashboard-lang";
 const POLL_MS = 3000;
 
 let lang = "es";
-let view = "overview";
+let view = "operation";
+let infoTab = "log";
 let state = null;
 let selected = null; // index into state.receipts shown in the drawer
 let drawerTab = "summary";
@@ -537,7 +560,7 @@ function takeSessionToken() {
   const match = location.hash.match(/^#s=([0-9a-f]{64})$/);
   if (match) {
     storageSet(sessionStorage, SESSION_KEY, match[1]);
-    history.replaceState(null, "", `${location.pathname}#/overview`);
+    history.replaceState(null, "", `${location.pathname}#/operation`);
   }
   sessionToken = storageGet(sessionStorage, SESSION_KEY) || (match && match[1]) || null;
 }
@@ -569,19 +592,6 @@ function renderShell() {
   const chip = document.getElementById("mode-chip");
   chip.className = state.approvals_from_page ? "chip ok" : "chip";
   chip.textContent = state.approvals_from_page ? t("mode_approvals") : t("mode_readonly");
-  document.getElementById("home").textContent = state.home;
-  const p = state.policy;
-  const s = state.summary;
-  const warning = document.getElementById("policy-warning");
-  if (p.status === "ok" && p.allow_all_rules.length > 0) {
-    warning.hidden = false;
-    warning.className = p.warn_allow_all_enforce ? "alert bad" : "alert warn";
-    warning.textContent = p.warn_allow_all_enforce
-      ? t("warn_allow_all", p.allow_all_rules.join(", "), s.enforce_receipts)
-      : t("note_allow_all", p.allow_all_rules.join(", "));
-  } else {
-    warning.hidden = true;
-  }
 }
 
 function renderStamp() {
@@ -595,45 +605,53 @@ function go(name) {
 
 // ---------- overview ----------
 
-function renderOverview() {
-  const root = document.getElementById("view-overview");
+function renderOperation() {
+  const root = document.getElementById("view-operation");
   root.replaceChildren();
   const s = state.summary;
   const v = state.verify;
-
   // One sentence for the state of things: integrity first, then what
   // waits for a person, then calm.
   const count = activePending().length;
   let hero;
   if (v.status === "error") {
-    hero = heroCard("bad", "!", t("hero_err_t"), String(v.error), t("see_integrity"));
+    hero = heroCard("bad", "!", t("hero_err_t"), String(v.error), t("see_integrity"), "info/integrity");
   } else if (v.status === "fail") {
-    hero = heroCard("bad", "!", t("hero_bad_t"), t("hero_bad_d", v.failed), t("see_integrity"));
+    hero = heroCard("bad", "!", t("hero_bad_t"), t("hero_bad_d", v.failed), t("see_integrity"), "info/integrity");
   } else if (count > 0) {
-    hero = heroCard("warn", "", t("cta_pending", count), t("cta_sub"), t("review"), "approvals");
+    hero = heroCard("warn", "", t("cta_pending", count), t("cta_sub"), null);
   } else if (s.total === 0) {
     hero = heroCard("ok", "", t("hero_empty_t"), t("hero_empty_d"), null);
   } else {
-    hero = heroCard("ok", "", t("hero_ok_t"), t("hero_ok_d", v.verified), t("see_integrity"));
+    hero = heroCard("ok", "", t("hero_ok_t"), t("hero_ok_d", v.verified), t("see_integrity"), "info/integrity");
   }
   root.append(hero);
 
+  const decide = el("section", { class: "op-section" }, el("h2", { class: "eyebrow" }, t("sec_decide")));
+  const active = activePending();
+  if (active.length === 0) decide.append(el("p", { class: "calm" }, t("decide_none")));
+  for (const p of active) decide.append(approvalCard(p));
+  root.append(decide);
+  root.append(recentCard());
+}
+
+function renderStats() {
+  const root = document.getElementById("info-stats");
+  root.replaceChildren();
+  const s = state.summary;
   const pct = (n) => (s.total ? Math.round((n / s.total) * 100) : 0);
-  const kpis = el("div", { class: "grid kpis section-gap" },
+  root.append(el("div", { class: "grid kpis" },
     kpi(t("k_total"), s.total, t("k_total_foot", s.enforce_receipts), "var(--ink)", 100),
     kpi(t("k_allow"), s.allow, t("pct", pct(s.allow)), "var(--bar-allow)", pct(s.allow)),
     kpi(t("k_deny"), s.deny, t("pct", pct(s.deny)), "var(--bar-deny)", pct(s.deny)),
-    kpi(t("k_ask"), s.require_approval, t("pct", pct(s.require_approval)), "var(--bar-ask)", pct(s.require_approval)));
-  root.append(kpis);
-
+    kpi(t("k_ask"), s.require_approval, t("pct", pct(s.require_approval)), "var(--bar-ask)", pct(s.require_approval))));
   const grid = el("div", { class: "grid two section-gap" });
   grid.append(chartCard());
   grid.append(toolsCard());
   root.append(grid);
-  root.append(recentCard());
 }
 
-function heroCard(cls, icon, title, text, linkText, target = "integrity") {
+function heroCard(cls, icon, title, text, linkText, target = "info/integrity") {
   return el("div", { class: `card hero ${cls}` },
     el("div", { class: "hero-icon" }, icon),
     el("div", { class: "hero-text" }, el("h2", {}, title), el("p", {}, text)),
@@ -718,23 +736,25 @@ function toolsCard() {
 
 function recentCard() {
   const list = el("ul", { class: "feed" });
-  const rows = state.receipts.map((r, i) => [r, i]).filter(([r]) => !r.parse_error).reverse().slice(0, 8);
+  const rows = state.receipts.map((r, i) => [r, i]).filter(([r]) => !r.parse_error).reverse().slice(0, 12);
   for (const [r, index] of rows) {
     const target = targetOf(r.arguments);
-    const cls = decisionClass(r.decision);
-    const li = el("li", { onclick: () => openDrawer(index) },
+    // For a held call, what the client cares about is how it ended.
+    const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
+    const cls = outcome ? outcome.cls : decisionClass(r.decision);
+    const li = el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(index) },
       el("span", { class: `avatar ${cls}` }),
       el("div", { class: "what" },
         el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short || r.server || "")),
-      decisionTag(r.decision),
+      outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
       el("time", { title: localText(r.decided_at) }, relativeText(r.decided_at)));
     list.append(li);
   }
   if (rows.length === 0) list.append(el("li", { class: "muted" }, t("empty_recent")));
-  return el("div", { class: "card section-gap" },
-    el("div", { class: "card-head" }, el("h2", {}, t("recent")),
-      el("a", { href: "#/activity" }, t("see_all"))),
+  return el("section", { class: "op-section" },
+    el("div", { class: "card-head" }, el("h2", { class: "eyebrow" }, t("sec_live")),
+      el("a", { href: "#/info/log" }, t("see_log"))),
     list);
 }
 
@@ -744,19 +764,12 @@ function heldReceipt(evidenceId) {
   return state.receipts.find((r) => r.evidence_id === evidenceId);
 }
 
-function renderApprovals() {
-  const root = document.getElementById("view-approvals");
+function renderApprovalsInfo() {
+  const root = document.getElementById("info-approvals");
   root.replaceChildren();
   if (state.pending && !Array.isArray(state.pending)) {
     root.append(el("p", { class: "alert bad" }, String(state.pending.error)));
   }
-  const list = [...activePending(), ...pending().filter(isExpired)];
-  if (activePending().length === 0) {
-    root.append(el("div", { class: "card" },
-      el("div", { class: "empty" },
-        el("strong", {}, t("pend_none_t")), t("pend_none_d"))));
-  }
-  for (const p of list) root.append(approvalCard(p));
   root.append(historyCard());
 }
 
@@ -790,10 +803,6 @@ function approvalCard(p) {
   card.append(el("div", { class: "label-sm" }, t("exact_args")));
   card.append(el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)));
   card.append(el("p", { class: "muted" }, t("exact_args_hint")));
-  card.append(kv([
-    ["approval_id", p.approval_id],
-    [t("f_utc"), utcText(p.expires_at)],
-  ]));
 
   const actions = el("div", { class: "actions" });
   const receiptIndex = state.receipts.findIndex((r) => r.evidence_id === p.evidence_id);
@@ -821,7 +830,7 @@ function approvalCard(p) {
 function historyCard() {
   const rows = state.receipts.map((r, i) => [r, i])
     .filter(([r]) => r.decision === "REQUIRE_APPROVAL").reverse().slice(0, 30);
-  const card = el("div", { class: "card flush section-gap" });
+  const card = el("div", { class: "card flush" });
   card.append(el("div", { class: "card-pad" },
     el("h2", {}, t("history")), el("p", { class: "card-sub" }, t("history_sub"))));
   if (rows.length === 0) {
@@ -976,14 +985,14 @@ function openDrawer(index) {
   const r = state.receipts[index];
   if (r && r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
   renderDrawer();
-  if (view === "activity") renderTable();
+  if (view === "info") renderTable();
 }
 
 function closeDrawer() {
   selected = null;
-  history.replaceState(null, "", `#/${view}`);
+  history.replaceState(null, "", `#/${currentRoute()}`);
   renderDrawer();
-  if (view === "activity") renderTable();
+  if (view === "info") renderTable();
 }
 
 function renderDrawer() {
@@ -1020,6 +1029,17 @@ function renderDrawer() {
   if (drawerTab === "signatures") drawerSignatures(body, r);
   if (drawerTab === "paths") drawerPaths(body, r);
   if (drawerTab === "json") {
+    if (!r.parse_error) {
+      body.append(kv([
+        ["evidence_id", el("span", {}, r.evidence_id, copyButton(r.evidence_id))],
+        [t("f_tool"), r.tool],
+        [t("f_mode"), r.mode],
+        [t("f_utc"), utcText(r.decided_at)],
+        [t("f_policy"), r.policy_digest],
+        [t("f_location"), `${r.location.file}:${r.location.line}`],
+      ]));
+      body.append(el("h3", {}, "JSON"));
+    }
     body.append(el("pre", { class: "json" }, r.raw !== null && r.raw !== undefined ? JSON.stringify(r.raw, null, 2) : r.raw_text));
   }
 }
@@ -1029,15 +1049,10 @@ function drawerSummary(body, r) {
   body.append(kv([
     [t("f_decision"), decisionTag(r.decision)],
     [t("f_rule"), r.rule ?? t("default_deny")],
-    [t("f_mode"), r.mode],
     [t("f_server"), r.server],
-    [t("f_tool"), `${toolLabel(r.tool)} (${r.tool})`],
+    [t("f_tool"), toolLabel(r.tool)],
     [t("f_local"), localText(r.decided_at)],
-    [t("f_utc"), utcText(r.decided_at)],
     [t("f_approval"), label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-"],
-    ["evidence_id", el("span", {}, r.evidence_id, copyButton(r.evidence_id))],
-    [t("f_policy"), r.policy_digest],
-    [t("f_location"), `${r.location.file}:${r.location.line}`],
   ]));
   body.append(el("h3", {}, t("args")));
   body.append(el("pre", { class: "json" }, argsText(r.arguments)));
@@ -1126,9 +1141,12 @@ function effectClass(effect) {
 }
 
 function renderPolicy() {
-  const root = document.getElementById("view-policy");
+  const root = document.getElementById("info-policy");
   root.replaceChildren();
   const p = state.policy;
+  if (p.status === "ok" && p.allow_all_rules.length > 0) {
+    root.append(el("p", { class: "alert bad" }, t("warn_allow_all", p.allow_all_rules.join(", "), state.summary.enforce_receipts)));
+  }
   if (p.status !== "ok") {
     root.append(el("p", { class: "alert bad mono" }, `${t("policy_error")}: ${p.error}`));
     return;
@@ -1158,7 +1176,7 @@ function renderPolicy() {
 // ---------- integrity ----------
 
 function renderIntegrity() {
-  const root = document.getElementById("view-integrity");
+  const root = document.getElementById("info-integrity");
   root.replaceChildren();
   const v = state.verify;
   if (v.status === "error") {
@@ -1192,6 +1210,8 @@ function renderIntegrity() {
   }
   root.append(appr);
 
+  root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("home_dir")),
+    el("div", { class: "hash" }, el("span", { class: "mono" }, state.home), copyButton(state.home))));
   const list = el("ul", { class: "checklist" });
   for (const item of t("checked_list", v.attester_pin, v.issuer_pins)) list.append(el("li", {}, item));
   root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("checked")), list,
@@ -1200,18 +1220,29 @@ function renderIntegrity() {
 
 // ---------- render + load ----------
 
+function renderSubnav() {
+  const nav = document.getElementById("subnav");
+  nav.replaceChildren();
+  for (const tab of INFO_TABS) {
+    nav.append(el("a", { href: `#/info/${tab}`, class: tab === infoTab ? "on" : "" }, t(`it_${tab}`)));
+    document.getElementById(`info-${tab}`).hidden = tab !== infoTab;
+  }
+}
+
 function renderAll() {
   applyStaticText();
   renderShell();
   renderStamp();
+  renderSubnav();
   if (!state) return;
-  renderOverview();
-  renderApprovals();
+  renderOperation();
+  renderApprovalsInfo();
   renderDecisionFilter();
   renderToolFilter();
   renderTable();
   renderPolicy();
   renderIntegrity();
+  renderStats();
   renderDrawer();
 }
 
@@ -1231,8 +1262,8 @@ function announce(next) {
     for (const id of ids) if (!knownIds.has(id)) { freshIds.add(id); added += 1; }
     let newPending = 0;
     for (const id of pendingIds) if (!knownPending.has(id)) newPending += 1;
-    if (newPending > 0) toast(t("toast_pending"), "warn", () => go("approvals"));
-    else if (added > 0) toast(t("toast_new", added), "", () => go("activity"));
+    if (newPending > 0) toast(t("toast_pending"), "warn", () => go("operation"));
+    else if (added > 0) toast(t("toast_new", added), "", () => go("operation"));
   }
   knownIds = ids;
   knownPending = pendingIds;
@@ -1268,21 +1299,31 @@ async function load() {
   }
 }
 
-// #/<view> picks a view; #e=<evidence_id> opens that receipt over the
-// activity view.
+// #/operation, #/info/<tab>; #e=<evidence_id> opens that receipt over the
+// log. Older links (#/overview, #/activity, #/policy...) still land.
+const LEGACY = {
+  overview: ["operation"], approvals: ["operation"], activity: ["info", "log"],
+  policy: ["info", "policy"], integrity: ["info", "integrity"],
+};
 function routeFromHash() {
   const hash = location.hash;
   const evidence = hash.match(/^#e=(.+)$/);
   if (evidence) {
-    view = "activity";
     if (state) {
       const index = state.receipts.findIndex((r) => r.evidence_id === decodeURIComponent(evidence[1]));
       if (index >= 0) selected = index;
     }
     return;
   }
-  const match = hash.match(/^#\/([a-z]+)/);
-  view = match && VIEWS.includes(match[1]) ? match[1] : "overview";
+  const match = hash.match(/^#\/([a-z]+)(?:\/([a-z]+))?/);
+  let [name, tab] = match ? [match[1], match[2]] : ["operation", undefined];
+  if (LEGACY[name]) [name, tab] = LEGACY[name];
+  view = VIEWS.includes(name) ? name : "operation";
+  if (view === "info") infoTab = INFO_TABS.includes(tab) ? tab : "log";
+}
+
+function currentRoute() {
+  return view === "info" ? `info/${infoTab}` : view;
 }
 
 // Ticks the approval countdowns and the "updated" stamp without a reload.
@@ -1291,7 +1332,7 @@ function tick() {
   for (const node of document.querySelectorAll(".countdown[data-expires]")) {
     const left = Math.floor((new Date(node.getAttribute("data-expires")).getTime() - Date.now()) / 1000);
     if (Number.isNaN(left)) continue;
-    if (left <= 0) { fingerprint = null; if (state) renderApprovals(); return; }
+    if (left <= 0) { fingerprint = null; if (state) renderOperation(); return; }
     node.textContent = t("expires_in", Math.floor(left / 60), left % 60);
   }
   for (const node of document.querySelectorAll(".countdown-fill[data-expires]")) {

@@ -165,6 +165,19 @@ button:disabled { opacity: .5; cursor: progress; }
 .hero.warn .hero-cta { background: var(--accent); border-color: var(--accent); color: var(--paper); }
 .cta { display: none; }
 
+/* Operation */
+.op-section { margin-top: 64px; }
+.op-section > .eyebrow, .op-section > .card-head { margin-bottom: 16px; }
+.op-section .approval:first-of-type { margin-top: 8px; }
+.calm { margin: 0; padding: 22px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); color: var(--quiet); font: 400 20px var(--serif); }
+.feed li.fresh .avatar { box-shadow: 0 0 0 4px var(--accent-soft); }
+
+/* Information */
+.subnav { display: flex; gap: 28px; flex-wrap: wrap; border-bottom: 1px solid var(--rule); margin: -8px 0 40px; }
+.subnav a { padding: 0 0 12px; color: var(--quiet); text-decoration: none; border-bottom: 1px solid transparent; margin-bottom: -1px; font-size: 14px; }
+.subnav a:hover { color: var(--ink); }
+.subnav a.on { color: var(--ink); border-bottom-color: var(--accent); }
+
 /* Figures */
 .kpi { padding: 24px 24px 22px; position: relative; }
 .kpi + .kpi { border-left: 1px solid var(--rule); }
