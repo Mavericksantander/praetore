@@ -155,6 +155,8 @@ praetore-mcp receipts --tail 20
 
 # 6. Verify every receipt (integrity, attester signature, intent, authority, mode)
 praetore-mcp verify
+#    or look at receipts and the same checks in a read-only page on 127.0.0.1
+praetore-mcp dashboard    # see GUIDE.md
 
 # 7. Add rules (no JSON editing), check them, then restart the client
 praetore-mcp policy deny --id deny-delete --server filesystem --tool delete_file

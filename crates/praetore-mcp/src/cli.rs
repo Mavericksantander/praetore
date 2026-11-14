@@ -25,6 +25,7 @@ Usage:
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
   praetore-mcp verify    [--dir DIR] [--expected-head HEX]
+  praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]
   praetore-mcp approvals [--dir DIR]
   praetore-mcp approve   <id> [--dir DIR]
   praetore-mcp reject    <id> [--dir DIR]
@@ -178,6 +179,27 @@ entry.
 Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
 cannot be read.";
 
+const DASHBOARD_HELP: &str =
+    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]
+
+Serves a read-only page over the receipts journal at http://127.0.0.1:N/
+(127.0.0.1 only, never another address). It shows the decisions, each
+receipt (full JSON, path_check, the agent, attester and authority
+signatures with their key ids) and the result of the same checks `verify`
+runs, per receipt and for the whole journal, with the journal head. The
+page is embedded in the binary and loads nothing from the network. Nothing
+is written under DIR. Each reload reads DIR again. Stop it with Ctrl-C.
+
+Any local process of any user can open the page and read what it shows
+(tool names and arguments included): run it only while you use it.
+
+  --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+  --port N             TCP port on 127.0.0.1 (default 8787; 0 picks a free port)
+  --expected-head HEX  passed to the same check as `verify --expected-head`
+
+Exit code: 2 on a usage error or if the port cannot be opened; otherwise it
+runs until stopped.";
+
 const POLICY_HELP: &str = "Usage:
   praetore-mcp policy list   [--dir DIR]
   praetore-mcp policy check  [--dir DIR]
@@ -206,6 +228,7 @@ fn help_for(command: &str) -> Option<&'static str> {
         "uninstall" => UNINSTALL_HELP,
         "receipts" => RECEIPTS_HELP,
         "verify" => VERIFY_HELP,
+        "dashboard" => DASHBOARD_HELP,
         "approvals" => APPROVALS_HELP,
         "approve" => APPROVE_HELP,
         "reject" => REJECT_HELP,
@@ -316,6 +339,7 @@ pub fn run(args: &[String]) -> i32 {
         "uninstall" => cmd_install(rest, true),
         "receipts" => cmd_receipts(rest),
         "verify" => cmd_verify(rest),
+        "dashboard" => cmd_dashboard(rest),
         "approvals" => cmd_approvals(rest),
         "approve" => cmd_decide(rest, crate::approvals::HumanOutcome::Approve),
         "reject" => cmd_decide(rest, crate::approvals::HumanOutcome::Reject),
@@ -655,6 +679,32 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         "approval checks: approver signature, binding to the held call, expiry, single use. An observe REQUIRE_APPROVAL receipt means enforce would ask; it is not a hold."
     );
     Ok(if report.failures.is_empty() { 0 } else { 1 })
+}
+
+fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--dir", "--port", "--expected-head"], &[], false)?;
+    let port = match parsed.value("--port") {
+        None => crate::dashboard::DEFAULT_PORT,
+        Some(value) => value
+            .parse::<u16>()
+            .map_err(|_| format!("--port must be a number from 0 to 65535, got {value:?}"))?,
+    };
+    let expected_head = parsed.value("--expected-head");
+    if let Some(head) = expected_head
+        && praetore_core::journal_chain::ChainLink::from_hex(head).is_none()
+    {
+        return Err("--expected-head must be 64 lowercase hex characters".into());
+    }
+    let home = parsed.home()?;
+    let listener = crate::dashboard::bind(port)?;
+    let address = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read the listening address: {e}"))?;
+    println!("praetore-mcp dashboard (read-only): http://{address}/");
+    println!("home: {}", home.root.display());
+    println!("listening on 127.0.0.1 only; stop with Ctrl-C");
+    crate::dashboard::serve(&listener, &home, expected_head, None)?;
+    Ok(0)
 }
 
 fn cmd_approvals(args: &[String]) -> Result<i32, String> {

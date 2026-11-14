@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRÆTORE MCP receipts</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1 data-i18n="title"></h1>
+    <p class="muted"><span data-i18n="readonly"></span> · <span id="home"></span></p>
+  </div>
+  <div class="controls">
+    <label><span data-i18n="language"></span>
+      <select id="lang">
+        <option value="es">Español</option>
+        <option value="en">English</option>
+        <option value="pt">Português</option>
+      </select>
+    </label>
+    <button id="reload" type="button" data-i18n="reload"></button>
+  </div>
+</header>
+<main>
+  <p id="load-error" class="banner bad" hidden></p>
+  <section id="policy-warning" class="banner bad" hidden></section>
+  <section class="cards" id="cards"></section>
+  <section class="panel">
+    <h2 data-i18n="verification"></h2>
+    <div id="verify"></div>
+  </section>
+  <section class="panel">
+    <h2 data-i18n="decisions"></h2>
+    <div class="filters">
+      <label><span data-i18n="f_decision"></span>
+        <select id="f-decision">
+          <option value="" data-i18n="all"></option>
+          <option value="ALLOW">ALLOW</option>
+          <option value="DENY">DENY</option>
+          <option value="REQUIRE_APPROVAL">REQUIRE_APPROVAL</option>
+        </select>
+      </label>
+      <label><span data-i18n="f_tool"></span>
+        <select id="f-tool"><option value="" data-i18n="all"></option></select>
+      </label>
+      <label class="grow"><span data-i18n="f_text"></span>
+        <input id="f-text" type="search" autocomplete="off">
+      </label>
+      <span id="shown" class="muted"></span>
+    </div>
+    <div class="table-wrap">
+      <table id="table">
+        <thead><tr>
+          <th data-i18n="c_local"></th>
+          <th data-i18n="c_utc"></th>
+          <th data-i18n="c_server"></th>
+          <th data-i18n="c_tool"></th>
+          <th data-i18n="c_args"></th>
+          <th data-i18n="c_decision"></th>
+          <th data-i18n="c_rule"></th>
+          <th data-i18n="c_mode"></th>
+          <th data-i18n="c_verify"></th>
+          <th>evidence_id</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="panel" id="detail" hidden>
+    <h2 data-i18n="detail"></h2>
+    <div id="detail-body"></div>
+  </section>
+</main>
+</body>
+</html>

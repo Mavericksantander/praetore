@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- **`praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]`.**
+  A read-only local page over `receipts/*.jsonl`, served on 127.0.0.1 only
+  (default port 8787, `0` picks a free one). Any other address is refused.
+  The page shows a summary (total, ALLOW, DENY, active policy id, version
+  and digest, and a warning when an allow-all rule meets enforce receipts),
+  the decisions table (local time and UTC, server, tool, arguments,
+  decision, rule or `default deny`, mode, evidence id) with filters, and
+  each receipt's full JSON, `path_check` and agent, attester and authority
+  signatures with their key ids. The verification status, per receipt and
+  for the journal, with seq/prev and the journal head, comes from the code
+  behind `praetore-mcp verify`. To share it, `verify`'s per-receipt check
+  is split into one result per check (`receipts::check_evidence`). `verify`
+  prints the same output as before. HTML, CSS and JS are embedded in the
+  binary. Nothing is loaded from the network or written under DIR. Only
+  GET requests with a loopback `Host` are answered. Texts in Spanish,
+  English and Portuguese.
+
 ## 0.3.4 - 2026-11-13
 
 Adds local approval to praetore-mcp: in enforce mode a `REQUIRE_APPROVAL`
