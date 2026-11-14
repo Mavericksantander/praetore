@@ -46,7 +46,7 @@ const I18N = {
     sub_policy: "Las reglas que deciden cada llamada",
     sub_integrity: "La misma verificación que praetore-mcp verify",
     live: "En vivo", updated: (s) => `Actualizado ${s}`,
-    mode_readonly: "Solo lectura", mode_approvals: "Aprobaciones activas",
+    mode_readonly: "Solo lectura", 
     hero_ok_t: "Todo en orden.",
     hero_ok_d: (n) => `${n} acciones de tu agente registradas, firmadas y verificadas.`,
     hero_bad_t: "Algo no cuadra.",
@@ -56,7 +56,7 @@ const I18N = {
     hero_empty_d: "Cuando tu agente use una herramienta, la decisión aparecerá aquí.",
     see_integrity: "Ver detalles",
     cta_pending: (n) => n === 1 ? "Una acción espera tu decisión." : `${n} acciones esperan tu decisión.`,
-    cta_sub: "Tu agente está en pausa hasta que la apruebes o la rechaces.",
+    cta_sub: "Tu agente está en pausa hasta que la apruebes o la rechaces desde una terminal.",
     review: "Revisar",
     k_total: "Decisiones", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pidieron aprobación",
     pct: (p) => `${p}% del total`, k_total_foot: (n) => `${n} en modo enforce`,
@@ -76,17 +76,8 @@ const I18N = {
     approve: "Aprobar", reject: "Rechazar", view_receipt: "Ver recibo",
     history: "Historial", history_sub: "Llamadas que pidieron aprobación y cómo terminaron",
     history_none: "Aún no hay llamadas que hayan pedido aprobación.",
-    need_token: "Esta pestaña no tiene el token de sesión. Abre el enlace con #s= que imprimió la terminal para decidir desde aquí.",
-    cli_hint: "Este dashboard es de solo lectura. Decide desde una terminal, o arráncalo con --approvals:",
+    cli_hint: "Para decidir, ejecuta uno de estos comandos en una terminal de este computador", copy_approve: "Copiar comando para aprobar",
     copy: "Copiar", copied: "Copiado",
-    m_approve_t: "¿Aprobar esta acción?",
-    m_approve_d: "Se firmará con la llave de aprobador de este computador. El agente podrá ejecutar esta llamada exacta UNA vez antes de que venza.",
-    m_reject_t: "¿Rechazar esta acción?",
-    m_reject_d: "Se firmará el rechazo. La llamada no se ejecutará; si el agente lo intenta de nuevo, volverá a pedir aprobación.",
-    cancel: "Cancelar", confirm_approve: "Sí, aprobar", confirm_reject: "Sí, rechazar", sending: "Firmando…",
-    decided_approve: "Aprobada. El agente puede reintentar esta llamada exacta una vez.",
-    decided_reject: "Rechazada. La llamada no se ejecutará.",
-    decide_error: "No se firmó nada",
     toast_pending: "Nueva acción esperando tu aprobación",
     toast_new: (n) => n === 1 ? "1 decisión nueva" : `${n} decisiones nuevas`,
     search_ph: "Buscar por archivo, herramienta, regla o id…",
@@ -160,7 +151,7 @@ const I18N = {
     sub_policy: "The rules that decide each call",
     sub_integrity: "The same verification as praetore-mcp verify",
     live: "Live", updated: (s) => `Updated ${s}`,
-    mode_readonly: "Read-only", mode_approvals: "Approvals enabled",
+    mode_readonly: "Read-only", 
     hero_ok_t: "All in order.",
     hero_ok_d: (n) => `${n} actions by your agent recorded, signed and verified.`,
     hero_bad_t: "Something does not add up.",
@@ -170,7 +161,7 @@ const I18N = {
     hero_empty_d: "When your agent uses a tool, the decision will show up here.",
     see_integrity: "See details",
     cta_pending: (n) => n === 1 ? "One action is waiting for you." : `${n} actions are waiting for you.`,
-    cta_sub: "Your agent is paused until you approve or reject it.",
+    cta_sub: "Your agent is paused until you approve or reject it from a terminal.",
     review: "Review",
     k_total: "Decisions", k_allow: "Allowed", k_deny: "Blocked", k_ask: "Asked for approval",
     pct: (p) => `${p}% of total`, k_total_foot: (n) => `${n} in enforce mode`,
@@ -190,17 +181,8 @@ const I18N = {
     approve: "Approve", reject: "Reject", view_receipt: "View receipt",
     history: "History", history_sub: "Calls that asked for approval and how they ended",
     history_none: "No call has asked for approval yet.",
-    need_token: "This tab has no session token. Open the #s= link the terminal printed to decide from here.",
-    cli_hint: "This dashboard is read-only. Decide from a terminal, or start it with --approvals:",
+    cli_hint: "To decide, run one of these commands in a terminal on this computer", copy_approve: "Copy approve command",
     copy: "Copy", copied: "Copied",
-    m_approve_t: "Approve this action?",
-    m_approve_d: "It will be signed with this computer's approver key. The agent may run this exact call ONCE before it expires.",
-    m_reject_t: "Reject this action?",
-    m_reject_d: "The rejection will be signed. The call will not run; if the agent tries again, it asks for approval again.",
-    cancel: "Cancel", confirm_approve: "Yes, approve", confirm_reject: "Yes, reject", sending: "Signing…",
-    decided_approve: "Approved. The agent can retry this exact call once.",
-    decided_reject: "Rejected. The call will not run.",
-    decide_error: "Nothing was signed",
     toast_pending: "New action waiting for your approval",
     toast_new: (n) => n === 1 ? "1 new decision" : `${n} new decisions`,
     search_ph: "Search by file, tool, rule or id…",
@@ -274,7 +256,7 @@ const I18N = {
     sub_policy: "As regras que decidem cada chamada",
     sub_integrity: "A mesma verificação do praetore-mcp verify",
     live: "Ao vivo", updated: (s) => `Atualizado ${s}`,
-    mode_readonly: "Somente leitura", mode_approvals: "Aprovações ativas",
+    mode_readonly: "Somente leitura", 
     hero_ok_t: "Tudo em ordem.",
     hero_ok_d: (n) => `${n} ações do seu agente registradas, assinadas e verificadas.`,
     hero_bad_t: "Algo não confere.",
@@ -284,7 +266,7 @@ const I18N = {
     hero_empty_d: "Quando seu agente usar uma ferramenta, a decisão aparecerá aqui.",
     see_integrity: "Ver detalhes",
     cta_pending: (n) => n === 1 ? "Uma ação aguarda sua decisão." : `${n} ações aguardam sua decisão.`,
-    cta_sub: "Seu agente está em pausa até você aprovar ou rejeitar.",
+    cta_sub: "Seu agente está em pausa até você aprovar ou rejeitar em um terminal.",
     review: "Revisar",
     k_total: "Decisões", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pediram aprovação",
     pct: (p) => `${p}% do total`, k_total_foot: (n) => `${n} em modo enforce`,
@@ -304,17 +286,8 @@ const I18N = {
     approve: "Aprovar", reject: "Rejeitar", view_receipt: "Ver recibo",
     history: "Histórico", history_sub: "Chamadas que pediram aprovação e como terminaram",
     history_none: "Nenhuma chamada pediu aprovação ainda.",
-    need_token: "Esta aba não tem o token de sessão. Abra o link com #s= que o terminal imprimiu para decidir daqui.",
-    cli_hint: "Este dashboard é somente leitura. Decida em um terminal, ou inicie-o com --approvals:",
+    cli_hint: "Para decidir, execute um destes comandos em um terminal deste computador", copy_approve: "Copiar comando para aprovar",
     copy: "Copiar", copied: "Copiado",
-    m_approve_t: "Aprovar esta ação?",
-    m_approve_d: "Será assinada com a chave de aprovador deste computador. O agente poderá executar esta chamada exata UMA vez antes de expirar.",
-    m_reject_t: "Rejeitar esta ação?",
-    m_reject_d: "A rejeição será assinada. A chamada não será executada; se o agente tentar de novo, pedirá aprovação de novo.",
-    cancel: "Cancelar", confirm_approve: "Sim, aprovar", confirm_reject: "Sim, rejeitar", sending: "Assinando…",
-    decided_approve: "Aprovada. O agente pode repetir esta chamada exata uma vez.",
-    decided_reject: "Rejeitada. A chamada não será executada.",
-    decide_error: "Nada foi assinado",
     toast_pending: "Nova ação aguardando sua aprovação",
     toast_new: (n) => n === 1 ? "1 decisão nova" : `${n} decisões novas`,
     search_ph: "Buscar por arquivo, ferramenta, regra ou id…",
@@ -376,7 +349,6 @@ const I18N = {
 
 const VIEWS = ["operation", "info"];
 const INFO_TABS = ["log", "approvals", "policy", "integrity", "stats"];
-const SESSION_KEY = "praetore-mcp-dashboard-session";
 const LIVE_KEY = "praetore-mcp-dashboard-live";
 const LANG_KEY = "praetore-mcp-dashboard-lang";
 const POLL_MS = 3000;
@@ -394,7 +366,6 @@ let knownPending = null;
 const freshIds = new Set();
 let loading = false;
 let live = true;
-let sessionToken = null;
 let lastLoadedAt = null;
 
 // ---------- helpers ----------
@@ -522,6 +493,20 @@ function copyButton(text) {
   return button;
 }
 
+function copyButtonLabeled(text, label) {
+  const button = el("button", { type: "button", class: "btn-ok" }, label);
+  button.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = t("copied");
+      setTimeout(() => { button.textContent = label; }, 1800);
+    } catch (_) {
+      button.textContent = "×";
+    }
+  });
+  return button;
+}
+
 function kv(pairs) {
   const box = el("div", { class: "kv" });
   for (const [k, v] of pairs) {
@@ -552,19 +537,6 @@ function activePending() {
   return pending().filter((p) => !isExpired(p));
 }
 
-// ---------- session token ----------
-
-// The terminal prints the session token after #s=. Keep it in this tab's
-// sessionStorage only, and take it out of the address bar.
-function takeSessionToken() {
-  const match = location.hash.match(/^#s=([0-9a-f]{64})$/);
-  if (match) {
-    storageSet(sessionStorage, SESSION_KEY, match[1]);
-    history.replaceState(null, "", `${location.pathname}#/operation`);
-  }
-  sessionToken = storageGet(sessionStorage, SESSION_KEY) || (match && match[1]) || null;
-}
-
 // ---------- shell ----------
 
 function applyStaticText() {
@@ -590,8 +562,8 @@ function renderShell() {
   badge.textContent = String(count);
   document.title = count > 0 ? `(${count}) PRÆTORE MCP` : "PRÆTORE MCP";
   const chip = document.getElementById("mode-chip");
-  chip.className = state.approvals_from_page ? "chip ok" : "chip";
-  chip.textContent = state.approvals_from_page ? t("mode_approvals") : t("mode_readonly");
+  chip.className = "chip ok";
+  chip.textContent = t("mode_readonly");
 }
 
 function renderStamp() {
@@ -804,26 +776,21 @@ function approvalCard(p) {
   card.append(el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)));
   card.append(el("p", { class: "muted" }, t("exact_args_hint")));
 
-  const actions = el("div", { class: "actions" });
   const receiptIndex = state.receipts.findIndex((r) => r.evidence_id === p.evidence_id);
-  if (!expired && state.approvals_from_page && sessionToken) {
-    actions.append(
-      el("button", { type: "button", class: "btn-ok", onclick: () => confirmDecision(p, "approve") }, `✓ ${t("approve")}`),
-      el("button", { type: "button", class: "btn-danger", onclick: () => confirmDecision(p, "reject") }, `✕ ${t("reject")}`));
+  if (!expired) {
+    const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}\npraetore-mcp reject ${p.approval_id} --dir ${state.home}`;
+    card.append(el("div", { class: "label-sm" }, t("cli_hint")));
+    card.append(el("div", { class: "code-box" }, el("pre", {}, commands)));
+  }
+  const actions = el("div", { class: "actions" });
+  if (!expired) {
+    const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}`;
+    actions.append(copyButtonLabeled(commands, t("copy_approve")));
   }
   if (receiptIndex >= 0) {
     actions.append(el("button", { type: "button", onclick: () => openDrawer(receiptIndex) }, t("view_receipt")));
   }
   card.append(actions);
-  if (!expired && state.approvals_from_page && !sessionToken) {
-    card.append(el("p", { class: "alert warn section-gap" }, t("need_token")));
-  }
-  if (!expired && !state.approvals_from_page) {
-    const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}\npraetore-mcp reject ${p.approval_id} --dir ${state.home}`;
-    card.append(el("p", { class: "muted section-gap" }, t("cli_hint")));
-    card.append(el("div", { class: "code-box" }, el("pre", {}, commands)));
-    card.append(copyButton(commands));
-  }
   return card;
 }
 
@@ -851,63 +818,6 @@ function historyCard() {
     el("thead", {}, el("tr", {}, el("th", {}, t("c_when")), el("th", {}, t("c_action")), el("th", {}, t("f_approval")))),
     body)));
   return card;
-}
-
-function closeModal() {
-  document.getElementById("modal").hidden = true;
-  document.getElementById("modal-box").replaceChildren();
-}
-
-function confirmDecision(p, mode) {
-  const box = document.getElementById("modal-box");
-  let args = null;
-  try { args = JSON.parse(p.arguments_canonical); } catch (_) { args = null; }
-  const target = targetOf(args);
-  const go = el("button", { type: "button", class: mode === "approve" ? "btn-ok" : "btn-danger solid" },
-    t(mode === "approve" ? "confirm_approve" : "confirm_reject"));
-  go.addEventListener("click", () => decide(p, mode, go));
-  box.replaceChildren(
-    el("div", { class: `modal-icon ${mode === "approve" ? "ok" : "bad"}` }, mode === "approve" ? "✓" : "✕"),
-    el("h2", {}, t(mode === "approve" ? "m_approve_t" : "m_reject_t")),
-    el("p", {}, t(mode === "approve" ? "m_approve_d" : "m_reject_d")),
-    kv([[t("f_server"), p.server], [t("f_tool"), `${toolLabel(p.tool)} (${p.tool})`], [t("args"), target.full || "-"]]),
-    el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)),
-    el("div", { class: "actions" },
-      el("button", { type: "button", onclick: closeModal }, t("cancel")), go));
-  document.getElementById("modal").hidden = false;
-  go.focus();
-}
-
-async function decide(p, mode, button) {
-  button.disabled = true;
-  button.textContent = t("sending");
-  try {
-    const response = await fetch(mode === "approve" ? "/api/approve" : "/api/reject", {
-      method: "POST",
-      cache: "no-store",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
-      body: JSON.stringify({
-        approval_id: p.approval_id,
-        server: p.server,
-        tool: p.tool,
-        evidence_id: p.evidence_id,
-        arguments_canonical: p.arguments_canonical,
-      }),
-    });
-    const text = await response.text();
-    let body = null;
-    try { body = JSON.parse(text); } catch (_) { body = null; }
-    if (response.ok && body && body.ok) {
-      toast(t(mode === "approve" ? "decided_approve" : "decided_reject"), "ok");
-    } else {
-      toast(`${t("decide_error")}: ${body && body.error ? body.error : `HTTP ${response.status} ${text}`}`, "bad");
-    }
-  } catch (e) {
-    toast(`${t("decide_error")}: ${e.message}`, "bad");
-  }
-  closeModal();
-  fingerprint = null;
-  await load();
 }
 
 // ---------- activity ----------
@@ -1250,7 +1160,7 @@ function fingerprintOf(s) {
   return JSON.stringify([
     s.summary, s.verify && s.verify.status, s.verify && s.verify.head, s.verify && s.verify.failed,
     s.verify && s.verify.approval, s.pending, s.policy && s.policy.digest, s.policy && s.policy.status,
-    s.approvals_from_page, s.receipts.map((r) => r.approval).join("|"),
+    s.receipts.map((r) => r.approval).join("|"),
   ]);
 }
 
@@ -1343,7 +1253,6 @@ function tick() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  takeSessionToken();
   const stored = storageGet(localStorage, LANG_KEY);
   const nav = (navigator.language || "es").slice(0, 2);
   lang = I18N[stored] ? stored : I18N[nav] ? nav : "es";
@@ -1375,13 +1284,9 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("f-text").addEventListener("input", renderTable);
   document.getElementById("drawer-close").addEventListener("click", closeDrawer);
   document.getElementById("scrim").addEventListener("click", closeDrawer);
-  document.getElementById("modal").addEventListener("click", (event) => {
-    if (event.target.id === "modal") closeModal();
-  });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
-    if (!document.getElementById("modal").hidden) closeModal();
-    else if (selected !== null) closeDrawer();
+    if (selected !== null) closeDrawer();
   });
   setInterval(() => { if (live && !document.hidden) load(); }, POLL_MS);
   setInterval(tick, 1000);
