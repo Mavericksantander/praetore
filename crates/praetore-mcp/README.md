@@ -27,21 +27,21 @@ what it does not cover, and has a troubleshooting table.
 
 ## Install
 
-To install `praetore-mcp` v0.3.3 without Rust and without cloning the
+To install `praetore-mcp` v0.3.4 without Rust and without cloning the
 repository, download one archive and `SHA256SUMS` from the published
-[v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3)
-(commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`, not a build of the
+[v0.3.4 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4)
+(commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`, not a build of the
 current `main` branch):
 
-- macOS Apple silicon: `praetore-mcp-v0.3.3-aarch64-apple-darwin.tar.gz`
-- macOS Intel: `praetore-mcp-v0.3.3-x86_64-apple-darwin.tar.gz`
-- Linux x86_64: `praetore-mcp-v0.3.3-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Apple silicon: `praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz`
+- macOS Intel: `praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz`
+- Linux x86_64: `praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz`
 
-v0.3.3 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.4 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you unpack it
 (`shasum -a 256 -c SHA256SUMS --ignore-missing` on macOS,
 `sha256sum -c SHA256SUMS --ignore-missing` on Linux). The published digests
-are in [Install from the v0.3.3 release](../../docs/install-prebuilt.md).
+are in [Install from the v0.3.4 release](../../docs/install-prebuilt.md).
 If `SHA256SUMS` does not match that list, stop. Unpack with `tar -xzf`,
 then move `praetore-mcp` to a directory on your `PATH` that you will keep,
 for example `~/.local/bin`, before you run `install`. `install` records
@@ -87,20 +87,20 @@ as the `release-assets-<tag>` artifact.
 
 For a `v*` tag, CI also signs `SHA256SUMS` with Sigstore keyless signing
 (`SHA256SUMS.sigstore.json`) and publishes the archives, `SHA256SUMS` and
-the signature as a GitHub Release. The v0.3.3 files are on
-[the v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3)
-(commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`). That release has no
+the signature as a GitHub Release. The v0.3.4 files are on
+[the v0.3.4 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4)
+(commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`). That release has no
 Windows binary and no Linux ARM binary.
 
 The install check is the digest. Download `SHA256SUMS` and the one archive
 for this machine, then run the `shasum` or `sha256sum` command below. The
 published digests are listed in
-[Install from the v0.3.3 release](../../docs/install-prebuilt.md). If the
+[Install from the v0.3.4 release](../../docs/install-prebuilt.md). If the
 file does not match, stop.
 
 Checking the Sigstore signature is optional for that install. It needs
-`cosign`. For v0.3.3, pass
-`--certificate-github-workflow-sha 0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`
+`cosign`. For v0.3.4, pass
+`--certificate-github-workflow-sha a606c111d788bfb927a8c5b953e30bf1d8c37421`
 instead of `git rev-parse`, which needs a clone. The command and what the
 signature does prove are in
 [`docs/operations.md`](../../docs/operations.md#release-artifact-integrity).
@@ -159,13 +159,21 @@ praetore-mcp verify
 # 7. Add rules (no JSON editing), check them, then restart the client
 praetore-mcp policy deny --id deny-delete --server filesystem --tool delete_file
 praetore-mcp policy require-approval --id approve-ssh --tool read_file --arg-path-prefix path=/Users/me/.ssh
-# v0.3.3 has no approval. From 0.3.4 the flow is in "Local approval".
 praetore-mcp policy list
 praetore-mcp policy check
 
 # 8. Switch to enforce (install skips entries that are already wrapped, so uninstall first)
 praetore-mcp uninstall --client claude-desktop --yes
 praetore-mcp install --client claude-desktop --mode enforce --yes
+
+# 9. Optional, after enforce, on a test server named filesystem.
+#    Restart the client, then ask to create a directory in the test folder
+#    (~/praetore-test when that is the folder). The call is held.
+#    An assistant must not run approve. You run it in your own terminal.
+praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory
+praetore-mcp approvals
+praetore-mcp approve <id>          # your terminal; an assistant must not run this
+# praetore-mcp reject <id>         # instead of approve: the call is not forwarded
 ```
 
 `install --mode enforce` on an entry that is already wrapped prints
@@ -185,8 +193,17 @@ A rule names one tool. `policy deny --tool write_file` on
 `@modelcontextprotocol/server-filesystem@2.3.0` does not make that server
 read-only: `append_file`, `edit_file`, `create_directory`, `move_file` and
 `copy_file` still write. Restart the client after every policy change. A
-running `wrap` keeps the `policy.json` it loaded at start. v0.3.3 has no
-approval. From 0.3.4 the flow is in "Local approval".
+running `wrap` keeps the `policy.json` it loaded at start. After enforce,
+the optional `approve-mkdir` step above holds `create_directory` until you
+run `praetore-mcp approve <id>` in your own terminal. An assistant must
+not run `approve`: it needs an interactive terminal (stdin and stderr)
+and the confirmation code you type. Without a terminal it signs nothing.
+After you approve, the same call goes through once. `praetore-mcp reject
+<id>` records a rejection and the call is not forwarded. A pending call
+expires after 10 minutes by default. The terminal check is cooperative.
+Deleting or truncating `approvals/journal.jsonl` lets an approval be used
+again. The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. The
+rest of the flow is in "Local approval".
 
 `install` turns each stdio entry such as
 
@@ -284,7 +301,9 @@ valid shorter chain: they are only detected with `verify --expected-head`
 against a head kept where the wrapped servers cannot write. Without that,
 the journal shows what is in it, not that nothing is missing. Lines written
 by earlier versions (a bare evidence document) still verify, are counted as
-unchained, and may only come before the first chained entry. Concurrent
+unchained, and may only come before the first chained entry. The v0.3.3
+`praetore-mcp verify` does not read 0.3.4 receipts: it reads each line as
+a bare evidence document, and a 0.3.4 line is not one. Concurrent
 wrappers serialize appends with a lock file (`receipts/.journal.lock`,
 `flock`, on Linux and macOS). If the last line is incomplete (an
 interrupted write), nothing more is appended: enforce refuses calls and

@@ -69,8 +69,8 @@ flowchart LR
 Requirements: Rust 1.88 or newer and Cargo.
 
 Readers who want a prebuilt `praetore-mcp` binary and no Rust can install
-from the published v0.3.3 release:
-[Install from the v0.3.3 release](docs/install-prebuilt.md).
+from the published v0.3.4 release:
+[Install from the v0.3.4 release](docs/install-prebuilt.md).
 The commands in this Quickstart stay a from-source path.
 
 Run the self-contained example from the repository root:
@@ -116,17 +116,20 @@ hash-linked evidence chain and tamper detection), run `make demo`; see
 ## Install with your AI coding agent
 
 This section is for a person who wants an assistant to install the published
-`praetore-mcp` v0.3.3 binary. The same steps are written out in
-[Install from the v0.3.3 release](docs/install-prebuilt.md). Copy the prompt
+`praetore-mcp` v0.3.4 binary. The same steps are written out in
+[Install from the v0.3.4 release](docs/install-prebuilt.md). Copy the prompt
 below and paste it into the assistant. The assistant should explain every
 step and wait for an explicit yes before it changes anything on the computer.
 When no stdio server is configured, the prompt can add one test filesystem
 server. It can then add one `write_file` deny rule and, if you ask, switch
-from observe to enforce. Each of those waits for its own yes.
+from observe to enforce. If you ask after that switch, it can add one
+`REQUIRE_APPROVAL` rule for `create_directory` on `~/praetore-test`. You
+approve the held call in your own terminal. The assistant does not run
+`approve`. Each of those waits for its own yes.
 
 The prebuilt binaries come from the published
-[v0.3.3 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3),
-built from commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`. They are not a
+[v0.3.4 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4),
+built from commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`. They are not a
 build of the current `main` branch. This install does not use Rust and does
 not clone the repository. On macOS, verification is `praetore-mcp verify`
 only.
@@ -137,11 +140,11 @@ guarantees. It is not a network service; it runs on the person's computer.
 ### Prompt to copy
 
 ```text
-Install praetore-mcp (PRÆTORE) for me from the published v0.3.3 release,
+Install praetore-mcp (PRÆTORE) for me from the published v0.3.4 release,
 without cloning the repository and without installing Rust. The prebuilt
 binaries come from
-https://github.com/Mavericksantander/praetore/releases/tag/v0.3.3
-and were built from commit 0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c.
+https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4
+and were built from commit a606c111d788bfb927a8c5b953e30bf1d8c37421.
 They are not a build of the current main branch. Follow these rules exactly.
 If docs/install-prebuilt.md is already on this machine, you may read it.
 Do not clone the repository to get it. The steps below are complete.
@@ -174,12 +177,12 @@ Ground rules
 - Do not install cosign, and do not verify the Sigstore signature, unless
   I ask. That check is optional. The required check is the SHA256 list in
   step 3. If I ask, pass
-  `--certificate-github-workflow-sha 0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`
+  `--certificate-github-workflow-sha a606c111d788bfb927a8c5b953e30bf1d8c37421`
   literally. Do not clone the repository to run `git rev-parse`.
 - Only use commands and flags shown by `praetore-mcp --help` and
   `praetore-mcp <command> --help`. If something you need is not there,
   stop and tell me.
-- v0.3.3 has no Windows binary and no Linux ARM binary, and there is no
+- v0.3.4 has no Windows binary and no Linux ARM binary, and there is no
   brew installer. If this machine is not macOS (Apple silicon or Intel)
   or Linux x86_64, stop and tell me.
 - Never point a filesystem MCP server at my home directory or at a
@@ -188,21 +191,21 @@ Ground rules
 
 Steps
 1. Choose the one archive that matches this machine. Stop if none matches.
-     macOS Apple silicon: praetore-mcp-v0.3.3-aarch64-apple-darwin.tar.gz
-     macOS Intel:         praetore-mcp-v0.3.3-x86_64-apple-darwin.tar.gz
-     Linux x86_64:        praetore-mcp-v0.3.3-x86_64-unknown-linux-gnu.tar.gz
+     macOS Apple silicon: praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz
+     macOS Intel:         praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz
+     Linux x86_64:        praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
 2. In a directory under my home, download SHA256SUMS and that one archive
    from
-   https://github.com/Mavericksantander/praetore/releases/download/v0.3.3/
+   https://github.com/Mavericksantander/praetore/releases/download/v0.3.4/
    Do not download the other archives. Do not download praetore-verify.
 3. Check the archive against SHA256SUMS before you open it.
    On macOS:  shasum -a 256 -c SHA256SUMS --ignore-missing
    On Linux:  sha256sum -c SHA256SUMS --ignore-missing
    The published SHA256SUMS is:
-     6535454b0eb692c29e7410d4856ebc72ba41c03be6d7e413d2097fc8320c8adf  praetore-mcp-v0.3.3-aarch64-apple-darwin.tar.gz
-     48aa92ff82de317a7630e9d9483c3a7700b79959d018dd1e8edd3360196432f9  praetore-mcp-v0.3.3-x86_64-apple-darwin.tar.gz
-     944f18c5985676cfd3c7d9969ba205e6efe3eedbcb3f3d51dfe1c6b3db5b9515  praetore-mcp-v0.3.3-x86_64-unknown-linux-gnu.tar.gz
-     30573a3cb85346ddba77aecc823998b2c983d201c9c4fcdf5c75843eb5935dde  praetore-verify
+     1e29d46c47dbec7289d9b8291dfd79f13f4ac516c0319a474fbdad03899fafe0  praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz
+     d8e539e96217238318643f3bdf283c68b5b2492b62facf5d8fbf273c928195bb  praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz
+     7a7ae8c683f5aff6de204d03675f3bf5622b6fd733cf9c28eb992a6c222839ad  praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
+     31114a527f3d221c66abe0acf29ea4eafb2158aeb1978707c42a3d395d634916  praetore-verify
    The praetore-verify line is there so you can recognize the file. Do not
    download that binary. Show me the check output. If the archive line is
    not OK, or if SHA256SUMS does not match this list, stop. Do not clear a
@@ -224,7 +227,7 @@ Steps
    ~/.local/bin, run `xattr -d com.apple.quarantine praetore-mcp` again.
    If ~/.local/bin is not on PATH, add it for my user shell only. Show me
    `command -v praetore-mcp` and `praetore-mcp --version`. The version line
-   must be `praetore-mcp 0.3.3`, and the command must be
+   must be `praetore-mcp 0.3.4`, and the command must be
    ~/.local/bin/praetore-mcp. If either check fails, stop.
 7. Run `praetore-mcp init`. Show me the files it created and explain them.
    Do not print private keys.
@@ -306,10 +309,8 @@ Steps
       praetore-mcp policy check
     A policy change is loaded when `wrap` starts. Tell me to restart the
     client before the next call. The `policy` command prints that reminder.
-    v0.3.3 has no approval flow. REQUIRE_APPROVAL is not supported. In
-    enforce mode it is treated like DENY, with the text "requires human
-    approval (not supported by praetore-mcp yet)". Do not add a
-    require-approval rule.
+    Do not add a require-approval rule in this step. That is step 16, and
+    only if I ask.
     If the server is the test server on ~/praetore-test, ask me to write
     a new file there with the `write_file` tool of `filesystem`. If it
     points anywhere else, do not call `write_file`.
@@ -344,6 +345,29 @@ Steps
     shows `DENY` and `first-rule` with mode `enforce`.
     Observe mode is the arrival mode: a DENY receipt records what enforce
     would have blocked, but the call still runs.
+16. Optional, only if I say yes, and only after step 15 has switched this
+    install to enforce. In observe a REQUIRE_APPROVAL call is not held.
+    The server must be the test server named `filesystem` on
+    ~/praetore-test. If it is not, do not add this rule.
+      praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory
+    A policy change is loaded when `wrap` starts. Tell me to restart the
+    client. Then ask me to create a directory in ~/praetore-test with the
+    `create_directory` tool of `filesystem`. The call is held. Show me
+    `praetore-mcp approvals`. It lists that pending call.
+    Do not run `praetore-mcp approve`. It needs an interactive terminal
+    (stdin and stderr are both terminals) and the confirmation code I
+    type. Without a terminal it signs nothing. Tell me to run these in
+    my own terminal:
+      praetore-mcp approvals
+      praetore-mcp approve <id>
+    After I approve, ask for the same call again. It is forwarded once.
+    `praetore-mcp reject <id>` records a rejection, and that call is not
+    forwarded. A pending call expires after 10 minutes by default.
+    The terminal check is cooperative: a process that can act as this
+    user can open a terminal and approve. It is not a guarantee that a
+    person reviewed the call. Deleting or truncating
+    approvals/journal.jsonl lets an approval be used again. The v0.3.3
+    `praetore-mcp verify` does not read 0.3.4 receipts.
 ```
 
 ### What the agent must explain to you
@@ -351,8 +375,8 @@ Steps
 Before you approve any step, the assistant should explain these points in
 plain language:
 
-- **Where the binary comes from.** The published v0.3.3 release, built from
-  commit `0ce6334ff33d7e76a2e2a2bdd3cde69dcd416a0c`, checked against
+- **Where the binary comes from.** The published v0.3.4 release, built from
+  commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`, checked against
   `SHA256SUMS`. It is not a build of the current `main` branch.
 - **What it is.** `praetore-mcp` sits on this computer, between the client
   and its MCP servers, and records a signed receipt for each governed call.
@@ -372,8 +396,13 @@ plain language:
   empty. It does not mean a server was wrapped. On macOS, do not download
   or run the release's `praetore-verify` binary. It is a Linux ELF x86_64
   file. The Sigstore check of `SHA256SUMS` is optional and needs `cosign`.
-  For v0.3.3 the workflow commit is the literal value in the prompt. The
-  required check is the SHA256 list.
+  For v0.3.4 the workflow commit is the literal value in the prompt. The
+  required check is the SHA256 list. The v0.3.3 `praetore-mcp verify` does
+  not read 0.3.4 receipts. A 0.3.4 journal line is
+  `{"seq","prev","evidence"}`. v0.3.3 reads each line as a bare evidence
+  document. This release's `praetore-mcp verify` still reads a v0.3.3
+  journal: those lines are unchained and may only come before the first
+  chained entry.
 - **Confirmation without a terminal.** `install` and `uninstall` change a
   file only after `[y/N]` on a terminal, or when you pass `--yes` after you
   have accepted the dry-run. Without a terminal and without `--yes` they
@@ -392,11 +421,24 @@ plain language:
   already wrapped prints `nothing to change` and exits 0. The mode already
   in the config stays. The switch is `uninstall --yes`, then
   `install --mode enforce --yes`, then a client restart.
+- **Optional local approval, after enforce.** Only if you ask, and only on
+  the test server named `filesystem` in `~/praetore-test`. The rule is
+  `praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory`.
+  The assistant asks to create a directory there. The call is held. You
+  run `praetore-mcp approvals` and then `praetore-mcp approve <id>` in
+  your own terminal. The assistant does not run `approve`: it needs an
+  interactive terminal and the confirmation code you type. After you
+  approve, the same call goes through once. `praetore-mcp reject <id>`
+  records a rejection and the call is not forwarded. A pending call
+  expires after 10 minutes by default. The terminal check is cooperative.
+  Deleting or truncating `approvals/journal.jsonl` lets an approval be
+  used again. The v0.3.3 `praetore-mcp verify` does not read 0.3.4
+  receipts.
 - **Enforcement is still cooperative.** Someone who can edit the client
   config can remove the wrapper.
 - **macOS.** The binaries are not signed or notarized. After the checksum,
   the quarantine command is `xattr -d com.apple.quarantine praetore-mcp`.
-- **Platforms.** v0.3.3 has no Windows binary and no Linux ARM binary, and
+- **Platforms.** v0.3.4 has no Windows binary and no Linux ARM binary, and
   there is no brew installer.
 - **Where things live.** The program is `~/.local/bin/praetore-mcp`. Keys,
   policy and receipts are in `~/.praetore/mcp` (or `$PRAETORE_MCP_HOME`).
@@ -412,10 +454,10 @@ plain language:
   `~/.local/bin/praetore-mcp` removes the program.
 - **Other limits that remain.** Path checks are point-in-time: a file or
   symlink can change after the decision and before the server uses it.
-  REQUIRE_APPROVAL has no approval flow in `praetore-mcp` yet. In v0.3.3
-  it is not supported. In enforce mode it is treated like DENY, with the
-  text "requires human approval (not supported by praetore-mcp yet)".
-  Policy changes need a client restart.
+  The terminal check on `approve` is cooperative, and deleting or
+  truncating `approvals/journal.jsonl` lets an approval be used again.
+  The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. Policy
+  changes need a client restart.
 - **You decide.** You approve each step. The assistant should not continue
   without your explicit yes.
 
@@ -873,7 +915,7 @@ is not a production deployment or an external-agent integration.
 
 ## Documentation
 
-* [Install `praetore-mcp` from the v0.3.3 release (no Rust)](docs/install-prebuilt.md)
+* [Install `praetore-mcp` from the v0.3.4 release (no Rust)](docs/install-prebuilt.md)
 * [Policy language and evaluation semantics](docs/policy-language.md)
 * [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
 * [Threat model and residual risks](docs/threat-model.md)
