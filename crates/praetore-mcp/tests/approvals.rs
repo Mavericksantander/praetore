@@ -164,6 +164,13 @@ fn verify(home: &Home) -> Output {
 /// Drives `approve` on a pseudo-terminal and types the code the command prints.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn approve_on_tty(home: &Home, id: &str) -> Output {
+    approve_on_tty_with(home, id, &|| {})
+}
+
+/// Like [`approve_on_tty`], and runs `before_code` after the call is printed
+/// and before the confirmation code is typed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -219,6 +226,7 @@ fn approve_on_tty(home: &Home, id: &str) -> Output {
                 .and_then(|rest| rest.split_whitespace().next())
             && code.len() == 6
         {
+            before_code();
             break Some(code.to_owned());
         }
         if started.elapsed() > Duration::from_secs(10) {
@@ -711,6 +719,42 @@ fn an_evidence_only_journal_still_verifies() {
         "{report}"
     );
     assert!(report.contains("approval journal: none"), "{report}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn pending_changed_after_it_was_shown_is_not_signed() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let (responses, stderr, _) = wrap(
+        &home,
+        "enforce",
+        &session(echo(7, json!({"note": "shown"}))),
+        &[],
+    );
+    assert!(!stderr.contains("EXECUTED echo"), "{stderr}");
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{id}.json"));
+    let approved = approve_on_tty_with(&home, &id, &|| {
+        let text = fs::read_to_string(&path).unwrap();
+        let edited = text.replace("\"shown\"", "\"changed\"");
+        assert_ne!(edited, text);
+        fs::write(&path, edited).unwrap();
+    });
+    let text = String::from_utf8_lossy(&approved.stdout);
+    let before = text.split("confirmation:").next().unwrap();
+    assert!(
+        before.contains("echo") && before.contains("shown"),
+        "{before}"
+    );
+    assert!(!approved.status.success(), "{text}");
+    assert!(text.contains("changed after it was shown"), "{text}");
+    assert!(path.is_file(), "pending file was removed");
+    assert!(!home.root.join("approvals").join("journal.jsonl").exists());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -659,8 +659,11 @@ praetore-mcp approve <id> --dir ~/.praetore/mcp
 praetore-mcp reject <id> --dir ~/.praetore/mcp
 ```
 
-`approve` prints a short code and waits for that code on stdin. It does
-this only when stdin and stderr are both terminals. The code is not stored.
+`approve` prints the server, the tool, the UTC expiry, and the full
+canonical arguments, then a short code, and waits for that code on stdin.
+It does this only when stdin and stderr are both terminals. The code is
+not stored. If the pending file changes after that print, `approve` does
+not sign it.
 The check is cooperative: any process that can act as this user can open a
 terminal and approve. It is not a guarantee that a person reviewed the call.
 

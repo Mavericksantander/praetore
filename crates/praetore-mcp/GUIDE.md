@@ -151,10 +151,11 @@ wrapped.
 
 Add one deny rule for the server named `filesystem`. A policy change is
 loaded when `wrap` starts, so restart the client after this. The `policy`
-command prints that reminder. v0.3.3 has no approval flow. Do not add a
-`require-approval` rule. REQUIRE_APPROVAL is not supported. In enforce
-mode it is treated like DENY, with the text "requires human approval (not
-supported by praetore-mcp yet)".
+command prints that reminder. The published v0.3.3 release has no
+approval. In enforce, REQUIRE_APPROVAL is treated like DENY, with the text
+"requires human approval (not supported by praetore-mcp yet)". From 0.3.4,
+which today is installed only from source, the flow is "Local approval"
+below.
 
 ```sh
 praetore-mcp policy deny --id first-rule --server filesystem --tool write_file
@@ -191,17 +192,18 @@ praetore-mcp receipts --tail 5
 praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
 ```
 
-To hold a call until someone at the machine approves it:
+From 0.3.4, to hold a call until someone at the machine approves it:
 
 ```sh
-praetore-mcp policy require-approval --id approve-write --server filesystem --tool write_file
-# restart the client, attempt the write, then:
+praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory
+# restart the client, attempt create_directory, then:
 praetore-mcp approvals
 praetore-mcp approve <id>    # interactive terminal; type the code it prints
 ```
 
-The agent retries the same call. It is forwarded once. Limits of that flow
-are in point 3 below. The evidence id in the chat matches the `EVIDENCE ID`
+A DENY rule on the same tool wins: the call is refused and approval is not
+asked. The agent retries the same call. It is forwarded once. Limits of
+that flow are in point 3 below. The evidence id in the chat matches the `EVIDENCE ID`
 column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
@@ -235,8 +237,9 @@ Read these before relying on anything above.
    command to run, for example `praetore-mcp approve <id> --dir <home>`.
    `praetore-mcp approvals` lists pending calls (server, tool, a short form
    of the arguments, expiry). `approve` works only in an interactive
-   terminal: it prints a short code and continues only if that code is
-   typed back. `reject <id>` records a rejection and the call is not
+   terminal. Before it asks for a short code, it prints the server, the
+   tool, the UTC expiry, and the full arguments. It continues only if that
+   code is typed back. `reject <id>` records a rejection and the call is not
    forwarded. The approval matches one server, one tool and the canonical
    arguments, expires after 10 minutes unless
    `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says

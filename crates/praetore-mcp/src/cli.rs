@@ -691,10 +691,12 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
                 .into(),
         );
     }
-    if outcome == crate::approvals::HumanOutcome::Approve {
-        confirm_approval(&home, &id)?;
-    }
-    let decided = crate::approvals::decide(&home, &id, outcome)?;
+    let shown = if outcome == crate::approvals::HumanOutcome::Approve {
+        Some(confirm_approval(&home, &id)?)
+    } else {
+        None
+    };
+    let decided = crate::approvals::decide(&home, &id, outcome, shown.as_ref())?;
     println!(
         "{} {} (approver {})",
         decided.outcome, decided.approval_id, decided.approver_key_id
@@ -717,7 +719,7 @@ fn interactive_terminal() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
-fn confirm_approval(home: &Home, id: &str) -> Result<(), String> {
+fn confirm_approval(home: &Home, id: &str) -> Result<crate::approvals::PendingCall, String> {
     let pending = crate::approvals::pending_call(home, id)?;
     let show = praetore_core::display::escape_for_display;
     eprintln!("server     {}", show(&pending.server));
@@ -738,7 +740,7 @@ fn confirm_approval(home: &Home, id: &str) -> Result<(), String> {
     if answer.trim() != code {
         return Err("confirmation did not match; nothing was signed".into());
     }
-    Ok(())
+    Ok(pending)
 }
 
 fn confirmation_code() -> String {

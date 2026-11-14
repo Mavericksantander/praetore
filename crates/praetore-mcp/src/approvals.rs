@@ -206,6 +206,7 @@ pub struct PendingCall {
     pub server: String,
     pub tool: String,
     pub expires_at: String,
+    pub evidence_id: String,
     /// Canonical JSON of the arguments, not truncated.
     pub arguments_canonical: String,
 }
@@ -237,6 +238,7 @@ pub fn pending_call(home: &Home, approval_id: &str) -> Result<PendingCall, Strin
         server: info.server,
         tool: info.tool,
         expires_at: info.expires_at,
+        evidence_id: info.evidence_id,
         arguments_canonical: canonical,
     })
 }
@@ -263,7 +265,12 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
 
 /// Signs a decision for a pending id and appends it to the approval journal.
 /// The `approve` command is what requires an interactive terminal.
-pub fn decide(home: &Home, approval_id: &str, outcome: HumanOutcome) -> Result<Decided, String> {
+pub fn decide(
+    home: &Home,
+    approval_id: &str,
+    outcome: HumanOutcome,
+    shown: Option<&PendingCall>,
+) -> Result<Decided, String> {
     if !valid_id(approval_id) {
         return Err(format!(
             "approval id {approval_id:?} is not a 64-character lowercase hex id"
@@ -294,9 +301,23 @@ pub fn decide(home: &Home, approval_id: &str, outcome: HumanOutcome) -> Result<D
                 info.expires_at
             ));
         }
+        let binding = binding_from_pending(&pending)?;
+        if let Some(shown) = shown {
+            let current = String::from_utf8(canonical_bytes(&binding.arguments)?)
+                .map_err(|_| "canonical arguments are not UTF-8".to_owned())?;
+            if shown.server != binding.server
+                || shown.tool != binding.tool
+                || shown.arguments_canonical != current
+                || shown.evidence_id != info.evidence_id
+            {
+                return Err(
+                    "the pending call changed after it was shown; nothing was signed and the pending file was kept"
+                        .into(),
+                );
+            }
+        }
         // The pending file is not signed. Refuse to sign it unless it still
         // matches the receipt written when the call was held.
-        let binding = binding_from_pending(&pending)?;
         let evidence = load_signed_receipt(home, &info.evidence_id)?;
         binding_matches_evidence(&binding, &evidence).map_err(|error| {
             format!("{error}; nothing was signed and the pending file was kept")
