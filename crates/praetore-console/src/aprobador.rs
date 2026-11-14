@@ -148,6 +148,7 @@ impl ApproverSigner {
             approver_key_id: self.key_id.clone(),
             challenge: view.challenge,
             outcome,
+            delegation_chain: None,
             signature: String::new(),
         };
         let message = decision.signing_message().ok()?;

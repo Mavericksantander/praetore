@@ -30,6 +30,15 @@ the same machine. Also carries everything merged to main since v0.3.3.
 
 ### Breaking
 
+- **Delegated approval changes Rust types.** `HumanApprovalDecision` gains
+  `delegation_chain: Option<Vec<String>>` (version 1 decisions leave it
+  `None` and serialize as before), `OutcomeKeys` gains `delegation`,
+  `ApprovalError` gains `RootMayNotApprove` and `Delegation`, `Policy` gains
+  `approval_delegation`, and `OutcomeReport` gains `delegated`. Action: add
+  `delegation_chain: None` and `delegation: None` to struct literals, and
+  handle the new error variants in exhaustive matches. Nothing signed,
+  recorded or exported by earlier versions changes.
+
 - **The console's JSON API sends codes and UTC instants instead of Spanish
   text.** `situacion`, `relato`, `aviso`, `mensaje` and `nota` are stable
   English `snake_case` codes (`"awaiting_approval"`,
@@ -223,6 +232,24 @@ the same machine. Also carries everything merged to main since v0.3.3.
 
 ### Added
 
+- **Delegated authority to approve.** A tenant's delegation root, pinned
+  in the optional `PRAETORE_GATEWAY_DELEGATION_FILE`, signs delegations to
+  delegators and approvers with an exact list of action types, a validity
+  window and a decreasing `max_depth`; revocations are signed by the
+  delegation's issuer or the root and invalidate every delegation below.
+  Schema version 2 human decisions carry the `delegation_chain` in the
+  signed payload. The gateway checks the chain when it records the decision
+  and when it claims the dispatch; `praetore-verify outcomes` checks it with
+  `--delegation-root-pin`, `--delegations` and `--policy`, and fails a
+  version 2 decision without them (`DELEGATION_UNVERIFIED`). The root
+  approves in its own name only when the policy sets
+  `approval_delegation.root_may_approve`; absent, the policy digest is
+  unchanged. Revocations are read at startup: a new one needs a restart.
+  Version 1 decisions and existing policies are unchanged. The console
+  still signs version 1 decisions only, and its compliance package fails
+  for a tenant with version 2 decisions; verify those with
+  `praetore-verify outcomes`.
+  Design: `docs/proposals/approval-delegation.md`.
 - **Console language and local time.** The console page can be read in
   Spanish, English or Portuguese (Brazil), chosen with a selector at the top
   and kept in the browser (`localStorage`, key `praetore_idioma`); without a

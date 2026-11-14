@@ -447,6 +447,22 @@ when the binaries start and when migrating, not continuously. The adoption
 record in `praetore.schema_migrations` is informative and not
 tamper-evident.
 
+## Delegated approval
+
+Delegation lets a tenant's root key authorize approver keys without a new
+pin per approver ([design](proposals/approval-delegation.md)). It changes
+who may sign a human decision; enforcement stays cooperative.
+
+| Threat | Mitigation | Remaining risk |
+|---|---|---|
+| A delegate key is stolen | The thief can approve only the action types of that delegation's scope, within its validity; revoking it (signed by its issuer or the root) invalidates it and every delegation below it | Revocations take effect at the next gateway restart; until then the key approves within its scope |
+| The root key is stolen | The root does not approve in its own name unless the policy allows it; the root key may not be a pinned approver, issuer, attester or another tenant's root, so it gains nothing outside delegation | The thief can sign new delegations for any action of the tenant and revoke legitimate ones. Response: replace the root in the delegation file and restart; every chain under the old root stops verifying |
+| A delegate widens its own authority | A child that adds action types, outlives its parent, keeps or raises `max_depth`, is issued by an approver, exceeds 4 links, or grants to an earlier key is invalid; nothing is narrowed silently | None within the chain rules; the scope is only as narrow as the action types the issuers chose |
+| Cross-tenant use | Each link must be for the root's tenant and the challenge's tenant; roots are unique across tenants | Depends on the gateway's issuer bindings and the delegation file being provisioned correctly |
+| The requesting agent approves itself | No key of the chain, nor the root approving alone, may be the agent's key | An agent that holds another key in a chain is not detected |
+| A decision is replayed onto another request or policy | The chain is inside the signed payload, the challenge binds the evidence and the `policy_digest`, and the gateway refuses a root decision when its policy is not the evidence's | None beyond the existing approval checks |
+| Offline verification and revocations | Offline, a revocation effective by the challenge's `expires_at` fails the decision | No signed decision time: a decision made before a revocation inside its window also fails offline (conservative). A revocation the verifier is not given is not seen: whoever supplies the delegation file can leave revocations out |
+
 ## Operational response
 
 Rotation, compromise response, policy rollback, secure clock sourcing, and

@@ -245,6 +245,10 @@ impl HumanApprovalVerifier {
         &self.key_id
     }
 
+    pub fn public_key(&self) -> &praetore_core::VerifiedPublicKey {
+        &self.public_key
+    }
+
     /// `None` for an unscoped (single-tenant) verifier.
     pub fn tenant_id(&self) -> Option<Uuid> {
         self.tenant_id
@@ -676,6 +680,9 @@ pub struct Gateway {
     dispatcher: Arc<dyn ActionDispatcher>,
     execution_attester: Arc<dyn ExecutionAttestationSigner>,
     approval_verifiers: Vec<HumanApprovalVerifier>,
+    /// Delegation roots, delegations and revocations; `None` when the
+    /// gateway accepts only pinned approvers.
+    approval_delegation: Option<Arc<praetore_core::approval_delegation::DelegationConfig>>,
 }
 
 impl Gateway {
@@ -694,6 +701,7 @@ impl Gateway {
             dispatcher,
             execution_attester,
             approval_verifiers: Vec::new(),
+            approval_delegation: None,
         })
     }
 
@@ -711,21 +719,65 @@ impl Gateway {
         self
     }
 
+    /// Adds delegated approval: each tenant's delegation root, the signed
+    /// delegations and the signed revocations, loaded once. A schema
+    /// version 2 decision is verified against them; version 1 decisions keep
+    /// using the pinned approvers. A new revocation takes effect when the
+    /// gateway is built again with it.
+    pub fn with_approval_delegation(
+        mut self,
+        delegation: praetore_core::approval_delegation::DelegationConfig,
+    ) -> Self {
+        self.approval_delegation = Some(Arc::new(delegation));
+        self
+    }
+
+    fn approval_configured(&self) -> bool {
+        !self.approval_verifiers.is_empty() || self.approval_delegation.is_some()
+    }
+
+    /// Whether the policy lets a delegation root approve the held request
+    /// of `record`: the policy that produced its evidence must be the one
+    /// this gateway enforces, and that policy must allow it.
+    fn root_may_approve(&self, record: &ExecutionRecord) -> bool {
+        let policy = self.engine.policy();
+        let same_policy = policy
+            .digest()
+            .is_ok_and(|digest| record.evidence.policy_digest.as_deref() == Some(digest.as_str()));
+        same_policy && policy.root_may_approve()
+    }
+
     /// Verifies a decision against the stored execution: the challenge must
     /// be the one derived from the persisted evidence, the approver key must
     /// be pinned for the execution's tenant, the signature must verify, and
-    /// the requesting agent must not be the approver.
+    /// the requesting agent must not be the approver. A schema version 2
+    /// decision is checked instead against the tenant's delegation root and
+    /// every loaded revocation
+    /// ([`HumanApprovalDecision::verify_delegated`]).
     fn verify_decision_for_record(
         &self,
         record: &ExecutionRecord,
         decision: &HumanApprovalDecision,
     ) -> Result<(), GatewayError> {
-        if self.approval_verifiers.is_empty() {
+        if !self.approval_configured() {
             return Err(ApprovalError::NotConfigured.into());
         }
         let expected = ApprovalChallenge::from_evidence(&record.evidence, &record.action_digest)?;
         if decision.challenge != expected {
             return Err(ApprovalError::InvalidChallenge.into());
+        }
+        if decision.is_delegated() {
+            let delegation = self
+                .approval_delegation
+                .as_deref()
+                .ok_or(ApprovalError::InvalidSignature)?;
+            decision.verify_delegated(
+                &record.evidence,
+                delegation,
+                self.root_may_approve(record),
+                praetore_core::approval_delegation::RevocationRule::Loaded,
+            )?;
+            return Ok(());
         }
         let mut candidates = self.approval_verifiers.iter().filter(|verifier| {
             verifier.applies_to(&decision.approver_key_id, record.key.tenant_id)
@@ -1065,7 +1117,7 @@ impl Gateway {
         &self,
         decision: HumanApprovalDecision,
     ) -> Result<HumanApprovalResult, GatewayError> {
-        if self.approval_verifiers.is_empty() {
+        if !self.approval_configured() {
             return Err(ApprovalError::NotConfigured.into());
         }
         let key = ExecutionKey {

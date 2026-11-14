@@ -1067,6 +1067,7 @@ fn human_approval_decision(
         approver_key_id: "test-human-approver-v1".into(),
         challenge,
         outcome,
+        delegation_chain: None,
         signature: String::new(),
     };
     decision.signature = hex::encode(
@@ -6377,6 +6378,7 @@ mod outcomes {
                 evidence_attesters: &evidence_attesters(),
                 execution,
                 approvers,
+                delegation: None,
             },
         )
     }
@@ -6696,6 +6698,7 @@ mod outcomes_history {
                     )
                     .unwrap(),
                 }],
+                delegation: None,
             },
         )
         .map(|report| report.held[0].outcome)
@@ -6811,5 +6814,1285 @@ mod outcomes_history {
             check(&[pending], &evidence, &[other]),
             Err(OutcomeError::InvalidSignature { line: 0 })
         ));
+    }
+}
+
+/// Delegated approval: a tenant's delegation root, signed delegations and
+/// revocations, schema version 2 decisions. Every case is checked where the
+/// gateway decides (recording the decision, claiming the dispatch) and where
+/// `praetore-verify outcomes` decides (`verify_outcomes`).
+mod delegated_approval {
+    use super::*;
+    use praetore_core::ApprovalDelegationPolicy;
+    use praetore_core::approval_delegation::{
+        ApprovalDelegation, ApprovalRevocation, DelegationConfig, DelegationError, DelegationRole,
+        DelegationScope,
+    };
+    use praetore_receipt::outcomes::{
+        KeyPin, Outcome, OutcomeDelegation, OutcomeError, OutcomeKeys, OutcomeReport,
+        verify_outcomes, write_outcomes,
+    };
+
+    const ACTION: &str = "local:set_value";
+    const ROOT: u8 = 61;
+    const OTHER_ROOT: u8 = 67;
+    const BOB: u8 = 62;
+    const ALICE: u8 = 63;
+    const CAROL: u8 = 64;
+    const DAVE: u8 = 65;
+    const EVE: u8 = 66;
+    /// The requesting agent's key in `approval_fixture_full`.
+    const AGENT: u8 = 31;
+    const OTHER_TENANT: Uuid = Uuid::from_u128(2);
+    /// The approval window of `approval_fixture_full`: the evidence's
+    /// `decided_at` and the challenge's `expires_at`.
+    const WINDOW_START: &str = "2026-06-01T12:00:00Z";
+    const WINDOW_END: &str = "2026-06-01T12:00:20Z";
+    const WIDE: (&str, &str) = ("2026-06-01T10:00:00Z", "2026-06-01T14:00:00Z");
+    const INNER: (&str, &str) = ("2026-06-01T11:00:00Z", "2026-06-01T13:00:00Z");
+
+    fn key_id(seed: u8) -> String {
+        match seed {
+            ROOT => "tenant-root".into(),
+            OTHER_ROOT => "other-tenant-root".into(),
+            BOB => "bob".into(),
+            ALICE => "alice".into(),
+            CAROL => "carol".into(),
+            DAVE => "dave".into(),
+            EVE => "eve".into(),
+            AGENT => "agent-key".into(),
+            _ => format!("key-{seed}"),
+        }
+    }
+
+    fn pair(seed: u8) -> AgentKeyPair {
+        AgentKeyPair::from_secret_bytes(&[seed; 32])
+    }
+
+    fn public_hex(seed: u8) -> String {
+        hex::encode(pair(seed).public_key().as_bytes())
+    }
+
+    struct Grant<'a> {
+        tenant: Uuid,
+        issuer: u8,
+        parent: Option<&'a ApprovalDelegation>,
+        subject: u8,
+        role: DelegationRole,
+        actions: &'a [&'a str],
+        validity: (&'a str, &'a str),
+        max_depth: u8,
+    }
+
+    impl<'a> Grant<'a> {
+        fn approver(issuer: u8, parent: Option<&'a ApprovalDelegation>, subject: u8) -> Self {
+            Self {
+                tenant: TEST_TENANT_ID,
+                issuer,
+                parent,
+                subject,
+                role: DelegationRole::Approver,
+                actions: &[ACTION],
+                validity: INNER,
+                max_depth: 0,
+            }
+        }
+
+        fn delegator(issuer: u8, parent: Option<&'a ApprovalDelegation>, subject: u8) -> Self {
+            Self {
+                tenant: TEST_TENANT_ID,
+                issuer,
+                parent,
+                subject,
+                role: DelegationRole::Delegator,
+                actions: &[ACTION],
+                validity: WIDE,
+                max_depth: 2,
+            }
+        }
+
+        fn sign(self) -> ApprovalDelegation {
+            let mut delegation = ApprovalDelegation {
+                schema_version: 1,
+                delegation_id: Uuid::new_v4(),
+                tenant_id: self.tenant,
+                issuer_key_id: key_id(self.issuer),
+                parent_delegation_hash: self.parent.map(|parent| parent.hash().unwrap()),
+                subject_key_id: key_id(self.subject),
+                subject_public_key_hex: public_hex(self.subject),
+                role: self.role,
+                scope: DelegationScope {
+                    action_types: self.actions.iter().map(|item| (*item).to_owned()).collect(),
+                },
+                not_before: self.validity.0.into(),
+                not_after: self.validity.1.into(),
+                max_depth: self.max_depth,
+                signature: String::new(),
+            };
+            delegation.sign(&pair(self.issuer)).unwrap();
+            delegation
+        }
+    }
+
+    fn revocation(signer: u8, of: &ApprovalDelegation, effective_at: &str) -> ApprovalRevocation {
+        let mut revocation = ApprovalRevocation {
+            schema_version: 1,
+            tenant_id: of.tenant_id,
+            delegation_hash: of.hash().unwrap(),
+            issuer_key_id: key_id(signer),
+            effective_at: effective_at.into(),
+            signature: String::new(),
+        };
+        revocation.sign(&pair(signer)).unwrap();
+        revocation
+    }
+
+    fn document(
+        delegations: &[&ApprovalDelegation],
+        revocations: &[&ApprovalRevocation],
+    ) -> String {
+        json!({
+            "schema_version": 1,
+            "roots": [
+                {"tenant_id": TEST_TENANT_ID, "key_id": key_id(ROOT), "public_key_hex": public_hex(ROOT)},
+                {"tenant_id": OTHER_TENANT, "key_id": key_id(OTHER_ROOT), "public_key_hex": public_hex(OTHER_ROOT)}
+            ],
+            "delegations": delegations,
+            "revocations": revocations,
+        })
+        .to_string()
+    }
+
+    fn chain(links: &[&ApprovalDelegation]) -> Vec<String> {
+        links.iter().map(|link| link.hash().unwrap()).collect()
+    }
+
+    /// A held request on a gateway with the pinned test approver and the
+    /// delegation `document`, under a policy whose `approval_delegation` is
+    /// `option` (absent for `None`).
+    struct Held {
+        gateway: Gateway,
+        tool: Arc<LocalSetTool>,
+        journal: Arc<MemoryJournal>,
+        key: ExecutionKey,
+        evidence: Evidence,
+        challenge: praetore_gateway::ApprovalChallenge,
+        pinned_approver: SigningKey,
+        policy: Policy,
+        document: String,
+    }
+
+    fn held_with(option: Option<bool>, document: &str) -> Held {
+        let mut policy_seen = None;
+        let (gateway, request, tool, journal, pinned_approver, _) = approval_fixture_full(
+            |_| Arc::new(CurrentFreshness),
+            [34; 32],
+            |policy| {
+                policy.approval_delegation =
+                    option.map(|root_may_approve| ApprovalDelegationPolicy { root_may_approve });
+                policy_seen = Some(policy.clone());
+            },
+            |approver_key| {
+                vec![
+                    HumanApprovalVerifier::new(
+                        "test-human-approver-v1",
+                        approver_public_key(approver_key),
+                    )
+                    .unwrap(),
+                ]
+            },
+        );
+        let gateway =
+            gateway.with_approval_delegation(DelegationConfig::from_json(document).unwrap());
+        let key = pending_key(&gateway, request);
+        let evidence = journal.entry(key).unwrap().evidence;
+        let challenge = gateway.approval_challenge(key).unwrap();
+        assert_eq!(evidence.decided_at.as_deref(), Some(WINDOW_START));
+        assert_eq!(challenge.expires_at, WINDOW_END);
+        Held {
+            gateway,
+            tool,
+            journal,
+            key,
+            evidence,
+            challenge,
+            pinned_approver,
+            policy: policy_seen.unwrap(),
+            document: document.to_owned(),
+        }
+    }
+
+    fn held_on(document: &str) -> Held {
+        held_with(None, document)
+    }
+
+    fn decide(
+        challenge: &praetore_gateway::ApprovalChallenge,
+        signer: u8,
+        chain: Vec<String>,
+        outcome: HumanApprovalOutcome,
+    ) -> HumanApprovalDecision {
+        let mut decision = HumanApprovalDecision {
+            schema_version: 2,
+            approval_id: Uuid::new_v4(),
+            approver_key_id: key_id(signer),
+            challenge: challenge.clone(),
+            outcome,
+            delegation_chain: Some(chain),
+            signature: String::new(),
+        };
+        let signing_key = SigningKey::from_bytes(&[signer; 32]);
+        decision.signature = hex::encode(
+            signing_key
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        decision
+    }
+
+    fn approve(held: &Held, signer: u8, chain: Vec<String>) -> HumanApprovalDecision {
+        decide(
+            &held.challenge,
+            signer,
+            chain,
+            HumanApprovalOutcome::Approve,
+        )
+    }
+
+    fn root_pin() -> KeyPin {
+        KeyPin {
+            key_id: key_id(ROOT),
+            public_key: pair(ROOT).public_key(),
+        }
+    }
+
+    /// `praetore-verify outcomes` over `records`, with the tenant's root
+    /// pinned, the same delegation document and the held request's policy.
+    fn offline(held: &Held, records: &[Outcome]) -> Result<OutcomeReport, OutcomeError> {
+        offline_with(held, records, Some(&held.document))
+    }
+
+    fn offline_with(
+        held: &Held,
+        records: &[Outcome],
+        document: Option<&str>,
+    ) -> Result<OutcomeReport, OutcomeError> {
+        let config = document.map(|text| DelegationConfig::from_json(text).unwrap());
+        let roots = [root_pin()];
+        let digest = held.policy.digest().unwrap();
+        let attesters = [EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap()];
+        verify_outcomes(
+            &write_outcomes(records).unwrap(),
+            std::slice::from_ref(&held.evidence),
+            &OutcomeKeys {
+                evidence_attesters: &attesters,
+                execution: &[KeyPin {
+                    key_id: "test-execution-attester-v1".into(),
+                    public_key: execution_attester_public_key(),
+                }],
+                approvers: &[KeyPin {
+                    key_id: "test-human-approver-v1".into(),
+                    public_key: approver_public_key(&held.pinned_approver),
+                }],
+                delegation: config.as_ref().map(|config| OutcomeDelegation {
+                    roots: &roots,
+                    delegations: config,
+                    policy_digest: &digest,
+                    root_may_approve: held.policy.root_may_approve(),
+                }),
+            },
+        )
+    }
+
+    /// The gateway records the approval, dispatches once, and the offline
+    /// verifier accepts the decision and its execution receipt.
+    fn assert_accepted(held: &Held, decision: HumanApprovalDecision) -> OutcomeReport {
+        assert!(matches!(
+            held.gateway
+                .resolve_human_approval(decision.clone())
+                .unwrap(),
+            HumanApprovalResult::ApprovedPendingDispatch { .. }
+        ));
+        let receipt = held.gateway.dispatch_approved(held.key).unwrap();
+        assert_eq!(receipt.execution, AttestedExecution::Confirmed);
+        assert_eq!(held.tool.invocations(), 1);
+        assert!(held.gateway.dispatch_approved(held.key).is_err());
+        assert_eq!(held.tool.invocations(), 1);
+        assert_eq!(
+            held.journal.get(held.key).unwrap().unwrap().human_approval,
+            Some(decision.clone())
+        );
+        let report = offline(
+            held,
+            &[
+                Outcome::HumanDecision(decision),
+                Outcome::ExecutionReceipt(Box::new(receipt)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.held[0].outcome.as_str(), "approved_executed");
+        assert_eq!(report.delegated.len(), 1);
+        report
+    }
+
+    /// The gateway refuses the decision with `expected` before writing
+    /// anything, and the offline verifier refuses it with `offline_code`.
+    fn assert_refused(
+        held: &Held,
+        decision: HumanApprovalDecision,
+        expected: ApprovalError,
+        offline_code: &str,
+    ) {
+        match held.gateway.resolve_human_approval(decision.clone()) {
+            Err(GatewayError::Approval(error)) => assert_eq!(error, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
+        }
+        let record = held.journal.get(held.key).unwrap().unwrap();
+        assert_eq!(record.human_approval, None, "nothing was recorded");
+        assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+        assert_eq!(held.tool.invocations(), 0);
+        assert_eq!(
+            held.journal.entry(held.key).unwrap().states,
+            Vec::<ExecutionStatus>::new()
+        );
+        let error = offline(held, &[Outcome::HumanDecision(decision)]).unwrap_err();
+        assert_eq!(error.code(), offline_code, "{error}");
+    }
+
+    fn refused_by_chain(held: &Held, decision: HumanApprovalDecision, error: DelegationError) {
+        assert_refused(
+            held,
+            decision,
+            ApprovalError::Delegation(error),
+            error.code(),
+        );
+    }
+
+    // --- The policy option -------------------------------------------------
+
+    #[test]
+    fn the_root_approves_itself_only_when_the_policy_allows_it() {
+        let held = held_with(Some(true), &document(&[], &[]));
+        let report = assert_accepted(&held, approve(&held, ROOT, vec![]));
+        assert!(report.delegated[0].root_approved);
+        assert!(report.delegated[0].delegation_chain.is_empty());
+        assert_eq!(report.delegated[0].approver_key_id, "tenant-root");
+    }
+
+    #[test]
+    fn an_explicit_false_refuses_the_root_before_anything_is_written() {
+        let held = held_with(Some(false), &document(&[], &[]));
+        assert!(!held.policy.root_may_approve());
+        assert_refused(
+            &held,
+            approve(&held, ROOT, vec![]),
+            ApprovalError::RootMayNotApprove,
+            "DELEGATION_ROOT_MAY_NOT_APPROVE",
+        );
+    }
+
+    #[test]
+    fn without_the_option_the_root_may_not_approve_and_the_policy_digest_is_unchanged() {
+        let held = held_with(None, &document(&[], &[]));
+        assert_refused(
+            &held,
+            approve(&held, ROOT, vec![]),
+            ApprovalError::RootMayNotApprove,
+            "DELEGATION_ROOT_MAY_NOT_APPROVE",
+        );
+        // The same policy as before the option existed, byte for byte.
+        assert!(
+            !serde_json::to_string(&held.policy)
+                .unwrap()
+                .contains("approval_delegation")
+        );
+        assert_eq!(held.policy.digest().unwrap(), FIXTURE_POLICY_DIGEST_ON_MAIN);
+    }
+
+    /// `approval_fixture_full`'s policy digest before `approval_delegation`
+    /// existed.
+    const FIXTURE_POLICY_DIGEST_ON_MAIN: &str =
+        include_str!("fixtures/approval-policy-digest-before-delegation.txt");
+
+    #[test]
+    fn the_option_is_recorded_in_the_evidence_and_the_challenge() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let delegations = document(&[&alice], &[]);
+        let allowed = held_with(Some(true), &delegations);
+        let absent = held_with(None, &delegations);
+        let explicit_false = held_with(Some(false), &delegations);
+        assert_ne!(
+            allowed.evidence.policy_digest,
+            absent.evidence.policy_digest
+        );
+        assert_ne!(
+            absent.evidence.policy_digest,
+            explicit_false.evidence.policy_digest
+        );
+        assert_ne!(
+            allowed.challenge.policy_digest,
+            absent.challenge.policy_digest
+        );
+        for held in [&allowed, &absent, &explicit_false] {
+            assert_eq!(
+                held.challenge.policy_digest,
+                held.evidence.policy_digest.clone().unwrap()
+            );
+            assert_eq!(held.challenge.policy_digest, held.policy.digest().unwrap());
+        }
+        // Alice's decision for the request under one policy, moved onto the
+        // same request under the other: the signed policy digest differs,
+        // so the signature does not verify, in the gateway and offline.
+        let signed = approve(&allowed, ALICE, chain(&[&alice]));
+        let mut moved = signed.clone();
+        moved.challenge = absent.challenge.clone();
+        assert_refused(
+            &absent,
+            moved,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_SIGNATURE_INVALID",
+        );
+        // Unchanged, it names the other request's challenge.
+        assert!(
+            absent
+                .gateway
+                .resolve_human_approval(signed.clone())
+                .is_err()
+        );
+        let error = offline(&absent, &[Outcome::HumanDecision(signed)]).unwrap_err();
+        assert_eq!(error.code(), "OUTCOME_UNKNOWN_REQUEST");
+    }
+
+    // --- Delegated approvers ---------------------------------------------
+
+    #[test]
+    fn a_delegated_approver_approves_once_and_the_chain_is_reported() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&bob), ALICE).sign();
+        let held = held_on(&document(&[&bob, &alice], &[]));
+        let report = assert_accepted(&held, approve(&held, ALICE, chain(&[&bob, &alice])));
+        assert!(!report.delegated[0].root_approved);
+        assert_eq!(report.delegated[0].delegation_chain, chain(&[&bob, &alice]));
+        assert_eq!(report.delegated[0].approver_key_id, "alice");
+    }
+
+    #[test]
+    fn a_delegated_rejection_is_recorded_and_verifies() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = decide(
+            &held.challenge,
+            ALICE,
+            chain(&[&alice]),
+            HumanApprovalOutcome::Reject,
+        );
+        let HumanApprovalResult::Rejected { receipt, .. } = held
+            .gateway
+            .resolve_human_approval(decision.clone())
+            .unwrap()
+        else {
+            panic!("rejected");
+        };
+        assert_eq!(held.tool.invocations(), 0);
+        let report = offline(
+            &held,
+            &[
+                Outcome::HumanDecision(decision),
+                Outcome::ExecutionReceipt(receipt),
+            ],
+        )
+        .unwrap();
+        assert_eq!(report.held[0].outcome.as_str(), "rejected");
+    }
+
+    #[test]
+    fn the_claim_re_verifies_the_chain_against_the_loaded_revocations() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        held.gateway.resolve_human_approval(decision).unwrap();
+        // The gateway restarts with a revocation before the claim.
+        let revoked = document(
+            &[&alice],
+            &[&revocation(ROOT, &alice, "2026-06-01T12:00:05Z")],
+        );
+        let restarted = held
+            .gateway
+            .clone()
+            .with_approval_delegation(DelegationConfig::from_json(&revoked).unwrap());
+        assert!(matches!(
+            restarted.dispatch_approved(held.key),
+            Err(GatewayError::Approval(ApprovalError::Delegation(
+                DelegationError::Revoked
+            )))
+        ));
+        assert_eq!(held.tool.invocations(), 0);
+    }
+
+    // --- Validity --------------------------------------------------------
+
+    fn alice_valid(validity: (&'static str, &'static str)) -> (ApprovalDelegation, Held) {
+        let alice = Grant {
+            validity,
+            ..Grant::approver(ROOT, None, ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&alice], &[]));
+        (alice, held)
+    }
+
+    #[test]
+    fn an_expired_delegation_is_refused() {
+        let (alice, held) = alice_valid(("2026-06-01T10:00:00Z", "2026-06-01T11:30:00Z"));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::OutsideValidity);
+    }
+
+    #[test]
+    fn a_delegation_not_yet_valid_is_refused() {
+        let (alice, held) = alice_valid(("2026-06-01T12:30:00Z", "2026-06-01T13:00:00Z"));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::OutsideValidity);
+    }
+
+    #[test]
+    fn a_delegation_that_ends_inside_the_approval_window_is_refused() {
+        // Valid when the request was decided, not until the window closes.
+        let (alice, held) = alice_valid(("2026-06-01T11:00:00Z", "2026-06-01T12:00:10Z"));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::OutsideValidity);
+    }
+
+    #[test]
+    fn a_delegation_that_starts_inside_the_approval_window_is_refused() {
+        let (alice, held) = alice_valid(("2026-06-01T12:00:05Z", "2026-06-01T13:00:00Z"));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::OutsideValidity);
+    }
+
+    #[test]
+    fn a_delegation_that_covers_exactly_the_window_is_accepted() {
+        let (alice, held) = alice_valid((WINDOW_START, WINDOW_END));
+        assert_accepted(&held, approve(&held, ALICE, chain(&[&alice])));
+    }
+
+    // --- Revocation ------------------------------------------------------
+
+    #[test]
+    fn a_revoked_delegation_is_refused() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let revoked = revocation(ROOT, &alice, "2026-06-01T11:59:00Z");
+        let held = held_on(&document(&[&alice], &[&revoked]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::Delegation(DelegationError::Revoked),
+            "DELEGATION_REVOKED",
+        );
+    }
+
+    #[test]
+    fn a_child_of_a_revoked_delegation_is_refused() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&bob), ALICE).sign();
+        // Only bob's delegation is revoked; alice's is not named.
+        let revoked = revocation(ROOT, &bob, "2026-06-01T12:00:10Z");
+        let held = held_on(&document(&[&bob, &alice], &[&revoked]));
+        let decision = approve(&held, ALICE, chain(&[&bob, &alice]));
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::Delegation(DelegationError::Revoked),
+            "DELEGATION_REVOKED",
+        );
+    }
+
+    #[test]
+    fn the_issuer_of_a_delegation_may_revoke_it() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&bob), ALICE).sign();
+        let revoked = revocation(BOB, &alice, "2026-06-01T12:00:00Z");
+        let held = held_on(&document(&[&bob, &alice], &[&revoked]));
+        let decision = approve(&held, ALICE, chain(&[&bob, &alice]));
+        refused_by_chain(&held, decision, DelegationError::Revoked);
+    }
+
+    #[test]
+    fn a_revocation_signed_by_anyone_else_is_not_valid() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&bob), ALICE).sign();
+        for signer in [EVE, ALICE, OTHER_ROOT] {
+            let forged = revocation(signer, &alice, "2026-06-01T12:00:00Z");
+            assert_eq!(
+                DelegationConfig::from_json(&document(&[&bob, &alice], &[&forged])).unwrap_err(),
+                DelegationError::InvalidRevocation,
+                "{signer}"
+            );
+        }
+        // A revocation that names bob as its issuer but is signed by eve.
+        let mut forged = revocation(EVE, &alice, "2026-06-01T12:00:00Z");
+        forged.issuer_key_id = key_id(BOB);
+        assert_eq!(
+            DelegationConfig::from_json(&document(&[&bob, &alice], &[&forged])).unwrap_err(),
+            DelegationError::InvalidRevocation
+        );
+    }
+
+    #[test]
+    fn offline_a_revocation_effective_after_the_window_does_not_count_and_the_gateway_refuses_any_loaded_one()
+     {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        // Approved and dispatched before the revocation was loaded.
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        held.gateway
+            .resolve_human_approval(decision.clone())
+            .unwrap();
+        let receipt = held.gateway.dispatch_approved(held.key).unwrap();
+        let records = [
+            Outcome::HumanDecision(decision.clone()),
+            Outcome::ExecutionReceipt(Box::new(receipt)),
+        ];
+        let late = document(
+            &[&alice],
+            &[&revocation(ROOT, &alice, "2026-06-01T12:30:00Z")],
+        );
+        assert!(offline_with(&held, &records, Some(&late)).is_ok());
+        let at_end = document(&[&alice], &[&revocation(ROOT, &alice, WINDOW_END)]);
+        assert_eq!(
+            offline_with(&held, &records, Some(&at_end))
+                .unwrap_err()
+                .code(),
+            "DELEGATION_REVOKED"
+        );
+        // The gateway refuses a decision whose chain has any loaded
+        // revocation, whatever its effective_at.
+        let other = held_with(None, &late);
+        let decision = approve(&other, ALICE, chain(&[&alice]));
+        assert!(matches!(
+            other.gateway.resolve_human_approval(decision),
+            Err(GatewayError::Approval(ApprovalError::Delegation(
+                DelegationError::Revoked
+            )))
+        ));
+    }
+
+    #[test]
+    fn a_root_cannot_revoke_another_tenants_delegation() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        // The other tenant's root signs a revocation of this tenant's
+        // delegation, under its own tenant id.
+        let mut forged = revocation(OTHER_ROOT, &alice, "2026-06-01T12:00:00Z");
+        forged.tenant_id = OTHER_TENANT;
+        forged.sign(&pair(OTHER_ROOT)).unwrap();
+        assert_eq!(
+            DelegationConfig::from_json(&document(&[&alice], &[&forged])).unwrap_err(),
+            DelegationError::InvalidRevocation
+        );
+    }
+
+    // --- Attenuation: one test per rule ------------------------------------
+
+    #[test]
+    fn a_child_cannot_add_an_action_type() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant {
+            actions: &[ACTION, "local:delete_value"],
+            ..Grant::approver(BOB, Some(&bob), ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&bob, &alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&bob, &alice]));
+        refused_by_chain(&held, decision, DelegationError::ScopeWidened);
+    }
+
+    #[test]
+    fn a_child_cannot_outlive_its_parent() {
+        // Bob covers the window but ends at 13:00; alice runs to 14:00.
+        let bob = Grant {
+            validity: INNER,
+            ..Grant::delegator(ROOT, None, BOB)
+        }
+        .sign();
+        let alice = Grant {
+            validity: ("2026-06-01T11:00:00Z", "2026-06-01T14:00:00Z"),
+            ..Grant::approver(BOB, Some(&bob), ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&bob, &alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&bob, &alice]));
+        refused_by_chain(&held, decision, DelegationError::ValidityWidened);
+    }
+
+    #[test]
+    fn a_child_cannot_start_before_its_parent() {
+        let bob = Grant {
+            validity: INNER,
+            ..Grant::delegator(ROOT, None, BOB)
+        }
+        .sign();
+        let alice = Grant {
+            validity: ("2026-06-01T10:30:00Z", "2026-06-01T12:30:00Z"),
+            ..Grant::approver(BOB, Some(&bob), ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&bob, &alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&bob, &alice]));
+        refused_by_chain(&held, decision, DelegationError::ValidityWidened);
+    }
+
+    #[test]
+    fn a_child_max_depth_must_be_lower_than_its_parent() {
+        for child_depth in [1, 2] {
+            let bob = Grant {
+                max_depth: 1,
+                ..Grant::delegator(ROOT, None, BOB)
+            }
+            .sign();
+            let alice = Grant {
+                max_depth: child_depth,
+                ..Grant::approver(BOB, Some(&bob), ALICE)
+            }
+            .sign();
+            let held = held_on(&document(&[&bob, &alice], &[]));
+            let decision = approve(&held, ALICE, chain(&[&bob, &alice]));
+            refused_by_chain(&held, decision, DelegationError::DepthNotDecreasing);
+        }
+    }
+
+    #[test]
+    fn an_approver_cannot_issue_delegations() {
+        // Alice is an approver with depth to spare; only her role stops her.
+        let alice = Grant {
+            max_depth: 2,
+            ..Grant::approver(ROOT, None, ALICE)
+        }
+        .sign();
+        let carol = Grant {
+            max_depth: 1,
+            ..Grant::approver(ALICE, Some(&alice), CAROL)
+        }
+        .sign();
+        let held = held_on(&document(&[&alice, &carol], &[]));
+        let decision = approve(&held, CAROL, chain(&[&alice, &carol]));
+        refused_by_chain(&held, decision, DelegationError::ApproverCannotDelegate);
+    }
+
+    #[test]
+    fn a_chain_longer_than_the_maximum_is_refused() {
+        let first = Grant {
+            max_depth: 3,
+            ..Grant::delegator(ROOT, None, BOB)
+        }
+        .sign();
+        let second = Grant {
+            max_depth: 2,
+            ..Grant::delegator(BOB, Some(&first), CAROL)
+        }
+        .sign();
+        let third = Grant {
+            max_depth: 1,
+            ..Grant::delegator(CAROL, Some(&second), DAVE)
+        }
+        .sign();
+        let fourth = Grant {
+            max_depth: 0,
+            ..Grant::delegator(DAVE, Some(&third), EVE)
+        }
+        .sign();
+        let fifth = Grant::approver(EVE, Some(&fourth), ALICE).sign();
+        let links = [&first, &second, &third, &fourth, &fifth];
+        let held = held_on(&document(&links, &[]));
+        let decision = approve(&held, ALICE, chain(&links));
+        refused_by_chain(&held, decision, DelegationError::ChainTooLong);
+        // Four links is the maximum, and verifies.
+        let fourth_approver = Grant::approver(DAVE, Some(&third), ALICE).sign();
+        let links = [&first, &second, &third, &fourth_approver];
+        let held = held_on(&document(&links, &[]));
+        assert_accepted(&held, approve(&held, ALICE, chain(&links)));
+    }
+
+    #[test]
+    fn nobody_grants_authority_to_itself_or_to_an_earlier_key() {
+        // Bob delegates to himself.
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let bob_again = Grant {
+            max_depth: 0,
+            ..Grant::approver(BOB, Some(&bob), BOB)
+        }
+        .sign();
+        let held = held_on(&document(&[&bob, &bob_again], &[]));
+        let decision = approve(&held, BOB, chain(&[&bob, &bob_again]));
+        refused_by_chain(&held, decision, DelegationError::Cycle);
+        // Bob hands authority back to the root key.
+        let to_root = Grant::approver(BOB, Some(&bob), ROOT).sign();
+        let held = held_with(Some(true), &document(&[&bob, &to_root], &[]));
+        let decision = approve(&held, ROOT, chain(&[&bob, &to_root]));
+        refused_by_chain(&held, decision, DelegationError::Cycle);
+        // Bob -> carol -> bob.
+        let carol = Grant {
+            max_depth: 1,
+            ..Grant::delegator(BOB, Some(&bob), CAROL)
+        }
+        .sign();
+        let back = Grant::approver(CAROL, Some(&carol), BOB).sign();
+        let held = held_on(&document(&[&bob, &carol, &back], &[]));
+        let decision = approve(&held, BOB, chain(&[&bob, &carol, &back]));
+        refused_by_chain(&held, decision, DelegationError::Cycle);
+    }
+
+    #[test]
+    fn a_delegation_for_another_tenant_cannot_join_the_chain() {
+        // Signed by this tenant's root, but for the other tenant.
+        let alice = Grant {
+            tenant: OTHER_TENANT,
+            ..Grant::approver(ROOT, None, ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::TenantMismatch);
+    }
+
+    // --- Signers that are not authorized ------------------------------------
+
+    #[test]
+    fn a_key_in_no_chain_cannot_approve() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&alice], &[]));
+        // Eve signs as alice, with alice's chain.
+        let mut decision = approve(&held, EVE, chain(&[&alice]));
+        decision.approver_key_id = key_id(ALICE);
+        let signing_key = SigningKey::from_bytes(&[EVE; 32]);
+        decision.signature = hex::encode(
+            signing_key
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_SIGNATURE_INVALID",
+        );
+        // Eve, in her own name, with no chain: not the root.
+        let decision = approve(&held, EVE, vec![]);
+        refused_by_chain(&held, decision, DelegationError::UnknownApprover);
+    }
+
+    #[test]
+    fn a_delegator_cannot_sign_a_decision() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let held = held_on(&document(&[&bob], &[]));
+        let decision = approve(&held, BOB, chain(&[&bob]));
+        refused_by_chain(&held, decision, DelegationError::NotAnApprover);
+    }
+
+    #[test]
+    fn an_approver_for_other_actions_cannot_approve_this_one() {
+        let alice = Grant {
+            actions: &["local:delete_value"],
+            ..Grant::approver(ROOT, None, ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::ActionNotInScope);
+    }
+
+    #[test]
+    fn an_altered_signature_is_refused() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let mut decision = approve(&held, ALICE, chain(&[&alice]));
+        let mut bytes = hex::decode(&decision.signature).unwrap();
+        bytes[0] ^= 1;
+        decision.signature = hex::encode(bytes);
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_SIGNATURE_INVALID",
+        );
+    }
+
+    #[test]
+    fn a_delegate_of_another_tenant_cannot_approve_for_this_one() {
+        let alice = Grant {
+            tenant: OTHER_TENANT,
+            ..Grant::approver(OTHER_ROOT, None, ALICE)
+        }
+        .sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        refused_by_chain(&held, decision, DelegationError::TenantMismatch);
+    }
+
+    #[test]
+    fn the_agent_key_cannot_be_a_delegate() {
+        let agent = Grant::approver(ROOT, None, AGENT).sign();
+        let held = held_on(&document(&[&agent], &[]));
+        let decision = approve(&held, AGENT, chain(&[&agent]));
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::SelfApproval,
+            "OUTCOME_SELF_APPROVAL",
+        );
+        // Nor an intermediate delegator.
+        let via_agent = Grant::delegator(ROOT, None, AGENT).sign();
+        let alice = Grant::approver(AGENT, Some(&via_agent), ALICE).sign();
+        let held = held_on(&document(&[&via_agent, &alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&via_agent, &alice]));
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::SelfApproval,
+            "OUTCOME_SELF_APPROVAL",
+        );
+    }
+
+    #[test]
+    fn the_agent_key_cannot_be_the_root_of_a_chain() {
+        // A document whose root is the requesting agent's key: the agent
+        // delegates to another key it holds and approves through it.
+        let mut alice = Grant::approver(AGENT, None, ALICE).sign();
+        alice.issuer_key_id = key_id(ROOT);
+        alice.sign(&pair(AGENT)).unwrap();
+        let agent_root = json!({
+            "schema_version": 1,
+            "roots": [{"tenant_id": TEST_TENANT_ID, "key_id": key_id(ROOT), "public_key_hex": public_hex(AGENT)}],
+            "delegations": [&alice],
+        })
+        .to_string();
+        let held = held_on(&agent_root);
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        match held.gateway.resolve_human_approval(decision) {
+            Err(GatewayError::Approval(error)) => assert_eq!(error, ApprovalError::SelfApproval),
+            other => panic!("expected SelfApproval, got {other:?}"),
+        }
+        assert_eq!(
+            held.journal.get(held.key).unwrap().unwrap().human_approval,
+            None
+        );
+        assert_eq!(held.tool.invocations(), 0);
+    }
+
+    // --- Compatibility ---------------------------------------------------
+
+    #[test]
+    fn a_pinned_approver_v1_decision_works_with_and_without_a_delegation_file() {
+        let with_file = held_on(&document(&[], &[]));
+        let decision = human_approval_decision(
+            with_file.challenge.clone(),
+            HumanApprovalOutcome::Approve,
+            &with_file.pinned_approver,
+        );
+        assert!(decision.delegation_chain.is_none());
+        let report = assert_accepted_v1(&with_file, decision);
+        assert!(report.delegated.is_empty());
+        // The offline verifier needs no delegation flags for it.
+        let (gateway, request, tool, _journal, approver_key) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let decision = human_approval_decision(
+            gateway.approval_challenge(key).unwrap(),
+            HumanApprovalOutcome::Approve,
+            &approver_key,
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        gateway.dispatch_approved(key).unwrap();
+        assert_eq!(tool.invocations(), 1);
+    }
+
+    fn assert_accepted_v1(held: &Held, decision: HumanApprovalDecision) -> OutcomeReport {
+        held.gateway
+            .resolve_human_approval(decision.clone())
+            .unwrap();
+        let receipt = held.gateway.dispatch_approved(held.key).unwrap();
+        assert_eq!(held.tool.invocations(), 1);
+        offline_with(
+            held,
+            &[
+                Outcome::HumanDecision(decision),
+                Outcome::ExecutionReceipt(Box::new(receipt)),
+            ],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_root_cannot_approve_with_a_v1_decision() {
+        // The root is not a pinned approver: a v1 decision has no verifier.
+        let held = held_with(Some(true), &document(&[], &[]));
+        let mut decision = human_approval_decision(
+            held.challenge.clone(),
+            HumanApprovalOutcome::Approve,
+            &SigningKey::from_bytes(&[ROOT; 32]),
+        );
+        decision.approver_key_id = key_id(ROOT);
+        decision.signature = hex::encode(
+            SigningKey::from_bytes(&[ROOT; 32])
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        assert_refused(
+            &held,
+            decision,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_KEY_UNKNOWN",
+        );
+    }
+
+    #[test]
+    fn a_v2_decision_changed_after_signing_does_not_verify() {
+        let bob = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&bob), ALICE).sign();
+        // A second valid chain to alice, straight from the root.
+        let direct = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&bob, &alice, &direct], &[]));
+        let signed = approve(&held, ALICE, chain(&[&bob, &alice]));
+        let mut swapped_chain = signed.clone();
+        swapped_chain.delegation_chain = Some(chain(&[&direct]));
+        let mut as_v1 = signed.clone();
+        as_v1.schema_version = 1;
+        as_v1.delegation_chain = None;
+        let mut other_id = signed.clone();
+        other_id.approval_id = Uuid::new_v4();
+        let mut as_v3 = signed.clone();
+        as_v3.schema_version = 3;
+        for (decision, code) in [
+            (swapped_chain, "OUTCOME_SIGNATURE_INVALID"),
+            (other_id, "OUTCOME_SIGNATURE_INVALID"),
+        ] {
+            assert_refused(&held, decision, ApprovalError::InvalidSignature, code);
+        }
+        // As version 1, it needs a pinned approver called alice.
+        assert_refused(
+            &held,
+            as_v1,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_KEY_UNKNOWN",
+        );
+        // An unknown version is no delegated decision either.
+        assert_refused(
+            &held,
+            as_v3,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_KEY_UNKNOWN",
+        );
+        // A version 1 decision with a chain is malformed for both.
+        let mut v1_with_chain = human_approval_decision(
+            held.challenge.clone(),
+            HumanApprovalOutcome::Approve,
+            &held.pinned_approver,
+        );
+        v1_with_chain.delegation_chain = Some(vec![]);
+        assert_refused(
+            &held,
+            v1_with_chain,
+            ApprovalError::InvalidSignature,
+            "OUTCOME_SIGNATURE_INVALID",
+        );
+        // The untouched decision still verifies.
+        assert_accepted(&held, signed);
+    }
+
+    #[test]
+    fn a_v2_decision_on_a_gateway_without_delegation_is_refused() {
+        let (gateway, request, tool, journal, _) = approval_fixture();
+        let key = pending_key(&gateway, request);
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let decision = decide(
+            &gateway.approval_challenge(key).unwrap(),
+            ALICE,
+            chain(&[&alice]),
+            HumanApprovalOutcome::Approve,
+        );
+        assert!(matches!(
+            gateway.resolve_human_approval(decision),
+            Err(GatewayError::Approval(ApprovalError::InvalidSignature))
+        ));
+        assert_eq!(journal.get(key).unwrap().unwrap().human_approval, None);
+        assert_eq!(tool.invocations(), 0);
+    }
+
+    #[test]
+    fn offline_a_v2_decision_without_the_delegation_flags_fails_clearly() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        let error =
+            offline_with(&held, &[Outcome::HumanDecision(decision.clone())], None).unwrap_err();
+        assert_eq!(error.code(), "DELEGATION_UNVERIFIED");
+        assert!(offline(&held, &[Outcome::HumanDecision(decision)]).is_ok());
+    }
+
+    #[test]
+    fn offline_the_root_must_be_pinned_and_the_policy_must_match() {
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        let held = held_on(&document(&[&alice], &[]));
+        let decision = approve(&held, ALICE, chain(&[&alice]));
+        let text = write_outcomes(&[Outcome::HumanDecision(decision)]).unwrap();
+        let config = DelegationConfig::from_json(&held.document).unwrap();
+        let attesters = [EvidenceAttesterKey::from_secret_bytes(&[33; 32])
+            .public_key()
+            .unwrap()];
+        let check = |roots: &[KeyPin], digest: &str| {
+            verify_outcomes(
+                &text,
+                std::slice::from_ref(&held.evidence),
+                &OutcomeKeys {
+                    evidence_attesters: &attesters,
+                    execution: &[],
+                    approvers: &[],
+                    delegation: Some(OutcomeDelegation {
+                        roots,
+                        delegations: &config,
+                        policy_digest: digest,
+                        root_may_approve: false,
+                    }),
+                },
+            )
+            .map(|_| ())
+            .map_err(|error| error.code())
+        };
+        let digest = held.policy.digest().unwrap();
+        assert_eq!(check(&[root_pin()], &digest), Ok(()));
+        let wrong_pin = KeyPin {
+            key_id: key_id(ROOT),
+            public_key: pair(EVE).public_key(),
+        };
+        assert_eq!(
+            check(&[wrong_pin], &digest),
+            Err("DELEGATION_ROOT_UNPINNED")
+        );
+        assert_eq!(check(&[], &digest), Err("DELEGATION_ROOT_UNPINNED"));
+        assert_eq!(
+            check(&[root_pin()], &"00".repeat(32)),
+            Err("DELEGATION_POLICY_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn a_child_cannot_be_moved_under_another_delegation_of_the_same_key() {
+        // Two delegations from the root to bob with the same scope; bob's
+        // grant to alice names the first as its parent, and the first is
+        // revoked.
+        let first = Grant::delegator(ROOT, None, BOB).sign();
+        let second = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&first), ALICE).sign();
+        let revoked = revocation(ROOT, &first, "2026-06-01T11:59:00Z");
+        let held = held_on(&document(&[&first, &second, &alice], &[&revoked]));
+        // Under the delegation that is not revoked, the child's signed
+        // parent does not match: it cannot escape the revocation.
+        let moved = approve(&held, ALICE, chain(&[&second, &alice]));
+        refused_by_chain(&held, moved, DelegationError::WrongIssuer);
+        // Under its own parent, the revocation applies.
+        let own = approve(&held, ALICE, chain(&[&first, &alice]));
+        refused_by_chain(&held, own, DelegationError::Revoked);
+    }
+
+    #[test]
+    fn a_version_1_decision_signed_with_a_chain_is_refused() {
+        let held = held_on(&document(&[], &[]));
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        for delegation_chain in [vec![], chain(&[&alice])] {
+            let mut decision = human_approval_decision(
+                held.challenge.clone(),
+                HumanApprovalOutcome::Approve,
+                &held.pinned_approver,
+            );
+            decision.delegation_chain = Some(delegation_chain);
+            // Signed over the chain by the pinned approver: the signature
+            // itself is valid, the shape is not.
+            decision.signature = hex::encode(
+                held.pinned_approver
+                    .sign(&decision.signing_message().unwrap())
+                    .to_bytes(),
+            );
+            assert_refused(
+                &held,
+                decision,
+                ApprovalError::InvalidSignature,
+                "OUTCOME_SIGNATURE_INVALID",
+            );
+        }
+    }
+
+    /// A gateway over `held`'s journal and tool whose policy is `held`'s
+    /// with `root_may_approve` set to true, as after a restart with a
+    /// changed policy.
+    fn rebuilt_allowing_the_root(held: &Held) -> Gateway {
+        let mut policy = held.policy.clone();
+        policy.approval_delegation = Some(ApprovalDelegationPolicy {
+            root_may_approve: true,
+        });
+        assert!(policy.root_may_approve());
+        let policy_digest = policy.digest().unwrap();
+        assert_ne!(Some(&policy_digest), held.evidence.policy_digest.as_ref());
+        let issuer_pin = TrustedAuthorityIssuer::new(
+            "local-test-issuer",
+            AgentKeyPair::from_secret_bytes(&[32; 32]).public_key(),
+        )
+        .unwrap()
+        .with_validity(long_validity())
+        .unwrap();
+        let config = HighAssuranceConfig::new(
+            policy_digest,
+            vec![issuer_pin],
+            EvidenceAttesterKey::from_secret_bytes(&[33; 32]),
+        )
+        .unwrap()
+        .with_audience("local-test-gateway")
+        .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
+        .with_freshness_provider(Arc::new(CurrentFreshness));
+        let clock = Arc::new(Mutex::new(FixedClock::try_new(NOW).unwrap().now()));
+        let engine =
+            AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock))
+                .unwrap();
+        Gateway::new(
+            engine,
+            held.journal.clone(),
+            held.tool.clone(),
+            execution_attester(),
+        )
+        .unwrap()
+        .with_human_approval_verifier(
+            HumanApprovalVerifier::new(
+                "test-human-approver-v1",
+                approver_public_key(&held.pinned_approver),
+            )
+            .unwrap(),
+        )
+        .with_approval_delegation(DelegationConfig::from_json(&held.document).unwrap())
+    }
+
+    #[test]
+    fn a_policy_that_allows_the_root_does_not_apply_to_requests_held_under_another() {
+        let held = held_with(None, &document(&[], &[]));
+        let rebuilt = rebuilt_allowing_the_root(&held);
+        // A rejection is checked first: only this guard stops it, while an
+        // approval would also fail the evidence check for dispatch.
+        for outcome in [HumanApprovalOutcome::Reject, HumanApprovalOutcome::Approve] {
+            let decision = decide(&held.challenge, ROOT, vec![], outcome);
+            match rebuilt.resolve_human_approval(decision) {
+                Err(GatewayError::Approval(error)) => {
+                    assert_eq!(error, ApprovalError::RootMayNotApprove)
+                }
+                other => panic!("expected RootMayNotApprove, got {other:?}"),
+            }
+            let record = held.journal.get(held.key).unwrap().unwrap();
+            assert_eq!(record.human_approval, None, "nothing was recorded");
+            assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+            assert_eq!(
+                held.journal.entry(held.key).unwrap().states,
+                Vec::<ExecutionStatus>::new()
+            );
+            assert_eq!(held.tool.invocations(), 0);
+        }
     }
 }

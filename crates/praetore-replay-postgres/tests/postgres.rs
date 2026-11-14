@@ -727,6 +727,7 @@ struct PostgresApprovalFixture {
     request: AuthorizationRequest,
     adapter: Arc<PostgresTestAdapter>,
     approver_key: SigningKey,
+    policy: Policy,
 }
 
 fn test_validity() -> Validity {
@@ -831,6 +832,18 @@ fn create_postgres_approval_gateway_with_clock(
     request_id: Uuid,
     clock: Option<SharedClock>,
 ) -> PostgresApprovalFixture {
+    create_postgres_approval_gateway_for(request_id, clock, TEST_TENANT_ID, None)
+}
+
+/// The approval fixture for `tenant_id`, with the policy's
+/// `approval_delegation` option set to `root_may_approve` (absent for
+/// `None`).
+fn create_postgres_approval_gateway_for(
+    request_id: Uuid,
+    clock: Option<SharedClock>,
+    tenant_id: Uuid,
+    root_may_approve: Option<bool>,
+) -> PostgresApprovalFixture {
     initialize_test_database();
     let agent_key = AgentKeyPair::from_secret_bytes(&[81; 32]);
     let issuer_key = AgentKeyPair::from_secret_bytes(&[82; 32]);
@@ -843,7 +856,7 @@ fn create_postgres_approval_gateway_with_clock(
         vec!["local:write".into()],
     )
     .with_validity(validity.clone())
-    .with_constraint("tenant_id", TEST_TENANT_ID.to_string());
+    .with_constraint("tenant_id", tenant_id.to_string());
     authority.sign_for_agent(&issuer_key, &agent).unwrap();
     let action = Action::new(
         "local:set_value",
@@ -852,7 +865,7 @@ fn create_postgres_approval_gateway_with_clock(
     )
     .unwrap()
     .with_capability("local:write");
-    let policy = mission_policy(Policy::new_v2(
+    let mut policy = mission_policy(Policy::new_v2(
         "postgres-human-approval",
         1,
         vec![
@@ -864,6 +877,8 @@ fn create_postgres_approval_gateway_with_clock(
             .with_capability("local:write"),
         ],
     ));
+    policy.approval_delegation = root_may_approve
+        .map(|root_may_approve| praetore_core::ApprovalDelegationPolicy { root_may_approve });
     // Intents are signed at the engine's (injected) time, never host time.
     let clock = clock.unwrap_or_else(SharedClock::at_test_now);
     let now = clock.now();
@@ -887,7 +902,7 @@ fn create_postgres_approval_gateway_with_clock(
         .with_audience("postgres-test-gateway")
         .with_replay_guard(Arc::new(connect_guard()))
         .with_freshness_provider(Arc::new(TestFreshness));
-    let engine = AuthorizationEngine::production_with_clock(policy, config, clock).unwrap();
+    let engine = AuthorizationEngine::production_with_clock(policy.clone(), config, clock).unwrap();
     let adapter = Arc::new(PostgresTestAdapter::new(None));
     let approver_key = SigningKey::from_bytes(&[84; 32]);
     let verifier = HumanApprovalVerifier::new(
@@ -909,6 +924,7 @@ fn create_postgres_approval_gateway_with_clock(
         request,
         adapter,
         approver_key,
+        policy,
     }
 }
 
@@ -1869,6 +1885,7 @@ fn postgres_human_approval_is_persisted_atomically_and_consumed_once() {
         approver_key_id: "postgres-human-approver-v1".into(),
         challenge,
         outcome: HumanApprovalOutcome::Approve,
+        delegation_chain: None,
         signature: String::new(),
     };
     decision.signature = hex::encode(
@@ -2066,6 +2083,7 @@ fn postgres_approval_expiration_is_signed_unique_exclusive_and_append_only() {
         approver_key_id: "postgres-human-approver-v1".into(),
         challenge,
         outcome: HumanApprovalOutcome::Approve,
+        delegation_chain: None,
         signature: String::new(),
     };
     late.signature = hex::encode(
@@ -2428,6 +2446,7 @@ fn sign_approval(fixture: &PostgresApprovalFixture, key: ExecutionKey) -> HumanA
         approver_key_id: "postgres-human-approver-v1".into(),
         challenge: fixture.gateway.approval_challenge(key).unwrap(),
         outcome: HumanApprovalOutcome::Approve,
+        delegation_chain: None,
         signature: String::new(),
     };
     decision.signature = hex::encode(
@@ -7464,6 +7483,7 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             approver_key_id: "postgres-human-approver-v1".into(),
             challenge,
             outcome: HumanApprovalOutcome::Reject,
+            delegation_chain: None,
             signature: String::new(),
         };
         decision.signature = hex::encode(
@@ -8592,6 +8612,7 @@ fn postgres_rejection_and_its_close_commit_together() {
         approver_key_id: "postgres-human-approver-v1".into(),
         challenge,
         outcome: HumanApprovalOutcome::Reject,
+        delegation_chain: None,
         signature: String::new(),
     };
     decision.signature = hex::encode(
@@ -11684,5 +11705,339 @@ mod journal_position {
             .collect();
         positions.sort_unstable();
         assert_eq!(positions, [2, 3]);
+    }
+}
+
+/// Delegated approval against PostgreSQL: the tenant's root delegates to a
+/// delegator, who names an approver; the approver's schema version 2
+/// decision is recorded, dispatched once, exported with the tenant's
+/// journal, and verified by the `praetore-verify outcomes` binary.
+mod delegated_approval_postgres {
+    use super::*;
+    use praetore_core::approval_delegation::{
+        ApprovalDelegation, DelegationConfig, DelegationRole, DelegationScope,
+    };
+    use std::{path::PathBuf, process::Command};
+
+    const ROOT: u8 = 94;
+    const DELEGATOR: u8 = 95;
+    const APPROVER: u8 = 96;
+
+    fn pair(seed: u8) -> AgentKeyPair {
+        AgentKeyPair::from_secret_bytes(&[seed; 32])
+    }
+
+    fn public_hex(seed: u8) -> String {
+        hex::encode(pair(seed).public_key().as_bytes())
+    }
+
+    fn grant(
+        tenant_id: Uuid,
+        issuer: (&str, u8),
+        parent: Option<&ApprovalDelegation>,
+        subject: (&str, u8),
+        role: DelegationRole,
+        max_depth: u8,
+    ) -> ApprovalDelegation {
+        let mut delegation = ApprovalDelegation {
+            schema_version: 1,
+            delegation_id: Uuid::new_v4(),
+            tenant_id,
+            issuer_key_id: issuer.0.into(),
+            parent_delegation_hash: parent.map(|parent| parent.hash().unwrap()),
+            subject_key_id: subject.0.into(),
+            subject_public_key_hex: public_hex(subject.1),
+            role,
+            scope: DelegationScope {
+                action_types: vec!["local:set_value".into()],
+            },
+            not_before: "2026-06-01T11:00:00Z".into(),
+            not_after: "2026-06-01T13:00:00Z".into(),
+            max_depth,
+            signature: String::new(),
+        };
+        delegation.sign(&pair(issuer.1)).unwrap();
+        delegation
+    }
+
+    fn document(tenant_id: Uuid, delegations: &[&ApprovalDelegation]) -> String {
+        json!({
+            "schema_version": 1,
+            "roots": [{"tenant_id": tenant_id, "key_id": "tenant-root", "public_key_hex": public_hex(ROOT)}],
+            "delegations": delegations,
+        })
+        .to_string()
+    }
+
+    fn sign_v2(
+        challenge: praetore_gateway::ApprovalChallenge,
+        signer: (&str, u8),
+        chain: Vec<String>,
+    ) -> HumanApprovalDecision {
+        let mut decision = HumanApprovalDecision {
+            schema_version: 2,
+            approval_id: Uuid::new_v4(),
+            approver_key_id: signer.0.into(),
+            challenge,
+            outcome: HumanApprovalOutcome::Approve,
+            delegation_chain: Some(chain),
+            signature: String::new(),
+        };
+        decision.signature = hex::encode(
+            SigningKey::from_bytes(&[signer.1; 32])
+                .sign(&decision.signing_message().unwrap())
+                .to_bytes(),
+        );
+        decision
+    }
+
+    /// `praetore-verify` in the nearest ancestor directory of this test
+    /// binary that holds it (`target/<profile>/`, whatever layout cargo
+    /// uses for test binaries).
+    fn verifier() -> PathBuf {
+        let name = format!("praetore-verify{}", env::consts::EXE_SUFFIX);
+        let exe = env::current_exe().unwrap();
+        exe.ancestors()
+            .skip(1)
+            .map(|dir| dir.join(&name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "praetore-verify not found above {}: run `cargo build -p praetore-verify --locked` first",
+                    exe.display()
+                )
+            })
+    }
+
+    fn pending(fixture: &PostgresApprovalFixture, tenant_id: Uuid) -> ExecutionKey {
+        let pending = fixture.gateway.execute(fixture.request.clone()).unwrap();
+        assert_eq!(
+            pending.evidence.decision.outcome,
+            DecisionOutcome::RequireApproval
+        );
+        ExecutionKey {
+            tenant_id,
+            agent_id: *pending.evidence.agent.id.as_uuid(),
+            request_id: pending.evidence.request_id,
+        }
+    }
+
+    fn approval_rows(key: ExecutionKey) -> i64 {
+        connect_client()
+            .query_one(
+                "SELECT count(*) FROM praetore.human_approvals \
+                 WHERE tenant_id = $1 AND agent_id = $2 AND request_id = $3",
+                &[&key.tenant_id, &key.agent_id, &key.request_id],
+            )
+            .unwrap()
+            .get(0)
+    }
+
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL and a built praetore-verify"]
+    fn postgres_delegated_approval_is_recorded_dispatched_exported_and_verified() {
+        let tenant_id = Uuid::new_v4();
+        let delegator = grant(
+            tenant_id,
+            ("tenant-root", ROOT),
+            None,
+            ("delegator", DELEGATOR),
+            DelegationRole::Delegator,
+            1,
+        );
+        let approver = grant(
+            tenant_id,
+            ("delegator", DELEGATOR),
+            Some(&delegator),
+            ("approver", APPROVER),
+            DelegationRole::Approver,
+            0,
+        );
+        let delegations = document(tenant_id, &[&delegator, &approver]);
+        let fixture = create_postgres_approval_gateway_for(Uuid::new_v4(), None, tenant_id, None);
+        let gateway = fixture
+            .gateway
+            .clone()
+            .with_approval_delegation(DelegationConfig::from_json(&delegations).unwrap());
+        let key = pending(&fixture, tenant_id);
+        let chain = vec![delegator.hash().unwrap(), approver.hash().unwrap()];
+        let decision = sign_v2(
+            gateway.approval_challenge(key).unwrap(),
+            ("approver", APPROVER),
+            chain.clone(),
+        );
+        assert!(matches!(
+            gateway.resolve_human_approval(decision.clone()).unwrap(),
+            HumanApprovalResult::ApprovedPendingDispatch { .. }
+        ));
+        let receipt = gateway.dispatch_approved(key).unwrap();
+        assert_eq!(receipt.execution, AttestedExecution::Confirmed);
+        assert!(gateway.dispatch_approved(key).is_err());
+        assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(database_invocation_count(key), 1);
+        // The stored decision is the signed version 2 decision, chain
+        // included.
+        let stored: Value = connect_client()
+            .query_one(
+                "SELECT decision_json FROM praetore.human_approvals \
+                 WHERE tenant_id = $1 AND request_id = $2",
+                &[&tenant_id, &key.request_id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(stored["schema_version"], 2);
+        assert_eq!(stored["delegation_chain"], json!(chain));
+
+        // Export the tenant's journal and outcomes, then verify offline.
+        let attester = EvidenceAttesterKey::from_secret_bytes(&[83; 32]);
+        let (export, outcomes) =
+            praetore_replay_postgres::journal_export::export_tenant_with_outcomes(
+                &mut connect_client(),
+                tenant_id,
+                &[attester.public_key().unwrap()],
+            )
+            .unwrap();
+        let dir = env::temp_dir().join(format!("praetore-delegated-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let write = |name: &str, text: &str| std::fs::write(dir.join(name), text).unwrap();
+        write("journal.jsonl", &export.text);
+        write(
+            "approvals.jsonl",
+            &praetore_receipt::outcomes::write_outcomes(&outcomes).unwrap(),
+        );
+        write(
+            "attester.hex",
+            &hex::encode(attester.public_key().unwrap().as_bytes()),
+        );
+        write(
+            "execution.json",
+            &json!({"schema_version": 1, "key_id": "postgres-test-execution-attester-v1",
+                    "public_key_hex": hex::encode(execution_attester_public_key().as_bytes())})
+            .to_string(),
+        );
+        write(
+            "approver.json",
+            &json!({"schema_version": 1, "key_id": "postgres-human-approver-v1",
+                    "public_key_hex": hex::encode(fixture.approver_key.verifying_key().to_bytes())})
+            .to_string(),
+        );
+        write(
+            "root.json",
+            &json!({"schema_version": 1, "key_id": "tenant-root", "public_key_hex": public_hex(ROOT)})
+                .to_string(),
+        );
+        write("delegations.json", &delegations);
+        write(
+            "policy.json",
+            &serde_json::to_string(&fixture.policy).unwrap(),
+        );
+        let run = |extra: &[&str]| {
+            let mut args = vec![
+                "outcomes",
+                "--outcomes",
+                "approvals.jsonl",
+                "--journal",
+                "journal.jsonl",
+                "--attester-pin",
+                "attester.hex",
+                "--execution-pin",
+                "execution.json",
+                "--approver-pin",
+                "approver.json",
+                "--format",
+                "json",
+            ];
+            args.extend(extra);
+            let output = Command::new(verifier())
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let summary: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
+                panic!(
+                    "stdout: {}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            (output.status.success(), summary)
+        };
+        let (ok, summary) = run(&[
+            "--delegation-root-pin",
+            "root.json",
+            "--delegations",
+            "delegations.json",
+            "--policy",
+            "policy.json",
+        ]);
+        assert!(ok, "{summary}");
+        let details = &summary["details"];
+        assert_eq!(details["held"][0]["outcome"], "approved_executed");
+        assert_eq!(details["delegation_checked"], true);
+        let delegated = &details["delegated_decisions"][0];
+        assert_eq!(delegated["approver_key_id"], "approver");
+        assert_eq!(delegated["root_approved"], false);
+        assert_eq!(delegated["delegation_chain"], json!(chain));
+        // Without the delegation flags the delegated decision is not
+        // verified.
+        let (ok, summary) = run(&[]);
+        assert!(!ok);
+        assert_eq!(summary["code"], "DELEGATION_UNVERIFIED", "{summary}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a PostgreSQL service; run in assurance CI"]
+    fn postgres_root_decision_refused_by_policy_writes_no_row() {
+        let tenant_id = Uuid::new_v4();
+        let delegations = document(tenant_id, &[]);
+        for option in [None, Some(false)] {
+            let fixture =
+                create_postgres_approval_gateway_for(Uuid::new_v4(), None, tenant_id, option);
+            let gateway = fixture
+                .gateway
+                .clone()
+                .with_approval_delegation(DelegationConfig::from_json(&delegations).unwrap());
+            let key = pending(&fixture, tenant_id);
+            let decision = sign_v2(
+                gateway.approval_challenge(key).unwrap(),
+                ("tenant-root", ROOT),
+                vec![],
+            );
+            assert!(
+                matches!(
+                    gateway.resolve_human_approval(decision),
+                    Err(GatewayError::Approval(
+                        praetore_gateway::ApprovalError::RootMayNotApprove
+                    ))
+                ),
+                "{option:?}"
+            );
+            assert_eq!(approval_rows(key), 0, "{option:?}");
+            assert_eq!(
+                connect_journal().get(key).unwrap().unwrap().execution,
+                ExecutionStatus::NotDispatched
+            );
+            assert!(gateway.dispatch_approved(key).is_err());
+            assert_eq!(fixture.adapter.invocations.load(Ordering::SeqCst), 0);
+            assert_eq!(database_invocation_count(key), 0);
+        }
+        // With the option set to true, the same root decision is recorded.
+        let fixture =
+            create_postgres_approval_gateway_for(Uuid::new_v4(), None, tenant_id, Some(true));
+        let gateway = fixture
+            .gateway
+            .clone()
+            .with_approval_delegation(DelegationConfig::from_json(&delegations).unwrap());
+        let key = pending(&fixture, tenant_id);
+        let decision = sign_v2(
+            gateway.approval_challenge(key).unwrap(),
+            ("tenant-root", ROOT),
+            vec![],
+        );
+        gateway.resolve_human_approval(decision).unwrap();
+        assert_eq!(approval_rows(key), 1);
+        gateway.dispatch_approved(key).unwrap();
+        assert_eq!(database_invocation_count(key), 1);
     }
 }
