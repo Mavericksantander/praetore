@@ -40,15 +40,15 @@ const I18N = {
     sub_integrity: "La misma verificación que praetore-mcp verify",
     live: "En vivo", updated: (s) => `Actualizado ${s}`,
     mode_readonly: "Solo lectura", mode_approvals: "Aprobaciones activas",
-    hero_ok_t: "Protección activa",
+    hero_ok_t: "Todo en orden.",
     hero_ok_d: (n) => `${n} decisiones firmadas y verificadas. El journal está íntegro.`,
-    hero_bad_t: "Falla de integridad",
+    hero_bad_t: "Algo no cuadra.",
     hero_bad_d: (f) => `verify encontró ${f} falla(s) en el journal.`,
     hero_err_t: "No se pudo verificar el journal",
-    hero_empty_t: "Esperando la primera acción",
+    hero_empty_t: "En silencio, por ahora.",
     hero_empty_d: "Cuando tu agente use una herramienta, la decisión aparecerá aquí.",
     see_integrity: "Ver integridad",
-    cta_pending: (n) => n === 1 ? "1 acción espera tu aprobación" : `${n} acciones esperan tu aprobación`,
+    cta_pending: (n) => n === 1 ? "Una acción espera tu decisión." : `${n} acciones esperan tu decisión.`,
     cta_sub: "El agente no la ejecutó y espera tu decisión.",
     review: "Revisar",
     k_total: "Decisiones", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pidieron aprobación",
@@ -60,7 +60,7 @@ const I18N = {
     d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pidió aprobación",
     ap_pending: "Esperando decisión", ap_held: "Retenida (sin decisión)", ap_approve: "Aprobada",
     ap_reject: "Rechazada", ap_executed: "Ejecutada tras aprobación", ap_would: "En enforce pediría aprobación",
-    pend_none_t: "Todo al día", pend_none_d: "No hay acciones esperando aprobación.",
+    pend_none_t: "Nada pendiente.", pend_none_d: "No hay acciones esperando aprobación.",
     agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
     expires_in: (m, s) => `Vence en ${m}:${String(s).padStart(2, "0")}`,
     expired: "Vencida: ya no se puede aprobar",
@@ -109,7 +109,7 @@ const I18N = {
     rule_default_t: "Todo lo demás", rule_default_d: "Cualquier llamada que ninguna regla cubra se bloquea (default deny).",
     allow_all_tag: "Permite todo",
     pol_note: "Los procesos wrap leen la política al arrancar: reinicia tu cliente MCP después de cambiarla.",
-    int_ok: "Journal íntegro", int_fail: "Se encontraron fallas",
+    int_ok: "El journal está íntegro.", int_fail: "Se encontraron fallas",
     verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} fallas`,
     head: "Journal head",
     head_text: (n, seq, u) => `${n} entradas encadenadas, próximo seq ${seq}, ${u} sin encadenar anteriores`,
@@ -147,15 +147,15 @@ const I18N = {
     sub_integrity: "The same verification as praetore-mcp verify",
     live: "Live", updated: (s) => `Updated ${s}`,
     mode_readonly: "Read-only", mode_approvals: "Approvals enabled",
-    hero_ok_t: "Protection active",
+    hero_ok_t: "All in order.",
     hero_ok_d: (n) => `${n} signed and verified decisions. The journal is intact.`,
-    hero_bad_t: "Integrity failure",
+    hero_bad_t: "Something does not add up.",
     hero_bad_d: (f) => `verify found ${f} failure(s) in the journal.`,
     hero_err_t: "The journal could not be verified",
-    hero_empty_t: "Waiting for the first action",
+    hero_empty_t: "Quiet, for now.",
     hero_empty_d: "When your agent uses a tool, the decision will show up here.",
     see_integrity: "View integrity",
-    cta_pending: (n) => n === 1 ? "1 action is waiting for your approval" : `${n} actions are waiting for your approval`,
+    cta_pending: (n) => n === 1 ? "One action is waiting for you." : `${n} actions are waiting for you.`,
     cta_sub: "The agent did not run it and is waiting for your decision.",
     review: "Review",
     k_total: "Decisions", k_allow: "Allowed", k_deny: "Blocked", k_ask: "Asked for approval",
@@ -167,7 +167,7 @@ const I18N = {
     d_ALLOW: "Allowed", d_DENY: "Blocked", d_REQUIRE_APPROVAL: "Asked for approval",
     ap_pending: "Waiting for decision", ap_held: "Held (no decision)", ap_approve: "Approved",
     ap_reject: "Rejected", ap_executed: "Executed after approval", ap_would: "Enforce would ask",
-    pend_none_t: "All caught up", pend_none_d: "No actions are waiting for approval.",
+    pend_none_t: "Nothing pending.", pend_none_d: "No actions are waiting for approval.",
     agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
     expires_in: (m, s) => `Expires in ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expired: it can no longer be approved",
@@ -216,7 +216,7 @@ const I18N = {
     rule_default_t: "Everything else", rule_default_d: "Any call no rule covers is blocked (default deny).",
     allow_all_tag: "Allows everything",
     pol_note: "wrap processes read the policy when they start: restart your MCP client after changing it.",
-    int_ok: "Journal intact", int_fail: "Failures found",
+    int_ok: "The journal is intact.", int_fail: "Failures found",
     verified_n: (ok, total, failed) => `${ok} of ${total} receipts verified, ${failed} failures`,
     head: "Journal head",
     head_text: (n, seq, u) => `${n} chained entries, next seq ${seq}, ${u} unchained earlier entries`,
@@ -254,15 +254,15 @@ const I18N = {
     sub_integrity: "A mesma verificação do praetore-mcp verify",
     live: "Ao vivo", updated: (s) => `Atualizado ${s}`,
     mode_readonly: "Somente leitura", mode_approvals: "Aprovações ativas",
-    hero_ok_t: "Proteção ativa",
+    hero_ok_t: "Tudo em ordem.",
     hero_ok_d: (n) => `${n} decisões assinadas e verificadas. O journal está íntegro.`,
-    hero_bad_t: "Falha de integridade",
+    hero_bad_t: "Algo não confere.",
     hero_bad_d: (f) => `o verify encontrou ${f} falha(s) no journal.`,
     hero_err_t: "Não foi possível verificar o journal",
-    hero_empty_t: "Aguardando a primeira ação",
+    hero_empty_t: "Em silêncio, por enquanto.",
     hero_empty_d: "Quando seu agente usar uma ferramenta, a decisão aparecerá aqui.",
     see_integrity: "Ver integridade",
-    cta_pending: (n) => n === 1 ? "1 ação aguarda sua aprovação" : `${n} ações aguardam sua aprovação`,
+    cta_pending: (n) => n === 1 ? "Uma ação aguarda sua decisão." : `${n} ações aguardam sua decisão.`,
     cta_sub: "O agente não a executou e aguarda sua decisão.",
     review: "Revisar",
     k_total: "Decisões", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pediram aprovação",
@@ -274,7 +274,7 @@ const I18N = {
     d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pediu aprovação",
     ap_pending: "Aguardando decisão", ap_held: "Retida (sem decisão)", ap_approve: "Aprovada",
     ap_reject: "Rejeitada", ap_executed: "Executada após aprovação", ap_would: "Em enforce pediria aprovação",
-    pend_none_t: "Tudo em dia", pend_none_d: "Não há ações aguardando aprovação.",
+    pend_none_t: "Nada pendente.", pend_none_d: "Não há ações aguardando aprovação.",
     agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
     expires_in: (m, s) => `Expira em ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expirada: não pode mais ser aprovada",
@@ -323,7 +323,7 @@ const I18N = {
     rule_default_t: "Todo o resto", rule_default_d: "Qualquer chamada que nenhuma regra cubra é bloqueada (default deny).",
     allow_all_tag: "Permite tudo",
     pol_note: "Os processos wrap leem a política ao iniciar: reinicie seu cliente MCP depois de alterá-la.",
-    int_ok: "Journal íntegro", int_fail: "Foram encontradas falhas",
+    int_ok: "O journal está íntegro.", int_fail: "Foram encontradas falhas",
     verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} falhas`,
     head: "Journal head",
     head_text: (n, seq, u) => `${n} entradas encadeadas, próximo seq ${seq}, ${u} não encadeadas anteriores`,
@@ -601,29 +601,26 @@ function renderOverview() {
   const s = state.summary;
   const v = state.verify;
 
+  // One sentence for the state of things: integrity first, then what
+  // waits for a person, then calm.
+  const count = activePending().length;
   let hero;
   if (v.status === "error") {
     hero = heroCard("bad", "!", t("hero_err_t"), String(v.error), t("see_integrity"));
   } else if (v.status === "fail") {
     hero = heroCard("bad", "!", t("hero_bad_t"), t("hero_bad_d", v.failed), t("see_integrity"));
+  } else if (count > 0) {
+    hero = heroCard("warn", "", t("cta_pending", count), t("cta_sub"), t("review"), "approvals");
   } else if (s.total === 0) {
-    hero = heroCard("ok", "✓", t("hero_empty_t"), t("hero_empty_d"), null);
+    hero = heroCard("ok", "", t("hero_empty_t"), t("hero_empty_d"), null);
   } else {
-    hero = heroCard("ok", "✓", t("hero_ok_t"), t("hero_ok_d", v.verified), t("see_integrity"));
+    hero = heroCard("ok", "", t("hero_ok_t"), t("hero_ok_d", v.verified), t("see_integrity"));
   }
   root.append(hero);
 
-  const count = activePending().length;
-  if (count > 0) {
-    root.append(el("div", { class: "cta section-gap" },
-      el("span", { class: "pulse" }),
-      el("div", {}, el("strong", {}, t("cta_pending", count)), el("div", {}, t("cta_sub"))),
-      el("button", { type: "button", class: "btn-primary", onclick: () => go("approvals") }, t("review"))));
-  }
-
   const pct = (n) => (s.total ? Math.round((n / s.total) * 100) : 0);
   const kpis = el("div", { class: "grid kpis section-gap" },
-    kpi(t("k_total"), s.total, t("k_total_foot", s.enforce_receipts), "var(--accent)", 100),
+    kpi(t("k_total"), s.total, t("k_total_foot", s.enforce_receipts), "var(--ink)", 100),
     kpi(t("k_allow"), s.allow, t("pct", pct(s.allow)), "var(--bar-allow)", pct(s.allow)),
     kpi(t("k_deny"), s.deny, t("pct", pct(s.deny)), "var(--bar-deny)", pct(s.deny)),
     kpi(t("k_ask"), s.require_approval, t("pct", pct(s.require_approval)), "var(--bar-ask)", pct(s.require_approval)));
@@ -636,11 +633,11 @@ function renderOverview() {
   root.append(recentCard());
 }
 
-function heroCard(cls, icon, title, text, linkText) {
+function heroCard(cls, icon, title, text, linkText, target = "integrity") {
   return el("div", { class: `card hero ${cls}` },
     el("div", { class: "hero-icon" }, icon),
-    el("div", {}, el("h2", {}, title), el("p", {}, text)),
-    linkText ? el("button", { type: "button", class: "hero-cta", onclick: () => go("integrity") }, linkText) : null);
+    el("div", { class: "hero-text" }, el("h2", {}, title), el("p", {}, text)),
+    linkText ? el("button", { type: "button", class: "hero-cta", onclick: () => go(target) }, linkText) : null);
 }
 
 function kpi(label, value, foot, color, percent) {
@@ -726,7 +723,7 @@ function recentCard() {
     const target = targetOf(r.arguments);
     const cls = decisionClass(r.decision);
     const li = el("li", { onclick: () => openDrawer(index) },
-      el("span", { class: `avatar ${cls}` }, r.decision === "ALLOW" ? "✓" : r.decision === "DENY" ? "✕" : "?"),
+      el("span", { class: `avatar ${cls}` }),
       el("div", { class: "what" },
         el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short || r.server || "")),
@@ -756,7 +753,7 @@ function renderApprovals() {
   const list = [...activePending(), ...pending().filter(isExpired)];
   if (activePending().length === 0) {
     root.append(el("div", { class: "card" },
-      el("div", { class: "empty" }, el("div", { class: "empty-icon" }, "✓"),
+      el("div", { class: "empty" },
         el("strong", {}, t("pend_none_t")), t("pend_none_d"))));
   }
   for (const p of list) root.append(approvalCard(p));
