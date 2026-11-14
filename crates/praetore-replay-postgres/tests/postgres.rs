@@ -61,7 +61,9 @@ impl VerifyWithTestEvidenceAttester for praetore_gateway::GatewayReceipt {
 }
 
 static TEST_DATABASE_SETUP: OnceLock<()> = OnceLock::new();
-/// Migration 0024 is the newest: every older rollback runs after it.
+/// Migration 0025 is the newest: every older rollback runs after it.
+const ROLLBACK_0025: &str =
+    include_str!("../../../docs/rollback/0025-journal-position-existing-key.sql");
 const ROLLBACK_0024: &str =
     include_str!("../../../docs/rollback/0024-journal-commit-order-position.sql");
 const TEST_NOW: &str = "2026-06-01T12:00:00Z";
@@ -3179,7 +3181,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -7143,7 +7146,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     assert!(again.is_empty());
@@ -7497,7 +7501,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
 
     // The held request is signed `awaiting_approval` (0022): the 0022
     // rollback refuses while that row exists and changes nothing.
-    // 0023 is newer, so roll it back first.
+    // 0025 is the newest migration, so roll the newer ones back first.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
@@ -7553,7 +7558,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7583,6 +7589,7 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     // With such rows the rollback fails as a whole and 0020 stays (0021 is
     // rolled back first, so only the row guard can refuse it).
     forget_awaiting_approval_attestations();
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
@@ -7600,7 +7607,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7685,6 +7693,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), up);
 
     // Down (0021 first): the columns, their constraints and grant are gone.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
@@ -7702,7 +7711,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7861,6 +7871,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
 
     // With classified rows the rollback fails as a whole and 0020 stays
     // (0021 is rolled back first, so only the row guard can refuse it).
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
@@ -7878,7 +7889,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -8528,6 +8540,7 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     // 0023 replaces the v2 attestation trigger this count includes.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state(), (2, 2, true));
@@ -8556,7 +8569,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -10580,6 +10594,7 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     // This test checks 0022. 0023 only replaces the attestation insert trigger.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let initial = state();
@@ -10630,10 +10645,12 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
         vec![
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state().0, up.0);
@@ -10646,6 +10663,7 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let late = approved_pending(&fixture);
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
@@ -10806,7 +10824,7 @@ mod journal_position {
     }
 
     /// Brings an empty database to 0023, recorded by the runner as if it
-    /// had applied it, so that `apply_migrations` applies only 0024.
+    /// had applied it, so that `apply_migrations` applies 0024 and 0025.
     fn at_0023(admin: &mut Client) {
         let end = praetore_replay_postgres::MIGRATIONS
             .iter()
@@ -11079,6 +11097,117 @@ mod journal_position {
         let whole = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
         assert_eq!(whole.head.entries.get(), 2);
         assert_eq!(evidence_ids(&whole.text)[1], next.evidence_id.to_string());
+    }
+
+    /// A repeated INSERT ... ON CONFLICT DO NOTHING of a primary key that is
+    /// already in the journal must not take a position. The position trigger
+    /// runs before PostgreSQL resolves the conflict, so a counter update that
+    /// commits with the discarded row leaves a permanent gap: chain_seq is
+    /// immutable, and every later export of the tenant fails.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_on_conflict_does_not_consume_a_position() {
+        let role = TestRole::create("LOGIN NOBYPASSRLS");
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        admin
+            .batch_execute(&format!("GRANT praetore_runtime TO {}", role.name))
+            .unwrap();
+        let mut runtime = connect_scratch_as(&scratch, &role.name);
+        verify_runtime_role(&mut runtime).unwrap();
+
+        let first = receipt(TENANT_A, None, None);
+        assert_eq!(insert_committed(&mut runtime, TENANT_A, &first), 0);
+        let next_seq = |client: &mut Client| -> i64 {
+            client
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(next_seq(&mut admin), 1);
+
+        // The replay claim is already committed. Only the journal INSERT is
+        // repeated, with ON CONFLICT DO NOTHING, as praetore_runtime.
+        let mut transaction = runtime.transaction().unwrap();
+        transaction
+            .execute(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&TENANT_A.to_string()],
+            )
+            .unwrap();
+        let agent = *first.agent.id.as_uuid();
+        let repeated = transaction.execute(
+            "INSERT INTO praetore.execution_journal \
+             (tenant_id, agent_id, request_id, request_digest, action_digest, \
+              authorization_status, execution_status, evidence_json, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                     clock_timestamp(), clock_timestamp()) \
+             ON CONFLICT DO NOTHING",
+            &[
+                &TENANT_A,
+                &agent,
+                &first.request_id,
+                &"ab".repeat(32),
+                &first.to_json().unwrap(),
+            ],
+        );
+        match repeated {
+            Ok(inserted) => {
+                assert_eq!(inserted, 0, "ON CONFLICT DO NOTHING inserts no second row");
+                transaction.commit().unwrap();
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.code(),
+                    Some(&postgres::error::SqlState::UNIQUE_VIOLATION),
+                    "{error}"
+                );
+                assert!(
+                    db_message(error).contains("execution journal row already exists"),
+                    "a repeated primary key is rejected before a position is taken"
+                );
+                drop(transaction);
+            }
+        }
+
+        assert_eq!(
+            next_seq(&mut admin),
+            1,
+            "ON CONFLICT DO NOTHING must not consume a journal position"
+        );
+        let rows_after_conflict: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal WHERE tenant_id = $1",
+                &[&TENANT_A],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(rows_after_conflict, 1);
+
+        let later = receipt(TENANT_A, None, None);
+        insert_committed(&mut runtime, TENANT_A, &later);
+        let positions: Vec<i64> = admin
+            .query(
+                "SELECT chain_seq FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 ORDER BY chain_seq",
+                &[&TENANT_A],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let contiguous: Vec<i64> = (0..positions.len() as i64).collect();
+        assert_eq!(positions, contiguous, "chain_seq must be 0..n-1");
+        assert_eq!(next_seq(&mut admin), positions.len() as i64);
+        let exported = export_tenant(&mut admin, TENANT_A, &pins())
+            .expect("export_tenant after a later insert");
+        assert_eq!(
+            evidence_ids(&exported.text),
+            [first.evidence_id.to_string(), later.evidence_id.to_string()]
+        );
     }
 
     /// chain_seq cannot be chosen or changed: the trigger overwrites the
@@ -11357,7 +11486,13 @@ mod journal_position {
             .get(0);
 
         let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-        assert_eq!(applied, vec!["0024_journal_commit_order_position"]);
+        assert_eq!(
+            applied,
+            vec![
+                "0024_journal_commit_order_position",
+                "0025_journal_position_existing_key"
+            ]
+        );
         praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
 
         let events_after: i64 = admin
@@ -11457,12 +11592,21 @@ mod journal_position {
                 .get(0)
         };
         assert_eq!(objects(&mut admin), 4);
+        // 0025 only repoints the position trigger. Roll it back first so
+        // 0024's guard accepts this database.
+        admin.batch_execute(ROLLBACK_0025).unwrap();
         admin.batch_execute(ROLLBACK_0024).unwrap();
         assert_eq!(objects(&mut admin), 0);
         // Not recorded any more: a second run refuses and changes nothing.
         assert!(scratch.connect().batch_execute(ROLLBACK_0024).is_err());
         let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-        assert_eq!(applied, vec!["0024_journal_commit_order_position"]);
+        assert_eq!(
+            applied,
+            vec![
+                "0024_journal_commit_order_position",
+                "0025_journal_position_existing_key"
+            ]
+        );
         praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
         assert_eq!(objects(&mut admin), 4);
         let after = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
@@ -11470,7 +11614,9 @@ mod journal_position {
     }
 
     /// Row level security, SECURITY DEFINER and privileges of 0024 as the
-    /// catalog records them after the runner migrates.
+    /// catalog records them after the runner migrates. 0025's assignment is
+    /// the same kind of function: EXECUTE denied to PUBLIC and to
+    /// praetore_runtime, and the position trigger calls it.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_journal_position_catalog_after_migration() {
@@ -11511,6 +11657,35 @@ mod journal_position {
             !row.get::<_, bool>(3),
             "praetore_runtime cannot execute the assignment"
         );
+        let row = admin
+            .query_one(
+                "SELECT p.prosecdef, p.proconfig, \
+                        pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE'), \
+                        pg_catalog.has_function_privilege('praetore_runtime', p.oid, 'EXECUTE') \
+                 FROM pg_catalog.pg_proc p \
+                 WHERE p.oid = 'praetore.assign_execution_journal_position_v2()'::regprocedure",
+                &[],
+            )
+            .unwrap();
+        assert!(row.get::<_, bool>(0), "v2 is SECURITY DEFINER");
+        assert_eq!(
+            row.get::<_, Option<Vec<String>>>(1),
+            Some(vec!["search_path=pg_catalog, praetore, pg_temp".to_owned()]),
+            "v2 pins its search_path"
+        );
+        assert!(!row.get::<_, bool>(2), "PUBLIC cannot execute v2");
+        assert!(!row.get::<_, bool>(3), "praetore_runtime cannot execute v2");
+        let trigger: String = admin
+            .query_one(
+                "SELECT p.proname \
+                 FROM pg_catalog.pg_trigger tg \
+                 JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid \
+                 WHERE tg.tgname = 'execution_journal_position_v1' AND NOT tg.tgisinternal",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(trigger, "assign_execution_journal_position_v2");
     }
 
     /// 0024 applied by a schema owner that is neither superuser nor
@@ -11554,8 +11729,14 @@ mod journal_position {
             .unwrap();
         let mut owner = connect_scratch_as(&scratch, &owner_role.name);
         let applied = praetore_replay_postgres::apply_migrations(&mut owner)
-            .expect("0024 applies as an owner without superuser or BYPASSRLS");
-        assert_eq!(applied, ["0024_journal_commit_order_position"]);
+            .expect("0024 and 0025 apply as an owner without superuser or BYPASSRLS");
+        assert_eq!(
+            applied,
+            [
+                "0024_journal_commit_order_position",
+                "0025_journal_position_existing_key"
+            ]
+        );
         drop(owner);
 
         // The former order: created_at within each tenant.
