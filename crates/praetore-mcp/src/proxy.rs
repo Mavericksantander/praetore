@@ -480,12 +480,136 @@ pub fn blocked_response(id: &Value, text: &str) -> Value {
     })
 }
 
-fn parse_error_response(message: &str) -> Value {
+/// JSON-RPC parse error (`-32700`). `id` is the request id when one can be
+/// read from the line, and null when it cannot.
+fn parse_error_response(message: &str, id: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
-        "id": null,
+        "id": id,
         "error": {"code": -32700, "message": message}
     })
+}
+
+/// Top-level JSON-RPC `id` (string, number, or null) when the line has exactly
+/// one. A missing id, an unreadable value, or two different ids yield null:
+/// the reply must not be attached to the wrong request.
+fn recoverable_request_id(raw: &[u8]) -> Value {
+    let Ok(text) = std::str::from_utf8(raw) else {
+        return Value::Null;
+    };
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let body = body.strip_suffix('\r').unwrap_or(body);
+    scan_top_level_request_id(body).unwrap_or(Value::Null)
+}
+
+fn scan_top_level_request_id(text: &str) -> Option<Value> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut found: Option<Value> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let Some(end) = skip_json_string(bytes, i) else {
+                    return found;
+                };
+                let after_key = skip_ws(bytes, end);
+                let is_key = depth == 1 && after_key < bytes.len() && bytes[after_key] == b':';
+                if is_key && json_string_is_id(&text[i..end]) {
+                    let value_at = skip_ws(bytes, after_key + 1);
+                    let (value, next) = read_json_value(text, value_at)?;
+                    if next <= value_at {
+                        return None;
+                    }
+                    let id = jsonrpc_id_value(value);
+                    match &found {
+                        Some(previous) if previous != &id => return None,
+                        Some(_) => {}
+                        None => found = Some(id),
+                    }
+                    i = next;
+                    continue;
+                }
+                i = end;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth -= 1;
+                if depth < 0 {
+                    break;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    found
+}
+
+fn json_string_is_id(literal: &str) -> bool {
+    serde_json::from_str::<String>(literal).ok().as_deref() == Some("id")
+}
+
+fn read_json_value(text: &str, at: usize) -> Option<(Value, usize)> {
+    if at >= text.len() || !text.is_char_boundary(at) {
+        return None;
+    }
+    // `into_iter` parses one JSON value and stops, so a later syntax error
+    // does not hide an id that was already written.
+    let mut stream = serde_json::Deserializer::from_str(&text[at..]).into_iter::<Value>();
+    let value = stream.next()?.ok()?;
+    let next = at + stream.byte_offset();
+    (next > at).then_some((value, next))
+}
+
+fn jsonrpc_id_value(value: Value) -> Value {
+    match value {
+        Value::Null | Value::Number(_) | Value::String(_) => value,
+        _ => Value::Null,
+    }
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && matches!(bytes[index], b' ' | b'\t' | b'\r' | b'\n') {
+        index += 1;
+    }
+    index
+}
+
+/// End offset of the JSON string that starts at `start` (the opening quote),
+/// or `None` when it is unterminated. Invalid `\u` sequences are skipped; the
+/// caller decides whether the text is a usable key.
+fn skip_json_string(bytes: &[u8], start: usize) -> Option<usize> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 1;
+                if index >= bytes.len() {
+                    return None;
+                }
+                if bytes[index] == b'u' {
+                    index += 1;
+                    for _ in 0..4 {
+                        if index < bytes.len() && bytes[index].is_ascii_hexdigit() {
+                            index += 1;
+                        }
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            b'"' => return Some(index + 1),
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn line(value: &impl serde::Serialize) -> Vec<u8> {
@@ -515,10 +639,10 @@ fn fingerprint(raw: &[u8]) -> String {
 }
 
 /// Whether a line this proxy cannot parse might name a `safety*` tool for
-/// a more lenient parser (G7): the text, or any string literal in it read
-/// with JSON escapes decoded (lone surrogates become U+FFFD), contains
-/// `safety` in any ASCII case. Deliberately broad: it only applies to lines
-/// that are already malformed.
+/// a more lenient parser (G7): the text, or any JSON or JSON5 string literal
+/// in it (`"` or `'`), read with JSON escapes and JSON5 `\x` escapes decoded
+/// (lone surrogates become U+FFFD), contains `safety` in any ASCII case.
+/// Deliberately broad: it only applies to lines that are already malformed.
 pub fn may_name_safety_tool(raw: &[u8]) -> bool {
     let text = String::from_utf8_lossy(raw);
     contains_safety(&text) || string_literals(&text).iter().any(|s| contains_safety(s))
@@ -530,47 +654,58 @@ fn contains_safety(text: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"safety"))
 }
 
-/// Every `"..."` literal in `text`, decoded leniently: unknown escapes are
-/// kept as the escaped character, an unterminated literal runs to the end.
+/// Every `"..."` or `'...'` literal in `text`, decoded leniently: unknown
+/// escapes are kept as the escaped character, `\xHH` is a JSON5 byte, and an
+/// unterminated literal runs to the end.
 fn string_literals(text: &str) -> Vec<String> {
     let mut literals = Vec::new();
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
-        if c != '"' {
+        if c != '"' && c != '\'' {
             continue;
         }
+        let quote = c;
         let mut units: Vec<u16> = Vec::new();
         while let Some(c) = chars.next() {
-            match c {
-                '"' => break,
-                '\\' => match chars.next() {
-                    Some('u') => {
-                        let hex: String = chars.by_ref().take(4).collect();
-                        match u16::from_str_radix(&hex, 16) {
-                            Ok(unit) if hex.len() == 4 => units.push(unit),
-                            _ => units.extend(hex.encode_utf16()),
-                        }
+            if c == quote {
+                break;
+            }
+            if c != '\\' {
+                push_utf16(&mut units, c);
+                continue;
+            }
+            match chars.next() {
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    match u16::from_str_radix(&hex, 16) {
+                        Ok(unit) if hex.len() == 4 => units.push(unit),
+                        _ => units.extend(hex.encode_utf16()),
                     }
-                    Some('n') => units.push(u16::from(b'\n')),
-                    Some('t') => units.push(u16::from(b'\t')),
-                    Some('r') => units.push(u16::from(b'\r')),
-                    Some('b') => units.push(0x08),
-                    Some('f') => units.push(0x0c),
-                    Some(other) => {
-                        let mut buffer = [0; 2];
-                        units.extend_from_slice(other.encode_utf16(&mut buffer));
-                    }
-                    None => break,
-                },
-                other => {
-                    let mut buffer = [0; 2];
-                    units.extend_from_slice(other.encode_utf16(&mut buffer));
                 }
+                Some('x') => {
+                    let hex: String = chars.by_ref().take(2).collect();
+                    match u8::from_str_radix(&hex, 16) {
+                        Ok(byte) if hex.len() == 2 => units.push(u16::from(byte)),
+                        _ => units.extend(hex.encode_utf16()),
+                    }
+                }
+                Some('n') => units.push(u16::from(b'\n')),
+                Some('t') => units.push(u16::from(b'\t')),
+                Some('r') => units.push(u16::from(b'\r')),
+                Some('b') => units.push(0x08),
+                Some('f') => units.push(0x0c),
+                Some(other) => push_utf16(&mut units, other),
+                None => break,
             }
         }
         literals.push(String::from_utf16_lossy(&units));
     }
     literals
+}
+
+fn push_utf16(units: &mut Vec<u16>, c: char) {
+    let mut buffer = [0; 2];
+    units.extend_from_slice(c.encode_utf16(&mut buffer));
 }
 
 /// Refuses a malformed line that may name a `safety*` tool, in both modes
@@ -581,9 +716,11 @@ fn refuse_safety_unparseable(out: &mut Outcome, mode: Mode, what: &str, reason: 
         fingerprint(raw),
         mode.as_str()
     ));
-    out.to_client = Some(line(&parse_error_response(&format!(
-        "praetore-mcp: {what} message that may name a safety* tool was not forwarded"
-    ))));
+    let id = recoverable_request_id(raw);
+    out.to_client = Some(line(&parse_error_response(
+        &format!("praetore-mcp: {what} message that may name a safety* tool was not forwarded"),
+        &id,
+    )));
 }
 
 fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str, raw: &[u8]) {
@@ -591,9 +728,11 @@ fn refuse_unparseable(out: &mut Outcome, what: &str, reason: &str, raw: &[u8]) {
         "praetore-mcp: REFUSED {what} client line in enforce mode ({reason}; {}); it could hide a tools/call",
         fingerprint(raw)
     ));
-    out.to_client = Some(line(&parse_error_response(&format!(
-        "praetore-mcp (enforce): {what} message was not forwarded"
-    ))));
+    let id = recoverable_request_id(raw);
+    out.to_client = Some(line(&parse_error_response(
+        &format!("praetore-mcp (enforce): {what} message was not forwarded"),
+        &id,
+    )));
 }
 
 fn batch_refused_error(id: &Value) -> Value {
@@ -669,8 +808,12 @@ pub fn handle_client_line(
                         );
                         out.to_client = Some(match id {
                             Some(id) => line(&blocked_response(&id, &text)),
+                            // This reading has no id. A notification gets no
+                            // request id back; do not borrow one from another
+                            // reading of the same line.
                             None => line(&parse_error_response(
                                 "praetore-mcp: an ambiguous message naming a safety* tool was not forwarded",
+                                &Value::Null,
                             )),
                         });
                     }
@@ -1119,6 +1262,9 @@ mod tests {
         assert!(eval.calls.is_empty());
         let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
         assert_eq!(reply["error"]["code"], -32700);
+        // The id sits inside the carriage-return segment, not on the line's
+        // top-level value, so it is not the request id of this line.
+        assert_eq!(reply["id"], Value::Null);
 
         let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
         let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
@@ -1228,5 +1374,200 @@ mod tests {
         // Ordinary non-reserved keys with distinct folds stay fine.
         let ok = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"Path":"/a","mode":"r"}}}"#;
         assert!(matches!(classify(ok), Classified::ToolCall(_)));
+    }
+
+    fn line_sha256(raw: &[u8]) -> String {
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(raw));
+        format!("sha256 {digest}, {} bytes", raw.len())
+    }
+
+    /// JSON5 single quotes and `\x` escapes can spell `safety` only after
+    /// decoding. Those lines are refused in both modes, and the refusal
+    /// warning still names the line by its sha256. A single-quoted ordinary
+    /// tool keeps the unparseable-line warning, which also carries the sha256.
+    #[test]
+    fn json5_safety_names_are_refused_and_the_warning_names_the_line() {
+        assert_eq!(
+            string_literals(r#"{'a':'\x73afety','b':"\x65",'c':'\u0073till'}"#),
+            ["a", "safety", "b", "e", "c", "still"]
+        );
+
+        let encoded: &[(&str, &[u8])] = &[
+            (
+                "single-quoted unicode escape",
+                br#"{'name':'\u0073afety:halt'}"#,
+            ),
+            (
+                "single-quoted hex escapes",
+                br#"{'name':'\x73\x61\x66\x65\x74\x79:halt'}"#,
+            ),
+            (
+                "double-quoted hex escapes",
+                br#"{"name":"\x73\x61fety:halt","x":1,"x":2}"#,
+            ),
+        ];
+        for (label, raw) in encoded {
+            assert!(
+                !raw.windows(6)
+                    .any(|window| window.eq_ignore_ascii_case(b"safety")),
+                "{label} contains the letters before decoding"
+            );
+            assert!(may_name_safety_tool(raw), "{label}");
+            let fingerprint = line_sha256(raw);
+            for mode in [Mode::Observe, Mode::Enforce] {
+                let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+                let out = handle_client_line(raw, mode, "fs", &mut eval);
+                assert!(out.to_server.is_none(), "{label} {}", mode.as_str());
+                let reply: Value =
+                    serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+                assert_eq!(reply["error"]["code"], -32700, "{label}");
+                let warning = &out.warnings[0];
+                assert!(
+                    warning.contains("may name a safety* tool") && warning.contains(&fingerprint),
+                    "{label} {}: {warning}",
+                    mode.as_str()
+                );
+                assert!(eval.calls.is_empty(), "{label}");
+            }
+        }
+
+        let quoted = br#"{method: 'tools/call', params: {name: 'safety:halt'}}"#;
+        assert!(may_name_safety_tool(quoted));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(quoted, Mode::Observe, "fs", &mut eval);
+        assert!(out.to_server.is_none());
+        assert!(
+            out.warnings[0].contains("may name a safety* tool")
+                && out.warnings[0].contains(&line_sha256(quoted)),
+            "{:?}",
+            out.warnings
+        );
+
+        let ordinary = b"{method: 'tools/call', params: {name: 'write_file'}}\n";
+        assert!(!may_name_safety_tool(ordinary));
+        assert!(!may_name_safety_tool(
+            br#"{"name":"\x77rite_file","x":1,"x":2}"#
+        ));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(ordinary, Mode::Observe, "fs", &mut eval);
+        assert_eq!(out.to_server.as_deref(), Some(ordinary.as_slice()));
+        assert!(out.to_client.is_none());
+        assert!(
+            out.warnings[0].contains("WARNING unparseable client line")
+                && out.warnings[0].contains(&line_sha256(ordinary)),
+            "{:?}",
+            out.warnings
+        );
+
+        let mut split = br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec();
+        split.push(b'\r');
+        split.extend_from_slice(br#"{"name":"\x73afety:halt"}"#);
+        split.push(b'\n');
+        assert!(
+            !split
+                .windows(6)
+                .any(|window| window.eq_ignore_ascii_case(b"safety"))
+        );
+        assert!(matches!(
+            classify(&split),
+            Classified::Ambiguous { unparsed: true, .. }
+        ));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(&split, Mode::Observe, "fs", &mut eval);
+        assert!(out.to_server.is_none());
+        assert!(eval.calls.is_empty());
+        let warning = &out.warnings[0];
+        assert!(
+            warning.contains("REFUSED an ambiguous")
+                && warning.contains("may name a safety* tool")
+                && warning.contains(&line_sha256(&split)),
+            "{warning}"
+        );
+        let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+        assert_eq!(reply["error"]["code"], -32700);
+        assert_eq!(reply["id"], 1);
+    }
+
+    /// `-32700` carries the request id when the line has one top-level id
+    /// that can be read, including when the rest of the line cannot be parsed.
+    /// It stays null when there is no id, the id is not a JSON-RPC id, or two
+    /// different ids appear.
+    #[test]
+    fn parse_error_recovers_the_request_id_when_the_line_has_one() {
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Deny));
+        let recovered = [
+            (
+                "duplicate key",
+                br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"x":1,"x":2}}}"#.to_vec(),
+                json!(3),
+            ),
+            (
+                "string id on a case-variant key",
+                br#"{"jsonrpc":"2.0","id":"call-1","method":"tools/list","Method":"tools/call","params":{"name":"rm"}}"#.to_vec(),
+                json!("call-1"),
+            ),
+            (
+                "id before a lone surrogate",
+                br#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"echo","arguments":{"p":"\ud800"}}}"#.to_vec(),
+                json!(5),
+            ),
+            (
+                "id after a lone surrogate",
+                br#"{"p":"\ud800","id":6,"name":"echo","name":"echo"}"#.to_vec(),
+                json!(6),
+            ),
+            (
+                "escaped id key",
+                br#"{"\u0069d":4,"x":1,"x":2}"#.to_vec(),
+                json!(4),
+            ),
+            (
+                "same id written twice",
+                br#"{"id":7,"id":7,"x":1,"x":2}"#.to_vec(),
+                json!(7),
+            ),
+        ];
+        for (label, raw, id) in &recovered {
+            let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+            assert!(out.to_server.is_none(), "{label}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32700, "{label}");
+            assert_eq!(&reply["id"], id, "{label}: {reply}");
+        }
+
+        let deep = nested_call("write_file", 200);
+        let out = handle_client_line(&deep, Mode::Enforce, "s", &mut eval);
+        let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+        assert_eq!(reply["error"]["code"], -32700);
+        assert_eq!(reply["id"], 9);
+
+        let safety = br#"{"jsonrpc":"2.0","id":"halt","method":"tools/call","params":{"name":"safety:halt","arguments":{"x":1,"x":2}}}"#;
+        for mode in [Mode::Observe, Mode::Enforce] {
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+            let out = handle_client_line(safety, mode, "s", &mut eval);
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["error"]["code"], -32700, "{}", mode.as_str());
+            assert_eq!(reply["id"], "halt", "{}", mode.as_str());
+            assert!(eval.calls.is_empty());
+        }
+
+        let absent: &[&[u8]] = &[
+            b"this is not json\n",
+            br#"{"method":"tools/call","#,
+            br#"{"note":"id is 5","x":1,"x":2}"#,
+            br#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"echo"}}"#,
+            br#"{"id":{"n":1},"x":1,"x":2}"#,
+        ];
+        for raw in absent {
+            let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                reply["error"]["code"],
+                -32700,
+                "{}",
+                String::from_utf8_lossy(raw)
+            );
+            assert_eq!(reply["id"], Value::Null, "{}", String::from_utf8_lossy(raw));
+        }
     }
 }
