@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.4 - 2026-11-13
+
+Adds local approval to praetore-mcp: in enforce mode a `REQUIRE_APPROVAL`
+rule holds the call until someone approves or rejects it from a terminal on
+the same machine. Also carries everything merged to main since v0.3.3.
+
 ### Added
 
 - **praetore-mcp 0.3.4: local approval for `REQUIRE_APPROVAL`.** In enforce
@@ -20,7 +26,7 @@
   the approval was not used twice. `receipts` shows the state. Observe mode
   still forwards, and the receipt list says enforce would ask. Receipt
   lines in `receipts/*.jsonl` are unchanged, so journals written by v0.3.3
-  and by current main keep verifying. No tag and no release.
+  and by current main keep verifying.
 
 ### Breaking
 
