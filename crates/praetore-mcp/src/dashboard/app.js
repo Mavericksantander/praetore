@@ -2,369 +2,379 @@
 // and the policy is written with textContent, never as HTML.
 "use strict";
 
-const I18N = {
+const TOOLS = {
   es: {
-    title: "PRÆTORE MCP · recibos",
-    readonly: "Solo lectura, servido en 127.0.0.1",
-    language: "Idioma",
-    reload: "Recargar",
-    verification: "Verificación (la misma de praetore-mcp verify)",
-    verification_short: "Verificación",
-    decisions: "Decisiones",
-    detail: "Detalle del recibo",
-    f_decision: "Decisión",
-    f_tool: "Herramienta",
-    f_text: "Texto",
-    all: "Todas",
-    c_local: "Hora local",
-    c_utc: "UTC",
-    c_server: "Servidor",
-    c_tool: "Herramienta",
-    c_args: "Argumentos",
-    c_decision: "Decisión",
-    c_rule: "Regla",
-    c_mode: "Modo",
-    c_verify: "verify",
-    default_deny: "default deny",
-    shown: (n, t) => `${n} de ${t}`,
-    total: "Total",
-    policy: "Política activa",
-    policy_error: "No se pudo leer la política",
-    verify_ok: "OK",
-    verify_fail: "FALLA",
-    verify_error: "verify no pudo correr",
-    verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} fallas`,
-    checked: "Qué comprueba verify",
-    checked_list: (a, i) => [
-      "hash de integridad",
-      `firma del attester (${a})`,
-      "firma del intent del agente",
-      `firma de la autoridad contra ${i} a la hora de la decisión`,
-      "vínculo de praetore.mode",
-      "orden del journal (seq y enlace hash)",
-      "journal de aprobaciones: firma del aprobador, vínculo con la llamada retenida, vencimiento, uso único",
-    ],
-    head: "Journal head",
-    head_text: (n, seq, prev, u) => `${n} entradas encadenadas, próximo seq ${seq}, head ${prev} (${u} entradas sin encadenar anteriores)`,
-    head_none: (c, u) => `sin head (${c} encadenadas, ${u} sin encadenar)`,
-    head_warn: "Guarda este head fuera de esta máquina y pásalo como --expected-head: sin él no se detectan entradas borradas al final del journal.",
-    expected_head: (h) => `Comparado con --expected-head ${h}.`,
-    failures: "Fallas reportadas por verify",
-    approvals: (d, e, h) => `Journal de aprobaciones: ${d} decisiones, ${e} ejecuciones, head ${h}`,
-    approvals_none: "Journal de aprobaciones: no hay",
-    observe_note: "Un recibo observe registra una decisión que NO se aplicó.",
-    warn_allow_all: (rules, n) => `La política tiene una regla que permite todo (${rules}) y hay ${n} recibos en modo enforce: en enforce esa regla deja pasar cualquier llamada que no cubra una regla DENY o REQUIRE_APPROVAL.`,
-    note_allow_all: (rules) => `La política tiene una regla que permite todo (${rules}). Por ahora no hay recibos en modo enforce.`,
-    signatures: "Firmas",
-    sig_agent: "Agente (intent)",
-    sig_attester: "Attester",
-    sig_authority: "Autoridad",
-    key: "Llave",
-    result: "Resultado",
-    other_checks: "Otras comprobaciones de verify",
-    chk_shape: "Forma HighAssurance (v2)",
-    chk_authority_subject: "La autoridad nombra al agente",
-    chk_audience: "Audiencia praetore-mcp",
-    chk_mode: "praetore.mode válido",
-    st_ok: "OK",
-    st_fail: "FALLA",
-    st_not_run: "no se comprobó",
-    chain: "Encadenado",
-    order_ok: "seq/prev siguen a la entrada anterior",
-    unchained: "entrada sin encadenar (versión anterior)",
-    path_check: "path_check",
-    path_none: "Este recibo no tiene path_check.",
-    lexical: "lexical",
-    resolved: "resolved",
-    status: "status",
-    json: "JSON completo de la línea",
-    location: "Ubicación",
-    approval: "Aprobación",
-    unreadable: "Línea ilegible",
-    omitted: (b, h) => `(omitidos: ${b} bytes, sha256 ${h})`,
-    load_error: "No se pudo cargar /api/state",
-    generated: "Leído",
-    live: "En vivo",
-    readonly_approvals: "Servido en 127.0.0.1 · aprobaciones desde la página habilitadas",
-    pending: "Esperando aprobación",
-    pending_none: "No hay llamadas esperando aprobación.",
-    pending_error: "No se pudieron leer las aprobaciones pendientes",
-    expires: "Vence",
-    expires_in: (m, s) => `vence en ${m}:${String(s).padStart(2, "0")}`,
-    expired: "vencida: ya no se puede aprobar",
-    held_receipt: "Recibo de la retención",
-    arguments_exact: "Argumentos exactos (canónicos), los que quedan ligados a la firma",
-    approve: "Aprobar…",
-    reject: "Rechazar…",
-    confirm_approve: "Confirmar aprobación",
-    confirm_reject: "Confirmar rechazo",
-    cancel: "Cancelar",
-    confirm_text_approve: "Vas a firmar con la llave de aprobador de este computador que el agente puede ejecutar UNA vez esta llamada exacta antes de que venza. Revisa servidor, herramienta y argumentos.",
-    confirm_text_reject: "Vas a firmar el rechazo de esta llamada. No se reenviará; un nuevo intento vuelve a pedir aprobación.",
-    sending: "Firmando…",
-    decided_approve: (id) => `Aprobada ${id}. El agente puede reintentar esta llamada exacta una vez.`,
-    decided_reject: (id) => `Rechazada ${id}.`,
-    decide_error: "No se firmó nada",
-    need_token: "Esta pestaña no tiene el token de sesión. Abre el enlace con #s= que imprimió la terminal para decidir desde aquí.",
-    cli_hint: "Para decidir, ejecuta en una terminal (o arranca el dashboard con --approvals):",
-    policy_rules: (n) => `Reglas de la política (${n})`,
-    r_id: "id",
-    r_effect: "Efecto",
-    r_target: "Servidor",
-    r_conditions: "Condiciones",
-    r_any: "cualquiera",
-    r_none: "ninguna",
-    new_receipts: (n) => `${n} recibo(s) nuevo(s)`,
-    yes: "sí",
-    no: "no",
+    read_file: "Leer archivo", read_text_file: "Leer archivo", read_media_file: "Leer archivo multimedia",
+    read_multiple_files: "Leer varios archivos", write_file: "Escribir archivo", edit_file: "Editar archivo",
+    append_file: "Agregar a archivo", create_directory: "Crear carpeta", list_directory: "Listar carpeta",
+    list_directory_with_sizes: "Listar carpeta con tamaños", directory_tree: "Ver árbol de carpetas",
+    move_file: "Mover archivo", copy_file: "Copiar archivo", search_files: "Buscar archivos",
+    get_file_info: "Ver información de archivo", list_allowed_directories: "Listar carpetas permitidas",
   },
   en: {
-    title: "PRÆTORE MCP · receipts",
-    readonly: "Read-only, served on 127.0.0.1",
-    language: "Language",
-    reload: "Reload",
-    verification: "Verification (the same as praetore-mcp verify)",
-    verification_short: "Verification",
-    decisions: "Decisions",
-    detail: "Receipt detail",
-    f_decision: "Decision",
-    f_tool: "Tool",
-    f_text: "Text",
-    all: "All",
-    c_local: "Local time",
-    c_utc: "UTC",
-    c_server: "Server",
-    c_tool: "Tool",
-    c_args: "Arguments",
-    c_decision: "Decision",
-    c_rule: "Rule",
-    c_mode: "Mode",
-    c_verify: "verify",
-    default_deny: "default deny",
-    shown: (n, t) => `${n} of ${t}`,
-    total: "Total",
-    policy: "Active policy",
-    policy_error: "Cannot read the policy",
-    verify_ok: "OK",
-    verify_fail: "FAIL",
-    verify_error: "verify could not run",
-    verified_n: (ok, total, failed) => `${ok} of ${total} receipts verified, ${failed} failures`,
-    checked: "What verify checks",
-    checked_list: (a, i) => [
-      "integrity hash",
-      `attester signature (${a})`,
-      "agent intent signature",
-      `authority signature against ${i} at decision time`,
-      "praetore.mode binding",
-      "journal order (seq and hash link)",
-      "approval journal: approver signature, binding to the held call, expiry, single use",
-    ],
-    head: "Journal head",
-    head_text: (n, seq, prev, u) => `${n} chained entries present, next seq ${seq}, head ${prev} (${u} unchained earlier entries)`,
-    head_none: (c, u) => `no head (${c} chained, ${u} unchained)`,
-    head_warn: "Keep this head outside this machine and pass it as --expected-head: without it, entries removed at the end of the journal are not detected.",
-    expected_head: (h) => `Compared with --expected-head ${h}.`,
-    failures: "Failures reported by verify",
-    approvals: (d, e, h) => `Approval journal: ${d} decision(s), ${e} execution(s), head ${h}`,
-    approvals_none: "Approval journal: none",
-    observe_note: "An observe receipt records a decision that was NOT enforced.",
-    warn_allow_all: (rules, n) => `The policy has an allow-all rule (${rules}) and there are ${n} enforce receipts: in enforce, that rule lets through any call no DENY or REQUIRE_APPROVAL rule covers.`,
-    note_allow_all: (rules) => `The policy has an allow-all rule (${rules}). There are no enforce receipts yet.`,
-    signatures: "Signatures",
-    sig_agent: "Agent (intent)",
-    sig_attester: "Attester",
-    sig_authority: "Authority",
-    key: "Key",
-    result: "Result",
-    other_checks: "Other verify checks",
-    chk_shape: "HighAssurance (v2) shape",
-    chk_authority_subject: "Authority names the agent",
-    chk_audience: "praetore-mcp audience",
-    chk_mode: "valid praetore.mode",
-    st_ok: "OK",
-    st_fail: "FAIL",
-    st_not_run: "not checked",
-    chain: "Chain",
-    order_ok: "seq/prev follow the previous entry",
-    unchained: "unchained entry (earlier version)",
-    path_check: "path_check",
-    path_none: "This receipt has no path_check.",
-    lexical: "lexical",
-    resolved: "resolved",
-    status: "status",
-    json: "Full JSON of the line",
-    location: "Location",
-    approval: "Approval",
-    unreadable: "Unreadable line",
-    omitted: (b, h) => `(omitted: ${b} bytes, sha256 ${h})`,
-    load_error: "Cannot load /api/state",
-    generated: "Read",
-    live: "Live",
-    readonly_approvals: "Served on 127.0.0.1 · approvals from the page enabled",
-    pending: "Waiting for approval",
-    pending_none: "No calls are waiting for approval.",
-    pending_error: "Cannot read the pending approvals",
-    expires: "Expires",
-    expires_in: (m, s) => `expires in ${m}:${String(s).padStart(2, "0")}`,
-    expired: "expired: it can no longer be approved",
-    held_receipt: "Receipt of the hold",
-    arguments_exact: "Exact (canonical) arguments, the ones bound to the signature",
-    approve: "Approve…",
-    reject: "Reject…",
-    confirm_approve: "Confirm approval",
-    confirm_reject: "Confirm rejection",
-    cancel: "Cancel",
-    confirm_text_approve: "You are about to sign, with this computer's approver key, that the agent may run this exact call ONCE before it expires. Check server, tool and arguments.",
-    confirm_text_reject: "You are about to sign the rejection of this call. It will not be forwarded; a new attempt asks for approval again.",
-    sending: "Signing…",
-    decided_approve: (id) => `Approved ${id}. The agent can retry this exact call once.`,
-    decided_reject: (id) => `Rejected ${id}.`,
-    decide_error: "Nothing was signed",
-    need_token: "This tab has no session token. Open the #s= link the terminal printed to decide from here.",
-    cli_hint: "To decide, run in a terminal (or start the dashboard with --approvals):",
-    policy_rules: (n) => `Policy rules (${n})`,
-    r_id: "id",
-    r_effect: "Effect",
-    r_target: "Server",
-    r_conditions: "Conditions",
-    r_any: "any",
-    r_none: "none",
-    new_receipts: (n) => `${n} new receipt(s)`,
-    yes: "yes",
-    no: "no",
+    read_file: "Read file", read_text_file: "Read file", read_media_file: "Read media file",
+    read_multiple_files: "Read several files", write_file: "Write file", edit_file: "Edit file",
+    append_file: "Append to file", create_directory: "Create folder", list_directory: "List folder",
+    list_directory_with_sizes: "List folder with sizes", directory_tree: "View folder tree",
+    move_file: "Move file", copy_file: "Copy file", search_files: "Search files",
+    get_file_info: "Get file info", list_allowed_directories: "List allowed folders",
   },
   pt: {
-    title: "PRÆTORE MCP · recibos",
-    readonly: "Somente leitura, servido em 127.0.0.1",
-    language: "Idioma",
-    reload: "Recarregar",
-    verification: "Verificação (a mesma de praetore-mcp verify)",
-    verification_short: "Verificação",
-    decisions: "Decisões",
-    detail: "Detalhe do recibo",
-    f_decision: "Decisão",
-    f_tool: "Ferramenta",
-    f_text: "Texto",
-    all: "Todas",
-    c_local: "Hora local",
-    c_utc: "UTC",
-    c_server: "Servidor",
-    c_tool: "Ferramenta",
-    c_args: "Argumentos",
-    c_decision: "Decisão",
-    c_rule: "Regra",
-    c_mode: "Modo",
-    c_verify: "verify",
-    default_deny: "default deny",
-    shown: (n, t) => `${n} de ${t}`,
-    total: "Total",
-    policy: "Política ativa",
-    policy_error: "Não foi possível ler a política",
-    verify_ok: "OK",
-    verify_fail: "FALHA",
-    verify_error: "verify não pôde rodar",
-    verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} falhas`,
-    checked: "O que o verify confere",
-    checked_list: (a, i) => [
-      "hash de integridade",
-      `assinatura do attester (${a})`,
-      "assinatura do intent do agente",
-      `assinatura da autoridade contra ${i} na hora da decisão`,
-      "vínculo de praetore.mode",
-      "ordem do journal (seq e link hash)",
-      "journal de aprovações: assinatura do aprovador, vínculo com a chamada retida, expiração, uso único",
-    ],
-    head: "Journal head",
-    head_text: (n, seq, prev, u) => `${n} entradas encadeadas, próximo seq ${seq}, head ${prev} (${u} entradas não encadeadas anteriores)`,
-    head_none: (c, u) => `sem head (${c} encadeadas, ${u} não encadeadas)`,
-    head_warn: "Guarde este head fora desta máquina e passe-o como --expected-head: sem ele, entradas apagadas no fim do journal não são detectadas.",
-    expected_head: (h) => `Comparado com --expected-head ${h}.`,
-    failures: "Falhas reportadas pelo verify",
-    approvals: (d, e, h) => `Journal de aprovações: ${d} decisões, ${e} execuções, head ${h}`,
-    approvals_none: "Journal de aprovações: não há",
-    observe_note: "Um recibo observe registra uma decisão que NÃO foi aplicada.",
-    warn_allow_all: (rules, n) => `A política tem uma regra que permite tudo (${rules}) e há ${n} recibos em modo enforce: em enforce essa regra deixa passar qualquer chamada que nenhuma regra DENY ou REQUIRE_APPROVAL cubra.`,
-    note_allow_all: (rules) => `A política tem uma regra que permite tudo (${rules}). Ainda não há recibos em modo enforce.`,
-    signatures: "Assinaturas",
-    sig_agent: "Agente (intent)",
-    sig_attester: "Attester",
-    sig_authority: "Autoridade",
-    key: "Chave",
-    result: "Resultado",
-    other_checks: "Outras verificações do verify",
-    chk_shape: "Forma HighAssurance (v2)",
-    chk_authority_subject: "A autoridade nomeia o agente",
-    chk_audience: "Audiência praetore-mcp",
-    chk_mode: "praetore.mode válido",
-    st_ok: "OK",
-    st_fail: "FALHA",
-    st_not_run: "não verificado",
-    chain: "Encadeamento",
-    order_ok: "seq/prev seguem a entrada anterior",
-    unchained: "entrada não encadeada (versão anterior)",
-    path_check: "path_check",
-    path_none: "Este recibo não tem path_check.",
-    lexical: "lexical",
-    resolved: "resolved",
-    status: "status",
-    json: "JSON completo da linha",
-    location: "Localização",
-    approval: "Aprovação",
-    unreadable: "Linha ilegível",
-    omitted: (b, h) => `(omitidos: ${b} bytes, sha256 ${h})`,
-    load_error: "Não foi possível carregar /api/state",
-    generated: "Lido",
-    live: "Ao vivo",
-    readonly_approvals: "Servido em 127.0.0.1 · aprovações pela página habilitadas",
-    pending: "Aguardando aprovação",
-    pending_none: "Não há chamadas aguardando aprovação.",
-    pending_error: "Não foi possível ler as aprovações pendentes",
-    expires: "Expira",
-    expires_in: (m, s) => `expira em ${m}:${String(s).padStart(2, "0")}`,
-    expired: "expirada: não pode mais ser aprovada",
-    held_receipt: "Recibo da retenção",
-    arguments_exact: "Argumentos exatos (canônicos), os que ficam vinculados à assinatura",
-    approve: "Aprovar…",
-    reject: "Rejeitar…",
-    confirm_approve: "Confirmar aprovação",
-    confirm_reject: "Confirmar rejeição",
-    cancel: "Cancelar",
-    confirm_text_approve: "Você vai assinar, com a chave de aprovador deste computador, que o agente pode executar UMA vez esta chamada exata antes de expirar. Confira servidor, ferramenta e argumentos.",
-    confirm_text_reject: "Você vai assinar a rejeição desta chamada. Ela não será encaminhada; uma nova tentativa pede aprovação de novo.",
-    sending: "Assinando…",
-    decided_approve: (id) => `Aprovada ${id}. O agente pode repetir esta chamada exata uma vez.`,
-    decided_reject: (id) => `Rejeitada ${id}.`,
-    decide_error: "Nada foi assinado",
-    need_token: "Esta aba não tem o token de sessão. Abra o link com #s= que o terminal imprimiu para decidir daqui.",
-    cli_hint: "Para decidir, execute em um terminal (ou inicie o dashboard com --approvals):",
-    policy_rules: (n) => `Regras da política (${n})`,
-    r_id: "id",
-    r_effect: "Efeito",
-    r_target: "Servidor",
-    r_conditions: "Condições",
-    r_any: "qualquer",
-    r_none: "nenhuma",
-    new_receipts: (n) => `${n} recibo(s) novo(s)`,
-    yes: "sim",
-    no: "não",
+    read_file: "Ler arquivo", read_text_file: "Ler arquivo", read_media_file: "Ler arquivo de mídia",
+    read_multiple_files: "Ler vários arquivos", write_file: "Escrever arquivo", edit_file: "Editar arquivo",
+    append_file: "Acrescentar ao arquivo", create_directory: "Criar pasta", list_directory: "Listar pasta",
+    list_directory_with_sizes: "Listar pasta com tamanhos", directory_tree: "Ver árvore de pastas",
+    move_file: "Mover arquivo", copy_file: "Copiar arquivo", search_files: "Buscar arquivos",
+    get_file_info: "Ver informações do arquivo", list_allowed_directories: "Listar pastas permitidas",
   },
 };
 
-let lang = "es";
-let state = null;
-let selected = null;
-let fingerprint = null;
-let knownIds = null;
-let freshIds = new Set();
-let loading = false;
-let live = true;
-// Pending id -> "approve" | "reject" while its confirmation box is open.
-const confirming = new Map();
-// Pending id -> { ok, text } after a decision from this tab.
-const decisionNotes = new Map();
+const I18N = {
+  es: {
+    nav_overview: "Resumen", nav_approvals: "Aprobaciones", nav_activity: "Actividad",
+    nav_policy: "Política", nav_integrity: "Integridad",
+    sub_overview: "Qué hizo tu agente y qué decidió PRÆTORE",
+    sub_approvals: "Acciones del agente que esperan una decisión humana",
+    sub_activity: "Cada llamada a una herramienta, con su recibo firmado",
+    sub_policy: "Las reglas que deciden cada llamada",
+    sub_integrity: "La misma verificación que praetore-mcp verify",
+    live: "En vivo", updated: (s) => `Actualizado ${s}`,
+    mode_readonly: "Solo lectura", mode_approvals: "Aprobaciones activas",
+    hero_ok_t: "Protección activa",
+    hero_ok_d: (n) => `${n} decisiones firmadas y verificadas. El journal está íntegro.`,
+    hero_bad_t: "Falla de integridad",
+    hero_bad_d: (f) => `verify encontró ${f} falla(s) en el journal.`,
+    hero_err_t: "No se pudo verificar el journal",
+    hero_empty_t: "Esperando la primera acción",
+    hero_empty_d: "Cuando tu agente use una herramienta, la decisión aparecerá aquí.",
+    see_integrity: "Ver integridad",
+    cta_pending: (n) => n === 1 ? "1 acción espera tu aprobación" : `${n} acciones esperan tu aprobación`,
+    cta_sub: "El agente no la ejecutó y espera tu decisión.",
+    review: "Revisar",
+    k_total: "Decisiones", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pidieron aprobación",
+    pct: (p) => `${p}% del total`, k_total_foot: (n) => `${n} en modo enforce`,
+    chart_title: "Actividad", chart_hours: "Últimas 24 horas, por hora", chart_days: "Últimos 14 días, por día",
+    recent: "Actividad reciente", see_all: "Ver todo →",
+    tools_title: "Herramientas más usadas", tools_sub: "Llamadas por herramienta",
+    empty_recent: "Todavía no hay actividad.",
+    d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pidió aprobación",
+    ap_pending: "Esperando decisión", ap_held: "Retenida (sin decisión)", ap_approve: "Aprobada",
+    ap_reject: "Rechazada", ap_executed: "Ejecutada tras aprobación", ap_would: "En enforce pediría aprobación",
+    pend_none_t: "Todo al día", pend_none_d: "No hay acciones esperando aprobación.",
+    agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
+    expires_in: (m, s) => `Vence en ${m}:${String(s).padStart(2, "0")}`,
+    expired: "Vencida: ya no se puede aprobar",
+    exact_args: "Argumentos exactos",
+    exact_args_hint: "Esto es exactamente lo que se firma y lo único que el agente podrá ejecutar.",
+    approve: "Aprobar", reject: "Rechazar", view_receipt: "Ver recibo",
+    history: "Historial", history_sub: "Llamadas que pidieron aprobación y cómo terminaron",
+    history_none: "Aún no hay llamadas que hayan pedido aprobación.",
+    need_token: "Esta pestaña no tiene el token de sesión. Abre el enlace con #s= que imprimió la terminal para decidir desde aquí.",
+    cli_hint: "Este dashboard es de solo lectura. Decide desde una terminal, o arráncalo con --approvals:",
+    copy: "Copiar", copied: "Copiado",
+    m_approve_t: "¿Aprobar esta acción?",
+    m_approve_d: "Se firmará con la llave de aprobador de este computador. El agente podrá ejecutar esta llamada exacta UNA vez antes de que venza.",
+    m_reject_t: "¿Rechazar esta acción?",
+    m_reject_d: "Se firmará el rechazo. La llamada no se ejecutará; si el agente lo intenta de nuevo, volverá a pedir aprobación.",
+    cancel: "Cancelar", confirm_approve: "Sí, aprobar", confirm_reject: "Sí, rechazar", sending: "Firmando…",
+    decided_approve: "Aprobada. El agente puede reintentar esta llamada exacta una vez.",
+    decided_reject: "Rechazada. La llamada no se ejecutará.",
+    decide_error: "No se firmó nada",
+    toast_pending: "Nueva acción esperando tu aprobación",
+    toast_new: (n) => n === 1 ? "1 decisión nueva" : `${n} decisiones nuevas`,
+    search_ph: "Buscar por archivo, herramienta, regla o id…",
+    all: "Todas", all_tools: "Todas las herramientas", shown: (n, t) => `${n} de ${t}`,
+    c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
+    default_deny: "Bloqueo por defecto",
+    empty_filter_t: "Sin resultados", empty_filter_d: "Prueba con otro filtro.",
+    tab_summary: "Resumen", tab_signatures: "Firmas", tab_paths: "Rutas", tab_json: "JSON",
+    f_decision: "Decisión", f_rule: "Regla", f_mode: "Modo", f_server: "Servidor", f_tool: "Herramienta",
+    f_local: "Hora local", f_utc: "UTC", f_approval: "Aprobación", f_policy: "Política (digest)",
+    f_location: "Ubicación", args: "Argumentos", omitted: (b, h) => `(omitidos: ${b} bytes, sha256 ${h})`,
+    sig_title: "Las tres firmas del recibo",
+    sig_agent: "Agente (intent)", sig_attester: "Attester", sig_authority: "Autoridad",
+    other_checks: "Otras comprobaciones de verify",
+    chk_shape: "Forma HighAssurance (v2)", chk_authority_subject: "La autoridad nombra al agente",
+    chk_audience: "Audiencia praetore-mcp", chk_mode: "praetore.mode válido",
+    chain: "Encadenado", order_ok: "seq/prev siguen a la entrada anterior", unchained: "Entrada sin encadenar (versión anterior)",
+    st_ok: "Válida", st_fail: "Falla", st_not_run: "No comprobada",
+    path_desc: "Cómo resolvió PRÆTORE cada ruta en el disco antes de decidir.",
+    path_none: "Este recibo no tiene path_check.", lexical: "Pedida", resolved: "Resuelta", status: "Estado",
+    pol_active: "Política activa", pol_meta: (v, n) => `versión ${v} · ${n} reglas`,
+    effect_Allow: "Permitir", effect_Deny: "Bloquear", effect_RequireApproval: "Pedir aprobación",
+    any_tool: "cualquier herramienta", any_server: "en cualquier servidor", in_server: (s) => `en ${s}`,
+    when: "cuando", and: "y",
+    c_within: (k, v) => `${k} está dentro de ${v}`, c_exact: (k, v) => `${k} es ${v}`,
+    c_prefix: (k, v) => `${k} empieza con ${v}`,
+    rule_default_t: "Todo lo demás", rule_default_d: "Cualquier llamada que ninguna regla cubra se bloquea (default deny).",
+    allow_all_tag: "Permite todo",
+    pol_note: "Los procesos wrap leen la política al arrancar: reinicia tu cliente MCP después de cambiarla.",
+    int_ok: "Journal íntegro", int_fail: "Se encontraron fallas",
+    verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} fallas`,
+    head: "Journal head",
+    head_text: (n, seq, u) => `${n} entradas encadenadas, próximo seq ${seq}, ${u} sin encadenar anteriores`,
+    head_none: (c, u) => `Sin head (${c} encadenadas, ${u} sin encadenar)`,
+    head_warn: "Guarda este head fuera de esta máquina y pásalo como --expected-head: sin él no se detectan entradas borradas al final del journal.",
+    expected_head: (h) => `Comparado con --expected-head ${h}.`,
+    failures: "Fallas reportadas por verify",
+    appr_journal: "Journal de aprobaciones",
+    appr_text: (d, e) => `${d} decisiones, ${e} ejecuciones`, appr_none: "Todavía no hay decisiones de aprobación.",
+    checked: "Qué comprueba verify",
+    checked_list: (a, i) => [
+      "Hash de integridad de cada recibo",
+      `Firma del attester (${a})`,
+      "Firma del intent del agente",
+      `Firma de la autoridad contra ${i} a la hora de la decisión`,
+      "Vínculo de praetore.mode",
+      "Orden del journal (seq y enlace hash)",
+      "Journal de aprobaciones: firma del aprobador, vínculo con la llamada retenida, vencimiento, uso único",
+    ],
+    observe_note: "Un recibo observe registra una decisión que NO se aplicó.",
+    verify_error: "verify no pudo correr",
+    warn_allow_all: (rules, n) => `La política tiene una regla que permite todo (${rules}) y hay ${n} recibos en modo enforce: esa regla deja pasar cualquier llamada que no cubra una regla de bloqueo o de aprobación.`,
+    note_allow_all: (rules) => `La política tiene una regla que permite todo (${rules}). Por ahora no hay recibos en modo enforce.`,
+    policy_error: "No se pudo leer la política",
+    load_error: "No se pudo cargar /api/state",
+    unreadable: "Línea ilegible",
+  },
+  en: {
+    nav_overview: "Overview", nav_approvals: "Approvals", nav_activity: "Activity",
+    nav_policy: "Policy", nav_integrity: "Integrity",
+    sub_overview: "What your agent did and what PRÆTORE decided",
+    sub_approvals: "Agent actions waiting for a human decision",
+    sub_activity: "Every tool call, with its signed receipt",
+    sub_policy: "The rules that decide each call",
+    sub_integrity: "The same verification as praetore-mcp verify",
+    live: "Live", updated: (s) => `Updated ${s}`,
+    mode_readonly: "Read-only", mode_approvals: "Approvals enabled",
+    hero_ok_t: "Protection active",
+    hero_ok_d: (n) => `${n} signed and verified decisions. The journal is intact.`,
+    hero_bad_t: "Integrity failure",
+    hero_bad_d: (f) => `verify found ${f} failure(s) in the journal.`,
+    hero_err_t: "The journal could not be verified",
+    hero_empty_t: "Waiting for the first action",
+    hero_empty_d: "When your agent uses a tool, the decision will show up here.",
+    see_integrity: "View integrity",
+    cta_pending: (n) => n === 1 ? "1 action is waiting for your approval" : `${n} actions are waiting for your approval`,
+    cta_sub: "The agent did not run it and is waiting for your decision.",
+    review: "Review",
+    k_total: "Decisions", k_allow: "Allowed", k_deny: "Blocked", k_ask: "Asked for approval",
+    pct: (p) => `${p}% of total`, k_total_foot: (n) => `${n} in enforce mode`,
+    chart_title: "Activity", chart_hours: "Last 24 hours, by hour", chart_days: "Last 14 days, by day",
+    recent: "Recent activity", see_all: "View all →",
+    tools_title: "Most used tools", tools_sub: "Calls per tool",
+    empty_recent: "No activity yet.",
+    d_ALLOW: "Allowed", d_DENY: "Blocked", d_REQUIRE_APPROVAL: "Asked for approval",
+    ap_pending: "Waiting for decision", ap_held: "Held (no decision)", ap_approve: "Approved",
+    ap_reject: "Rejected", ap_executed: "Executed after approval", ap_would: "Enforce would ask",
+    pend_none_t: "All caught up", pend_none_d: "No actions are waiting for approval.",
+    agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
+    expires_in: (m, s) => `Expires in ${m}:${String(s).padStart(2, "0")}`,
+    expired: "Expired: it can no longer be approved",
+    exact_args: "Exact arguments",
+    exact_args_hint: "This is exactly what gets signed and the only call the agent will be able to run.",
+    approve: "Approve", reject: "Reject", view_receipt: "View receipt",
+    history: "History", history_sub: "Calls that asked for approval and how they ended",
+    history_none: "No call has asked for approval yet.",
+    need_token: "This tab has no session token. Open the #s= link the terminal printed to decide from here.",
+    cli_hint: "This dashboard is read-only. Decide from a terminal, or start it with --approvals:",
+    copy: "Copy", copied: "Copied",
+    m_approve_t: "Approve this action?",
+    m_approve_d: "It will be signed with this computer's approver key. The agent may run this exact call ONCE before it expires.",
+    m_reject_t: "Reject this action?",
+    m_reject_d: "The rejection will be signed. The call will not run; if the agent tries again, it asks for approval again.",
+    cancel: "Cancel", confirm_approve: "Yes, approve", confirm_reject: "Yes, reject", sending: "Signing…",
+    decided_approve: "Approved. The agent can retry this exact call once.",
+    decided_reject: "Rejected. The call will not run.",
+    decide_error: "Nothing was signed",
+    toast_pending: "New action waiting for your approval",
+    toast_new: (n) => n === 1 ? "1 new decision" : `${n} new decisions`,
+    search_ph: "Search by file, tool, rule or id…",
+    all: "All", all_tools: "All tools", shown: (n, t) => `${n} of ${t}`,
+    c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
+    default_deny: "Default deny",
+    empty_filter_t: "No results", empty_filter_d: "Try another filter.",
+    tab_summary: "Summary", tab_signatures: "Signatures", tab_paths: "Paths", tab_json: "JSON",
+    f_decision: "Decision", f_rule: "Rule", f_mode: "Mode", f_server: "Server", f_tool: "Tool",
+    f_local: "Local time", f_utc: "UTC", f_approval: "Approval", f_policy: "Policy (digest)",
+    f_location: "Location", args: "Arguments", omitted: (b, h) => `(omitted: ${b} bytes, sha256 ${h})`,
+    sig_title: "The receipt's three signatures",
+    sig_agent: "Agent (intent)", sig_attester: "Attester", sig_authority: "Authority",
+    other_checks: "Other verify checks",
+    chk_shape: "HighAssurance (v2) shape", chk_authority_subject: "Authority names the agent",
+    chk_audience: "praetore-mcp audience", chk_mode: "Valid praetore.mode",
+    chain: "Chain", order_ok: "seq/prev follow the previous entry", unchained: "Unchained entry (earlier version)",
+    st_ok: "Valid", st_fail: "Failed", st_not_run: "Not checked",
+    path_desc: "How PRÆTORE resolved each path on disk before deciding.",
+    path_none: "This receipt has no path_check.", lexical: "Requested", resolved: "Resolved", status: "Status",
+    pol_active: "Active policy", pol_meta: (v, n) => `version ${v} · ${n} rules`,
+    effect_Allow: "Allow", effect_Deny: "Block", effect_RequireApproval: "Ask for approval",
+    any_tool: "any tool", any_server: "on any server", in_server: (s) => `on ${s}`,
+    when: "when", and: "and",
+    c_within: (k, v) => `${k} is inside ${v}`, c_exact: (k, v) => `${k} is ${v}`,
+    c_prefix: (k, v) => `${k} starts with ${v}`,
+    rule_default_t: "Everything else", rule_default_d: "Any call no rule covers is blocked (default deny).",
+    allow_all_tag: "Allows everything",
+    pol_note: "wrap processes read the policy when they start: restart your MCP client after changing it.",
+    int_ok: "Journal intact", int_fail: "Failures found",
+    verified_n: (ok, total, failed) => `${ok} of ${total} receipts verified, ${failed} failures`,
+    head: "Journal head",
+    head_text: (n, seq, u) => `${n} chained entries, next seq ${seq}, ${u} unchained earlier entries`,
+    head_none: (c, u) => `No head (${c} chained, ${u} unchained)`,
+    head_warn: "Keep this head outside this machine and pass it as --expected-head: without it, entries removed at the end of the journal are not detected.",
+    expected_head: (h) => `Compared with --expected-head ${h}.`,
+    failures: "Failures reported by verify",
+    appr_journal: "Approval journal",
+    appr_text: (d, e) => `${d} decision(s), ${e} execution(s)`, appr_none: "No approval decisions yet.",
+    checked: "What verify checks",
+    checked_list: (a, i) => [
+      "Integrity hash of each receipt",
+      `Attester signature (${a})`,
+      "Agent intent signature",
+      `Authority signature against ${i} at decision time`,
+      "praetore.mode binding",
+      "Journal order (seq and hash link)",
+      "Approval journal: approver signature, binding to the held call, expiry, single use",
+    ],
+    observe_note: "An observe receipt records a decision that was NOT enforced.",
+    verify_error: "verify could not run",
+    warn_allow_all: (rules, n) => `The policy has an allow-all rule (${rules}) and there are ${n} enforce receipts: that rule lets through any call no block or approval rule covers.`,
+    note_allow_all: (rules) => `The policy has an allow-all rule (${rules}). There are no enforce receipts yet.`,
+    policy_error: "Cannot read the policy",
+    load_error: "Cannot load /api/state",
+    unreadable: "Unreadable line",
+  },
+  pt: {
+    nav_overview: "Resumo", nav_approvals: "Aprovações", nav_activity: "Atividade",
+    nav_policy: "Política", nav_integrity: "Integridade",
+    sub_overview: "O que seu agente fez e o que o PRÆTORE decidiu",
+    sub_approvals: "Ações do agente aguardando uma decisão humana",
+    sub_activity: "Cada chamada de ferramenta, com seu recibo assinado",
+    sub_policy: "As regras que decidem cada chamada",
+    sub_integrity: "A mesma verificação do praetore-mcp verify",
+    live: "Ao vivo", updated: (s) => `Atualizado ${s}`,
+    mode_readonly: "Somente leitura", mode_approvals: "Aprovações ativas",
+    hero_ok_t: "Proteção ativa",
+    hero_ok_d: (n) => `${n} decisões assinadas e verificadas. O journal está íntegro.`,
+    hero_bad_t: "Falha de integridade",
+    hero_bad_d: (f) => `o verify encontrou ${f} falha(s) no journal.`,
+    hero_err_t: "Não foi possível verificar o journal",
+    hero_empty_t: "Aguardando a primeira ação",
+    hero_empty_d: "Quando seu agente usar uma ferramenta, a decisão aparecerá aqui.",
+    see_integrity: "Ver integridade",
+    cta_pending: (n) => n === 1 ? "1 ação aguarda sua aprovação" : `${n} ações aguardam sua aprovação`,
+    cta_sub: "O agente não a executou e aguarda sua decisão.",
+    review: "Revisar",
+    k_total: "Decisões", k_allow: "Permitidas", k_deny: "Bloqueadas", k_ask: "Pediram aprovação",
+    pct: (p) => `${p}% do total`, k_total_foot: (n) => `${n} em modo enforce`,
+    chart_title: "Atividade", chart_hours: "Últimas 24 horas, por hora", chart_days: "Últimos 14 dias, por dia",
+    recent: "Atividade recente", see_all: "Ver tudo →",
+    tools_title: "Ferramentas mais usadas", tools_sub: "Chamadas por ferramenta",
+    empty_recent: "Ainda não há atividade.",
+    d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pediu aprovação",
+    ap_pending: "Aguardando decisão", ap_held: "Retida (sem decisão)", ap_approve: "Aprovada",
+    ap_reject: "Rejeitada", ap_executed: "Executada após aprovação", ap_would: "Em enforce pediria aprovação",
+    pend_none_t: "Tudo em dia", pend_none_d: "Não há ações aguardando aprovação.",
+    agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
+    expires_in: (m, s) => `Expira em ${m}:${String(s).padStart(2, "0")}`,
+    expired: "Expirada: não pode mais ser aprovada",
+    exact_args: "Argumentos exatos",
+    exact_args_hint: "Isto é exatamente o que é assinado e a única chamada que o agente poderá executar.",
+    approve: "Aprovar", reject: "Rejeitar", view_receipt: "Ver recibo",
+    history: "Histórico", history_sub: "Chamadas que pediram aprovação e como terminaram",
+    history_none: "Nenhuma chamada pediu aprovação ainda.",
+    need_token: "Esta aba não tem o token de sessão. Abra o link com #s= que o terminal imprimiu para decidir daqui.",
+    cli_hint: "Este dashboard é somente leitura. Decida em um terminal, ou inicie-o com --approvals:",
+    copy: "Copiar", copied: "Copiado",
+    m_approve_t: "Aprovar esta ação?",
+    m_approve_d: "Será assinada com a chave de aprovador deste computador. O agente poderá executar esta chamada exata UMA vez antes de expirar.",
+    m_reject_t: "Rejeitar esta ação?",
+    m_reject_d: "A rejeição será assinada. A chamada não será executada; se o agente tentar de novo, pedirá aprovação de novo.",
+    cancel: "Cancelar", confirm_approve: "Sim, aprovar", confirm_reject: "Sim, rejeitar", sending: "Assinando…",
+    decided_approve: "Aprovada. O agente pode repetir esta chamada exata uma vez.",
+    decided_reject: "Rejeitada. A chamada não será executada.",
+    decide_error: "Nada foi assinado",
+    toast_pending: "Nova ação aguardando sua aprovação",
+    toast_new: (n) => n === 1 ? "1 decisão nova" : `${n} decisões novas`,
+    search_ph: "Buscar por arquivo, ferramenta, regra ou id…",
+    all: "Todas", all_tools: "Todas as ferramentas", shown: (n, t) => `${n} de ${t}`,
+    c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
+    default_deny: "Bloqueio padrão",
+    empty_filter_t: "Sem resultados", empty_filter_d: "Tente outro filtro.",
+    tab_summary: "Resumo", tab_signatures: "Assinaturas", tab_paths: "Caminhos", tab_json: "JSON",
+    f_decision: "Decisão", f_rule: "Regra", f_mode: "Modo", f_server: "Servidor", f_tool: "Ferramenta",
+    f_local: "Hora local", f_utc: "UTC", f_approval: "Aprovação", f_policy: "Política (digest)",
+    f_location: "Localização", args: "Argumentos", omitted: (b, h) => `(omitidos: ${b} bytes, sha256 ${h})`,
+    sig_title: "As três assinaturas do recibo",
+    sig_agent: "Agente (intent)", sig_attester: "Attester", sig_authority: "Autoridade",
+    other_checks: "Outras verificações do verify",
+    chk_shape: "Forma HighAssurance (v2)", chk_authority_subject: "A autoridade nomeia o agente",
+    chk_audience: "Audiência praetore-mcp", chk_mode: "praetore.mode válido",
+    chain: "Encadeamento", order_ok: "seq/prev seguem a entrada anterior", unchained: "Entrada não encadeada (versão anterior)",
+    st_ok: "Válida", st_fail: "Falha", st_not_run: "Não verificada",
+    path_desc: "Como o PRÆTORE resolveu cada caminho no disco antes de decidir.",
+    path_none: "Este recibo não tem path_check.", lexical: "Pedido", resolved: "Resolvido", status: "Estado",
+    pol_active: "Política ativa", pol_meta: (v, n) => `versão ${v} · ${n} regras`,
+    effect_Allow: "Permitir", effect_Deny: "Bloquear", effect_RequireApproval: "Pedir aprovação",
+    any_tool: "qualquer ferramenta", any_server: "em qualquer servidor", in_server: (s) => `em ${s}`,
+    when: "quando", and: "e",
+    c_within: (k, v) => `${k} está dentro de ${v}`, c_exact: (k, v) => `${k} é ${v}`,
+    c_prefix: (k, v) => `${k} começa com ${v}`,
+    rule_default_t: "Todo o resto", rule_default_d: "Qualquer chamada que nenhuma regra cubra é bloqueada (default deny).",
+    allow_all_tag: "Permite tudo",
+    pol_note: "Os processos wrap leem a política ao iniciar: reinicie seu cliente MCP depois de alterá-la.",
+    int_ok: "Journal íntegro", int_fail: "Foram encontradas falhas",
+    verified_n: (ok, total, failed) => `${ok} de ${total} recibos verificados, ${failed} falhas`,
+    head: "Journal head",
+    head_text: (n, seq, u) => `${n} entradas encadeadas, próximo seq ${seq}, ${u} não encadeadas anteriores`,
+    head_none: (c, u) => `Sem head (${c} encadeadas, ${u} não encadeadas)`,
+    head_warn: "Guarde este head fora desta máquina e passe-o como --expected-head: sem ele, entradas apagadas no fim do journal não são detectadas.",
+    expected_head: (h) => `Comparado com --expected-head ${h}.`,
+    failures: "Falhas reportadas pelo verify",
+    appr_journal: "Journal de aprovações",
+    appr_text: (d, e) => `${d} decisões, ${e} execuções`, appr_none: "Ainda não há decisões de aprovação.",
+    checked: "O que o verify confere",
+    checked_list: (a, i) => [
+      "Hash de integridade de cada recibo",
+      `Assinatura do attester (${a})`,
+      "Assinatura do intent do agente",
+      `Assinatura da autoridade contra ${i} na hora da decisão`,
+      "Vínculo de praetore.mode",
+      "Ordem do journal (seq e link hash)",
+      "Journal de aprovações: assinatura do aprovador, vínculo com a chamada retida, expiração, uso único",
+    ],
+    observe_note: "Um recibo observe registra uma decisão que NÃO foi aplicada.",
+    verify_error: "o verify não pôde rodar",
+    warn_allow_all: (rules, n) => `A política tem uma regra que permite tudo (${rules}) e há ${n} recibos em modo enforce: essa regra deixa passar qualquer chamada que nenhuma regra de bloqueio ou aprovação cubra.`,
+    note_allow_all: (rules) => `A política tem uma regra que permite tudo (${rules}). Ainda não há recibos em modo enforce.`,
+    policy_error: "Não foi possível ler a política",
+    load_error: "Não foi possível carregar /api/state",
+    unreadable: "Linha ilegível",
+  },
+};
+
+const VIEWS = ["overview", "approvals", "activity", "policy", "integrity"];
 const SESSION_KEY = "praetore-mcp-dashboard-session";
 const LIVE_KEY = "praetore-mcp-dashboard-live";
+const LANG_KEY = "praetore-mcp-dashboard-lang";
 const POLL_MS = 3000;
+
+let lang = "es";
+let view = "overview";
+let state = null;
+let selected = null; // index into state.receipts shown in the drawer
+let drawerTab = "summary";
+let decisionFilter = "";
+let fingerprint = null;
+let knownIds = null;
+let knownPending = null;
+const freshIds = new Set();
+let loading = false;
+let live = true;
+let sessionToken = null;
+let lastLoadedAt = null;
+
+// ---------- helpers ----------
 
 function t(key, ...args) {
   const value = (I18N[lang] && I18N[lang][key]) ?? I18N.es[key] ?? key;
@@ -374,24 +384,67 @@ function t(key, ...args) {
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
     if (k === "class") node.className = v;
-    else node.setAttribute(k, v);
+    // The CSP has no 'unsafe-inline' for styles: a style attribute would be
+    // dropped, so styles go through the CSSOM.
+    else if (k === "style") node.style.cssText = v;
+    else if (k === "onclick") node.addEventListener("click", v);
+    else node.setAttribute(k, v === true ? "" : v);
   }
-  for (const child of children) {
-    if (child === null || child === undefined) continue;
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
     node.append(child instanceof Node ? child : String(child));
   }
   return node;
 }
 
-function pill(status) {
-  const cls = status === "ok" ? "ok" : status === "fail" ? "bad" : "neutral";
-  return el("span", { class: `pill ${cls}` }, t(`st_${status}`));
+function storageGet(store, key) {
+  try { return store.getItem(key); } catch (_) { return null; }
 }
 
-function decisionPill(decision) {
-  const cls = decision === "ALLOW" ? "ok" : decision === "DENY" ? "bad" : "warn";
-  return el("span", { class: `pill ${cls}` }, decision);
+function storageSet(store, key, value) {
+  try { store.setItem(key, value); } catch (_) { /* this page only */ }
+}
+
+function toolLabel(tool) {
+  if (typeof tool !== "string") return "-";
+  return (TOOLS[lang] && TOOLS[lang][tool]) || tool;
+}
+
+function decisionClass(decision) {
+  return decision === "ALLOW" ? "ok" : decision === "DENY" ? "bad" : "warn";
+}
+
+function decisionTag(decision) {
+  return el("span", { class: `tag ${decisionClass(decision)}` }, t(`d_${decision}`));
+}
+
+function basename(path) {
+  if (typeof path !== "string") return "";
+  const parts = path.split("/").filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : path;
+}
+
+// The main object of a call, for a one-line description.
+function targetOf(args) {
+  if (!args || typeof args !== "object") return { short: "", full: "" };
+  if (args.omitted === true) return { short: t("omitted", args.bytes, args.sha256), full: "" };
+  if (typeof args.source === "string" && typeof args.destination === "string") {
+    return { short: `${basename(args.source)} → ${basename(args.destination)}`, full: `${args.source} → ${args.destination}` };
+  }
+  if (typeof args.path === "string") return { short: basename(args.path) || args.path, full: args.path };
+  if (Array.isArray(args.paths)) {
+    return { short: args.paths.map(basename).join(", "), full: args.paths.join(", ") };
+  }
+  const first = Object.values(args).find((v) => typeof v === "string");
+  return { short: first || "", full: first || "" };
+}
+
+function argsText(args) {
+  if (args === null || args === undefined) return "-";
+  if (args && args.omitted === true) return t("omitted", args.bytes, args.sha256);
+  return JSON.stringify(args, null, 2);
 }
 
 function utcText(iso) {
@@ -404,98 +457,125 @@ function localText(iso) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "-";
   return date.toLocaleString(lang, {
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
   });
 }
 
-function argsText(args) {
-  if (args === null || args === undefined) return "-";
-  if (args && args.omitted === true) return t("omitted", args.bytes, args.sha256);
-  return JSON.stringify(args);
+function relativeText(iso) {
+  const date = new Date(iso);
+  if (!iso || Number.isNaN(date.getTime())) return "-";
+  const seconds = Math.round((date.getTime() - Date.now()) / 1000);
+  const rtf = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
+  const abs = Math.abs(seconds);
+  if (abs < 45) return rtf.format(seconds, "second");
+  if (abs < 2700) return rtf.format(Math.round(seconds / 60), "minute");
+  if (abs < 79200) return rtf.format(Math.round(seconds / 3600), "hour");
+  return rtf.format(Math.round(seconds / 86400), "day");
 }
 
-function storageGet(store, key) {
-  try {
-    return store.getItem(key);
-  } catch (_) {
-    return null;
-  }
+function approvalLabel(value) {
+  if (!value) return null;
+  if (value === "pending") return { text: t("ap_pending"), cls: "warn" };
+  if (value === "held") return { text: t("ap_held"), cls: "neutral" };
+  if (value === "executed once") return { text: t("ap_executed"), cls: "ok" };
+  if (value === "enforce would ask") return { text: t("ap_would"), cls: "neutral" };
+  if (value.startsWith("approve")) return { text: t("ap_approve"), cls: "ok" };
+  if (value.startsWith("reject")) return { text: t("ap_reject"), cls: "bad" };
+  return { text: value, cls: "neutral" };
 }
 
-function storageSet(store, key, value) {
-  try {
-    store.setItem(key, value);
-  } catch (_) {
-    // Storage unavailable: lasts for this page only.
-  }
+function copyButton(text) {
+  const button = el("button", { type: "button", class: "btn-sm copy" }, t("copy"));
+  button.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text);
+      button.textContent = t("copied");
+      setTimeout(() => { button.textContent = t("copy"); }, 1500);
+    } catch (_) {
+      button.textContent = "×";
+    }
+  });
+  return button;
 }
+
+function kv(pairs) {
+  const box = el("div", { class: "kv" });
+  for (const [k, v] of pairs) {
+    box.append(el("div", { class: "k" }, k));
+    box.append(el("div", { class: "v mono" }, v ?? "-"));
+  }
+  return box;
+}
+
+function toast(text, cls, onClick) {
+  const node = el("div", { class: `toast ${cls || ""}` }, text);
+  if (onClick) node.addEventListener("click", () => { onClick(); node.remove(); });
+  document.getElementById("toasts").append(node);
+  setTimeout(() => node.remove(), 6000);
+}
+
+function pending() {
+  return state && Array.isArray(state.pending) ? state.pending : [];
+}
+
+function isExpired(p) {
+  const at = new Date(p.expires_at).getTime();
+  return !Number.isNaN(at) && at <= Date.now();
+}
+
+// Pending calls that can still be decided.
+function activePending() {
+  return pending().filter((p) => !isExpired(p));
+}
+
+// ---------- session token ----------
 
 // The terminal prints the session token after #s=. Keep it in this tab's
 // sessionStorage only, and take it out of the address bar.
-let sessionToken = null;
 function takeSessionToken() {
   const match = location.hash.match(/^#s=([0-9a-f]{64})$/);
   if (match) {
     storageSet(sessionStorage, SESSION_KEY, match[1]);
-    history.replaceState(null, "", location.pathname);
+    history.replaceState(null, "", `${location.pathname}#/overview`);
   }
-  sessionToken = storageGet(sessionStorage, SESSION_KEY) || sessionToken || (match && match[1]) || null;
+  sessionToken = storageGet(sessionStorage, SESSION_KEY) || (match && match[1]) || null;
 }
 
-function readStoredLang() {
-  try {
-    return localStorage.getItem("praetore-mcp-dashboard-lang");
-  } catch (_) {
-    return null;
-  }
-}
-
-function storeLang(value) {
-  try {
-    localStorage.setItem("praetore-mcp-dashboard-lang", value);
-  } catch (_) {
-    // Storage unavailable: the choice lasts for this page only.
-  }
-}
+// ---------- shell ----------
 
 function applyStaticText() {
   document.documentElement.lang = lang;
   for (const node of document.querySelectorAll("[data-i18n]")) {
     node.textContent = t(node.getAttribute("data-i18n"));
   }
+  document.getElementById("live-label").textContent = t("live");
+  document.getElementById("f-text").setAttribute("placeholder", t("search_ph"));
+  document.getElementById("page-title").textContent = t(`nav_${view}`);
+  document.getElementById("page-sub").textContent = t(`sub_${view}`);
 }
 
-function card(key, value, small) {
-  return el("div", { class: "card" },
-    el("div", { class: "k" }, key),
-    el("div", { class: small ? "v small" : "v" }, value));
-}
-
-function renderSummary() {
-  const s = state.summary;
-  const p = state.policy;
-  const v = state.verify;
-  const cards = document.getElementById("cards");
-  cards.replaceChildren();
-  cards.append(card(t("total"), s.total));
-  cards.append(card("ALLOW", s.allow));
-  cards.append(card("DENY", s.deny));
-  cards.append(card("REQUIRE_APPROVAL", s.require_approval));
-  const vText = v.status === "ok" ? t("verify_ok") : v.status === "fail" ? t("verify_fail") : t("verify_error");
-  const vNode = el("span", { class: `pill ${v.status === "ok" ? "ok" : "bad"}` }, `verify: ${vText}`);
-  cards.append(card(t("verification_short"), vNode));
-  if (p.status === "ok") {
-    cards.append(card(t("policy"),
-      el("span", {}, `${p.id} v${p.version}`, el("br"),
-        el("span", { class: "mono" }, `digest ${p.digest ?? "-"}`)), true));
-  } else {
-    cards.append(card(t("policy"), el("span", { class: "mono" }, `${t("policy_error")}: ${p.error}`), true));
+function renderShell() {
+  for (const link of document.querySelectorAll("#nav a")) {
+    link.classList.toggle("active", link.getAttribute("data-view") === view);
   }
+  for (const name of VIEWS) document.getElementById(`view-${name}`).hidden = name !== view;
+  if (!state) return;
+  const count = activePending().length;
+  const badge = document.getElementById("nav-badge");
+  badge.hidden = count === 0;
+  badge.textContent = String(count);
+  document.title = count > 0 ? `(${count}) PRÆTORE MCP` : "PRÆTORE MCP";
+  const chip = document.getElementById("mode-chip");
+  chip.className = state.approvals_from_page ? "chip ok" : "chip";
+  chip.textContent = state.approvals_from_page ? t("mode_approvals") : t("mode_readonly");
+  document.getElementById("home").textContent = state.home;
+  const p = state.policy;
+  const s = state.summary;
   const warning = document.getElementById("policy-warning");
   if (p.status === "ok" && p.allow_all_rules.length > 0) {
     warning.hidden = false;
-    warning.className = p.warn_allow_all_enforce ? "banner bad" : "banner warn";
+    warning.className = p.warn_allow_all_enforce ? "alert bad" : "alert warn";
     warning.textContent = p.warn_allow_all_enforce
       ? t("warn_allow_all", p.allow_all_rules.join(", "), s.enforce_receipts)
       : t("note_allow_all", p.allow_all_rules.join(", "));
@@ -504,294 +584,297 @@ function renderSummary() {
   }
 }
 
-function renderVerify() {
+function renderStamp() {
+  document.getElementById("updated").textContent =
+    lastLoadedAt ? t("updated", relativeText(lastLoadedAt.toISOString())) : "";
+}
+
+function go(name) {
+  location.hash = `#/${name}`;
+}
+
+// ---------- overview ----------
+
+function renderOverview() {
+  const root = document.getElementById("view-overview");
+  root.replaceChildren();
+  const s = state.summary;
   const v = state.verify;
-  const box = document.getElementById("verify");
-  box.replaceChildren();
+
+  let hero;
   if (v.status === "error") {
-    box.append(el("p", { class: "banner bad" }, `${t("verify_error")}: ${v.error}`));
-    return;
+    hero = heroCard("bad", "!", t("hero_err_t"), String(v.error), t("see_integrity"));
+  } else if (v.status === "fail") {
+    hero = heroCard("bad", "!", t("hero_bad_t"), t("hero_bad_d", v.failed), t("see_integrity"));
+  } else if (s.total === 0) {
+    hero = heroCard("ok", "✓", t("hero_empty_t"), t("hero_empty_d"), null);
+  } else {
+    hero = heroCard("ok", "✓", t("hero_ok_t"), t("hero_ok_d", v.verified), t("see_integrity"));
   }
-  box.append(el("p", {},
-    el("span", { class: `pill ${v.status === "ok" ? "ok" : "bad"}` },
-      v.status === "ok" ? t("verify_ok") : t("verify_fail")),
-    " ", t("verified_n", v.verified, v.total, v.failed)));
-  if (v.failures.length > 0) {
-    box.append(el("h3", {}, t("failures")));
-    const ul = el("ul", { class: "plain mono" });
-    for (const f of v.failures) ul.append(el("li", {}, f));
-    box.append(ul);
+  root.append(hero);
+
+  const count = activePending().length;
+  if (count > 0) {
+    root.append(el("div", { class: "cta section-gap" },
+      el("span", { class: "pulse" }),
+      el("div", {}, el("strong", {}, t("cta_pending", count)), el("div", {}, t("cta_sub"))),
+      el("button", { type: "button", class: "btn-primary", onclick: () => go("approvals") }, t("review"))));
   }
-  box.append(el("h3", {}, t("head")));
-  box.append(el("p", { class: "mono" }, v.head
-    ? t("head_text", v.chained, v.head.next_seq, v.head.prev, v.unchained)
-    : t("head_none", v.chained, v.unchained)));
-  box.append(el("p", { class: "banner warn" }, t("head_warn")));
-  if (v.expected_head) box.append(el("p", { class: "mono" }, t("expected_head", v.expected_head)));
-  box.append(el("p", { class: "mono" }, v.approval.head
-    ? t("approvals", v.approval.decisions, v.approval.executions, v.approval.head)
-    : t("approvals_none")));
-  box.append(el("h3", {}, t("checked")));
-  const ul = el("ul", { class: "plain" });
-  for (const item of t("checked_list", v.attester_pin, v.issuer_pins)) ul.append(el("li", {}, item));
-  box.append(ul);
-  box.append(el("p", { class: "muted" }, t("observe_note")));
+
+  const pct = (n) => (s.total ? Math.round((n / s.total) * 100) : 0);
+  const kpis = el("div", { class: "grid kpis section-gap" },
+    kpi(t("k_total"), s.total, t("k_total_foot", s.enforce_receipts), "var(--accent)", 100),
+    kpi(t("k_allow"), s.allow, t("pct", pct(s.allow)), "var(--bar-allow)", pct(s.allow)),
+    kpi(t("k_deny"), s.deny, t("pct", pct(s.deny)), "var(--bar-deny)", pct(s.deny)),
+    kpi(t("k_ask"), s.require_approval, t("pct", pct(s.require_approval)), "var(--bar-ask)", pct(s.require_approval)));
+  root.append(kpis);
+
+  const grid = el("div", { class: "grid two section-gap" });
+  grid.append(chartCard());
+  grid.append(toolsCard());
+  root.append(grid);
+  root.append(recentCard());
 }
 
-function renderToolFilter() {
-  const select = document.getElementById("f-tool");
-  const current = select.value;
-  const tools = [...new Set(state.receipts.map((r) => r.tool).filter((x) => typeof x === "string"))].sort();
-  select.replaceChildren(el("option", { value: "" }, t("all")));
-  for (const tool of tools) select.append(el("option", { value: tool }, tool));
-  if (tools.includes(current)) select.value = current;
+function heroCard(cls, icon, title, text, linkText) {
+  return el("div", { class: `card hero ${cls}` },
+    el("div", { class: "hero-icon" }, icon),
+    el("div", {}, el("h2", {}, title), el("p", {}, text)),
+    linkText ? el("button", { type: "button", class: "hero-cta", onclick: () => go("integrity") }, linkText) : null);
 }
 
-function matches(r) {
-  const decision = document.getElementById("f-decision").value;
-  const tool = document.getElementById("f-tool").value;
-  const text = document.getElementById("f-text").value.trim().toLowerCase();
-  if (decision && r.decision !== decision) return false;
-  if (tool && r.tool !== tool) return false;
-  if (text && !r.raw_text.toLowerCase().includes(text)) return false;
-  return true;
+function kpi(label, value, foot, color, percent) {
+  return el("div", { class: "card kpi" },
+    el("div", { class: "label" }, el("span", { class: "dot", style: `background:${color}` }), label),
+    el("div", { class: "value" }, String(value)),
+    el("div", { class: "foot" }, foot),
+    el("div", { class: "meter" }, el("span", { style: `width:${percent}%;background:${color}` })));
 }
 
-function renderTable() {
-  const body = document.querySelector("#table tbody");
-  body.replaceChildren();
-  const rows = state.receipts.map((r, i) => [r, i]).reverse();
-  let shown = 0;
+function chartCard() {
+  const receipts = state.receipts.filter((r) => r.decided_at);
+  const now = new Date();
+  const newest = receipts.length ? new Date(receipts[receipts.length - 1].decided_at) : now;
+  const hourly = now.getTime() - newest.getTime() < 24 * 3600 * 1000;
+  const buckets = [];
+  if (hourly) {
+    const end = new Date(now); end.setMinutes(0, 0, 0);
+    for (let i = 23; i >= 0; i -= 1) {
+      const start = new Date(end.getTime() - i * 3600 * 1000);
+      buckets.push({ start, end: new Date(start.getTime() + 3600 * 1000),
+        label: start.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" }) });
+    }
+  } else {
+    const end = new Date(now); end.setHours(0, 0, 0, 0);
+    for (let i = 13; i >= 0; i -= 1) {
+      const start = new Date(end); start.setDate(end.getDate() - i);
+      const stop = new Date(start); stop.setDate(start.getDate() + 1);
+      buckets.push({ start, end: stop, label: start.toLocaleDateString(lang, { day: "2-digit", month: "short" }) });
+    }
+  }
+  for (const b of buckets) { b.ALLOW = 0; b.DENY = 0; b.REQUIRE_APPROVAL = 0; }
+  for (const r of receipts) {
+    const time = new Date(r.decided_at).getTime();
+    const b = buckets.find((x) => time >= x.start.getTime() && time < x.end.getTime());
+    if (b && b[r.decision] !== undefined) b[r.decision] += 1;
+  }
+  const max = Math.max(1, ...buckets.map((b) => b.ALLOW + b.DENY + b.REQUIRE_APPROVAL));
+  const chart = el("div", { class: "chart" });
+  const colors = { ALLOW: "var(--bar-allow)", DENY: "var(--bar-deny)", REQUIRE_APPROVAL: "var(--bar-ask)" };
+  for (const b of buckets) {
+    const total = b.ALLOW + b.DENY + b.REQUIRE_APPROVAL;
+    const col = el("div", { class: "col",
+      title: `${b.label} · ${t("d_ALLOW")} ${b.ALLOW} · ${t("d_DENY")} ${b.DENY} · ${t("d_REQUIRE_APPROVAL")} ${b.REQUIRE_APPROVAL}` });
+    for (const key of ["ALLOW", "REQUIRE_APPROVAL", "DENY"]) {
+      if (b[key] > 0) col.append(el("div", { class: "seg", style: `height:${(b[key] / max) * 100}%;background:${colors[key]}` }));
+    }
+    if (total === 0) col.append(el("div", { class: "seg", style: "height:2px;background:var(--line)" }));
+    chart.append(col);
+  }
+  const mid = buckets[Math.floor(buckets.length / 2)];
+  return el("div", { class: "card" },
+    el("div", { class: "card-head" }, el("h2", {}, t("chart_title")),
+      el("div", { class: "legend" },
+        el("span", {}, el("i", { style: "background:var(--bar-allow)" }), t("d_ALLOW")),
+        el("span", {}, el("i", { style: "background:var(--bar-deny)" }), t("d_DENY")),
+        el("span", {}, el("i", { style: "background:var(--bar-ask)" }), t("d_REQUIRE_APPROVAL")))),
+    el("p", { class: "card-sub" }, hourly ? t("chart_hours") : t("chart_days")),
+    chart,
+    el("div", { class: "chart-axis" },
+      el("span", {}, buckets[0].label), el("span", {}, mid.label), el("span", {}, buckets[buckets.length - 1].label)));
+}
+
+function toolsCard() {
+  const counts = new Map();
+  for (const r of state.receipts) if (typeof r.tool === "string") counts.set(r.tool, (counts.get(r.tool) || 0) + 1);
+  const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const max = Math.max(1, ...top.map(([, n]) => n));
+  const bars = el("div", { class: "bars" });
+  for (const [tool, n] of top) {
+    bars.append(el("div", { class: "row" },
+      el("span", { title: tool }, toolLabel(tool)), el("span", { class: "muted" }, String(n)),
+      el("div", { class: "track" }, el("span", { style: `width:${(n / max) * 100}%` }))));
+  }
+  if (top.length === 0) bars.append(el("p", { class: "muted" }, t("empty_recent")));
+  return el("div", { class: "card" }, el("h2", {}, t("tools_title")), el("p", { class: "card-sub" }, t("tools_sub")), bars);
+}
+
+function recentCard() {
+  const list = el("ul", { class: "feed" });
+  const rows = state.receipts.map((r, i) => [r, i]).filter(([r]) => !r.parse_error).reverse().slice(0, 8);
   for (const [r, index] of rows) {
-    if (!matches(r)) continue;
-    shown += 1;
-    const tr = el("tr", {});
-    const classes = [];
-    if (index === selected) classes.push("selected");
-    if (freshIds.has(r.evidence_id)) classes.push("fresh");
-    tr.className = classes.join(" ");
-    tr.addEventListener("click", () => {
-      selected = index;
-      freshIds.delete(r.evidence_id);
-      if (r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
-      renderTable();
-      renderDetail();
-    });
-    if (r.parse_error) {
-      tr.append(el("td", { colspan: "10", class: "mono" },
-        el("span", { class: "pill bad" }, t("unreadable")), ` ${r.location.file}:${r.location.line}: ${r.parse_error}`));
-    } else {
-      tr.append(el("td", {}, localText(r.decided_at)));
-      tr.append(el("td", { class: "mono" }, utcText(r.decided_at)));
-      tr.append(el("td", {}, r.server ?? "-"));
-      tr.append(el("td", {}, r.tool ?? "-"));
-      const args = argsText(r.arguments);
-      tr.append(el("td", { class: "args mono", title: args }, args));
-      tr.append(el("td", {}, decisionPill(r.decision)));
-      tr.append(el("td", {}, r.rule ?? t("default_deny")));
-      tr.append(el("td", {}, r.mode ?? "?"));
-      tr.append(el("td", {}, el("span", { class: `pill ${r.verified ? "ok" : "bad"}` },
-        r.verified ? t("st_ok") : t("st_fail"))));
-      tr.append(el("td", { class: "mono" }, r.evidence_id));
-    }
-    body.append(tr);
+    const target = targetOf(r.arguments);
+    const cls = decisionClass(r.decision);
+    const li = el("li", { onclick: () => openDrawer(index) },
+      el("span", { class: `avatar ${cls}` }, r.decision === "ALLOW" ? "✓" : r.decision === "DENY" ? "✕" : "?"),
+      el("div", { class: "what" },
+        el("strong", {}, toolLabel(r.tool)),
+        el("div", { class: "target", title: target.full }, target.short || r.server || "")),
+      decisionTag(r.decision),
+      el("time", { title: localText(r.decided_at) }, relativeText(r.decided_at)));
+    list.append(li);
   }
-  document.getElementById("shown").textContent = t("shown", shown, state.receipts.length);
+  if (rows.length === 0) list.append(el("li", { class: "muted" }, t("empty_recent")));
+  return el("div", { class: "card section-gap" },
+    el("div", { class: "card-head" }, el("h2", {}, t("recent")),
+      el("a", { href: "#/activity" }, t("see_all"))),
+    list);
 }
 
-function kv(pairs) {
-  const box = el("div", { class: "kv" });
-  for (const [k, v] of pairs) {
-    box.append(el("div", { class: "k" }, k));
-    box.append(el("div", { class: "mono" }, v ?? "-"));
-  }
-  return box;
+// ---------- approvals ----------
+
+function heldReceipt(evidenceId) {
+  return state.receipts.find((r) => r.evidence_id === evidenceId);
 }
 
-function checkCell(check) {
-  const cell = el("td", {}, pill(check.status));
-  if (check.error) cell.append(" ", el("span", { class: "mono" }, check.error));
-  return cell;
+function renderApprovals() {
+  const root = document.getElementById("view-approvals");
+  root.replaceChildren();
+  if (state.pending && !Array.isArray(state.pending)) {
+    root.append(el("p", { class: "alert bad" }, String(state.pending.error)));
+  }
+  const list = [...activePending(), ...pending().filter(isExpired)];
+  if (activePending().length === 0) {
+    root.append(el("div", { class: "card" },
+      el("div", { class: "empty" }, el("div", { class: "empty-icon" }, "✓"),
+        el("strong", {}, t("pend_none_t")), t("pend_none_d"))));
+  }
+  for (const p of list) root.append(approvalCard(p));
+  root.append(historyCard());
 }
 
-function renderDetail() {
-  const section = document.getElementById("detail");
-  const body = document.getElementById("detail-body");
-  if (selected === null || !state || !state.receipts[selected]) {
-    section.hidden = true;
-    return;
-  }
-  const r = state.receipts[selected];
-  section.hidden = false;
-  body.replaceChildren();
-  body.append(kv([
-    [t("location"), `${r.location.file}:${r.location.line}`],
-    ["evidence_id", r.evidence_id],
-    [t("c_local"), localText(r.decided_at)],
-    [t("c_utc"), utcText(r.decided_at)],
-    [t("c_decision"), r.decision],
-    [t("c_rule"), r.rule ?? t("default_deny")],
-    [t("c_mode"), r.mode],
-    [t("approval"), r.approval],
-    ["policy_digest", r.policy_digest],
-  ]));
-  if (!r.parse_error) {
-    body.append(el("h3", {}, t("signatures")));
-    const sig = el("table", {},
-      el("thead", {}, el("tr", {}, el("th", {}, ""), el("th", {}, t("key")), el("th", {}, t("result")))));
-    const tbody = el("tbody", {});
-    const s = r.signatures;
-    tbody.append(el("tr", {}, el("td", {}, t("sig_agent")),
-      el("td", { class: "mono" }, `agent_id ${s.agent.agent_id}`, el("br"),
-        `subject_key_hash ${s.agent.subject_key_hash ?? "-"}`),
-      checkCell(s.agent.check)));
-    tbody.append(el("tr", {}, el("td", {}, t("sig_attester")),
-      el("td", { class: "mono" }, `attester_key_id ${s.attester.key_id ?? "-"}`),
-      checkCell(s.attester.check)));
-    tbody.append(el("tr", {}, el("td", {}, t("sig_authority")),
-      el("td", { class: "mono" }, `issuer ${s.authority.issuer}`, el("br"),
-        `issuer_key_id ${s.authority.key_id ?? "-"}`, el("br"),
-        `authority_id ${s.authority.authority_id}`),
-      checkCell(s.authority.check)));
-    sig.append(tbody);
-    body.append(el("div", { class: "table-wrap" }, sig));
-
-    body.append(el("h3", {}, t("other_checks")));
-    const other = el("table", {});
-    const otherBody = el("tbody", {});
-    for (const name of ["shape", "authority_subject", "audience", "mode"]) {
-      const check = r.checks[name] || { status: "not_run", error: null };
-      otherBody.append(el("tr", {}, el("td", {}, t(`chk_${name}`)), checkCell(check)));
-    }
-    other.append(otherBody);
-    body.append(other);
-
-    body.append(el("h3", {}, t("chain")));
-    if (r.seq === null || r.seq === undefined) {
-      body.append(el("p", {}, t("unchained")));
-    } else {
-      body.append(kv([["seq", String(r.seq)], ["prev", r.prev]]));
-    }
-    body.append(el("p", {}, r.order
-      ? el("span", {}, pill("fail"), " ", el("span", { class: "mono" }, r.order))
-      : el("span", {}, pill("ok"), " ", t("order_ok"))));
-
-    body.append(el("h3", {}, t("path_check")));
-    if (r.path_check && typeof r.path_check === "object") {
-      const table = el("table", {},
-        el("thead", {}, el("tr", {}, el("th", {}, "key"), el("th", {}, t("lexical")),
-          el("th", {}, t("resolved")), el("th", {}, t("status")))));
-      const pb = el("tbody", {});
-      for (const [key, value] of Object.entries(r.path_check)) {
-        pb.append(el("tr", {}, el("td", { class: "mono" }, key),
-          el("td", { class: "mono" }, value.lexical ?? "-"),
-          el("td", { class: "mono" }, value.resolved ?? "-"),
-          el("td", {}, el("span", { class: `pill ${value.status === "same" ? "ok" : "warn"}` }, value.status ?? "-"))));
-      }
-      table.append(pb);
-      body.append(el("div", { class: "table-wrap" }, table));
-    } else {
-      body.append(el("p", { class: "muted" }, t("path_none")));
-    }
-  }
-  body.append(el("h3", {}, t("json")));
-  body.append(el("pre", {}, r.raw !== null ? JSON.stringify(r.raw, null, 2) : r.raw_text));
-}
-
-function renderPending() {
-  const box = document.getElementById("pending-body");
-  const section = document.getElementById("pending");
-  box.replaceChildren();
-  const pending = state.pending;
-  if (!Array.isArray(pending)) {
-    section.className = "panel";
-    box.append(el("p", { class: "banner bad" }, `${t("pending_error")}: ${pending && pending.error}`));
-    return;
-  }
-  section.className = pending.length > 0 ? "panel attention" : "panel";
-  document.title = pending.length > 0 ? `(${pending.length}) PRÆTORE MCP` : "PRÆTORE MCP receipts";
-  for (const [id, note] of decisionNotes) {
-    box.append(el("p", { class: `banner ${note.ok ? "ok" : "bad"}` }, note.text));
-    if (!pending.some((p) => p.approval_id === id)) decisionNotes.delete(id);
-  }
-  if (pending.length === 0) {
-    box.append(el("p", { class: "muted" }, t("pending_none")));
-    return;
-  }
-  for (const p of pending) box.append(pendingItem(p));
-}
-
-function pendingItem(p) {
-  const expires = new Date(p.expires_at);
-  const left = Math.floor((expires.getTime() - Date.now()) / 1000);
+function approvalCard(p) {
+  const receipt = heldReceipt(p.evidence_id);
+  const start = receipt ? new Date(receipt.decided_at).getTime() : NaN;
+  const expires = new Date(p.expires_at).getTime();
+  const left = Math.floor((expires - Date.now()) / 1000);
   const expired = !Number.isNaN(left) && left <= 0;
-  const item = el("div", { class: "pending-item" });
-  item.append(el("div", { class: "pending-head" },
-    el("span", { class: "pill warn" }, "REQUIRE_APPROVAL"), " ",
-    el("strong", {}, `${p.server} · ${p.tool}`), " ",
-    el("span", { class: expired ? "pill bad" : "pill neutral countdown", "data-expires": p.expires_at },
-      expired ? t("expired") : t("expires_in", Math.floor(left / 60), left % 60))));
-  const receipt = el("a", { href: `#e=${encodeURIComponent(p.evidence_id)}` }, p.evidence_id);
-  receipt.addEventListener("click", (event) => {
-    event.preventDefault();
-    const index = state.receipts.findIndex((r) => r.evidence_id === p.evidence_id);
-    if (index >= 0) {
-      selected = index;
-      history.replaceState(null, "", `#e=${encodeURIComponent(p.evidence_id)}`);
-      renderTable();
-      renderDetail();
-      document.getElementById("detail").scrollIntoView({ behavior: "smooth" });
-    }
-  });
-  item.append(kv([
-    ["approval_id", p.approval_id],
-    [t("expires"), `${localText(p.expires_at)} · ${utcText(p.expires_at)}`],
-    [t("held_receipt"), receipt],
-  ]));
-  if (p.error) {
-    item.append(el("p", { class: "banner bad mono" }, p.error));
-    return item;
-  }
-  item.append(el("div", { class: "k small" }, t("arguments_exact")));
-  item.append(el("pre", { class: "args-full" }, p.arguments_canonical));
-  if (expired) return item;
+  let args = null;
+  try { args = JSON.parse(p.arguments_canonical); } catch (_) { args = null; }
+  const target = targetOf(args);
+  const total = Number.isNaN(start) ? 600 : Math.max(1, (expires - start) / 1000);
 
-  if (!state.approvals_from_page) {
-    item.append(el("p", { class: "muted" }, t("cli_hint")));
-    item.append(el("pre", {},
-      `praetore-mcp approve ${p.approval_id} --dir ${state.home}\n` +
-      `praetore-mcp reject ${p.approval_id} --dir ${state.home}`));
-    return item;
+  const card = el("div", { class: expired ? "card approval expired" : "card approval" });
+  card.append(el("div", { class: "approval-head" },
+    el("div", {},
+      el("p", { class: "approval-title" },
+        `${t("agent_wants")} ${toolLabel(p.tool).toLowerCase()}`, target.short ? `: ${target.short}` : "",
+        el("small", {}, `${t("on_server", p.server)} · ${p.tool}`))),
+    el("span", { class: expired ? "tag bad" : "tag warn countdown", "data-expires": p.expires_at },
+      expired ? t("expired") : t("expires_in", Math.floor(left / 60), left % 60))));
+  card.append(el("div", { class: "countdown-bar" },
+    el("span", { class: "countdown-fill", "data-expires": p.expires_at, "data-total": String(total),
+      style: `width:${Math.max(0, Math.min(100, (left / total) * 100))}%` })));
+
+  if (p.error) {
+    card.append(el("p", { class: "alert bad mono" }, p.error));
+    return card;
   }
-  if (!sessionToken) {
-    item.append(el("p", { class: "banner warn" }, t("need_token")));
-    return item;
+  card.append(el("div", { class: "label-sm" }, t("exact_args")));
+  card.append(el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)));
+  card.append(el("p", { class: "muted" }, t("exact_args_hint")));
+  card.append(kv([
+    ["approval_id", p.approval_id],
+    [t("f_utc"), utcText(p.expires_at)],
+  ]));
+
+  const actions = el("div", { class: "actions" });
+  const receiptIndex = state.receipts.findIndex((r) => r.evidence_id === p.evidence_id);
+  if (!expired && state.approvals_from_page && sessionToken) {
+    actions.append(
+      el("button", { type: "button", class: "btn-ok", onclick: () => confirmDecision(p, "approve") }, `✓ ${t("approve")}`),
+      el("button", { type: "button", class: "btn-danger", onclick: () => confirmDecision(p, "reject") }, `✕ ${t("reject")}`));
   }
-  const mode = confirming.get(p.approval_id);
-  if (!mode) {
-    const approve = el("button", { type: "button", class: "primary" }, t("approve"));
-    const reject = el("button", { type: "button", class: "danger" }, t("reject"));
-    approve.addEventListener("click", () => { confirming.set(p.approval_id, "approve"); renderPending(); });
-    reject.addEventListener("click", () => { confirming.set(p.approval_id, "reject"); renderPending(); });
-    item.append(el("div", { class: "actions" }, approve, reject));
-    return item;
+  if (receiptIndex >= 0) {
+    actions.append(el("button", { type: "button", onclick: () => openDrawer(receiptIndex) }, t("view_receipt")));
   }
-  const confirmBox = el("div", { class: `banner ${mode === "approve" ? "warn" : "bad"}` },
-    el("p", {}, t(mode === "approve" ? "confirm_text_approve" : "confirm_text_reject")));
-  const go = el("button", { type: "button", class: mode === "approve" ? "primary" : "danger" },
+  card.append(actions);
+  if (!expired && state.approvals_from_page && !sessionToken) {
+    card.append(el("p", { class: "alert warn section-gap" }, t("need_token")));
+  }
+  if (!expired && !state.approvals_from_page) {
+    const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}\npraetore-mcp reject ${p.approval_id} --dir ${state.home}`;
+    card.append(el("p", { class: "muted section-gap" }, t("cli_hint")));
+    card.append(el("div", { class: "code-box" }, el("pre", {}, commands)));
+    card.append(copyButton(commands));
+  }
+  return card;
+}
+
+function historyCard() {
+  const rows = state.receipts.map((r, i) => [r, i])
+    .filter(([r]) => r.decision === "REQUIRE_APPROVAL").reverse().slice(0, 30);
+  const card = el("div", { class: "card flush section-gap" });
+  card.append(el("div", { class: "card-pad" },
+    el("h2", {}, t("history")), el("p", { class: "card-sub" }, t("history_sub"))));
+  if (rows.length === 0) {
+    card.append(el("div", { class: "empty" }, t("history_none")));
+    return card;
+  }
+  const body = el("tbody", {});
+  for (const [r, index] of rows) {
+    const target = targetOf(r.arguments);
+    const label = approvalLabel(r.approval);
+    body.append(el("tr", { onclick: () => openDrawer(index) },
+      el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
+      el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
+        el("div", { class: "target", title: target.full }, target.short)),
+      el("td", {}, label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-")));
+  }
+  card.append(el("div", { class: "table-wrap" }, el("table", { class: "data" },
+    el("thead", {}, el("tr", {}, el("th", {}, t("c_when")), el("th", {}, t("c_action")), el("th", {}, t("f_approval")))),
+    body)));
+  return card;
+}
+
+function closeModal() {
+  document.getElementById("modal").hidden = true;
+  document.getElementById("modal-box").replaceChildren();
+}
+
+function confirmDecision(p, mode) {
+  const box = document.getElementById("modal-box");
+  let args = null;
+  try { args = JSON.parse(p.arguments_canonical); } catch (_) { args = null; }
+  const target = targetOf(args);
+  const go = el("button", { type: "button", class: mode === "approve" ? "btn-ok" : "btn-danger solid" },
     t(mode === "approve" ? "confirm_approve" : "confirm_reject"));
-  const cancel = el("button", { type: "button" }, t("cancel"));
-  cancel.addEventListener("click", () => { confirming.delete(p.approval_id); renderPending(); });
   go.addEventListener("click", () => decide(p, mode, go));
-  confirmBox.append(el("div", { class: "actions" }, go, cancel));
-  item.append(confirmBox);
-  return item;
+  box.replaceChildren(
+    el("div", { class: `modal-icon ${mode === "approve" ? "ok" : "bad"}` }, mode === "approve" ? "✓" : "✕"),
+    el("h2", {}, t(mode === "approve" ? "m_approve_t" : "m_reject_t")),
+    el("p", {}, t(mode === "approve" ? "m_approve_d" : "m_reject_d")),
+    kv([[t("f_server"), p.server], [t("f_tool"), `${toolLabel(p.tool)} (${p.tool})`], [t("args"), target.full || "-"]]),
+    el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)),
+    el("div", { class: "actions" },
+      el("button", { type: "button", onclick: closeModal }, t("cancel")), go));
+  document.getElementById("modal").hidden = false;
+  go.focus();
 }
 
 async function decide(p, mode, button) {
   button.disabled = true;
   button.textContent = t("sending");
-  let note;
   try {
     const response = await fetch(mode === "approve" ? "/api/approve" : "/api/reject", {
       method: "POST",
@@ -809,106 +892,353 @@ async function decide(p, mode, button) {
     let body = null;
     try { body = JSON.parse(text); } catch (_) { body = null; }
     if (response.ok && body && body.ok) {
-      note = { ok: true, text: t(mode === "approve" ? "decided_approve" : "decided_reject", body.approval_id) };
+      toast(t(mode === "approve" ? "decided_approve" : "decided_reject"), "ok");
     } else {
-      note = { ok: false, text: `${t("decide_error")}: HTTP ${response.status} ${body && body.error ? body.error : text}` };
+      toast(`${t("decide_error")}: ${body && body.error ? body.error : `HTTP ${response.status} ${text}`}`, "bad");
     }
   } catch (e) {
-    note = { ok: false, text: `${t("decide_error")}: ${e.message}` };
+    toast(`${t("decide_error")}: ${e.message}`, "bad");
   }
-  confirming.delete(p.approval_id);
-  decisionNotes.set(p.approval_id, note);
+  closeModal();
   fingerprint = null;
   await load();
 }
 
-function conditionsText(rule) {
-  const parts = [];
-  for (const c of rule.parameter_conditions || []) parts.push(JSON.stringify(c));
-  for (const c of rule.context_conditions || []) parts.push(`context ${JSON.stringify(c)}`);
-  if (rule.required_capability) parts.push(`capability ${rule.required_capability}`);
-  if (rule.control_loop) parts.push(`loop ${rule.control_loop}${rule.delta_ms ? ` δ=${rule.delta_ms}ms` : ""}`);
-  return parts.length ? parts.join("\n") : t("r_none");
+// ---------- activity ----------
+
+function renderDecisionFilter() {
+  const box = document.getElementById("f-decision");
+  box.replaceChildren();
+  for (const [value, label] of [["", t("all")], ["ALLOW", t("d_ALLOW")], ["DENY", t("d_DENY")], ["REQUIRE_APPROVAL", t("d_REQUIRE_APPROVAL")]]) {
+    const button = el("button", { type: "button", class: decisionFilter === value ? "on" : "" }, label);
+    button.addEventListener("click", () => { decisionFilter = value; renderDecisionFilter(); renderTable(); });
+    box.append(button);
+  }
 }
 
-function effectPill(effect) {
-  const label = String(effect).toUpperCase();
-  const cls = label.includes("ALLOW") ? "ok" : label.includes("DENY") ? "bad" : "warn";
-  return el("span", { class: `pill ${cls}` }, label);
+function renderToolFilter() {
+  const select = document.getElementById("f-tool");
+  const current = select.value;
+  const tools = [...new Set(state.receipts.map((r) => r.tool).filter((x) => typeof x === "string"))].sort();
+  select.replaceChildren(el("option", { value: "" }, t("all_tools")));
+  for (const tool of tools) select.append(el("option", { value: tool }, `${toolLabel(tool)} · ${tool}`));
+  if (tools.includes(current)) select.value = current;
+}
+
+function matches(r) {
+  const tool = document.getElementById("f-tool").value;
+  const text = document.getElementById("f-text").value.trim().toLowerCase();
+  if (decisionFilter && r.decision !== decisionFilter) return false;
+  if (tool && r.tool !== tool) return false;
+  if (text && !(r.raw_text.toLowerCase().includes(text) || toolLabel(r.tool).toLowerCase().includes(text))) return false;
+  return true;
+}
+
+function renderTable() {
+  const body = document.querySelector("#table tbody");
+  body.replaceChildren();
+  const rows = state.receipts.map((r, i) => [r, i]).reverse();
+  let shown = 0;
+  for (const [r, index] of rows) {
+    if (!matches(r)) continue;
+    shown += 1;
+    const classes = [];
+    if (index === selected) classes.push("selected");
+    if (freshIds.has(r.evidence_id)) classes.push("fresh");
+    const tr = el("tr", { class: classes.join(" "), onclick: () => openDrawer(index) });
+    if (r.parse_error) {
+      tr.append(el("td", { colspan: "6", class: "mono" },
+        el("span", { class: "tag bad" }, t("unreadable")), ` ${r.location.file}:${r.location.line}: ${r.parse_error}`));
+    } else {
+      const target = targetOf(r.arguments);
+      const label = approvalLabel(r.approval);
+      tr.append(
+        el("td", { class: "cell-when", title: utcText(r.decided_at) }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
+        el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
+          el("div", { class: "target mono", title: target.full }, target.full || target.short || "-")),
+        el("td", {}, r.server ?? "-"),
+        el("td", {}, decisionTag(r.decision), label ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, label.text) : null),
+        el("td", { class: "mono" }, r.rule ?? t("default_deny")),
+        el("td", {}, el("span", { class: `check-icon ${r.verified ? "ok" : "bad"}`, title: r.verified ? t("st_ok") : t("st_fail") },
+          r.verified ? "✓" : "✕")));
+    }
+    body.append(tr);
+  }
+  document.getElementById("shown").textContent = t("shown", shown, state.receipts.length);
+  const empty = document.getElementById("table-empty");
+  empty.hidden = shown > 0;
+  empty.replaceChildren(el("strong", {}, state.receipts.length ? t("empty_filter_t") : t("empty_recent")),
+    state.receipts.length ? t("empty_filter_d") : "");
+}
+
+// ---------- drawer ----------
+
+function openDrawer(index) {
+  selected = index;
+  drawerTab = "summary";
+  const r = state.receipts[index];
+  if (r && r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
+  renderDrawer();
+  if (view === "activity") renderTable();
+}
+
+function closeDrawer() {
+  selected = null;
+  history.replaceState(null, "", `#/${view}`);
+  renderDrawer();
+  if (view === "activity") renderTable();
+}
+
+function renderDrawer() {
+  const drawer = document.getElementById("drawer");
+  const scrim = document.getElementById("scrim");
+  const r = selected !== null && state ? state.receipts[selected] : null;
+  if (!r) {
+    drawer.classList.remove("open");
+    drawer.setAttribute("aria-hidden", "true");
+    scrim.hidden = true;
+    return;
+  }
+  drawer.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false");
+  scrim.hidden = false;
+  const target = targetOf(r.arguments);
+  document.getElementById("drawer-title").replaceChildren(
+    r.parse_error ? el("span", { class: "tag bad" }, t("unreadable")) : decisionTag(r.decision),
+    el("h2", {}, r.parse_error ? t("unreadable") : toolLabel(r.tool)),
+    el("div", { class: "target" }, target.full || `${r.location.file}:${r.location.line}`));
+
+  const tabs = document.getElementById("drawer-tabs");
+  tabs.replaceChildren();
+  const available = r.parse_error ? ["json"] : ["summary", "signatures", "paths", "json"];
+  if (!available.includes(drawerTab)) drawerTab = available[0];
+  for (const name of available) {
+    const button = el("button", { type: "button", class: drawerTab === name ? "on" : "" }, t(`tab_${name}`));
+    button.addEventListener("click", () => { drawerTab = name; renderDrawer(); });
+    tabs.append(button);
+  }
+  const body = document.getElementById("drawer-body");
+  body.replaceChildren();
+  if (drawerTab === "summary") drawerSummary(body, r);
+  if (drawerTab === "signatures") drawerSignatures(body, r);
+  if (drawerTab === "paths") drawerPaths(body, r);
+  if (drawerTab === "json") {
+    body.append(el("pre", { class: "json" }, r.raw !== null && r.raw !== undefined ? JSON.stringify(r.raw, null, 2) : r.raw_text));
+  }
+}
+
+function drawerSummary(body, r) {
+  const label = approvalLabel(r.approval);
+  body.append(kv([
+    [t("f_decision"), decisionTag(r.decision)],
+    [t("f_rule"), r.rule ?? t("default_deny")],
+    [t("f_mode"), r.mode],
+    [t("f_server"), r.server],
+    [t("f_tool"), `${toolLabel(r.tool)} (${r.tool})`],
+    [t("f_local"), localText(r.decided_at)],
+    [t("f_utc"), utcText(r.decided_at)],
+    [t("f_approval"), label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-"],
+    ["evidence_id", el("span", {}, r.evidence_id, copyButton(r.evidence_id))],
+    [t("f_policy"), r.policy_digest],
+    [t("f_location"), `${r.location.file}:${r.location.line}`],
+  ]));
+  body.append(el("h3", {}, t("args")));
+  body.append(el("pre", { class: "json" }, argsText(r.arguments)));
+}
+
+function sigBlock(name, keyLines, check) {
+  const cls = check.status === "ok" ? "ok" : check.status === "fail" ? "bad" : "neutral";
+  return el("div", { class: "sig" },
+    el("div", { class: `sig-icon ${cls}` }, cls === "ok" ? "✓" : cls === "bad" ? "✕" : "–"),
+    el("div", { class: "sig-name" }, name),
+    el("span", { class: `tag ${cls}` }, t(`st_${check.status}`)),
+    el("div", { class: "sig-key mono" }, ...keyLines.flatMap((line, i) => (i ? [el("br"), line] : [line]))),
+    check.error ? el("div", { class: "sig-key mono", style: "color:var(--bad)" }, check.error) : null);
+}
+
+function drawerSignatures(body, r) {
+  const s = r.signatures;
+  body.append(el("h3", {}, t("sig_title")));
+  body.append(sigBlock(t("sig_agent"), [`agent_id ${s.agent.agent_id}`, `subject_key_hash ${s.agent.subject_key_hash ?? "-"}`], s.agent.check));
+  body.append(sigBlock(t("sig_attester"), [`attester_key_id ${s.attester.key_id ?? "-"}`], s.attester.check));
+  body.append(sigBlock(t("sig_authority"), [`issuer ${s.authority.issuer}`, `issuer_key_id ${s.authority.key_id ?? "-"}`,
+    `authority_id ${s.authority.authority_id}`], s.authority.check));
+  body.append(el("h3", {}, t("other_checks")));
+  const table = el("table", { class: "mini" });
+  const tbody = el("tbody", {});
+  for (const name of ["shape", "authority_subject", "audience", "mode"]) {
+    const check = r.checks[name] || { status: "not_run", error: null };
+    const cls = check.status === "ok" ? "ok" : check.status === "fail" ? "bad" : "neutral";
+    tbody.append(el("tr", {}, el("td", {}, t(`chk_${name}`)),
+      el("td", {}, el("span", { class: `tag ${cls}` }, t(`st_${check.status}`)), check.error ? ` ${check.error}` : "")));
+  }
+  table.append(tbody);
+  body.append(table);
+  body.append(el("h3", {}, t("chain")));
+  if (r.seq === null || r.seq === undefined) body.append(el("p", {}, t("unchained")));
+  else body.append(kv([["seq", String(r.seq)], ["prev", r.prev]]));
+  body.append(el("p", {}, r.order
+    ? el("span", { class: "tag bad" }, r.order)
+    : el("span", { class: "tag ok" }, t("order_ok"))));
+}
+
+function drawerPaths(body, r) {
+  body.append(el("p", { class: "muted" }, t("path_desc")));
+  if (!r.path_check || typeof r.path_check !== "object") {
+    body.append(el("p", { class: "muted" }, t("path_none")));
+    return;
+  }
+  const tbody = el("tbody", {});
+  for (const [key, value] of Object.entries(r.path_check)) {
+    tbody.append(el("tr", {},
+      el("td", { class: "mono" }, key),
+      el("td", { class: "mono" }, value.lexical ?? "-"),
+      el("td", { class: "mono" }, value.resolved ?? "-"),
+      el("td", {}, el("span", { class: `tag ${value.status === "same" ? "ok" : "warn"}` }, value.status ?? "-"))));
+  }
+  body.append(el("div", { class: "table-wrap" }, el("table", { class: "mini" },
+    el("thead", {}, el("tr", {}, el("th", {}, "key"), el("th", {}, t("lexical")), el("th", {}, t("resolved")), el("th", {}, t("status")))),
+    tbody)));
+}
+
+// ---------- policy ----------
+
+function conditionText(c) {
+  const key = c.key;
+  const value = typeof c.expected === "string" ? c.expected : JSON.stringify(c.expected);
+  if (c.operator === "PathPrefix") return t("c_within", key, value);
+  if (c.operator === "Exact") return t("c_exact", key, value);
+  if (c.operator === "Prefix") return t("c_prefix", key, value);
+  return JSON.stringify(c);
+}
+
+function ruleSentence(rule) {
+  const conditions = rule.parameter_conditions || [];
+  const toolCond = conditions.find((c) => c.key === "tool" && c.operator === "Exact");
+  const others = conditions.filter((c) => c !== toolCond).map(conditionText);
+  for (const c of rule.context_conditions || []) others.push(`context: ${conditionText(c)}`);
+  const tool = toolCond ? `${toolLabel(toolCond.expected).toLowerCase()} (${toolCond.expected})` : t("any_tool");
+  const server = rule.target ? t("in_server", rule.target) : t("any_server");
+  let sentence = `${t(`effect_${rule.effect}`)}: ${tool} ${server}`;
+  if (others.length) sentence += `, ${t("when")} ${others.join(` ${t("and")} `)}`;
+  return sentence;
+}
+
+function effectClass(effect) {
+  return effect === "Allow" ? "ok" : effect === "Deny" ? "bad" : "warn";
 }
 
 function renderPolicy() {
-  const box = document.getElementById("policy-body");
-  const title = document.getElementById("policy-title");
-  box.replaceChildren();
+  const root = document.getElementById("view-policy");
+  root.replaceChildren();
   const p = state.policy;
   if (p.status !== "ok") {
-    title.textContent = t("policy");
-    box.append(el("p", { class: "banner bad mono" }, `${t("policy_error")}: ${p.error}`));
+    root.append(el("p", { class: "alert bad mono" }, `${t("policy_error")}: ${p.error}`));
     return;
   }
   const rules = Array.isArray(p.rules_detail) ? p.rules_detail : [];
-  title.textContent = t("policy_rules", rules.length);
-  box.append(kv([["id", `${p.id} v${p.version}`], ["digest", p.digest], ["path", p.path]]));
-  const table = el("table", {},
-    el("thead", {}, el("tr", {},
-      el("th", {}, t("r_id")), el("th", {}, t("r_effect")),
-      el("th", {}, t("r_target")), el("th", {}, t("r_conditions")))));
-  const body = el("tbody", { class: "static" });
+  root.append(el("div", { class: "card" },
+    el("div", { class: "card-head" },
+      el("div", {}, el("h2", {}, `${t("pol_active")}: ${p.id}`), el("p", { class: "card-sub" }, t("pol_meta", p.version, rules.length)))),
+    kv([["digest", el("span", {}, p.digest ?? "-", p.digest ? copyButton(p.digest) : null)], ["path", p.path]]),
+    el("p", { class: "muted section-gap" }, t("pol_note"))));
+
+  const list = el("div", { class: "card section-gap" });
   for (const rule of rules) {
     const allowAll = p.allow_all_rules.includes(rule.id);
-    body.append(el("tr", { class: allowAll ? "allow-all" : "" },
-      el("td", { class: "mono" }, rule.id),
-      el("td", {}, effectPill(rule.effect)),
-      el("td", {}, rule.target ?? t("r_any")),
-      el("td", { class: "mono pre" }, conditionsText(rule))));
+    list.append(el("div", { class: allowAll ? "rule allow-all" : "rule" },
+      el("div", { class: "effect" }, el("span", { class: `tag ${effectClass(rule.effect)}` }, t(`effect_${rule.effect}`))),
+      el("div", { class: "rule-text" },
+        el("p", {}, ruleSentence(rule)),
+        el("div", { class: "rule-id mono" }, rule.id, allowAll ? el("span", { class: "tag warn plain", style: "margin-left:8px" }, t("allow_all_tag")) : null))));
   }
-  table.append(body);
-  box.append(el("div", { class: "table-wrap" }, table));
+  list.append(el("div", { class: "rule" },
+    el("div", { class: "effect" }, el("span", { class: "tag bad" }, t("effect_Deny"))),
+    el("div", { class: "rule-text" }, el("p", {}, el("strong", {}, t("rule_default_t"))), el("div", { class: "muted" }, t("rule_default_d")))));
+  root.append(list);
 }
+
+// ---------- integrity ----------
+
+function renderIntegrity() {
+  const root = document.getElementById("view-integrity");
+  root.replaceChildren();
+  const v = state.verify;
+  if (v.status === "error") {
+    root.append(el("p", { class: "alert bad" }, `${t("verify_error")}: ${v.error}`));
+    return;
+  }
+  root.append(heroCard(v.status === "ok" ? "ok" : "bad", v.status === "ok" ? "✓" : "!",
+    v.status === "ok" ? t("int_ok") : t("int_fail"), t("verified_n", v.verified, v.total, v.failed), null));
+  if (v.failures.length > 0) {
+    const ul = el("ul", { class: "mono" });
+    for (const f of v.failures) ul.append(el("li", {}, f));
+    root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("failures")), ul));
+  }
+  const head = el("div", { class: "card section-gap" }, el("h2", {}, t("head")));
+  if (v.head) {
+    head.append(el("p", { class: "card-sub" }, t("head_text", v.chained, v.head.next_seq, v.unchained)));
+    head.append(el("div", { class: "hash" }, el("span", { class: "mono" }, v.head.prev), copyButton(v.head.prev)));
+  } else {
+    head.append(el("p", { class: "card-sub" }, t("head_none", v.chained, v.unchained)));
+  }
+  head.append(el("p", { class: "alert warn section-gap" }, t("head_warn")));
+  if (v.expected_head) head.append(el("p", { class: "mono" }, t("expected_head", v.expected_head)));
+  root.append(head);
+
+  const appr = el("div", { class: "card section-gap" }, el("h2", {}, t("appr_journal")));
+  if (v.approval.head) {
+    appr.append(el("p", { class: "card-sub" }, t("appr_text", v.approval.decisions, v.approval.executions)));
+    appr.append(el("div", { class: "hash" }, el("span", { class: "mono" }, v.approval.head), copyButton(v.approval.head)));
+  } else {
+    appr.append(el("p", { class: "card-sub" }, t("appr_none")));
+  }
+  root.append(appr);
+
+  const list = el("ul", { class: "checklist" });
+  for (const item of t("checked_list", v.attester_pin, v.issuer_pins)) list.append(el("li", {}, item));
+  root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("checked")), list,
+    el("p", { class: "muted section-gap" }, t("observe_note"))));
+}
+
+// ---------- render + load ----------
 
 function renderAll() {
   applyStaticText();
-  document.getElementById("live-label").textContent = t("live");
-  if (!state) return;
-  document.querySelector("[data-i18n=readonly]").textContent =
-    state.approvals_from_page ? t("readonly_approvals") : t("readonly");
+  renderShell();
   renderStamp();
-  renderSummary();
-  renderPending();
-  renderVerify();
-  renderPolicy();
+  if (!state) return;
+  renderOverview();
+  renderApprovals();
+  renderDecisionFilter();
   renderToolFilter();
   renderTable();
-  renderDetail();
-}
-
-function renderStamp() {
-  const fresh = freshIds.size > 0 ? ` · ${t("new_receipts", freshIds.size)}` : "";
-  document.getElementById("home").textContent =
-    `${state.home} · ${t("generated")} ${localText(state.generated_at_utc)}${fresh}`;
+  renderPolicy();
+  renderIntegrity();
+  renderDrawer();
 }
 
 function fingerprintOf(s) {
   return JSON.stringify([
     s.summary, s.verify && s.verify.status, s.verify && s.verify.head, s.verify && s.verify.failed,
     s.verify && s.verify.approval, s.pending, s.policy && s.policy.digest, s.policy && s.policy.status,
-    s.approvals_from_page,
+    s.approvals_from_page, s.receipts.map((r) => r.approval).join("|"),
   ]);
 }
 
-// Ticks the countdowns without a reload.
-function tickCountdowns() {
-  for (const node of document.querySelectorAll(".countdown[data-expires]")) {
-    const left = Math.floor((new Date(node.getAttribute("data-expires")).getTime() - Date.now()) / 1000);
-    if (Number.isNaN(left)) continue;
-    if (left <= 0) {
-      fingerprint = null;
-      if (state) renderPending();
-      return;
-    }
-    node.textContent = t("expires_in", Math.floor(left / 60), left % 60);
+function announce(next) {
+  const ids = new Set(next.receipts.map((r) => r.evidence_id).filter(Boolean));
+  const pendingIds = new Set((Array.isArray(next.pending) ? next.pending : []).map((p) => p.approval_id));
+  if (knownIds) {
+    let added = 0;
+    for (const id of ids) if (!knownIds.has(id)) { freshIds.add(id); added += 1; }
+    let newPending = 0;
+    for (const id of pendingIds) if (!knownPending.has(id)) newPending += 1;
+    if (newPending > 0) toast(t("toast_pending"), "warn", () => go("approvals"));
+    else if (added > 0) toast(t("toast_new", added), "", () => go("activity"));
   }
+  knownIds = ids;
+  knownPending = pendingIds;
 }
 
 async function load() {
@@ -921,20 +1251,10 @@ async function load() {
     const next = await response.json();
     error.hidden = true;
     const firstLoad = state === null;
-    const ids = new Set(next.receipts.map((r) => r.evidence_id).filter(Boolean));
-    if (knownIds) {
-      for (const id of ids) if (!knownIds.has(id)) freshIds.add(id);
-    }
-    knownIds = ids;
+    announce(next);
     state = next;
-    if (firstLoad) {
-      // #e=<evidence_id> opens that receipt.
-      const wanted = decodeURIComponent((location.hash.match(/^#e=(.+)$/) || [])[1] || "");
-      if (wanted) {
-        const index = state.receipts.findIndex((r) => r.evidence_id === wanted);
-        if (index >= 0) selected = index;
-      }
-    }
+    lastLoadedAt = new Date();
+    if (firstLoad) routeFromHash();
     const print = fingerprintOf(state);
     if (print === fingerprint) {
       renderStamp();
@@ -951,17 +1271,58 @@ async function load() {
   }
 }
 
+// #/<view> picks a view; #e=<evidence_id> opens that receipt over the
+// activity view.
+function routeFromHash() {
+  const hash = location.hash;
+  const evidence = hash.match(/^#e=(.+)$/);
+  if (evidence) {
+    view = "activity";
+    if (state) {
+      const index = state.receipts.findIndex((r) => r.evidence_id === decodeURIComponent(evidence[1]));
+      if (index >= 0) selected = index;
+    }
+    return;
+  }
+  const match = hash.match(/^#\/([a-z]+)/);
+  view = match && VIEWS.includes(match[1]) ? match[1] : "overview";
+}
+
+// Ticks the approval countdowns and the "updated" stamp without a reload.
+function tick() {
+  renderStamp();
+  for (const node of document.querySelectorAll(".countdown[data-expires]")) {
+    const left = Math.floor((new Date(node.getAttribute("data-expires")).getTime() - Date.now()) / 1000);
+    if (Number.isNaN(left)) continue;
+    if (left <= 0) { fingerprint = null; if (state) renderApprovals(); return; }
+    node.textContent = t("expires_in", Math.floor(left / 60), left % 60);
+  }
+  for (const node of document.querySelectorAll(".countdown-fill[data-expires]")) {
+    const left = (new Date(node.getAttribute("data-expires")).getTime() - Date.now()) / 1000;
+    const total = Number(node.getAttribute("data-total")) || 600;
+    node.style.width = `${Math.max(0, Math.min(100, (left / total) * 100))}%`;
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   takeSessionToken();
-  const stored = readStoredLang();
+  const stored = storageGet(localStorage, LANG_KEY);
   const nav = (navigator.language || "es").slice(0, 2);
   lang = I18N[stored] ? stored : I18N[nav] ? nav : "es";
+  routeFromHash();
   const select = document.getElementById("lang");
   select.value = lang;
   select.addEventListener("change", () => {
     lang = I18N[select.value] ? select.value : "es";
-    storeLang(lang);
+    storageSet(localStorage, LANG_KEY, lang);
     renderAll();
+  });
+  window.addEventListener("hashchange", () => {
+    if (/^#e=/.test(location.hash)) return;
+    routeFromHash();
+    selected = null;
+    renderAll();
+    window.scrollTo(0, 0);
   });
   document.getElementById("reload").addEventListener("click", () => { fingerprint = null; load(); });
   const liveBox = document.getElementById("live");
@@ -972,17 +1333,22 @@ document.addEventListener("DOMContentLoaded", () => {
     storageSet(localStorage, LIVE_KEY, live ? "on" : "off");
     if (live) load();
   });
-  setInterval(() => {
-    if (live && !document.hidden) load();
-  }, POLL_MS);
-  setInterval(tickCountdowns, 1000);
-  document.addEventListener("visibilitychange", () => {
-    if (live && !document.hidden) load();
-  });
-  for (const id of ["f-decision", "f-tool"]) {
-    document.getElementById(id).addEventListener("change", renderTable);
-  }
+  document.getElementById("f-tool").addEventListener("change", renderTable);
   document.getElementById("f-text").addEventListener("input", renderTable);
+  document.getElementById("drawer-close").addEventListener("click", closeDrawer);
+  document.getElementById("scrim").addEventListener("click", closeDrawer);
+  document.getElementById("modal").addEventListener("click", (event) => {
+    if (event.target.id === "modal") closeModal();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    if (!document.getElementById("modal").hidden) closeModal();
+    else if (selected !== null) closeDrawer();
+  });
+  setInterval(() => { if (live && !document.hidden) load(); }, POLL_MS);
+  setInterval(tick, 1000);
+  document.addEventListener("visibilitychange", () => { if (live && !document.hidden) load(); });
   applyStaticText();
+  renderShell();
   load();
 });
