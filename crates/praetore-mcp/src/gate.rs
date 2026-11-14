@@ -1349,6 +1349,19 @@ mod tests {
             .with_action_class("safety:halt", ActionClass::Safety)
             .with_action_class("safety:stop_all", ActionClass::Safety);
         policy.id = policy_id.to_owned();
+        // `init` writes no rules (default deny); the control call needs one.
+        policy.rules.push(
+            praetore_core::PolicyRule::new(
+                "allow-read-file",
+                store::ACTION_TYPE,
+                praetore_core::PolicyEffect::Allow,
+            )
+            .with_capability(store::CAPABILITY)
+            .with_parameter_condition(praetore_core::PolicyCondition::exact(
+                "tool",
+                json!("read_file"),
+            )),
+        );
         fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
         let receipts = home.receipts_dir();
         let _ = fs::remove_dir_all(&receipts);

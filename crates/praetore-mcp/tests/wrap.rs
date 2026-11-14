@@ -4,7 +4,7 @@
 use praetore_core::{DecisionOutcome, Evidence, Policy, PolicyCondition, PolicyEffect, PolicyRule};
 use praetore_mcp::{
     receipts,
-    store::{self, ACTION_TYPE, CAPABILITY, DEFAULT_ALLOW_RULE, Home},
+    store::{self, ACTION_TYPE, CAPABILITY, Home, LEGACY_ALLOW_ALL_RULE},
 };
 use serde_json::{Value, json};
 use std::{
@@ -59,7 +59,7 @@ fn init_home() -> (tempfile::TempDir, Home) {
 
 fn write_policy(home: &Home, extra: Vec<PolicyRule>) {
     let mut rules = vec![
-        PolicyRule::new(DEFAULT_ALLOW_RULE, ACTION_TYPE, PolicyEffect::Allow)
+        PolicyRule::new(LEGACY_ALLOW_ALL_RULE, ACTION_TYPE, PolicyEffect::Allow)
             .with_capability(CAPABILITY),
     ];
     rules.extend(extra);
@@ -424,6 +424,17 @@ fn rules_generated_by_policy_commands_enforce_end_to_end() {
     let ok_path = fs::canonicalize(temp.path()).unwrap().join("ok");
     let ok_path = ok_path.to_str().unwrap();
     for args in [
+        // `init` writes a default-deny policy: allow what this test runs.
+        vec![
+            "policy",
+            "allow",
+            "--id",
+            "allow-echo",
+            "--server",
+            "fake",
+            "--tool",
+            "echo",
+        ],
         vec![
             "policy",
             "deny",

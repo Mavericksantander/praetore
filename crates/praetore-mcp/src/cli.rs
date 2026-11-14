@@ -30,6 +30,7 @@ Usage:
   praetore-mcp reject    <id> [--dir DIR]
   praetore-mcp policy list   [--dir DIR]
   praetore-mcp policy check  [--dir DIR]
+  praetore-mcp policy coverage [--dir DIR] [--server NAME] -- <command> [args...]
   praetore-mcp policy deny|require-approval|allow --id ID [--server NAME] [--tool NAME]
                          [--arg-exact KEY=VALUE]... [--arg-path-prefix KEY=/abs/path]...
                          [--arg-prefix KEY=VALUE]... [--any-tool] [--dir DIR]
@@ -40,8 +41,10 @@ Usage:
 
 DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys, including a separate approver
-key. Observe mode records decisions but never blocks. Enforce mode blocks
-DENY. A REQUIRE_APPROVAL call is not forwarded until someone runs `approve`
+key. The policy written by `init` has no rules: in enforce mode every
+tools/call is denied until a `policy allow` rule allows it. Observe mode
+records decisions but never blocks. Enforce mode blocks DENY. A
+REQUIRE_APPROVAL call is not forwarded until someone runs `approve`
 for that exact call. `approve` reads a confirmation from an interactive
 terminal; that check is cooperative (a process that can act as this user
 can still approve). If the home cannot be loaded (e.g. no `init`), `wrap`
@@ -50,7 +53,8 @@ refuses every tools/call in both modes.
 Exit codes:
   0    success (also --help and --version)
   1    the command ran and found a problem: `verify` found a failed receipt,
-       `policy check` found an invalid policy or engine, or `install` /
+       `policy check` found an invalid policy or engine, `policy coverage`
+       found a tool allowed only by an allow-all rule, or `install` /
        `uninstall` could not read, parse or write a config (or was not
        confirmed)
   2    usage error, or the command could not run (message on stderr)
@@ -60,10 +64,19 @@ Exit codes:
 const INIT_HELP: &str = "Usage: praetore-mcp init [--dir DIR]
 
 Creates LOCAL/DEV Ed25519 keys (0600), a signed authority, trust pins for
-praetore-verify, a v2 policy that allows every tools/call, and the receipts
-journal under DIR. The approver key is separate from the issuer, agent and
-attester keys. Running init again on an initialized DIR adds the approver
-key when it is missing and otherwise changes nothing.
+praetore-verify, a v2 policy with no rules, and the receipts journal under
+DIR. The approver key is separate from the issuer, agent and attester keys.
+
+With no rules, every tools/call is denied by default in enforce mode. Only
+tools/call is evaluated: initialize, tools/list and the rest of the MCP
+traffic pass, so a client can start the server and list its tools. Observe
+mode never blocks. Allow tools with
+`praetore-mcp policy allow --id ID --server NAME --tool NAME`.
+
+Running init again on an initialized DIR adds the approver key when it is
+missing and otherwise changes nothing. If its policy still has an allow-all
+rule (`allow-all-mcp-tool-calls`, written by init up to 0.3.4), init prints a
+warning with the command to remove it and leaves the policy unchanged.
 
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
 
@@ -181,6 +194,7 @@ cannot be read.";
 const POLICY_HELP: &str = "Usage:
   praetore-mcp policy list   [--dir DIR]
   praetore-mcp policy check  [--dir DIR]
+  praetore-mcp policy coverage [--dir DIR] [--server NAME] -- <command> [args...]
   praetore-mcp policy deny|require-approval|allow --id ID [--server NAME] [--tool NAME]
                          [--arg-exact KEY=VALUE]... [--arg-path-prefix KEY=/abs/path]...
                          [--arg-prefix KEY=VALUE]... [--any-tool] [--dir DIR]
@@ -195,8 +209,17 @@ DENY/REQUIRE_APPROVAL path rule on that key and no ALLOW path rule.
 `policy deny|require-approval|allow` and `policy check` resolve each prefix
 and warn when it resolves to another path: write resolved prefixes.
 
-Exit code: 0 on success, 1 if `check` finds an invalid policy or engine,
-2 on a usage error or a rejected change.";
+`policy coverage` starts the MCP server given after `--`, sends initialize
+and tools/list (no tools/call), closes it, and prints for each tool what the
+policy decides: the rule that applies or default deny, and whether a rule
+depends on an argument. Tools allowed only by an allow-all rule are listed
+apart. --server is the name `wrap --name` uses (default: the command's file
+name). It writes nothing under DIR.
+
+Exit code: 0 on success, 1 if `check` finds an invalid policy or engine or
+`coverage` finds a tool allowed only by an allow-all rule, 2 on a usage
+error, a rejected change, or a server that cannot be started or does not
+answer.";
 
 fn help_for(command: &str) -> Option<&'static str> {
     Some(match command {
@@ -342,7 +365,8 @@ pub fn run(args: &[String]) -> i32 {
 fn cmd_init(args: &[String]) -> Result<i32, String> {
     let parsed = parse(args, &["--dir"], &[], false)?;
     let home = parsed.home()?;
-    match store::init(&home)? {
+    let outcome = store::init(&home)?;
+    match outcome {
         InitOutcome::AlreadyInitialized => {
             println!(
                 "praetore-mcp: {} is already initialized; nothing was changed.",
@@ -371,16 +395,58 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!("    {}", home.approver_pin().display());
             println!("  signed authority: {}", home.authority().display());
             println!(
-                "  policy (v2, allows every tools/call): {}",
+                "  policy (v2, no rules: default deny): {}",
                 home.policy().display()
             );
             println!("  receipts journal: {}", home.receipts_dir().display());
             println!();
             println!("  These are LOCAL/DEV keys for one machine. They are not a production PKI.");
+            println!(
+                "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
+            );
+            println!("  mode never blocks. To allow a tool:");
+            println!("    praetore-mcp policy allow --id ID --server NAME --tool NAME");
+            println!("  To see what the policy decides for each tool of a server:");
+            println!("    praetore-mcp policy coverage --server NAME -- <server command>");
             println!("  Next: praetore-mcp install --dry-run");
         }
     }
+    if !matches!(outcome, InitOutcome::Created) {
+        warn_allow_all(&home);
+    }
     Ok(0)
+}
+
+/// An existing home may still have the allow-all rule `init` used to write.
+/// It is left in place; the warning says how to remove it.
+fn warn_allow_all(home: &Home) {
+    let Ok(text) = fs::read_to_string(home.policy()) else {
+        return;
+    };
+    let Ok(policy) = praetore_core::Policy::from_json(&text) else {
+        return;
+    };
+    for rule in policy
+        .rules
+        .iter()
+        .filter(|rule| crate::policy::is_allow_all(rule))
+    {
+        let id = crate::proxy::display_safe(&rule.id);
+        println!(
+            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`praetore-mcp policy allow --id ID --server NAME --tool NAME`; `praetore-mcp policy coverage` lists what each tool gets), then run:\n    praetore-mcp policy remove --id {id}{}",
+            home.policy().display(),
+            dir_suffix(home)
+        );
+    }
+}
+
+/// ` --dir DIR` when DIR is not the default home, so a printed command
+/// acts on the same home.
+fn dir_suffix(home: &Home) -> String {
+    match store::resolve_home(None) {
+        Ok(default) if default == home.root => String::new(),
+        _ => format!(" --dir {}", home.root.display()),
+    }
 }
 
 pub(crate) fn valid_server_name(name: &str) -> bool {
@@ -389,6 +455,12 @@ pub(crate) fn valid_server_name(name: &str) -> bool {
         && name.len() <= 128
         && name == name.trim()
         && !name.chars().any(char::is_control)
+}
+
+/// The server name `wrap` uses without `--name`: the command's file name.
+fn default_server_name(command: &str) -> String {
+    let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    file.strip_suffix(".exe").unwrap_or(file).to_owned()
 }
 
 fn cmd_wrap(args: &[String]) -> Result<i32, String> {
@@ -401,13 +473,9 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
     let Some((command, command_args)) = parsed.rest.split_first() else {
         return Err("wrap needs `-- <command> [args...]`".into());
     };
-    let name = match parsed.value("--name") {
-        Some(name) => name.to_owned(),
-        None => {
-            let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
-            file.strip_suffix(".exe").unwrap_or(file).to_owned()
-        }
-    };
+    let name = parsed
+        .value("--name")
+        .map_or_else(|| default_server_name(command), str::to_owned);
     if !valid_server_name(&name) {
         return Err(format!(
             "invalid server name {name:?} (1-128 printable characters, not starting with '-')"
@@ -907,6 +975,34 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                 }
             }
         }
+        "coverage" => {
+            let parsed = parse(rest, &["--dir", "--server"], &[], true)?;
+            let Some((command, command_args)) = parsed.rest.split_first() else {
+                return Err("policy coverage needs `-- <command> [args...]`".into());
+            };
+            let server = parsed
+                .value("--server")
+                .map_or_else(|| default_server_name(command), str::to_owned);
+            if !valid_server_name(&server) {
+                return Err(format!(
+                    "invalid server name {server:?} (1-128 printable characters, not starting with '-')"
+                ));
+            }
+            let home = parsed.home()?;
+            let (_, policy) = read_policy(&home)?;
+            let tools = crate::coverage::list_tools(command, command_args)?;
+            let report = policy::coverage(&policy, &server, &tools);
+            print!(
+                "{}",
+                policy::render_coverage(&policy, &server, &report, &dir_suffix(&home))
+            );
+            // Read only: no restart reminder.
+            return Ok(if report.iter().any(|item| item.only_allow_all) {
+                1
+            } else {
+                0
+            });
+        }
         "remove" => {
             let parsed = parse(rest, &["--dir", "--id"], &[], false)?;
             let id = parsed.value("--id").ok_or("policy remove needs --id")?;
@@ -921,7 +1017,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
         effect_name => {
             let Some(effect) = policy::parse_effect(effect_name) else {
                 return Err(format!(
-                    "unknown policy subcommand {effect_name:?} (list, check, deny, require-approval, allow, remove)"
+                    "unknown policy subcommand {effect_name:?} (list, check, coverage, deny, require-approval, allow, remove)"
                 ));
             };
             let parsed = parse_multi(
@@ -963,6 +1059,9 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                     if warning.starts_with(&rule_tag) {
                         println!("warning: {warning}");
                     }
+                }
+                if let Some(warning) = policy::allow_all_warning(&saved) {
+                    println!("warning: {warning}");
                 }
             }
             0
