@@ -7976,4 +7976,123 @@ mod delegated_approval {
             Err("DELEGATION_POLICY_MISMATCH")
         );
     }
+
+    #[test]
+    fn a_child_cannot_be_moved_under_another_delegation_of_the_same_key() {
+        // Two delegations from the root to bob with the same scope; bob's
+        // grant to alice names the first as its parent, and the first is
+        // revoked.
+        let first = Grant::delegator(ROOT, None, BOB).sign();
+        let second = Grant::delegator(ROOT, None, BOB).sign();
+        let alice = Grant::approver(BOB, Some(&first), ALICE).sign();
+        let revoked = revocation(ROOT, &first, "2026-06-01T11:59:00Z");
+        let held = held_on(&document(&[&first, &second, &alice], &[&revoked]));
+        // Under the delegation that is not revoked, the child's signed
+        // parent does not match: it cannot escape the revocation.
+        let moved = approve(&held, ALICE, chain(&[&second, &alice]));
+        refused_by_chain(&held, moved, DelegationError::WrongIssuer);
+        // Under its own parent, the revocation applies.
+        let own = approve(&held, ALICE, chain(&[&first, &alice]));
+        refused_by_chain(&held, own, DelegationError::Revoked);
+    }
+
+    #[test]
+    fn a_version_1_decision_signed_with_a_chain_is_refused() {
+        let held = held_on(&document(&[], &[]));
+        let alice = Grant::approver(ROOT, None, ALICE).sign();
+        for delegation_chain in [vec![], chain(&[&alice])] {
+            let mut decision = human_approval_decision(
+                held.challenge.clone(),
+                HumanApprovalOutcome::Approve,
+                &held.pinned_approver,
+            );
+            decision.delegation_chain = Some(delegation_chain);
+            // Signed over the chain by the pinned approver: the signature
+            // itself is valid, the shape is not.
+            decision.signature = hex::encode(
+                held.pinned_approver
+                    .sign(&decision.signing_message().unwrap())
+                    .to_bytes(),
+            );
+            assert_refused(
+                &held,
+                decision,
+                ApprovalError::InvalidSignature,
+                "OUTCOME_SIGNATURE_INVALID",
+            );
+        }
+    }
+
+    /// A gateway over `held`'s journal and tool whose policy is `held`'s
+    /// with `root_may_approve` set to true, as after a restart with a
+    /// changed policy.
+    fn rebuilt_allowing_the_root(held: &Held) -> Gateway {
+        let mut policy = held.policy.clone();
+        policy.approval_delegation = Some(ApprovalDelegationPolicy {
+            root_may_approve: true,
+        });
+        assert!(policy.root_may_approve());
+        let policy_digest = policy.digest().unwrap();
+        assert_ne!(Some(&policy_digest), held.evidence.policy_digest.as_ref());
+        let issuer_pin = TrustedAuthorityIssuer::new(
+            "local-test-issuer",
+            AgentKeyPair::from_secret_bytes(&[32; 32]).public_key(),
+        )
+        .unwrap()
+        .with_validity(long_validity())
+        .unwrap();
+        let config = HighAssuranceConfig::new(
+            policy_digest,
+            vec![issuer_pin],
+            EvidenceAttesterKey::from_secret_bytes(&[33; 32]),
+        )
+        .unwrap()
+        .with_audience("local-test-gateway")
+        .with_replay_guard(Arc::new(MemoryReplayGuard::default()))
+        .with_freshness_provider(Arc::new(CurrentFreshness));
+        let clock = Arc::new(Mutex::new(FixedClock::try_new(NOW).unwrap().now()));
+        let engine =
+            AuthorizationEngine::production_with_clock(policy, config, SharedTestClock(clock))
+                .unwrap();
+        Gateway::new(
+            engine,
+            held.journal.clone(),
+            held.tool.clone(),
+            execution_attester(),
+        )
+        .unwrap()
+        .with_human_approval_verifier(
+            HumanApprovalVerifier::new(
+                "test-human-approver-v1",
+                approver_public_key(&held.pinned_approver),
+            )
+            .unwrap(),
+        )
+        .with_approval_delegation(DelegationConfig::from_json(&held.document).unwrap())
+    }
+
+    #[test]
+    fn a_policy_that_allows_the_root_does_not_apply_to_requests_held_under_another() {
+        let held = held_with(None, &document(&[], &[]));
+        let rebuilt = rebuilt_allowing_the_root(&held);
+        // A rejection is checked first: only this guard stops it, while an
+        // approval would also fail the evidence check for dispatch.
+        for outcome in [HumanApprovalOutcome::Reject, HumanApprovalOutcome::Approve] {
+            let decision = decide(&held.challenge, ROOT, vec![], outcome);
+            match rebuilt.resolve_human_approval(decision) {
+                Err(GatewayError::Approval(error)) => {
+                    assert_eq!(error, ApprovalError::RootMayNotApprove)
+                }
+                other => panic!("expected RootMayNotApprove, got {other:?}"),
+            }
+            let record = held.journal.get(held.key).unwrap().unwrap();
+            assert_eq!(record.human_approval, None, "nothing was recorded");
+            assert_eq!(record.execution, ExecutionStatus::NotDispatched);
+            assert_eq!(
+                held.journal.entry(held.key).unwrap().states,
+                Vec::<ExecutionStatus>::new()
+            );
+            assert_eq!(held.tool.invocations(), 0);
+        }
+    }
 }

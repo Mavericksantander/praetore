@@ -1482,8 +1482,6 @@ fn read_attester_pins(paths: &[PathBuf]) -> Result<Vec<VerifiedPublicKey>, CliEr
     Ok(keys)
 }
 
-/// Execution or approver pins (`{"schema_version":1,"key_id":...,
-/// "public_key_hex":...}`); a repeated key or key id is refused.
 /// The trust for delegated decisions, read from the files of
 /// [`DelegationArgs`].
 struct LoadedDelegation {
@@ -1510,6 +1508,8 @@ fn read_delegation(args: &DelegationArgs) -> Result<LoadedDelegation, CliError> 
     })
 }
 
+/// Execution or approver pins (`{"schema_version":1,"key_id":...,
+/// "public_key_hex":...}`); a repeated key or key id is refused.
 fn read_key_pins(paths: &[PathBuf]) -> Result<Vec<KeyPin>, CliError> {
     let mut pins: Vec<KeyPin> = Vec::with_capacity(paths.len());
     for path in paths {

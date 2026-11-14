@@ -1303,7 +1303,9 @@ the approver pins), `--delegations delegations.json` (the gateway's
 delegation file) and `--policy policy.json` (the policy the request was
 decided under: its digest must equal the challenge's `policy_digest`, or
 `DELEGATION_POLICY_MISMATCH`; its `approval_delegation.root_may_approve` is
-read from it). The root the file names for the tenant must equal a pinned
+read from it). A run takes one `--policy`: version 2 decisions taken under
+another policy fail with `DELEGATION_POLICY_MISMATCH`, so verify them in a
+separate run with that policy. The root the file names for the tenant must equal a pinned
 root (`DELEGATION_ROOT_UNPINNED`). Without the three arguments a version 2
 decision fails with `DELEGATION_UNVERIFIED`; version 1 decisions verify the
 same with or without them. The chain is checked as the gateway checks it,
