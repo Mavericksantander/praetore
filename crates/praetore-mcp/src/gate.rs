@@ -76,6 +76,11 @@ pub struct Verdict {
     pub reason: String,
     /// Whether the evidence reached the journal (fsynced).
     pub journaled: Result<PathBuf, String>,
+    /// Set when enforce consumed one local approval and the call may be
+    /// forwarded once. The engine outcome stays `RequireApproval`.
+    pub consumed_approval: Option<String>,
+    /// Client-facing text when the call stays held for approval.
+    pub hold_message: Option<String>,
 }
 
 /// Why a `tools/call` got no verdict.
@@ -259,6 +264,7 @@ pub struct Gate {
     authority: Authority,
     policy_digest: String,
     mode: Mode,
+    home: Home,
     journal: Journal,
     /// Parameter keys used by `PathPrefix` conditions (T-014).
     path_keys: BTreeSet<String>,
@@ -1032,6 +1038,7 @@ impl Gate {
             authority,
             policy_digest,
             mode,
+            home: home.clone(),
             journal: Journal::new(home.receipts_dir()),
             path_keys,
             path_prefixes,
@@ -1197,7 +1204,27 @@ impl Evaluator for Gate {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
         let journaled = self.journal.append(&evidence);
-        Ok(verdict_from(&evidence, journaled))
+        let mut verdict = verdict_from(&evidence, journaled);
+        if verdict.journaled.is_ok()
+            && self.mode == Mode::Enforce
+            && verdict.outcome == DecisionOutcome::RequireApproval
+        {
+            match crate::approvals::on_require_approval(&self.home, server, params, &evidence) {
+                Ok(crate::approvals::HoldOrForward::Forward { approval_id }) => {
+                    verdict.consumed_approval = Some(approval_id);
+                }
+                Ok(crate::approvals::HoldOrForward::Hold { message }) => {
+                    verdict.hold_message = Some(message);
+                }
+                Err(error) => {
+                    verdict.hold_message = Some(format!(
+                        "This tool call was not executed. Local approval could not be recorded ({error}). Evidence id: {}",
+                        evidence.evidence_id
+                    ));
+                }
+            }
+        }
+        Ok(verdict)
     }
 }
 
@@ -1220,6 +1247,8 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
             .collect(),
         reason: evidence.decision.reason.clone(),
         journaled,
+        consumed_approval: None,
+        hold_message: None,
     }
 }
 

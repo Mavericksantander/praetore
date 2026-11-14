@@ -7,6 +7,7 @@ use crate::{
     receipts, relay,
     store::{self, Home, InitOutcome},
 };
+use rand_core::{OsRng, RngCore};
 use std::{
     collections::BTreeMap,
     fs,
@@ -24,6 +25,9 @@ Usage:
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
   praetore-mcp verify    [--dir DIR] [--expected-head HEX]
+  praetore-mcp approvals [--dir DIR]
+  praetore-mcp approve   <id> [--dir DIR]
+  praetore-mcp reject    <id> [--dir DIR]
   praetore-mcp policy list   [--dir DIR]
   praetore-mcp policy check  [--dir DIR]
   praetore-mcp policy deny|require-approval|allow --id ID [--server NAME] [--tool NAME]
@@ -35,10 +39,13 @@ Usage:
   praetore-mcp --version
 
 DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
-Keys created by `init` are LOCAL/DEV keys. Observe mode records decisions but
-never blocks; enforce mode blocks DENY and REQUIRE_APPROVAL decisions. If the
-home cannot be loaded (e.g. no `init`), `wrap` refuses every tools/call in
-both modes.
+Keys created by `init` are LOCAL/DEV keys, including a separate approver
+key. Observe mode records decisions but never blocks. Enforce mode blocks
+DENY. A REQUIRE_APPROVAL call is not forwarded until someone runs `approve`
+for that exact call. `approve` reads a confirmation from an interactive
+terminal; that check is cooperative (a process that can act as this user
+can still approve). If the home cannot be loaded (e.g. no `init`), `wrap`
+refuses every tools/call in both modes.
 
 Exit codes:
   0    success (also --help and --version)
@@ -54,7 +61,9 @@ const INIT_HELP: &str = "Usage: praetore-mcp init [--dir DIR]
 
 Creates LOCAL/DEV Ed25519 keys (0600), a signed authority, trust pins for
 praetore-verify, a v2 policy that allows every tools/call, and the receipts
-journal under DIR. Running it again on an initialized DIR changes nothing.
+journal under DIR. The approver key is separate from the issuer, agent and
+attester keys. Running init again on an initialized DIR adds the approver
+key when it is missing and otherwise changes nothing.
 
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
 
@@ -68,7 +77,8 @@ passed to the server unchanged (including any --help).
   --name SERVER server name used in policy rules and receipts
                 (default: the command's file name)
   --mode MODE   observe (default): forward every call, record the decision
-                enforce: block DENY and REQUIRE_APPROVAL with an MCP tool error
+                enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
+                `praetore-mcp approve <id>` for that exact call
 
 Exit code: the server's; 127 if it cannot be started, 1 if it was killed by
 a signal, 2 on a usage error.";
@@ -110,6 +120,36 @@ Prints the last N receipts of the journal as a table (default 20).
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --tail N    number of receipts to show";
 
+const APPROVALS_HELP: &str = "Usage: praetore-mcp approvals [--dir DIR]
+
+Lists pending local approvals: id, server, tool, a short form of the
+arguments, and when the pending call expires. Default lifetime is 10
+minutes (PRAETORE_MCP_APPROVAL_TTL_SECONDS, or DIR/approvals/ttl-seconds,
+an integer from 1 to 86400).
+
+  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
+
+const APPROVE_HELP: &str = "Usage: praetore-mcp approve <id> [--dir DIR]
+
+Approves one pending call. Requires an interactive terminal: it prints a
+short code and waits for that code on stdin. Without a terminal it signs
+nothing. The check is cooperative. A process that can act as this user can
+open a terminal and approve. It is not a guarantee that a person reviewed
+the call.
+
+The approval is signed with the local approver key, is bound to the server,
+tool and canonical arguments of that pending call, expires at the pending
+call's deadline, and authorizes one later matching tools/call.
+
+  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
+
+const REJECT_HELP: &str = "Usage: praetore-mcp reject <id> [--dir DIR]
+
+Rejects one pending call. The call is not forwarded. A later attempt asks
+for a new approval. The rejection is signed with the local approver key.
+
+  --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
+
 const VERIFY_HELP: &str = "Usage: praetore-mcp verify [--dir DIR] [--expected-head HEX]
 
 Checks every receipt in the journal: integrity hash, attester signature,
@@ -118,6 +158,12 @@ decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
 previous one, so an entry removed, duplicated or reordered before the last
 one is reported. Prints the head (entry count and last link).
+
+Also checks DIR/approvals/journal.jsonl when it exists: the approver
+signature, that the decision is bound to the held receipt, that an
+execution is inside the expiry window and bound to the same call, and that
+one approval was not used twice. Homes without that file (v0.3.3 and
+earlier) still verify.
 
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --expected-head HEX  head printed by an earlier run and kept somewhere the
@@ -160,6 +206,9 @@ fn help_for(command: &str) -> Option<&'static str> {
         "uninstall" => UNINSTALL_HELP,
         "receipts" => RECEIPTS_HELP,
         "verify" => VERIFY_HELP,
+        "approvals" => APPROVALS_HELP,
+        "approve" => APPROVE_HELP,
+        "reject" => REJECT_HELP,
         "policy" => POLICY_HELP,
         _ => return None,
     })
@@ -267,6 +316,9 @@ pub fn run(args: &[String]) -> i32 {
         "uninstall" => cmd_install(rest, true),
         "receipts" => cmd_receipts(rest),
         "verify" => cmd_verify(rest),
+        "approvals" => cmd_approvals(rest),
+        "approve" => cmd_decide(rest, crate::approvals::HumanOutcome::Approve),
+        "reject" => cmd_decide(rest, crate::approvals::HumanOutcome::Reject),
         "policy" => cmd_policy(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -297,6 +349,14 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
                 home.root.display()
             );
         }
+        InitOutcome::ApproverKeyAdded => {
+            println!(
+                "praetore-mcp: added a local approver key to {}. Existing keys, authority, policy and receipts were not changed.",
+                home.root.display()
+            );
+            println!("    {}", home.approver_key().display());
+            println!("    {}", home.approver_pin().display());
+        }
         InitOutcome::Created => {
             println!("praetore-mcp: initialized {}", home.root.display());
             println!();
@@ -304,9 +364,11 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!("    {}", home.issuer_key().display());
             println!("    {}", home.agent_key().display());
             println!("    {}", home.attester_key().display());
+            println!("    {}", home.approver_key().display());
             println!("  trust files for third-party verification (praetore-verify formats):");
             println!("    {}", home.issuer_pins().display());
             println!("    {}", home.attester_pin().display());
+            println!("    {}", home.approver_pin().display());
             println!("  signed authority: {}", home.authority().display());
             println!(
                 "  policy (v2, allows every tools/call): {}",
@@ -524,12 +586,14 @@ fn cmd_receipts(args: &[String]) -> Result<i32, String> {
             .parse::<usize>()
             .map_err(|_| format!("--tail must be a number, got {value:?}"))?,
     };
-    let lines = receipts::read_journal(&parsed.home()?)?;
+    let home = parsed.home()?;
+    let lines = receipts::read_journal(&home)?;
     if lines.is_empty() {
         println!("no receipts yet");
         return Ok(0);
     }
-    print!("{}", receipts::render_table(&lines, tail));
+    let status = crate::approvals::status_by_evidence(&home)?;
+    print!("{}", receipts::render_table(&lines, tail, &status));
     Ok(0)
 }
 
@@ -580,7 +644,142 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         ),
     }
     println!("observe receipts record a decision that was NOT enforced.");
+    match report.approval_head {
+        Some(head) => println!(
+            "approval journal: {} decision(s), {} execution(s), head {head}",
+            report.approval_decisions, report.approval_executions
+        ),
+        None => println!("approval journal: none"),
+    }
+    println!(
+        "approval checks: approver signature, binding to the held call, expiry, single use. An observe REQUIRE_APPROVAL receipt means enforce would ask; it is not a hold."
+    );
     Ok(if report.failures.is_empty() { 0 } else { 1 })
+}
+
+fn cmd_approvals(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["--dir"], &[], false)?;
+    let pending = crate::approvals::list_pending(&parsed.home()?)?;
+    if pending.is_empty() {
+        println!("no pending approvals");
+        return Ok(0);
+    }
+    for item in pending {
+        println!("id         {}", item.approval_id);
+        println!("server     {}", crate::proxy::display_safe(&item.server));
+        println!("tool       {}", crate::proxy::display_safe(&item.tool));
+        println!("expires    {}", item.expires_at);
+        println!("arguments  {}", item.arguments_preview);
+        println!();
+    }
+    Ok(0)
+}
+
+fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Result<i32, String> {
+    let (id, dir) = parse_decision_args(args)?;
+    let home = store::resolve_home(dir.as_deref()).map(Home::new)?;
+    if !home.is_initialized() {
+        return Err(format!(
+            "{} is not initialized; run `praetore-mcp init --dir {}`",
+            home.root.display(),
+            home.root.display()
+        ));
+    }
+    if outcome == crate::approvals::HumanOutcome::Approve && !interactive_terminal() {
+        return Err(
+            "`approve` needs an interactive terminal (stdin and stderr are not both terminals). Nothing was signed. This check is cooperative: a process that can open a terminal as this user can still approve, and it is not a guarantee that a person reviewed the call."
+                .into(),
+        );
+    }
+    let shown = if outcome == crate::approvals::HumanOutcome::Approve {
+        Some(confirm_approval(&home, &id)?)
+    } else {
+        None
+    };
+    let decided = crate::approvals::decide(&home, &id, outcome, shown.as_ref())?;
+    println!(
+        "{} {} (approver {})",
+        decided.outcome, decided.approval_id, decided.approver_key_id
+    );
+    println!(
+        "server {} tool {} expires {}",
+        crate::proxy::display_safe(&decided.server),
+        crate::proxy::display_safe(&decided.tool),
+        decided.expires_at
+    );
+    if outcome == crate::approvals::HumanOutcome::Approve {
+        println!("The agent can retry this exact call once before it expires.");
+    } else {
+        println!("The call will not be forwarded. A new attempt asks for approval again.");
+    }
+    Ok(0)
+}
+
+fn interactive_terminal() -> bool {
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+fn confirm_approval(home: &Home, id: &str) -> Result<crate::approvals::PendingCall, String> {
+    let pending = crate::approvals::pending_call(home, id)?;
+    let show = praetore_core::display::escape_for_display;
+    eprintln!("server     {}", show(&pending.server));
+    eprintln!("tool       {}", show(&pending.tool));
+    eprintln!("expires    {}", pending.expires_at);
+    eprintln!("arguments  {}", show(&pending.arguments_canonical));
+    let code = confirmation_code();
+    eprintln!("Type {code} to approve {id}.");
+    eprintln!(
+        "This asks for a person at the terminal. It is cooperative: a process that can act as this user can still approve."
+    );
+    eprint!("confirmation: ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("cannot read confirmation: {e}"))?;
+    if answer.trim() != code {
+        return Err("confirmation did not match; nothing was signed".into());
+    }
+    Ok(pending)
+}
+
+fn confirmation_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut raw = [0u8; 6];
+    OsRng.fill_bytes(&mut raw);
+    raw.iter()
+        .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// `<id>` plus optional `--dir DIR`, in either order.
+fn parse_decision_args(args: &[String]) -> Result<(String, Option<PathBuf>), String> {
+    let mut id = None;
+    let mut dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--dir" => {
+                let value = args.get(index + 1).ok_or("--dir needs a value")?.clone();
+                if dir.replace(PathBuf::from(value)).is_some() {
+                    return Err("--dir given twice".into());
+                }
+                index += 2;
+            }
+            "-h" | "--help" => return Err("pass --help before the approval id".into()),
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument {other:?}"));
+            }
+            other => {
+                if id.replace(other.to_owned()).is_some() {
+                    return Err("approval id given twice".into());
+                }
+                index += 1;
+            }
+        }
+    }
+    let id = id.ok_or("approve/reject needs an approval id")?;
+    Ok((id, dir))
 }
 
 /// Exclusive lock for policy read-modify-write (O_EXCL lock file, removed on

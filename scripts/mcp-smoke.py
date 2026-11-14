@@ -18,10 +18,13 @@ Exit code 0 when every check passes; every check is printed.
 
 import json
 import os
+import pty
+import select
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 SERVER_PACKAGE = "@modelcontextprotocol/server-filesystem"
 SERVER_VERSION = "2.3.0"
@@ -101,6 +104,62 @@ def wrap_session(binary, home, root, server, requests, wanted_ids):
     return responses
 
 
+def approve_on_pty(binary, home, approval_id):
+    """Runs `approve` on a pseudo-terminal and types the code it prints."""
+    master, slave = pty.openpty()
+    process = subprocess.Popen(
+        [binary, "approve", approval_id, "--dir", home],
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        close_fds=True,
+    )
+    os.close(slave)
+    buf = b""
+    deadline = time.time() + 30
+
+    def read_ready():
+        ready, _, _ = select.select([master], [], [], 0.2)
+        if not ready:
+            return b""
+        try:
+            return os.read(master, 4096)
+        except OSError:
+            return b""
+
+    typed = False
+    while time.time() < deadline:
+        chunk = read_ready()
+        if chunk:
+            buf += chunk
+            if not typed and b"confirmation:" in buf and b"Type " in buf:
+                code = buf.split(b"Type ", 1)[1].split()[0]
+                os.write(master, code + b"\n")
+                typed = True
+        if process.poll() is not None and not select.select([master], [], [], 0)[0]:
+            break
+    try:
+        returncode = process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        returncode = process.wait()
+    os.close(master)
+    text = buf.decode("utf-8", "replace")
+    print(f"$ praetore-mcp approve {approval_id}  -> exit {returncode}")
+    for line in text.splitlines():
+        print(f"    {line}")
+    return returncode, text
+
+
+def approval_id_from(message):
+    content = message.get("result", {}).get("content") or []
+    text = content[0].get("text", "") if content else ""
+    marker = "Approval id: "
+    if marker not in text:
+        return ""
+    return text.split(marker, 1)[1].split()[0]
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -168,6 +227,89 @@ def main():
     verify = run(binary, "verify", "--dir", home)
     check("verify exit 0", verify.returncode == 0)
     check("verify: 2 verified, 0 failed", "2 receipts: 2 verified, 0 failed" in verify.stdout)
+
+    # Local approval, still on the same home: list_directory needs a person
+    # to approve that exact call. The confirmation runs on a pseudo-terminal.
+    check(
+        "policy require-approval list_directory",
+        run(binary, "policy", "require-approval", "--id", "approve-list",
+            "--server", "filesystem", "--tool", "list_directory", "--dir", home).returncode == 0,
+    )
+    hold_requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "praetore-mcp-smoke", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "list_directory", "arguments": {"path": root}}},
+    ]
+    print("$ praetore-mcp wrap ... list_directory (expect hold)")
+    held = wrap_session(binary, home, root, server, hold_requests, {4})
+    held_msg = held.get(4, {})
+    approval_id = approval_id_from(held_msg)
+    held_text = json.dumps(held_msg.get("result", {}).get("content", []))
+    check(
+        "list_directory is held for approval",
+        held_msg.get("result", {}).get("isError") is True
+        and "waiting for local human approval" in held_text
+        and f"praetore-mcp approve {approval_id} --dir {home}" in held_text
+        and len(approval_id) == 64,
+        held_text[:400],
+    )
+    pending = run(binary, "approvals", "--dir", home)
+    check("approvals lists the pending id", approval_id in pending.stdout, pending.stdout)
+    code, approve_text = approve_on_pty(binary, home, approval_id)
+    check("approve on a pty exits 0", code == 0, approve_text)
+
+    retry_requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "praetore-mcp-smoke", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {
+            "name": "list_directory", "arguments": {"path": root}}},
+    ]
+    print("$ praetore-mcp wrap ... list_directory (expect one forward)")
+    forwarded = wrap_session(binary, home, root, server, retry_requests, {5})
+    forwarded_text = json.dumps(forwarded.get(5, {}).get("result", {}).get("content", []))
+    check(
+        "approved list_directory is forwarded once",
+        forwarded.get(5, {}).get("result", {}).get("isError") is not True and "a.txt" in forwarded_text,
+        forwarded_text[:400],
+    )
+    again_requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "praetore-mcp-smoke", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+            "name": "list_directory", "arguments": {"path": root}}},
+    ]
+    print("$ praetore-mcp wrap ... list_directory (expect a new hold)")
+    again = wrap_session(binary, home, root, server, again_requests, {6})
+    again_id = approval_id_from(again.get(6, {}))
+    again_text = json.dumps(again.get(6, {}).get("result", {}).get("content", []))
+    check(
+        "a second retry asks for approval again",
+        again.get(6, {}).get("result", {}).get("isError") is True
+        and again_id
+        and again_id != approval_id
+        and "waiting for local human approval" in again_text,
+        again_text[:400],
+    )
+    receipts = run(binary, "receipts", "--dir", home)
+    check(
+        "receipts show the approval and the one execution",
+        "approve by " in receipts.stdout and "executed once" in receipts.stdout,
+        receipts.stdout,
+    )
+    verify = run(binary, "verify", "--dir", home)
+    check("verify after approval exits 0", verify.returncode == 0, verify.stdout)
+    check(
+        "verify reports one approval execution",
+        "0 failed" in verify.stdout and "1 decision(s), 1 execution(s)" in verify.stdout,
+        verify.stdout,
+    )
 
     print(f"{len(failures)} check(s) failed" if failures else "all checks passed")
     sys.exit(1 if failures else 0)

@@ -19,6 +19,7 @@ path = "src/lib.rs"
 
 [dependencies]
 caseless = "0.2.2"
+ed25519-dalek = "2.2.0"
 hex = "0.4.3"
 praetore-core = { path = "../praetore-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -37,6 +38,7 @@ libc = "0.2.189"
 [dev-dependencies]
 # G7 runtime tests count engine calls with the test-only probe.
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
+libc = "0.2.189"
 tempfile = "3"
 
 [[example]]

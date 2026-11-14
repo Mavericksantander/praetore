@@ -445,10 +445,27 @@ fn decide_verdict(
             ));
             CallDecision::Block(denied())
         }
-        (Mode::Enforce, DecisionOutcome::RequireApproval) => CallDecision::Block(format!(
-            "This tool call requires human approval (not supported by praetore-mcp yet), so it was not executed. Rule: {rules}. Evidence id: {}",
-            verdict.evidence_id
-        )),
+        (Mode::Enforce, DecisionOutcome::RequireApproval) => {
+            if let Some(id) = &verdict.consumed_approval {
+                warnings.push(format!(
+                    "praetore-mcp: {server}/{tool} forwarded once under local approval {id} (evidence {})",
+                    verdict.evidence_id
+                ));
+                CallDecision::Forward
+            } else {
+                let text = verdict.hold_message.clone().unwrap_or_else(|| {
+                    format!(
+                        "This tool call is waiting for local human approval and was not executed. Evidence id: {}",
+                        verdict.evidence_id
+                    )
+                });
+                warnings.push(format!(
+                    "praetore-mcp: {server}/{tool} waiting for local approval (evidence {})",
+                    verdict.evidence_id
+                ));
+                CallDecision::Block(text)
+            }
+        }
     }
 }
 
@@ -765,6 +782,8 @@ mod tests {
                 } else {
                     Err("disk full".into())
                 },
+                consumed_approval: None,
+                hold_message: None,
             })
         }
     }
@@ -880,7 +899,7 @@ mod tests {
             reply["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("requires human approval (not supported by praetore-mcp yet)")
+                .contains("waiting for local human approval")
         );
     }
 

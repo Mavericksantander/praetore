@@ -13,9 +13,9 @@ MCP server**, it evaluates your policy with the PRÆTORE engine and writes an
 Ed25519-signed receipt. In `enforce` mode, DENY and REQUIRE_APPROVAL calls
 are not forwarded. A DENY is an MCP tool error whose text is
 `Denied by PRÆTORE. Evidence id: ...`. The rule id is not in that text. It
-is on stderr and in `praetore-mcp receipts`. REQUIRE_APPROVAL is not
-supported in v0.3.3. In enforce mode it is treated like DENY, with the text
-"requires human approval (not supported by praetore-mcp yet)".
+is on stderr and in `praetore-mcp receipts`. A REQUIRE_APPROVAL call is not
+forwarded until a person approves that exact call from a terminal
+(`praetore-mcp approve`).
 
 What was run end to end (macOS arm64, 2026-10-30): `cargo install --git`,
 `init`, a `deny` rule for `write_file`, `install --mode enforce` into the real
@@ -23,7 +23,8 @@ Claude Desktop and Cursor apps, in front of
 `@modelcontextprotocol/server-filesystem@2.1.0`. Reads were allowed,
 `write_file` was refused in both apps with the evidence id shown in the chat,
 the file was not created, and `praetore-mcp verify` checked every receipt.
-Not run: Windows, Linux desktop apps, VS Code, other MCP servers.
+Not run: Windows, Linux desktop apps, VS Code, other MCP servers. That
+macOS arm64 run on 2026-10-30 did not include local approval.
 
 ## Ten-minute walkthrough
 
@@ -150,10 +151,11 @@ wrapped.
 
 Add one deny rule for the server named `filesystem`. A policy change is
 loaded when `wrap` starts, so restart the client after this. The `policy`
-command prints that reminder. v0.3.3 has no approval flow. Do not add a
-`require-approval` rule. REQUIRE_APPROVAL is not supported. In enforce
-mode it is treated like DENY, with the text "requires human approval (not
-supported by praetore-mcp yet)".
+command prints that reminder. The published v0.3.3 release has no
+approval. In enforce, REQUIRE_APPROVAL is treated like DENY, with the text
+"requires human approval (not supported by praetore-mcp yet)". From 0.3.4,
+which today is installed only from source, the flow is "Local approval"
+below.
 
 ```sh
 praetore-mcp policy deny --id first-rule --server filesystem --tool write_file
@@ -190,7 +192,19 @@ praetore-mcp receipts --tail 5
 praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
 ```
 
-The evidence id in the chat matches the `EVIDENCE ID` column. To undo:
+From 0.3.4, to hold a call until someone at the machine approves it:
+
+```sh
+praetore-mcp policy require-approval --id approve-mkdir --server filesystem --tool create_directory
+# restart the client, attempt create_directory, then:
+praetore-mcp approvals
+praetore-mcp approve <id>    # interactive terminal; type the code it prints
+```
+
+A DENY rule on the same tool wins: the call is refused and approval is not
+asked. The agent retries the same call. It is forwarded once. Limits of
+that flow are in point 3 below. The evidence id in the chat matches the `EVIDENCE ID`
+column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
 
@@ -209,15 +223,35 @@ Read these before relying on anything above.
    no receipt for it, it did not go through `praetore-mcp`, or (observe only)
    `praetore-mcp` could not parse the line and forwarded it with a stderr
    warning that names its SHA-256.
-2. **The keys are LOCAL/DEV keys for one machine.** `init` creates three
-   Ed25519 keys under `~/.praetore/mcp/keys/` (0600). There is no PKI, no key
-   rotation, no hardware key storage and no revocation. Anyone who can read
-   that directory can sign receipts as this installation. A receipt shows
-   what this installation recorded; it does not prove anything about who
-   controls the machine.
-3. **REQUIRE_APPROVAL has no approval flow.** A matching call is blocked in
-   enforce mode, with the text "requires human approval (not supported by
-   praetore-mcp yet)". There is no way to approve it and let it run.
+2. **The keys are LOCAL/DEV keys for one machine.** `init` creates four
+   Ed25519 keys under `~/.praetore/mcp/keys/` (0600): issuer, agent,
+   attester and approver. There is no PKI, no key rotation, no hardware
+   key storage and no revocation. Anyone who can read that directory can
+   sign receipts and approvals as this installation. A receipt shows what
+   this installation recorded; it does not prove anything about who
+   controls the machine. An older home gets the approver key from a second
+   `praetore-mcp init`. That run does not replace the other keys or the
+   receipts.
+3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
+   call is not forwarded. The tool error names an approval id and the
+   command to run, for example `praetore-mcp approve <id> --dir <home>`.
+   `praetore-mcp approvals` lists pending calls (server, tool, a short form
+   of the arguments, expiry). `approve` works only in an interactive
+   terminal. Before it asks for a short code, it prints the server, the
+   tool, the UTC expiry, and the full arguments. It continues only if that
+   code is typed back. `reject <id>` records a rejection and the call is not
+   forwarded. The approval matches one server, one tool and the canonical
+   arguments, expires after 10 minutes unless
+   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says
+   otherwise (1 to 86400 seconds), and is consumed by one later call. A
+   second identical call asks again. Different arguments do not match.
+   A process that can act as this user can open a terminal and approve.
+   That is not a guarantee that a person reviewed the call. Deleting or
+   truncating `approvals/journal.jsonl` lets an approval be used again.
+   `verify` does not detect that unless you compare, by hand, the approval
+   head it prints. There is no flag for that head. Observe mode
+   does not hold the call; `praetore-mcp receipts` shows
+   `enforce would ask` on that receipt.
 4. **Path arguments must resolve to themselves.** For an argument that a
    `--arg-path-prefix` rule covers, `wrap` resolves symlinks first. If the
    path goes through a symlink, has `.`/`..`, or its parent does not exist,
