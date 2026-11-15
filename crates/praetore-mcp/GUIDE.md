@@ -294,7 +294,7 @@ Ctrl-C. The page has four views. Each mark it draws stands for a value
 in a receipt, in a pending approval file or in the result of `verify`;
 nothing is drawn that PRÆTORE does not record.
 
-- **Home**: the agent id and the servers from the latest receipts, the mode
+- **Home**: the agent id and the servers from the 40 latest receipts, the mode
   (enforce, observe, or both with their counts), the verification result
   (OK with the number of receipts, or the first failure, or the error when
   the journal cannot be read) and three counts: ALLOW, DENY and pending
@@ -306,7 +306,11 @@ nothing is drawn that PRÆTORE does not record.
   the engine check. In observe mode the bar is only outlined, since the
   call went through. A call waiting for approval stops at an amber dashed
   bar marked "pending, notice not signed, not checked by verify", with the
-  `praetore-mcp approve` and `reject` commands to run in a terminal.
+  `praetore-mcp approve` and `reject` commands to run in a terminal. A
+  receipt that `verify` rejects is marked, with the reason `verify` gives,
+  in the drawing and in the list. A call that arrives while the page is
+  open is scanned in; nothing moves when a read of the journal finds
+  nothing new.
 - **Chain**: the receipts in seq order, joined by the `prev` hash link,
   with the decision of each in the same colors. Where `verify` fails, the
   link is drawn cut and the reason is written next to it. The filters

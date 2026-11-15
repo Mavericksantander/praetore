@@ -56,11 +56,14 @@
   receipts in seq order joined by the `prev` hash link and shows the link
   cut, with the reason, where `verify` fails. Opening a receipt shows its
   tool, arguments, rule, mode, local time and UTC, evidence id, seq, `prev`
-  and its `verify` result. Live and chain each have a text list view with
-  the same content, and nothing moves when the system asks for reduced
-  motion. The drawings use a 2D canvas and code embedded in the binary;
-  the page keeps the same Content-Security-Policy and loads nothing from
-  the network. The page now uses one dark color scheme.
+  and its `verify` result. The live view marks a receipt that `verify`
+  rejects, with the reason, and moves only when a receipt arrives, the
+  `verify` result changes or the pending calls change. Live and chain each
+  have a text list view with the same content, and nothing moves when the
+  system asks for reduced motion. The drawings use a 2D canvas and code
+  embedded in the binary; the page keeps the same Content-Security-Policy
+  and loads nothing from the network. The page now uses one dark color
+  scheme.
 - **praetore-mcp: `policy coverage [--dir DIR] [--server NAME] -- <command>
   [args...]`.** Starts the MCP server, sends `initialize` and `tools/list`
   (every page), closes it, and prints for each tool what the policy
