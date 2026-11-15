@@ -926,8 +926,11 @@ function renderHome() {
 // scan completes and the line reaches the object in cyan. DENY: a red wall
 // rises between the agent and the action, with the receipt's reason on it.
 // REQUIRE_APPROVAL: the action waits before the wall in amber; a pending
-// one says its notice is not signed. A horizontal sweep runs once each
-// time the journal is read.
+// one says its notice is not signed. A receipt verify rejects says so,
+// with verify's whole reason under its box. A horizontal sweep runs once
+// when a read of the journal brings a change: a new receipt, a new verify
+// result or a change in the pending calls (see liveKey). A read that
+// finds nothing new draws nothing.
 
 const hud = { rows: [], seen: null, frame: 0, readAt: null, geo: null, liveKey: null };
 
@@ -1086,7 +1089,8 @@ function drawHud(now) {
     }
   });
 
-  // The sweep: once per read of the journal.
+  // The sweep: once after a read that changed something (hud.readAt is
+  // set in load() only then).
   if (hud.readAt !== null && !reducedMotion()) {
     const p = (now - hud.readAt) / 900;
     if (p >= 0 && p < 1) {
