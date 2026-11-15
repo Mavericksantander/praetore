@@ -31,6 +31,32 @@ const TOOLS = {
 
 const I18N = {
   es: {
+    nav_home: "Inicio", nav_live: "En vivo", nav_chain: "Cadena",
+    sub_home: "El estado de tu agente, de un vistazo",
+    sub_live: "Cada llamada a una herramienta, al momento en que se decide",
+    sub_chain: "Los recibos en orden, unidos por su enlace hash",
+    m_visual: "Visual", m_list: "Lista", m_diagram: "Diagrama",
+    h_agent: "Agente", h_server: "Servidor", h_mode: "Modo", h_verify: "verify",
+    h_allow: "Permitidas", h_deny: "Bloqueadas", h_pending: "Pendientes", h_pending_sub: "aviso sin firma",
+    h_verify_ok: (n) => `OK · ${n} recibos verificados`, h_verify_err: "verify no pudo correr",
+    h_mode_mixed: (e, o) => `enforce y observe (${e} enforce, ${o} observe)`,
+    h_empty: "Todavía no hay recibos. Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
+    h_to_live: "Ver en vivo →", h_to_chain: "Ver la cadena →",
+    l_cap_live: (n) => n === 1 ? "1 decisión en los últimos 15 minutos." : `${n} decisiones en los últimos 15 minutos.`,
+    l_cap_quiet: (when) => `Sin decisiones en los últimos 15 minutos. La última fue ${when}.`,
+    l_cap_empty: "Esperando la primera llamada a una herramienta.",
+    l_more: (n) => `${n} decisiones anteriores en la cadena →`,
+    l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PIDIÓ APROBACIÓN",
+    l_default_deny: "default deny: ninguna regla lo permite", l_rule: (id) => `regla ${id}`, l_guard: (g) => `comprobación del motor: ${g}`,
+    l_observe: "observe: registrada, no aplicada",
+    l_pending: "pendiente · aviso sin firma · verify no lo comprueba",
+    l_label: (n, total) => `Vista en vivo: las ${n} decisiones más recientes de ${total}. La vista de lista tiene lo mismo.`,
+    c_cap: (n, m) => `${n} de ${m} recibos en esta página, del más reciente al más antiguo.`,
+    c_gap: (n) => n === 1 ? "1 recibo omitido por el filtro" : `${n} recibos omitidos por el filtro`,
+    c_cut: "la cadena se corta aquí", c_newer: (n) => `${n} más recientes ↑`, c_older: (n) => `${n} anteriores ↓`,
+    c_label: (n, m) => `Diagrama de la cadena: ${n} de ${m} recibos. La vista de lista tiene lo mismo.`,
+    c_unreadable: "línea ilegible",
+    f_seq: "seq", f_prev: "prev (enlace hash)", f_verified: "verify", f_evidence: "evidence_id",
     nav_operation: "Operación", nav_info: "Información",
     sub_operation: "Lo que tu agente está haciendo, en tiempo real",
     sub_info: "Registro, reglas y verificación de todo lo que hizo tu agente",
@@ -155,6 +181,32 @@ const I18N = {
     unreadable: "Línea ilegible",
   },
   en: {
+    nav_home: "Home", nav_live: "Live", nav_chain: "Chain",
+    sub_home: "Your agent's state, at a glance",
+    sub_live: "Each tool call, as it is decided",
+    sub_chain: "The receipts in order, joined by their hash link",
+    m_visual: "Visual", m_list: "List", m_diagram: "Diagram",
+    h_agent: "Agent", h_server: "Server", h_mode: "Mode", h_verify: "verify",
+    h_allow: "Allowed", h_deny: "Denied", h_pending: "Pending", h_pending_sub: "notice not signed",
+    h_verify_ok: (n) => `OK · ${n} receipts verified`, h_verify_err: "verify could not run",
+    h_mode_mixed: (e, o) => `enforce and observe (${e} enforce, ${o} observe)`,
+    h_empty: "No receipts yet. They appear when an MCP client calls a tool through praetore-mcp wrap.",
+    h_to_live: "See it live →", h_to_chain: "See the chain →",
+    l_cap_live: (n) => n === 1 ? "1 decision in the last 15 minutes." : `${n} decisions in the last 15 minutes.`,
+    l_cap_quiet: (when) => `No decisions in the last 15 minutes. The last one was ${when}.`,
+    l_cap_empty: "Waiting for the first tool call.",
+    l_more: (n) => `${n} earlier decisions in the chain →`,
+    l_allow: "ALLOWED", l_deny: "DENIED", l_ask: "ASKED FOR APPROVAL",
+    l_default_deny: "default deny: no rule allows it", l_rule: (id) => `rule ${id}`, l_guard: (g) => `engine check: ${g}`,
+    l_observe: "observe: recorded, not applied",
+    l_pending: "pending · notice not signed · not checked by verify",
+    l_label: (n, total) => `Live view: the ${n} most recent decisions of ${total}. The list view has the same.`,
+    c_cap: (n, m) => `${n} of ${m} receipts on this page, newest to oldest.`,
+    c_gap: (n) => n === 1 ? "1 receipt left out by the filter" : `${n} receipts left out by the filter`,
+    c_cut: "the chain breaks here", c_newer: (n) => `${n} newer ↑`, c_older: (n) => `${n} older ↓`,
+    c_label: (n, m) => `Chain diagram: ${n} of ${m} receipts. The list view has the same.`,
+    c_unreadable: "unreadable line",
+    f_seq: "seq", f_prev: "prev (hash link)", f_verified: "verify", f_evidence: "evidence_id",
     nav_operation: "Operation", nav_info: "Information",
     sub_operation: "What your agent is doing, in real time",
     sub_info: "Log, rules and verification of everything your agent did",
@@ -279,6 +331,32 @@ const I18N = {
     unreadable: "Unreadable line",
   },
   pt: {
+    nav_home: "Início", nav_live: "Ao vivo", nav_chain: "Cadeia",
+    sub_home: "O estado do seu agente, num relance",
+    sub_live: "Cada chamada a uma ferramenta, no momento em que é decidida",
+    sub_chain: "Os recibos em ordem, unidos pelo seu link hash",
+    m_visual: "Visual", m_list: "Lista", m_diagram: "Diagrama",
+    h_agent: "Agente", h_server: "Servidor", h_mode: "Modo", h_verify: "verify",
+    h_allow: "Permitidas", h_deny: "Bloqueadas", h_pending: "Pendentes", h_pending_sub: "aviso sem assinatura",
+    h_verify_ok: (n) => `OK · ${n} recibos verificados`, h_verify_err: "o verify não pôde rodar",
+    h_mode_mixed: (e, o) => `enforce e observe (${e} enforce, ${o} observe)`,
+    h_empty: "Ainda não há recibos. Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
+    h_to_live: "Ver ao vivo →", h_to_chain: "Ver a cadeia →",
+    l_cap_live: (n) => n === 1 ? "1 decisão nos últimos 15 minutos." : `${n} decisões nos últimos 15 minutos.`,
+    l_cap_quiet: (when) => `Sem decisões nos últimos 15 minutos. A última foi ${when}.`,
+    l_cap_empty: "Esperando a primeira chamada a uma ferramenta.",
+    l_more: (n) => `${n} decisões anteriores na cadeia →`,
+    l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PEDIU APROVAÇÃO",
+    l_default_deny: "default deny: nenhuma regra a permite", l_rule: (id) => `regra ${id}`, l_guard: (g) => `verificação do motor: ${g}`,
+    l_observe: "observe: registrada, não aplicada",
+    l_pending: "pendente · aviso sem assinatura · o verify não o verifica",
+    l_label: (n, total) => `Vista ao vivo: as ${n} decisões mais recentes de ${total}. A vista de lista tem o mesmo.`,
+    c_cap: (n, m) => `${n} de ${m} recibos nesta página, do mais recente ao mais antigo.`,
+    c_gap: (n) => n === 1 ? "1 recibo omitido pelo filtro" : `${n} recibos omitidos pelo filtro`,
+    c_cut: "a cadeia se corta aqui", c_newer: (n) => `${n} mais recentes ↑`, c_older: (n) => `${n} anteriores ↓`,
+    c_label: (n, m) => `Diagrama da cadeia: ${n} de ${m} recibos. A vista de lista tem o mesmo.`,
+    c_unreadable: "linha ilegível",
+    f_seq: "seq", f_prev: "prev (link hash)", f_verified: "verify", f_evidence: "evidence_id",
     nav_operation: "Operação", nav_info: "Informação",
     sub_operation: "O que seu agente está fazendo, em tempo real",
     sub_info: "Registro, regras e verificação de tudo o que seu agente fez",
@@ -404,15 +482,15 @@ const I18N = {
   },
 };
 
-const VIEWS = ["operation", "info"];
-const INFO_TABS = ["log", "approvals", "policy", "integrity", "stats"];
+const VIEWS = ["home", "live", "chain", "info"];
+const INFO_TABS = ["approvals", "policy", "integrity", "stats"];
 const LIVE_KEY = "praetore-mcp-dashboard-live";
 const LANG_KEY = "praetore-mcp-dashboard-lang";
 const POLL_MS = 3000;
 
 let lang = "es";
-let view = "operation";
-let infoTab = "log";
+let view = "home";
+let infoTab = "approvals";
 let state = null;
 let selected = null; // the receipt shown in the drawer
 const PAGE = 100;
@@ -693,38 +771,628 @@ function go(name) {
   location.hash = `#/${name}`;
 }
 
-// ---------- overview ----------
+// ---------- shared drawing ----------
+//
+// Everything drawn on the canvases is a receipt, a count, a rule id, the
+// verify result or the moment the journal was read. Nothing is drawn that
+// the journal or verify does not record.
 
-function renderOperation() {
-  const root = document.getElementById("view-operation");
+const LIVE_ROWS = 8;
+const LIVE_MODE_KEY = "praetore-mcp-dashboard-live-mode";
+const CHAIN_KEY = "praetore-mcp-dashboard-chain-mode";
+const motionQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+let liveMode = "visual";
+let chainMode = "visual";
+
+function reducedMotion() {
+  return Boolean(motionQuery && motionQuery.matches);
+}
+
+function colors() {
+  const css = getComputedStyle(document.documentElement);
+  const v = (name) => css.getPropertyValue(name).trim();
+  return { paper: v("--paper"), sheet: v("--sheet"), ink: v("--ink"), ink2: v("--ink-2"), quiet: v("--quiet"),
+    rule: v("--rule"), hud: v("--hud"), hudDim: v("--hud-dim"), wall: v("--wall"), ask: v("--ask"),
+    sans: v("--sans"), mono: v("--mono") };
+}
+
+function rgba(color, alpha) {
+  const hex = color.replace("#", "");
+  if (hex.length !== 6) return color;
+  const n = parseInt(hex, 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
+}
+
+// Sizes a canvas to its CSS box and the screen's pixel ratio.
+function fitCanvas(canvas, height) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(300, Math.round(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth));
+  canvas.style.height = `${height}px`;
+  if (canvas.width !== w * dpr || canvas.height !== height * dpr) {
+    canvas.width = w * dpr;
+    canvas.height = height * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, w, h: height };
+}
+
+// HUD corner brackets around a box.
+function brackets(ctx, x, y, w, h, color, size = 7) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (const [cx, cy, dx, dy] of [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]]) {
+    ctx.moveTo(cx + dx * size, cy);
+    ctx.lineTo(cx, cy);
+    ctx.lineTo(cx, cy + dy * size);
+  }
+  ctx.stroke();
+}
+
+function clipText(ctx, text, width) {
+  if (ctx.measureText(text).width <= width) return text;
+  let out = text;
+  while (out.length > 1 && ctx.measureText(`${out}…`).width > width) out = out.slice(0, -1);
+  return `${out}…`;
+}
+
+// The reason a receipt carries for its decision, in a few words.
+function wallText(r) {
+  const by = r.decided_by;
+  if (by && by.kind === "default_deny") return t("l_default_deny");
+  if (by && by.kind === "engine_guard") return t("l_guard", by.guard);
+  if (by && (by.kind === "rule" || by.kind === "unbound_rule")) return t("l_rule", by.rule_id);
+  return r.rule ? t("l_rule", r.rule) : t("l_default_deny");
+}
+
+function whenText(r) {
+  return `${localText(r.decided_at)} · ${utcText(r.decided_at)}`;
+}
+
+// What breaks the chain at a receipt, as verify reported it.
+function breakReason(r) {
+  if (r.parse_error) return `${t("c_unreadable")}: ${r.parse_error}`;
+  if (r.order) return r.order;
+  for (const name of ["agent", "attester", "authority"]) {
+    const check = r.signatures && r.signatures[name] && r.signatures[name].check;
+    if (check && check.error) return check.error;
+  }
+  for (const check of Object.values(r.checks || {})) if (check.error) return check.error;
+  return r.verified ? null : t("st_fail");
+}
+
+function pendingIds() {
+  return new Set(activePending().map((p) => p.evidence_id));
+}
+
+function stat(label, color, value, sub) {
+  return el("div", { class: "stat" },
+    el("dt", {}, color ? el("i", { style: `background:${color}` }) : null, label),
+    el("dd", {}, value, sub ? el("small", {}, sub) : null));
+}
+
+// ---------- home ----------
+
+function modeText() {
+  const s = state.summary;
+  const readable = s.total - s.unreadable;
+  if (readable === 0) return "-";
+  if (s.enforce_receipts === readable) return "enforce";
+  if (s.enforce_receipts === 0) return "observe";
+  return t("h_mode_mixed", s.enforce_receipts, readable - s.enforce_receipts);
+}
+
+// With no receipts, say why: an empty home, or a journal that could not be
+// read (then verify carries the error and the counts are not trustworthy).
+function noReceiptsText() {
+  return state.verify.status === "error" ? t("journal_unreadable_t") : t("h_empty");
+}
+
+function renderHome() {
+  const root = document.getElementById("view-home");
   root.replaceChildren();
   const s = state.summary;
   const v = state.verify;
-  // One sentence for the state of things: integrity first, then what
-  // waits for a person, then calm.
-  const count = activePending().length;
-  let hero;
-  if (v.status === "error") {
-    hero = heroCard("bad", "!", t("hero_err_t"), String(v.error), t("see_integrity"), "info/integrity");
-  } else if (v.status === "fail") {
-    hero = heroCard("bad", "!", t("hero_bad_t"), t("hero_bad_d", v.failed), t("see_integrity"), "info/integrity");
-  } else if (count > 0) {
-    hero = heroCard("warn", "", t("cta_pending", count), t("cta_sub"), null);
-  } else if (s.total === 0) {
-    hero = heroCard("ok", "", t("hero_empty_t"), t("hero_empty_d"), null);
-  } else {
-    hero = heroCard("ok", "", t("hero_ok_t"), t("hero_ok_d", v.verified), t("see_integrity"), "info/integrity");
-  }
-  root.append(hero);
+  const latest = state.recent.find((r) => !r.parse_error);
+  const servers = [...new Set(state.recent.map((r) => r.server).filter((x) => typeof x === "string"))];
+  let verifyLine;
+  if (v.status === "ok") verifyLine = el("span", { class: "ok-text" }, t("h_verify_ok", v.verified));
+  else if (v.status === "fail") verifyLine = el("span", { class: "bad-text mono" }, v.failures[0] || t("verify_chip_fail", v.failed));
+  else verifyLine = el("span", { class: "bad-text" }, `${t("h_verify_err")}: `, el("span", { class: "mono" }, String(v.error)));
+  const ident = el("dl", { class: "home-ident" },
+    el("div", {}, el("dt", {}, t("h_agent")), el("dd", { class: "mono" }, latest ? latest.signatures.agent.agent_id : "-")),
+    el("div", {}, el("dt", {}, t("h_server")), el("dd", {}, servers.length ? servers.join(", ") : "-")),
+    el("div", {}, el("dt", {}, t("h_mode")), el("dd", {}, modeText())),
+    el("div", {}, el("dt", {}, t("h_verify")), el("dd", {}, verifyLine)));
+  const numbers = el("dl", { class: "home-numbers" },
+    stat(t("h_allow"), "var(--allow)", String(s.allow)),
+    stat(t("h_deny"), "var(--deny)", String(s.deny)),
+    stat(t("h_pending"), "var(--ask)", String(activePending().length), t("h_pending_sub")));
+  root.append(el("div", { class: "home" },
+    ident, numbers,
+    s.total === 0 ? el("p", { class: "home-empty" }, noReceiptsText()) : null,
+    el("p", { class: "home-links" }, el("a", { href: "#/live" }, t("h_to_live")), el("a", { href: "#/chain" }, t("h_to_chain")))));
+}
 
+// ---------- live (HUD) ----------
+//
+// The agent is the line on the left. Each of the newest receipts is an
+// object scanned on the right, joined to the agent by a line. ALLOW: the
+// scan completes and the line reaches the object in cyan. DENY: a red wall
+// rises between the agent and the action, with the receipt's reason on it.
+// REQUIRE_APPROVAL: the action waits before the wall in amber; a pending
+// one says its notice is not signed. A horizontal sweep runs once each
+// time the journal is read.
+
+const hud = { rows: [], seen: null, frame: 0, readAt: null, geo: null };
+
+function syncHud() {
+  const pending = pendingIds();
+  const rows = state.recent.filter((r) => !r.parse_error).slice(0, LIVE_ROWS);
+  const now = performance.now();
+  const known = new Map(hud.rows.map((row) => [row.r.evidence_id, row]));
+  const firstLoad = hud.seen === null;
+  let stagger = 0;
+  hud.rows = rows.map((r) => {
+    const row = known.get(r.evidence_id) || { born: null };
+    row.r = r;
+    row.pending = r.decision === "REQUIRE_APPROVAL" && pending.has(r.evidence_id);
+    const fresh = firstLoad ? false : !hud.seen.has(r.evidence_id);
+    if (!known.has(r.evidence_id) && fresh && !reducedMotion()) {
+      row.born = now + stagger * 220;
+      stagger += 1;
+    }
+    return row;
+  });
+  // On the first load the newest one is scanned, so the page shows how a
+  // decision arrives.
+  if (firstLoad && hud.rows[0] && !reducedMotion()) hud.rows[0].born = now + 300;
+  hud.seen = new Set(state.recent.map((r) => r.evidence_id));
+}
+
+const SCAN_MS = 520;
+const OUTCOME_MS = 180;
+
+function drawHud(now) {
+  const canvas = document.getElementById("hud");
+  const rowH = 62;
+  const top = 46;
+  const height = top + Math.max(1, hud.rows.length) * rowH + 20;
+  const { ctx, w, h } = fitCanvas(canvas, height);
+  const c = colors();
+  hud.geo = { top, rowH };
+  ctx.clearRect(0, 0, w, h);
+  const spineX = 28;
+  const wallX = Math.round(w * 0.42);
+  const boxX = wallX + 34;
+  const boxW = w - boxX - 12;
+
+  // The agent: the line every action leaves from.
+  const latest = hud.rows[0] ? hud.rows[0].r : null;
+  ctx.strokeStyle = rgba(c.hud, 0.7);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(spineX, top - 12);
+  ctx.lineTo(spineX, h - 12);
+  ctx.stroke();
+  ctx.fillStyle = c.hud;
+  ctx.font = `11px ${c.mono}`;
+  ctx.textAlign = "left";
+  ctx.fillText(latest ? `${t("h_agent").toUpperCase()} ${latest.signatures.agent.agent_id.slice(0, 8)} · ${latest.server ?? "-"}` : t("h_agent").toUpperCase(),
+    spineX - 4, 18);
+  if (!hud.rows.length) {
+    ctx.fillStyle = c.quiet;
+    ctx.font = `13px ${c.sans}`;
+    ctx.fillText(state.verify.status === "error" ? t("journal_unreadable_t") : t("l_cap_empty"), spineX + 20, top + 26);
+  }
+
+  hud.rows.forEach((row, index) => {
+    const r = row.r;
+    const y = top + index * rowH;
+    const mid = y + 21;
+    const age = row.born === null ? Infinity : now - row.born;
+    if (age < 0) {
+      brackets(ctx, boxX, y, boxW, 42, rgba(c.hud, 0.25));
+      return;
+    }
+    const scan = Math.min(1, age / SCAN_MS);
+    const outcome = Math.min(1, Math.max(0, (age - SCAN_MS) / OUTCOME_MS));
+    const observe = r.mode === "observe";
+    const color = r.decision === "ALLOW" ? c.hud : r.decision === "DENY" ? c.wall : c.ask;
+
+    // The object, scanned.
+    if (scan < 1) {
+      ctx.fillStyle = rgba(c.hud, 0.06);
+      ctx.fillRect(boxX, y, boxW * scan, 42);
+      ctx.strokeStyle = rgba(c.hud, 0.9);
+      ctx.beginPath();
+      ctx.moveTo(boxX + boxW * scan, y - 3);
+      ctx.lineTo(boxX + boxW * scan, y + 45);
+      ctx.stroke();
+    }
+    brackets(ctx, boxX, y, boxW, 42, rgba(scan < 1 ? c.hud : color, scan < 1 ? 0.6 : 0.95));
+    ctx.textAlign = "left";
+    ctx.fillStyle = c.ink;
+    ctx.font = `14px ${c.sans}`;
+    ctx.fillText(clipText(ctx, toolLabel(r.tool), boxW * 0.55), boxX + 12, y + 17);
+    ctx.fillStyle = c.quiet;
+    ctx.font = `10px ${c.mono}`;
+    ctx.fillText(clipText(ctx, `${r.server ?? "-"} · ${whenText(r)}`, boxW - 24), boxX + 12, y + 33);
+    if (scan >= 1) {
+      ctx.textAlign = "right";
+      ctx.font = `10px ${c.mono}`;
+      ctx.fillStyle = color;
+      const label = r.decision === "ALLOW" ? t("l_allow") : r.decision === "DENY" ? t("l_deny") : t("l_ask");
+      ctx.fillText(label, boxX + boxW - 10, y + 17);
+    }
+
+    // The line from the agent, and the wall when there is one.
+    const reach = outcome * (r.decision === "ALLOW" ? boxX - spineX : wallX - 6 - spineX);
+    if (scan >= 1) {
+      ctx.strokeStyle = rgba(r.decision === "ALLOW" ? c.hud : c.hud, 0.75);
+      ctx.lineWidth = 1;
+      ctx.setLineDash(r.decision === "REQUIRE_APPROVAL" ? [3, 4] : []);
+      ctx.beginPath();
+      ctx.moveTo(spineX, mid);
+      ctx.lineTo(spineX + reach, mid);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = c.hud;
+      ctx.beginPath();
+      ctx.arc(spineX, mid, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    if (outcome > 0 && r.decision !== "ALLOW") {
+      const wallH = 40 * outcome;
+      if (r.decision === "DENY") {
+        // Observe mode records a DENY that was not applied: the wall is
+        // only outlined.
+        if (observe) {
+          ctx.strokeStyle = rgba(c.wall, 0.8);
+          ctx.setLineDash([3, 3]);
+          ctx.strokeRect(wallX - 3, mid - wallH / 2, 6, wallH);
+          ctx.setLineDash([]);
+        } else {
+          ctx.fillStyle = rgba(c.wall, 0.9);
+          ctx.fillRect(wallX - 3, mid - wallH / 2, 6, wallH);
+        }
+      } else {
+        ctx.strokeStyle = rgba(c.ask, 0.7);
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        ctx.moveTo(wallX, mid - wallH / 2);
+        ctx.lineTo(wallX, mid + wallH / 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      if (outcome >= 1) {
+        ctx.textAlign = "right";
+        ctx.font = `10px ${c.mono}`;
+        ctx.fillStyle = r.decision === "DENY" ? c.wall : c.ask;
+        const room = wallX - spineX - 30;
+        let text = r.decision === "DENY" ? wallText(r) : row.pending ? t("l_pending") : (approvalLabel(r.approval) || { text: wallText(r) }).text;
+        if (observe) text = `${text} · ${t("l_observe")}`;
+        ctx.fillText(clipText(ctx, text, room), wallX - 12, mid - 6);
+      }
+    }
+  });
+
+  // The sweep: once per read of the journal.
+  if (hud.readAt !== null && !reducedMotion()) {
+    const p = (now - hud.readAt) / 900;
+    if (p >= 0 && p < 1) {
+      const y = p * h;
+      const sweep = ctx.createLinearGradient(0, y - 30, 0, y);
+      sweep.addColorStop(0, rgba(c.hud, 0));
+      sweep.addColorStop(1, rgba(c.hud, 0.08));
+      ctx.fillStyle = sweep;
+      ctx.fillRect(0, y - 30, w, 30);
+      ctx.fillStyle = rgba(c.hud, 0.35);
+      ctx.fillRect(0, y, w, 1);
+    }
+  }
+}
+
+function hudBusy(now) {
+  if (hud.readAt !== null && now - hud.readAt < 900) return true;
+  return hud.rows.some((row) => row.born !== null && now - row.born < SCAN_MS + OUTCOME_MS);
+}
+
+function hudLoop() {
+  hud.frame = 0;
+  if (!state || view !== "live" || liveMode !== "visual") return;
+  const now = performance.now();
+  drawHud(now);
+  // Frames only while something moves; a still page costs nothing.
+  if (!reducedMotion() && !document.hidden && hudBusy(now)) hud.frame = requestAnimationFrame(hudLoop);
+}
+
+function startHud() {
+  if (hud.frame) cancelAnimationFrame(hud.frame);
+  hud.frame = requestAnimationFrame(hudLoop);
+}
+
+function hudList() {
+  const pending = pendingIds();
+  const list = el("ul", { class: "feed" });
+  for (const r of state.recent) {
+    if (r.parse_error) continue;
+    const target = targetOf(r.arguments);
+    const waiting = r.decision === "REQUIRE_APPROVAL" && pending.has(r.evidence_id);
+    const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
+    const cls = outcome ? outcome.cls : decisionClass(r.decision);
+    list.append(activatable(el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
+      el("span", { class: `avatar ${cls}` }),
+      el("div", { class: "what" },
+        el("strong", {}, toolLabel(r.tool)),
+        el("div", { class: "target", title: target.full }, `${r.server ?? "-"} · ${target.short}`),
+        el("div", { class: "why-line mono" }, r.decision === "ALLOW" ? "" : wallText(r)),
+        waiting ? el("div", { class: "unsigned" }, t("l_pending")) : null),
+      outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
+      el("time", {}, localText(r.decided_at), el("small", {}, utcText(r.decided_at)))), () => openDrawer(r), r.evidence_id));
+  }
+  if (!list.children.length) list.append(el("li", { class: "muted" }, t("empty_recent")));
+  return list;
+}
+
+function liveCaption() {
+  const quarter = Date.now() - 15 * 60 * 1000;
+  const recent = state.recent.filter((r) => r.decided_at && new Date(r.decided_at).getTime() >= quarter).length;
+  if (!state.summary.total) return t("l_cap_empty");
+  if (recent > 0) return t("l_cap_live", recent >= state.recent.length && state.summary.total > state.recent.length ? `${recent}+` : recent);
+  return t("l_cap_quiet", relativeText(state.recent[0] && state.recent[0].decided_at));
+}
+
+function renderLive() {
+  syncHud();
+  document.getElementById("live-caption").textContent = liveCaption();
+  for (const [id, mode] of [["live-visual", "visual"], ["live-list", "list"]]) {
+    const button = document.getElementById(id);
+    button.classList.toggle("on", liveMode === mode);
+    button.setAttribute("aria-pressed", liveMode === mode ? "true" : "false");
+  }
+  const canvas = document.getElementById("hud");
+  const list = document.getElementById("hud-list");
+  canvas.hidden = liveMode !== "visual";
+  list.hidden = liveMode !== "list";
+  canvas.setAttribute("aria-label", t("l_label", hud.rows.length, state.summary.total));
+  if (liveMode === "list") list.replaceChildren(hudList());
+  else startHud();
+  const more = document.getElementById("live-more");
+  const older = state.summary.total - hud.rows.length;
+  more.replaceChildren(older > 0 && liveMode === "visual" ? el("a", { href: "#/chain" }, t("l_more", older)) : "");
+
+  const root = document.getElementById("live-rest");
+  root.replaceChildren();
   const active = activePending();
   const decide = el("section", { class: "op-section" },
     el("h2", { class: "eyebrow" }, active.length ? t("sec_decide_n", active.length) : t("sec_decide")));
   if (active.length === 0) decide.append(el("p", { class: "calm" }, t("decide_none")));
   for (const p of active) decide.append(approvalCard(p));
   root.append(decide);
-  root.append(recentCard());
 }
+
+// ---------- chain (flow diagram) ----------
+//
+// The receipts of the current page, newest at the top, each a node on the
+// spine in seq order, joined by its hash link (`prev`). The branch shows
+// the decision in the same colors. Where verify failed for a receipt, the
+// spine is cut above that node and says why. Older pages are one grouped
+// node at the bottom; only the rows in view are drawn.
+
+const CHAIN_ROW = 64;
+const CHAIN_VIEW = 620;
+const chain = { rows: [], hasNewer: 0, hasOlder: 0, frame: 0 };
+
+function syncChain() {
+  const page = state.page;
+  chain.rows = page.receipts;
+  chain.hasNewer = page.offset;
+  chain.hasOlder = Math.max(0, page.matching - page.offset - page.receipts.length);
+  chain.filtered = Object.values(page.filters).some((x) => x !== null && x !== undefined && x !== "");
+}
+
+// The entries of the chain as drawn: optional "newer" node, receipts,
+// optional "older" node.
+function chainEntries() {
+  const entries = [];
+  if (chain.hasNewer) entries.push({ kind: "newer", count: chain.hasNewer });
+  for (const r of chain.rows) entries.push({ kind: "receipt", r });
+  if (chain.hasOlder) entries.push({ kind: "older", count: chain.hasOlder });
+  return entries;
+}
+
+function drawChain() {
+  const scroll = document.getElementById("chain-scroll");
+  const canvas = document.getElementById("chain");
+  const entries = chainEntries();
+  const total = entries.length * CHAIN_ROW + 24;
+  const height = Math.min(CHAIN_VIEW, Math.max(140, total));
+  // The canvas stays in place (sticky); the spacer gives the scroll range.
+  document.getElementById("chain-spacer").style.height = `${Math.max(0, total - height)}px`;
+  scroll.style.height = `${height}px`;
+  const { ctx, w, h } = fitCanvas(canvas, height);
+  const c = colors();
+  const offset = scroll.scrollTop;
+  ctx.clearRect(0, 0, w, h);
+  const spineX = 40;
+  const branchX = 92;
+  const textX = 116;
+  const first = Math.max(0, Math.floor((offset - 12) / CHAIN_ROW) - 1);
+  const last = Math.min(entries.length - 1, Math.ceil((offset + h) / CHAIN_ROW));
+  if (!entries.length) {
+    ctx.fillStyle = c.quiet;
+    ctx.font = `13px ${c.sans}`;
+    ctx.textAlign = "left";
+    ctx.fillText(state.summary.total ? t("empty_filter_t") : noReceiptsText(), spineX, 40);
+    return;
+  }
+  for (let i = first; i <= last; i += 1) {
+    const entry = entries[i];
+    const y = 12 + i * CHAIN_ROW - offset + 22;
+    const next = entries[i + 1];
+
+    // The link down to the next (older) entry.
+    if (next) {
+      const y2 = y + CHAIN_ROW;
+      const cut = entry.kind === "receipt" ? breakReason(entry.r) : null;
+      const consecutive = entry.kind === "receipt" && next.kind === "receipt" && entry.r.seq !== null && next.r.seq !== null &&
+        entry.r.seq === next.r.seq + 1;
+      if (cut) {
+        // Cut: the spine stops above and below a gap, with the reason.
+        ctx.strokeStyle = rgba(c.wall, 0.9);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(spineX, y + 9);
+        ctx.lineTo(spineX, y + 22);
+        ctx.moveTo(spineX - 6, y + 22);
+        ctx.lineTo(spineX + 6, y + 18);
+        ctx.moveTo(spineX - 6, y + 30);
+        ctx.lineTo(spineX + 6, y + 26);
+        ctx.moveTo(spineX, y + 30);
+        ctx.lineTo(spineX, y2 - 9);
+        ctx.stroke();
+      } else {
+        ctx.strokeStyle = rgba(c.hud, consecutive ? 0.7 : 0.35);
+        ctx.setLineDash(consecutive ? [] : [2, 4]);
+        ctx.beginPath();
+        ctx.moveTo(spineX, y + 9);
+        ctx.lineTo(spineX, y2 - 9);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      if (entry.kind === "receipt" && next.kind === "receipt" && !cut) {
+        ctx.font = `9px ${c.mono}`;
+        ctx.fillStyle = rgba(c.hud, 0.6);
+        ctx.textAlign = "left";
+        const gap = entry.r.seq !== null && next.r.seq !== null ? entry.r.seq - next.r.seq - 1 : 0;
+        const linkText = consecutive && entry.r.prev ? `prev ${entry.r.prev.slice(0, 12)}…` : gap > 0 ? t("c_gap", gap) : "";
+        ctx.fillText(linkText, spineX + 8, y + CHAIN_ROW / 2 + 4);
+      }
+    }
+
+    if (entry.kind !== "receipt") {
+      // Grouped pages: stacked rings.
+      for (let k = 2; k >= 0; k -= 1) {
+        ctx.strokeStyle = rgba(c.hud, 0.25 + 0.2 * (2 - k));
+        ctx.beginPath();
+        ctx.arc(spineX, y + k * 3 * (entry.kind === "older" ? 1 : -1), 7, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.fillStyle = c.hud;
+      ctx.font = `12px ${c.sans}`;
+      ctx.textAlign = "left";
+      ctx.fillText(entry.kind === "older" ? t("c_older", entry.count) : t("c_newer", entry.count), textX, y + 4);
+      continue;
+    }
+
+    const r = entry.r;
+    if (r.parse_error) {
+      ctx.strokeStyle = c.wall;
+      ctx.strokeRect(spineX - 6, y - 6, 12, 12);
+      ctx.fillStyle = c.wall;
+      ctx.font = `11px ${c.mono}`;
+      ctx.textAlign = "left";
+      ctx.fillText(clipText(ctx, `${t("c_unreadable")} · ${r.location.file}:${r.location.line}`, w - textX - 10), textX, y - 2);
+      ctx.fillStyle = c.quiet;
+      ctx.fillText(clipText(ctx, r.parse_error, w - textX - 10), textX, y + 14);
+      continue;
+    }
+    const color = r.decision === "ALLOW" ? c.hud : r.decision === "DENY" ? c.wall : c.ask;
+    const pending = r.decision === "REQUIRE_APPROVAL" && pendingIds().has(r.evidence_id);
+    // Node and branch.
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(spineX, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = rgba(color, 0.8);
+    ctx.setLineDash(r.decision === "REQUIRE_APPROVAL" ? [2, 3] : []);
+    ctx.beginPath();
+    ctx.moveTo(spineX + 5, y);
+    ctx.lineTo(branchX, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    if (r.decision === "DENY") {
+      if (r.mode === "observe") {
+        ctx.strokeStyle = c.wall;
+        ctx.strokeRect(branchX, y - 9, 4, 18);
+      } else {
+        ctx.fillStyle = c.wall;
+        ctx.fillRect(branchX, y - 9, 4, 18);
+      }
+    } else {
+      ctx.beginPath();
+      ctx.arc(branchX + 2, y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // Text: what, when, why, verify.
+    ctx.textAlign = "left";
+    ctx.font = `10px ${c.mono}`;
+    ctx.fillStyle = c.quiet;
+    ctx.fillText(r.seq === null || r.seq === undefined ? "-" : `seq ${r.seq}`, textX, y - 9);
+    ctx.font = `14px ${c.sans}`;
+    ctx.fillStyle = c.ink;
+    const right = w - 12;
+    ctx.fillText(clipText(ctx, `${toolLabel(r.tool)} · ${r.server ?? "-"}`, (right - textX) * 0.5), textX, y + 7);
+    ctx.font = `10px ${c.mono}`;
+    ctx.fillStyle = c.quiet;
+    ctx.fillText(clipText(ctx, whenText(r), (right - textX) * 0.5), textX, y + 22);
+    ctx.textAlign = "right";
+    ctx.fillStyle = color;
+    const why = r.decision === "ALLOW" ? wallText(r) : pending ? t("l_pending") : wallText(r);
+    ctx.fillText(clipText(ctx, why, (right - textX) * 0.42), right - 22, y + 7);
+    const cut = breakReason(r);
+    ctx.fillStyle = cut ? c.wall : c.ok;
+    ctx.font = `12px ${c.mono}`;
+    ctx.fillText(cut ? "✕" : "✓", right, y + 7);
+    if (cut) {
+      ctx.font = `10px ${c.mono}`;
+      ctx.fillStyle = c.wall;
+      ctx.fillText(clipText(ctx, `${t("c_cut")}: ${cut}`, (right - textX) * 0.5), right, y + 22);
+    }
+  }
+}
+
+function chainHit(event) {
+  const scroll = document.getElementById("chain-scroll");
+  const rect = event.target.getBoundingClientRect();
+  const y = event.clientY - rect.top + scroll.scrollTop;
+  const index = Math.floor((y - 12) / CHAIN_ROW);
+  return chainEntries()[index] || null;
+}
+
+function renderChain() {
+  syncChain();
+  const page = state.page;
+  document.getElementById("chain-caption").textContent = t("c_cap", page.receipts.length, page.matching);
+  for (const [id, mode] of [["chain-visual", "visual"], ["chain-list", "list"]]) {
+    const button = document.getElementById(id);
+    button.classList.toggle("on", chainMode === mode);
+    button.setAttribute("aria-pressed", chainMode === mode ? "true" : "false");
+  }
+  document.getElementById("chain-scroll").hidden = chainMode !== "visual";
+  document.getElementById("chain-table").hidden = chainMode !== "list";
+  document.getElementById("chain").setAttribute("aria-label", t("c_label", page.receipts.length, page.matching));
+  renderTable();
+  if (chainMode === "visual" && view === "chain") drawChain();
+}
+
+function setLiveMode(mode) {
+  liveMode = mode;
+  storageSet(localStorage, LIVE_MODE_KEY, mode);
+  if (state) renderLive();
+}
+
+function setChainMode(mode) {
+  chainMode = mode;
+  storageSet(localStorage, CHAIN_KEY, mode);
+  if (state) renderChain();
+}
+
+// ---------- approvals ----------
+
+// ---------- stats ----------
 
 function renderStats() {
   const root = document.getElementById("info-stats");
@@ -788,15 +1456,15 @@ function chartCard() {
   }
   const max = Math.max(1, ...buckets.map((b) => b.ALLOW + b.DENY + b.REQUIRE_APPROVAL));
   const chart = el("div", { class: "chart" });
-  const colors = { ALLOW: "var(--bar-allow)", DENY: "var(--bar-deny)", REQUIRE_APPROVAL: "var(--bar-ask)" };
+  const fills = { ALLOW: "var(--bar-allow)", DENY: "var(--bar-deny)", REQUIRE_APPROVAL: "var(--bar-ask)" };
   for (const b of buckets) {
     const total = b.ALLOW + b.DENY + b.REQUIRE_APPROVAL;
     const col = el("div", { class: "col",
       title: `${b.label} · ${t("d_ALLOW")} ${b.ALLOW} · ${t("d_DENY")} ${b.DENY} · ${t("d_REQUIRE_APPROVAL")} ${b.REQUIRE_APPROVAL}` });
     for (const key of ["ALLOW", "REQUIRE_APPROVAL", "DENY"]) {
-      if (b[key] > 0) col.append(el("div", { class: "seg", style: `height:${(b[key] / max) * 100}%;background:${colors[key]}` }));
+      if (b[key] > 0) col.append(el("div", { class: "seg", style: `height:${(b[key] / max) * 100}%;background:${fills[key]}` }));
     }
-    if (total === 0) col.append(el("div", { class: "seg", style: "height:2px;background:var(--line)" }));
+    if (total === 0) col.append(el("div", { class: "seg", style: "height:2px;background:var(--rule)" }));
     chart.append(col);
   }
   const mid = buckets[Math.floor(buckets.length / 2)];
@@ -824,32 +1492,6 @@ function toolsCard() {
   if (top.length === 0) bars.append(el("p", { class: "muted" }, t("empty_recent")));
   return el("div", { class: "card" }, el("h2", {}, t("tools_title")), el("p", { class: "card-sub" }, t("tools_sub")), bars);
 }
-
-function recentCard() {
-  const list = el("ul", { class: "feed" });
-  const rows = state.recent;
-  for (const r of rows) {
-    const target = targetOf(r.arguments);
-    // For a held call, what the client cares about is how it ended.
-    const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
-    const cls = outcome ? outcome.cls : decisionClass(r.decision);
-    const li = activatable(el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
-      el("span", { class: `avatar ${cls}` }),
-      el("div", { class: "what" },
-        el("strong", {}, toolLabel(r.tool)),
-        el("div", { class: "target", title: target.full }, target.short || r.server || "")),
-      outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
-      el("time", { title: `${localText(r.decided_at)} · ${utcText(r.decided_at)}` }, relativeText(r.decided_at))), () => openDrawer(r), r.evidence_id);
-    list.append(li);
-  }
-  if (rows.length === 0) list.append(el("li", { class: "muted" }, t("empty_recent")));
-  return el("section", { class: "op-section" },
-    el("div", { class: "card-head" }, el("h2", { class: "eyebrow" }, t("sec_live")),
-      el("a", { href: "#/info/log" }, t("see_log"))),
-    list);
-}
-
-// ---------- approvals ----------
 
 function renderApprovalsInfo() {
   const root = document.getElementById("info-approvals");
@@ -1063,7 +1705,7 @@ function openDrawer(r) {
   drawerTab = "summary";
   if (r && r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
   renderDrawer();
-  if (view === "info") renderTable();
+  if (view === "chain") renderChain();
   document.getElementById("drawer-close").focus();
 }
 
@@ -1071,7 +1713,7 @@ function closeDrawer() {
   selected = null;
   history.replaceState(null, "", `#/${currentRoute()}`);
   renderDrawer();
-  if (view === "info") renderTable();
+  if (view === "chain") renderChain();
   // Back to where the keyboard was: the same element, or the row of the
   // same receipt when the list was drawn again.
   let back = focusBeforeDrawer && document.contains(focusBeforeDrawer) ? focusBeforeDrawer : null;
@@ -1329,11 +1971,12 @@ function renderAll() {
   renderStamp();
   renderSubnav();
   if (!state) return;
-  renderOperation();
+  renderHome();
+  renderLive();
   renderApprovalsInfo();
   renderDecisionFilter();
   renderToolFilter();
-  renderTable();
+  renderChain();
   renderPolicy();
   renderIntegrity();
   renderStats();
@@ -1357,8 +2000,8 @@ function announce(next) {
     const added = Math.max(0, next.summary.total - state.summary.total);
     let newPending = 0;
     for (const id of pendingIds) if (!knownPending.has(id)) newPending += 1;
-    if (newPending > 0) toast(t("toast_pending"), "warn", () => go("operation"));
-    else if (added > 0) toast(t("toast_new", added), "", () => go("operation"));
+    if (newPending > 0) toast(t("toast_pending"), "warn", () => go("live"));
+    else if (added > 0) toast(t("toast_new", added), "", () => go("live"));
   }
   knownIds = ids;
   knownPending = pendingIds;
@@ -1377,10 +2020,12 @@ async function load() {
     announce(next);
     state = next;
     lastLoadedAt = new Date();
+    hud.readAt = performance.now();
     if (firstLoad) routeFromHash();
     const print = fingerprintOf(state);
     if (print === fingerprint) {
       renderStamp();
+      if (view === "live" && liveMode === "visual") startHud();
     } else {
       fingerprint = print;
       renderAll();
@@ -1407,10 +2052,10 @@ async function openEvidence(id) {
   } catch (_) { /* the link names no receipt here */ }
 }
 
-// #/operation, #/info/<tab>; #e=<evidence_id> opens that receipt over the
-// log. Older links (#/overview, #/activity, #/policy...) still land.
+// #/home, #/live, #/chain, #/info/<tab>; #e=<evidence_id> opens that
+// receipt. Older links (#/operation, #/activity, #/info/log...) still land.
 const LEGACY = {
-  overview: ["operation"], approvals: ["operation"], activity: ["info", "log"],
+  operation: ["home"], overview: ["home"], approvals: ["live"], activity: ["chain"],
   policy: ["info", "policy"], integrity: ["info", "integrity"],
 };
 function routeFromHash() {
@@ -1421,10 +2066,11 @@ function routeFromHash() {
     return;
   }
   const match = hash.match(/^#\/([a-z]+)(?:\/([a-z]+))?/);
-  let [name, tab] = match ? [match[1], match[2]] : ["operation", undefined];
+  let [name, tab] = match ? [match[1], match[2]] : ["home", undefined];
   if (LEGACY[name]) [name, tab] = LEGACY[name];
-  view = VIEWS.includes(name) ? name : "operation";
-  if (view === "info") infoTab = INFO_TABS.includes(tab) ? tab : "log";
+  if (name === "info" && tab === "log") name = "chain";
+  view = VIEWS.includes(name) ? name : "home";
+  if (view === "info") infoTab = INFO_TABS.includes(tab) ? tab : "approvals";
 }
 
 function currentRoute() {
@@ -1437,7 +2083,7 @@ function tick() {
   for (const node of document.querySelectorAll(".countdown[data-expires]")) {
     const left = Math.floor((new Date(node.getAttribute("data-expires")).getTime() - Date.now()) / 1000);
     if (Number.isNaN(left)) continue;
-    if (left <= 0) { fingerprint = null; if (state) renderOperation(); return; }
+    if (left <= 0) { fingerprint = null; if (state) renderLive(); return; }
     node.textContent = t("expires_in", Math.floor(left / 60), left % 60);
   }
   for (const node of document.querySelectorAll(".countdown-fill[data-expires]")) {
@@ -1485,6 +2131,37 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("page-newer").addEventListener("click", () => goPage(pageOffset - PAGE));
   document.getElementById("page-older").addEventListener("click", () => goPage(pageOffset + PAGE));
   document.getElementById("drawer-close").addEventListener("click", closeDrawer);
+  liveMode = storageGet(localStorage, LIVE_MODE_KEY) === "list" ? "list" : "visual";
+  chainMode = storageGet(localStorage, CHAIN_KEY) === "list" ? "list" : "visual";
+  document.getElementById("live-visual").addEventListener("click", () => setLiveMode("visual"));
+  document.getElementById("live-list").addEventListener("click", () => setLiveMode("list"));
+  document.getElementById("chain-visual").addEventListener("click", () => setChainMode("visual"));
+  document.getElementById("chain-list").addEventListener("click", () => setChainMode("list"));
+  const hudCanvas = document.getElementById("hud");
+  hudCanvas.addEventListener("click", (event) => {
+    if (!hud.geo) return;
+    const y = event.clientY - hudCanvas.getBoundingClientRect().top;
+    const row = hud.rows[Math.floor((y - hud.geo.top + 10) / hud.geo.rowH)];
+    if (row) openDrawer(row.r);
+  });
+  const chainCanvas = document.getElementById("chain");
+  chainCanvas.addEventListener("click", (event) => {
+    const entry = chainHit(event);
+    if (!entry) return;
+    if (entry.kind === "receipt") openDrawer(entry.r);
+    else if (entry.kind === "older") goPage(pageOffset + PAGE);
+    else goPage(pageOffset - PAGE);
+  });
+  document.getElementById("chain-scroll").addEventListener("scroll", () => {
+    if (chain.frame) return;
+    chain.frame = requestAnimationFrame(() => { chain.frame = 0; if (state && view === "chain") drawChain(); });
+  });
+  window.addEventListener("resize", () => {
+    if (!state) return;
+    if (view === "live") startHud();
+    if (view === "chain" && chainMode === "visual") drawChain();
+  });
+  if (motionQuery && motionQuery.addEventListener) motionQuery.addEventListener("change", () => { if (state) renderAll(); });
   document.getElementById("scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
@@ -1492,7 +2169,10 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   setInterval(() => { if (live && !document.hidden) load(); }, POLL_MS);
   setInterval(tick, 1000);
-  document.addEventListener("visibilitychange", () => { if (live && !document.hidden) load(); });
+  document.addEventListener("visibilitychange", () => {
+    if (live && !document.hidden) load();
+    if (!document.hidden && state && view === "live") startHud();
+  });
   applyStaticText();
   renderShell();
   load();

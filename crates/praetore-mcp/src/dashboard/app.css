@@ -356,6 +356,31 @@ table.mini th { color: var(--quiet); font: 500 10.5px var(--sans); letter-spacin
 .toast.bad, .toast.warn { border-left-color: var(--accent); }
 @keyframes rise { from { transform: translateY(6px); opacity: 0; } }
 
+/* ---------- home, live, chain ---------- */
+.view-head { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; flex-wrap: wrap; margin-bottom: 12px; }
+.caption { margin: 0; color: var(--ink-2); font-size: 15px; }
+#hud, #chain { display: block; width: 100%; }
+#hud { cursor: pointer; border-top: 1px solid var(--rule); padding-top: 4px; }
+.more { margin: 8px 0 40px; font-size: 13px; }
+.more a, .home-links a { color: var(--hud); text-decoration: none; }
+.chain-scroll { position: relative; overflow-y: auto; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); margin-bottom: 8px; }
+.chain-scroll canvas { position: sticky; top: 0; cursor: pointer; }
+.home { max-width: 760px; padding: 24px 0 40px; }
+.home-ident { display: grid; grid-template-columns: max-content 1fr; gap: 14px 40px; margin: 0 0 56px; }
+.home-ident div { display: contents; }
+.home-ident dt { font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--quiet); padding-top: 3px; }
+.home-ident dd { margin: 0; font-size: 16px; color: var(--ink); overflow-wrap: anywhere; }
+.home-ident dd.mono { font-size: 13px; }
+.ok-text { color: var(--ok); }
+.bad-text { color: var(--wall); }
+.home-numbers { display: flex; flex-wrap: wrap; gap: 56px; margin: 0 0 48px; }
+.stat dt { font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--quiet); display: flex; align-items: center; gap: 8px; }
+.stat dt i { width: 8px; height: 8px; display: inline-block; }
+.stat dd { margin: 6px 0 0; font-size: 44px; font-weight: 300; line-height: 1; color: var(--ink); font-variant-numeric: tabular-nums; }
+.stat dd small { display: block; font-size: 12px; color: var(--quiet); margin-top: 8px; }
+.home-empty { color: var(--ink-2); max-width: 60ch; margin: 0 0 32px; }
+.home-links { display: flex; gap: 32px; font-size: 14px; }
+.why-line { color: var(--wall); font-size: 11px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before { animation: none !important; transition: none !important; }
 }
@@ -384,8 +409,4 @@ table.mini th { color: var(--quiet); font: 500 10.5px var(--sans); letter-spacin
   .rule { grid-template-columns: 1fr; gap: 6px; }
   .drawer-head, .tabs, .drawer-body { padding-left: 20px; padding-right: 20px; }
   .modal { padding: 24px; }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  * { transition: none !important; animation: none !important; }
 }
