@@ -572,6 +572,97 @@ pub fn coverage(policy: &Policy, server: &str, tools: &[String]) -> Vec<ToolCove
 
 /// `dir_suffix` is appended to the printed `policy remove` commands
 /// (` --dir DIR` for a home other than the default one).
+/// A tool name `policy coverage` prints inside a suggested command without
+/// quoting: the MCP tool name characters, 1 to 128 of them.
+fn plain_tool_name(name: &str) -> bool {
+    (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+/// `value` as one POSIX shell word: unchanged when it only has characters
+/// a shell does not interpret, otherwise in single quotes.
+pub(crate) fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' | b'=')
+        })
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
+}
+
+/// The part of a rule id taken from a name: MCP tool name characters, at
+/// most 48, `x` when nothing is left.
+fn id_part(name: &str) -> String {
+    let part: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        .take(48)
+        .collect();
+    if part.is_empty() { "x".into() } else { part }
+}
+
+/// For each tool denied only because no rule names it, the `policy allow`
+/// command that allows it. Tools with an argument-dependent rule are left
+/// out: an unconditional ALLOW would widen what that rule allows. Nothing is
+/// written; the person running it decides which lines to run.
+fn render_allow_suggestions(
+    policy: &Policy,
+    server: &str,
+    report: &[ToolCoverage],
+    dir_suffix: &str,
+) -> String {
+    let denied: Vec<&ToolCoverage> = report
+        .iter()
+        .filter(|item| {
+            item.note.is_none()
+                && item.rules.is_empty()
+                && item.conditional.is_empty()
+                && matches!(item.outcome, None | Some(Outcome::Deny))
+        })
+        .collect();
+    if denied.is_empty() {
+        return String::new();
+    }
+    let mut taken: std::collections::BTreeSet<String> =
+        policy.rules.iter().map(|rule| rule.id.clone()).collect();
+    let mut out = format!(
+        "\ndenied because no rule names them ({}). To allow one, run its line (each allows every call to that tool in enforce mode):\n",
+        denied.len()
+    );
+    let mut unusual = Vec::new();
+    for item in denied {
+        if !plain_tool_name(&item.tool) {
+            unusual.push(cell(&item.tool, 60));
+            continue;
+        }
+        let base = format!("allow-{}-{}", id_part(server), item.tool);
+        let mut id = base.clone();
+        let mut n = 2;
+        while taken.contains(&id) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        taken.insert(id.clone());
+        out.push_str(&format!(
+            "  praetore-mcp policy allow --id {id} --server {} --tool {}{dir_suffix}\n",
+            shell_word(server),
+            item.tool
+        ));
+    }
+    if !unusual.is_empty() {
+        out.push_str(&format!(
+            "  not suggested (characters outside A-Z a-z 0-9 _ - .): {}\n",
+            unusual.join(", ")
+        ));
+    }
+    out
+}
+
 pub fn render_coverage(
     policy: &Policy,
     server: &str,
@@ -625,6 +716,9 @@ pub fn render_coverage(
             depends
         ));
     }
+    out.push_str(&render_allow_suggestions(
+        policy, server, report, dir_suffix,
+    ));
     let loose: Vec<&ToolCoverage> = report.iter().filter(|item| item.only_allow_all).collect();
     out.push('\n');
     if loose.is_empty() {
@@ -987,5 +1081,68 @@ mod tests {
             "{warnings}"
         );
         assert!(!warnings.contains("\"usual\""), "{warnings}");
+    }
+
+    #[test]
+    fn shell_word_quotes_what_a_shell_would_interpret() {
+        assert_eq!(shell_word("filesystem"), "filesystem");
+        assert_eq!(shell_word("/srv/a-b_c.d"), "/srv/a-b_c.d");
+        assert_eq!(shell_word("my fs"), "'my fs'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word("$(id)"), "'$(id)'");
+        assert_eq!(shell_word(""), "''");
+    }
+
+    #[test]
+    fn coverage_suggests_allow_lines_only_for_tools_no_rule_names() {
+        let mut policy = default_policy();
+        // Same id the suggestion for `read` would take, on another server.
+        policy.rules.push(
+            build_rule(
+                PolicyEffect::Allow,
+                &RuleSpec {
+                    server: Some("other".into()),
+                    tool: Some("read".into()),
+                    ..spec("allow-myfs-read")
+                },
+            )
+            .unwrap(),
+        );
+        policy.rules.push(
+            build_rule(
+                PolicyEffect::Deny,
+                &RuleSpec {
+                    server: Some("my fs".into()),
+                    tool: Some("write".into()),
+                    ..spec("deny-write")
+                },
+            )
+            .unwrap(),
+        );
+        let tools: Vec<String> = ["read", "write", "x;rm -rf ~", "safety:halt"]
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        let report = coverage(&policy, "my fs", &tools);
+        let text = render_coverage(&policy, "my fs", &report, " --dir '/h h'");
+        assert!(
+            text.contains("denied because no rule names them (2)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  praetore-mcp policy allow --id allow-myfs-read-2 --server 'my fs' --tool read --dir '/h h'\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("--tool write"), "{text}");
+        assert!(!text.contains("--tool x"), "{text}");
+        assert!(!text.contains("--tool safety"), "{text}");
+        assert!(text.contains("not suggested"), "{text}");
+
+        // Nothing denied by default: no section.
+        let report = coverage(&policy, "my fs", &["write".to_owned()]);
+        let text = render_coverage(&policy, "my fs", &report, "");
+        assert!(!text.contains("no rule names"), "{text}");
     }
 }

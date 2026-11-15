@@ -38,6 +38,44 @@
 
 ### Added
 
+- **`praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]`.**
+  A read-only local page over `receipts/*.jsonl`, served on 127.0.0.1 only
+  (default port 8787, `0` picks a free one). Any other address is refused.
+  The page shows a summary (total, ALLOW, DENY, active policy id, version
+  and digest, and a warning when an allow-all rule meets enforce receipts),
+  the decisions table (local time and UTC, server, tool, arguments,
+  decision, rule or `default deny`, mode, evidence id) with filters, and
+  each receipt's full JSON, `path_check` and agent, attester and authority
+  signatures with their key ids. The verification status, per receipt and
+  for the journal, with seq/prev and the journal head, comes from the code
+  behind `praetore-mcp verify`. To share it, `verify`'s per-receipt check
+  is split into one result per check (`receipts::check_evidence`). `verify`
+  prints the same output as before. HTML, CSS and JS are embedded in the
+  binary. Nothing is loaded from the network or written under DIR. Only
+  GET requests with a loopback `Host` are answered. Texts in Spanish,
+  English and Portuguese. The table shows 100 receipts per page, newest
+  first; the filters (decision, tool, time range, text) run on the server
+  over the whole journal. The verification result is kept in memory until
+  a file `verify` reads changes, so a reload of an unchanged 10,000-receipt
+  journal does not run `verify` again.
+- **praetore-mcp dashboard: home, live, chain and information views.** The
+  page opens on a home view with the agent, the servers, the mode, the
+  verification result and the ALLOW, DENY and pending counts. The live view
+  draws the newest receipts: an allowed call reaches its box, a denied one
+  stops at a red bar that shows the rule id, default deny or the engine
+  check, and a call waiting for approval stops at an amber bar marked as an
+  unsigned notice that `verify` does not check. The chain view draws the
+  receipts in seq order joined by the `prev` hash link and shows the link
+  cut, with the reason, where `verify` fails. Opening a receipt shows its
+  tool, arguments, rule, mode, local time and UTC, evidence id, seq, `prev`
+  and its `verify` result. The live view marks a receipt that `verify`
+  rejects, with the reason, and moves only when a receipt arrives, the
+  `verify` result changes or the pending calls change. Live and chain each
+  have a text list view with the same content, and nothing moves when the
+  system asks for reduced motion. The drawings use a 2D canvas and code
+  embedded in the binary; the page keeps the same Content-Security-Policy
+  and loads nothing from the network. The page now uses one dark color
+  scheme.
 - **praetore-mcp: `policy coverage [--dir DIR] [--server NAME] -- <command>
   [args...]`.** Starts the MCP server, sends `initialize` and `tools/list`
   (every page), closes it, and prints for each tool what the policy
@@ -45,7 +83,14 @@
   depends on an argument. Tools allowed only by an allow-all rule are
   listed apart. Exit code 0 when there are none, 1 when there is one, 2 on a
   usage error or when the server cannot be started or does not answer. It
-  sends no `tools/call` and writes nothing under `DIR`.
+  sends no `tools/call` and writes nothing under `DIR`. For each tool
+  denied because no rule names it, it prints the
+  `praetore-mcp policy allow --id ... --server ... --tool ...` line that
+  allows it, quoted to run as printed in a POSIX shell. Tools with a rule
+  that depends on an argument get no line, and neither do tool names with
+  characters outside `A-Z a-z 0-9 _ - .`.
+- Commands that praetore-mcp prints with `--dir DIR` quote `DIR` when it
+  has spaces or other characters a shell would interpret.
 - `scripts/mcp-smoke.py` checks `policy coverage` against
   `@modelcontextprotocol/server-filesystem@2.3.0`, and the smoke test now
   allows `read_text_file` with an explicit rule.

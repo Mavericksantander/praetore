@@ -23,6 +23,7 @@ fn every_subcommand_has_help_on_stdout_with_exit_zero() {
         "uninstall",
         "receipts",
         "verify",
+        "dashboard",
         "approvals",
         "approve",
         "reject",
