@@ -82,6 +82,10 @@ const I18N = {
     toast_new: (n) => n === 1 ? "1 decisión nueva" : `${n} decisiones nuevas`,
     search_ph: "Buscar por archivo, herramienta, regla o id…",
     all: "Todas", all_tools: "Todas las herramientas", shown: (n, t) => `${n} de ${t}`,
+    shown_range: (a, b, n) => `${a}–${b} de ${n}`, page_newer: "← Más recientes", page_older: "Más antiguos →",
+    f_from: "Desde", f_to: "Hasta", f_search: "Buscar en los recibos", f_tool_label: "Herramienta", f_decision_label: "Decisión",
+    empty_home_t: "Este home todavía no tiene recibos.",
+    empty_home_d: "Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
     c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
     default_deny: "Bloqueo por defecto",
     empty_filter_t: "Sin resultados", empty_filter_d: "Prueba con otro filtro.",
@@ -187,6 +191,10 @@ const I18N = {
     toast_new: (n) => n === 1 ? "1 new decision" : `${n} new decisions`,
     search_ph: "Search by file, tool, rule or id…",
     all: "All", all_tools: "All tools", shown: (n, t) => `${n} of ${t}`,
+    shown_range: (a, b, n) => `${a}–${b} of ${n}`, page_newer: "← Newer", page_older: "Older →",
+    f_from: "From", f_to: "To", f_search: "Search the receipts", f_tool_label: "Tool", f_decision_label: "Decision",
+    empty_home_t: "This home has no receipts yet.",
+    empty_home_d: "They appear when an MCP client calls a tool through praetore-mcp wrap.",
     c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
     default_deny: "Default deny",
     empty_filter_t: "No results", empty_filter_d: "Try another filter.",
@@ -292,6 +300,10 @@ const I18N = {
     toast_new: (n) => n === 1 ? "1 decisão nova" : `${n} decisões novas`,
     search_ph: "Buscar por arquivo, ferramenta, regra ou id…",
     all: "Todas", all_tools: "Todas as ferramentas", shown: (n, t) => `${n} de ${t}`,
+    shown_range: (a, b, n) => `${a}–${b} de ${n}`, page_newer: "← Mais recentes", page_older: "Mais antigos →",
+    f_from: "De", f_to: "Até", f_search: "Buscar nos recibos", f_tool_label: "Ferramenta", f_decision_label: "Decisão",
+    empty_home_t: "Este home ainda não tem recibos.",
+    empty_home_d: "Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
     c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
     default_deny: "Bloqueio padrão",
     empty_filter_t: "Sem resultados", empty_filter_d: "Tente outro filtro.",
@@ -357,7 +369,11 @@ let lang = "es";
 let view = "operation";
 let infoTab = "log";
 let state = null;
-let selected = null; // index into state.receipts shown in the drawer
+let selected = null; // the receipt shown in the drawer
+const PAGE = 100;
+let pageOffset = 0;
+let reloadQueued = false;
+let searchTimer = null;
 let drawerTab = "summary";
 let decisionFilter = "";
 let fingerprint = null;
@@ -639,9 +655,10 @@ function kpi(label, value, foot, color, percent) {
 }
 
 function chartCard() {
-  const receipts = state.receipts.filter((r) => r.decided_at);
+  // 15-minute UTC buckets from the server, regrouped by local hour or day.
+  const counts = state.activity.buckets;
   const now = new Date();
-  const newest = receipts.length ? new Date(receipts[receipts.length - 1].decided_at) : now;
+  const newest = state.recent.length && state.recent[0].decided_at ? new Date(state.recent[0].decided_at) : now;
   const hourly = now.getTime() - newest.getTime() < 24 * 3600 * 1000;
   const buckets = [];
   if (hourly) {
@@ -660,10 +677,11 @@ function chartCard() {
     }
   }
   for (const b of buckets) { b.ALLOW = 0; b.DENY = 0; b.REQUIRE_APPROVAL = 0; }
-  for (const r of receipts) {
-    const time = new Date(r.decided_at).getTime();
+  for (const c of counts) {
+    const time = c.start * 1000;
     const b = buckets.find((x) => time >= x.start.getTime() && time < x.end.getTime());
-    if (b && b[r.decision] !== undefined) b[r.decision] += 1;
+    if (!b) continue;
+    for (const key of ["ALLOW", "DENY", "REQUIRE_APPROVAL"]) b[key] += c[key];
   }
   const max = Math.max(1, ...buckets.map((b) => b.ALLOW + b.DENY + b.REQUIRE_APPROVAL));
   const chart = el("div", { class: "chart" });
@@ -692,9 +710,7 @@ function chartCard() {
 }
 
 function toolsCard() {
-  const counts = new Map();
-  for (const r of state.receipts) if (typeof r.tool === "string") counts.set(r.tool, (counts.get(r.tool) || 0) + 1);
-  const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const top = state.tools.slice(0, 6).map((x) => [x.tool, x.count]);
   const max = Math.max(1, ...top.map(([, n]) => n));
   const bars = el("div", { class: "bars" });
   for (const [tool, n] of top) {
@@ -708,13 +724,13 @@ function toolsCard() {
 
 function recentCard() {
   const list = el("ul", { class: "feed" });
-  const rows = state.receipts.map((r, i) => [r, i]).filter(([r]) => !r.parse_error).reverse().slice(0, 12);
-  for (const [r, index] of rows) {
+  const rows = state.recent;
+  for (const r of rows) {
     const target = targetOf(r.arguments);
     // For a held call, what the client cares about is how it ended.
     const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
     const cls = outcome ? outcome.cls : decisionClass(r.decision);
-    const li = el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(index) },
+    const li = el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
       el("span", { class: `avatar ${cls}` }),
       el("div", { class: "what" },
         el("strong", {}, toolLabel(r.tool)),
@@ -732,10 +748,6 @@ function recentCard() {
 
 // ---------- approvals ----------
 
-function heldReceipt(evidenceId) {
-  return state.receipts.find((r) => r.evidence_id === evidenceId);
-}
-
 function renderApprovalsInfo() {
   const root = document.getElementById("info-approvals");
   root.replaceChildren();
@@ -746,7 +758,7 @@ function renderApprovalsInfo() {
 }
 
 function approvalCard(p) {
-  const receipt = heldReceipt(p.evidence_id);
+  const receipt = p.receipt;
   const start = receipt ? new Date(receipt.decided_at).getTime() : NaN;
   const expires = new Date(p.expires_at).getTime();
   const left = Math.floor((expires - Date.now()) / 1000);
@@ -776,7 +788,6 @@ function approvalCard(p) {
   card.append(el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)));
   card.append(el("p", { class: "muted" }, t("exact_args_hint")));
 
-  const receiptIndex = state.receipts.findIndex((r) => r.evidence_id === p.evidence_id);
   if (!expired) {
     const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}\npraetore-mcp reject ${p.approval_id} --dir ${state.home}`;
     card.append(el("div", { class: "label-sm" }, t("cli_hint")));
@@ -787,16 +798,15 @@ function approvalCard(p) {
     const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}`;
     actions.append(copyButtonLabeled(commands, t("copy_approve")));
   }
-  if (receiptIndex >= 0) {
-    actions.append(el("button", { type: "button", onclick: () => openDrawer(receiptIndex) }, t("view_receipt")));
+  if (receipt) {
+    actions.append(el("button", { type: "button", onclick: () => openDrawer(receipt) }, t("view_receipt")));
   }
   card.append(actions);
   return card;
 }
 
 function historyCard() {
-  const rows = state.receipts.map((r, i) => [r, i])
-    .filter(([r]) => r.decision === "REQUIRE_APPROVAL").reverse().slice(0, 30);
+  const rows = state.approval_history;
   const card = el("div", { class: "card flush" });
   card.append(el("div", { class: "card-pad" },
     el("h2", {}, t("history")), el("p", { class: "card-sub" }, t("history_sub"))));
@@ -805,10 +815,10 @@ function historyCard() {
     return card;
   }
   const body = el("tbody", {});
-  for (const [r, index] of rows) {
+  for (const r of rows) {
     const target = targetOf(r.arguments);
     const label = approvalLabel(r.approval);
-    body.append(el("tr", { onclick: () => openDrawer(index) },
+    body.append(el("tr", { onclick: () => openDrawer(r) },
       el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
       el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short)),
@@ -827,7 +837,7 @@ function renderDecisionFilter() {
   box.replaceChildren();
   for (const [value, label] of [["", t("all")], ["ALLOW", t("d_ALLOW")], ["DENY", t("d_DENY")], ["REQUIRE_APPROVAL", t("d_REQUIRE_APPROVAL")]]) {
     const button = el("button", { type: "button", class: decisionFilter === value ? "on" : "" }, label);
-    button.addEventListener("click", () => { decisionFilter = value; renderDecisionFilter(); renderTable(); });
+    button.addEventListener("click", () => { decisionFilter = value; renderDecisionFilter(); filtersChanged(); });
     box.append(button);
   }
 }
@@ -835,33 +845,61 @@ function renderDecisionFilter() {
 function renderToolFilter() {
   const select = document.getElementById("f-tool");
   const current = select.value;
-  const tools = [...new Set(state.receipts.map((r) => r.tool).filter((x) => typeof x === "string"))].sort();
+  const tools = state.tools.map((x) => x.tool).sort();
   select.replaceChildren(el("option", { value: "" }, t("all_tools")));
   for (const tool of tools) select.append(el("option", { value: tool }, `${toolLabel(tool)} · ${tool}`));
   if (tools.includes(current)) select.value = current;
 }
 
-function matches(r) {
+// A datetime-local value (local time, to the minute) as a UTC instant.
+// "To" covers the whole minute it names.
+function instantOf(value, endOfMinute) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  if (endOfMinute) date.setSeconds(59, 999);
+  return date.toISOString();
+}
+
+// The filters are applied by the server, over the whole journal.
+function stateUrl() {
+  const params = new URLSearchParams();
   const tool = document.getElementById("f-tool").value;
-  const text = document.getElementById("f-text").value.trim().toLowerCase();
-  if (decisionFilter && r.decision !== decisionFilter) return false;
-  if (tool && r.tool !== tool) return false;
-  if (text && !(r.raw_text.toLowerCase().includes(text) || toolLabel(r.tool).toLowerCase().includes(text))) return false;
-  return true;
+  const text = document.getElementById("f-text").value.trim();
+  const from = instantOf(document.getElementById("f-from").value, false);
+  const to = instantOf(document.getElementById("f-to").value, true);
+  if (decisionFilter) params.set("decision", decisionFilter);
+  if (tool) params.set("tool", tool);
+  if (text) params.set("q", text);
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  params.set("offset", String(pageOffset));
+  params.set("limit", String(PAGE));
+  return `/api/state?${params}`;
+}
+
+function filtersChanged() {
+  pageOffset = 0;
+  fingerprint = null;
+  load();
+}
+
+function goPage(offset) {
+  pageOffset = Math.max(0, offset);
+  fingerprint = null;
+  load();
 }
 
 function renderTable() {
   const body = document.querySelector("#table tbody");
   body.replaceChildren();
-  const rows = state.receipts.map((r, i) => [r, i]).reverse();
-  let shown = 0;
-  for (const [r, index] of rows) {
-    if (!matches(r)) continue;
-    shown += 1;
+  const page = state.page;
+  const rows = page.receipts;
+  for (const r of rows) {
     const classes = [];
-    if (index === selected) classes.push("selected");
+    if (selected && r.evidence_id && selected.evidence_id === r.evidence_id) classes.push("selected");
     if (freshIds.has(r.evidence_id)) classes.push("fresh");
-    const tr = el("tr", { class: classes.join(" "), onclick: () => openDrawer(index) });
+    const tr = el("tr", { class: classes.join(" "), onclick: () => openDrawer(r) });
     if (r.parse_error) {
       tr.append(el("td", { colspan: "6", class: "mono" },
         el("span", { class: "tag bad" }, t("unreadable")), ` ${r.location.file}:${r.location.line}: ${r.parse_error}`));
@@ -880,19 +918,27 @@ function renderTable() {
     }
     body.append(tr);
   }
-  document.getElementById("shown").textContent = t("shown", shown, state.receipts.length);
+  document.getElementById("shown").textContent = rows.length
+    ? t("shown_range", page.offset + 1, page.offset + rows.length, page.matching)
+    : t("shown", 0, page.matching);
+  const newer = document.getElementById("page-newer");
+  const older = document.getElementById("page-older");
+  newer.textContent = t("page_newer");
+  older.textContent = t("page_older");
+  newer.disabled = page.offset === 0;
+  older.disabled = page.offset + rows.length >= page.matching;
   const empty = document.getElementById("table-empty");
-  empty.hidden = shown > 0;
-  empty.replaceChildren(el("strong", {}, state.receipts.length ? t("empty_filter_t") : t("empty_recent")),
-    state.receipts.length ? t("empty_filter_d") : "");
+  empty.hidden = rows.length > 0;
+  const none = state.summary.total === 0;
+  empty.replaceChildren(el("strong", {}, none ? t("empty_home_t") : t("empty_filter_t")),
+    el("p", {}, none ? t("empty_home_d") : t("empty_filter_d")));
 }
 
 // ---------- drawer ----------
 
-function openDrawer(index) {
-  selected = index;
+function openDrawer(r) {
+  selected = r;
   drawerTab = "summary";
-  const r = state.receipts[index];
   if (r && r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
   renderDrawer();
   if (view === "info") renderTable();
@@ -908,7 +954,7 @@ function closeDrawer() {
 function renderDrawer() {
   const drawer = document.getElementById("drawer");
   const scrim = document.getElementById("scrim");
-  const r = selected !== null && state ? state.receipts[selected] : null;
+  const r = selected;
   if (!r) {
     drawer.classList.remove("open");
     drawer.setAttribute("aria-hidden", "true");
@@ -1160,16 +1206,17 @@ function fingerprintOf(s) {
   return JSON.stringify([
     s.summary, s.verify && s.verify.status, s.verify && s.verify.head, s.verify && s.verify.failed,
     s.verify && s.verify.approval, s.pending, s.policy && s.policy.digest, s.policy && s.policy.status,
-    s.receipts.map((r) => r.approval).join("|"),
+    s.page.offset, s.page.matching, s.page.receipts.map((r) => [r.evidence_id, r.approval]),
+    s.recent.map((r) => [r.evidence_id, r.approval]),
   ]);
 }
 
 function announce(next) {
-  const ids = new Set(next.receipts.map((r) => r.evidence_id).filter(Boolean));
+  const ids = new Set(next.recent.map((r) => r.evidence_id).filter(Boolean));
   const pendingIds = new Set((Array.isArray(next.pending) ? next.pending : []).map((p) => p.approval_id));
   if (knownIds) {
-    let added = 0;
-    for (const id of ids) if (!knownIds.has(id)) { freshIds.add(id); added += 1; }
+    for (const id of ids) if (!knownIds.has(id)) freshIds.add(id);
+    const added = Math.max(0, next.summary.total - state.summary.total);
     let newPending = 0;
     for (const id of pendingIds) if (!knownPending.has(id)) newPending += 1;
     if (newPending > 0) toast(t("toast_pending"), "warn", () => go("operation"));
@@ -1180,11 +1227,11 @@ function announce(next) {
 }
 
 async function load() {
-  if (loading) return;
+  if (loading) { reloadQueued = true; return; }
   loading = true;
   const error = document.getElementById("load-error");
   try {
-    const response = await fetch("/api/state", { cache: "no-store" });
+    const response = await fetch(stateUrl(), { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const next = await response.json();
     error.hidden = true;
@@ -1206,7 +1253,20 @@ async function load() {
     if (!state) renderAll();
   } finally {
     loading = false;
+    if (reloadQueued) { reloadQueued = false; load(); }
   }
+}
+
+// A receipt named by #e=<evidence_id>: from what is loaded, or asked for.
+async function openEvidence(id) {
+  const loaded = [...state.page.receipts, ...state.recent, ...state.approval_history,
+    ...(Array.isArray(state.pending) ? state.pending.map((p) => p.receipt).filter(Boolean) : [])];
+  const found = loaded.find((r) => r.evidence_id === id);
+  if (found) { openDrawer(found); return; }
+  try {
+    const response = await fetch(`/api/receipt?${new URLSearchParams({ id })}`, { cache: "no-store" });
+    if (response.ok) openDrawer(await response.json());
+  } catch (_) { /* the link names no receipt here */ }
 }
 
 // #/operation, #/info/<tab>; #e=<evidence_id> opens that receipt over the
@@ -1219,10 +1279,7 @@ function routeFromHash() {
   const hash = location.hash;
   const evidence = hash.match(/^#e=(.+)$/);
   if (evidence) {
-    if (state) {
-      const index = state.receipts.findIndex((r) => r.evidence_id === decodeURIComponent(evidence[1]));
-      if (index >= 0) selected = index;
-    }
+    if (state) openEvidence(decodeURIComponent(evidence[1]));
     return;
   }
   const match = hash.match(/^#\/([a-z]+)(?:\/([a-z]+))?/);
@@ -1280,8 +1337,15 @@ document.addEventListener("DOMContentLoaded", () => {
     storageSet(localStorage, LIVE_KEY, live ? "on" : "off");
     if (live) load();
   });
-  document.getElementById("f-tool").addEventListener("change", renderTable);
-  document.getElementById("f-text").addEventListener("input", renderTable);
+  document.getElementById("f-tool").addEventListener("change", filtersChanged);
+  document.getElementById("f-from").addEventListener("change", filtersChanged);
+  document.getElementById("f-to").addEventListener("change", filtersChanged);
+  document.getElementById("f-text").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(filtersChanged, 250);
+  });
+  document.getElementById("page-newer").addEventListener("click", () => goPage(pageOffset - PAGE));
+  document.getElementById("page-older").addEventListener("click", () => goPage(pageOffset + PAGE));
   document.getElementById("drawer-close").addEventListener("click", closeDrawer);
   document.getElementById("scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {

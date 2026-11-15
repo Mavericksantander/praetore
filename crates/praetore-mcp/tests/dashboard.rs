@@ -847,3 +847,243 @@ fn assert_no_event_handler_attributes(js: &str) {
         }
     }
 }
+
+/// `/api/state` with `query`, through [`dashboard::respond_with`].
+fn api(home: &Home, cache: &mut dashboard::Cache, query: &str) -> (u16, Value) {
+    let request = format!("GET /api/state{query} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n");
+    let response = dashboard::respond_with(&request, home, None, 8787, cache);
+    let body = if response.status == 200 {
+        serde_json::from_slice(&response.body).unwrap()
+    } else {
+        Value::String(String::from_utf8(response.body).unwrap())
+    };
+    (response.status, body)
+}
+
+fn page_tools(state: &Value) -> Vec<&str> {
+    state["page"]["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["tool"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn api_state_sends_one_page_newest_first_with_full_counts() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (status, state) = api(&home, &mut cache, "?limit=2");
+    assert_eq!(status, 200, "{state}");
+    assert_eq!(
+        page_tools(&state),
+        ["read_file", "move_file"],
+        "newest first"
+    );
+    assert_eq!(state["page"]["matching"], 4);
+    assert!(state.get("receipts").is_none(), "no whole journal");
+    let (_, next) = api(&home, &mut cache, "?limit=2&offset=2");
+    assert_eq!(page_tools(&next), ["delete_file", "echo"]);
+    // The counts cover the whole journal, whatever the page.
+    assert_eq!(state["summary"]["total"], 4);
+    assert_eq!(state["summary"]["allow"], 2);
+    assert_eq!(
+        state["tools"].as_array().unwrap().len(),
+        4,
+        "{}",
+        state["tools"]
+    );
+    let buckets = state["activity"]["buckets"].as_array().unwrap();
+    let decisions: u64 = buckets
+        .iter()
+        .map(|b| {
+            b["ALLOW"].as_u64().unwrap()
+                + b["DENY"].as_u64().unwrap()
+                + b["REQUIRE_APPROVAL"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(decisions, 4);
+    assert_eq!(state["activity"]["bucket_seconds"], 900);
+    assert_eq!(state["recent"].as_array().unwrap().len(), 4);
+    assert_eq!(state["approval_history"][0]["tool"], "move_file");
+    // A parsed receipt is sent once, as JSON, not again as text.
+    let first = &state["page"]["receipts"][0];
+    assert!(first["raw"].is_object() && first.get("raw_text").is_none());
+    // One verification for the three requests.
+    assert_eq!(cache.verifications(), 1);
+}
+
+#[test]
+fn api_state_filters_by_decision_tool_time_and_text() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let tools = |query: &str, cache: &mut dashboard::Cache| -> Vec<String> {
+        let (status, state) = api(&home, cache, query);
+        assert_eq!(status, 200, "{query}: {state}");
+        page_tools(&state).into_iter().map(str::to_owned).collect()
+    };
+    assert_eq!(tools("?decision=DENY", &mut cache), ["delete_file"]);
+    assert_eq!(tools("?decision=ALLOW", &mut cache), ["read_file", "echo"]);
+    assert_eq!(
+        tools("?decision=REQUIRE_APPROVAL", &mut cache),
+        ["move_file"]
+    );
+    assert_eq!(tools("?tool=echo", &mut cache), ["echo"]);
+    assert_eq!(
+        tools("?decision=ALLOW&tool=delete_file", &mut cache),
+        Vec::<String>::new()
+    );
+    // Text search over the receipt, case-insensitive, form-encoded.
+    assert_eq!(tools("?q=%3CB%3Ehi", &mut cache), ["echo"]);
+    assert_eq!(tools("?q=ok.txt", &mut cache), ["read_file"]);
+    // Time range on decided_at, inclusive, any UTC offset.
+    let (_, all) = api(&home, &mut cache, "");
+    let times: Vec<&str> = all["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["decided_at"].as_str().unwrap())
+        .collect();
+    let (newest, oldest) = (times[0], times[times.len() - 1]);
+    let enc = |t: &str| t.replace('+', "%2B");
+    assert_eq!(
+        tools(
+            &format!("?from={}&to={}", enc(oldest), enc(newest)),
+            &mut cache
+        )
+        .len(),
+        4
+    );
+    assert_eq!(
+        tools("?from=2999-01-01T00:00:00Z", &mut cache),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        tools("?to=2000-01-01T00:00:00%2B03:00", &mut cache),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        tools(&format!("?from={}", enc(newest)), &mut cache).len(),
+        times.iter().filter(|t| **t == newest).count()
+    );
+    for bad in [
+        "?decision=allow",
+        "?decision=UNREADABLE",
+        "?limit=0",
+        "?limit=501",
+        "?offset=-1",
+        "?from=yesterday",
+        "?to=2026-01-01",
+        "?q=%ZZ",
+        "?q=%FF",
+        "?sort=asc",
+    ] {
+        let (status, body) = api(&home, &mut cache, bad);
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
+    assert_eq!(cache.verifications(), 1);
+}
+
+/// Rewrites `file` with `edit` applied, keeping its length and its
+/// modification time.
+fn rewrite_keeping_mtime(file: &Path, edit: impl Fn(&str) -> String) {
+    let before = fs::metadata(file).unwrap();
+    let text = edit(&fs::read_to_string(file).unwrap());
+    assert_eq!(text.len() as u64, before.len(), "same length");
+    fs::write(file, text).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(before.modified().unwrap())
+        .unwrap();
+    assert_eq!(
+        fs::metadata(file).unwrap().modified().unwrap(),
+        before.modified().unwrap()
+    );
+}
+
+#[test]
+fn cached_verification_is_redone_when_a_file_verify_reads_changes() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(state["verify"]["status"], "ok");
+    let (_, _) = api(&home, &mut cache, "?decision=DENY");
+    assert_eq!(cache.verifications(), 1, "nothing changed");
+
+    // Same length, same modification time: still verified again.
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    rewrite_keeping_mtime(&file, |text| {
+        text.replacen(
+            r#""praetore.mode":"enforce""#,
+            r#""praetore.mode":"observe""#,
+            1,
+        )
+    });
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(cache.verifications(), 2);
+    assert_eq!(state["verify"]["status"], "fail", "{}", state["verify"]);
+    assert_eq!(
+        state["verify"]["status"],
+        dashboard::state(&home, None)["verify"]["status"]
+    );
+
+    // A changed pin is verified again too.
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    assert_eq!(api(&home, &mut cache, "").1["verify"]["status"], "ok");
+    let approver = fs::read_to_string(home.approver_pin()).unwrap();
+    rewrite_keeping_mtime(&home.attester_pin(), |_| approver.clone());
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(cache.verifications(), 2);
+    assert_eq!(state["verify"]["status"], "fail");
+
+    // An appended line.
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    let mut journal = fs::OpenOptions::new().append(true).open(&file).unwrap();
+    journal.write_all(b"{not json\n").unwrap();
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(cache.verifications(), 3);
+    assert_eq!(state["summary"]["unreadable"], 1);
+    assert_eq!(state["summary"]["total"], 5);
+}
+
+#[test]
+fn pending_calls_carry_their_receipt() {
+    let (_temp, home) = home_with_receipts();
+    let (_, state) = api(&home, &mut dashboard::Cache::default(), "");
+    let pending = state["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{}", state["pending"]);
+    let receipt = &pending[0]["receipt"];
+    assert_eq!(receipt["evidence_id"], pending[0]["evidence_id"]);
+    assert_eq!(receipt["decision"], "REQUIRE_APPROVAL");
+    assert_eq!(receipt["verified"], true);
+}
+
+#[test]
+fn api_receipt_returns_one_receipt_by_evidence_id() {
+    let (_temp, home) = home_with_receipts();
+    let state = dashboard::state(&home, None);
+    let id = state["receipts"][2]["evidence_id"].as_str().unwrap();
+    let get = |target: &str| {
+        dashboard::respond(
+            &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n"),
+            &home,
+            None,
+            8787,
+        )
+    };
+    let found = get(&format!("/api/receipt?id={id}"));
+    assert_eq!(found.status, 200);
+    let receipt: Value = serde_json::from_slice(&found.body).unwrap();
+    assert_eq!(receipt["evidence_id"], id);
+    assert_eq!(receipt["tool"], "move_file");
+    for missing in [
+        "/api/receipt?id=nope",
+        "/api/receipt",
+        "/api/receipt?id=%ZZ",
+    ] {
+        assert_eq!(get(missing).status, 404, "{missing}");
+    }
+}

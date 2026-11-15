@@ -67,7 +67,8 @@
             </div>
             <div class="segmented" id="f-decision" role="group"></div>
             <select id="f-tool"></select>
-            <span id="shown" class="muted"></span>
+            <label class="range"><span data-i18n="f_from"></span><input id="f-from" type="datetime-local"></label>
+            <label class="range"><span data-i18n="f_to"></span><input id="f-to" type="datetime-local"></label>
           </div>
           <div class="table-wrap">
             <table class="data" id="table">
@@ -83,6 +84,11 @@
             </table>
           </div>
           <div class="empty" id="table-empty" hidden></div>
+          <div class="pager">
+            <button type="button" id="page-newer"></button>
+            <span id="shown" class="muted"></span>
+            <button type="button" id="page-older"></button>
+          </div>
         </div>
         <div class="subview" id="info-approvals" hidden></div>
         <div class="subview" id="info-policy" hidden></div>
