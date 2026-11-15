@@ -1339,3 +1339,40 @@ fn a_corrupt_or_truncated_journal_shows_an_error_and_the_server_keeps_serving() 
     assert!(get("/").0.starts_with("HTTP/1.1 200"));
     server.join().unwrap();
 }
+
+#[test]
+fn api_state_sends_the_40_most_recent_receipts_for_the_live_view() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("home");
+    let dir = root.to_str().unwrap();
+    assert!(run(&["init", "--dir", dir], "").status.success());
+    let mut input = json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}).to_string() + "\n";
+    for id in 1..=45 {
+        input += &format!(
+            "{}\n",
+            json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"echo","arguments":{"n": id}}})
+        );
+    }
+    let server = fake_server();
+    let out = run(
+        &[
+            "wrap",
+            "--dir",
+            dir,
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+            "--",
+            server.to_str().unwrap(),
+        ],
+        &input,
+    );
+    assert!(out.status.success(), "{out:?}");
+    let (_, state) = api(&Home::new(root), &mut dashboard::Cache::default(), "");
+    assert_eq!(state["summary"]["total"], 45);
+    let recent = state["recent"].as_array().unwrap();
+    assert_eq!(recent.len(), 40);
+    assert_eq!(recent[0]["arguments"]["n"], 45, "newest first");
+    assert_eq!(recent[39]["arguments"]["n"], 6);
+}

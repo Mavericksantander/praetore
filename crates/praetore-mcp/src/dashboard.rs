@@ -267,7 +267,8 @@ pub fn respond_with(
 pub const DEFAULT_PAGE: usize = 100;
 /// Largest `limit` accepted.
 pub const MAX_PAGE: usize = 500;
-const RECENT: usize = 12;
+/// Receipts the live view draws one by one.
+const RECENT: usize = 40;
 const APPROVAL_HISTORY: usize = 30;
 /// Activity buckets are 15 minutes wide: every UTC offset in use is a
 /// multiple of 15 minutes, so the page can regroup them by local hour or
