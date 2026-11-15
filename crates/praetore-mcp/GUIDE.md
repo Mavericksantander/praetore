@@ -303,10 +303,16 @@ the home again. Stop it with Ctrl-C. The page shows:
   resolved, status), and the agent, attester and authority signatures with
   their key ids. Each signature shows OK or FAIL.
 - the verification status, per receipt and for the whole journal. It comes
-  from the same code as `praetore-mcp verify`. The page shows nothing
-  `verify` does not check. It includes the journal order (seq/prev) and the
-  journal head. Keep the head outside this machine. `--expected-head HEX`
-  works as it does for `verify`.
+  from the same code as `praetore-mcp verify`. It covers the receipts
+  only. It includes the journal order (seq/prev) and the journal head.
+  Keep the head outside this machine. `--expected-head HEX` works as it
+  does for `verify`.
+
+The page reads three things from the home: the receipts, which `verify` checks; the
+calls waiting for approval, read from `approvals/pending/*.json`, which are
+not signed and which `verify` does not check; and the rules of the current
+policy. It is read-only: approving or rejecting is done with
+`praetore-mcp approve` and `praetore-mcp reject` in a terminal.
 
 The page is embedded in the binary and loads nothing from the network.
 `dashboard` writes nothing under the home. It answers only GET requests

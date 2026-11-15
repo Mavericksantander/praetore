@@ -501,6 +501,90 @@ fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (u64, SystemTime)> {
     out
 }
 
+/// The whole policy, so any added source (`'unsafe-inline'`, a host, a
+/// scheme) or removed directive fails the comparison.
+const EXPECTED_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+/// The value of the only `Content-Security-Policy` header of `response`.
+fn csp_of(response: &str) -> &str {
+    let head = response.split_once("\r\n\r\n").unwrap().0;
+    let values: Vec<&str> = head
+        .split("\r\n")
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-security-policy")
+                .then(|| value.trim())
+        })
+        .collect();
+    assert_eq!(values.len(), 1, "{head}");
+    values[0]
+}
+
+#[test]
+fn host_header_matrix() {
+    let (_temp, home) = home_with_receipts();
+    let listener = dashboard::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let good = format!("Host: 127.0.0.1:{port}");
+    let other_port = format!("Host: 127.0.0.1:{}", port.wrapping_add(1));
+    let cases: Vec<(String, u16)> = vec![
+        (format!("GET / HTTP/1.1\r\n{good}\r\n\r\n"), 200),
+        (
+            format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+            200,
+        ),
+        (
+            "GET / HTTP/1.1\r\nHost: attacker.example\r\n\r\n".into(),
+            403,
+        ),
+        (format!("GET / HTTP/1.1\r\n{other_port}\r\n\r\n"), 403),
+        ("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".into(), 403),
+        ("GET / HTTP/1.0\r\n\r\n".into(), 403),
+        (
+            format!("GET / HTTP/1.1\r\n{good}\r\nHost: attacker.example\r\n\r\n"),
+            400,
+        ),
+        (
+            format!("GET / HTTP/1.1\r\nHost: attacker.example\r\n{good}\r\n\r\n"),
+            400,
+        ),
+        (
+            format!("GET /api/state HTTP/1.1\r\n{good}\r\n{good}\r\n\r\n"),
+            400,
+        ),
+        (
+            format!("GET /app.js HTTP/1.1\r\n{good}\r\nhost: 127.0.0.1:{port}\r\n\r\n"),
+            400,
+        ),
+    ];
+    let served_home = home.clone();
+    let count = cases.len();
+    let server = std::thread::spawn(move || {
+        dashboard::serve(&listener, &served_home, None, Some(count)).unwrap();
+    });
+    for (request, status) in &cases {
+        let response = http(port, request);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{request:?} gave\n{response}"
+        );
+        if *status != 200 {
+            // Nothing served: only the short plain-text refusal.
+            let (head, body) = response.split_once("\r\n\r\n").unwrap();
+            assert!(
+                head.contains("Content-Type: text/plain"),
+                "{request:?}: {head}"
+            );
+            assert!(body.len() < 64, "{request:?}: {body}");
+            assert!(
+                !body.contains('<') && !body.contains('{') && !body.contains("function"),
+                "{request:?}: {body}"
+            );
+        }
+    }
+    server.join().unwrap();
+}
+
 #[test]
 fn server_answers_get_on_loopback_only_and_writes_nothing() {
     let (_temp, home) = home_with_receipts();
@@ -515,11 +599,12 @@ fn server_answers_get_on_loopback_only_and_writes_nothing() {
 
     let page = http(port, &format!("GET / HTTP/1.1\r\n{host}\r\n\r\n"));
     assert!(page.starts_with("HTTP/1.1 200"), "{page}");
-    assert!(page.contains("Content-Security-Policy: default-src 'none'"));
+    assert_eq!(csp_of(&page), EXPECTED_CSP);
     // No network origin anywhere in the embedded page.
     for asset in ["/", "/app.js", "/app.css"] {
         let body = http(port, &format!("GET {asset} HTTP/1.1\r\n{host}\r\n\r\n"));
         assert!(body.starts_with("HTTP/1.1 200"), "{asset}");
+        assert_eq!(csp_of(&body), EXPECTED_CSP, "{asset}");
         assert!(
             !body.contains("http://") && !body.contains("https://"),
             "{asset}"
@@ -564,13 +649,179 @@ fn page_never_writes_journal_values_as_html() {
         &format!("GET /app.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
     );
     server.join().unwrap();
+    let js = js.split_once("\r\n\r\n").unwrap().1;
     for sink in [
         "innerHTML",
         "outerHTML",
         "insertAdjacentHTML",
         "document.write",
+        "createContextualFragment",
+        "DOMParser",
+        "srcdoc",
         "eval(",
+        "Function(",
     ] {
         assert!(!js.contains(sink), "app.js uses {sink}");
+    }
+    assert_no_event_handler_attributes(js);
+}
+
+/// HTML event handler content attributes (GlobalEventHandlers and the
+/// document and window ones).
+const EVENT_HANDLER_ATTRIBUTES: &[&str] = &[
+    "onabort",
+    "onafterprint",
+    "onanimationend",
+    "onanimationiteration",
+    "onanimationstart",
+    "onauxclick",
+    "onbeforeinput",
+    "onbeforeprint",
+    "onbeforetoggle",
+    "onbeforeunload",
+    "onblur",
+    "oncancel",
+    "oncanplay",
+    "oncanplaythrough",
+    "onchange",
+    "onclick",
+    "onclose",
+    "oncontextlost",
+    "oncontextmenu",
+    "oncontextrestored",
+    "oncopy",
+    "oncuechange",
+    "oncut",
+    "ondblclick",
+    "ondrag",
+    "ondragend",
+    "ondragenter",
+    "ondragleave",
+    "ondragover",
+    "ondragstart",
+    "ondrop",
+    "ondurationchange",
+    "onemptied",
+    "onended",
+    "onerror",
+    "onfocus",
+    "onfocusin",
+    "onfocusout",
+    "onformdata",
+    "onhashchange",
+    "oninput",
+    "oninvalid",
+    "onkeydown",
+    "onkeypress",
+    "onkeyup",
+    "onlanguagechange",
+    "onload",
+    "onloadeddata",
+    "onloadedmetadata",
+    "onloadstart",
+    "onmessage",
+    "onmessageerror",
+    "onmousedown",
+    "onmouseenter",
+    "onmouseleave",
+    "onmousemove",
+    "onmouseout",
+    "onmouseover",
+    "onmouseup",
+    "onoffline",
+    "ononline",
+    "onpagehide",
+    "onpagereveal",
+    "onpageshow",
+    "onpageswap",
+    "onpaste",
+    "onpause",
+    "onplay",
+    "onplaying",
+    "onpointercancel",
+    "onpointerdown",
+    "onpointerenter",
+    "onpointerleave",
+    "onpointermove",
+    "onpointerout",
+    "onpointerover",
+    "onpointerup",
+    "onpopstate",
+    "onprogress",
+    "onratechange",
+    "onrejectionhandled",
+    "onreset",
+    "onresize",
+    "onscroll",
+    "onscrollend",
+    "onsecuritypolicyviolation",
+    "onseeked",
+    "onseeking",
+    "onselect",
+    "onselectionchange",
+    "onselectstart",
+    "onslotchange",
+    "onstalled",
+    "onstorage",
+    "onsubmit",
+    "onsuspend",
+    "ontimeupdate",
+    "ontoggle",
+    "ontouchcancel",
+    "ontouchend",
+    "ontouchmove",
+    "ontouchstart",
+    "ontransitioncancel",
+    "ontransitionend",
+    "ontransitionrun",
+    "ontransitionstart",
+    "onunhandledrejection",
+    "onunload",
+    "onvolumechange",
+    "onwaiting",
+    "onwheel",
+];
+
+/// Fails when `js` sets an event handler attribute: a literal
+/// `setAttribute("on...")`, or an `on...:` key in the attributes passed to
+/// `el()`, which hands every key other than `class`, `style` and `onclick`
+/// to `setAttribute`. `el()` turns `onclick` into `addEventListener`.
+fn assert_no_event_handler_attributes(js: &str) {
+    let lower = js.to_ascii_lowercase();
+    let word_at = |at: usize| -> &str {
+        let rest = &lower[at..];
+        let len = rest.bytes().take_while(u8::is_ascii_alphanumeric).count();
+        &rest[..len]
+    };
+    for (at, _) in lower.match_indices("setattribute(") {
+        let argument = lower[at + "setattribute(".len()..].trim_start();
+        let Some(name) = argument.strip_prefix(['"', '\'', '`']) else {
+            continue;
+        };
+        let start = lower.len() - name.len();
+        assert!(
+            !EVENT_HANDLER_ATTRIBUTES.contains(&word_at(start)),
+            "app.js sets an event handler attribute: {}",
+            &js[at..(at + 60).min(js.len())]
+        );
+    }
+    let bytes = lower.as_bytes();
+    for (at, _) in lower.match_indices("on") {
+        if at > 0
+            && (bytes[at - 1].is_ascii_alphanumeric()
+                || matches!(bytes[at - 1], b'_' | b'$' | b'.'))
+        {
+            continue;
+        }
+        let word = word_at(at);
+        let after = lower[at + word.len()..]
+            .trim_start_matches(['"', '\''])
+            .trim_start();
+        if word != "onclick" && EVENT_HANDLER_ATTRIBUTES.contains(&word) && after.starts_with(':') {
+            panic!(
+                "app.js passes an event handler attribute to el(): {}",
+                &js[at..(at + 60).min(js.len())]
+            );
+        }
     }
 }

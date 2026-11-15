@@ -163,12 +163,25 @@ pub fn respond(request: &str, home: &Home, expected_head: Option<&str>, port: u1
     let (Some(method), Some(target)) = (request_line.next(), request_line.next()) else {
         return Response::text(400, "bad request");
     };
-    let host = lines.take_while(|line| !line.is_empty()).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("host").then(|| value.trim())
-    });
+    let hosts: Vec<&str> = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("host")
+                .then(|| value.trim())
+        })
+        .collect();
+    // More than one Host is ambiguous: a proxy and this listener could
+    // read different ones. Refused whatever the values and their order.
+    if hosts.len() > 1 {
+        return Response::text(400, "more than one Host header");
+    }
     let allowed_hosts = [format!("127.0.0.1:{port}"), format!("localhost:{port}")];
-    if !host.is_some_and(|host| allowed_hosts.iter().any(|allowed| allowed == host)) {
+    if !hosts
+        .first()
+        .is_some_and(|host| allowed_hosts.iter().any(|allowed| allowed == host))
+    {
         return Response::text(403, "host not allowed");
     }
     if method != "GET" {
