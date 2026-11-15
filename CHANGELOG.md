@@ -33,7 +33,14 @@
   depends on an argument. Tools allowed only by an allow-all rule are
   listed apart. Exit code 0 when there are none, 1 when there is one, 2 on a
   usage error or when the server cannot be started or does not answer. It
-  sends no `tools/call` and writes nothing under `DIR`.
+  sends no `tools/call` and writes nothing under `DIR`. For each tool
+  denied because no rule names it, it prints the
+  `praetore-mcp policy allow --id ... --server ... --tool ...` line that
+  allows it, quoted to run as printed in a POSIX shell. Tools with a rule
+  that depends on an argument get no line, and neither do tool names with
+  characters outside `A-Z a-z 0-9 _ - .`.
+- Commands that praetore-mcp prints with `--dir DIR` quote `DIR` when it
+  has spaces or other characters a shell would interpret.
 - `scripts/mcp-smoke.py` checks `policy coverage` against
   `@modelcontextprotocol/server-filesystem@2.3.0`, and the smoke test now
   allows `read_text_file` with an explicit rule.
