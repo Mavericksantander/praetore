@@ -290,39 +290,71 @@ praetore-mcp dashboard --port 0   # a free port, printed at startup
 
 `dashboard` serves a read-only page over `receipts/*.jsonl` on 127.0.0.1
 only. There is no option to listen on another address. Stop it with
-Ctrl-C. The page shows:
+Ctrl-C. The page has four views. Each mark it draws stands for a value
+in a receipt, in a pending approval file or in the result of `verify`;
+nothing is drawn that PRÆTORE does not record.
 
-- a summary: total, ALLOW, DENY, REQUIRE_APPROVAL, the active policy (id,
-  version, digest) and a warning when the policy has an allow-all rule and
-  the journal has enforce receipts. The mode is a `wrap` option, so the
-  page takes it from the receipts. An allow-all rule is an ALLOW rule
-  with no tool and no condition, for every server or for one, like the
+- **Home**: the agent id and the servers from the 40 latest receipts, the mode
+  (enforce, observe, or both with their counts), the verification result
+  (OK with the number of receipts, or the first failure, or the error when
+  the journal cannot be read) and three counts: ALLOW, DENY and pending
+  calls.
+- **Live**: the 8 newest receipts as a drawing. The agent is a line on the
+  left; each call is a box with its tool, server, local time and UTC. A
+  call that was allowed reaches its box. A denied call stops at a red bar
+  with what decided it: the rule id, `default deny: no rule allows it`, or
+  the engine check. In observe mode the bar is only outlined, since the
+  call went through. A call waiting for approval stops at an amber dashed
+  bar marked "pending, notice not signed, not checked by verify", with the
+  `praetore-mcp approve` and `reject` commands to run in a terminal. A
+  receipt that `verify` rejects is marked, with the reason `verify` gives,
+  in the drawing and in the list. A call that arrives while the page is
+  open is scanned in; nothing moves when a read of the journal finds
+  nothing new.
+- **Chain**: the receipts in seq order, joined by the `prev` hash link,
+  with the decision of each in the same colors. Where `verify` fails, the
+  link is drawn cut and the reason is written next to it. The filters
+  (decision, tool, time range, text) run over the whole journal on the
+  server, 100 receipts per page, newest first; the receipts outside the
+  page are drawn as one node each side that opens the next page, and only
+  the rows on screen are drawn.
+- **Information**: approvals, the policy rules, the verification detail
+  and statistics (counts per decision, activity per hour or day, the most
+  used tools). A summary of the policy (id, version, digest) and a warning
+  when the policy has an allow-all rule and the journal has enforce
+  receipts. The mode is a `wrap` option, so the page takes it from the
+  receipts. An allow-all rule is an ALLOW rule with no tool and no
+  condition, for every server or for one, like the
   `allow-all-mcp-tool-calls` that `init` wrote before default deny; it is
   the same rule `policy check` warns about.
-- the decisions table, newest first, 100 receipts per page: local time
-  next to UTC, server, tool, arguments, decision, rule (or `default deny`),
-  mode and evidence id. You can filter by decision, tool, time range and
-  text; the filters run over the whole journal, not only the page shown.
-- the detail of a receipt: what decided it, from the `decided_by` signed
-  in the receipt (a rule, a rule that matched but could not apply, default
-  deny or an engine check), with the rule text when the current policy is
-  the one the receipt names; the full JSON line, `path_check` (lexical,
-  resolved, status), and the agent, attester and authority signatures with
-  their key ids. Each signature shows OK or FAIL.
-- the verification status, per receipt and for the whole journal. It comes
-  from the same code as `praetore-mcp verify` and is also shown in the
-  sidebar. It covers the receipts only. It includes the journal order
-  (seq/prev) and the journal head.
-  Keep the head outside this machine. `--expected-head HEX` works as it
-  does for `verify`. The result is kept in memory and computed again when
-  any file `verify` reads (the journal files, the attester and issuer
-  pins, the approver pin, the approval journal) changes length,
-  modification time, change time or inode. On a platform without change
-  times it is computed again on every request. With a large journal the
-  first request after a change takes as long as `verify`. A line that is
-  not a receipt (a write cut short, for example) is listed as unreadable;
-  a journal that cannot be read at all shows the error instead of the
-  table.
+
+Live and Chain each have a list view with the same content as text: rows
+reached with Tab and opened with Enter, read by a screen reader, with no
+animation. The drawings have a text label for screen readers. With
+"reduce motion" set in the system, nothing moves.
+
+Opening a receipt shows its tool, its arguments as text, what decided it,
+the mode, local time and UTC, the evidence id, seq, the `prev` hash link
+and the result of `verify` for that receipt. What decided it comes from the
+`decided_by` signed in the receipt (a rule, a rule that matched but could
+not apply, default deny or an engine check), with the rule text when the
+current policy is the one the receipt names. Other tabs show the full JSON
+line, `path_check` (lexical, resolved, status), and the agent, attester
+and authority signatures with their key ids. Each signature shows OK or
+FAIL.
+
+The verification status, per receipt and for the whole journal, comes from
+the same code as `praetore-mcp verify` and is also shown in the sidebar. It
+covers the receipts only. It includes the journal order (seq/prev) and the
+journal head. Keep the head outside this machine. `--expected-head HEX`
+works as it does for `verify`. The result is kept in memory and computed
+again when any file `verify` reads (the journal files, the attester and
+issuer pins, the approver pin, the approval journal) changes length,
+modification time, change time or inode. On a platform without change times
+it is computed again on every request. With a large journal the first
+request after a change takes as long as `verify`. A line that is not a
+receipt (a write cut short, for example) is listed as unreadable; a journal
+that cannot be read at all shows the error instead of the table.
 
 The page reads three things from the home: the receipts, which `verify`
 checks; the calls waiting for approval, read from `approvals/pending/*.json`,

@@ -304,6 +304,12 @@ jobs:
         run: TZ=UTC node --test "crates/praetore-console/tests-js/*.test.mjs"
       - name: Page tests, machine zone Asia/Kolkata
         run: TZ=Asia/Kolkata node --test "crates/praetore-console/tests-js/*.test.mjs"
+      # The praetore-mcp dashboard page on a stand-in DOM and canvas, fed
+      # with real /api/state answers (tests-js/fixtures/make.sh).
+      - name: Dashboard page tests, machine zone UTC
+        run: TZ=UTC node --test "crates/praetore-mcp/tests-js/*.test.mjs"
+      - name: Dashboard page tests, machine zone Asia/Kolkata
+        run: TZ=Asia/Kolkata node --test "crates/praetore-mcp/tests-js/*.test.mjs"
 
   claude-code-hook-example:
     name: Claude Code hook example (standalone)
