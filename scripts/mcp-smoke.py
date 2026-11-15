@@ -2,10 +2,11 @@
 """End-to-end smoke test of a built praetore-mcp binary.
 
 Runs the binary in front of the real @modelcontextprotocol/server-filesystem
-with a fresh LOCAL/DEV home and a deny rule for write_file, sends one
-allowed tools/call (read_text_file) and one denied one (write_file), and
-checks the replies, the file system, the receipts and `verify`. Needs
-Python 3 (standard library only) and Node.
+with a fresh LOCAL/DEV home (default deny), an allow rule for read_text_file
+and a deny rule for write_file, sends one allowed tools/call (read_text_file)
+and one denied one (write_file), and checks the replies, the file system,
+the receipts and `verify`. It also runs `policy coverage` against the same
+server. Needs Python 3 (standard library only) and Node.
 
 The server comes from scripts/mcp-smoke/, installed from its committed
 lockfile; the script does not download anything:
@@ -182,12 +183,54 @@ def main():
 
     check("--version", run(binary, "--version").returncode == 0)
     check("init", run(binary, "init", "--dir", home).returncode == 0)
+    with open(os.path.join(home, "policy.json"), encoding="utf-8") as handle:
+        check("init writes no rules (default deny)", json.load(handle).get("rules") == [])
+    check(
+        "policy allow read_text_file",
+        run(binary, "policy", "allow", "--id", "allow-read", "--server", "filesystem",
+            "--tool", "read_text_file", "--dir", home).returncode == 0,
+    )
     check(
         "policy deny write_file",
         run(binary, "policy", "deny", "--id", "deny-write", "--server", "filesystem",
             "--tool", "write_file", "--dir", home).returncode == 0,
     )
     check("policy check", run(binary, "policy", "check", "--dir", home).returncode == 0)
+
+    coverage = run(binary, "policy", "coverage", "--dir", home, "--server", "filesystem",
+                   "--", *server, root)
+    rows = {}
+    for line in coverage.stdout.splitlines():
+        cells = [cell.strip() for cell in line.split("  ") if cell.strip()]
+        if len(cells) >= 4:
+            rows[cells[0]] = cells[1:]
+    check("policy coverage exit 0", coverage.returncode == 0)
+    check("policy coverage lists the 16 tools", "16 tool(s)" in coverage.stdout
+          and len([name for name in rows if name != "TOOL"]) == 16, coverage.stdout)
+    check("coverage: read_text_file ALLOW allow-read",
+          rows.get("read_text_file", [])[:2] == ["ALLOW", "allow-read"])
+    check("coverage: write_file DENY deny-write",
+          rows.get("write_file", [])[:2] == ["DENY", "deny-write"])
+    check("coverage: copy_file and append_file default deny",
+          rows.get("copy_file", [])[:2] == ["DENY", "default deny"]
+          and rows.get("append_file", [])[:2] == ["DENY", "default deny"])
+    check(
+        "policy allow --any-tool (temporary allow-all)",
+        run(binary, "policy", "allow", "--id", "allow-everything", "--any-tool",
+            "--dir", home).returncode == 0,
+    )
+    loose = run(binary, "policy", "coverage", "--dir", home, "--server", "filesystem",
+                "--", *server, root)
+    section = loose.stdout.split("allowed only by an allow-all rule", 1)[-1]
+    listed = {line.split()[0] for line in section.splitlines()[1:] if line.startswith("  ")}
+    check("coverage with allow-all exits 1", loose.returncode == 1)
+    check("coverage lists copy_file and append_file under allow-all",
+          {"copy_file", "append_file"} <= listed and "write_file" not in listed
+          and "read_text_file" not in listed, loose.stdout)
+    check(
+        "policy remove allow-everything",
+        run(binary, "policy", "remove", "--id", "allow-everything", "--dir", home).returncode == 0,
+    )
 
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {

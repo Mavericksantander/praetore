@@ -4,12 +4,86 @@
 //! delete `arguments.path`) and `append` (really appends `arguments.text` to
 //! `arguments.path`, for path-alias tests). Every executed tools/call is also logged to
 //! stderr as `fake_server: EXECUTED <tool>` so tests can see what ran.
+//!
+//! For `policy coverage` tests:
+//! - `FAKE_SERVER_TOOLS=filesystem-2.3.0` makes `tools/list` return the 16
+//!   tool names of `@modelcontextprotocol/server-filesystem@2.3.0`, in its
+//!   order; `FAKE_SERVER_PAGE_SIZE=N` splits that list into pages linked by
+//!   `nextCursor`.
+//! - `FAKE_SERVER_EXIT_AT_START=1` exits without answering. On Unix it
+//!   closes stdout first and writes `exiting without answering` to stderr a
+//!   moment later, so a client sees the end of stdout before that line is
+//!   written, as with a server that fails while still writing to stderr.
+
+/// `tools/list` of `@modelcontextprotocol/server-filesystem@2.3.0`.
+const FILESYSTEM_2_3_0: [&str; 16] = [
+    "read_file",
+    "read_text_file",
+    "read_media_file",
+    "read_multiple_files",
+    "write_file",
+    "append_file",
+    "edit_file",
+    "create_directory",
+    "list_directory",
+    "list_directory_with_sizes",
+    "directory_tree",
+    "move_file",
+    "copy_file",
+    "search_files",
+    "get_file_info",
+    "list_allowed_directories",
+];
+
+fn env_set(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn tools_list(params: &Value) -> Value {
+    if env_set("FAKE_SERVER_TOOLS").as_deref() != Some("filesystem-2.3.0") {
+        return json!({"tools": [
+            {"name": "echo", "description": "Echo arguments", "inputSchema": {"type": "object"}},
+            {"name": "delete_file", "description": "Pretend to delete a file",
+             "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}
+        ]});
+    }
+    let size = env_set("FAKE_SERVER_PAGE_SIZE")
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(FILESYSTEM_2_3_0.len());
+    let start = params["cursor"]
+        .as_str()
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(FILESYSTEM_2_3_0.len());
+    let end = (start + size).min(FILESYSTEM_2_3_0.len());
+    let tools: Vec<Value> = FILESYSTEM_2_3_0[start..end]
+        .iter()
+        .map(|name| json!({"name": name, "inputSchema": {"type": "object"}}))
+        .collect();
+    if end < FILESYSTEM_2_3_0.len() {
+        json!({"tools": tools, "nextCursor": end.to_string()})
+    } else {
+        json!({"tools": tools})
+    }
+}
 
 use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 
 fn main() {
     eprintln!("fake_server: started");
+    if env_set("FAKE_SERVER_EXIT_AT_START").is_some() {
+        #[cfg(unix)]
+        {
+            // SAFETY: closes this process's own stdout, which nothing else
+            // in this branch uses.
+            unsafe { libc::close(1) };
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        eprintln!("fake_server: exiting without answering");
+        return;
+    }
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -30,11 +104,7 @@ fn main() {
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fake_server", "version": "0.0.1"}
             }),
-            Some("tools/list") => json!({"tools": [
-                {"name": "echo", "description": "Echo arguments", "inputSchema": {"type": "object"}},
-                {"name": "delete_file", "description": "Pretend to delete a file",
-                 "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}}}}
-            ]}),
+            Some("tools/list") => tools_list(&message["params"]),
             Some("tools/call") => {
                 let name = message["params"]["name"].as_str().unwrap_or("?").to_owned();
                 eprintln!("fake_server: EXECUTED {name}");
