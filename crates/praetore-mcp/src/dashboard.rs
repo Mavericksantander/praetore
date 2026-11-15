@@ -155,6 +155,7 @@ impl Response {
     fn to_bytes(&self) -> Vec<u8> {
         let reason = match self.status {
             200 => "OK",
+            204 => "No Content",
             400 => "Bad Request",
             403 => "Forbidden",
             404 => "Not Found",
@@ -259,6 +260,9 @@ pub fn respond_with(
                 None => Response::text(404, "no such receipt"),
             }
         }
+        // Browsers ask for /favicon.ico on their own. The page has no icon;
+        // an empty answer keeps that request out of the console as a 404.
+        "/favicon.ico" => Response::text(204, ""),
         _ => Response::text(404, "not found"),
     }
 }
