@@ -905,7 +905,8 @@ function renderHome() {
   else verifyLine = el("span", { class: "bad-text" }, `${t("h_verify_err")}: `, el("span", { class: "mono" }, String(v.error)));
   const ident = el("dl", { class: "home-ident" },
     el("div", {}, el("dt", {}, t("h_agent")), el("dd", { class: "mono" }, latest ? latest.signatures.agent.agent_id : "-")),
-    el("div", {}, el("dt", {}, t("h_server")), el("dd", {}, servers.length ? servers.join(", ") : "-")),
+    el("div", {}, el("dt", {}, t("h_server")), el("dd", {}, servers.length ? servers.join(", ") : "-",
+      servers.length ? el("small", { class: "note" }, t("h_server_note")) : null)),
     el("div", {}, el("dt", {}, t("h_mode")), el("dd", {}, modeText())),
     el("div", {}, el("dt", {}, t("h_verify")), el("dd", {}, verifyLine)));
   const numbers = el("dl", { class: "home-numbers" },
@@ -1286,7 +1287,7 @@ function drawChain() {
         ctx.fillStyle = rgba(c.hud, 0.6);
         ctx.textAlign = "left";
         const gap = entry.r.seq !== null && next.r.seq !== null ? entry.r.seq - next.r.seq - 1 : 0;
-        const linkText = consecutive && entry.r.prev ? `prev ${entry.r.prev.slice(0, 12)}…` : gap > 0 ? t("c_gap", gap) : "";
+        const linkText = consecutive && entry.r.prev ? `prev ${entry.r.prev.slice(0, 12)}…` : gap > 0 && chain.filtered ? t("c_gap", gap) : "";
         ctx.fillText(linkText, spineX + 8, y + CHAIN_ROW / 2 + 4);
       }
     }
@@ -1359,12 +1360,17 @@ function drawChain() {
     ctx.fillText(clipText(ctx, whenText(r), (right - textX) * 0.5), textX, y + 22);
     ctx.textAlign = "right";
     ctx.fillStyle = color;
-    const why = r.decision === "ALLOW" ? wallText(r) : pending ? t("l_pending") : wallText(r);
-    ctx.fillText(clipText(ctx, why, (right - textX) * 0.42), right - 22, y + 7);
     const cut = breakReason(r);
-    ctx.fillStyle = cut ? c.wall : c.ok;
+    // On a pending row the mark is the receipt's: the notice is not signed.
+    const mark = `${pending ? `${t("c_receipt")} ` : ""}${cut ? "✕" : "✓"}`;
     ctx.font = `12px ${c.mono}`;
-    ctx.fillText(cut ? "✕" : "✓", right, y + 7);
+    const markW = ctx.measureText(mark).width;
+    ctx.fillStyle = cut ? c.wall : c.ok;
+    ctx.fillText(mark, right, y + 7);
+    ctx.font = `10px ${c.mono}`;
+    ctx.fillStyle = color;
+    const why = r.decision === "ALLOW" ? wallText(r) : pending ? t("l_pending") : wallText(r);
+    ctx.fillText(clipText(ctx, why, (right - textX) * 0.42), right - markW - 10, y + 7);
     if (cut) {
       ctx.font = `10px ${c.mono}`;
       ctx.fillStyle = c.wall;
