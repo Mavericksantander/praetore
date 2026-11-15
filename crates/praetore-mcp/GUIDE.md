@@ -232,18 +232,27 @@ A home created by `init` in v0.3.4 or earlier has the rule
 matches. DENY rules for some tools then leave every other tool allowed: in
 a real run with that rule and DENY rules per tool, `copy_file` and
 `append_file` of `@modelcontextprotocol/server-filesystem@2.3.0` were
-allowed because no rule named them. Running `init` again does not remove
-the rule; it prints a warning with the command. `policy check` also warns
-when an allow-all rule sits next to DENY rules for specific tools, and
-`policy coverage` lists the tools that only the allow-all rule allows (exit
-code 1). To move to default deny, add the ALLOW rules you need, then:
+allowed because no rule named them.
+
+With the v0.3.4 binary nothing warns about it. Running `init` again prints
+"already initialized; nothing was changed" and no warning. `policy check`
+does not warn about the allow-all rule. `policy coverage` does not exist
+(exit code 2). To move to default deny with v0.3.4, add an ALLOW rule for
+each tool you need, remove the allow-all rule, then restart the client:
 
 ```sh
+praetore-mcp policy allow --id ID --server NAME --tool NAME
 praetore-mcp policy remove --id allow-all-mcp-tool-calls
-praetore-mcp policy check
 ```
 
-Restart the client after the change.
+After v0.3.4 there are warnings, none of them in v0.3.4:
+
+- `init` run again on such a home prints a warning with the `policy remove`
+  command (not in v0.3.4);
+- `policy check` warns when an allow-all rule sits next to DENY rules for
+  specific tools (not in v0.3.4);
+- `policy coverage` lists the tools that only the allow-all rule allows,
+  with exit code 1 (not in v0.3.4).
 
 ### Optional: local approval
 
@@ -289,10 +298,10 @@ praetore-mcp dashboard --port 0   # a free port, printed at startup
 ```
 
 `dashboard` serves a read-only page over `receipts/*.jsonl` on 127.0.0.1
-only. There is no option to listen on another address. Stop it with
-Ctrl-C. The page has four views. Each mark it draws stands for a value
-in a receipt, in a pending approval file or in the result of `verify`;
-nothing is drawn that PRÆTORE does not record.
+only. It is not in v0.3.4. There is no option to listen on another
+address. Stop it with Ctrl-C. The page has four views. Each mark it draws
+stands for a value in a receipt, in a pending approval file or in the
+result of `verify`; nothing is drawn that PRÆTORE does not record.
 
 - **Home**: the agent id and the servers from the 40 latest receipts, the mode
   (enforce, observe, or both with their counts), the verification result

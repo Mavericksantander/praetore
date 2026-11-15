@@ -18,18 +18,8 @@
   mode is unchanged and never blocks. Existing homes keep their policy:
   `init` on a home that has an allow-all rule leaves it in place and prints
   a warning with `praetore-mcp policy remove --id allow-all-mcp-tool-calls`.
-- **The published v0.3.4 binary still creates an allow-all home.**
-  `praetore-mcp init` in that release (tag `v0.3.4`, commit `a606c111`)
-  writes the rule `allow-all-mcp-tool-calls` and prints
-  `policy (v2, allows every tools/call)`. The default-deny policy above is
-  not in v0.3.4. Running `init` again does not replace the rule. To deny
-  by default with the v0.3.4 binary, allow the tools you want and remove
-  the rule, then restart the client:
-
-      praetore-mcp policy allow --id ID --server NAME --tool NAME
-      praetore-mcp policy remove --id allow-all-mcp-tool-calls
-
-  `policy coverage` is not in v0.3.4.
+  Not in v0.3.4: `init` in that release still writes
+  `allow-all-mcp-tool-calls`.
 - **praetore-mcp: `policy check` warns about allow-all next to tool
   rules.** When the policy has an allow-all rule and DENY or
   REQUIRE_APPROVAL rules for specific tools, it says that tools those rules
