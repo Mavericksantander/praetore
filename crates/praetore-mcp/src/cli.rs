@@ -445,7 +445,10 @@ fn warn_allow_all(home: &Home) {
 fn dir_suffix(home: &Home) -> String {
     match store::resolve_home(None) {
         Ok(default) if default == home.root => String::new(),
-        _ => format!(" --dir {}", home.root.display()),
+        _ => format!(
+            " --dir {}",
+            crate::policy::shell_word(&home.root.display().to_string())
+        ),
     }
 }
 

@@ -186,7 +186,10 @@ praetore-mcp policy coverage --server filesystem -- /absolute/path/to/npx -y @mo
 On `@modelcontextprotocol/server-filesystem@2.3.0` it lists 16 tools:
 `list_directory` and `read_text_file` are `ALLOW`, `write_file` is `DENY`
 by `first-rule`, and the other 13 (`append_file`, `copy_file`, `edit_file`,
-`move_file` and the rest) are `DENY` by `default deny`.
+`move_file` and the rest) are `DENY` by `default deny`. Below the table,
+each of those 13 has its `policy allow` line. Run only the lines for tools
+you want to allow: each one allows every call to that tool in enforce
+mode.
 
 Restart the client, then ask for `write_file` on the test folder. In
 observe the file is still written, and `praetore-mcp receipts --tail 5`

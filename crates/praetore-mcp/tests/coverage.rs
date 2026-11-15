@@ -525,3 +525,78 @@ fn default_deny_blocks_in_enforce_and_observe_still_forwards() {
     let allowed = wrap_echo(&home, "enforce");
     assert!(allowed.contains("EXECUTED echo"), "{allowed}");
 }
+
+#[test]
+fn coverage_suggested_lines_run_as_printed() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("it's a home");
+    let out = run(&["init", "--dir", home.to_str().unwrap()]);
+    assert!(out.status.success(), "{out:?}");
+    policy_cmd(
+        &home,
+        &[
+            "allow",
+            "--id",
+            "allow-read",
+            "--server",
+            "filesystem",
+            "--tool",
+            "read_text_file",
+        ],
+    );
+    policy_cmd(
+        &home,
+        &[
+            "require-approval",
+            "--id",
+            "approve-edit",
+            "--server",
+            "filesystem",
+            "--tool",
+            "edit_file",
+            "--arg-path-prefix",
+            "path=/srv/data",
+        ],
+    );
+    let before = snapshot(&home);
+    let out = coverage(&home, Some("filesystem"), FS_TOOLS_ENV);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}{out:?}");
+    assert_eq!(snapshot(&home), before, "coverage wrote under DIR");
+    let section = text
+        .split("denied because no rule names them (14).")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no suggestion section:\n{text}"));
+    let lines: Vec<&str> = section
+        .lines()
+        .filter(|l| l.starts_with("  praetore-mcp policy allow "))
+        .collect();
+    assert_eq!(lines.len(), 14, "{section}");
+    for tool in ["read_text_file", "edit_file"] {
+        assert!(!section.contains(&format!("--tool {tool} ")), "{section}");
+    }
+    let copy = lines
+        .iter()
+        .find(|l| l.contains("--tool copy_file "))
+        .unwrap_or_else(|| panic!("no copy_file line:\n{section}"));
+
+    // The line, as printed, through a POSIX shell.
+    let line = copy.trim().replacen("praetore-mcp", "\"$PRAETORE_MCP\"", 1);
+    let ran = Command::new("sh")
+        .arg("-c")
+        .arg(&line)
+        .env("PRAETORE_MCP", bin())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{line}\n{ran:?}");
+    let text = stdout(&coverage(&home, Some("filesystem"), FS_TOOLS_ENV));
+    assert_eq!(
+        row(&text, "copy_file"),
+        ["copy_file", "ALLOW", "allow-filesystem-copy_file", "no"]
+    );
+    assert!(
+        text.contains("denied because no rule names them (13)."),
+        "{text}"
+    );
+}

@@ -405,7 +405,10 @@ praetore-mcp policy remove --id allow-all-mcp-tool-calls
 per tool: the decision (ALLOW, DENY, REQUIRE_APPROVAL), the rule that gives
 it or `default deny`, and whether another rule depends on an argument (for
 example a `--arg-path-prefix` rule). Tools that only an allow-all rule
-allows are listed apart, with the command to remove it. It sends no
+allows are listed apart, with the command to remove it. Tools that no
+rule names, and that have no argument-dependent rule, are listed with the
+`policy allow` line that allows each one, ready to run as printed; it
+writes nothing until you run a line. It sends no
 `tools/call` and writes nothing under `DIR`. `--server` is the name `wrap
 --name` uses; without it, the command's file name, as in `wrap`.
 
