@@ -1050,11 +1050,22 @@ fn cached_verification_is_redone_when_a_file_verify_reads_changes() {
 }
 
 #[test]
-fn pending_calls_carry_their_receipt() {
+fn pending_calls_are_marked_unsigned_and_carry_their_receipt() {
     let (_temp, home) = home_with_receipts();
     let (_, state) = api(&home, &mut dashboard::Cache::default(), "");
     let pending = state["pending"].as_array().unwrap();
     assert_eq!(pending.len(), 1, "{}", state["pending"]);
+    // A pending file is not signed and verify does not check it.
+    assert_eq!(pending[0]["signed"], false);
+    assert_eq!(state["summary"]["pending_unsigned"], 1);
+    assert_eq!(dashboard::state(&home, None)["pending"][0]["signed"], false);
+    // The page labels it, from that field.
+    let js = include_str!("../src/dashboard/app.js");
+    assert!(
+        js.contains("p.signed === false"),
+        "app.js does not read signed"
+    );
+    assert!(js.contains("unsigned_tag") && js.contains("unsigned_note"));
     let receipt = &pending[0]["receipt"];
     assert_eq!(receipt["evidence_id"], pending[0]["evidence_id"]);
     assert_eq!(receipt["decision"], "REQUIRE_APPROVAL");

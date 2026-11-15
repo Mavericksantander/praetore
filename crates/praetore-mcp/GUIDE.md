@@ -319,9 +319,10 @@ Ctrl-C. The page shows:
 
 The page reads three things from the home: the receipts, which `verify`
 checks; the calls waiting for approval, read from `approvals/pending/*.json`,
-which are not signed and which `verify` does not check; and the rules of the
-current policy. It is read-only: approving or rejecting is done with
-`praetore-mcp approve` and `praetore-mcp reject` in a terminal.
+which are not signed and which `verify` does not check (the page labels them
+"not signed"); and the rules of the current policy. It is read-only:
+approving or rejecting is done with `praetore-mcp approve` and
+`praetore-mcp reject` in a terminal.
 
 The page is embedded in the binary and loads nothing from the network.
 `dashboard` writes nothing under the home. It answers only GET requests

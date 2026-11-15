@@ -71,6 +71,9 @@ const I18N = {
     agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
     expires_in: (m, s) => `Vence en ${m}:${String(s).padStart(2, "0")}`,
     expired: "Vencida: ya no se puede aprobar",
+    unsigned_tag: "Sin firma",
+    unsigned_note: "Este aviso sale de approvals/pending: no está firmado y verify no lo comprueba. El recibo de la llamada retenida sí está firmado y verify lo comprueba.",
+    sec_decide_n: (n) => `Por decidir (${n}, sin firma)`,
     exact_args: "Lo que hará exactamente",
     exact_args_hint: "Esto es exactamente lo que se firma y lo único que el agente podrá ejecutar.",
     approve: "Aprobar", reject: "Rechazar", view_receipt: "Ver recibo",
@@ -180,6 +183,9 @@ const I18N = {
     agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
     expires_in: (m, s) => `Expires in ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expired: it can no longer be approved",
+    unsigned_tag: "Not signed",
+    unsigned_note: "This notice comes from approvals/pending: it is not signed and verify does not check it. The receipt of the held call is signed and verify checks it.",
+    sec_decide_n: (n) => `To decide (${n}, not signed)`,
     exact_args: "Exactly what it will do",
     exact_args_hint: "This is exactly what gets signed and the only call the agent will be able to run.",
     approve: "Approve", reject: "Reject", view_receipt: "View receipt",
@@ -289,6 +295,9 @@ const I18N = {
     agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
     expires_in: (m, s) => `Expira em ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expirada: não pode mais ser aprovada",
+    unsigned_tag: "Sem assinatura",
+    unsigned_note: "Este aviso vem de approvals/pending: não está assinado e o verify não o verifica. O recibo da chamada retida está assinado e o verify o verifica.",
+    sec_decide_n: (n) => `Para decidir (${n}, sem assinatura)`,
     exact_args: "O que fará exatamente",
     exact_args_hint: "Isto é exatamente o que é assinado e a única chamada que o agente poderá executar.",
     approve: "Aprovar", reject: "Rejeitar", view_receipt: "Ver recibo",
@@ -615,8 +624,9 @@ function renderOperation() {
   }
   root.append(hero);
 
-  const decide = el("section", { class: "op-section" }, el("h2", { class: "eyebrow" }, t("sec_decide")));
   const active = activePending();
+  const decide = el("section", { class: "op-section" },
+    el("h2", { class: "eyebrow" }, active.length ? t("sec_decide_n", active.length) : t("sec_decide")));
   if (active.length === 0) decide.append(el("p", { class: "calm" }, t("decide_none")));
   for (const p of active) decide.append(approvalCard(p));
   root.append(decide);
@@ -776,6 +786,9 @@ function approvalCard(p) {
         el("small", {}, `${t("on_server", p.server)} · ${p.tool}`))),
     el("span", { class: expired ? "tag bad" : "tag warn countdown", "data-expires": p.expires_at },
       expired ? t("expired") : t("expires_in", Math.floor(left / 60), left % 60))));
+  if (p.signed === false) {
+    card.append(el("p", { class: "unsigned" }, el("span", { class: "tag neutral" }, t("unsigned_tag")), ` ${t("unsigned_note")}`));
+  }
   card.append(el("div", { class: "countdown-bar" },
     el("span", { class: "countdown-fill", "data-expires": p.expires_at, "data-total": String(total),
       style: `width:${Math.max(0, Math.min(100, (left / total) * 100))}%` })));

@@ -435,7 +435,7 @@ impl Snapshot {
         }
     }
 
-    fn summary(&self) -> Value {
+    fn summary(&self, pending: usize) -> Value {
         let count = |label: &str| {
             self.rows
                 .iter()
@@ -449,6 +449,8 @@ impl Snapshot {
             "require_approval": count("REQUIRE_APPROVAL"),
             "unreadable": self.rows.iter().filter(|r| r.decision.is_none()).count(),
             "enforce_receipts": self.enforce_receipts(),
+            // Read from approvals/pending: not signed, not checked by verify.
+            "pending_unsigned": pending,
         })
     }
 
@@ -651,11 +653,12 @@ pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
         .map(|&index| view(index))
         .collect();
     let pending = pending_view(home, Some((snapshot, &approval_status)));
+    let pending_count = pending.as_array().map_or(0, Vec::len);
     let format = |at: &Option<OffsetDateTime>| at.and_then(|at| at.format(&Rfc3339).ok());
     json!({
         "generated_at_utc": now.format(&Rfc3339).unwrap_or_default(),
         "home": home.root.display().to_string(),
-        "summary": snapshot.summary(),
+        "summary": snapshot.summary(pending_count),
         "policy": policy_view(home, snapshot.enforce_receipts()),
         "pending": pending,
         "verify": snapshot.verify,
@@ -690,10 +693,11 @@ pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
         .map(|line| receipt_view(line, &approval_status))
         .collect();
     let pending = pending_view(home, Some((&snapshot, &approval_status)));
+    let pending_count = pending.as_array().map_or(0, Vec::len);
     json!({
         "generated_at_utc": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
         "home": home.root.display().to_string(),
-        "summary": snapshot.summary(),
+        "summary": snapshot.summary(pending_count),
         "policy": policy_view(home, snapshot.enforce_receipts()),
         "pending": pending,
         "verify": snapshot.verify,
@@ -703,8 +707,9 @@ pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
 
 /// Calls waiting for approval, with the full canonical arguments (the text
 /// `approve` prints before it asks for confirmation) and the receipt of the
-/// held call. Read only: deciding stays with `praetore-mcp approve` /
-/// `reject` in a terminal.
+/// held call. A pending file is not signed and `verify` does not check it:
+/// each item says so with `signed: false`. Read only: deciding stays with
+/// `praetore-mcp approve` / `reject` in a terminal.
 fn pending_view(home: &Home, receipts: Option<(&Snapshot, &BTreeMap<String, String>)>) -> Value {
     match crate::approvals::list_pending(home) {
         Ok(list) => Value::Array(
@@ -721,6 +726,7 @@ fn pending_view(home: &Home, receipts: Option<(&Snapshot, &BTreeMap<String, Stri
                         "tool": item.tool,
                         "expires_at": item.expires_at,
                         "evidence_id": item.evidence_id,
+                        "signed": false,
                         "arguments_canonical": full.as_ref().ok().map(|c| c.arguments_canonical.clone()),
                         "error": full.err(),
                         "receipt": receipt,
