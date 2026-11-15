@@ -1002,17 +1002,19 @@ function drawHud(now) {
   const boxX = wallX + 34;
   const boxW = width - boxX - 12;
   // verify's reason for a rejected receipt is written whole under its box,
-  // over up to three lines; the row grows to hold them.
+  // over up to three lines; if it needs more, a note (up to three lines) says
+  // where to read the rest. The row grows to hold them.
   const measure = canvas.getContext("2d");
   measure.font = `10px ${c.mono}`;
   for (const row of hud.rows) {
     row.reason = row.cut ? wrapText(measure, `${t("l_unverified")}: ${row.cut}`, boxW - 24, 3) : null;
+    row.more = row.reason && row.reason.cut ? wrapText(measure, t("l_reason_more"), boxW - 24, 3).lines : [];
   }
   const tops = [];
   let next = top;
   for (const row of hud.rows) {
     tops.push(next);
-    next += rowH + (row.reason ? (row.reason.lines.length + (row.reason.cut ? 1 : 0)) * lineH : 0);
+    next += rowH + (row.reason ? (row.reason.lines.length + row.more.length) * lineH : 0);
   }
   const height = (hud.rows.length ? next : top + rowH) + 20;
   const { ctx, w, h } = fitCanvas(canvas, height);
@@ -1030,7 +1032,7 @@ function drawHud(now) {
   ctx.fillStyle = c.hud;
   ctx.font = `11px ${c.mono}`;
   ctx.textAlign = "left";
-  ctx.fillText(latest ? `${t("h_agent").toUpperCase()} ${latest.signatures.agent.agent_id.slice(0, 8)} · ${latest.server ?? "-"}` : t("h_agent").toUpperCase(),
+  ctx.fillText(clipText(ctx, latest ? `${t("h_agent").toUpperCase()} ${latest.signatures.agent.agent_id.slice(0, 8)} · ${latest.server ?? "-"}` : t("h_agent").toUpperCase(), w - spineX - 8),
     spineX - 4, 18);
   if (!hud.rows.length) {
     ctx.fillStyle = c.quiet;
@@ -1084,10 +1086,8 @@ function drawHud(now) {
         ctx.fillText(`✕ ${t("l_unverified")}`, boxX + boxW - 10, y + 33);
         ctx.textAlign = "left";
         row.reason.lines.forEach((line, k) => ctx.fillText(line, boxX + 12, y + 42 + lineH * (k + 1)));
-        if (row.reason.cut) {
-          ctx.fillStyle = c.quiet;
-          ctx.fillText(t("l_reason_more"), boxX + 12, y + 42 + lineH * (row.reason.lines.length + 1));
-        }
+        ctx.fillStyle = c.quiet;
+        row.more.forEach((line, k) => ctx.fillText(line, boxX + 12, y + 42 + lineH * (row.reason.lines.length + k + 1)));
         ctx.textAlign = "right";
       }
     }
