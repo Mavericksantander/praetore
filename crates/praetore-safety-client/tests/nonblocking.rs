@@ -14,29 +14,40 @@ use std::{
 use praetore_core::{SafetyEvent, SafetyEventDraft, SafetySourceKey, safety_ingest::ParamValue};
 use praetore_safety_client::{SafetyClient, SendError};
 
-/// The hard bound on one send asserted here. A non-blocking `sendto`
-/// takes microseconds (the measured values are printed). A send that
-/// blocked on a stalled ingester would not return at all.
+/// The bound on one send. A non-blocking `sendto` takes microseconds (the
+/// measured values are printed). A send that blocked on a stalled ingester
+/// would not return at all.
 const SEND_BOUND: Duration = Duration::from_millis(50);
 /// The 99th percentile bound.
 const P99_BOUND: Duration = Duration::from_millis(2);
-/// How many times a measurement may run before the bounds count as broken.
+/// The most the bounds can grow with load, whatever the probes measure.
+const MAX_CAP: Duration = Duration::from_millis(100);
+const P99_CAP: Duration = Duration::from_millis(10);
+/// The probes show load when their max reaches `LOAD_PROBE_MAX` or their
+/// p99 reaches `LOAD_PROBE_P99`. An idle machine measures probes of tens of
+/// microseconds; a probe of 5 ms, or 1% of probes over 1 ms, means the
+/// thread was descheduled.
+const LOAD_PROBE_MAX: Duration = Duration::from_millis(5);
+const LOAD_PROBE_P99: Duration = Duration::from_millis(1);
+/// How many runs a measurement gets when the machine is loaded.
 ///
 /// On a loaded machine the thread can be descheduled in the middle of a
 /// send, for longer than the bound: that is the machine, not the client.
-/// Two things keep that from failing the test while a slow `send` still
-/// fails it:
+/// After each send the same thread times a probe: one encoding of the
+/// event, the CPU part of a send, with no system call and nothing that can
+/// block. Being descheduled lengthens the probes as much as the sends; a
+/// sleep, a retry or a blocking call in `send` lengthens only the sends.
 ///
-/// - After each send the same thread times a probe that does only CPU work
-///   (no system call, nothing that can block). Being descheduled lengthens
-///   the probes as much as the sends; a sleep, a retry or a blocking call
-///   in `send` lengthens only the sends. Each bound is the fixed bound plus
-///   what the probes measured in the same run (p99 for p99, max for max).
-/// - A burst of load lands on random sends of a random run, while a slow
-///   `send` is slow in every run. Each measurement runs again from a fresh
-///   client and socket until one run is within the bounds, up to this many
-///   runs; it fails only if every run is over a bound.
-const RUNS: usize = 5;
+/// - Each bound is the fixed bound plus what the probes measured in the
+///   same run (p99 for p99, max for max), capped at `MAX_CAP` and
+///   `P99_CAP`.
+/// - A run over a bound is run again, from a fresh client and socket, only
+///   if its probes show load (see `LOAD_PROBE_MAX`), up to this many runs.
+///   A run over a bound with idle probes fails the test at once.
+const RUNS: usize = 3;
+/// Sends per run in the single-thread tests. A send that is slow once
+/// every 2000 sends lands in every run.
+const SENDS: u64 = 2000;
 
 /// The timing tests run one at a time, so they do not compete for the CPU.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -98,9 +109,15 @@ fn quantile(values: &mut [Duration], q: f64) -> Duration {
     values[((values.len() - 1) as f64 * q) as usize]
 }
 
+/// A run over a bound: why, and whether its probes showed load.
+struct Over {
+    message: String,
+    loaded: bool,
+}
+
 impl Timings {
-    /// Prints both distributions; an error names the bound that was passed.
-    fn check(&mut self, label: &str) -> Result<(), String> {
+    /// Prints both distributions; `Err` names the bound that was passed.
+    fn check(&mut self, label: &str) -> Result<(), Over> {
         let (p50, p99, max) = (
             quantile(&mut self.sends, 0.5),
             quantile(&mut self.sends, 0.99),
@@ -110,41 +127,53 @@ impl Timings {
             quantile(&mut self.probes, 0.99),
             quantile(&mut self.probes, 1.0),
         );
-        let (max_bound, p99_bound) = (SEND_BOUND + probe_max, P99_BOUND + probe_p99);
+        let max_bound = (SEND_BOUND + probe_max).min(MAX_CAP);
+        let p99_bound = (P99_BOUND + probe_p99).min(P99_CAP);
+        let loaded = probe_max >= LOAD_PROBE_MAX || probe_p99 >= LOAD_PROBE_P99;
         println!(
-            "{label}: {} sends, p50 {p50:?}, p99 {p99:?} (bound {p99_bound:?}), max {max:?} (bound {max_bound:?}); probe p99 {probe_p99:?}, max {probe_max:?}",
+            "{label}: {} sends, p50 {p50:?}, p99 {p99:?} (bound {p99_bound:?}), max {max:?} (bound {max_bound:?}); probe p99 {probe_p99:?}, max {probe_max:?}{}",
             self.sends.len(),
+            if loaded { ", load" } else { "" },
         );
-        if max >= max_bound {
-            return Err(format!("{label}: a send took {max:?}, bound {max_bound:?}"));
-        }
-        if p99 >= p99_bound {
-            return Err(format!("{label}: p99 {p99:?}, bound {p99_bound:?}"));
-        }
-        Ok(())
+        let message = if max >= max_bound {
+            format!("{label}: a send took {max:?}, bound {max_bound:?}")
+        } else if p99 >= p99_bound {
+            format!("{label}: p99 {p99:?}, bound {p99_bound:?}")
+        } else {
+            return Ok(());
+        };
+        Err(Over { message, loaded })
     }
 }
 
-/// Runs `measure` (one run: a fresh client, its sends and their checks)
-/// until every timing it returns is within the bounds, up to [`RUNS`]
-/// times. Panics with every run's failure if none was.
+/// Runs `measure` (one run: a fresh client, its sends and their checks).
+/// Passes on the first run whose timings are all within the bounds. A run
+/// over a bound is run again only if every timing over a bound showed load,
+/// up to [`RUNS`] runs; otherwise the test fails at once.
 fn within_bounds(label: &str, mut measure: impl FnMut() -> Vec<(String, Timings)>) {
     let mut failures = Vec::new();
     for run in 1..=RUNS {
         let mut timings = measure();
-        let over: Vec<String> = timings
+        let over: Vec<Over> = timings
             .iter_mut()
             .filter_map(|(name, times)| times.check(&format!("{label}, {name}, run {run}")).err())
             .collect();
         if over.is_empty() {
+            println!("{label}: within the bounds on run {run} of {RUNS}");
             return;
         }
-        failures.extend(over);
+        if let Some(idle) = over.iter().find(|o| !o.loaded) {
+            panic!(
+                "{label}: over a bound on run {run} with no sign of load in the probes: {}",
+                idle.message
+            );
+        }
+        failures.extend(over.into_iter().map(|o| o.message));
         // Let a burst of load pass before the next run.
         thread::sleep(Duration::from_millis(20));
     }
     panic!(
-        "{label}: over a bound in all {RUNS} runs:\n{}",
+        "{label}: over a bound in all {RUNS} runs, each under load:\n{}",
         failures.join("\n")
     );
 }
@@ -153,12 +182,10 @@ fn timed(client: &SafetyClient, event: &SafetyEvent, times: &mut Timings) -> Res
     let start = Instant::now();
     let result = client.send(event);
     times.sends.push(start.elapsed());
-    // The probe: CPU work of the same kind as a send (encoding the event),
-    // with no system call, so nothing in it can sleep or block.
+    // The probe: one encoding of the event, the CPU part of a send, with no
+    // system call, so nothing in it can sleep or block.
     let start = Instant::now();
-    for _ in 0..3 {
-        std::hint::black_box(std::hint::black_box(event).to_wire().ok());
-    }
+    std::hint::black_box(std::hint::black_box(event).to_wire().ok());
     times.probes.push(start.elapsed());
     result
 }
@@ -170,13 +197,13 @@ fn no_ingester_returns_at_once_and_counts_the_drop() {
         let dir = SocketDir::new("none");
         let client = SafetyClient::new(dir.socket()).unwrap();
         let mut times = Timings::default();
-        for seq in 1..=1000 {
+        for seq in 1..=SENDS {
             assert_eq!(
                 timed(&client, &event(seq, 0), &mut times),
                 Err(SendError::NoListener)
             );
         }
-        assert_eq!((client.sent(), client.dropped()), (0, 1000));
+        assert_eq!((client.sent(), client.dropped()), (0, SENDS));
         vec![("sends".into(), times)]
     });
 }
@@ -191,7 +218,7 @@ fn a_dead_ingester_returns_at_once() {
         assert!(dir.socket().exists());
         let client = SafetyClient::new(dir.socket()).unwrap();
         let mut times = Timings::default();
-        for seq in 1..=1000 {
+        for seq in 1..=SENDS {
             assert_eq!(
                 timed(&client, &event(seq, 0), &mut times),
                 Err(SendError::NoListener)
