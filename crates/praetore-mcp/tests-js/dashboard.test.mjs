@@ -37,6 +37,7 @@ class Node {
     this.checked = false;
     this.scrollTop = 0;
     this.clientWidth = 1200;
+    this.width = 1200;
     const node = this;
     this.classList = {
       set: new Set(),
@@ -82,7 +83,7 @@ class Node {
   dispatchEvent() { return true; }
   focus() {}
   matches() { return false; }
-  getBoundingClientRect() { return { width: 1200, height: 600, top: 0, left: 0 }; }
+  getBoundingClientRect() { return { width: this.width, height: 600, top: 0, left: 0 }; }
   all() {
     return [this, ...this.children.flatMap((c) => (c instanceof Text ? [] : c.all()))];
   }
@@ -109,7 +110,7 @@ function recorder() {
     font: "",
     textAlign: "left",
     lineWidth: 1,
-    fillText(text, x, y) { ctx.texts.push({ text: String(text), color: ctx.fillStyle, x, y }); },
+    fillText(text, x, y) { ctx.texts.push({ text: String(text), color: ctx.fillStyle, x, y, align: ctx.textAlign }); },
     measureText(text) { return { width: String(text).length * 6 }; },
     createLinearGradient() { return { addColorStop() {} }; },
     clear() { ctx.texts = []; },
@@ -124,12 +125,15 @@ function recorder() {
 // ---------- a page ----------
 
 // Loads app.js in a fresh context. `reduced` is the reduced-motion setting;
-// the clock and the frames are driven by the test.
-function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T00:00:00Z") } = {}) {
+// `width` is the width of every element (the canvases among them); the clock
+// and the frames are driven by the test.
+function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T00:00:00Z"), width = 1200 } = {}) {
   const byId = new Map();
   const getElementById = (id) => {
     if (!byId.has(id)) {
       const node = new Node(id === "hud" || id === "chain" ? "canvas" : "div");
+      node.width = width;
+      node.clientWidth = width;
       node.setAttribute("id", id);
       byId.set(id, node);
     }
@@ -316,6 +320,20 @@ test("a gap is said to be left out by the filter only when a filter is on", asyn
   assert.ok(!texts.some((t) => t.includes("omitido")), texts.join("\n"));
 });
 
+// The lines of verify's reason written under a box: they start with
+// "verify falla: " and continue at the same x, in the wall color.
+function reasonLines(texts) {
+  const start = texts.findIndex((t) => t.text.startsWith("verify falla: "));
+  if (start < 0) return [];
+  const { x, color } = texts[start];
+  const lines = [];
+  for (const t of texts.slice(start)) {
+    if (t.x !== x || t.color !== color) break;
+    lines.push(t.text);
+  }
+  return lines;
+}
+
 test("live view marks a receipt verify rejects, in the drawing and the list", async () => {
   const state = fixture("cut");
   const bad = state.recent.find((r) => r.verified === false);
@@ -323,9 +341,8 @@ test("live view marks a receipt verify rejects, in the drawing and the list", as
   const p = page();
   await p.start(state);
   const texts = drawn(p, "hud");
-  const mark = texts.find((t) => t.text.startsWith("✕ verify falla: "));
+  const mark = texts.find((t) => t.text === "✕ verify falla");
   assert.ok(mark, texts.map((t) => t.text).join("\n"));
-  assert.ok(bad.order.startsWith(mark.text.slice("✕ verify falla: ".length).replace(/…$/, "")));
   assert.equal(mark.color, tokens["--wall"]);
   assert.equal(texts.filter((t) => t.text.startsWith("✕ verify falla")).length, 1, "only the bad one");
 
@@ -333,6 +350,89 @@ test("live view marks a receipt verify rejects, in the drawing and the list", as
   const list = p.text("hud-list");
   assert.ok(list.includes(`✕ verify falla: ${bad.order}`), list);
   assert.equal(list.split("✕ verify falla").length - 1, 1);
+});
+
+test("live view writes verify's whole reason, over several lines", async () => {
+  const state = fixture("cut");
+  const bad = state.recent.find((r) => r.verified === false);
+  assert.ok(`verify falla: ${bad.order}`.length * 6 > 650, "the reason is longer than one line");
+  const p = page();
+  await p.start(state);
+  const lines = reasonLines(drawn(p, "hud"));
+  assert.ok(lines.length >= 2, lines.join("\n"));
+  assert.equal(lines.join(" "), `verify falla: ${bad.order}`, "nothing left out");
+  assert.ok(!lines.some((line) => line.endsWith("…")));
+  assert.ok(!drawn(p, "hud").some((t) => t.text.includes("detalle del recibo")));
+});
+
+test("a reason too long for the drawing says it is cut and where to read it whole", async () => {
+  const state = fixture("cut");
+  const bad = state.recent.find((r) => r.verified === false);
+  const long = Array(8).fill(bad.order).join(" / ");
+  bad.order = long;
+  state.page.receipts.find((r) => r.evidence_id === bad.evidence_id).order = long;
+  const p = page();
+  await p.start(state);
+  const texts = drawn(p, "hud");
+  const lines = reasonLines(texts);
+  assert.equal(lines.length, 3);
+  assert.ok(lines[2].endsWith("…"), lines[2]);
+  const more = texts.find((t) => t.text === "la razón sigue en el detalle del recibo: haz clic en la fila");
+  assert.ok(more, texts.map((t) => t.text).join("\n"));
+  // A click on that row opens the receipt, where the reason is whole.
+  const row = p.hud.rows.findIndex((r) => r.r.evidence_id === bad.evidence_id);
+  p.byId.get("hud").listeners.get("click")[0]({ clientY: p.hud.geo.tops[row] + 60 });
+  const drawer = p.text("drawer-body");
+  assert.ok(drawer.includes(long), drawer.slice(0, 400));
+});
+
+// Where a drawn text starts and ends, with the recorder's measure (6 px a
+// character) and the alignment it was drawn with.
+function extent(t) {
+  const w = t.text.length * 6;
+  if (t.align === "right" || t.align === "end") return [t.x - w, t.x];
+  if (t.align === "center") return [t.x - w / 2, t.x + w / 2];
+  return [t.x, t.x + w];
+}
+
+test("on a 420 px canvas no live view text leaves the drawing and the long row still opens", async () => {
+  const state = fixture("cut");
+  const bad = state.recent.find((r) => r.verified === false);
+  const long = Array(8).fill(bad.order).join(" / ");
+  bad.order = long;
+  state.page.receipts.find((r) => r.evidence_id === bad.evidence_id).order = long;
+  // A server name longer than the drawing is wide, in the agent label at
+  // the top and in every box.
+  for (const r of state.recent) r.server = "a-server-whose-name-is-longer-than-a-narrow-window-is-wide";
+  const p = page({ width: 420 });
+  await p.start(state);
+  const texts = drawn(p, "hud");
+  assert.ok(texts.length > 10, texts.map((t) => t.text).join("\n"));
+  for (const t of texts) {
+    const [from, to] = extent(t);
+    assert.ok(from >= 0 && to <= 420, `${JSON.stringify(t.text)} spans ${from}..${to}`);
+  }
+  // The note on where to read the rest is written whole, inside the box
+  // (its text column ends 12 px before the box does: 420 - 12 - 12).
+  const hint = "la razón sigue en el detalle del recibo: haz clic en la fila";
+  const first = texts.findIndex((t) => hint.startsWith(t.text) && t.text.startsWith("la razón"));
+  assert.ok(first >= 0, texts.map((t) => t.text).join("\n"));
+  const more = [];
+  for (const t of texts.slice(first)) {
+    if (t.x !== texts[first].x || t.color !== texts[first].color) break;
+    more.push(t);
+  }
+  assert.ok(more.length >= 2, "the note is wrapped at this width");
+  assert.equal(more.map((t) => t.text).join(" "), hint);
+  for (const t of more) assert.ok(extent(t)[1] <= 420 - 24, `${t.text} ends at ${extent(t)[1]}`);
+  // The row holds all its lines: a click on the note's last line opens
+  // that receipt, where the reason is whole.
+  const row = p.hud.rows.findIndex((r) => r.r.evidence_id === bad.evidence_id);
+  const last = more[more.length - 1].y;
+  assert.ok(last < p.hud.geo.bottoms[row] - 10, `the note's last line (${last}) is inside the row (${p.hud.geo.bottoms[row]})`);
+  p.byId.get("hud").listeners.get("click")[0]({ clientY: last });
+  const drawer = p.text("drawer-body");
+  assert.ok(drawer.includes(long), drawer.slice(0, 400));
 });
 
 test("a healthy home draws no verify mark and the DENY wall says what decided it", async () => {

@@ -8,11 +8,8 @@ praetore-mcp: `init` writes a default-deny policy (no
 `allow-all-mcp-tool-calls`), `policy coverage` reports what the policy
 decides for each tool a server lists, and `dashboard` serves a read-only
 local page over the receipts journal. Also carries everything merged to
-main since v0.3.4.
-
-[#175](https://github.com/Mavericksantander/praetore/pull/175) (dashboard
-minors and a load-proof latency test) is not in this tree. It has to land
-on main before the tag. This section does not tag or publish a release.
+main since v0.3.4, including the dashboard minors and the load-proof
+latency test from #175. This section does not tag or publish a release.
 
 ### Changed
 
@@ -101,6 +98,14 @@ on main before the tag. This section does not tag or publish a release.
 
 ### Fixed
 
+- praetore-mcp dashboard: the live view writes the whole reason `verify`
+  gives for a rejected receipt, over up to three lines, and says when a
+  longer one continues in the receipt detail. It was clipped (#175).
+- praetore-mcp dashboard: `/favicon.ico` is answered with 204 instead of
+  404, so the browser console shows no error. Only GET on loopback, as for
+  the other paths (#175).
+- praetore-safety-client: the non-blocking latency tests no longer fail on
+  a loaded machine; a slow `send` still fails them (#175).
 - **console: keep the operator language chosen during the first catalog
   load.** If the operator changed language while that catalog request was
   still in flight, the first load could overwrite the choice and put the
