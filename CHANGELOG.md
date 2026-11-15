@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Changed
+
+- **praetore-mcp: `init` writes a default-deny policy (behavior change for
+  enforce mode).** The policy has no rules. Before, it had
+  `allow-all-mcp-tool-calls`, which allowed every `tools/call` that no other
+  rule matched, so DENY rules that named tools left every other tool
+  allowed: with DENY rules per tool, `copy_file` and `append_file` of
+  `@modelcontextprotocol/server-filesystem@2.3.0` were allowed because no
+  rule named them. Now, in enforce mode, every `tools/call` that no rule
+  allows is denied; allow tools with
+  `praetore-mcp policy allow --id ID --server NAME --tool NAME`. No rule is
+  needed to start a server: only `tools/call` is evaluated, so
+  `initialize`, `tools/list` and the rest of the MCP traffic pass. Observe
+  mode is unchanged and never blocks. Existing homes keep their policy:
+  `init` on a home that has an allow-all rule leaves it in place and prints
+  a warning with `praetore-mcp policy remove --id allow-all-mcp-tool-calls`.
+- **praetore-mcp: `policy check` warns about allow-all next to tool
+  rules.** When the policy has an allow-all rule and DENY or
+  REQUIRE_APPROVAL rules for specific tools, it says that tools those rules
+  do not name are allowed and suggests `policy coverage`. `policy deny`,
+  `require-approval` and `allow` print the same warning after the change.
+
 ### Added
 
 - **`praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]`.**
@@ -20,6 +42,17 @@
   binary. Nothing is loaded from the network or written under DIR. Only
   GET requests with a loopback `Host` are answered. Texts in Spanish,
   English and Portuguese.
+- **praetore-mcp: `policy coverage [--dir DIR] [--server NAME] -- <command>
+  [args...]`.** Starts the MCP server, sends `initialize` and `tools/list`
+  (every page), closes it, and prints for each tool what the policy
+  decides: the rule that applies or default deny, and whether a rule
+  depends on an argument. Tools allowed only by an allow-all rule are
+  listed apart. Exit code 0 when there are none, 1 when there is one, 2 on a
+  usage error or when the server cannot be started or does not answer. It
+  sends no `tools/call` and writes nothing under `DIR`.
+- `scripts/mcp-smoke.py` checks `policy coverage` against
+  `@modelcontextprotocol/server-filesystem@2.3.0`, and the smoke test now
+  allows `read_text_file` with an explicit rule.
 
 ## 0.3.4 - 2026-11-13
 

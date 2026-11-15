@@ -149,23 +149,48 @@ praetore-mcp verify
 `OK 0 receipts` means the journal is empty. It does not mean a server was
 wrapped.
 
-Add one deny rule for the server named `filesystem`. A policy change is
-loaded when `wrap` starts, so restart the client after this. The `policy`
-command prints that reminder. The published v0.3.4 release can hold a
+**The policy `init` writes is default deny.** It has no rules. In enforce
+mode every `tools/call` that no rule allows is denied, including tools you
+have not looked at and tools a server adds later. Observe mode does not
+block anything, so the observe step above works with no rules: the receipts
+show `DENY` with no rule id. `init` needs no rule for the client to start
+the server or list its tools: only `tools/call` is evaluated. `init` in
+v0.3.4 and earlier wrote an allow-all rule instead
+(`allow-all-mcp-tool-calls`); see "A home from v0.3.4" below.
+
+Allow the tools you want, one rule per tool, and add one deny rule for the
+server named `filesystem`. The deny rule is not needed for default deny; it
+puts a rule id on the `write_file` receipt. A policy change is loaded when
+`wrap` starts, so restart the client after this. The `policy` command
+prints that reminder. The published v0.3.4 release can hold a
 REQUIRE_APPROVAL call. That optional step is after the switch to enforce,
-below. Do not add it with this deny rule. In observe the call is not held.
+below. Do not add it with these rules. In observe the call is not held.
 
 ```sh
+praetore-mcp policy allow --id allow-list --server filesystem --tool list_directory
+praetore-mcp policy allow --id allow-read --server filesystem --tool read_text_file
 praetore-mcp policy deny --id first-rule --server filesystem --tool write_file
 praetore-mcp policy check
 ```
 
+See what the policy decides for every tool the server lists. `policy
+coverage` starts the server with the command after `--`, sends
+`initialize` and `tools/list`, closes it, and writes nothing under the
+home. Use the same command and test folder as in the client config. It is
+not in v0.3.4.
+
+```sh
+praetore-mcp policy coverage --server filesystem -- /absolute/path/to/npx -y @modelcontextprotocol/server-filesystem@2.3.0 /absolute/path/to/test-dir
+```
+
+On `@modelcontextprotocol/server-filesystem@2.3.0` it lists 16 tools:
+`list_directory` and `read_text_file` are `ALLOW`, `write_file` is `DENY`
+by `first-rule`, and the other 13 (`append_file`, `copy_file`, `edit_file`,
+`move_file` and the rest) are `DENY` by `default deny`.
+
 Restart the client, then ask for `write_file` on the test folder. In
 observe the file is still written, and `praetore-mcp receipts --tail 5`
-shows `DENY` and `first-rule`. The rule blocks that one tool. On
-`@modelcontextprotocol/server-filesystem@2.3.0` it does not make the server
-read-only: `append_file`, `edit_file`, `create_directory`, `move_file` and
-`copy_file` still write.
+shows `DENY` and `first-rule`.
 
 To switch that observe install to enforce, uninstall and install again.
 `install --mode enforce` on an entry that is already wrapped prints
@@ -178,8 +203,9 @@ praetore-mcp install --client cursor --mode enforce --yes
 ```
 
 Read the dry-run before `--yes`. It must show `wrap` with `--mode enforce`.
-Restart the client. In enforce, `write_file` is refused and the file is not
-written. The client text is `Denied by PRÆTORE. Evidence id: ...`. The rule
+Restart the client. In enforce, `list_directory` and `read_text_file` are
+forwarded, every other tool is refused, and `write_file` is refused and the
+file is not written. The client text is `Denied by PRÆTORE. Evidence id: ...`. The rule
 id is in `praetore-mcp receipts`, in the `DENY` / `first-rule` row, with
 mode `enforce`. You can instead edit `--mode` in the client config and
 restart. `install` does not rewrite `--mode` while the entry is already
@@ -195,6 +221,28 @@ journal line is `{"seq","prev","evidence"}`. v0.3.3 reads each line as a
 bare evidence document. This release's `praetore-mcp verify` still reads a
 v0.3.3 journal: those lines are unchained and may only come before the
 first chained entry.
+
+### A home from v0.3.4
+
+A home created by `init` in v0.3.4 or earlier has the rule
+`allow-all-mcp-tool-calls`. It allows every `tools/call` that no other rule
+matches. DENY rules for some tools then leave every other tool allowed: in
+a real run with that rule and DENY rules per tool, `copy_file` and
+`append_file` of `@modelcontextprotocol/server-filesystem@2.3.0` were
+allowed because no rule named them. Running `init` again does not remove
+the rule; it prints a warning with the command. `policy check` also warns
+when an allow-all rule sits next to DENY rules for specific tools, and
+`policy coverage` lists the tools that only the allow-all rule allows (exit
+code 1). To move to default deny, add the ALLOW rules you need, then:
+
+```sh
+praetore-mcp policy remove --id allow-all-mcp-tool-calls
+praetore-mcp policy check
+```
+
+Restart the client after the change.
+
+### Optional: local approval
 
 Optional, after the install is in enforce, and only for the test server
 named `filesystem`. In observe a REQUIRE_APPROVAL call is not held. Add
@@ -339,13 +387,20 @@ Read these before relying on anything above.
    decision.
 6. **Observe mode does not block anything.** It records what enforce would
    have decided, labeled `praetore.mode: observe` in the signed receipt. Use
-   it to try a policy, not to stop calls.
+   it to try a policy, not to stop calls. In enforce, a tool that no rule
+   allows is denied by default.
 7. **The proxy is cooperative.** Whoever can edit the client config can
    remove the wrapper. The proxy does not see actions the server takes on its
    own initiative.
 8. **Policy changes need a restart.** Each `wrap` process loads
    `policy.json` when it starts. After `policy deny|allow|remove`, restart
    the client.
+9. **`policy coverage` shows one `tools/list`.** It reports what the rules
+   decide for the tools the server listed in that run, for a call where no
+   argument condition matches. A call's arguments, the mode and path
+   resolution can still change the outcome on the receipt. A tool the
+   server did not list is not in the report; in enforce, default deny
+   applies to it unless a rule allows it.
 
 ## Troubleshooting
 
@@ -359,6 +414,8 @@ Read these before relying on anything above.
 | A call on a `/tmp/...` (or other symlinked) path is refused, or never allowed, by a path rule | The argument does not resolve to itself (`/tmp` → `/private/tmp` on macOS) | Use the resolved path (`realpath /tmp/x`). `praetore-mcp receipts` and the receipt's `praetore.path_check` show `differs` and the resolved value. |
 | `policy deny ... --arg-path-prefix` prints `warning: ... resolves to ...` | The prefix itself goes through a symlink | Remove the rule and add it again with the resolved prefix; otherwise a DENY rule does not cover the resolved path. |
 | A new rule has no effect | The running `wrap` loaded the old policy | Restart the client. `praetore-mcp policy check` shows the digest it will load. |
+| In enforce a tool is refused and its receipt shows `DENY` with no rule id | Default deny: no rule allows that tool | `praetore-mcp policy allow --id ID --server NAME --tool NAME`, then restart the client. `praetore-mcp policy coverage --server NAME -- <server command>` lists the decision for every tool. |
+| `init` or `policy check` prints a warning about `allow-all-mcp-tool-calls` | The home was created by `init` in v0.3.4 or earlier | See "A home from v0.3.4". Add the ALLOW rules you need, then `praetore-mcp policy remove --id allow-all-mcp-tool-calls`. |
 | The server does not start; `wrap` exits with 127 | The client could not find the server command (for example `npx`) with the PATH apps get from the desktop | Put the absolute path in the config, e.g. `/opt/homebrew/bin/npx` (check with `which npx`), then `install` again. In the macOS check, both apps found Homebrew's `npx` without this. |
 | `install` says the config `is not strict JSON` | The file has comments or trailing commas (JSONC) | Remove them, or wrap the server by hand with `praetore-mcp wrap ... -- <command>`. The file is never rewritten in this case. |
 | `install --mode enforce` says `nothing to change` / `already wrapped` and exits 0 | The entry is already wrapped. `install` does not change `--mode` on a wrapped entry. Exit 0 leaves the mode already in the config | `praetore-mcp uninstall --client <client> --yes`, then `praetore-mcp install --client <client> --mode enforce --yes`, then restart the client. Or edit `--mode` in the config and restart. |

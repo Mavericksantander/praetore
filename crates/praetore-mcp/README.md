@@ -137,7 +137,7 @@ python3 -I scripts/mcp-smoke.py target/release/praetore-mcp
 
 ```sh
 
-# 1. Create LOCAL/DEV keys, a signed authority, trust pins and a default policy
+# 1. Create LOCAL/DEV keys, a signed authority, trust pins and a default-deny policy
 praetore-mcp init                     # ~/.praetore/mcp, or $PRAETORE_MCP_HOME, or --dir DIR
 
 # 2. See what would change in your MCP client configs (nothing is written)
@@ -158,11 +158,18 @@ praetore-mcp verify
 #    or look at receipts and the same checks in a read-only page on 127.0.0.1
 praetore-mcp dashboard    # see GUIDE.md
 
-# 7. Add rules (no JSON editing), check them, then restart the client
+# 7. Add rules (no JSON editing), check them, then restart the client.
+#    The policy from init has no rules: in enforce, a tool no ALLOW rule
+#    covers is denied. Allow the tools you want, one rule per tool.
+praetore-mcp policy allow --id allow-list --server filesystem --tool list_directory
+praetore-mcp policy allow --id allow-read --server filesystem --tool read_text_file
 praetore-mcp policy deny --id deny-delete --server filesystem --tool delete_file
 praetore-mcp policy require-approval --id approve-ssh --tool read_file --arg-path-prefix path=/Users/me/.ssh
 praetore-mcp policy list
 praetore-mcp policy check
+#    What the policy decides for each tool the server lists (starts the
+#    server, sends tools/list, closes it; no tools/call)
+praetore-mcp policy coverage --server filesystem -- npx -y @modelcontextprotocol/server-filesystem@2.3.0 /abs/test-dir
 
 # 8. Switch to enforce (install skips entries that are already wrapped, so uninstall first)
 praetore-mcp uninstall --client claude-desktop --yes
@@ -364,10 +371,56 @@ time is only as trustworthy as the attester key that signed it.
 ## Writing policy
 
 `DIR/policy.json` is a PRÆTORE policy, format 2 with semantics v2 (see
-[`docs/policy-language.md`](../../docs/policy-language.md)). The default policy
-has one rule, `allow-all-mcp-tool-calls`, which allows every `tools/call`,
-and declares the action type `mcp.tools/call` as `Mission` in
-`action_classes`. A home created before G7 has a format 1 policy, which no
+[`docs/policy-language.md`](../../docs/policy-language.md)). The policy
+`init` writes has no rules and declares the action type `mcp.tools/call` as
+`Mission` in `action_classes`.
+
+**Default deny in enforce.** With no rule matching, a `tools/call` is
+DENY. In enforce mode, every tool that is not allowed is denied, including
+tools a server adds in a later version. Observe mode never blocks: it
+records DENY and forwards the call. `init` needs no rule for the client to
+start the server: only `tools/call` is evaluated, so `initialize`,
+`tools/list`, notifications and every other message pass through. Allow
+tools one by one:
+
+```sh
+praetore-mcp policy allow --id allow-read --server filesystem --tool read_text_file
+praetore-mcp policy allow --id allow-list --server filesystem --tool list_directory
+```
+
+A home created by `init` up to 0.3.4 has the rule `allow-all-mcp-tool-calls`,
+which allows every `tools/call` that no other rule matches. With that rule,
+DENY rules that name tools leave every other tool allowed: on
+`@modelcontextprotocol/server-filesystem@2.3.0`, DENY rules for
+`write_file` and `edit_file` leave `copy_file` and `append_file` allowed.
+Running `init` again on such a home does not remove the rule; it prints a
+warning with the command. `policy check` warns when an allow-all rule sits
+next to DENY or REQUIRE_APPROVAL rules for specific tools. To move to
+default deny, add the ALLOW rules you need, then:
+
+```sh
+praetore-mcp policy remove --id allow-all-mcp-tool-calls
+```
+
+**`policy coverage`** starts the server given after `--`, sends
+`initialize` and `tools/list` (every page), closes it, and prints one row
+per tool: the decision (ALLOW, DENY, REQUIRE_APPROVAL), the rule that gives
+it or `default deny`, and whether another rule depends on an argument (for
+example a `--arg-path-prefix` rule). Tools that only an allow-all rule
+allows are listed apart, with the command to remove it. It sends no
+`tools/call` and writes nothing under `DIR`. `--server` is the name `wrap
+--name` uses; without it, the command's file name, as in `wrap`.
+
+```sh
+praetore-mcp policy coverage [--dir DIR] [--server NAME] -- <command> [args...]
+```
+
+Exit code 0 when no tool is allowed only by an allow-all rule, 1 when one
+is, and 2 on a usage error or when the server cannot be started or does not
+answer within 60 seconds. The decisions are read from the rules for a call
+where no argument condition matches; a call's arguments, the mode and path
+resolution can still change the receipt's outcome. The list is the one the
+server returned for that run. A home created before G7 has a format 1 policy, which no
 longer loads, so **migrate it before upgrading the binary**: after the
 upgrade every call is refused, `safety:*` included, until the policy is
 migrated. Add `"format_version": 2` and
@@ -396,6 +449,7 @@ Manage rules with `praetore-mcp policy` instead of editing JSON by hand:
 ```sh
 praetore-mcp policy list                     # id, effect, server, tool, other conditions
 praetore-mcp policy check                    # validate, print digest, lint; exit 1 if invalid
+praetore-mcp policy coverage [--server NAME] -- <server command>   # decision per listed tool
 praetore-mcp policy deny             --id ID [--server NAME] [--tool NAME] [conditions...]
 praetore-mcp policy require-approval --id ID [--server NAME] [--tool NAME] [conditions...]
 praetore-mcp policy allow            --id ID [--server NAME] [--tool NAME] [conditions...]
@@ -576,8 +630,8 @@ Things to know:
   you pass `--any-tool`. Even with `--tool read_file`, a `read_file` call that
   omits `path` matches the rule; that is the fail-safe direction.
 * The outcome folds as DENY > REQUIRE_APPROVAL > ALLOW. If no rule matches, the
-  result is DENY. `policy allow` rules only matter after you
-  `policy remove --id allow-all-mcp-tool-calls`.
+  result is DENY. In a home that still has `allow-all-mcp-tool-calls`, a
+  `policy allow` rule changes nothing until you remove that rule.
 * A hand-written rule can also match on the mode through
   `context_conditions` on `praetore.mode`.
 * Every receipt records the policy digest. Compare it with

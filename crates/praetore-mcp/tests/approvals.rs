@@ -704,6 +704,21 @@ fn dir_empty(home: &Home) -> bool {
 #[test]
 fn an_evidence_only_journal_still_verifies() {
     let (_temp, home) = init_home();
+    // `init` writes a default-deny policy; allow the tool this test calls.
+    let out = run(
+        &[
+            "policy",
+            "allow",
+            "--id",
+            "allow-echo",
+            "--tool",
+            "echo",
+            "--dir",
+            home.root.to_str().unwrap(),
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{out:?}");
     let (_, stderr, _) = wrap(&home, "enforce", &session(echo(4, json!({"n": 1}))), &[]);
     assert!(stderr.contains("EXECUTED echo"), "{stderr}");
     assert!(!home.root.join("approvals").join("journal.jsonl").exists());
