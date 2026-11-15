@@ -49,7 +49,7 @@ const I18N = {
     l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PIDIÓ APROBACIÓN",
     l_default_deny: "default deny: ninguna regla lo permite", l_rule: (id) => `regla ${id}`, l_guard: (g) => `comprobación del motor: ${g}`,
     l_observe: "observe: registrada, no aplicada",
-    l_unverified: "verify falla", h_server_note: "de los 40 recibos más recientes", c_receipt: "recibo",
+    l_unverified: "verify falla", l_reason_more: "la razón sigue en el detalle del recibo: haz clic en la fila", h_server_note: "de los 40 recibos más recientes", c_receipt: "recibo",
     l_pending: "pendiente · aviso sin firma · verify no lo comprueba",
     l_label: (n, total) => `Vista en vivo: las ${n} decisiones más recientes de ${total}. La vista de lista tiene lo mismo.`,
     c_cap: (n, m) => `${n} de ${m} recibos en esta página, del más reciente al más antiguo.`,
@@ -200,7 +200,7 @@ const I18N = {
     l_allow: "ALLOWED", l_deny: "DENIED", l_ask: "ASKED FOR APPROVAL",
     l_default_deny: "default deny: no rule allows it", l_rule: (id) => `rule ${id}`, l_guard: (g) => `engine check: ${g}`,
     l_observe: "observe: recorded, not applied",
-    l_unverified: "verify fails", h_server_note: "from the 40 most recent receipts", c_receipt: "receipt",
+    l_unverified: "verify fails", l_reason_more: "the reason continues in the receipt detail: click the row", h_server_note: "from the 40 most recent receipts", c_receipt: "receipt",
     l_pending: "pending · notice not signed · not checked by verify",
     l_label: (n, total) => `Live view: the ${n} most recent decisions of ${total}. The list view has the same.`,
     c_cap: (n, m) => `${n} of ${m} receipts on this page, newest to oldest.`,
@@ -351,7 +351,7 @@ const I18N = {
     l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PEDIU APROVAÇÃO",
     l_default_deny: "default deny: nenhuma regra a permite", l_rule: (id) => `regra ${id}`, l_guard: (g) => `verificação do motor: ${g}`,
     l_observe: "observe: registrada, não aplicada",
-    l_unverified: "verify falha", h_server_note: "dos 40 recibos mais recentes", c_receipt: "recibo",
+    l_unverified: "verify falha", l_reason_more: "o motivo continua no detalhe do recibo: clique na linha", h_server_note: "dos 40 recibos mais recentes", c_receipt: "recibo",
     l_pending: "pendente · aviso sem assinatura · o verify não o verifica",
     l_label: (n, total) => `Vista ao vivo: as ${n} decisões mais recentes de ${total}. A vista de lista tem o mesmo.`,
     c_cap: (n, m) => `${n} de ${m} recibos nesta página, do mais recente ao mais antigo.`,
@@ -807,9 +807,39 @@ function rgba(color, alpha) {
 }
 
 // Sizes a canvas to its CSS box and the screen's pixel ratio.
+function canvasWidth(canvas) {
+  return Math.max(300, Math.round(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth));
+}
+
+// Splits `text` into lines no wider than `width`, at spaces (a word wider
+// than a line is split). With more than `max` lines the last one ends in
+// "…" and `cut` is true.
+function wrapText(ctx, text, width, max) {
+  const lines = [];
+  let line = "";
+  for (const word of text.split(" ")) {
+    let rest = word;
+    while (rest) {
+      const next = line ? `${line} ${rest}` : rest;
+      if (ctx.measureText(next).width <= width) { line = next; rest = ""; continue; }
+      if (line) { lines.push(line); line = ""; continue; }
+      let n = rest.length;
+      while (n > 1 && ctx.measureText(rest.slice(0, n)).width > width) n -= 1;
+      lines.push(rest.slice(0, n));
+      rest = rest.slice(n);
+    }
+  }
+  if (line) lines.push(line);
+  if (lines.length <= max) return { lines, cut: false };
+  const kept = lines.slice(0, max);
+  kept[max - 1] = clipText(ctx, `${kept[max - 1]} ${lines[max]}`, width);
+  if (!kept[max - 1].endsWith("…")) kept[max - 1] = clipText(ctx, `${kept[max - 1]}…`, width);
+  return { lines: kept, cut: true };
+}
+
 function fitCanvas(canvas, height) {
   const dpr = window.devicePixelRatio || 1;
-  const w = Math.max(300, Math.round(canvas.getBoundingClientRect().width || canvas.parentElement.clientWidth));
+  const w = canvasWidth(canvas);
   canvas.style.height = `${height}px`;
   if (canvas.width !== w * dpr || canvas.height !== height * dpr) {
     canvas.width = w * dpr;
@@ -926,8 +956,11 @@ function renderHome() {
 // scan completes and the line reaches the object in cyan. DENY: a red wall
 // rises between the agent and the action, with the receipt's reason on it.
 // REQUIRE_APPROVAL: the action waits before the wall in amber; a pending
-// one says its notice is not signed. A horizontal sweep runs once each
-// time the journal is read.
+// one says its notice is not signed. A receipt verify rejects says so,
+// with verify's whole reason under its box. A horizontal sweep runs once
+// when a read of the journal brings a change: a new receipt, a new verify
+// result or a change in the pending calls (see liveKey). A read that
+// finds nothing new draws nothing.
 
 const hud = { rows: [], seen: null, frame: 0, readAt: null, geo: null, liveKey: null };
 
@@ -960,16 +993,33 @@ const OUTCOME_MS = 180;
 function drawHud(now) {
   const canvas = document.getElementById("hud");
   const rowH = 62;
+  const lineH = 13;
   const top = 46;
-  const height = top + Math.max(1, hud.rows.length) * rowH + 20;
-  const { ctx, w, h } = fitCanvas(canvas, height);
   const c = colors();
-  hud.geo = { top, rowH };
-  ctx.clearRect(0, 0, w, h);
   const spineX = 28;
-  const wallX = Math.round(w * 0.42);
+  const width = canvasWidth(canvas);
+  const wallX = Math.round(width * 0.42);
   const boxX = wallX + 34;
-  const boxW = w - boxX - 12;
+  const boxW = width - boxX - 12;
+  // verify's reason for a rejected receipt is written whole under its box,
+  // over up to three lines; if it needs more, a note (up to three lines) says
+  // where to read the rest. The row grows to hold them.
+  const measure = canvas.getContext("2d");
+  measure.font = `10px ${c.mono}`;
+  for (const row of hud.rows) {
+    row.reason = row.cut ? wrapText(measure, `${t("l_unverified")}: ${row.cut}`, boxW - 24, 3) : null;
+    row.more = row.reason && row.reason.cut ? wrapText(measure, t("l_reason_more"), boxW - 24, 3).lines : [];
+  }
+  const tops = [];
+  let next = top;
+  for (const row of hud.rows) {
+    tops.push(next);
+    next += rowH + (row.reason ? (row.reason.lines.length + row.more.length) * lineH : 0);
+  }
+  const height = (hud.rows.length ? next : top + rowH) + 20;
+  const { ctx, w, h } = fitCanvas(canvas, height);
+  hud.geo = { tops, bottoms: [...tops.slice(1), next] };
+  ctx.clearRect(0, 0, w, h);
 
   // The agent: the line every action leaves from.
   const latest = hud.rows[0] ? hud.rows[0].r : null;
@@ -982,7 +1032,7 @@ function drawHud(now) {
   ctx.fillStyle = c.hud;
   ctx.font = `11px ${c.mono}`;
   ctx.textAlign = "left";
-  ctx.fillText(latest ? `${t("h_agent").toUpperCase()} ${latest.signatures.agent.agent_id.slice(0, 8)} · ${latest.server ?? "-"}` : t("h_agent").toUpperCase(),
+  ctx.fillText(clipText(ctx, latest ? `${t("h_agent").toUpperCase()} ${latest.signatures.agent.agent_id.slice(0, 8)} · ${latest.server ?? "-"}` : t("h_agent").toUpperCase(), w - spineX - 8),
     spineX - 4, 18);
   if (!hud.rows.length) {
     ctx.fillStyle = c.quiet;
@@ -992,7 +1042,7 @@ function drawHud(now) {
 
   hud.rows.forEach((row, index) => {
     const r = row.r;
-    const y = top + index * rowH;
+    const y = tops[index];
     const mid = y + 21;
     const age = row.born === null ? Infinity : now - row.born;
     if (age < 0) {
@@ -1021,7 +1071,7 @@ function drawHud(now) {
     ctx.fillText(clipText(ctx, toolLabel(r.tool), boxW * 0.55), boxX + 12, y + 17);
     ctx.fillStyle = c.quiet;
     ctx.font = `10px ${c.mono}`;
-    ctx.fillText(clipText(ctx, `${r.server ?? "-"} · ${whenText(r)}`, row.cut ? boxW * 0.5 : boxW - 24), boxX + 12, y + 33);
+    ctx.fillText(clipText(ctx, `${r.server ?? "-"} · ${whenText(r)}`, row.cut ? boxW - 24 - ctx.measureText(`✕ ${t("l_unverified")}`).width - 16 : boxW - 24), boxX + 12, y + 33);
     if (scan >= 1) {
       ctx.textAlign = "right";
       ctx.font = `10px ${c.mono}`;
@@ -1029,9 +1079,16 @@ function drawHud(now) {
       const label = r.decision === "ALLOW" ? t("l_allow") : r.decision === "DENY" ? t("l_deny") : t("l_ask");
       ctx.fillText(label, boxX + boxW - 10, y + 17);
       if (row.cut) {
-        // verify failed for this receipt: say so, with verify's reason.
+        // verify failed for this receipt: say so in the box, and write
+        // verify's reason whole under it. If it does not fit in three
+        // lines, say where to read the rest.
         ctx.fillStyle = c.wall;
-        ctx.fillText(clipText(ctx, `✕ ${t("l_unverified")}: ${row.cut}`, boxW * 0.45), boxX + boxW - 10, y + 33);
+        ctx.fillText(`✕ ${t("l_unverified")}`, boxX + boxW - 10, y + 33);
+        ctx.textAlign = "left";
+        row.reason.lines.forEach((line, k) => ctx.fillText(line, boxX + 12, y + 42 + lineH * (k + 1)));
+        ctx.fillStyle = c.quiet;
+        row.more.forEach((line, k) => ctx.fillText(line, boxX + 12, y + 42 + lineH * (row.reason.lines.length + k + 1)));
+        ctx.textAlign = "right";
       }
     }
 
@@ -1086,7 +1143,8 @@ function drawHud(now) {
     }
   });
 
-  // The sweep: once per read of the journal.
+  // The sweep: once after a read that changed something (hud.readAt is
+  // set in load() only then).
   if (hud.readAt !== null && !reducedMotion()) {
     const p = (now - hud.readAt) / 900;
     if (p >= 0 && p < 1) {
@@ -2180,7 +2238,7 @@ document.addEventListener("DOMContentLoaded", () => {
   hudCanvas.addEventListener("click", (event) => {
     if (!hud.geo) return;
     const y = event.clientY - hudCanvas.getBoundingClientRect().top;
-    const row = hud.rows[Math.floor((y - hud.geo.top + 10) / hud.geo.rowH)];
+    const row = hud.rows[hud.geo.tops.findIndex((top, i) => y >= top - 10 && y < hud.geo.bottoms[i] - 10)];
     if (row) openDrawer(row.r);
   });
   const chainCanvas = document.getElementById("chain");

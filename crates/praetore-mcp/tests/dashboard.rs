@@ -636,6 +636,98 @@ fn server_answers_get_on_loopback_only_and_writes_nothing() {
 }
 
 #[test]
+fn favicon_is_answered_empty_and_stays_get_only_on_loopback() {
+    let (_temp, home) = home_with_receipts();
+    let before = snapshot(&home.root);
+    let listener = dashboard::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let host = format!("Host: 127.0.0.1:{port}");
+    let cases: Vec<(String, u16)> = vec![
+        (format!("GET /favicon.ico HTTP/1.1\r\n{host}\r\n\r\n"), 204),
+        (
+            format!("GET /favicon.ico HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"),
+            204,
+        ),
+        (format!("POST /favicon.ico HTTP/1.1\r\n{host}\r\n\r\n"), 405),
+        (format!("PUT /favicon.ico HTTP/1.1\r\n{host}\r\n\r\n"), 405),
+        (
+            format!("DELETE /favicon.ico HTTP/1.1\r\n{host}\r\n\r\n"),
+            405,
+        ),
+        (
+            "GET /favicon.ico HTTP/1.1\r\nHost: attacker.example\r\n\r\n".into(),
+            403,
+        ),
+        ("GET /favicon.ico HTTP/1.0\r\n\r\n".into(), 403),
+        (
+            format!("GET /favicon.ico HTTP/1.1\r\n{host}\r\nHost: attacker.example\r\n\r\n"),
+            400,
+        ),
+        // Only that path: anything else unknown is still a 404.
+        (format!("GET /favicon.png HTTP/1.1\r\n{host}\r\n\r\n"), 404),
+    ];
+    let served_home = home.clone();
+    let count = cases.len();
+    let server = std::thread::spawn(move || {
+        dashboard::serve(&listener, &served_home, None, Some(count)).unwrap();
+    });
+    for (request, status) in &cases {
+        let response = http(port, request);
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{request:?} gave\n{response}"
+        );
+        assert_eq!(csp_of(&response), EXPECTED_CSP, "{request:?}");
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let names: Vec<String> = head
+            .lines()
+            .skip(1)
+            .map(|line| line.split_once(':').unwrap().0.to_ascii_lowercase())
+            .collect();
+        // Every answer keeps these, the 204 too.
+        for name in [
+            "cache-control",
+            "x-content-type-options",
+            "referrer-policy",
+            "x-frame-options",
+            "content-security-policy",
+            "connection",
+        ] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "{request:?}: no {name}\n{head}"
+            );
+        }
+        let lines: Vec<&str> = head.lines().collect();
+        for line in [
+            "Cache-Control: no-store",
+            "X-Content-Type-Options: nosniff",
+            "Referrer-Policy: no-referrer",
+            "X-Frame-Options: DENY",
+            "Connection: close",
+        ] {
+            assert!(lines.contains(&line), "{request:?}: no {line:?}\n{head}");
+        }
+        if *status == 204 {
+            // RFC 9110 section 8.6: no Content-Length, no Content-Type, no body.
+            assert!(head.starts_with("HTTP/1.1 204 No Content\r\n"), "{head}");
+            assert!(!names.iter().any(|n| n == "content-length"), "{head}");
+            assert!(!names.iter().any(|n| n == "content-type"), "{head}");
+            assert_eq!(body, "");
+        } else {
+            assert!(names.iter().any(|n| n == "content-length"), "{head}");
+            assert!(names.iter().any(|n| n == "content-type"), "{head}");
+        }
+    }
+    server.join().unwrap();
+    assert_eq!(
+        before,
+        snapshot(&home.root),
+        "the dashboard wrote under DIR"
+    );
+}
+
+#[test]
 fn page_never_writes_journal_values_as_html() {
     let (_temp, home) = home_with_receipts();
     let listener = dashboard::bind(0).unwrap();
