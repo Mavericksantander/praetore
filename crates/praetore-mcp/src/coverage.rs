@@ -30,11 +30,87 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// running and what they copied so far is used.
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// Test-only gate. The stderr reader copies nothing into the shared buffer
+/// until `release_for_join` runs (from that reader's `join_until`) or until
+/// `mark_read_done` runs after `close` has already sampled the buffer.
+/// Removing the stderr `join_until` therefore makes
+/// `stderr_tail_is_read_after_the_reader_joins` fail on every run: the sample
+/// happens while the bytes are still unpublished. Armed only by that test;
+/// every other caller sees an immediate return.
+#[cfg(test)]
+mod stderr_hold {
+    use std::sync::{Condvar, Mutex};
+
+    struct State {
+        armed: bool,
+        released: bool,
+        read_done: bool,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        armed: false,
+        released: false,
+        read_done: false,
+    });
+    static CV: Condvar = Condvar::new();
+
+    pub struct Armed;
+
+    pub fn arm() -> Armed {
+        let mut state = STATE.lock().unwrap();
+        state.armed = true;
+        state.released = false;
+        state.read_done = false;
+        Armed
+    }
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            let mut state = STATE.lock().unwrap();
+            state.armed = false;
+            state.released = true;
+            state.read_done = true;
+            CV.notify_all();
+        }
+    }
+
+    pub fn wait_to_publish() {
+        let mut state = STATE.lock().unwrap();
+        if !state.armed {
+            return;
+        }
+        while state.armed && !state.released && !state.read_done {
+            state = CV.wait(state).unwrap();
+        }
+    }
+
+    pub fn release_for_join() {
+        let mut state = STATE.lock().unwrap();
+        if state.armed {
+            state.released = true;
+            CV.notify_all();
+        }
+    }
+
+    pub fn mark_read_done() {
+        let mut state = STATE.lock().unwrap();
+        if state.armed {
+            state.read_done = true;
+            CV.notify_all();
+        }
+    }
+}
+
 /// A thread copying one of the server's pipes. `done` receives a message
 /// (or disconnects) when the thread is about to return.
 struct Reader {
     handle: JoinHandle<()>,
     done: Receiver<()>,
+    /// Set only on the stderr reader. `join_until` then lets that reader
+    /// publish bytes it was holding back for the test
+    /// `stderr_tail_is_read_after_the_reader_joins`.
+    #[cfg(test)]
+    releases_stderr_hold: bool,
 }
 
 impl Reader {
@@ -44,12 +120,24 @@ impl Reader {
             body();
             let _ = signal.send(());
         });
-        Self { handle, done }
+        Self {
+            handle,
+            done,
+            #[cfg(test)]
+            releases_stderr_hold: false,
+        }
     }
 
     /// Joins the thread once it has reached the end of its pipe, waiting at
     /// most until `until`. Returns whether it was joined.
     fn join_until(self, until: Instant) -> bool {
+        // Before waiting, so a reader blocked in `wait_to_publish` can
+        // finish and the bytes are in the buffer when this returns. The
+        // stdout reader does not hold the gate.
+        #[cfg(test)]
+        if self.releases_stderr_hold {
+            stderr_hold::release_for_join();
+        }
         let left = until.saturating_duration_since(Instant::now());
         match self.done.recv_timeout(left) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => {
@@ -143,6 +231,10 @@ impl Server {
         self.stdout_reader.join_until(drained);
         self.stderr_reader.join_until(drained);
         let bytes = self.stderr.lock().map(|b| b.clone()).unwrap_or_default();
+        // After the sample. If the stderr reader was not joined, it is still
+        // holding its bytes and this is what lets it finish.
+        #[cfg(test)]
+        stderr_hold::mark_read_done();
         String::from_utf8_lossy(&bytes).trim_end().to_owned()
     }
 }
@@ -169,6 +261,8 @@ fn start(command: &str, args: &[String]) -> Result<Server, String> {
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let tail = Arc::clone(&stderr);
     let stderr_reader = Reader::spawn(move || {
+        #[cfg(test)]
+        stderr_hold::wait_to_publish();
         let mut buf = [0u8; 1024];
         while let Ok(n) = stderr_pipe.read(&mut buf) {
             if n == 0 {
@@ -181,6 +275,12 @@ fn start(command: &str, args: &[String]) -> Result<Server, String> {
             }
         }
     });
+    #[cfg(test)]
+    let stderr_reader = {
+        let mut stderr_reader = stderr_reader;
+        stderr_reader.releases_stderr_hold = true;
+        stderr_reader
+    };
     Ok(Server {
         stdin: child.stdin.take(),
         child,
@@ -251,4 +351,31 @@ pub fn list_tools(command: &str, args: &[String]) -> Result<Vec<String>, String>
             )
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The integration test `coverage_exits_2_on_usage_errors_and_dead_servers`
+    /// notices a missing stderr `join_until` only when the reader thread loses
+    /// the race. Here the reader publishes nothing until that join starts, so
+    /// deleting `self.stderr_reader.join_until` in [`Server::close`] fails
+    /// this test on every run.
+    #[test]
+    fn stderr_tail_is_read_after_the_reader_joins() {
+        let _hold = stderr_hold::arm();
+        let error = list_tools(
+            "sh",
+            &[
+                "-c".into(),
+                "exec 1>&-; printf '%s\\n' SENTINEL-STDERR-JOIN >&2".into(),
+            ],
+        )
+        .expect_err("the shell closes stdout without answering");
+        assert!(
+            error.contains("SENTINEL-STDERR-JOIN"),
+            "stderr was sampled before the reader published it:\n{error}"
+        );
+    }
 }
