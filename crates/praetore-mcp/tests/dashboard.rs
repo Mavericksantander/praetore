@@ -1061,12 +1061,15 @@ fn flip_hex_after(text: &str, marker: &str) -> String {
     format!("{}{new}{}", &text[..at], &text[at + 1..])
 }
 
+/// A file verify reads: its name, where it is and a same-length edit.
+type StampedFile = (&'static str, fn(&Home) -> PathBuf, fn(&str) -> String);
+
 #[test]
 fn cached_verification_is_redone_for_each_approval_and_issuer_file() {
     // Each of these files is read by verify and stamped by the cache. A home
     // with a signed approval decision, so the approval journal and the
     // approver pin are both checked.
-    let files: [(&str, fn(&Home) -> PathBuf, fn(&str) -> String); 3] = [
+    let files: [StampedFile; 3] = [
         (
             "approvals/journal.jsonl",
             |home| home.root.join("approvals").join("journal.jsonl"),
