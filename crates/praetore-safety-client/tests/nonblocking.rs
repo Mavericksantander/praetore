@@ -33,10 +33,13 @@ const LOAD_PROBE_P99: Duration = Duration::from_millis(1);
 ///
 /// On a loaded machine the thread can be descheduled in the middle of a
 /// send, for longer than the bound: that is the machine, not the client.
-/// After each send the same thread times a probe: one encoding of the
-/// event, the CPU part of a send, with no system call and nothing that can
-/// block. Being descheduled lengthens the probes as much as the sends; a
-/// sleep, a retry or a blocking call in `send` lengthens only the sends.
+/// After each send the same thread times a probe: three encodings of the
+/// event, with no system call and nothing that can block. The probe has to
+/// last about as long as a whole send, so that being descheduled lengthens
+/// the probes as often and as much as the sends; a shorter probe is hit
+/// less, and the concurrent test then fails under load with nothing wrong
+/// in `send`. A sleep, a retry or a blocking call in `send` lengthens only
+/// the sends.
 ///
 /// - Each bound is the fixed bound plus what the probes measured in the
 ///   same run (p99 for p99, max for max), capped at `MAX_CAP` and
@@ -182,10 +185,14 @@ fn timed(client: &SafetyClient, event: &SafetyEvent, times: &mut Timings) -> Res
     let start = Instant::now();
     let result = client.send(event);
     times.sends.push(start.elapsed());
-    // The probe: one encoding of the event, the CPU part of a send, with no
-    // system call, so nothing in it can sleep or block.
+    // The probe: three encodings of the event, about as long as a whole send
+    // (one encoding alone is shorter, is descheduled less often than a send
+    // and lets the concurrent test fail under load with no defect in send),
+    // with no system call, so nothing in it can sleep or block.
     let start = Instant::now();
-    std::hint::black_box(std::hint::black_box(event).to_wire().ok());
+    for _ in 0..3 {
+        std::hint::black_box(std::hint::black_box(event).to_wire().ok());
+    }
     times.probes.push(start.elapsed());
     result
 }
