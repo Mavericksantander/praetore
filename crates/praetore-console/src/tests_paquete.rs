@@ -173,6 +173,14 @@ impl Drop for Setup {
 }
 
 fn app(settings: Option<PackSettings>, store: Arc<SetExport>, with_inbox: bool) -> Router {
+    console(settings, store, with_inbox).router()
+}
+
+fn console(
+    settings: Option<PackSettings>,
+    store: Arc<SetExport>,
+    with_inbox: bool,
+) -> ConsoleState {
     let mut state = ConsoleState::new(
         Arc::new(NoHistory),
         LocalSession::from_secret(SESSION_SECRET),
@@ -189,7 +197,7 @@ fn app(settings: Option<PackSettings>, store: Arc<SetExport>, with_inbox: bool) 
     if let Some(settings) = settings {
         state = state.with_compliance_pack(CompliancePack::new(settings, store));
     }
-    state.router()
+    state
 }
 
 fn store() -> Arc<SetExport> {
@@ -1835,40 +1843,31 @@ async fn the_package_is_the_same_bytes_whatever_the_page_language() {
     let setup = Setup::held("idiomas");
     let (receipts, outcomes) = held_set();
     let store = held_store_of(receipts, outcomes);
-    // The package names the second it was built; downloads that straddle a
-    // second are taken again.
-    let built_at = |files: &[(String, Vec<u8>)]| {
-        let leeme = String::from_utf8(file(files, "LEEME.txt").to_vec()).unwrap();
-        leeme
-            .lines()
-            .find(|line| {
-                line.ends_with("(UTC), para el tenant 00000000-0000-0000-0000-0000000000d3.")
-            })
-            .map(str::to_owned)
-    };
+    // The package names the second it was built. Every download is built at
+    // the same instant, so the test does not depend on how fast it runs.
+    let at = time::OffsetDateTime::now_utc()
+        .replace_nanosecond(0)
+        .unwrap();
+    let stamp = at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let mut downloads = Vec::new();
-    for _ in 0..5 {
-        downloads.clear();
-        for language in ["es", "en", "pt-BR,pt;q=0.9", "de-DE"] {
-            let mut request = download();
-            request.headers_mut().insert(
-                header::ACCEPT_LANGUAGE,
-                header::HeaderValue::from_static(language),
-            );
-            let response = app(Some(setup.both_pins()), store.clone(), true)
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{language}");
-            assert!(response.headers().get(header::SET_COOKIE).is_none());
-            assert!(response.headers().get(header::CONTENT_LANGUAGE).is_none());
-            downloads.push(unpack(&body(response).await));
-        }
-        let first = built_at(&downloads[0]);
-        assert!(first.is_some());
-        if downloads.iter().all(|files| built_at(files) == first) {
-            break;
-        }
+    for language in ["es", "en", "pt-BR,pt;q=0.9", "de-DE"] {
+        let mut request = download();
+        request.headers_mut().insert(
+            header::ACCEPT_LANGUAGE,
+            header::HeaderValue::from_static(language),
+        );
+        let response = console(Some(setup.both_pins()), store.clone(), true)
+            .with_pack_clock(at)
+            .router()
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{language}");
+        assert!(response.headers().get(header::SET_COOKIE).is_none());
+        assert!(response.headers().get(header::CONTENT_LANGUAGE).is_none());
+        downloads.push(unpack(&body(response).await));
     }
     assert_eq!(downloads[0].len(), 11);
     for other in &downloads[1..] {
@@ -1876,6 +1875,10 @@ async fn the_package_is_the_same_bytes_whatever_the_page_language() {
     }
     let leeme = String::from_utf8(file(&downloads[0], "LEEME.txt").to_vec()).unwrap();
     assert!(leeme.contains("praetore-verify"));
+    assert!(
+        leeme.contains(&format!("el {stamp} (UTC), para el tenant ")),
+        "{leeme}"
+    );
 
     let fixed = time::macros::datetime!(2026-09-06 04:00:00 UTC);
     let signer = ApproverSigner::new("approver-1", APPROVER_SECRET).unwrap();

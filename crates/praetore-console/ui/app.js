@@ -706,7 +706,10 @@ document.getElementById("siguiente").addEventListener("click", () => {
 
 async function iniciar() {
   const elegido = elegirIdioma(idiomaGuardado(), navigator.languages);
-  if (!(await usarIdioma(elegido)) && elegido !== "es") await usarIdioma("es");
+  const pedidoInicial = ultimoPedidoDeIdioma + 1;
+  const usado = await usarIdioma(elegido);
+  // Spanish only when the chosen catalog failed, not when a newer choice superseded it.
+  if (!usado && elegido !== "es" && ultimoPedidoDeIdioma === pedidoInicial) await usarIdioma("es");
   const codigo = codigoDelHash();
   if (codigo) {
     await abrirSesion(codigo);

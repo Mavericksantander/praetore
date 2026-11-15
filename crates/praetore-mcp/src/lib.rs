@@ -5,6 +5,7 @@
 pub mod approvals;
 pub mod cli;
 pub mod coverage;
+pub mod dashboard;
 pub mod fsutil;
 pub mod gate;
 pub mod install;

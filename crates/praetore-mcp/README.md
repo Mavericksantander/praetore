@@ -155,6 +155,8 @@ praetore-mcp receipts --tail 20
 
 # 6. Verify every receipt (integrity, attester signature, intent, authority, mode)
 praetore-mcp verify
+#    or look at receipts and the same checks in a read-only page on 127.0.0.1
+praetore-mcp dashboard    # see GUIDE.md
 
 # 7. Add rules (no JSON editing), check them, then restart the client.
 #    The policy from init has no rules: in enforce, a tool no ALLOW rule
@@ -405,7 +407,10 @@ praetore-mcp policy remove --id allow-all-mcp-tool-calls
 per tool: the decision (ALLOW, DENY, REQUIRE_APPROVAL), the rule that gives
 it or `default deny`, and whether another rule depends on an argument (for
 example a `--arg-path-prefix` rule). Tools that only an allow-all rule
-allows are listed apart, with the command to remove it. It sends no
+allows are listed apart, with the command to remove it. Tools that no
+rule names, and that have no argument-dependent rule, are listed with the
+`policy allow` line that allows each one, ready to run as printed; it
+writes nothing until you run a line. It sends no
 `tools/call` and writes nothing under `DIR`. `--server` is the name `wrap
 --name` uses; without it, the command's file name, as in `wrap`.
 

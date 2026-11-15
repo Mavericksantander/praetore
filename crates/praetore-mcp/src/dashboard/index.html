@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PRÆTORE MCP receipts</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-text"><strong>PRÆTORE</strong><small>MCP</small></span>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/home" data-view="home">
+        <span data-i18n="nav_home"></span>
+      </a>
+      <a href="#/live" data-view="live">
+        <span data-i18n="nav_live"></span>
+        <span class="badge" id="nav-badge" hidden></span>
+      </a>
+      <a href="#/chain" data-view="chain">
+        <span data-i18n="nav_chain"></span>
+      </a>
+      <a href="#/info" data-view="info">
+        <span data-i18n="nav_info"></span>
+      </a>
+    </nav>
+    <div class="sidebar-foot">
+      <div id="mode-chip" class="chip"></div>
+      <a id="verify-chip" class="chip" href="#/info/integrity"></a>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="titles">
+        <h1 id="page-title"></h1>
+        <p id="page-sub" class="sub"></p>
+      </div>
+      <div class="top-actions">
+        <span class="updated" id="updated"></span>
+        <label class="switch">
+          <input id="live" type="checkbox" checked>
+          <span class="track"><span class="thumb"></span></span>
+          <span id="live-label"></span>
+        </label>
+        <select id="lang" aria-label="Idioma">
+          <option value="es">ES</option>
+          <option value="en">EN</option>
+          <option value="pt">PT</option>
+        </select>
+        <button id="reload" type="button" class="icon-btn" aria-label="Reload">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="content">
+      <p id="load-error" class="alert bad" role="alert" hidden></p>
+
+      <section class="view" id="view-home"></section>
+
+      <section class="view" id="view-live" hidden>
+        <div class="view-head">
+          <p class="caption" id="live-caption" aria-live="polite"></p>
+          <div class="segmented" id="live-mode" role="group">
+            <button type="button" id="live-visual" data-i18n="m_visual"></button>
+            <button type="button" id="live-list" data-i18n="m_list"></button>
+          </div>
+        </div>
+        <canvas id="hud" role="img"></canvas>
+        <div id="hud-list" hidden></div>
+        <p class="more" id="live-more"></p>
+        <div id="live-rest"></div>
+      </section>
+
+      <section class="view" id="view-chain" hidden>
+        <div class="toolbar">
+          <div class="search">
+            <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="m21 21-4.3-4.3M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            <label class="sr-only" for="f-text" data-i18n="f_search"></label>
+            <input id="f-text" type="search" autocomplete="off">
+          </div>
+          <div class="segmented" id="f-decision" role="group"></div>
+          <label class="sr-only" for="f-tool" data-i18n="f_tool_label"></label>
+          <select id="f-tool"></select>
+          <label class="range"><span data-i18n="f_from"></span><input id="f-from" type="datetime-local"></label>
+          <label class="range"><span data-i18n="f_to"></span><input id="f-to" type="datetime-local"></label>
+        </div>
+        <div class="view-head">
+          <p class="caption" id="chain-caption" aria-live="polite"></p>
+          <div class="segmented" id="chain-mode" role="group">
+            <button type="button" id="chain-visual" data-i18n="m_diagram"></button>
+            <button type="button" id="chain-list" data-i18n="m_list"></button>
+          </div>
+        </div>
+        <div class="chain-scroll" id="chain-scroll">
+          <canvas id="chain" role="img"></canvas>
+          <div id="chain-spacer"></div>
+        </div>
+        <div class="table-wrap" id="chain-table">
+          <table class="data" id="table" aria-describedby="shown">
+            <thead><tr>
+              <th scope="col" data-i18n="c_when"></th>
+              <th scope="col" data-i18n="c_action"></th>
+              <th scope="col" data-i18n="c_server"></th>
+              <th scope="col" data-i18n="c_result"></th>
+              <th scope="col" data-i18n="c_rule"></th>
+              <th scope="col" data-i18n="c_verify"></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty" id="table-empty" hidden></div>
+        <div class="pager">
+          <button type="button" id="page-newer"></button>
+          <span id="shown" class="muted"></span>
+          <button type="button" id="page-older"></button>
+        </div>
+      </section>
+
+      <section class="view" id="view-info" hidden>
+        <nav class="subnav" id="subnav"></nav>
+
+        <div class="subview" id="info-approvals" hidden></div>
+        <div class="subview" id="info-policy" hidden></div>
+        <div class="subview" id="info-integrity" hidden></div>
+        <div class="subview" id="info-stats" hidden></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" aria-hidden="true">
+  <header class="drawer-head">
+    <div id="drawer-title"></div>
+    <button type="button" class="icon-btn" id="drawer-close" aria-label="Close">
+      <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    </button>
+  </header>
+  <div class="tabs" id="drawer-tabs"></div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>
