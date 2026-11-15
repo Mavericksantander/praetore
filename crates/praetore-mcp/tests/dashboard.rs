@@ -1049,6 +1049,86 @@ fn cached_verification_is_redone_when_a_file_verify_reads_changes() {
     assert_eq!(state["summary"]["total"], 5);
 }
 
+/// Changes the hex digit right after `marker`, keeping the length.
+fn flip_hex_after(text: &str, marker: &str) -> String {
+    let at = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("no {marker} in {text}"))
+        + marker.len();
+    let old = text.as_bytes()[at] as char;
+    assert!(old.is_ascii_hexdigit(), "{marker} is not followed by hex");
+    let new = if old == '0' { '1' } else { '0' };
+    format!("{}{new}{}", &text[..at], &text[at + 1..])
+}
+
+/// A file verify reads: its name, where it is and a same-length edit.
+type StampedFile = (&'static str, fn(&Home) -> PathBuf, fn(&str) -> String);
+
+#[test]
+fn cached_verification_is_redone_for_each_approval_and_issuer_file() {
+    // Each of these files is read by verify and stamped by the cache. A home
+    // with a signed approval decision, so the approval journal and the
+    // approver pin are both checked.
+    let files: [StampedFile; 3] = [
+        (
+            "approvals/journal.jsonl",
+            |home| home.root.join("approvals").join("journal.jsonl"),
+            |text| flip_hex_after(text, r#""signature":""#),
+        ),
+        (
+            "approver-public-key.hex",
+            |home| home.approver_pin(),
+            |text| flip_hex_after(text, ""),
+        ),
+        (
+            "issuer-pins.jsonl",
+            |home| home.issuer_pins(),
+            |text| flip_hex_after(text, r#""public_key":""#),
+        ),
+    ];
+    for (name, path, edit) in files {
+        let (_temp, home) = home_with_receipts();
+        let pending = praetore_mcp::approvals::list_pending(&home).unwrap();
+        assert_eq!(pending.len(), 1);
+        praetore_mcp::approvals::decide(
+            &home,
+            &pending[0].approval_id,
+            praetore_mcp::approvals::HumanOutcome::Approve,
+            None,
+        )
+        .unwrap();
+        let mut cache = dashboard::Cache::default();
+        let (_, state) = api(&home, &mut cache, "");
+        assert_eq!(
+            state["verify"]["status"], "ok",
+            "{name}: {}",
+            state["verify"]
+        );
+        api(&home, &mut cache, "?decision=DENY");
+        assert_eq!(cache.verifications(), 1, "{name}: nothing changed");
+
+        // Same length, same modification time.
+        rewrite_keeping_mtime(&path(&home), edit);
+        let (_, state) = api(&home, &mut cache, "");
+        assert_eq!(
+            cache.verifications(),
+            2,
+            "{name} changed but was not verified again"
+        );
+        // verify fails (approval files) or cannot run (issuer pin): not OK.
+        assert_ne!(
+            state["verify"]["status"], "ok",
+            "{name}: {}",
+            state["verify"]
+        );
+        assert_eq!(
+            state["verify"],
+            dashboard::state(&home, None)["verify"],
+            "{name}: the cached result is what a fresh read gives"
+        );
+    }
+}
+
 #[test]
 fn pending_calls_are_marked_unsigned_and_carry_their_receipt() {
     let (_temp, home) = home_with_receipts();
