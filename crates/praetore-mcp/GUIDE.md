@@ -381,6 +381,48 @@ can still open the page and read what it shows, tool arguments included,
 so run it only while you are using it. Texts are in Spanish, English and
 Portuguese.
 
+### A report of each session
+
+From 0.3.6, when a `wrap` session ends (the client or the server closes,
+or SIGINT/SIGTERM on macOS and Linux) and it recorded at least one receipt,
+two files are written to `DIR/reports/`:
+
+```
+session-<start UTC>-<id>.json   header + the session's receipts
+session-<start UTC>-<id>.pdf    the same session, for a person to read
+```
+
+The JSON header has the praetore-mcp version, agent, server, mode, seq
+range, the heads of the receipts and approval journals when the session
+closed, and the result of `verify`. Each receipt is the journal line
+itself, on a line of its own, copied byte for byte. The PDF has the
+summary (ALLOW, DENY, held, approved, expired), the calls, the approvals
+with the approver key id and time, the result of `verify`, both heads and
+the SHA-256 of the JSON file. Times are local with UTC next to them. If
+`verify` fails, the first page says `VERIFY FAILED` and both files are
+still written.
+
+```sh
+praetore-mcp report                    # write again the last session's report
+praetore-mcp report --session a41f9c2e # the id at the end of the file name
+praetore-mcp wrap --no-report -- ...   # this session writes no report
+```
+
+`report = false` in `DIR/config.toml` turns reports off for every session
+of that home. `praetore-mcp install` does not add `--no-report`.
+
+The report is a view of the journal: it signs nothing, changes no journal
+and takes no part in a decision. If it cannot be written, the reason goes
+to stderr and the session ends with the same exit code. It is
+tamper-evident on this machine; verify against an external copy of the
+heads. Someone who can write the home can rewrite a report as well as the
+journal, so keep the heads (or the PDF) somewhere the wrapped servers
+cannot write. `verify` at close reads the whole journal, so the report
+takes longer as the journal grows. Reports contain tool names and
+arguments; they are created with mode 0600 in a 0700 directory and are
+never deleted by `praetore-mcp`. A session can be regenerated only if it
+wrote a report. On Windows a session ended with Ctrl-C writes none.
+
 ## Limits
 
 Read these before relying on anything above.

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Added
+
+- **praetore-mcp: a report of each `wrap` session.** When a session ends
+  (the client or the server closes, or SIGINT/SIGTERM on macOS and Linux)
+  and it recorded at least one receipt, `wrap` writes
+  `DIR/reports/session-<start UTC>-<id>.json` and `.pdf`. The JSON has a
+  header (praetore-mcp version, agent, server, mode, seq range, the heads
+  of the receipts and approval journals at close, the result of `verify`)
+  and the session's receipts, each one the journal line copied byte for
+  byte. The PDF shows the same session for a person: PRÆTOR TECHNOLOGIES
+  wordmark, local time with UTC next to it, summary (ALLOW, DENY, held,
+  approved, expired), the calls (time, tool, decision, rule, short reason),
+  the approvals with the approver key id and time, the result of `verify`,
+  both heads and the SHA-256 of the JSON. If `verify` fails the first page
+  says `VERIFY FAILED` and both files are still written. The report is a
+  view: it signs nothing and does not change the journal; if it cannot be
+  written the reason goes to stderr and the exit code and every decision
+  stay the same. `wrap --no-report` and `report = false` in
+  `DIR/config.toml` (new, optional file) turn it off.
+  `praetore-mcp report [--dir DIR] [--session ID | --last]` writes a
+  session's report again from the journal as it is now (exit code 1 if it
+  says verify failed). The PDF is written in Rust with `pdf-writer` (MIT OR
+  Apache-2.0; adds no other crate to the lockfile), with no network access
+  and no external process.
+
+### Changed
+
+- **praetore-mcp: `wrap` handles SIGINT and SIGTERM on macOS and Linux.**
+  Before, the signal ended `wrap` at once. Now `wrap` waits up to 300 ms for
+  the server to end, forwards the signal to it, waits up to 2 s more, kills
+  it if it is still running, and then writes the session report. The exit
+  code is the server's, or 1 if it was killed by a signal.
+
 ## 0.3.5 - 2026-11-15
 
 praetore-mcp: `init` writes a default-deny policy (no

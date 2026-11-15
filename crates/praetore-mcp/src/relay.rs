@@ -13,15 +13,18 @@
 use crate::{
     gate::{Evaluator, Gate, GateError, Mode, Verdict},
     proxy::handle_client_line,
+    report::{self, SessionLog, SessionMeta},
     store::Home,
 };
 use serde_json::Value;
 use std::{
     io::{self, BufRead, BufReader, Write},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
+    time::Duration,
 };
+use time::OffsetDateTime;
 
 /// Maximum client line kept in memory for classification (32 MiB).
 pub const MAX_CLIENT_LINE_BYTES: usize = 32 * 1024 * 1024;
@@ -32,6 +35,8 @@ pub struct WrapOptions {
     pub mode: Mode,
     pub command: String,
     pub args: Vec<String>,
+    /// Write the session report under `DIR/reports/` when the session ends.
+    pub report: bool,
 }
 
 /// Evaluator that fails every call when the gate could not be loaded, so
@@ -48,6 +53,110 @@ impl Evaluator for GateOrError {
         }
     }
 }
+
+/// Records which receipts this session journaled, for the session report.
+/// It only reads the verdict; the verdict itself is returned unchanged.
+struct Recording<E> {
+    inner: E,
+    log: SessionLog,
+}
+
+impl<E: Evaluator> Evaluator for Recording<E> {
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
+        let verdict = self.inner.evaluate(server, params)?;
+        if verdict.journaled.is_ok() {
+            self.log.record(&verdict.evidence_id);
+        }
+        Ok(verdict)
+    }
+}
+
+/// Why `wrap` stops waiting.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+enum End {
+    /// The server closed its stdout.
+    ServerClosed,
+    /// SIGINT or SIGTERM arrived.
+    Signal(i32),
+}
+
+/// SIGINT and SIGTERM end the session in order, so its report is written:
+/// the handler writes the signal number to a pipe and a thread turns it
+/// into an [`End::Signal`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod signals {
+    use super::End;
+    use std::{
+        fs::File,
+        io::Read,
+        os::fd::FromRawFd,
+        sync::{
+            atomic::{AtomicI32, Ordering},
+            mpsc::Sender,
+        },
+        thread,
+    };
+
+    static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let fd = PIPE_WRITE.load(Ordering::Relaxed);
+        if fd >= 0 {
+            let byte = signal as u8;
+            // SAFETY: `write` is async-signal-safe; `byte` lives for the call.
+            unsafe {
+                libc::write(fd, (&raw const byte).cast(), 1);
+            }
+        }
+    }
+
+    /// Installs the handlers. If the pipe cannot be created the default
+    /// actions stay in place (the session ends without a report).
+    pub fn install(events: Sender<End>) {
+        let mut fds = [-1; 2];
+        // SAFETY: `pipe` fills the two descriptors of the array it is given.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return;
+        }
+        PIPE_WRITE.store(fds[1], Ordering::Relaxed);
+        // SAFETY: `fds[0]` is a descriptor this function just created and
+        // nothing else owns.
+        let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+        thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            while reader.read_exact(&mut byte).is_ok() {
+                if events.send(End::Signal(i32::from(byte[0]))).is_err() {
+                    break;
+                }
+            }
+        });
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: `action` is fully initialized before `sigaction` reads
+            // it, and the handler only calls `write`.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&raw mut action.sa_mask);
+                libc::sigaction(signal, &raw const action, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// Sends `signal` to the server.
+    pub fn forward(pid: u32, signal: i32) {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: `kill` takes no pointers.
+            unsafe {
+                libc::kill(pid, signal);
+            }
+        }
+    }
+}
+
+/// Time the server gets to end by itself after a signal before the signal
+/// is forwarded to it, and then before it is killed.
+const SIGNAL_GRACE: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(2)];
 
 /// Windows-style command lookup: a bare name (no separator, no extension)
 /// is searched in `path` with each `pathext` extension, so `npx` finds
@@ -210,6 +319,7 @@ pub fn other_namespace_launcher(command: &str, args: &[String]) -> Option<String
 }
 
 pub fn run(options: WrapOptions) -> i32 {
+    let started_at = OffsetDateTime::now_utc();
     let gate = Gate::load(&options.home, options.mode);
     // Without a gate no receipt can be written, so there is nothing to
     // observe: both modes refuse every tools/call (fail closed) and gate the
@@ -232,7 +342,11 @@ pub fn run(options: WrapOptions) -> i32 {
             "praetore-mcp: WARNING the server is started through {launcher:?}, which usually runs it in another mount namespace or on another host. Path rules are checked against THIS machine's filesystem; the server may resolve the same path to a different file. This setup is not supported by the path check (defense in depth only)."
         );
     }
-    let mut evaluator = GateOrError(gate);
+    let log = SessionLog::default();
+    let mut evaluator = Recording {
+        inner: GateOrError(gate),
+        log: log.clone(),
+    };
 
     #[cfg(windows)]
     let program = resolve_command(
@@ -268,8 +382,10 @@ pub fn run(options: WrapOptions) -> i32 {
 
     let stdout = Arc::new(Mutex::new(io::stdout()));
 
+    let (events, ended) = mpsc::channel();
     let server_to_client = {
         let stdout = Arc::clone(&stdout);
+        let events = events.clone();
         thread::spawn(move || {
             let mut reader = BufReader::new(child_stdout);
             let mut buf = Vec::new();
@@ -284,8 +400,13 @@ pub fn run(options: WrapOptions) -> i32 {
                     }
                 }
             }
+            let _ = events.send(End::ServerClosed);
         })
     };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    signals::install(events);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    drop(events);
 
     let name = options.name.clone();
     let client_stdout = Arc::clone(&stdout);
@@ -332,12 +453,64 @@ pub fn run(options: WrapOptions) -> i32 {
         // Dropping child_stdin closes the server's stdin (client went away).
     });
 
-    let _ = server_to_client.join();
+    match ended.recv() {
+        Ok(End::Signal(signal)) => {
+            // The client is going away. Give the server a moment to end by
+            // itself (a terminal's Ctrl-C reaches it too), then pass the
+            // signal on, then stop waiting for it.
+            if !matches!(ended.recv_timeout(SIGNAL_GRACE[0]), Ok(End::ServerClosed)) {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                signals::forward(child.id(), signal);
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                let _ = signal;
+                if !matches!(ended.recv_timeout(SIGNAL_GRACE[1]), Ok(End::ServerClosed)) {
+                    let _ = child.kill();
+                }
+            }
+        }
+        Ok(End::ServerClosed) | Err(_) => {
+            let _ = server_to_client.join();
+        }
+    }
     let status = child.wait();
     let _ = stdout.lock().map(|out| out.lock().flush());
-    match status {
+    let code = match status {
         Ok(status) => status.code().unwrap_or(1),
         Err(_) => 1,
+    };
+    if options.report {
+        write_report(&options, started_at, &log);
+    }
+    code
+}
+
+/// Writes the session report. Whatever happens here goes to stderr and
+/// nowhere else: the exit code and every decision already made stay as
+/// they are.
+fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &SessionLog) {
+    let meta = SessionMeta {
+        id: report::new_session_id(),
+        server: options.name.clone(),
+        mode: options.mode.as_str().to_owned(),
+        started_at,
+        ended_at: OffsetDateTime::now_utc(),
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        report::close_session(&options.home, meta, log)
+    }));
+    match outcome {
+        Ok(Ok(Some(generated))) => eprintln!(
+            "praetore-mcp: session report: {}{}",
+            generated.pdf.display(),
+            if generated.verify_passed {
+                ""
+            } else {
+                " (verify FAILED; see the report)"
+            }
+        ),
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => eprintln!("praetore-mcp: session report not written: {error}"),
+        Err(_) => eprintln!("praetore-mcp: session report not written: internal error"),
     }
 }
 

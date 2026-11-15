@@ -19,13 +19,15 @@ const USAGE: &str = "praetore-mcp: put PRÆTORE in front of any stdio MCP server
 
 Usage:
   praetore-mcp init      [--dir DIR]
-  praetore-mcp wrap      [--dir DIR] [--name SERVER] [--mode observe|enforce] -- <command> [args...]
+  praetore-mcp wrap      [--dir DIR] [--name SERVER] [--mode observe|enforce] [--no-report]
+                         -- <command> [args...]
   praetore-mcp install   [--client claude-desktop|cursor|vscode] [--config FILE] [--dir DIR]
                          [--mode observe|enforce] [--dry-run] [--yes]
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
   praetore-mcp verify    [--dir DIR] [--expected-head HEX]
   praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]
+  praetore-mcp report    [--dir DIR] [--session ID | --last]
   praetore-mcp approvals [--dir DIR]
   praetore-mcp approve   <id> [--dir DIR]
   praetore-mcp reject    <id> [--dir DIR]
@@ -54,7 +56,7 @@ refuses every tools/call in both modes.
 Exit codes:
   0    success (also --help and --version)
   1    the command ran and found a problem: `verify` found a failed receipt,
-       `policy check` found an invalid policy or engine, `policy coverage`
+       `report` wrote a report that says verify failed, `policy check` found an invalid policy or engine, `policy coverage`
        found a tool allowed only by an allow-all rule, or `install` /
        `uninstall` could not read, parse or write a config (or was not
        confirmed)
@@ -81,7 +83,9 @@ warning with the command to remove it and leaves the policy unchanged.
 
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
 
-const WRAP_HELP: &str = "Usage: praetore-mcp wrap [--dir DIR] [--name SERVER] [--mode observe|enforce] -- <command> [args...]
+const WRAP_HELP: &str =
+    "Usage: praetore-mcp wrap [--dir DIR] [--name SERVER] [--mode observe|enforce] [--no-report]
+                         -- <command> [args...]
 
 Starts the stdio MCP server <command> and relays its stdio. Every tools/call
 is evaluated and recorded as a signed receipt. Everything after `--` is
@@ -93,6 +97,15 @@ passed to the server unchanged (including any --help).
   --mode MODE   observe (default): forward every call, record the decision
                 enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
                 `praetore-mcp approve <id>` for that exact call
+  --no-report   do not write the session report (same as `report = false`
+                in DIR/config.toml)
+
+When the session ends (the client or the server closes, or SIGINT/SIGTERM
+on macOS and Linux) and it recorded at least one receipt, a report of the
+session is written to DIR/reports/ as session-<start UTC>-<id>.json and
+.pdf; see `praetore-mcp report --help`. The report is a view of the journal:
+it changes no decision, and if it cannot be written the reason goes to
+stderr and the exit code is the same.
 
 Exit code: the server's; 127 if it cannot be started, 1 if it was killed by
 a signal, 2 on a usage error.";
@@ -217,6 +230,33 @@ Any local process of any user can open the page and read what it shows
 Exit code: 2 on a usage error or if the port cannot be opened; otherwise it
 runs until stopped.";
 
+const REPORT_HELP: &str = "Usage: praetore-mcp report [--dir DIR] [--session ID | --last]
+
+Writes again the report of one `wrap` session: DIR/reports/session-<start
+UTC>-<id>.json and .pdf. The session is the one named by ID (the eight
+characters at the end of the file name) or, by default and with --last, the
+most recent one. Its receipts are read from the journal as it is now and
+`verify` runs again; the two journal heads shown are the ones recorded when
+the session closed.
+
+The JSON file has a header (praetore-mcp version, agent, server, mode, seq
+range, both journal heads, the result of verify) and the session's receipts,
+each one the journal line copied byte for byte. The PDF shows the same
+session for a person: summary, calls, approvals, the result of verify, both
+heads and the SHA-256 of the JSON file. If verify fails the PDF says so on
+its first page and both files are still written.
+
+The report is a view. It signs nothing and does not change the journal.
+A session can be regenerated only if it wrote a report (not after
+`wrap --no-report` or `report = false`).
+
+  --dir DIR      home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
+  --session ID   session id
+  --last         the most recent session (default)
+
+Exit code: 0 if the report was written and verify passed, 1 if it was
+written and says verify failed, 2 if it could not be written.";
+
 const POLICY_HELP: &str = "Usage:
   praetore-mcp policy list   [--dir DIR]
   praetore-mcp policy check  [--dir DIR]
@@ -256,6 +296,7 @@ fn help_for(command: &str) -> Option<&'static str> {
         "receipts" => RECEIPTS_HELP,
         "verify" => VERIFY_HELP,
         "dashboard" => DASHBOARD_HELP,
+        "report" => REPORT_HELP,
         "approvals" => APPROVALS_HELP,
         "approve" => APPROVE_HELP,
         "reject" => REJECT_HELP,
@@ -367,6 +408,7 @@ pub fn run(args: &[String]) -> i32 {
         "receipts" => cmd_receipts(rest),
         "verify" => cmd_verify(rest),
         "dashboard" => cmd_dashboard(rest),
+        "report" => cmd_report(rest),
         "approvals" => cmd_approvals(rest),
         "approve" => cmd_decide(rest, crate::approvals::HumanOutcome::Approve),
         "reject" => cmd_decide(rest, crate::approvals::HumanOutcome::Reject),
@@ -498,7 +540,7 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
     let parsed = parse(
         args,
         &["--dir", "--name", "--mode"],
-        &[install::ORIGINAL_ARGS_ABSENT],
+        &[install::ORIGINAL_ARGS_ABSENT, "--no-report"],
         true,
     )?;
     let Some((command, command_args)) = parsed.rest.split_first() else {
@@ -512,12 +554,18 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
             "invalid server name {name:?} (1-128 printable characters, not starting with '-')"
         ));
     }
+    let home = parsed.home()?;
+    let (config, warnings) = crate::config::load(&home);
+    for warning in warnings {
+        eprintln!("praetore-mcp: warning: {warning}");
+    }
     Ok(relay::run(relay::WrapOptions {
-        home: parsed.home()?,
+        home,
         name,
         mode: parsed.mode()?,
         command: command.clone(),
         args: command_args.to_vec(),
+        report: config.report && !parsed.flag("--no-report"),
     }))
 }
 
@@ -780,6 +828,31 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
     println!("listening on 127.0.0.1 only; stop with Ctrl-C");
     crate::dashboard::serve(&listener, &home, expected_head, None)?;
     Ok(0)
+}
+
+fn cmd_report(args: &[String]) -> Result<i32, String> {
+    use crate::report::{self, Selector};
+    let parsed = parse(args, &["--dir", "--session"], &["--last"], false)?;
+    let selector = match (parsed.value("--session"), parsed.flag("--last")) {
+        (Some(_), true) => return Err("--session and --last cannot be used together".into()),
+        (Some(id), false) if report::valid_session_id(id) => Selector::Session(id.to_owned()),
+        (Some(id), false) => {
+            return Err(format!(
+                "--session must be the 8 lowercase hex characters at the end of the report file name, got {id:?}"
+            ));
+        }
+        (None, _) => Selector::Last,
+    };
+    let generated = report::regenerate(&parsed.home()?, &selector)?;
+    println!("{}", generated.json.display());
+    println!("{}", generated.pdf.display());
+    if generated.verify_passed {
+        println!("verify passed");
+        Ok(0)
+    } else {
+        println!("verify FAILED: the report says so on its first page");
+        Ok(1)
+    }
 }
 
 fn cmd_approvals(args: &[String]) -> Result<i32, String> {

@@ -402,6 +402,16 @@ pub fn record_duplicate_execution(
     })
 }
 
+/// The approval journal records (decisions and executions) in file order,
+/// for read-only views such as the session report. Nothing is checked here:
+/// `verify` checks signatures, bindings and order.
+pub fn records(home: &Home) -> Result<Vec<Value>, String> {
+    Ok(read_journal_unlocked(home)?
+        .into_iter()
+        .map(|entry| entry.record)
+        .collect())
+}
+
 /// Evidence id → short status for `receipts`. Not a signature check; `verify`
 /// does that. A missing approval directory yields an empty map.
 pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, String> {
