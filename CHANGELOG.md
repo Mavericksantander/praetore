@@ -2,14 +2,14 @@
 
 ## Unreleased
 
-## 0.3.5 - (sin fecha, pendiente de tag)
+## 0.3.5 - 2026-11-15
 
 praetore-mcp: `init` writes a default-deny policy (no
 `allow-all-mcp-tool-calls`), `policy coverage` reports what the policy
 decides for each tool a server lists, and `dashboard` serves a read-only
 local page over the receipts journal. Also carries everything merged to
-main since v0.3.4, including the dashboard minors and the load-proof
-latency test from #175. This section does not tag or publish a release.
+main since v0.3.4, including the dashboard minors and latency tests that
+tolerate a loaded machine from #175.
 
 ### Changed
 
