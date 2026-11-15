@@ -49,6 +49,7 @@ const I18N = {
     l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PIDIÓ APROBACIÓN",
     l_default_deny: "default deny: ninguna regla lo permite", l_rule: (id) => `regla ${id}`, l_guard: (g) => `comprobación del motor: ${g}`,
     l_observe: "observe: registrada, no aplicada",
+    l_unverified: "verify falla", h_server_note: "de los 40 recibos más recientes", c_receipt: "recibo",
     l_pending: "pendiente · aviso sin firma · verify no lo comprueba",
     l_label: (n, total) => `Vista en vivo: las ${n} decisiones más recientes de ${total}. La vista de lista tiene lo mismo.`,
     c_cap: (n, m) => `${n} de ${m} recibos en esta página, del más reciente al más antiguo.`,
@@ -199,6 +200,7 @@ const I18N = {
     l_allow: "ALLOWED", l_deny: "DENIED", l_ask: "ASKED FOR APPROVAL",
     l_default_deny: "default deny: no rule allows it", l_rule: (id) => `rule ${id}`, l_guard: (g) => `engine check: ${g}`,
     l_observe: "observe: recorded, not applied",
+    l_unverified: "verify fails", h_server_note: "from the 40 most recent receipts", c_receipt: "receipt",
     l_pending: "pending · notice not signed · not checked by verify",
     l_label: (n, total) => `Live view: the ${n} most recent decisions of ${total}. The list view has the same.`,
     c_cap: (n, m) => `${n} of ${m} receipts on this page, newest to oldest.`,
@@ -349,6 +351,7 @@ const I18N = {
     l_allow: "PERMITIDA", l_deny: "BLOQUEADA", l_ask: "PEDIU APROVAÇÃO",
     l_default_deny: "default deny: nenhuma regra a permite", l_rule: (id) => `regra ${id}`, l_guard: (g) => `verificação do motor: ${g}`,
     l_observe: "observe: registrada, não aplicada",
+    l_unverified: "verify falha", h_server_note: "dos 40 recibos mais recentes", c_receipt: "recibo",
     l_pending: "pendente · aviso sem assinatura · o verify não o verifica",
     l_label: (n, total) => `Vista ao vivo: as ${n} decisões mais recentes de ${total}. A vista de lista tem o mesmo.`,
     c_cap: (n, m) => `${n} de ${m} recibos nesta página, do mais recente ao mais antigo.`,
@@ -938,6 +941,8 @@ function syncHud() {
     const row = known.get(r.evidence_id) || { born: null };
     row.r = r;
     row.pending = r.decision === "REQUIRE_APPROVAL" && pending.has(r.evidence_id);
+    // What verify said about this receipt, as the server sent it.
+    row.cut = breakReason(r);
     const fresh = firstLoad ? false : !hud.seen.has(r.evidence_id);
     if (!known.has(r.evidence_id) && fresh && !reducedMotion()) {
       row.born = now + stagger * 220;
@@ -1011,20 +1016,25 @@ function drawHud(now) {
       ctx.lineTo(boxX + boxW * scan, y + 45);
       ctx.stroke();
     }
-    brackets(ctx, boxX, y, boxW, 42, rgba(scan < 1 ? c.hud : color, scan < 1 ? 0.6 : 0.95));
+    brackets(ctx, boxX, y, boxW, 42, rgba(scan < 1 ? c.hud : row.cut ? c.wall : color, scan < 1 ? 0.6 : 0.95));
     ctx.textAlign = "left";
     ctx.fillStyle = c.ink;
     ctx.font = `14px ${c.sans}`;
     ctx.fillText(clipText(ctx, toolLabel(r.tool), boxW * 0.55), boxX + 12, y + 17);
     ctx.fillStyle = c.quiet;
     ctx.font = `10px ${c.mono}`;
-    ctx.fillText(clipText(ctx, `${r.server ?? "-"} · ${whenText(r)}`, boxW - 24), boxX + 12, y + 33);
+    ctx.fillText(clipText(ctx, `${r.server ?? "-"} · ${whenText(r)}`, row.cut ? boxW * 0.5 : boxW - 24), boxX + 12, y + 33);
     if (scan >= 1) {
       ctx.textAlign = "right";
       ctx.font = `10px ${c.mono}`;
       ctx.fillStyle = color;
       const label = r.decision === "ALLOW" ? t("l_allow") : r.decision === "DENY" ? t("l_deny") : t("l_ask");
       ctx.fillText(label, boxX + boxW - 10, y + 17);
+      if (row.cut) {
+        // verify failed for this receipt: say so, with verify's reason.
+        ctx.fillStyle = c.wall;
+        ctx.fillText(clipText(ctx, `✕ ${t("l_unverified")}: ${row.cut}`, boxW * 0.45), boxX + boxW - 10, y + 33);
+      }
     }
 
     // The line from the agent, and the wall when there is one.
@@ -1120,6 +1130,7 @@ function hudList() {
     if (r.parse_error) continue;
     const target = targetOf(r.arguments);
     const waiting = r.decision === "REQUIRE_APPROVAL" && pending.has(r.evidence_id);
+    const cut = breakReason(r);
     const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
     const cls = outcome ? outcome.cls : decisionClass(r.decision);
     list.append(activatable(el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
@@ -1128,7 +1139,8 @@ function hudList() {
         el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, `${r.server ?? "-"} · ${target.short}`),
         el("div", { class: "why-line mono" }, r.decision === "ALLOW" ? "" : wallText(r)),
-        waiting ? el("div", { class: "unsigned" }, t("l_pending")) : null),
+        waiting ? el("div", { class: "unsigned" }, t("l_pending")) : null,
+        cut ? el("div", { class: "bad-text mono" }, `✕ ${t("l_unverified")}: ${cut}`) : null),
       outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
       el("time", {}, localText(r.decided_at), el("small", {}, utcText(r.decided_at)))), () => openDrawer(r), r.evidence_id));
   }
