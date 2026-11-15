@@ -1778,17 +1778,28 @@ function renderDrawer() {
   }
 }
 
+// The receipt rebuilt field by field, as text: nothing from the journal is
+// written as HTML.
 function drawerSummary(body, r) {
   const label = approvalLabel(r.approval);
-  body.append(kv([
+  const cut = breakReason(r);
+  const rows = kv([
     [t("f_decision"), decisionTag(r.decision)],
     [t("why"), whyBlock(r)],
     [t("f_server"), r.server],
     [t("f_tool"), toolLabel(r.tool)],
+    [t("f_mode"), r.mode ?? "-"],
     [t("f_local"), localText(r.decided_at)],
     [t("f_utc"), utcText(r.decided_at)],
     [t("f_approval"), label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-"],
-  ]));
+    [t("f_evidence"), el("span", {}, r.evidence_id, copyButton(r.evidence_id))],
+    [t("f_seq"), r.seq === null || r.seq === undefined ? t("unchained") : String(r.seq)],
+    [t("f_prev"), r.prev ?? "-"],
+    [t("f_verified"), el("span", { class: `tag ${cut ? "bad" : "ok"}` }, cut ? `${t("st_fail")}: ${cut}` : t("st_ok"))],
+  ]);
+  rows.classList.add("rebuild");
+  [...rows.children].forEach((node, index) => { node.style.animationDelay = `${index * 45}ms`; });
+  body.append(rows);
   body.append(el("h3", {}, t("args")));
   body.append(el("pre", { class: "json" }, argsText(r.arguments)));
 }
