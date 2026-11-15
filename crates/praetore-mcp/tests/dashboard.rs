@@ -660,10 +660,32 @@ fn page_never_writes_journal_values_as_html() {
         "srcdoc",
         "eval(",
         "Function(",
+        "setHTML",
+        "javascript:",
     ] {
         assert!(!js.contains(sink), "app.js uses {sink}");
     }
+    assert_no_string_timers(js);
     assert_no_event_handler_attributes(js);
+}
+
+/// Fails when `js` passes a string to `setTimeout` or `setInterval`, which
+/// the browser would run as code.
+fn assert_no_string_timers(js: &str) {
+    for timer in ["setTimeout", "setInterval"] {
+        for (at, _) in js.match_indices(timer) {
+            let rest = js[at + timer.len()..].trim_start();
+            let Some(argument) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let first = argument.trim_start().chars().next();
+            assert!(
+                !matches!(first, Some('"' | '\'' | '`')),
+                "app.js passes a string to {timer}: {}",
+                &js[at..(at + 60).min(js.len())]
+            );
+        }
+    }
 }
 
 /// HTML event handler content attributes (GlobalEventHandlers and the
@@ -824,4 +846,576 @@ fn assert_no_event_handler_attributes(js: &str) {
             );
         }
     }
+}
+
+/// `/api/state` with `query`, through [`dashboard::respond_with`].
+fn api(home: &Home, cache: &mut dashboard::Cache, query: &str) -> (u16, Value) {
+    let request = format!("GET /api/state{query} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n");
+    let response = dashboard::respond_with(&request, home, None, 8787, cache);
+    let body = if response.status == 200 {
+        serde_json::from_slice(&response.body).unwrap()
+    } else {
+        Value::String(String::from_utf8(response.body).unwrap())
+    };
+    (response.status, body)
+}
+
+fn page_tools(state: &Value) -> Vec<&str> {
+    state["page"]["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["tool"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn api_state_sends_one_page_newest_first_with_full_counts() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (status, state) = api(&home, &mut cache, "?limit=2");
+    assert_eq!(status, 200, "{state}");
+    assert_eq!(
+        page_tools(&state),
+        ["read_file", "move_file"],
+        "newest first"
+    );
+    assert_eq!(state["page"]["matching"], 4);
+    assert!(state.get("receipts").is_none(), "no whole journal");
+    let (_, next) = api(&home, &mut cache, "?limit=2&offset=2");
+    assert_eq!(page_tools(&next), ["delete_file", "echo"]);
+    // The counts cover the whole journal, whatever the page.
+    assert_eq!(state["summary"]["total"], 4);
+    assert_eq!(state["summary"]["allow"], 2);
+    assert_eq!(
+        state["tools"].as_array().unwrap().len(),
+        4,
+        "{}",
+        state["tools"]
+    );
+    let buckets = state["activity"]["buckets"].as_array().unwrap();
+    let decisions: u64 = buckets
+        .iter()
+        .map(|b| {
+            b["ALLOW"].as_u64().unwrap()
+                + b["DENY"].as_u64().unwrap()
+                + b["REQUIRE_APPROVAL"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(decisions, 4);
+    assert_eq!(state["activity"]["bucket_seconds"], 900);
+    assert_eq!(state["recent"].as_array().unwrap().len(), 4);
+    assert_eq!(state["approval_history"][0]["tool"], "move_file");
+    // A parsed receipt is sent once, as JSON, not again as text.
+    let first = &state["page"]["receipts"][0];
+    assert!(first["raw"].is_object() && first.get("raw_text").is_none());
+    // One verification for the three requests.
+    assert_eq!(cache.verifications(), 1);
+}
+
+#[test]
+fn api_state_filters_by_decision_tool_time_and_text() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let tools = |query: &str, cache: &mut dashboard::Cache| -> Vec<String> {
+        let (status, state) = api(&home, cache, query);
+        assert_eq!(status, 200, "{query}: {state}");
+        page_tools(&state).into_iter().map(str::to_owned).collect()
+    };
+    assert_eq!(tools("?decision=DENY", &mut cache), ["delete_file"]);
+    assert_eq!(tools("?decision=ALLOW", &mut cache), ["read_file", "echo"]);
+    assert_eq!(
+        tools("?decision=REQUIRE_APPROVAL", &mut cache),
+        ["move_file"]
+    );
+    assert_eq!(tools("?tool=echo", &mut cache), ["echo"]);
+    assert_eq!(
+        tools("?decision=ALLOW&tool=delete_file", &mut cache),
+        Vec::<String>::new()
+    );
+    // Text search over the receipt, case-insensitive, form-encoded.
+    assert_eq!(tools("?q=%3CB%3Ehi", &mut cache), ["echo"]);
+    assert_eq!(tools("?q=ok.txt", &mut cache), ["read_file"]);
+    // Time range on decided_at, inclusive, any UTC offset.
+    let (_, all) = api(&home, &mut cache, "");
+    let times: Vec<&str> = all["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["decided_at"].as_str().unwrap())
+        .collect();
+    let (newest, oldest) = (times[0], times[times.len() - 1]);
+    let enc = |t: &str| t.replace('+', "%2B");
+    assert_eq!(
+        tools(
+            &format!("?from={}&to={}", enc(oldest), enc(newest)),
+            &mut cache
+        )
+        .len(),
+        4
+    );
+    assert_eq!(
+        tools("?from=2999-01-01T00:00:00Z", &mut cache),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        tools("?to=2000-01-01T00:00:00%2B03:00", &mut cache),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        tools(&format!("?from={}", enc(newest)), &mut cache).len(),
+        times.iter().filter(|t| **t == newest).count()
+    );
+    for bad in [
+        "?decision=allow",
+        "?decision=UNREADABLE",
+        "?limit=0",
+        "?limit=501",
+        "?offset=-1",
+        "?from=yesterday",
+        "?to=2026-01-01",
+        "?q=%ZZ",
+        "?q=%FF",
+        "?sort=asc",
+    ] {
+        let (status, body) = api(&home, &mut cache, bad);
+        assert_eq!(status, 400, "{bad}: {body}");
+    }
+    assert_eq!(cache.verifications(), 1);
+}
+
+/// Rewrites `file` with `edit` applied, keeping its length and its
+/// modification time.
+fn rewrite_keeping_mtime(file: &Path, edit: impl Fn(&str) -> String) {
+    let before = fs::metadata(file).unwrap();
+    let text = edit(&fs::read_to_string(file).unwrap());
+    assert_eq!(text.len() as u64, before.len(), "same length");
+    fs::write(file, text).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(before.modified().unwrap())
+        .unwrap();
+    assert_eq!(
+        fs::metadata(file).unwrap().modified().unwrap(),
+        before.modified().unwrap()
+    );
+}
+
+#[test]
+fn cached_verification_is_redone_when_a_file_verify_reads_changes() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(state["verify"]["status"], "ok");
+    let (_, _) = api(&home, &mut cache, "?decision=DENY");
+    assert_eq!(cache.verifications(), 1, "nothing changed");
+
+    // Same length, same modification time: still verified again.
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    rewrite_keeping_mtime(&file, |text| {
+        text.replacen(
+            r#""praetore.mode":"enforce""#,
+            r#""praetore.mode":"observe""#,
+            1,
+        )
+    });
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(cache.verifications(), 2);
+    assert_eq!(state["verify"]["status"], "fail", "{}", state["verify"]);
+    assert_eq!(
+        state["verify"]["status"],
+        dashboard::state(&home, None)["verify"]["status"]
+    );
+
+    // A changed pin is verified again too.
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    assert_eq!(api(&home, &mut cache, "").1["verify"]["status"], "ok");
+    let approver = fs::read_to_string(home.approver_pin()).unwrap();
+    rewrite_keeping_mtime(&home.attester_pin(), |_| approver.clone());
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(cache.verifications(), 2);
+    assert_eq!(state["verify"]["status"], "fail");
+
+    // An appended line.
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    let mut journal = fs::OpenOptions::new().append(true).open(&file).unwrap();
+    journal.write_all(b"{not json\n").unwrap();
+    let (_, state) = api(&home, &mut cache, "");
+    assert_eq!(cache.verifications(), 3);
+    assert_eq!(state["summary"]["unreadable"], 1);
+    assert_eq!(state["summary"]["total"], 5);
+}
+
+/// Changes the hex digit right after `marker`, keeping the length.
+fn flip_hex_after(text: &str, marker: &str) -> String {
+    let at = text
+        .find(marker)
+        .unwrap_or_else(|| panic!("no {marker} in {text}"))
+        + marker.len();
+    let old = text.as_bytes()[at] as char;
+    assert!(old.is_ascii_hexdigit(), "{marker} is not followed by hex");
+    let new = if old == '0' { '1' } else { '0' };
+    format!("{}{new}{}", &text[..at], &text[at + 1..])
+}
+
+/// A file verify reads: its name, where it is and a same-length edit.
+type StampedFile = (&'static str, fn(&Home) -> PathBuf, fn(&str) -> String);
+
+#[test]
+fn cached_verification_is_redone_for_each_approval_and_issuer_file() {
+    // Each of these files is read by verify and stamped by the cache. A home
+    // with a signed approval decision, so the approval journal and the
+    // approver pin are both checked.
+    let files: [StampedFile; 3] = [
+        (
+            "approvals/journal.jsonl",
+            |home| home.root.join("approvals").join("journal.jsonl"),
+            |text| flip_hex_after(text, r#""signature":""#),
+        ),
+        (
+            "approver-public-key.hex",
+            |home| home.approver_pin(),
+            |text| flip_hex_after(text, ""),
+        ),
+        (
+            "issuer-pins.jsonl",
+            |home| home.issuer_pins(),
+            |text| flip_hex_after(text, r#""public_key":""#),
+        ),
+    ];
+    for (name, path, edit) in files {
+        let (_temp, home) = home_with_receipts();
+        let pending = praetore_mcp::approvals::list_pending(&home).unwrap();
+        assert_eq!(pending.len(), 1);
+        praetore_mcp::approvals::decide(
+            &home,
+            &pending[0].approval_id,
+            praetore_mcp::approvals::HumanOutcome::Approve,
+            None,
+        )
+        .unwrap();
+        let mut cache = dashboard::Cache::default();
+        let (_, state) = api(&home, &mut cache, "");
+        assert_eq!(
+            state["verify"]["status"], "ok",
+            "{name}: {}",
+            state["verify"]
+        );
+        api(&home, &mut cache, "?decision=DENY");
+        assert_eq!(cache.verifications(), 1, "{name}: nothing changed");
+
+        // Same length, same modification time.
+        rewrite_keeping_mtime(&path(&home), edit);
+        let (_, state) = api(&home, &mut cache, "");
+        assert_eq!(
+            cache.verifications(),
+            2,
+            "{name} changed but was not verified again"
+        );
+        // verify fails (approval files) or cannot run (issuer pin): not OK.
+        assert_ne!(
+            state["verify"]["status"], "ok",
+            "{name}: {}",
+            state["verify"]
+        );
+        assert_eq!(
+            state["verify"],
+            dashboard::state(&home, None)["verify"],
+            "{name}: the cached result is what a fresh read gives"
+        );
+    }
+}
+
+#[test]
+fn pending_calls_are_marked_unsigned_and_carry_their_receipt() {
+    let (_temp, home) = home_with_receipts();
+    let (_, state) = api(&home, &mut dashboard::Cache::default(), "");
+    let pending = state["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{}", state["pending"]);
+    // A pending file is not signed and verify does not check it.
+    assert_eq!(pending[0]["signed"], false);
+    assert_eq!(state["summary"]["pending_unsigned"], 1);
+    assert_eq!(dashboard::state(&home, None)["pending"][0]["signed"], false);
+    // The page labels it, from that field.
+    let js = include_str!("../src/dashboard/app.js");
+    assert!(
+        js.contains("p.signed === false"),
+        "app.js does not read signed"
+    );
+    assert!(js.contains("unsigned_tag") && js.contains("unsigned_note"));
+    let receipt = &pending[0]["receipt"];
+    assert_eq!(receipt["evidence_id"], pending[0]["evidence_id"]);
+    assert_eq!(receipt["decision"], "REQUIRE_APPROVAL");
+    assert_eq!(receipt["verified"], true);
+}
+
+#[test]
+fn api_receipt_returns_one_receipt_by_evidence_id() {
+    let (_temp, home) = home_with_receipts();
+    let state = dashboard::state(&home, None);
+    let id = state["receipts"][2]["evidence_id"].as_str().unwrap();
+    let get = |target: &str| {
+        dashboard::respond(
+            &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n"),
+            &home,
+            None,
+            8787,
+        )
+    };
+    let found = get(&format!("/api/receipt?id={id}"));
+    assert_eq!(found.status, 200);
+    let receipt: Value = serde_json::from_slice(&found.body).unwrap();
+    assert_eq!(receipt["evidence_id"], id);
+    assert_eq!(receipt["tool"], "move_file");
+    for missing in [
+        "/api/receipt?id=nope",
+        "/api/receipt",
+        "/api/receipt?id=%ZZ",
+    ] {
+        assert_eq!(get(missing).status, 404, "{missing}");
+    }
+}
+
+#[test]
+fn receipts_say_what_decided_them() {
+    let (_temp, home) = home_with_receipts();
+    let state = dashboard::state(&home, None);
+    let by_tool = |tool: &str| {
+        state["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["tool"] == tool)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        by_tool("echo")["decided_by"],
+        json!({"kind": "rule", "rule_id": "allow-all-mcp-tool-calls"})
+    );
+    assert_eq!(
+        by_tool("delete_file")["decided_by"],
+        json!({"kind": "rule", "rule_id": "deny-delete"})
+    );
+    assert!(
+        by_tool("delete_file")["reason"]
+            .as_str()
+            .unwrap()
+            .contains("deny-delete")
+    );
+
+    // `init` writes a default-deny policy: a call no rule covers.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("home");
+    let dir = root.to_str().unwrap();
+    assert!(run(&["init", "--dir", dir], "").status.success());
+    let calls = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{}}}),
+    ];
+    let input: String = calls.iter().map(|c| format!("{c}\n")).collect();
+    let server = fake_server();
+    let out = run(
+        &[
+            "wrap",
+            "--dir",
+            dir,
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+            "--",
+            server.to_str().unwrap(),
+        ],
+        &input,
+    );
+    assert!(out.status.success(), "{out:?}");
+    let state = dashboard::state(&Home::new(root), None);
+    let receipt = &state["receipts"][0];
+    assert_eq!(receipt["decision"], "DENY");
+    assert_eq!(receipt["rule"], Value::Null);
+    assert_eq!(receipt["decided_by"], json!({"kind": "default_deny"}));
+
+    // The page explains each kind from that field.
+    let js = include_str!("../src/dashboard/app.js");
+    for kind in [
+        "\"rule\"",
+        "\"unbound_rule\"",
+        "\"default_deny\"",
+        "\"engine_guard\"",
+    ] {
+        assert!(
+            js.contains(&format!("by.kind === {kind}")),
+            "app.js: {kind}"
+        );
+    }
+}
+
+/// WCAG relative luminance of `#rrggbb`.
+fn luminance(hex: &str) -> f64 {
+    let channel = |i: usize| {
+        let c = f64::from(u8::from_str_radix(&hex[1 + 2 * i..3 + 2 * i], 16).unwrap()) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2)
+}
+
+/// `--name: #hex;` tokens of the first block after `marker` in `css`.
+fn color_tokens(css: &str, marker: &str) -> BTreeMap<String, String> {
+    let block = &css[css.find(marker).unwrap()..];
+    let block = &block[..block.find('}').unwrap()];
+    let block = &block[block.rfind('{').unwrap() + 1..];
+    block
+        .split(';')
+        .filter_map(|decl| {
+            let (name, value) = decl.trim().split_once(':')?;
+            let value = value.trim();
+            (name.starts_with("--") && value.starts_with('#') && value.len() == 7)
+                .then(|| (name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn page_meets_basic_accessibility() {
+    let html = include_str!("../src/dashboard/index.html");
+    let js = include_str!("../src/dashboard/app.js");
+    let css = include_str!("../src/dashboard/app.css");
+
+    // Table headers say what they head, in the page and in tables built by
+    // app.js.
+    assert_eq!(
+        html.matches("<th ").count(),
+        html.matches("<th scope=\"col\"").count(),
+        "a <th> without scope in index.html"
+    );
+    assert!(html.contains("<th scope=\"col\""));
+    assert!(
+        !js.contains("el(\"th\", {}"),
+        "a <th> without scope in app.js"
+    );
+
+    // Every form control has a name: a <label for>, a wrapping <label> or
+    // an aria-label set by app.js.
+    for id in ["f-text", "f-tool", "f-from", "f-to"] {
+        let labelled = html.contains(&format!("for=\"{id}\""))
+            || html.split("<label").skip(1).any(|label| {
+                label
+                    .split("</label>")
+                    .next()
+                    .unwrap()
+                    .contains(&format!("id=\"{id}\""))
+            });
+        assert!(labelled, "#{id} has no label");
+    }
+    for id in ["lang", "reload", "drawer-close", "f-decision"] {
+        assert!(
+            js.contains(&format!(
+                "getElementById(\"{id}\").setAttribute(\"aria-label\""
+            )),
+            "#{id} has no aria-label"
+        );
+    }
+    assert!(html.contains("id=\"load-error\" class=\"alert bad\" role=\"alert\""));
+    assert!(html.contains("role=\"dialog\" aria-modal=\"true\""));
+
+    // Rows and feed items that open a receipt are reached and opened by
+    // keyboard; the drawer moves focus in and back out.
+    assert!(js.contains("node.setAttribute(\"tabindex\", \"0\")"));
+    assert!(js.contains("event.key !== \"Enter\" && event.key !== \" \""));
+    assert_eq!(
+        js.matches("activatable(el(\"tr\"").count(),
+        2,
+        "log and history rows"
+    );
+    assert!(js.contains("activatable(el(\"li\""), "feed items");
+    assert!(js.contains("document.getElementById(\"drawer-close\").focus()"));
+    assert!(js.contains("if (back) back.focus();"));
+    assert!(js.contains("node.setAttribute(\"data-evidence-id\", evidenceId)"));
+    assert!(js.contains("drawer.inert = true"));
+    assert!(js.contains("\"aria-pressed\""));
+
+    // Focus is visible: nothing removes the outline, rows have their own.
+    assert!(!css.contains("outline: none"), "app.css hides a focus ring");
+    assert!(css.contains("tr[tabindex]:focus-visible"));
+
+    // Text colors reach 4.5:1 on both backgrounds, light and dark.
+    for (scheme, tokens) in [
+        ("light", color_tokens(css, ":root {")),
+        (
+            "dark",
+            color_tokens(css, "@media (prefers-color-scheme: dark)"),
+        ),
+    ] {
+        for fg in ["--ink", "--ink-2", "--quiet", "--accent", "--ok"] {
+            for bg in ["--paper", "--sheet"] {
+                let (a, b) = (luminance(&tokens[fg]), luminance(&tokens[bg]));
+                let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                assert!(
+                    ratio >= 4.5,
+                    "{scheme}: {fg} {} on {bg} {} is {ratio:.2}:1",
+                    tokens[fg],
+                    tokens[bg]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_corrupt_or_truncated_journal_shows_an_error_and_the_server_keeps_serving() {
+    let (_temp, home) = home_with_receipts();
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    let listener = dashboard::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served_home = home.clone();
+    let server = std::thread::spawn(move || {
+        dashboard::serve(&listener, &served_home, None, Some(4)).unwrap();
+    });
+    let get = |target: &str| {
+        let response = http(
+            port,
+            &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (head.to_owned(), body.to_owned())
+    };
+
+    // A last line cut in the middle of a write: listed, verify fails.
+    let mut journal = fs::OpenOptions::new().append(true).open(&file).unwrap();
+    journal.write_all(br#"{"seq":4,"prev":"ab"#).unwrap();
+    let (head, body) = get("/api/state");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["verify"]["status"], "fail");
+    assert_eq!(state["summary"]["unreadable"], 1);
+    assert!(state["page"]["receipts"][0]["parse_error"].is_string());
+
+    // Bytes that are not UTF-8: the journal cannot be read at all.
+    journal.write_all(b"\n\xff\xfe\x00garbage\n").unwrap();
+    let (head, body) = get("/api/state");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["verify"]["status"], "error");
+    let error = state["verify"]["error"].as_str().unwrap();
+    assert!(
+        error.contains(file.to_str().unwrap()) && error.contains("UTF-8"),
+        "{error}"
+    );
+
+    // The page says the journal could not be read, not that it is empty.
+    let js = include_str!("../src/dashboard/app.js");
+    assert!(js.contains("if (none && state.verify.status === \"error\")"));
+
+    // Still serving.
+    assert!(get("/api/state").0.starts_with("HTTP/1.1 200"));
+    assert!(get("/").0.starts_with("HTTP/1.1 200"));
+    server.join().unwrap();
 }

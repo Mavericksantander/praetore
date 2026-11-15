@@ -289,8 +289,8 @@ praetore-mcp dashboard --port 0   # a free port, printed at startup
 ```
 
 `dashboard` serves a read-only page over `receipts/*.jsonl` on 127.0.0.1
-only. There is no option to listen on another address. Each reload reads
-the home again. Stop it with Ctrl-C. The page shows:
+only. There is no option to listen on another address. Stop it with
+Ctrl-C. The page shows:
 
 - a summary: total, ALLOW, DENY, REQUIRE_APPROVAL, the active policy (id,
   version, digest) and a warning when the policy has an allow-all rule and
@@ -299,23 +299,37 @@ the home again. Stop it with Ctrl-C. The page shows:
   with no tool and no condition, for every server or for one, like the
   `allow-all-mcp-tool-calls` that `init` wrote before default deny; it is
   the same rule `policy check` warns about.
-- the decisions table, local time next to UTC, server, tool, arguments,
-  decision, rule (or `default deny`), mode and evidence id. You can filter
-  by decision, tool and text.
-- the detail of a receipt: the full JSON line, `path_check` (lexical,
+- the decisions table, newest first, 100 receipts per page: local time
+  next to UTC, server, tool, arguments, decision, rule (or `default deny`),
+  mode and evidence id. You can filter by decision, tool, time range and
+  text; the filters run over the whole journal, not only the page shown.
+- the detail of a receipt: what decided it, from the `decided_by` signed
+  in the receipt (a rule, a rule that matched but could not apply, default
+  deny or an engine check), with the rule text when the current policy is
+  the one the receipt names; the full JSON line, `path_check` (lexical,
   resolved, status), and the agent, attester and authority signatures with
   their key ids. Each signature shows OK or FAIL.
 - the verification status, per receipt and for the whole journal. It comes
-  from the same code as `praetore-mcp verify`. It covers the receipts
-  only. It includes the journal order (seq/prev) and the journal head.
+  from the same code as `praetore-mcp verify` and is also shown in the
+  sidebar. It covers the receipts only. It includes the journal order
+  (seq/prev) and the journal head.
   Keep the head outside this machine. `--expected-head HEX` works as it
-  does for `verify`.
+  does for `verify`. The result is kept in memory and computed again when
+  any file `verify` reads (the journal files, the attester and issuer
+  pins, the approver pin, the approval journal) changes length,
+  modification time, change time or inode. On a platform without change
+  times it is computed again on every request. With a large journal the
+  first request after a change takes as long as `verify`. A line that is
+  not a receipt (a write cut short, for example) is listed as unreadable;
+  a journal that cannot be read at all shows the error instead of the
+  table.
 
-The page reads three things from the home: the receipts, which `verify` checks; the
-calls waiting for approval, read from `approvals/pending/*.json`, which are
-not signed and which `verify` does not check; and the rules of the current
-policy. It is read-only: approving or rejecting is done with
-`praetore-mcp approve` and `praetore-mcp reject` in a terminal.
+The page reads three things from the home: the receipts, which `verify`
+checks; the calls waiting for approval, read from `approvals/pending/*.json`,
+which are not signed and which `verify` does not check (the page labels them
+"not signed"); and the rules of the current policy. It is read-only:
+approving or rejecting is done with `praetore-mcp approve` and
+`praetore-mcp reject` in a terminal.
 
 The page is embedded in the binary and loads nothing from the network.
 `dashboard` writes nothing under the home. It answers only GET requests

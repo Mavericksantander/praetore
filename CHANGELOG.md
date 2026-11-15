@@ -41,7 +41,11 @@
   prints the same output as before. HTML, CSS and JS are embedded in the
   binary. Nothing is loaded from the network or written under DIR. Only
   GET requests with a loopback `Host` are answered. Texts in Spanish,
-  English and Portuguese.
+  English and Portuguese. The table shows 100 receipts per page, newest
+  first; the filters (decision, tool, time range, text) run on the server
+  over the whole journal. The verification result is kept in memory until
+  a file `verify` reads changes, so a reload of an unchanged 10,000-receipt
+  journal does not run `verify` again.
 - **praetore-mcp: `policy coverage [--dir DIR] [--server NAME] -- <command>
   [args...]`.** Starts the MCP server, sends `initialize` and `tools/list`
   (every page), closes it, and prints for each tool what the policy

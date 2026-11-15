@@ -71,6 +71,9 @@ const I18N = {
     agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
     expires_in: (m, s) => `Vence en ${m}:${String(s).padStart(2, "0")}`,
     expired: "Vencida: ya no se puede aprobar",
+    unsigned_tag: "Sin firma",
+    unsigned_note: "Este aviso sale de approvals/pending: no está firmado y verify no lo comprueba. El recibo de la llamada retenida sí está firmado y verify lo comprueba.",
+    sec_decide_n: (n) => `Por decidir (${n}, sin firma)`,
     exact_args: "Lo que hará exactamente",
     exact_args_hint: "Esto es exactamente lo que se firma y lo único que el agente podrá ejecutar.",
     approve: "Aprobar", reject: "Rechazar", view_receipt: "Ver recibo",
@@ -82,8 +85,24 @@ const I18N = {
     toast_new: (n) => n === 1 ? "1 decisión nueva" : `${n} decisiones nuevas`,
     search_ph: "Buscar por archivo, herramienta, regla o id…",
     all: "Todas", all_tools: "Todas las herramientas", shown: (n, t) => `${n} de ${t}`,
+    shown_range: (a, b, n) => `${a}-${b} de ${n}`, page_newer: "← Más recientes", page_older: "Más antiguos →",
+    f_from: "Desde", f_to: "Hasta", f_search: "Buscar en los recibos", f_tool_label: "Herramienta", f_decision_label: "Decisión",
+    empty_home_t: "Este home todavía no tiene recibos.",
+    journal_unreadable_t: "No se pudo leer el journal.",
+    empty_home_d: "Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
     c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
     default_deny: "Bloqueo por defecto",
+    a_reload: "Recargar", a_close: "Cerrar", a_lang: "Idioma",
+    why: "Por qué", why_signed: "La causa va firmada en el recibo.",
+    why_rule: (id) => `Decidió la regla ${id}.`,
+    why_unbound: (id) => `La regla ${id} coincidió pero no se pudo aplicar (falta la capacidad o el destino): se bloqueó.`,
+    why_default: "Ninguna regla cubría la llamada: bloqueo por defecto.",
+    why_guard: (g) => `La bloqueó una comprobación del motor fuera de las reglas (${g}).`,
+    why_legacy: "Este recibo es anterior al registro firmado de la causa.",
+    why_same: "La política actual es la misma con que se decidió. La regla dice:",
+    why_changed: "La política cambió después de esta decisión: la regla de hoy puede ser otra.",
+    unbound_short: (id) => `${id} (sin aplicar)`,
+    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} falla(s)`, verify_chip_err: "verify no corrió",
     empty_filter_t: "Sin resultados", empty_filter_d: "Prueba con otro filtro.",
     tab_summary: "Resumen", tab_signatures: "Verificación", tab_paths: "Rutas", tab_json: "Datos técnicos",
     f_decision: "Decisión", f_rule: "Regla", f_mode: "Modo", f_server: "Servidor", f_tool: "Herramienta",
@@ -176,6 +195,9 @@ const I18N = {
     agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
     expires_in: (m, s) => `Expires in ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expired: it can no longer be approved",
+    unsigned_tag: "Not signed",
+    unsigned_note: "This notice comes from approvals/pending: it is not signed and verify does not check it. The receipt of the held call is signed and verify checks it.",
+    sec_decide_n: (n) => `To decide (${n}, not signed)`,
     exact_args: "Exactly what it will do",
     exact_args_hint: "This is exactly what gets signed and the only call the agent will be able to run.",
     approve: "Approve", reject: "Reject", view_receipt: "View receipt",
@@ -187,8 +209,24 @@ const I18N = {
     toast_new: (n) => n === 1 ? "1 new decision" : `${n} new decisions`,
     search_ph: "Search by file, tool, rule or id…",
     all: "All", all_tools: "All tools", shown: (n, t) => `${n} of ${t}`,
+    shown_range: (a, b, n) => `${a}-${b} of ${n}`, page_newer: "← Newer", page_older: "Older →",
+    f_from: "From", f_to: "To", f_search: "Search the receipts", f_tool_label: "Tool", f_decision_label: "Decision",
+    empty_home_t: "This home has no receipts yet.",
+    journal_unreadable_t: "The journal could not be read.",
+    empty_home_d: "They appear when an MCP client calls a tool through praetore-mcp wrap.",
     c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
     default_deny: "Default deny",
+    a_reload: "Reload", a_close: "Close", a_lang: "Language",
+    why: "Why", why_signed: "The cause is signed in the receipt.",
+    why_rule: (id) => `Rule ${id} decided.`,
+    why_unbound: (id) => `Rule ${id} matched but could not apply (capability or target missing): denied.`,
+    why_default: "No rule covered the call: default deny.",
+    why_guard: (g) => `An engine check outside the rules denied it (${g}).`,
+    why_legacy: "This receipt predates the signed record of the cause.",
+    why_same: "The current policy is the one it was decided under. The rule says:",
+    why_changed: "The policy changed after this decision: today's rule may differ.",
+    unbound_short: (id) => `${id} (not applied)`,
+    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} failure(s)`, verify_chip_err: "verify did not run",
     empty_filter_t: "No results", empty_filter_d: "Try another filter.",
     tab_summary: "Summary", tab_signatures: "Verification", tab_paths: "Paths", tab_json: "Technical data",
     f_decision: "Decision", f_rule: "Rule", f_mode: "Mode", f_server: "Server", f_tool: "Tool",
@@ -281,6 +319,9 @@ const I18N = {
     agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
     expires_in: (m, s) => `Expira em ${m}:${String(s).padStart(2, "0")}`,
     expired: "Expirada: não pode mais ser aprovada",
+    unsigned_tag: "Sem assinatura",
+    unsigned_note: "Este aviso vem de approvals/pending: não está assinado e o verify não o verifica. O recibo da chamada retida está assinado e o verify o verifica.",
+    sec_decide_n: (n) => `Para decidir (${n}, sem assinatura)`,
     exact_args: "O que fará exatamente",
     exact_args_hint: "Isto é exatamente o que é assinado e a única chamada que o agente poderá executar.",
     approve: "Aprovar", reject: "Rejeitar", view_receipt: "Ver recibo",
@@ -292,8 +333,24 @@ const I18N = {
     toast_new: (n) => n === 1 ? "1 decisão nova" : `${n} decisões novas`,
     search_ph: "Buscar por arquivo, ferramenta, regra ou id…",
     all: "Todas", all_tools: "Todas as ferramentas", shown: (n, t) => `${n} de ${t}`,
+    shown_range: (a, b, n) => `${a}-${b} de ${n}`, page_newer: "← Mais recentes", page_older: "Mais antigos →",
+    f_from: "De", f_to: "Até", f_search: "Buscar nos recibos", f_tool_label: "Ferramenta", f_decision_label: "Decisão",
+    empty_home_t: "Este home ainda não tem recibos.",
+    journal_unreadable_t: "Não foi possível ler o journal.",
+    empty_home_d: "Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
     c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
     default_deny: "Bloqueio padrão",
+    a_reload: "Recarregar", a_close: "Fechar", a_lang: "Idioma",
+    why: "Por quê", why_signed: "A causa vai assinada no recibo.",
+    why_rule: (id) => `A regra ${id} decidiu.`,
+    why_unbound: (id) => `A regra ${id} coincidiu mas não pôde ser aplicada (falta a capacidade ou o destino): foi bloqueada.`,
+    why_default: "Nenhuma regra cobria a chamada: bloqueio padrão.",
+    why_guard: (g) => `Uma verificação do motor fora das regras a bloqueou (${g}).`,
+    why_legacy: "Este recibo é anterior ao registro assinado da causa.",
+    why_same: "A política atual é a mesma com que se decidiu. A regra diz:",
+    why_changed: "A política mudou depois desta decisão: a regra de hoje pode ser outra.",
+    unbound_short: (id) => `${id} (não aplicada)`,
+    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} falha(s)`, verify_chip_err: "verify não rodou",
     empty_filter_t: "Sem resultados", empty_filter_d: "Tente outro filtro.",
     tab_summary: "Resumo", tab_signatures: "Verificação", tab_paths: "Caminhos", tab_json: "Dados técnicos",
     f_decision: "Decisão", f_rule: "Regra", f_mode: "Modo", f_server: "Servidor", f_tool: "Ferramenta",
@@ -357,7 +414,11 @@ let lang = "es";
 let view = "operation";
 let infoTab = "log";
 let state = null;
-let selected = null; // index into state.receipts shown in the drawer
+let selected = null; // the receipt shown in the drawer
+const PAGE = 100;
+let pageOffset = 0;
+let reloadQueued = false;
+let searchTimer = null;
 let drawerTab = "summary";
 let decisionFilter = "";
 let fingerprint = null;
@@ -390,6 +451,19 @@ function el(tag, attrs, ...children) {
     if (child === null || child === undefined || child === false) continue;
     node.append(child instanceof Node ? child : String(child));
   }
+  return node;
+}
+
+// A clickable row or item that the keyboard reaches (Tab) and opens
+// (Enter or Space), like a button.
+function activatable(node, open, evidenceId) {
+  node.setAttribute("tabindex", "0");
+  if (evidenceId) node.setAttribute("data-evidence-id", evidenceId);
+  node.addEventListener("keydown", (event) => {
+    if (event.target !== node || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    open();
+  });
   return node;
 }
 
@@ -478,6 +552,40 @@ function approvalLabel(value) {
   return { text: value, cls: "neutral" };
 }
 
+// What decided a receipt, from the signed `decided_by`.
+function whyShort(r) {
+  const by = r.decided_by;
+  if (!by) return r.rule ?? t("default_deny");
+  if (by.kind === "rule") return by.rule_id;
+  if (by.kind === "unbound_rule") return t("unbound_short", by.rule_id);
+  if (by.kind === "default_deny") return t("default_deny");
+  if (by.kind === "engine_guard") return by.guard;
+  return r.rule ?? "-";
+}
+
+function whyBlock(r) {
+  const by = r.decided_by;
+  const box = el("div", { class: "why" });
+  if (!by) {
+    box.append(el("p", {}, r.rule ? t("why_rule", r.rule) : t("why_default")), el("p", { class: "muted" }, t("why_legacy")));
+    return box;
+  }
+  if (by.kind === "rule") box.append(el("p", {}, t("why_rule", by.rule_id)));
+  else if (by.kind === "unbound_rule") box.append(el("p", {}, t("why_unbound", by.rule_id)));
+  else if (by.kind === "default_deny") box.append(el("p", {}, t("why_default")));
+  else if (by.kind === "engine_guard") box.append(el("p", {}, t("why_guard", by.guard)));
+  const ruleId = by.rule_id;
+  const p = state.policy;
+  if (ruleId && p.status === "ok") {
+    const rule = (Array.isArray(p.rules_detail) ? p.rules_detail : []).find((x) => x.id === ruleId);
+    if (r.policy_digest === p.digest && rule) box.append(el("p", { class: "muted" }, t("why_same")), el("p", { class: "mono" }, ruleSentence(rule)));
+    else if (r.policy_digest !== p.digest) box.append(el("p", { class: "muted" }, t("why_changed")));
+  }
+  if (r.reason) box.append(el("p", { class: "mono muted" }, r.reason));
+  box.append(el("p", { class: "muted" }, t("why_signed")));
+  return box;
+}
+
 function copyButton(text) {
   const button = el("button", { type: "button", class: "btn-sm copy" }, t("copy"));
   button.addEventListener("click", async (event) => {
@@ -546,6 +654,10 @@ function applyStaticText() {
   }
   document.getElementById("live-label").textContent = t("live");
   document.getElementById("f-text").setAttribute("placeholder", t("search_ph"));
+  document.getElementById("f-decision").setAttribute("aria-label", t("f_decision_label"));
+  document.getElementById("reload").setAttribute("aria-label", t("a_reload"));
+  document.getElementById("drawer-close").setAttribute("aria-label", t("a_close"));
+  document.getElementById("lang").setAttribute("aria-label", t("a_lang"));
   document.getElementById("page-title").textContent = t(`nav_${view}`);
   document.getElementById("page-sub").textContent = t(`sub_${view}`);
 }
@@ -564,6 +676,12 @@ function renderShell() {
   const chip = document.getElementById("mode-chip");
   chip.className = "chip ok";
   chip.textContent = t("mode_readonly");
+  const v = state.verify;
+  const verifyChip = document.getElementById("verify-chip");
+  verifyChip.className = v.status === "ok" ? "chip ok" : "chip bad";
+  verifyChip.textContent = v.status === "ok" ? t("verify_chip_ok", `${v.verified}/${v.total}`)
+    : v.status === "fail" ? t("verify_chip_fail", v.failed) : t("verify_chip_err");
+  verifyChip.setAttribute("href", "#/info/integrity");
 }
 
 function renderStamp() {
@@ -599,8 +717,9 @@ function renderOperation() {
   }
   root.append(hero);
 
-  const decide = el("section", { class: "op-section" }, el("h2", { class: "eyebrow" }, t("sec_decide")));
   const active = activePending();
+  const decide = el("section", { class: "op-section" },
+    el("h2", { class: "eyebrow" }, active.length ? t("sec_decide_n", active.length) : t("sec_decide")));
   if (active.length === 0) decide.append(el("p", { class: "calm" }, t("decide_none")));
   for (const p of active) decide.append(approvalCard(p));
   root.append(decide);
@@ -639,9 +758,10 @@ function kpi(label, value, foot, color, percent) {
 }
 
 function chartCard() {
-  const receipts = state.receipts.filter((r) => r.decided_at);
+  // 15-minute UTC buckets from the server, regrouped by local hour or day.
+  const counts = state.activity.buckets;
   const now = new Date();
-  const newest = receipts.length ? new Date(receipts[receipts.length - 1].decided_at) : now;
+  const newest = state.recent.length && state.recent[0].decided_at ? new Date(state.recent[0].decided_at) : now;
   const hourly = now.getTime() - newest.getTime() < 24 * 3600 * 1000;
   const buckets = [];
   if (hourly) {
@@ -660,10 +780,11 @@ function chartCard() {
     }
   }
   for (const b of buckets) { b.ALLOW = 0; b.DENY = 0; b.REQUIRE_APPROVAL = 0; }
-  for (const r of receipts) {
-    const time = new Date(r.decided_at).getTime();
+  for (const c of counts) {
+    const time = c.start * 1000;
     const b = buckets.find((x) => time >= x.start.getTime() && time < x.end.getTime());
-    if (b && b[r.decision] !== undefined) b[r.decision] += 1;
+    if (!b) continue;
+    for (const key of ["ALLOW", "DENY", "REQUIRE_APPROVAL"]) b[key] += c[key];
   }
   const max = Math.max(1, ...buckets.map((b) => b.ALLOW + b.DENY + b.REQUIRE_APPROVAL));
   const chart = el("div", { class: "chart" });
@@ -692,9 +813,7 @@ function chartCard() {
 }
 
 function toolsCard() {
-  const counts = new Map();
-  for (const r of state.receipts) if (typeof r.tool === "string") counts.set(r.tool, (counts.get(r.tool) || 0) + 1);
-  const top = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6);
+  const top = state.tools.slice(0, 6).map((x) => [x.tool, x.count]);
   const max = Math.max(1, ...top.map(([, n]) => n));
   const bars = el("div", { class: "bars" });
   for (const [tool, n] of top) {
@@ -708,19 +827,19 @@ function toolsCard() {
 
 function recentCard() {
   const list = el("ul", { class: "feed" });
-  const rows = state.receipts.map((r, i) => [r, i]).filter(([r]) => !r.parse_error).reverse().slice(0, 12);
-  for (const [r, index] of rows) {
+  const rows = state.recent;
+  for (const r of rows) {
     const target = targetOf(r.arguments);
     // For a held call, what the client cares about is how it ended.
     const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
     const cls = outcome ? outcome.cls : decisionClass(r.decision);
-    const li = el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(index) },
+    const li = activatable(el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
       el("span", { class: `avatar ${cls}` }),
       el("div", { class: "what" },
         el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short || r.server || "")),
       outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
-      el("time", { title: localText(r.decided_at) }, relativeText(r.decided_at)));
+      el("time", { title: `${localText(r.decided_at)} · ${utcText(r.decided_at)}` }, relativeText(r.decided_at))), () => openDrawer(r), r.evidence_id);
     list.append(li);
   }
   if (rows.length === 0) list.append(el("li", { class: "muted" }, t("empty_recent")));
@@ -732,10 +851,6 @@ function recentCard() {
 
 // ---------- approvals ----------
 
-function heldReceipt(evidenceId) {
-  return state.receipts.find((r) => r.evidence_id === evidenceId);
-}
-
 function renderApprovalsInfo() {
   const root = document.getElementById("info-approvals");
   root.replaceChildren();
@@ -746,7 +861,7 @@ function renderApprovalsInfo() {
 }
 
 function approvalCard(p) {
-  const receipt = heldReceipt(p.evidence_id);
+  const receipt = p.receipt;
   const start = receipt ? new Date(receipt.decided_at).getTime() : NaN;
   const expires = new Date(p.expires_at).getTime();
   const left = Math.floor((expires - Date.now()) / 1000);
@@ -764,6 +879,9 @@ function approvalCard(p) {
         el("small", {}, `${t("on_server", p.server)} · ${p.tool}`))),
     el("span", { class: expired ? "tag bad" : "tag warn countdown", "data-expires": p.expires_at },
       expired ? t("expired") : t("expires_in", Math.floor(left / 60), left % 60))));
+  if (p.signed === false) {
+    card.append(el("p", { class: "unsigned" }, el("span", { class: "tag neutral" }, t("unsigned_tag")), ` ${t("unsigned_note")}`));
+  }
   card.append(el("div", { class: "countdown-bar" },
     el("span", { class: "countdown-fill", "data-expires": p.expires_at, "data-total": String(total),
       style: `width:${Math.max(0, Math.min(100, (left / total) * 100))}%` })));
@@ -776,7 +894,6 @@ function approvalCard(p) {
   card.append(el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)));
   card.append(el("p", { class: "muted" }, t("exact_args_hint")));
 
-  const receiptIndex = state.receipts.findIndex((r) => r.evidence_id === p.evidence_id);
   if (!expired) {
     const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}\npraetore-mcp reject ${p.approval_id} --dir ${state.home}`;
     card.append(el("div", { class: "label-sm" }, t("cli_hint")));
@@ -787,16 +904,15 @@ function approvalCard(p) {
     const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}`;
     actions.append(copyButtonLabeled(commands, t("copy_approve")));
   }
-  if (receiptIndex >= 0) {
-    actions.append(el("button", { type: "button", onclick: () => openDrawer(receiptIndex) }, t("view_receipt")));
+  if (receipt) {
+    actions.append(el("button", { type: "button", onclick: () => openDrawer(receipt) }, t("view_receipt")));
   }
   card.append(actions);
   return card;
 }
 
 function historyCard() {
-  const rows = state.receipts.map((r, i) => [r, i])
-    .filter(([r]) => r.decision === "REQUIRE_APPROVAL").reverse().slice(0, 30);
+  const rows = state.approval_history;
   const card = el("div", { class: "card flush" });
   card.append(el("div", { class: "card-pad" },
     el("h2", {}, t("history")), el("p", { class: "card-sub" }, t("history_sub"))));
@@ -805,17 +921,19 @@ function historyCard() {
     return card;
   }
   const body = el("tbody", {});
-  for (const [r, index] of rows) {
+  for (const r of rows) {
     const target = targetOf(r.arguments);
     const label = approvalLabel(r.approval);
-    body.append(el("tr", { onclick: () => openDrawer(index) },
-      el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
+    body.append(activatable(el("tr", { onclick: () => openDrawer(r) },
+      el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at)),
+        el("small", {}, utcText(r.decided_at))),
       el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short)),
-      el("td", {}, label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-")));
+      el("td", {}, label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-")), () => openDrawer(r), r.evidence_id));
   }
   card.append(el("div", { class: "table-wrap" }, el("table", { class: "data" },
-    el("thead", {}, el("tr", {}, el("th", {}, t("c_when")), el("th", {}, t("c_action")), el("th", {}, t("f_approval")))),
+    el("thead", {}, el("tr", {}, el("th", { scope: "col" }, t("c_when")), el("th", { scope: "col" }, t("c_action")),
+      el("th", { scope: "col" }, t("f_approval")))),
     body)));
   return card;
 }
@@ -826,8 +944,9 @@ function renderDecisionFilter() {
   const box = document.getElementById("f-decision");
   box.replaceChildren();
   for (const [value, label] of [["", t("all")], ["ALLOW", t("d_ALLOW")], ["DENY", t("d_DENY")], ["REQUIRE_APPROVAL", t("d_REQUIRE_APPROVAL")]]) {
-    const button = el("button", { type: "button", class: decisionFilter === value ? "on" : "" }, label);
-    button.addEventListener("click", () => { decisionFilter = value; renderDecisionFilter(); renderTable(); });
+    const button = el("button", { type: "button", class: decisionFilter === value ? "on" : "",
+      "aria-pressed": decisionFilter === value ? "true" : "false" }, label);
+    button.addEventListener("click", () => { decisionFilter = value; renderDecisionFilter(); filtersChanged(); });
     box.append(button);
   }
 }
@@ -835,33 +954,61 @@ function renderDecisionFilter() {
 function renderToolFilter() {
   const select = document.getElementById("f-tool");
   const current = select.value;
-  const tools = [...new Set(state.receipts.map((r) => r.tool).filter((x) => typeof x === "string"))].sort();
+  const tools = state.tools.map((x) => x.tool).sort();
   select.replaceChildren(el("option", { value: "" }, t("all_tools")));
   for (const tool of tools) select.append(el("option", { value: tool }, `${toolLabel(tool)} · ${tool}`));
   if (tools.includes(current)) select.value = current;
 }
 
-function matches(r) {
+// A datetime-local value (local time, to the minute) as a UTC instant.
+// "To" covers the whole minute it names.
+function instantOf(value, endOfMinute) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  if (endOfMinute) date.setSeconds(59, 999);
+  return date.toISOString();
+}
+
+// The filters are applied by the server, over the whole journal.
+function stateUrl() {
+  const params = new URLSearchParams();
   const tool = document.getElementById("f-tool").value;
-  const text = document.getElementById("f-text").value.trim().toLowerCase();
-  if (decisionFilter && r.decision !== decisionFilter) return false;
-  if (tool && r.tool !== tool) return false;
-  if (text && !(r.raw_text.toLowerCase().includes(text) || toolLabel(r.tool).toLowerCase().includes(text))) return false;
-  return true;
+  const text = document.getElementById("f-text").value.trim();
+  const from = instantOf(document.getElementById("f-from").value, false);
+  const to = instantOf(document.getElementById("f-to").value, true);
+  if (decisionFilter) params.set("decision", decisionFilter);
+  if (tool) params.set("tool", tool);
+  if (text) params.set("q", text);
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  params.set("offset", String(pageOffset));
+  params.set("limit", String(PAGE));
+  return `/api/state?${params}`;
+}
+
+function filtersChanged() {
+  pageOffset = 0;
+  fingerprint = null;
+  load();
+}
+
+function goPage(offset) {
+  pageOffset = Math.max(0, offset);
+  fingerprint = null;
+  load();
 }
 
 function renderTable() {
   const body = document.querySelector("#table tbody");
   body.replaceChildren();
-  const rows = state.receipts.map((r, i) => [r, i]).reverse();
-  let shown = 0;
-  for (const [r, index] of rows) {
-    if (!matches(r)) continue;
-    shown += 1;
+  const page = state.page;
+  const rows = page.receipts;
+  for (const r of rows) {
     const classes = [];
-    if (index === selected) classes.push("selected");
+    if (selected && r.evidence_id && selected.evidence_id === r.evidence_id) classes.push("selected");
     if (freshIds.has(r.evidence_id)) classes.push("fresh");
-    const tr = el("tr", { class: classes.join(" "), onclick: () => openDrawer(index) });
+    const tr = activatable(el("tr", { class: classes.join(" "), onclick: () => openDrawer(r) }), () => openDrawer(r), r.evidence_id);
     if (r.parse_error) {
       tr.append(el("td", { colspan: "6", class: "mono" },
         el("span", { class: "tag bad" }, t("unreadable")), ` ${r.location.file}:${r.location.line}: ${r.parse_error}`));
@@ -869,33 +1016,55 @@ function renderTable() {
       const target = targetOf(r.arguments);
       const label = approvalLabel(r.approval);
       tr.append(
-        el("td", { class: "cell-when", title: utcText(r.decided_at) }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
+        el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at)),
+          el("small", {}, utcText(r.decided_at))),
         el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
           el("div", { class: "target mono", title: target.full }, target.full || target.short || "-")),
         el("td", {}, r.server ?? "-"),
         el("td", {}, decisionTag(r.decision), label ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, label.text) : null),
-        el("td", { class: "mono" }, r.rule ?? t("default_deny")),
+        el("td", { class: "mono" }, whyShort(r)),
         el("td", {}, el("span", { class: `check-icon ${r.verified ? "ok" : "bad"}`, title: r.verified ? t("st_ok") : t("st_fail") },
           r.verified ? "✓" : "✕")));
     }
     body.append(tr);
   }
-  document.getElementById("shown").textContent = t("shown", shown, state.receipts.length);
+  document.getElementById("shown").textContent = rows.length
+    ? t("shown_range", page.offset + 1, page.offset + rows.length, page.matching)
+    : t("shown", 0, page.matching);
+  const newer = document.getElementById("page-newer");
+  const older = document.getElementById("page-older");
+  newer.textContent = t("page_newer");
+  older.textContent = t("page_older");
+  newer.disabled = page.offset === 0;
+  older.disabled = page.offset + rows.length >= page.matching;
   const empty = document.getElementById("table-empty");
-  empty.hidden = shown > 0;
-  empty.replaceChildren(el("strong", {}, state.receipts.length ? t("empty_filter_t") : t("empty_recent")),
-    state.receipts.length ? t("empty_filter_d") : "");
+  empty.hidden = rows.length > 0;
+  const none = state.summary.total === 0;
+  if (none && state.verify.status === "error") {
+    // Not an empty home: the journal or the pins could not be read.
+    empty.replaceChildren(el("strong", {}, t("journal_unreadable_t")), el("p", { class: "mono" }, String(state.verify.error)));
+  } else {
+    empty.replaceChildren(el("strong", {}, none ? t("empty_home_t") : t("empty_filter_t")),
+      el("p", {}, none ? t("empty_home_d") : t("empty_filter_d")));
+  }
 }
 
 // ---------- drawer ----------
 
-function openDrawer(index) {
-  selected = index;
+let focusBeforeDrawer = null;
+let focusEvidenceId = null;
+
+function openDrawer(r) {
+  if (!selected) {
+    focusBeforeDrawer = document.activeElement;
+    focusEvidenceId = focusBeforeDrawer ? focusBeforeDrawer.getAttribute("data-evidence-id") : null;
+  }
+  selected = r;
   drawerTab = "summary";
-  const r = state.receipts[index];
   if (r && r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
   renderDrawer();
   if (view === "info") renderTable();
+  document.getElementById("drawer-close").focus();
 }
 
 function closeDrawer() {
@@ -903,20 +1072,32 @@ function closeDrawer() {
   history.replaceState(null, "", `#/${currentRoute()}`);
   renderDrawer();
   if (view === "info") renderTable();
+  // Back to where the keyboard was: the same element, or the row of the
+  // same receipt when the list was drawn again.
+  let back = focusBeforeDrawer && document.contains(focusBeforeDrawer) ? focusBeforeDrawer : null;
+  if (!back && focusEvidenceId) {
+    back = [...document.querySelectorAll("[data-evidence-id]")]
+      .find((node) => node.getAttribute("data-evidence-id") === focusEvidenceId && node.offsetParent !== null) || null;
+  }
+  if (back) back.focus();
+  focusBeforeDrawer = null;
+  focusEvidenceId = null;
 }
 
 function renderDrawer() {
   const drawer = document.getElementById("drawer");
   const scrim = document.getElementById("scrim");
-  const r = selected !== null && state ? state.receipts[selected] : null;
+  const r = selected;
   if (!r) {
     drawer.classList.remove("open");
     drawer.setAttribute("aria-hidden", "true");
+    drawer.inert = true; // closed: out of the Tab order
     scrim.hidden = true;
     return;
   }
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
+  drawer.inert = false;
   scrim.hidden = false;
   const target = targetOf(r.arguments);
   document.getElementById("drawer-title").replaceChildren(
@@ -929,7 +1110,8 @@ function renderDrawer() {
   const available = r.parse_error ? ["json"] : ["summary", "signatures", "paths", "json"];
   if (!available.includes(drawerTab)) drawerTab = available[0];
   for (const name of available) {
-    const button = el("button", { type: "button", class: drawerTab === name ? "on" : "" }, t(`tab_${name}`));
+    const button = el("button", { type: "button", class: drawerTab === name ? "on" : "",
+      "aria-pressed": drawerTab === name ? "true" : "false" }, t(`tab_${name}`));
     button.addEventListener("click", () => { drawerTab = name; renderDrawer(); });
     tabs.append(button);
   }
@@ -958,10 +1140,11 @@ function drawerSummary(body, r) {
   const label = approvalLabel(r.approval);
   body.append(kv([
     [t("f_decision"), decisionTag(r.decision)],
-    [t("f_rule"), r.rule ?? t("default_deny")],
+    [t("why"), whyBlock(r)],
     [t("f_server"), r.server],
     [t("f_tool"), toolLabel(r.tool)],
     [t("f_local"), localText(r.decided_at)],
+    [t("f_utc"), utcText(r.decided_at)],
     [t("f_approval"), label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-"],
   ]));
   body.append(el("h3", {}, t("args")));
@@ -1019,7 +1202,8 @@ function drawerPaths(body, r) {
       el("td", {}, el("span", { class: `tag ${value.status === "same" ? "ok" : "warn"}` }, value.status ?? "-"))));
   }
   body.append(el("div", { class: "table-wrap" }, el("table", { class: "mini" },
-    el("thead", {}, el("tr", {}, el("th", {}, "key"), el("th", {}, t("lexical")), el("th", {}, t("resolved")), el("th", {}, t("status")))),
+    el("thead", {}, el("tr", {}, el("th", { scope: "col" }, "key"), el("th", { scope: "col" }, t("lexical")),
+      el("th", { scope: "col" }, t("resolved")), el("th", { scope: "col" }, t("status")))),
     tbody)));
 }
 
@@ -1160,16 +1344,17 @@ function fingerprintOf(s) {
   return JSON.stringify([
     s.summary, s.verify && s.verify.status, s.verify && s.verify.head, s.verify && s.verify.failed,
     s.verify && s.verify.approval, s.pending, s.policy && s.policy.digest, s.policy && s.policy.status,
-    s.receipts.map((r) => r.approval).join("|"),
+    s.page.offset, s.page.matching, s.page.receipts.map((r) => [r.evidence_id, r.approval]),
+    s.recent.map((r) => [r.evidence_id, r.approval]),
   ]);
 }
 
 function announce(next) {
-  const ids = new Set(next.receipts.map((r) => r.evidence_id).filter(Boolean));
+  const ids = new Set(next.recent.map((r) => r.evidence_id).filter(Boolean));
   const pendingIds = new Set((Array.isArray(next.pending) ? next.pending : []).map((p) => p.approval_id));
   if (knownIds) {
-    let added = 0;
-    for (const id of ids) if (!knownIds.has(id)) { freshIds.add(id); added += 1; }
+    for (const id of ids) if (!knownIds.has(id)) freshIds.add(id);
+    const added = Math.max(0, next.summary.total - state.summary.total);
     let newPending = 0;
     for (const id of pendingIds) if (!knownPending.has(id)) newPending += 1;
     if (newPending > 0) toast(t("toast_pending"), "warn", () => go("operation"));
@@ -1180,11 +1365,11 @@ function announce(next) {
 }
 
 async function load() {
-  if (loading) return;
+  if (loading) { reloadQueued = true; return; }
   loading = true;
   const error = document.getElementById("load-error");
   try {
-    const response = await fetch("/api/state", { cache: "no-store" });
+    const response = await fetch(stateUrl(), { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const next = await response.json();
     error.hidden = true;
@@ -1206,7 +1391,20 @@ async function load() {
     if (!state) renderAll();
   } finally {
     loading = false;
+    if (reloadQueued) { reloadQueued = false; load(); }
   }
+}
+
+// A receipt named by #e=<evidence_id>: from what is loaded, or asked for.
+async function openEvidence(id) {
+  const loaded = [...state.page.receipts, ...state.recent, ...state.approval_history,
+    ...(Array.isArray(state.pending) ? state.pending.map((p) => p.receipt).filter(Boolean) : [])];
+  const found = loaded.find((r) => r.evidence_id === id);
+  if (found) { openDrawer(found); return; }
+  try {
+    const response = await fetch(`/api/receipt?${new URLSearchParams({ id })}`, { cache: "no-store" });
+    if (response.ok) openDrawer(await response.json());
+  } catch (_) { /* the link names no receipt here */ }
 }
 
 // #/operation, #/info/<tab>; #e=<evidence_id> opens that receipt over the
@@ -1219,10 +1417,7 @@ function routeFromHash() {
   const hash = location.hash;
   const evidence = hash.match(/^#e=(.+)$/);
   if (evidence) {
-    if (state) {
-      const index = state.receipts.findIndex((r) => r.evidence_id === decodeURIComponent(evidence[1]));
-      if (index >= 0) selected = index;
-    }
+    if (state) openEvidence(decodeURIComponent(evidence[1]));
     return;
   }
   const match = hash.match(/^#\/([a-z]+)(?:\/([a-z]+))?/);
@@ -1280,8 +1475,15 @@ document.addEventListener("DOMContentLoaded", () => {
     storageSet(localStorage, LIVE_KEY, live ? "on" : "off");
     if (live) load();
   });
-  document.getElementById("f-tool").addEventListener("change", renderTable);
-  document.getElementById("f-text").addEventListener("input", renderTable);
+  document.getElementById("f-tool").addEventListener("change", filtersChanged);
+  document.getElementById("f-from").addEventListener("change", filtersChanged);
+  document.getElementById("f-to").addEventListener("change", filtersChanged);
+  document.getElementById("f-text").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(filtersChanged, 250);
+  });
+  document.getElementById("page-newer").addEventListener("click", () => goPage(pageOffset - PAGE));
+  document.getElementById("page-older").addEventListener("click", () => goPage(pageOffset + PAGE));
   document.getElementById("drawer-close").addEventListener("click", closeDrawer);
   document.getElementById("scrim").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (event) => {
