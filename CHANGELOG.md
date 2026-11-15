@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.3.5 - (sin fecha, pendiente de tag)
+
+praetore-mcp: `init` writes a default-deny policy (no
+`allow-all-mcp-tool-calls`), `policy coverage` reports what the policy
+decides for each tool a server lists, and `dashboard` serves a read-only
+local page over the receipts journal. Also carries everything merged to
+main since v0.3.4.
+
+[#175](https://github.com/Mavericksantander/praetore/pull/175) (dashboard
+minors and a load-proof latency test) is not in this tree. It has to land
+on main before the tag. This section does not tag or publish a release.
+
 ### Changed
 
 - **praetore-mcp: `init` writes a default-deny policy (behavior change for
@@ -19,12 +31,14 @@
   `init` on a home that has an allow-all rule leaves it in place and prints
   a warning with `praetore-mcp policy remove --id allow-all-mcp-tool-calls`.
   Not in v0.3.4: `init` in that release still writes
-  `allow-all-mcp-tool-calls`.
+  `allow-all-mcp-tool-calls` (#167). The GUIDE records that fact and how
+  to remove the rule from a home created by that release (#168).
 - **praetore-mcp: `policy check` warns about allow-all next to tool
   rules.** When the policy has an allow-all rule and DENY or
   REQUIRE_APPROVAL rules for specific tools, it says that tools those rules
   do not name are allowed and suggests `policy coverage`. `policy deny`,
-  `require-approval` and `allow` print the same warning after the change.
+  `require-approval` and `allow` print the same warning after the change
+  (#167).
 
 ### Added
 
@@ -47,7 +61,7 @@
   first; the filters (decision, tool, time range, text) run on the server
   over the whole journal. The verification result is kept in memory until
   a file `verify` reads changes, so a reload of an unchanged 10,000-receipt
-  journal does not run `verify` again.
+  journal does not run `verify` again (#166).
 - **praetore-mcp dashboard: home, live, chain and information views.** The
   page opens on a home view with the agent, the servers, the mode, the
   verification result and the ALLOW, DENY and pending counts. The live view
@@ -65,7 +79,7 @@
   system asks for reduced motion. The drawings use a 2D canvas and code
   embedded in the binary; the page keeps the same Content-Security-Policy
   and loads nothing from the network. The page now uses one dark color
-  scheme.
+  scheme (#172, #173).
 - **praetore-mcp: `policy coverage [--dir DIR] [--server NAME] -- <command>
   [args...]`.** Starts the MCP server, sends `initialize` and `tools/list`
   (every page), closes it, and prints for each tool what the policy
@@ -78,12 +92,22 @@
   `praetore-mcp policy allow --id ... --server ... --tool ...` line that
   allows it, quoted to run as printed in a POSIX shell. Tools with a rule
   that depends on an argument get no line, and neither do tool names with
-  characters outside `A-Z a-z 0-9 _ - .`.
+  characters outside `A-Z a-z 0-9 _ - .` (#167, #170).
 - Commands that praetore-mcp prints with `--dir DIR` quote `DIR` when it
   has spaces or other characters a shell would interpret.
 - `scripts/mcp-smoke.py` checks `policy coverage` against
   `@modelcontextprotocol/server-filesystem@2.3.0`, and the smoke test now
   allows `read_text_file` with an explicit rule.
+
+### Fixed
+
+- **console: keep the operator language chosen during the first catalog
+  load.** If the operator changed language while that catalog request was
+  still in flight, the first load could overwrite the choice and put the
+  page back in Spanish (#161).
+- **console: the package language test builds every download at one fixed
+  instant**, so the byte-for-byte comparison no longer fails when two
+  builds straddle a second (#171).
 
 ## 0.3.4 - 2026-11-13
 
