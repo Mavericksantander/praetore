@@ -88,6 +88,7 @@ const I18N = {
     shown_range: (a, b, n) => `${a}–${b} de ${n}`, page_newer: "← Más recientes", page_older: "Más antiguos →",
     f_from: "Desde", f_to: "Hasta", f_search: "Buscar en los recibos", f_tool_label: "Herramienta", f_decision_label: "Decisión",
     empty_home_t: "Este home todavía no tiene recibos.",
+    journal_unreadable_t: "No se pudo leer el journal.",
     empty_home_d: "Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
     c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
     default_deny: "Bloqueo por defecto",
@@ -211,6 +212,7 @@ const I18N = {
     shown_range: (a, b, n) => `${a}–${b} of ${n}`, page_newer: "← Newer", page_older: "Older →",
     f_from: "From", f_to: "To", f_search: "Search the receipts", f_tool_label: "Tool", f_decision_label: "Decision",
     empty_home_t: "This home has no receipts yet.",
+    journal_unreadable_t: "The journal could not be read.",
     empty_home_d: "They appear when an MCP client calls a tool through praetore-mcp wrap.",
     c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
     default_deny: "Default deny",
@@ -334,6 +336,7 @@ const I18N = {
     shown_range: (a, b, n) => `${a}–${b} de ${n}`, page_newer: "← Mais recentes", page_older: "Mais antigos →",
     f_from: "De", f_to: "Até", f_search: "Buscar nos recibos", f_tool_label: "Ferramenta", f_decision_label: "Decisão",
     empty_home_t: "Este home ainda não tem recibos.",
+    journal_unreadable_t: "Não foi possível ler o journal.",
     empty_home_d: "Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
     c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
     default_deny: "Bloqueio padrão",
@@ -1037,8 +1040,13 @@ function renderTable() {
   const empty = document.getElementById("table-empty");
   empty.hidden = rows.length > 0;
   const none = state.summary.total === 0;
-  empty.replaceChildren(el("strong", {}, none ? t("empty_home_t") : t("empty_filter_t")),
-    el("p", {}, none ? t("empty_home_d") : t("empty_filter_d")));
+  if (none && state.verify.status === "error") {
+    // Not an empty home: the journal or the pins could not be read.
+    empty.replaceChildren(el("strong", {}, t("journal_unreadable_t")), el("p", { class: "mono" }, String(state.verify.error)));
+  } else {
+    empty.replaceChildren(el("strong", {}, none ? t("empty_home_t") : t("empty_filter_t")),
+      el("p", {}, none ? t("empty_home_d") : t("empty_filter_d")));
+  }
 }
 
 // ---------- drawer ----------

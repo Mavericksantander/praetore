@@ -1288,3 +1288,54 @@ fn page_meets_basic_accessibility() {
         }
     }
 }
+
+#[test]
+fn a_corrupt_or_truncated_journal_shows_an_error_and_the_server_keeps_serving() {
+    let (_temp, home) = home_with_receipts();
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    let listener = dashboard::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served_home = home.clone();
+    let server = std::thread::spawn(move || {
+        dashboard::serve(&listener, &served_home, None, Some(4)).unwrap();
+    });
+    let get = |target: &str| {
+        let response = http(
+            port,
+            &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        (head.to_owned(), body.to_owned())
+    };
+
+    // A last line cut in the middle of a write: listed, verify fails.
+    let mut journal = fs::OpenOptions::new().append(true).open(&file).unwrap();
+    journal.write_all(br#"{"seq":4,"prev":"ab"#).unwrap();
+    let (head, body) = get("/api/state");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["verify"]["status"], "fail");
+    assert_eq!(state["summary"]["unreadable"], 1);
+    assert!(state["page"]["receipts"][0]["parse_error"].is_string());
+
+    // Bytes that are not UTF-8: the journal cannot be read at all.
+    journal.write_all(b"\n\xff\xfe\x00garbage\n").unwrap();
+    let (head, body) = get("/api/state");
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["verify"]["status"], "error");
+    let error = state["verify"]["error"].as_str().unwrap();
+    assert!(
+        error.contains(file.to_str().unwrap()) && error.contains("UTF-8"),
+        "{error}"
+    );
+
+    // The page says the journal could not be read, not that it is empty.
+    let js = include_str!("../src/dashboard/app.js");
+    assert!(js.contains("if (none && state.verify.status === \"error\")"));
+
+    // Still serving.
+    assert!(get("/api/state").0.starts_with("HTTP/1.1 200"));
+    assert!(get("/").0.starts_with("HTTP/1.1 200"));
+    server.join().unwrap();
+}

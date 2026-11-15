@@ -319,7 +319,10 @@ Ctrl-C. The page shows:
   pins, the approver pin, the approval journal) changes length,
   modification time, change time or inode. On a platform without change
   times it is computed again on every request. With a large journal the
-  first request after a change takes as long as `verify`.
+  first request after a change takes as long as `verify`. A line that is
+  not a receipt (a write cut short, for example) is listed as unreadable;
+  a journal that cannot be read at all shows the error instead of the
+  table.
 
 The page reads three things from the home: the receipts, which `verify`
 checks; the calls waiting for approval, read from `approvals/pending/*.json`,
