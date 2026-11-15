@@ -660,10 +660,32 @@ fn page_never_writes_journal_values_as_html() {
         "srcdoc",
         "eval(",
         "Function(",
+        "setHTML",
+        "javascript:",
     ] {
         assert!(!js.contains(sink), "app.js uses {sink}");
     }
+    assert_no_string_timers(js);
     assert_no_event_handler_attributes(js);
+}
+
+/// Fails when `js` passes a string to `setTimeout` or `setInterval`, which
+/// the browser would run as code.
+fn assert_no_string_timers(js: &str) {
+    for timer in ["setTimeout", "setInterval"] {
+        for (at, _) in js.match_indices(timer) {
+            let rest = js[at + timer.len()..].trim_start();
+            let Some(argument) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let first = argument.trim_start().chars().next();
+            assert!(
+                !matches!(first, Some('"' | '\'' | '`')),
+                "app.js passes a string to {timer}: {}",
+                &js[at..(at + 60).min(js.len())]
+            );
+        }
+    }
 }
 
 /// HTML event handler content attributes (GlobalEventHandlers and the
