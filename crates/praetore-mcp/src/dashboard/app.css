@@ -1,44 +1,34 @@
 /* PRÆTORE MCP. Paper, ink, one accent. Hairlines instead of boxes,
    type instead of chrome. The accent marks only what asks for a person. */
 :root {
-  --paper: #f4f2ec;
-  --sheet: #f9f8f4;
-  --ink: #1b1a17;
-  --ink-2: #4a4843;
-  --quiet: #6b6860;
-  --rule: #d9d5ca;
-  --rule-2: #e6e3da;
-  --accent: #c2412b;
-  --accent-soft: #f1dcd4;
-  --allow: #1b1a17;
-  --deny: #b4b0a5;
-  --ask: #c2412b;
-  --ok: #3d6b4f;
+  /* HUD: deep dark, thin cyan lines. Cyan is an ALLOW, red is the wall a
+     DENY puts between the agent and the action, amber is what waits for a
+     person. Each color means one decision, nothing else. */
+  --paper: #07090c;
+  --sheet: #0d1117;
+  --ink: #e6edf3;
+  --ink-2: #b3bfcc;
+  --quiet: #8593a3;
+  --rule: #1c2a36;
+  --rule-2: #121b24;
+  --hud: #4fd1e8;
+  --hud-dim: #1d4f5a;
+  --wall: #e0645a;
+  --accent: #f0a646;
+  --accent-soft: #2e2112;
+  --allow: #4fd1e8;
+  --deny: #e0645a;
+  --ask: #f0a646;
+  --ok: #5fd4a0;
   --bar-allow: var(--allow);
   --bar-deny: var(--deny);
   --bar-ask: var(--ask);
-  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Charter, Georgia, serif;
-  --sans: "Helvetica Neue", Helvetica, system-ui, -apple-system, "Segoe UI", sans-serif;
+  /* A geometric sans for the narrative, mono only for raw data. System
+     fonts only: nothing is loaded from the network. */
+  --sans: "Avenir Next", Avenir, Futura, "Century Gothic", "URW Gothic", Montserrat, system-ui, sans-serif;
+  --serif: var(--sans);
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  color-scheme: light;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --paper: #12110f;
-    --sheet: #181714;
-    --ink: #ebe8df;
-    --ink-2: #bdb9ae;
-    --quiet: #949086;
-    --rule: #2e2c27;
-    --rule-2: #24221e;
-    --accent: #e0644a;
-    --accent-soft: #3a1e17;
-    --allow: #ebe8df;
-    --deny: #55524b;
-    --ask: #e0644a;
-    --ok: #8fbf9f;
-    color-scheme: dark;
-  }
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -394,4 +384,8 @@ table.mini th { color: var(--quiet); font: 500 10.5px var(--sans); letter-spacin
   .rule { grid-template-columns: 1fr; gap: 6px; }
   .drawer-head, .tabs, .drawer-body { padding-left: 20px; padding-right: 20px; }
   .modal { padding: 24px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
 }

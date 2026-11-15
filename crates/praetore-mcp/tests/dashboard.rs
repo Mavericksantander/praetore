@@ -1192,8 +1192,17 @@ fn color_tokens(css: &str, marker: &str) -> BTreeMap<String, String> {
     let block = &css[css.find(marker).unwrap()..];
     let block = &block[..block.find('}').unwrap()];
     let block = &block[block.rfind('{').unwrap() + 1..];
-    block
-        .split(';')
+    // Without comments.
+    let mut text = String::new();
+    let mut rest = block;
+    while let Some(start) = rest.find("/*") {
+        text.push_str(&rest[..start]);
+        rest = rest[start..]
+            .split_once("*/")
+            .map_or("", |(_, after)| after);
+    }
+    text.push_str(rest);
+    text.split(';')
         .filter_map(|decl| {
             let (name, value) = decl.trim().split_once(':')?;
             let value = value.trim();
@@ -1266,15 +1275,14 @@ fn page_meets_basic_accessibility() {
     assert!(!css.contains("outline: none"), "app.css hides a focus ring");
     assert!(css.contains("tr[tabindex]:focus-visible"));
 
-    // Text colors reach 4.5:1 on both backgrounds, light and dark.
-    for (scheme, tokens) in [
-        ("light", color_tokens(css, ":root {")),
-        (
-            "dark",
-            color_tokens(css, "@media (prefers-color-scheme: dark)"),
-        ),
-    ] {
-        for fg in ["--ink", "--ink-2", "--quiet", "--accent", "--ok"] {
+    // One dark scheme; text colors reach 4.5:1 on both backgrounds.
+    let tokens = color_tokens(css, ":root {");
+    assert!(luminance(&tokens["--paper"]) < 0.01, "the page is dark");
+    assert!(!css.contains("prefers-color-scheme"), "one scheme only");
+    for (scheme, tokens) in [("dark", tokens)] {
+        for fg in [
+            "--ink", "--ink-2", "--quiet", "--accent", "--ok", "--hud", "--wall",
+        ] {
             for bg in ["--paper", "--sheet"] {
                 let (a, b) = (luminance(&tokens[fg]), luminance(&tokens[bg]));
                 let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
