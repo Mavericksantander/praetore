@@ -318,7 +318,8 @@ in the result of `verify`; nothing is drawn that PRÆTORE does not record.
   bar marked "pending, notice not signed, not checked by verify", with the
   `praetore-mcp approve` and `reject` commands to run in a terminal. A
   receipt that `verify` rejects is marked, with the reason `verify` gives,
-  in the drawing and in the list. A call that arrives while the page is
+  over up to three lines in the drawing and in the list; a longer one
+  continues in the receipt detail. A call that arrives while the page is
   open is scanned in; nothing moves when a read of the journal finds
   nothing new.
 - **Chain**: the receipts in seq order, joined by the `prev` hash link,
