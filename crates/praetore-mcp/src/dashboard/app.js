@@ -91,6 +91,7 @@ const I18N = {
     empty_home_d: "Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
     c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
     default_deny: "Bloqueo por defecto",
+    a_reload: "Recargar", a_close: "Cerrar", a_lang: "Idioma",
     why: "Por qué", why_signed: "La causa va firmada en el recibo.",
     why_rule: (id) => `Decidió la regla ${id}.`,
     why_unbound: (id) => `La regla ${id} coincidió pero no se pudo aplicar (falta la capacidad o el destino): se bloqueó.`,
@@ -213,6 +214,7 @@ const I18N = {
     empty_home_d: "They appear when an MCP client calls a tool through praetore-mcp wrap.",
     c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
     default_deny: "Default deny",
+    a_reload: "Reload", a_close: "Close", a_lang: "Language",
     why: "Why", why_signed: "The cause is signed in the receipt.",
     why_rule: (id) => `Rule ${id} decided.`,
     why_unbound: (id) => `Rule ${id} matched but could not apply (capability or target missing): denied.`,
@@ -335,6 +337,7 @@ const I18N = {
     empty_home_d: "Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
     c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
     default_deny: "Bloqueio padrão",
+    a_reload: "Recarregar", a_close: "Fechar", a_lang: "Idioma",
     why: "Por quê", why_signed: "A causa vai assinada no recibo.",
     why_rule: (id) => `A regra ${id} decidiu.`,
     why_unbound: (id) => `A regra ${id} coincidiu mas não pôde ser aplicada (falta a capacidade ou o destino): foi bloqueada.`,
@@ -445,6 +448,19 @@ function el(tag, attrs, ...children) {
     if (child === null || child === undefined || child === false) continue;
     node.append(child instanceof Node ? child : String(child));
   }
+  return node;
+}
+
+// A clickable row or item that the keyboard reaches (Tab) and opens
+// (Enter or Space), like a button.
+function activatable(node, open, evidenceId) {
+  node.setAttribute("tabindex", "0");
+  if (evidenceId) node.setAttribute("data-evidence-id", evidenceId);
+  node.addEventListener("keydown", (event) => {
+    if (event.target !== node || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    open();
+  });
   return node;
 }
 
@@ -635,6 +651,10 @@ function applyStaticText() {
   }
   document.getElementById("live-label").textContent = t("live");
   document.getElementById("f-text").setAttribute("placeholder", t("search_ph"));
+  document.getElementById("f-decision").setAttribute("aria-label", t("f_decision_label"));
+  document.getElementById("reload").setAttribute("aria-label", t("a_reload"));
+  document.getElementById("drawer-close").setAttribute("aria-label", t("a_close"));
+  document.getElementById("lang").setAttribute("aria-label", t("a_lang"));
   document.getElementById("page-title").textContent = t(`nav_${view}`);
   document.getElementById("page-sub").textContent = t(`sub_${view}`);
 }
@@ -810,13 +830,13 @@ function recentCard() {
     // For a held call, what the client cares about is how it ended.
     const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
     const cls = outcome ? outcome.cls : decisionClass(r.decision);
-    const li = el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
+    const li = activatable(el("li", { class: freshIds.has(r.evidence_id) ? "fresh" : "", onclick: () => openDrawer(r) },
       el("span", { class: `avatar ${cls}` }),
       el("div", { class: "what" },
         el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short || r.server || "")),
       outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
-      el("time", { title: localText(r.decided_at) }, relativeText(r.decided_at)));
+      el("time", { title: `${localText(r.decided_at)} · ${utcText(r.decided_at)}` }, relativeText(r.decided_at))), () => openDrawer(r), r.evidence_id);
     list.append(li);
   }
   if (rows.length === 0) list.append(el("li", { class: "muted" }, t("empty_recent")));
@@ -901,14 +921,16 @@ function historyCard() {
   for (const r of rows) {
     const target = targetOf(r.arguments);
     const label = approvalLabel(r.approval);
-    body.append(el("tr", { onclick: () => openDrawer(r) },
-      el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
+    body.append(activatable(el("tr", { onclick: () => openDrawer(r) },
+      el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at)),
+        el("small", {}, utcText(r.decided_at))),
       el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short)),
-      el("td", {}, label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-")));
+      el("td", {}, label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-")), () => openDrawer(r), r.evidence_id));
   }
   card.append(el("div", { class: "table-wrap" }, el("table", { class: "data" },
-    el("thead", {}, el("tr", {}, el("th", {}, t("c_when")), el("th", {}, t("c_action")), el("th", {}, t("f_approval")))),
+    el("thead", {}, el("tr", {}, el("th", { scope: "col" }, t("c_when")), el("th", { scope: "col" }, t("c_action")),
+      el("th", { scope: "col" }, t("f_approval")))),
     body)));
   return card;
 }
@@ -919,7 +941,8 @@ function renderDecisionFilter() {
   const box = document.getElementById("f-decision");
   box.replaceChildren();
   for (const [value, label] of [["", t("all")], ["ALLOW", t("d_ALLOW")], ["DENY", t("d_DENY")], ["REQUIRE_APPROVAL", t("d_REQUIRE_APPROVAL")]]) {
-    const button = el("button", { type: "button", class: decisionFilter === value ? "on" : "" }, label);
+    const button = el("button", { type: "button", class: decisionFilter === value ? "on" : "",
+      "aria-pressed": decisionFilter === value ? "true" : "false" }, label);
     button.addEventListener("click", () => { decisionFilter = value; renderDecisionFilter(); filtersChanged(); });
     box.append(button);
   }
@@ -982,7 +1005,7 @@ function renderTable() {
     const classes = [];
     if (selected && r.evidence_id && selected.evidence_id === r.evidence_id) classes.push("selected");
     if (freshIds.has(r.evidence_id)) classes.push("fresh");
-    const tr = el("tr", { class: classes.join(" "), onclick: () => openDrawer(r) });
+    const tr = activatable(el("tr", { class: classes.join(" "), onclick: () => openDrawer(r) }), () => openDrawer(r), r.evidence_id);
     if (r.parse_error) {
       tr.append(el("td", { colspan: "6", class: "mono" },
         el("span", { class: "tag bad" }, t("unreadable")), ` ${r.location.file}:${r.location.line}: ${r.parse_error}`));
@@ -1020,12 +1043,20 @@ function renderTable() {
 
 // ---------- drawer ----------
 
+let focusBeforeDrawer = null;
+let focusEvidenceId = null;
+
 function openDrawer(r) {
+  if (!selected) {
+    focusBeforeDrawer = document.activeElement;
+    focusEvidenceId = focusBeforeDrawer ? focusBeforeDrawer.getAttribute("data-evidence-id") : null;
+  }
   selected = r;
   drawerTab = "summary";
   if (r && r.evidence_id) history.replaceState(null, "", `#e=${encodeURIComponent(r.evidence_id)}`);
   renderDrawer();
   if (view === "info") renderTable();
+  document.getElementById("drawer-close").focus();
 }
 
 function closeDrawer() {
@@ -1033,6 +1064,16 @@ function closeDrawer() {
   history.replaceState(null, "", `#/${currentRoute()}`);
   renderDrawer();
   if (view === "info") renderTable();
+  // Back to where the keyboard was: the same element, or the row of the
+  // same receipt when the list was drawn again.
+  let back = focusBeforeDrawer && document.contains(focusBeforeDrawer) ? focusBeforeDrawer : null;
+  if (!back && focusEvidenceId) {
+    back = [...document.querySelectorAll("[data-evidence-id]")]
+      .find((node) => node.getAttribute("data-evidence-id") === focusEvidenceId && node.offsetParent !== null) || null;
+  }
+  if (back) back.focus();
+  focusBeforeDrawer = null;
+  focusEvidenceId = null;
 }
 
 function renderDrawer() {
@@ -1042,11 +1083,13 @@ function renderDrawer() {
   if (!r) {
     drawer.classList.remove("open");
     drawer.setAttribute("aria-hidden", "true");
+    drawer.inert = true; // closed: out of the Tab order
     scrim.hidden = true;
     return;
   }
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
+  drawer.inert = false;
   scrim.hidden = false;
   const target = targetOf(r.arguments);
   document.getElementById("drawer-title").replaceChildren(
@@ -1059,7 +1102,8 @@ function renderDrawer() {
   const available = r.parse_error ? ["json"] : ["summary", "signatures", "paths", "json"];
   if (!available.includes(drawerTab)) drawerTab = available[0];
   for (const name of available) {
-    const button = el("button", { type: "button", class: drawerTab === name ? "on" : "" }, t(`tab_${name}`));
+    const button = el("button", { type: "button", class: drawerTab === name ? "on" : "",
+      "aria-pressed": drawerTab === name ? "true" : "false" }, t(`tab_${name}`));
     button.addEventListener("click", () => { drawerTab = name; renderDrawer(); });
     tabs.append(button);
   }
@@ -1150,7 +1194,8 @@ function drawerPaths(body, r) {
       el("td", {}, el("span", { class: `tag ${value.status === "same" ? "ok" : "warn"}` }, value.status ?? "-"))));
   }
   body.append(el("div", { class: "table-wrap" }, el("table", { class: "mini" },
-    el("thead", {}, el("tr", {}, el("th", {}, "key"), el("th", {}, t("lexical")), el("th", {}, t("resolved")), el("th", {}, t("status")))),
+    el("thead", {}, el("tr", {}, el("th", { scope: "col" }, "key"), el("th", { scope: "col" }, t("lexical")),
+      el("th", { scope: "col" }, t("resolved")), el("th", { scope: "col" }, t("status")))),
     tbody)));
 }
 

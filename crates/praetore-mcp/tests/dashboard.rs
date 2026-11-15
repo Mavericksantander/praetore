@@ -1173,3 +1173,118 @@ fn receipts_say_what_decided_them() {
         );
     }
 }
+
+/// WCAG relative luminance of `#rrggbb`.
+fn luminance(hex: &str) -> f64 {
+    let channel = |i: usize| {
+        let c = f64::from(u8::from_str_radix(&hex[1 + 2 * i..3 + 2 * i], 16).unwrap()) / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2)
+}
+
+/// `--name: #hex;` tokens of the first block after `marker` in `css`.
+fn color_tokens(css: &str, marker: &str) -> BTreeMap<String, String> {
+    let block = &css[css.find(marker).unwrap()..];
+    let block = &block[..block.find('}').unwrap()];
+    let block = &block[block.rfind('{').unwrap() + 1..];
+    block
+        .split(';')
+        .filter_map(|decl| {
+            let (name, value) = decl.trim().split_once(':')?;
+            let value = value.trim();
+            (name.starts_with("--") && value.starts_with('#') && value.len() == 7)
+                .then(|| (name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn page_meets_basic_accessibility() {
+    let html = include_str!("../src/dashboard/index.html");
+    let js = include_str!("../src/dashboard/app.js");
+    let css = include_str!("../src/dashboard/app.css");
+
+    // Table headers say what they head, in the page and in tables built by
+    // app.js.
+    assert_eq!(
+        html.matches("<th ").count(),
+        html.matches("<th scope=\"col\"").count(),
+        "a <th> without scope in index.html"
+    );
+    assert!(html.contains("<th scope=\"col\""));
+    assert!(
+        !js.contains("el(\"th\", {}"),
+        "a <th> without scope in app.js"
+    );
+
+    // Every form control has a name: a <label for>, a wrapping <label> or
+    // an aria-label set by app.js.
+    for id in ["f-text", "f-tool", "f-from", "f-to"] {
+        let labelled = html.contains(&format!("for=\"{id}\""))
+            || html.split("<label").skip(1).any(|label| {
+                label
+                    .split("</label>")
+                    .next()
+                    .unwrap()
+                    .contains(&format!("id=\"{id}\""))
+            });
+        assert!(labelled, "#{id} has no label");
+    }
+    for id in ["lang", "reload", "drawer-close", "f-decision"] {
+        assert!(
+            js.contains(&format!(
+                "getElementById(\"{id}\").setAttribute(\"aria-label\""
+            )),
+            "#{id} has no aria-label"
+        );
+    }
+    assert!(html.contains("id=\"load-error\" class=\"alert bad\" role=\"alert\""));
+    assert!(html.contains("role=\"dialog\" aria-modal=\"true\""));
+
+    // Rows and feed items that open a receipt are reached and opened by
+    // keyboard; the drawer moves focus in and back out.
+    assert!(js.contains("node.setAttribute(\"tabindex\", \"0\")"));
+    assert!(js.contains("event.key !== \"Enter\" && event.key !== \" \""));
+    assert_eq!(
+        js.matches("activatable(el(\"tr\"").count(),
+        2,
+        "log and history rows"
+    );
+    assert!(js.contains("activatable(el(\"li\""), "feed items");
+    assert!(js.contains("document.getElementById(\"drawer-close\").focus()"));
+    assert!(js.contains("if (back) back.focus();"));
+    assert!(js.contains("node.setAttribute(\"data-evidence-id\", evidenceId)"));
+    assert!(js.contains("drawer.inert = true"));
+    assert!(js.contains("\"aria-pressed\""));
+
+    // Focus is visible: nothing removes the outline, rows have their own.
+    assert!(!css.contains("outline: none"), "app.css hides a focus ring");
+    assert!(css.contains("tr[tabindex]:focus-visible"));
+
+    // Text colors reach 4.5:1 on both backgrounds, light and dark.
+    for (scheme, tokens) in [
+        ("light", color_tokens(css, ":root {")),
+        (
+            "dark",
+            color_tokens(css, "@media (prefers-color-scheme: dark)"),
+        ),
+    ] {
+        for fg in ["--ink", "--ink-2", "--quiet", "--accent", "--ok"] {
+            for bg in ["--paper", "--sheet"] {
+                let (a, b) = (luminance(&tokens[fg]), luminance(&tokens[bg]));
+                let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
+                assert!(
+                    ratio >= 4.5,
+                    "{scheme}: {fg} {} on {bg} {} is {ratio:.2}:1",
+                    tokens[fg],
+                    tokens[bg]
+                );
+            }
+        }
+    }
+}
