@@ -1384,3 +1384,370 @@ fn api_state_sends_the_40_most_recent_receipts_for_the_live_view() {
     assert_eq!(recent[0]["arguments"]["n"], 45, "newest first");
     assert_eq!(recent[39]["arguments"]["n"], 6);
 }
+
+/// Identifiers and punctuation of app.js, with comments, strings and
+/// template literals left out. Enough to see calls and definitions.
+fn js_tokens(js: &str) -> Vec<String> {
+    let chars: Vec<char> = js.chars().collect();
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            i += 2;
+            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c == '"' || c == '\'' || c == '`' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+            tokens.push("\"\"".to_owned());
+        } else if c.is_alphabetic() || c == '_' || c == '$' {
+            let start = i;
+            while i < chars.len()
+                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$')
+            {
+                i += 1;
+            }
+            tokens.push(chars[start..i].iter().collect());
+        } else if c == '=' && next == Some('>') {
+            tokens.push("=>".to_owned());
+            i += 2;
+        } else {
+            if !c.is_whitespace() {
+                tokens.push(c.to_string());
+            }
+            i += 1;
+        }
+    }
+    tokens
+}
+
+/// Names app.js calls as plain functions but never defines. A function
+/// left out by an edit only fails when the page runs it, so look here.
+fn undefined_calls(js: &str) -> Vec<String> {
+    let tokens = js_tokens(js);
+    let is_ident = |t: &str| {
+        t.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
+    };
+    let closing = |open: usize, step: isize| {
+        let (a, b) = if step > 0 { ("(", ")") } else { (")", "(") };
+        let mut depth = 0;
+        let mut j = open as isize;
+        while j >= 0 && (j as usize) < tokens.len() {
+            let t = tokens[j as usize].as_str();
+            if t == a {
+                depth += 1;
+            } else if t == b {
+                depth -= 1;
+                if depth == 0 {
+                    return j as usize;
+                }
+            }
+            j += step;
+        }
+        open
+    };
+    let mut defined = std::collections::BTreeSet::new();
+    for (i, t) in tokens.iter().enumerate() {
+        let t = t.as_str();
+        if matches!(t, "function" | "const" | "let" | "var") {
+            match tokens.get(i + 1).map(String::as_str) {
+                Some("{" | "[") => {
+                    for name in tokens[i + 2..]
+                        .iter()
+                        .take_while(|x| !matches!(x.as_str(), "}" | "]"))
+                    {
+                        defined.insert(name.clone());
+                    }
+                }
+                Some(name) if is_ident(name) => {
+                    defined.insert(name.to_owned());
+                }
+                _ => {}
+            }
+            if t == "function"
+                && let Some(open) = (i + 1..tokens.len()).find(|&j| tokens[j] == "(")
+            {
+                for name in &tokens[open..closing(open, 1)] {
+                    defined.insert(name.clone());
+                }
+            }
+        } else if t == "=>" && i > 0 {
+            if tokens[i - 1] == ")" {
+                for name in &tokens[closing(i - 1, -1)..i] {
+                    defined.insert(name.clone());
+                }
+            } else {
+                defined.insert(tokens[i - 1].clone());
+            }
+        }
+    }
+    let builtin = [
+        "if",
+        "for",
+        "while",
+        "switch",
+        "catch",
+        "return",
+        "typeof",
+        "new",
+        "function",
+        "async",
+        "await",
+        "String",
+        "Number",
+        "Boolean",
+        "Array",
+        "Object",
+        "JSON",
+        "Math",
+        "Date",
+        "Set",
+        "Map",
+        "Promise",
+        "Error",
+        "RegExp",
+        "parseInt",
+        "parseFloat",
+        "isNaN",
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "requestAnimationFrame",
+        "cancelAnimationFrame",
+        "fetch",
+        "encodeURIComponent",
+        "decodeURIComponent",
+        "getComputedStyle",
+        "URLSearchParams",
+    ];
+    let mut missing: Vec<String> = tokens
+        .windows(3)
+        .filter(|w| w[0] != "." && w[0] != "function" && is_ident(&w[1]) && w[2] == "(")
+        .map(|w| w[1].clone())
+        .filter(|name| !defined.contains(name) && !builtin.contains(&name.as_str()))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+#[test]
+fn every_function_the_page_calls_is_defined() {
+    let js = include_str!("../src/dashboard/app.js");
+    assert_eq!(undefined_calls(js), Vec::<String>::new());
+    // The check sees a function that is called but gone.
+    let gone = js.replacen("function renderStats(", "function renderStatsGone(", 1);
+    assert_eq!(undefined_calls(&gone), vec!["renderStats".to_owned()]);
+}
+
+#[test]
+fn views_have_routes_and_old_links_still_land() {
+    let html = include_str!("../src/dashboard/index.html");
+    let js = include_str!("../src/dashboard/app.js");
+    assert!(js.contains("const VIEWS = [\"home\", \"live\", \"chain\", \"info\"];"));
+    assert!(
+        js.contains("const INFO_TABS = [\"approvals\", \"policy\", \"integrity\", \"stats\"];")
+    );
+    for view in ["home", "live", "chain", "info"] {
+        assert!(html.contains(&format!("<a href=\"#/{view}\" data-view=\"{view}\">")));
+        assert!(html.contains(&format!("id=\"view-{view}\"")));
+    }
+    // Links from earlier versions of the page land on the view that took
+    // their place.
+    assert!(js.contains(
+        "operation: [\"home\"], overview: [\"home\"], approvals: [\"live\"], activity: [\"chain\"],"
+    ));
+    for function in ["renderHome", "renderLive", "renderChain", "renderStats"] {
+        assert!(
+            js.split("function renderAll() {")
+                .nth(1)
+                .unwrap()
+                .split("\n}\n")
+                .next()
+                .unwrap()
+                .contains(&format!("{function}();")),
+            "renderAll does not call {function}"
+        );
+    }
+}
+
+#[test]
+fn hud_draws_only_what_the_journal_and_verify_say() {
+    let js = include_str!("../src/dashboard/app.js");
+    // Nothing made up: no randomness, no measure PRÆTORE does not take.
+    assert!(!js.contains("Math.random"), "random values in the page");
+    let lower = js.to_lowercase();
+    for word in [
+        "confianza",
+        "salud",
+        "health",
+        "trust",
+        "confidence",
+        "inestab",
+        "instab",
+        "pensando",
+        "thinking",
+        "stress",
+        "estrés",
+    ] {
+        assert!(
+            !lower
+                .lines()
+                .any(|line| line.contains(word) && !line.trim_start().starts_with("//")),
+            "app.js shows `{word}`"
+        );
+    }
+    // The wall says what decided the call, from the receipt.
+    assert!(js.contains("if (by && by.kind === \"default_deny\") return t(\"l_default_deny\");"));
+    assert!(
+        js.contains("if (by && by.kind === \"engine_guard\") return t(\"l_guard\", by.guard);")
+    );
+    assert!(js.contains(
+        "if (by && (by.kind === \"rule\" || by.kind === \"unbound_rule\")) return t(\"l_rule\", by.rule_id);"
+    ));
+    assert!(js.contains("l_default_deny: \"default deny: ninguna regla lo permite\""));
+    assert!(js.contains(
+        "let text = r.decision === \"DENY\" ? wallText(r) : row.pending ? t(\"l_pending\")"
+    ));
+    // A pending call is said to be unsigned and not checked by verify, in
+    // the drawing and in the list.
+    assert!(js.contains("l_pending: \"pendiente · aviso sin firma · verify no lo comprueba\""));
+    assert!(js.contains("waiting ? el(\"div\", { class: \"unsigned\" }, t(\"l_pending\")) : null"));
+}
+
+#[test]
+fn motion_stops_when_the_system_asks_for_less() {
+    let js = include_str!("../src/dashboard/app.js");
+    let css = include_str!("../src/dashboard/app.css");
+    assert!(js.contains("window.matchMedia(\"(prefers-reduced-motion: reduce)\")"));
+    // The animation loop only asks for another frame when motion is wanted.
+    let loops: Vec<&str> = js
+        .lines()
+        .filter(|l| l.contains("requestAnimationFrame(hudLoop)"))
+        .collect();
+    assert!(
+        loops
+            .iter()
+            .any(|l| l.contains("!reducedMotion() && !document.hidden && hudBusy(now)"))
+    );
+    // New receipts are scanned and the read sweep runs only with motion.
+    assert!(js.contains("if (!known.has(r.evidence_id) && fresh && !reducedMotion())"));
+    assert!(js.contains("if (hud.readAt !== null && !reducedMotion())"));
+    let reduce = css
+        .split("@media (prefers-reduced-motion: reduce) {")
+        .nth(1)
+        .expect("no reduced-motion rule in app.css")
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(reduce.contains("animation: none !important"), "{reduce}");
+    assert!(reduce.contains("transition: none !important"), "{reduce}");
+}
+
+#[test]
+fn drawings_have_a_text_alternative_and_a_list_view() {
+    let html = include_str!("../src/dashboard/index.html");
+    let js = include_str!("../src/dashboard/app.js");
+    for canvas in ["hud", "chain"] {
+        assert!(html.contains(&format!("<canvas id=\"{canvas}\" role=\"img\">")));
+    }
+    assert!(js.contains("canvas.setAttribute(\"aria-label\", t(\"l_label\""));
+    assert!(
+        js.contains(
+            "document.getElementById(\"chain\").setAttribute(\"aria-label\", t(\"c_label\""
+        )
+    );
+    // Visual and list switches say which one is on.
+    assert!(js.contains(
+        "button.setAttribute(\"aria-pressed\", liveMode === mode ? \"true\" : \"false\");"
+    ));
+    assert!(js.contains(
+        "button.setAttribute(\"aria-pressed\", chainMode === mode ? \"true\" : \"false\");"
+    ));
+    for id in [
+        "live-visual",
+        "live-list",
+        "chain-visual",
+        "chain-list",
+        "hud-list",
+        "chain-table",
+    ] {
+        assert!(html.contains(&format!("id=\"{id}\"")), "#{id}");
+    }
+    // The list view is text: rows reached by keyboard, no canvas.
+    let list = js
+        .split("function hudList() {")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(list.contains("activatable("));
+    assert!(!list.contains("getContext"));
+}
+
+#[test]
+fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
+    let (_temp, home) = home_with_receipts();
+    let file = receipts::read_journal(&home).unwrap()[0].file.clone();
+    let original = fs::read_to_string(&file).unwrap();
+    let mut lines: Vec<&str> = original.lines().collect();
+    lines.remove(1);
+    fs::write(&file, lines.join("\n") + "\n").unwrap();
+
+    // What the diagram draws comes from the page sent to the browser: seq,
+    // the prev hash link and, where verify fails, why.
+    let (status, state) = api(&home, &mut dashboard::Cache::default(), "");
+    assert_eq!(status, 200);
+    let receipts = state["page"]["receipts"].as_array().unwrap();
+    let cut: Vec<&Value> = receipts.iter().filter(|r| r["order"].is_string()).collect();
+    assert_eq!(cut.len(), 1, "{receipts:?}");
+    assert_eq!(cut[0]["verified"], false);
+    for r in receipts {
+        assert!(r["seq"].is_u64(), "{r}");
+        assert!(r["prev"].is_string(), "{r}");
+    }
+
+    let js = include_str!("../src/dashboard/app.js");
+    // The diagram cuts the link at that receipt and says why.
+    assert!(js.contains("if (r.order) return r.order;"));
+    assert!(js.contains("const cut = entry.kind === \"receipt\" ? breakReason(entry.r) : null;"));
+    assert!(js.contains("ctx.fillText(clipText(ctx, `${t(\"c_cut\")}: ${cut}`"));
+    // The drawer rebuilds the receipt with seq, prev and verify's result.
+    let drawer = js
+        .split("function drawerSummary(")
+        .nth(1)
+        .unwrap()
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(drawer.contains("const cut = breakReason(r);"));
+    for field in [
+        "t(\"f_tool\")",
+        "t(\"why\"), whyBlock(r)",
+        "t(\"f_mode\")",
+        "t(\"f_local\")",
+        "t(\"f_utc\")",
+        "t(\"f_evidence\")",
+        "t(\"f_seq\")",
+        "t(\"f_prev\"), r.prev",
+        "t(\"f_verified\")",
+    ] {
+        assert!(drawer.contains(field), "drawer has no {field}");
+    }
+    assert!(drawer.contains("el(\"pre\", { class: \"json\" }, argsText(r.arguments))"));
+}
