@@ -316,6 +316,20 @@ test("a gap is said to be left out by the filter only when a filter is on", asyn
   assert.ok(!texts.some((t) => t.includes("omitido")), texts.join("\n"));
 });
 
+// The lines of verify's reason written under a box: they start with
+// "verify falla: " and continue at the same x, in the wall color.
+function reasonLines(texts) {
+  const start = texts.findIndex((t) => t.text.startsWith("verify falla: "));
+  if (start < 0) return [];
+  const { x, color } = texts[start];
+  const lines = [];
+  for (const t of texts.slice(start)) {
+    if (t.x !== x || t.color !== color) break;
+    lines.push(t.text);
+  }
+  return lines;
+}
+
 test("live view marks a receipt verify rejects, in the drawing and the list", async () => {
   const state = fixture("cut");
   const bad = state.recent.find((r) => r.verified === false);
@@ -323,9 +337,8 @@ test("live view marks a receipt verify rejects, in the drawing and the list", as
   const p = page();
   await p.start(state);
   const texts = drawn(p, "hud");
-  const mark = texts.find((t) => t.text.startsWith("✕ verify falla: "));
+  const mark = texts.find((t) => t.text === "✕ verify falla");
   assert.ok(mark, texts.map((t) => t.text).join("\n"));
-  assert.ok(bad.order.startsWith(mark.text.slice("✕ verify falla: ".length).replace(/…$/, "")));
   assert.equal(mark.color, tokens["--wall"]);
   assert.equal(texts.filter((t) => t.text.startsWith("✕ verify falla")).length, 1, "only the bad one");
 
@@ -333,6 +346,40 @@ test("live view marks a receipt verify rejects, in the drawing and the list", as
   const list = p.text("hud-list");
   assert.ok(list.includes(`✕ verify falla: ${bad.order}`), list);
   assert.equal(list.split("✕ verify falla").length - 1, 1);
+});
+
+test("live view writes verify's whole reason, over several lines", async () => {
+  const state = fixture("cut");
+  const bad = state.recent.find((r) => r.verified === false);
+  assert.ok(`verify falla: ${bad.order}`.length * 6 > 650, "the reason is longer than one line");
+  const p = page();
+  await p.start(state);
+  const lines = reasonLines(drawn(p, "hud"));
+  assert.ok(lines.length >= 2, lines.join("\n"));
+  assert.equal(lines.join(" "), `verify falla: ${bad.order}`, "nothing left out");
+  assert.ok(!lines.some((line) => line.endsWith("…")));
+  assert.ok(!drawn(p, "hud").some((t) => t.text.includes("detalle del recibo")));
+});
+
+test("a reason too long for the drawing says it is cut and where to read it whole", async () => {
+  const state = fixture("cut");
+  const bad = state.recent.find((r) => r.verified === false);
+  const long = Array(8).fill(bad.order).join(" / ");
+  bad.order = long;
+  state.page.receipts.find((r) => r.evidence_id === bad.evidence_id).order = long;
+  const p = page();
+  await p.start(state);
+  const texts = drawn(p, "hud");
+  const lines = reasonLines(texts);
+  assert.equal(lines.length, 3);
+  assert.ok(lines[2].endsWith("…"), lines[2]);
+  const more = texts.find((t) => t.text === "la razón sigue en el detalle del recibo: haz clic en la fila");
+  assert.ok(more, texts.map((t) => t.text).join("\n"));
+  // A click on that row opens the receipt, where the reason is whole.
+  const row = p.hud.rows.findIndex((r) => r.r.evidence_id === bad.evidence_id);
+  p.byId.get("hud").listeners.get("click")[0]({ clientY: p.hud.geo.tops[row] + 60 });
+  const drawer = p.text("drawer-body");
+  assert.ok(drawer.includes(long), drawer.slice(0, 400));
 });
 
 test("a healthy home draws no verify mark and the DENY wall says what decided it", async () => {
