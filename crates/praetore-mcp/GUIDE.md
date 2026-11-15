@@ -281,6 +281,49 @@ column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
 
+### Looking at the receipts in a browser
+
+```sh
+praetore-mcp dashboard            # http://127.0.0.1:8787/
+praetore-mcp dashboard --port 0   # a free port, printed at startup
+```
+
+`dashboard` serves a read-only page over `receipts/*.jsonl` on 127.0.0.1
+only. There is no option to listen on another address. Each reload reads
+the home again. Stop it with Ctrl-C. The page shows:
+
+- a summary: total, ALLOW, DENY, REQUIRE_APPROVAL, the active policy (id,
+  version, digest) and a warning when the policy has an allow-all rule and
+  the journal has enforce receipts. The mode is a `wrap` option, so the
+  page takes it from the receipts. An allow-all rule is an ALLOW rule
+  with no tool and no condition, for every server or for one, like the
+  `allow-all-mcp-tool-calls` that `init` wrote before default deny; it is
+  the same rule `policy check` warns about.
+- the decisions table, local time next to UTC, server, tool, arguments,
+  decision, rule (or `default deny`), mode and evidence id. You can filter
+  by decision, tool and text.
+- the detail of a receipt: the full JSON line, `path_check` (lexical,
+  resolved, status), and the agent, attester and authority signatures with
+  their key ids. Each signature shows OK or FAIL.
+- the verification status, per receipt and for the whole journal. It comes
+  from the same code as `praetore-mcp verify`. It covers the receipts
+  only. It includes the journal order (seq/prev) and the journal head.
+  Keep the head outside this machine. `--expected-head HEX` works as it
+  does for `verify`.
+
+The page reads three things from the home: the receipts, which `verify` checks; the
+calls waiting for approval, read from `approvals/pending/*.json`, which are
+not signed and which `verify` does not check; and the rules of the current
+policy. It is read-only: approving or rejecting is done with
+`praetore-mcp approve` and `praetore-mcp reject` in a terminal.
+
+The page is embedded in the binary and loads nothing from the network.
+`dashboard` writes nothing under the home. It answers only GET requests
+whose `Host` is `127.0.0.1:PORT` or `localhost:PORT`. Any local process
+can still open the page and read what it shows, tool arguments included,
+so run it only while you are using it. Texts are in Spanish, English and
+Portuguese.
+
 ## Limits
 
 Read these before relying on anything above.

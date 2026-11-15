@@ -166,6 +166,8 @@ pub struct VerifyReport {
     pub approval_decisions: usize,
     pub approval_executions: usize,
     pub approval_head: Option<String>,
+    /// One verdict per journal line, in journal order.
+    pub lines: Vec<LineVerdict>,
 }
 
 /// Verifies one journal line against the local pins. Returns the evidence.
@@ -179,27 +181,145 @@ pub fn verify_line(
     Ok(evidence)
 }
 
-/// Verifies one parsed receipt against the local pins.
-fn verify_evidence(
+/// Result of one check of a receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Check {
+    Ok,
+    Fail(String),
+    /// Not run: the receipt does not have the HighAssurance shape.
+    NotRun,
+}
+
+impl Check {
+    fn from_result(result: Result<(), String>) -> Self {
+        match result {
+            Ok(()) => Self::Ok,
+            Err(error) => Self::Fail(error),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Fail(_) => "fail",
+            Self::NotRun => "not_run",
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Fail(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// The checks `verify` runs on one receipt, each with its own result, in
+/// the order `verify` reports them. The first failure is what `verify`
+/// prints ([`ReceiptChecks::first_failure`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptChecks {
+    /// HighAssurance (v2) evidence shape.
+    pub shape: Check,
+    /// Attester signature, against the local attester pin.
+    pub attester_signature: Check,
+    /// Agent signature over the intent.
+    pub agent_intent: Check,
+    /// The authority names the agent that signed.
+    pub authority_subject: Check,
+    /// Authority signature, against the issuer pins at `decided_at`.
+    pub authority_signature: Check,
+    /// Intent audience is praetore-mcp.
+    pub audience: Check,
+    /// `praetore.mode` is observe or enforce.
+    pub mode: Check,
+}
+
+impl ReceiptChecks {
+    /// `(name, result)` in the order `verify` runs them.
+    pub fn named(&self) -> [(&'static str, &Check); 7] {
+        [
+            ("shape", &self.shape),
+            ("attester_signature", &self.attester_signature),
+            ("agent_intent", &self.agent_intent),
+            ("authority_subject", &self.authority_subject),
+            ("authority_signature", &self.authority_signature),
+            ("audience", &self.audience),
+            ("mode", &self.mode),
+        ]
+    }
+
+    /// The error `verify` reports for this receipt, if any.
+    pub fn first_failure(&self) -> Option<&str> {
+        self.named()
+            .into_iter()
+            .find_map(|(_, check)| check.detail())
+    }
+}
+
+/// Runs every check of one parsed receipt against the local pins. This is
+/// the only implementation: `verify` and `dashboard` both use it.
+pub fn check_evidence(
     evidence: &Evidence,
     attester: &VerifiedPublicKey,
     issuer_pins: &[TrustedAuthorityIssuer],
-) -> Result<(), String> {
+) -> ReceiptChecks {
     if !evidence.is_high_assurance_shape() {
-        return Err("not HighAssurance (v2) evidence".into());
+        return ReceiptChecks {
+            shape: Check::Fail("not HighAssurance (v2) evidence".into()),
+            attester_signature: Check::NotRun,
+            agent_intent: Check::NotRun,
+            authority_subject: Check::NotRun,
+            authority_signature: Check::NotRun,
+            audience: Check::NotRun,
+            mode: Check::NotRun,
+        };
     }
-    evidence
-        .verify_attester_signature(attester)
-        .map_err(|e| format!("attester signature: {}", e.code()))?;
-    evidence
-        .verify_agent_intent()
-        .map_err(|e| format!("agent intent: {}", e.code()))?;
-    evidence
-        .authority
-        .verify_subject_identity(&evidence.agent)
-        .map_err(|e| format!("authority subject: {}", e.code()))?;
-    // Historical check: the authority must have been valid and pinned at the
-    // signed decision time, not necessarily now.
+    let attester_signature = Check::from_result(
+        evidence
+            .verify_attester_signature(attester)
+            .map_err(|e| format!("attester signature: {}", e.code())),
+    );
+    let agent_intent = Check::from_result(
+        evidence
+            .verify_agent_intent()
+            .map_err(|e| format!("agent intent: {}", e.code())),
+    );
+    let authority_subject = Check::from_result(
+        evidence
+            .authority
+            .verify_subject_identity(&evidence.agent)
+            .map_err(|e| format!("authority subject: {}", e.code())),
+    );
+    let authority_signature = Check::from_result(authority_signature(evidence, issuer_pins));
+    let audience = Check::from_result(
+        if evidence.intent_v2.as_ref().map(|i| i.audience.as_str()) == Some(AUDIENCE) {
+            Ok(())
+        } else {
+            Err("intent audience is not praetore-mcp".into())
+        },
+    );
+    let mode = Check::from_result(match mode_of(evidence) {
+        Some("observe" | "enforce") => Ok(()),
+        _ => Err(format!("missing or invalid {MODE_CONTEXT_KEY}")),
+    });
+    ReceiptChecks {
+        shape: Check::Ok,
+        attester_signature,
+        agent_intent,
+        authority_subject,
+        authority_signature,
+        audience,
+        mode,
+    }
+}
+
+/// Historical check: the authority must have been valid and pinned at the
+/// signed decision time, not necessarily now.
+fn authority_signature(
+    evidence: &Evidence,
+    issuer_pins: &[TrustedAuthorityIssuer],
+) -> Result<(), String> {
     let decided_at = evidence
         .decided_at
         .as_deref()
@@ -213,14 +333,35 @@ fn verify_evidence(
         })
         .ok_or("authority issuer is not pinned")?;
     pin.verify_authority_at(&evidence.authority, decided_at)
-        .map_err(|e| format!("authority: {}", e.code()))?;
-    if evidence.intent_v2.as_ref().map(|i| i.audience.as_str()) != Some(AUDIENCE) {
-        return Err("intent audience is not praetore-mcp".into());
+        .map_err(|e| format!("authority: {}", e.code()))
+}
+
+/// Verifies one parsed receipt against the local pins.
+fn verify_evidence(
+    evidence: &Evidence,
+    attester: &VerifiedPublicKey,
+    issuer_pins: &[TrustedAuthorityIssuer],
+) -> Result<(), String> {
+    match check_evidence(evidence, attester, issuer_pins).first_failure() {
+        None => Ok(()),
+        Some(error) => Err(error.to_owned()),
     }
-    match mode_of(evidence) {
-        Some("observe" | "enforce") => Ok(()),
-        _ => Err(format!("missing or invalid {MODE_CONTEXT_KEY}")),
-    }
+}
+
+/// What `verify` found for one journal line.
+#[derive(Debug, Clone)]
+pub struct LineVerdict {
+    pub file: PathBuf,
+    pub line_number: usize,
+    pub text: String,
+    /// The parse error, when the line is not a readable receipt.
+    pub parse_error: Option<String>,
+    /// Every check of the receipt (absent when the line could not be parsed).
+    pub checks: Option<ReceiptChecks>,
+    /// Journal order problem (seq / prev / duplicate), if any.
+    pub order: Option<String>,
+    /// Whether `verify` counts this line as verified.
+    pub verified: bool,
 }
 
 /// Verifies every receipt and the order of the journal: no entry removed,
@@ -241,19 +382,32 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
     for line in read_journal(home)? {
         report.total += 1;
         let at = format!("{}:{}", line.file.display(), line.line_number);
-        let entry = match journal::parse_line(&line.text) {
+        let mut verdict = LineVerdict {
+            file: line.file,
+            line_number: line.line_number,
+            text: line.text,
+            parse_error: None,
+            checks: None,
+            order: None,
+            verified: false,
+        };
+        let entry = match journal::parse_line(&verdict.text) {
             Ok(entry) => entry,
             Err(error) => {
                 chain.push_unreadable();
                 report.failures.push(format!("FAIL {at}: {error}"));
+                verdict.parse_error = Some(error);
+                report.lines.push(verdict);
                 continue;
             }
         };
         parsed_evidence.push(entry.evidence.clone());
         let order = chain.push(&entry);
-        match verify_evidence(&entry.evidence, &attester, &pins) {
-            Ok(()) if order.is_none() => {
+        let checks = check_evidence(&entry.evidence, &attester, &pins);
+        match checks.first_failure() {
+            None if order.is_none() => {
                 report.ok += 1;
+                verdict.verified = true;
                 *report
                     .by_mode
                     .entry(mode_of(&entry.evidence).unwrap_or("?").to_owned())
@@ -263,14 +417,17 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
                     .entry(decision_label(entry.evidence.decision.outcome))
                     .or_default() += 1;
             }
-            Ok(()) => {}
-            Err(error) => report.failures.push(format!("FAIL {at}: {error}")),
+            None => {}
+            Some(error) => report.failures.push(format!("FAIL {at}: {error}")),
         }
-        if let Some(problem) = order {
+        if let Some(problem) = &order {
             report
                 .failures
                 .push(format!("FAIL {at}: journal order: {problem}"));
         }
+        verdict.checks = Some(checks);
+        verdict.order = order;
+        report.lines.push(verdict);
     }
     report.chained = chain.chained;
     report.unchained = chain.unchained;
