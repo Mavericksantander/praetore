@@ -149,14 +149,15 @@ praetore-mcp verify
 `OK 0 receipts` means the journal is empty. It does not mean a server was
 wrapped.
 
-**The policy `init` writes is default deny.** It has no rules. In enforce
-mode every `tools/call` that no rule allows is denied, including tools you
-have not looked at and tools a server adds later. Observe mode does not
-block anything, so the observe step above works with no rules: the receipts
-show `DENY` with no rule id. `init` needs no rule for the client to start
-the server or list its tools: only `tools/call` is evaluated. `init` in
-v0.3.4 and earlier wrote an allow-all rule instead
-(`allow-all-mcp-tool-calls`); see "A home from v0.3.4" below.
+**From 0.3.5, the policy `init` writes is default deny.** It has no rules
+and no `allow-all-mcp-tool-calls` rule. In enforce mode every `tools/call`
+that no rule allows is denied, including tools you have not looked at and
+tools a server adds later. Observe mode does not block anything, so the
+observe step above works with no rules: the receipts show `DENY` with no
+rule id. `init` needs no rule for the client to start the server or list
+its tools: only `tools/call` is evaluated. `init` in v0.3.4 and earlier
+wrote an allow-all rule instead (`allow-all-mcp-tool-calls`); see "A home
+from v0.3.4" below.
 
 Allow the tools you want, one rule per tool, and add one deny rule for the
 server named `filesystem`. The deny rule is not needed for default deny; it
@@ -177,7 +178,7 @@ See what the policy decides for every tool the server lists. `policy
 coverage` starts the server with the command after `--`, sends
 `initialize` and `tools/list`, closes it, and writes nothing under the
 home. Use the same command and test folder as in the client config. It is
-not in v0.3.4.
+in 0.3.5. It is not in v0.3.4.
 
 ```sh
 praetore-mcp policy coverage --server filesystem -- /absolute/path/to/npx -y @modelcontextprotocol/server-filesystem@2.3.0 /absolute/path/to/test-dir
@@ -245,7 +246,7 @@ praetore-mcp policy allow --id ID --server NAME --tool NAME
 praetore-mcp policy remove --id allow-all-mcp-tool-calls
 ```
 
-After v0.3.4 there are warnings, none of them in v0.3.4:
+From 0.3.5 there are warnings, none of them in v0.3.4:
 
 - `init` run again on such a home prints a warning with the `policy remove`
   command (not in v0.3.4);
@@ -298,10 +299,10 @@ praetore-mcp dashboard --port 0   # a free port, printed at startup
 ```
 
 `dashboard` serves a read-only page over `receipts/*.jsonl` on 127.0.0.1
-only. It is not in v0.3.4. There is no option to listen on another
-address. Stop it with Ctrl-C. The page has four views. Each mark it draws
-stands for a value in a receipt, in a pending approval file or in the
-result of `verify`; nothing is drawn that PRÆTORE does not record.
+only. It is in 0.3.5. It is not in v0.3.4. There is no option to listen on
+another address. Stop it with Ctrl-C. The page has four views. Each mark
+it draws stands for a value in a receipt, in a pending approval file or
+in the result of `verify`; nothing is drawn that PRÆTORE does not record.
 
 - **Home**: the agent id and the servers from the 40 latest receipts, the mode
   (enforce, observe, or both with their counts), the verification result
@@ -317,7 +318,8 @@ result of `verify`; nothing is drawn that PRÆTORE does not record.
   bar marked "pending, notice not signed, not checked by verify", with the
   `praetore-mcp approve` and `reject` commands to run in a terminal. A
   receipt that `verify` rejects is marked, with the reason `verify` gives,
-  in the drawing and in the list. A call that arrives while the page is
+  over up to three lines in the drawing and in the list; a longer one
+  continues in the receipt detail. A call that arrives while the page is
   open is scanned in; nothing moves when a read of the journal finds
   nothing new.
 - **Chain**: the receipts in seq order, joined by the `prev` hash link,

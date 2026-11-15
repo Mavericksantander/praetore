@@ -138,6 +138,7 @@ python3 -I scripts/mcp-smoke.py target/release/praetore-mcp
 ```sh
 
 # 1. Create LOCAL/DEV keys, a signed authority, trust pins and a default-deny policy
+#    (from 0.3.5; 0.3.4 init writes allow-all-mcp-tool-calls instead)
 praetore-mcp init                     # ~/.praetore/mcp, or $PRAETORE_MCP_HOME, or --dir DIR
 
 # 2. See what would change in your MCP client configs (nothing is written)
@@ -156,7 +157,7 @@ praetore-mcp receipts --tail 20
 # 6. Verify every receipt (integrity, attester signature, intent, authority, mode)
 praetore-mcp verify
 #    or look at receipts and the same checks in a read-only page on 127.0.0.1
-praetore-mcp dashboard    # see GUIDE.md
+praetore-mcp dashboard    # from 0.3.5; see GUIDE.md
 
 # 7. Add rules (no JSON editing), check them, then restart the client.
 #    The policy from init has no rules: in enforce, a tool no ALLOW rule
@@ -168,7 +169,7 @@ praetore-mcp policy require-approval --id approve-ssh --tool read_file --arg-pat
 praetore-mcp policy list
 praetore-mcp policy check
 #    What the policy decides for each tool the server lists (starts the
-#    server, sends tools/list, closes it; no tools/call)
+#    server, sends tools/list, closes it; no tools/call). From 0.3.5.
 praetore-mcp policy coverage --server filesystem -- npx -y @modelcontextprotocol/server-filesystem@2.3.0 /abs/test-dir
 
 # 8. Switch to enforce (install skips entries that are already wrapped, so uninstall first)
@@ -372,39 +373,41 @@ time is only as trustworthy as the attester key that signed it.
 
 `DIR/policy.json` is a PRÆTORE policy, format 2 with semantics v2 (see
 [`docs/policy-language.md`](../../docs/policy-language.md)). The policy
-`init` writes has no rules and declares the action type `mcp.tools/call` as
-`Mission` in `action_classes`.
+`init` writes from 0.3.5 has no rules and no `allow-all-mcp-tool-calls`
+rule, and declares the action type `mcp.tools/call` as `Mission` in
+`action_classes`.
 
-**Default deny in enforce.** With no rule matching, a `tools/call` is
-DENY. In enforce mode, every tool that is not allowed is denied, including
-tools a server adds in a later version. Observe mode never blocks: it
-records DENY and forwards the call. `init` needs no rule for the client to
-start the server: only `tools/call` is evaluated, so `initialize`,
-`tools/list`, notifications and every other message pass through. Allow
-tools one by one:
+**Default deny in enforce (from 0.3.5).** With no rule matching, a
+`tools/call` is DENY. In enforce mode, every tool that is not allowed is
+denied, including tools a server adds in a later version. Observe mode
+never blocks: it records DENY and forwards the call. `init` needs no rule
+for the client to start the server: only `tools/call` is evaluated, so
+`initialize`, `tools/list`, notifications and every other message pass
+through. Allow tools one by one:
 
 ```sh
 praetore-mcp policy allow --id allow-read --server filesystem --tool read_text_file
 praetore-mcp policy allow --id allow-list --server filesystem --tool list_directory
 ```
 
-A home created by `init` up to 0.3.4 has the rule `allow-all-mcp-tool-calls`,
-which allows every `tools/call` that no other rule matches. With that rule,
-DENY rules that name tools leave every other tool allowed: on
-`@modelcontextprotocol/server-filesystem@2.3.0`, DENY rules for
-`write_file` and `edit_file` leave `copy_file` and `append_file` allowed.
-Running `init` again on such a home does not remove the rule; it prints a
-warning with the command. `policy check` warns when an allow-all rule sits
-next to DENY or REQUIRE_APPROVAL rules for specific tools. To move to
-default deny, add the ALLOW rules you need, then:
+A home created by `init` in 0.3.4 or earlier has the rule
+`allow-all-mcp-tool-calls`, which allows every `tools/call` that no other
+rule matches. With that rule, DENY rules that name tools leave every other
+tool allowed: on `@modelcontextprotocol/server-filesystem@2.3.0`, DENY
+rules for `write_file` and `edit_file` leave `copy_file` and `append_file`
+allowed. Running `init` again on such a home does not remove the rule; it
+prints a warning with the command. `policy check` warns when an allow-all
+rule sits next to DENY or REQUIRE_APPROVAL rules for specific tools. To
+move to default deny, add the ALLOW rules you need, then:
 
 ```sh
 praetore-mcp policy remove --id allow-all-mcp-tool-calls
 ```
 
-**`policy coverage`** starts the server given after `--`, sends
-`initialize` and `tools/list` (every page), closes it, and prints one row
-per tool: the decision (ALLOW, DENY, REQUIRE_APPROVAL), the rule that gives
+**`policy coverage`** (from 0.3.5) starts the server given after `--`,
+sends `initialize` and `tools/list` (every page), closes it, and prints
+one row per tool: the decision (ALLOW, DENY, REQUIRE_APPROVAL), the rule
+that gives
 it or `default deny`, and whether another rule depends on an argument (for
 example a `--arg-path-prefix` rule). Tools that only an allow-all rule
 allows are listed apart, with the command to remove it. Tools that no
