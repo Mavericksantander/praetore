@@ -95,6 +95,10 @@ h1, h2, h3 { font-weight: 400; }
 .chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; border: 1px solid var(--quiet); }
 .chip.ok { color: var(--ink-2); }
 .chip.ok::before { background: var(--ok); border-color: var(--ok); }
+.chip.bad { color: var(--accent); }
+.chip.bad::before { background: var(--accent); border-color: var(--accent); }
+a.chip { text-decoration: none; }
+.why p { margin: 0 0 6px; }
 
 .main { min-width: 0; display: flex; flex-direction: column; }
 .topbar {

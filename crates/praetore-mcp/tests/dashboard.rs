@@ -1098,3 +1098,78 @@ fn api_receipt_returns_one_receipt_by_evidence_id() {
         assert_eq!(get(missing).status, 404, "{missing}");
     }
 }
+
+#[test]
+fn receipts_say_what_decided_them() {
+    let (_temp, home) = home_with_receipts();
+    let state = dashboard::state(&home, None);
+    let by_tool = |tool: &str| {
+        state["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["tool"] == tool)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(
+        by_tool("echo")["decided_by"],
+        json!({"kind": "rule", "rule_id": "allow-all-mcp-tool-calls"})
+    );
+    assert_eq!(
+        by_tool("delete_file")["decided_by"],
+        json!({"kind": "rule", "rule_id": "deny-delete"})
+    );
+    assert!(
+        by_tool("delete_file")["reason"]
+            .as_str()
+            .unwrap()
+            .contains("deny-delete")
+    );
+
+    // `init` writes a default-deny policy: a call no rule covers.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("home");
+    let dir = root.to_str().unwrap();
+    assert!(run(&["init", "--dir", dir], "").status.success());
+    let calls = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{}}}),
+    ];
+    let input: String = calls.iter().map(|c| format!("{c}\n")).collect();
+    let server = fake_server();
+    let out = run(
+        &[
+            "wrap",
+            "--dir",
+            dir,
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+            "--",
+            server.to_str().unwrap(),
+        ],
+        &input,
+    );
+    assert!(out.status.success(), "{out:?}");
+    let state = dashboard::state(&Home::new(root), None);
+    let receipt = &state["receipts"][0];
+    assert_eq!(receipt["decision"], "DENY");
+    assert_eq!(receipt["rule"], Value::Null);
+    assert_eq!(receipt["decided_by"], json!({"kind": "default_deny"}));
+
+    // The page explains each kind from that field.
+    let js = include_str!("../src/dashboard/app.js");
+    for kind in [
+        "\"rule\"",
+        "\"unbound_rule\"",
+        "\"default_deny\"",
+        "\"engine_guard\"",
+    ] {
+        assert!(
+            js.contains(&format!("by.kind === {kind}")),
+            "app.js: {kind}"
+        );
+    }
+}

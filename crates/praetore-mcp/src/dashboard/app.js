@@ -91,6 +91,16 @@ const I18N = {
     empty_home_d: "Aparecen cuando un cliente MCP llama a una herramienta a través de praetore-mcp wrap.",
     c_when: "Cuándo", c_action: "Acción", c_server: "Servidor", c_result: "Resultado", c_rule: "Regla", c_verify: "Firma",
     default_deny: "Bloqueo por defecto",
+    why: "Por qué", why_signed: "La causa va firmada en el recibo.",
+    why_rule: (id) => `Decidió la regla ${id}.`,
+    why_unbound: (id) => `La regla ${id} coincidió pero no se pudo aplicar (falta la capacidad o el destino): se bloqueó.`,
+    why_default: "Ninguna regla cubría la llamada: bloqueo por defecto.",
+    why_guard: (g) => `La bloqueó una comprobación del motor fuera de las reglas (${g}).`,
+    why_legacy: "Este recibo es anterior al registro firmado de la causa.",
+    why_same: "La política actual es la misma con que se decidió. La regla dice:",
+    why_changed: "La política cambió después de esta decisión: la regla de hoy puede ser otra.",
+    unbound_short: (id) => `${id} (sin aplicar)`,
+    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} falla(s)`, verify_chip_err: "verify no corrió",
     empty_filter_t: "Sin resultados", empty_filter_d: "Prueba con otro filtro.",
     tab_summary: "Resumen", tab_signatures: "Verificación", tab_paths: "Rutas", tab_json: "Datos técnicos",
     f_decision: "Decisión", f_rule: "Regla", f_mode: "Modo", f_server: "Servidor", f_tool: "Herramienta",
@@ -203,6 +213,16 @@ const I18N = {
     empty_home_d: "They appear when an MCP client calls a tool through praetore-mcp wrap.",
     c_when: "When", c_action: "Action", c_server: "Server", c_result: "Result", c_rule: "Rule", c_verify: "Signature",
     default_deny: "Default deny",
+    why: "Why", why_signed: "The cause is signed in the receipt.",
+    why_rule: (id) => `Rule ${id} decided.`,
+    why_unbound: (id) => `Rule ${id} matched but could not apply (capability or target missing): denied.`,
+    why_default: "No rule covered the call: default deny.",
+    why_guard: (g) => `An engine check outside the rules denied it (${g}).`,
+    why_legacy: "This receipt predates the signed record of the cause.",
+    why_same: "The current policy is the one it was decided under. The rule says:",
+    why_changed: "The policy changed after this decision: today's rule may differ.",
+    unbound_short: (id) => `${id} (not applied)`,
+    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} failure(s)`, verify_chip_err: "verify did not run",
     empty_filter_t: "No results", empty_filter_d: "Try another filter.",
     tab_summary: "Summary", tab_signatures: "Verification", tab_paths: "Paths", tab_json: "Technical data",
     f_decision: "Decision", f_rule: "Rule", f_mode: "Mode", f_server: "Server", f_tool: "Tool",
@@ -315,6 +335,16 @@ const I18N = {
     empty_home_d: "Eles aparecem quando um cliente MCP chama uma ferramenta através de praetore-mcp wrap.",
     c_when: "Quando", c_action: "Ação", c_server: "Servidor", c_result: "Resultado", c_rule: "Regra", c_verify: "Assinatura",
     default_deny: "Bloqueio padrão",
+    why: "Por quê", why_signed: "A causa vai assinada no recibo.",
+    why_rule: (id) => `A regra ${id} decidiu.`,
+    why_unbound: (id) => `A regra ${id} coincidiu mas não pôde ser aplicada (falta a capacidade ou o destino): foi bloqueada.`,
+    why_default: "Nenhuma regra cobria a chamada: bloqueio padrão.",
+    why_guard: (g) => `Uma verificação do motor fora das regras a bloqueou (${g}).`,
+    why_legacy: "Este recibo é anterior ao registro assinado da causa.",
+    why_same: "A política atual é a mesma com que se decidiu. A regra diz:",
+    why_changed: "A política mudou depois desta decisão: a regra de hoje pode ser outra.",
+    unbound_short: (id) => `${id} (não aplicada)`,
+    verify_chip_ok: (n) => `verify OK · ${n}`, verify_chip_fail: (f) => `verify: ${f} falha(s)`, verify_chip_err: "verify não rodou",
     empty_filter_t: "Sem resultados", empty_filter_d: "Tente outro filtro.",
     tab_summary: "Resumo", tab_signatures: "Verificação", tab_paths: "Caminhos", tab_json: "Dados técnicos",
     f_decision: "Decisão", f_rule: "Regra", f_mode: "Modo", f_server: "Servidor", f_tool: "Ferramenta",
@@ -503,6 +533,40 @@ function approvalLabel(value) {
   return { text: value, cls: "neutral" };
 }
 
+// What decided a receipt, from the signed `decided_by`.
+function whyShort(r) {
+  const by = r.decided_by;
+  if (!by) return r.rule ?? t("default_deny");
+  if (by.kind === "rule") return by.rule_id;
+  if (by.kind === "unbound_rule") return t("unbound_short", by.rule_id);
+  if (by.kind === "default_deny") return t("default_deny");
+  if (by.kind === "engine_guard") return by.guard;
+  return r.rule ?? "-";
+}
+
+function whyBlock(r) {
+  const by = r.decided_by;
+  const box = el("div", { class: "why" });
+  if (!by) {
+    box.append(el("p", {}, r.rule ? t("why_rule", r.rule) : t("why_default")), el("p", { class: "muted" }, t("why_legacy")));
+    return box;
+  }
+  if (by.kind === "rule") box.append(el("p", {}, t("why_rule", by.rule_id)));
+  else if (by.kind === "unbound_rule") box.append(el("p", {}, t("why_unbound", by.rule_id)));
+  else if (by.kind === "default_deny") box.append(el("p", {}, t("why_default")));
+  else if (by.kind === "engine_guard") box.append(el("p", {}, t("why_guard", by.guard)));
+  const ruleId = by.rule_id;
+  const p = state.policy;
+  if (ruleId && p.status === "ok") {
+    const rule = (Array.isArray(p.rules_detail) ? p.rules_detail : []).find((x) => x.id === ruleId);
+    if (r.policy_digest === p.digest && rule) box.append(el("p", { class: "muted" }, t("why_same")), el("p", { class: "mono" }, ruleSentence(rule)));
+    else if (r.policy_digest !== p.digest) box.append(el("p", { class: "muted" }, t("why_changed")));
+  }
+  if (r.reason) box.append(el("p", { class: "mono muted" }, r.reason));
+  box.append(el("p", { class: "muted" }, t("why_signed")));
+  return box;
+}
+
 function copyButton(text) {
   const button = el("button", { type: "button", class: "btn-sm copy" }, t("copy"));
   button.addEventListener("click", async (event) => {
@@ -589,6 +653,12 @@ function renderShell() {
   const chip = document.getElementById("mode-chip");
   chip.className = "chip ok";
   chip.textContent = t("mode_readonly");
+  const v = state.verify;
+  const verifyChip = document.getElementById("verify-chip");
+  verifyChip.className = v.status === "ok" ? "chip ok" : "chip bad";
+  verifyChip.textContent = v.status === "ok" ? t("verify_chip_ok", `${v.verified}/${v.total}`)
+    : v.status === "fail" ? t("verify_chip_fail", v.failed) : t("verify_chip_err");
+  verifyChip.setAttribute("href", "#/info/integrity");
 }
 
 function renderStamp() {
@@ -920,12 +990,13 @@ function renderTable() {
       const target = targetOf(r.arguments);
       const label = approvalLabel(r.approval);
       tr.append(
-        el("td", { class: "cell-when", title: utcText(r.decided_at) }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at))),
+        el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at)),
+          el("small", {}, utcText(r.decided_at))),
         el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
           el("div", { class: "target mono", title: target.full }, target.full || target.short || "-")),
         el("td", {}, r.server ?? "-"),
         el("td", {}, decisionTag(r.decision), label ? el("div", { class: "muted", style: "font-size:12px;margin-top:4px" }, label.text) : null),
-        el("td", { class: "mono" }, r.rule ?? t("default_deny")),
+        el("td", { class: "mono" }, whyShort(r)),
         el("td", {}, el("span", { class: `check-icon ${r.verified ? "ok" : "bad"}`, title: r.verified ? t("st_ok") : t("st_fail") },
           r.verified ? "✓" : "✕")));
     }
@@ -1017,10 +1088,11 @@ function drawerSummary(body, r) {
   const label = approvalLabel(r.approval);
   body.append(kv([
     [t("f_decision"), decisionTag(r.decision)],
-    [t("f_rule"), r.rule ?? t("default_deny")],
+    [t("why"), whyBlock(r)],
     [t("f_server"), r.server],
     [t("f_tool"), toolLabel(r.tool)],
     [t("f_local"), localText(r.decided_at)],
+    [t("f_utc"), utcText(r.decided_at)],
     [t("f_approval"), label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-"],
   ]));
   body.append(el("h3", {}, t("args")));

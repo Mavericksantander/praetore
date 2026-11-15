@@ -303,12 +303,16 @@ Ctrl-C. The page shows:
   next to UTC, server, tool, arguments, decision, rule (or `default deny`),
   mode and evidence id. You can filter by decision, tool, time range and
   text; the filters run over the whole journal, not only the page shown.
-- the detail of a receipt: the full JSON line, `path_check` (lexical,
+- the detail of a receipt: what decided it, from the `decided_by` signed
+  in the receipt (a rule, a rule that matched but could not apply, default
+  deny or an engine check), with the rule text when the current policy is
+  the one the receipt names; the full JSON line, `path_check` (lexical,
   resolved, status), and the agent, attester and authority signatures with
   their key ids. Each signature shows OK or FAIL.
 - the verification status, per receipt and for the whole journal. It comes
-  from the same code as `praetore-mcp verify`. It covers the receipts
-  only. It includes the journal order (seq/prev) and the journal head.
+  from the same code as `praetore-mcp verify` and is also shown in the
+  sidebar. It covers the receipts only. It includes the journal order
+  (seq/prev) and the journal head.
   Keep the head outside this machine. `--expected-head HEX` works as it
   does for `verify`. The result is kept in memory and computed again when
   any file `verify` reads (the journal files, the attester and issuer

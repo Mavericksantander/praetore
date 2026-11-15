@@ -838,6 +838,10 @@ pub fn receipt_view(line: &LineVerdict, approval_status: &BTreeMap<String, Strin
         "arguments": arguments,
         "decision": receipts::decision_label(outcome),
         "rule": if rules.is_empty() { Value::Null } else { Value::String(rules.join(",")) },
+        // Signed with the receipt: which rule, the default deny or an
+        // engine guard decided. Absent on receipts older than schema v4.
+        "decided_by": evidence.decision.decided_by().and_then(|by| serde_json::to_value(by).ok()),
+        "reason": evidence.decision.reason,
         "mode": mode,
         "evidence_id": evidence_id,
         "approval": approval,
