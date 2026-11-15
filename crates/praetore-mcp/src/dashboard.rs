@@ -163,11 +163,20 @@ impl Response {
             431 => "Request Header Fields Too Large",
             _ => "Error",
         };
+        // A 204 has no content: it carries no Content-Length and no
+        // Content-Type (RFC 9110 section 8.6).
+        let content = if self.status == 204 {
+            String::new()
+        } else {
+            format!(
+                "Content-Type: {}\r\nContent-Length: {}\r\n",
+                self.content_type,
+                self.body.len()
+            )
+        };
         let mut out = format!(
-            "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: {CSP}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 {} {reason}\r\n{content}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: {CSP}\r\nConnection: close\r\n\r\n",
             self.status,
-            self.content_type,
-            self.body.len()
         )
         .into_bytes();
         out.extend_from_slice(&self.body);

@@ -678,11 +678,45 @@ fn favicon_is_answered_empty_and_stays_get_only_on_loopback() {
             "{request:?} gave\n{response}"
         );
         assert_eq!(csp_of(&response), EXPECTED_CSP, "{request:?}");
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let names: Vec<String> = head
+            .lines()
+            .skip(1)
+            .map(|line| line.split_once(':').unwrap().0.to_ascii_lowercase())
+            .collect();
+        // Every answer keeps these, the 204 too.
+        for name in [
+            "cache-control",
+            "x-content-type-options",
+            "referrer-policy",
+            "x-frame-options",
+            "content-security-policy",
+            "connection",
+        ] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "{request:?}: no {name}\n{head}"
+            );
+        }
+        let lines: Vec<&str> = head.lines().collect();
+        for line in [
+            "Cache-Control: no-store",
+            "X-Content-Type-Options: nosniff",
+            "Referrer-Policy: no-referrer",
+            "X-Frame-Options: DENY",
+            "Connection: close",
+        ] {
+            assert!(lines.contains(&line), "{request:?}: no {line:?}\n{head}");
+        }
         if *status == 204 {
-            let (head, body) = response.split_once("\r\n\r\n").unwrap();
-            assert!(head.starts_with("HTTP/1.1 204 No Content"), "{head}");
-            assert!(head.contains("Content-Length: 0"), "{head}");
+            // RFC 9110 section 8.6: no Content-Length, no Content-Type, no body.
+            assert!(head.starts_with("HTTP/1.1 204 No Content\r\n"), "{head}");
+            assert!(!names.iter().any(|n| n == "content-length"), "{head}");
+            assert!(!names.iter().any(|n| n == "content-type"), "{head}");
             assert_eq!(body, "");
+        } else {
+            assert!(names.iter().any(|n| n == "content-length"), "{head}");
+            assert!(names.iter().any(|n| n == "content-type"), "{head}");
         }
     }
     server.join().unwrap();
