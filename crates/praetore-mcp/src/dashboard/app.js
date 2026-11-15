@@ -928,7 +928,7 @@ function renderHome() {
 // one says its notice is not signed. A horizontal sweep runs once each
 // time the journal is read.
 
-const hud = { rows: [], seen: null, frame: 0, readAt: null, geo: null };
+const hud = { rows: [], seen: null, frame: 0, readAt: null, geo: null, liveKey: null };
 
 function syncHud() {
   const pending = pendingIds();
@@ -950,9 +950,6 @@ function syncHud() {
     }
     return row;
   });
-  // On the first load the newest one is scanned, so the page shows how a
-  // decision arrives.
-  if (firstLoad && hud.rows[0] && !reducedMotion()) hud.rows[0].born = now + 300;
   hud.seen = new Set(state.recent.map((r) => r.evidence_id));
 }
 
@@ -1104,6 +1101,13 @@ function drawHud(now) {
   }
 }
 
+function liveKey(s) {
+  const v = s.verify || {};
+  return JSON.stringify([s.summary.total, s.recent.length ? s.recent[0].evidence_id : null,
+    v.status, v.failed ?? null, v.head ?? null, v.error ?? null,
+    (Array.isArray(s.pending) ? s.pending : []).map((p) => p.approval_id)]);
+}
+
 function hudBusy(now) {
   if (hud.readAt !== null && now - hud.readAt < 900) return true;
   return hud.rows.some((row) => row.born !== null && now - row.born < SCAN_MS + OUTCOME_MS);
@@ -1120,7 +1124,10 @@ function hudLoop() {
 
 function startHud() {
   if (hud.frame) cancelAnimationFrame(hud.frame);
-  hud.frame = requestAnimationFrame(hudLoop);
+  hud.frame = 0;
+  // With reduced motion the still picture is drawn at once: no frames.
+  if (reducedMotion()) hudLoop();
+  else hud.frame = requestAnimationFrame(hudLoop);
 }
 
 function hudList() {
@@ -2043,12 +2050,15 @@ async function load() {
     announce(next);
     state = next;
     lastLoadedAt = new Date();
-    hud.readAt = performance.now();
+    // The sweep runs when a receipt arrives, verify's result changes or the
+    // pending calls change; not on a read that found nothing new.
+    const key = liveKey(next);
+    if (!firstLoad && key !== hud.liveKey) hud.readAt = performance.now();
+    hud.liveKey = key;
     if (firstLoad) routeFromHash();
     const print = fingerprintOf(state);
     if (print === fingerprint) {
       renderStamp();
-      if (view === "live" && liveMode === "visual") startHud();
     } else {
       fingerprint = print;
       renderAll();
