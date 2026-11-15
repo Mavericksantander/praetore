@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- praetore-mcp dashboard: the live view writes the whole reason `verify`
+  gives for a rejected receipt, over up to three lines, and says when a
+  longer one continues in the receipt detail. It was clipped.
+- praetore-mcp dashboard: `/favicon.ico` is answered with 204 instead of
+  404, so the browser console shows no error. Only GET on loopback, as for
+  the other paths.
+- praetore-safety-client: the non-blocking latency tests no longer fail on
+  a loaded machine; a slow `send` still fails them.
+
 ### Changed
 
 - **praetore-mcp: `init` writes a default-deny policy (behavior change for
