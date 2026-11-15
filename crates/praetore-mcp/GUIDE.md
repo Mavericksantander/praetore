@@ -292,9 +292,10 @@ the home again. Stop it with Ctrl-C. The page shows:
 - a summary: total, ALLOW, DENY, REQUIRE_APPROVAL, the active policy (id,
   version, digest) and a warning when the policy has an allow-all rule and
   the journal has enforce receipts. The mode is a `wrap` option, so the
-  page takes it from the receipts. An allow-all rule is an ALLOW rule with
-  no server, no tool and no condition, like `allow-all-mcp-tool-calls`
-  from `init`.
+  page takes it from the receipts. An allow-all rule is an ALLOW rule
+  with no tool and no condition, for every server or for one, like the
+  `allow-all-mcp-tool-calls` that `init` wrote before default deny; it is
+  the same rule `policy check` warns about.
 - the decisions table, local time next to UTC, server, tool, arguments,
   decision, rule (or `default deny`), mode and evidence id. You can filter
   by decision, tool and text.

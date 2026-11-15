@@ -63,6 +63,14 @@ fn home_with_receipts() -> (tempfile::TempDir, Home) {
     fs::create_dir(&allowed).unwrap();
     let allowed = fs::canonicalize(&allowed).unwrap();
     for args in [
+        // A home from before default deny: `init` no longer writes this rule.
+        vec![
+            "policy",
+            "allow",
+            "--id",
+            "allow-all-mcp-tool-calls",
+            "--any-tool",
+        ],
         vec![
             "policy",
             "deny",
@@ -298,11 +306,29 @@ fn allow_all_warning_needs_an_enforce_receipt() {
             .success()
     );
     let home = Home::new(root);
+    // `init` writes a default-deny policy: no allow-all rule.
     let state = dashboard::state(&home, None);
-    assert_eq!(
-        state["policy"]["allow_all_rules"].as_array().unwrap().len(),
-        1
+    assert_eq!(state["policy"]["allow_all_rules"], json!([]));
+    assert_eq!(state["policy"]["warn_allow_all_enforce"], false);
+
+    // A server-scoped allow-all counts, as in `policy check`.
+    let out = run(
+        &[
+            "policy",
+            "allow",
+            "--id",
+            "allow-fake",
+            "--server",
+            "fake",
+            "--any-tool",
+            "--dir",
+            home.root.to_str().unwrap(),
+        ],
+        "",
     );
+    assert!(out.status.success(), "{out:?}");
+    let state = dashboard::state(&home, None);
+    assert_eq!(state["policy"]["allow_all_rules"], json!(["allow-fake"]));
     assert_eq!(state["policy"]["warn_allow_all_enforce"], false);
     assert_eq!(state["summary"]["total"], 0);
     assert_eq!(state["verify"]["status"], "ok");

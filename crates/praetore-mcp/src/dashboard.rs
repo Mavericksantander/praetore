@@ -12,9 +12,9 @@ use crate::{
     gate::PATH_CHECK_CONTEXT_KEY,
     journal,
     receipts::{self, Check, LineVerdict, VerifyReport},
-    store::{self, ACTION_TYPE, Home},
+    store::{self, Home},
 };
-use praetore_core::{DecisionOutcome, Evidence, Policy, PolicyEffect};
+use praetore_core::{DecisionOutcome, Evidence, Policy};
 use serde_json::{Map, Value, json};
 use std::{
     collections::BTreeMap,
@@ -417,19 +417,14 @@ fn tool_of(evidence: &Evidence) -> Value {
     }
 }
 
-/// Ids of the ALLOW rules that match every `tools/call`: no server, no
-/// condition on the parameters or the context.
+/// Ids of the allow-all rules, as `policy check` and `policy coverage`
+/// find them ([`crate::policy::is_allow_all`]): ALLOW rules that match
+/// every `tools/call`, or every one of a server.
 pub fn allow_all_rules(policy: &Policy) -> Vec<String> {
     policy
         .rules
         .iter()
-        .filter(|rule| {
-            matches!(rule.effect, PolicyEffect::Allow)
-                && rule.action_type == ACTION_TYPE
-                && rule.target.is_none()
-                && rule.parameter_conditions.is_empty()
-                && rule.context_conditions.is_empty()
-        })
+        .filter(|rule| crate::policy::is_allow_all(rule))
         .map(|rule| rule.id.clone())
         .collect()
 }
