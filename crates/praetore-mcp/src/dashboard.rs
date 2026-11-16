@@ -9,15 +9,22 @@
 //! between requests while none of the files it reads has changed (see
 //! [`Cache`]); `/api/state` then sends one page of receipts, not the whole
 //! journal. Nothing is written under the home.
+//!
+//! The Sessions view lists the session reports in `DIR/reports/` (the
+//! pair written at close, with the pairs `report` wrote later grouped
+//! under it) and `/reports/<file>` serves one of them for download. The
+//! dashboard reads them only: it does not write, regenerate or sign one.
 
 use crate::{
     gate::PATH_CHECK_CONTEXT_KEY,
     journal,
     receipts::{self, Check, LineVerdict, VerifyReport},
+    report,
     store::{self, Home},
 };
 use praetore_core::{DecisionOutcome, Evidence, Policy};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
@@ -133,6 +140,8 @@ pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// `Content-Disposition`, for a report served as a download.
+    pub disposition: Option<String>,
 }
 
 impl Response {
@@ -141,6 +150,7 @@ impl Response {
             status,
             content_type: "text/plain; charset=utf-8",
             body: body.as_bytes().to_vec(),
+            disposition: None,
         }
     }
 
@@ -149,6 +159,7 @@ impl Response {
             status: 200,
             content_type: "application/json; charset=utf-8",
             body: serde_json::to_vec(value).unwrap_or_default(),
+            disposition: None,
         }
     }
 
@@ -165,7 +176,7 @@ impl Response {
         };
         // A 204 has no content: it carries no Content-Length and no
         // Content-Type (RFC 9110 section 8.6).
-        let content = if self.status == 204 {
+        let mut content = if self.status == 204 {
             String::new()
         } else {
             format!(
@@ -174,6 +185,9 @@ impl Response {
                 self.body.len()
             )
         };
+        if let Some(disposition) = &self.disposition {
+            content.push_str(&format!("Content-Disposition: {disposition}\r\n"));
+        }
         let mut out = format!(
             "HTTP/1.1 {} {reason}\r\n{content}Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: {CSP}\r\nConnection: close\r\n\r\n",
             self.status,
@@ -204,15 +218,21 @@ pub fn respond_with(
     let (Some(method), Some(target)) = (request_line.next(), request_line.next()) else {
         return Response::text(400, "bad request");
     };
-    let hosts: Vec<&str> = lines
+    let headers: Vec<(&str, &str)> = lines
         .take_while(|line| !line.is_empty())
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("host")
-                .then(|| value.trim())
+            Some((name.trim(), value.trim()))
         })
         .collect();
+    let named = |wanted: &str| -> Vec<&str> {
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| *value)
+            .collect()
+    };
+    let hosts = named("host");
     // More than one Host is ambiguous: a proxy and this listener could
     // read different ones. Refused whatever the values and their order.
     if hosts.len() > 1 {
@@ -225,6 +245,17 @@ pub fn respond_with(
     {
         return Response::text(403, "host not allowed");
     }
+    // A browser names the page that made a request in Origin (on every
+    // request but a same-origin GET). Any other page is refused.
+    let origins = named("origin");
+    let allowed_origins = allowed_hosts.map(|host| format!("http://{host}"));
+    if origins.len() > 1
+        || origins
+            .first()
+            .is_some_and(|origin| !allowed_origins.iter().any(|allowed| allowed == origin))
+    {
+        return Response::text(403, "origin not allowed");
+    }
     if method != "GET" {
         return Response::text(405, "read-only: GET only");
     }
@@ -235,21 +266,27 @@ pub fn respond_with(
             status: 200,
             content_type: "text/html; charset=utf-8",
             body: INDEX_HTML.as_bytes().to_vec(),
+            disposition: None,
         },
         "/app.js" => Response {
             status: 200,
             content_type: "text/javascript; charset=utf-8",
             body: APP_JS.as_bytes().to_vec(),
+            disposition: None,
         },
         "/app.css" => Response {
             status: 200,
             content_type: "text/css; charset=utf-8",
             body: APP_CSS.as_bytes().to_vec(),
+            disposition: None,
         },
         "/api/state" => match Query::parse(query) {
             Ok(query) => {
+                let reports = cache.reports(home);
                 let snapshot = cache.get(home, expected_head);
-                Response::json(&page_state(home, snapshot, &query))
+                let mut state = page_state(home, snapshot, &query);
+                state["reports"] = reports;
+                Response::json(&state)
             }
             Err(error) => Response::text(400, &error),
         },
@@ -272,7 +309,10 @@ pub fn respond_with(
         // Browsers ask for /favicon.ico on their own. The page has no icon;
         // an empty answer keeps that request out of the console as a 404.
         "/favicon.ico" => Response::text(204, ""),
-        _ => Response::text(404, "not found"),
+        _ => match path.strip_prefix("/reports/") {
+            Some(name) => serve_report(home, name),
+            None => Response::text(404, "not found"),
+        },
     }
 }
 
@@ -302,6 +342,9 @@ const ACTIVITY_DAYS: i64 = 14;
 pub struct Cache {
     snapshot: Option<Snapshot>,
     verifications: usize,
+    /// SHA-256 and header of each report file, by path, kept while the
+    /// file has the same stamp.
+    report_files: HashMap<PathBuf, (FileStamp, ReportFile)>,
 }
 
 impl Cache {
@@ -325,12 +368,38 @@ impl Cache {
     pub fn verifications(&self) -> usize {
         self.verifications
     }
+
+    /// The session reports in `DIR/reports/` ([`reports_view`]), reading
+    /// again only the files that changed.
+    pub fn reports(&mut self, home: &Home) -> Value {
+        let mut seen = HashMap::new();
+        let view = reports_view(home, |path| {
+            let stamp = stamp(path);
+            let file = match self.report_files.remove(path) {
+                Some((old, file)) if old == stamp && stamp.meta.is_some() => file,
+                _ => ReportFile::read(path),
+            };
+            seen.insert(path.to_path_buf(), (stamp, file.clone()));
+            file
+        });
+        self.report_files = seen;
+        view
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct FileStamp {
     path: PathBuf,
     meta: Option<(u64, Option<SystemTime>, [i64; 4])>,
+}
+
+#[cfg(not(unix))]
+fn stamp(path: &Path) -> FileStamp {
+    // No change time: nothing is reused.
+    FileStamp {
+        path: path.to_path_buf(),
+        meta: None,
+    }
 }
 
 #[cfg(unix)]
@@ -696,6 +765,232 @@ pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
     })
 }
 
+/// The path of the report file `name` in `DIR/reports/`, if it may be
+/// served: `name` is exactly a report file name
+/// ([`report::parse_report_name`]), it is a regular file and not a symlink,
+/// and its real path (every symlink on the way resolved) is in the real
+/// `DIR/reports/`. Anything else is `None`.
+pub fn report_path(home: &Home, name: &str) -> Option<PathBuf> {
+    report::parse_report_name(name)?;
+    let dir = home.root.canonicalize().ok()?.join("reports");
+    let path = dir.join(name);
+    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
+        return None;
+    }
+    // `reports` (or a directory above it) may be a symlink to somewhere
+    // else; the file is served only if it really is in DIR/reports.
+    let real = path.canonicalize().ok()?;
+    (real.parent() == Some(dir.as_path())).then_some(real)
+}
+
+/// Reads a regular file without following a symlink at its last component.
+fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// `GET /reports/<name>`: the report file as a download, or 404.
+fn serve_report(home: &Home, name: &str) -> Response {
+    let not_found = || Response::text(404, "no such report");
+    let Some(parsed) = report::parse_report_name(name) else {
+        return not_found();
+    };
+    let Some(path) = report_path(home, name) else {
+        return not_found();
+    };
+    match read_regular(&path) {
+        Ok(body) => Response {
+            status: 200,
+            content_type: if parsed.pdf {
+                "application/pdf"
+            } else {
+                "application/json"
+            },
+            body,
+            // `name` is only letters, digits, `-` and `.` here.
+            disposition: Some(format!("attachment; filename=\"{name}\"")),
+        },
+        Err(_) => not_found(),
+    }
+}
+
+/// What the Sessions view shows of one report file.
+#[derive(Clone)]
+struct ReportFile {
+    bytes: u64,
+    /// JSON files only.
+    sha256: Option<String>,
+    header: Option<Value>,
+    error: Option<String>,
+}
+
+impl ReportFile {
+    fn read(path: &Path) -> Self {
+        let pdf = path.extension().is_some_and(|ext| ext == "pdf");
+        if pdf {
+            return match fs::metadata(path) {
+                Ok(meta) => Self {
+                    bytes: meta.len(),
+                    sha256: None,
+                    header: None,
+                    error: None,
+                },
+                Err(error) => Self::failed(error.to_string()),
+            };
+        }
+        match read_regular(path) {
+            Ok(bytes) => {
+                let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
+                let header = std::str::from_utf8(first)
+                    .ok()
+                    .and_then(report::header_of_first_line);
+                Self {
+                    bytes: bytes.len() as u64,
+                    sha256: Some(hex::encode(Sha256::digest(&bytes))),
+                    error: header
+                        .is_none()
+                        .then(|| "no session report header".to_owned()),
+                    header,
+                }
+            }
+            Err(error) => Self::failed(error.to_string()),
+        }
+    }
+
+    fn failed(error: String) -> Self {
+        Self {
+            bytes: 0,
+            sha256: None,
+            header: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// One close report and the pairs `report` wrote from it, by file name.
+#[derive(Default)]
+struct ReportGroup {
+    session_id: String,
+    json: Option<String>,
+    pdf: Option<String>,
+    /// `<now UTC>` of the file name -> (json, pdf).
+    regenerated: BTreeMap<String, (Option<String>, Option<String>)>,
+}
+
+/// The fields of a report header the Sessions view shows.
+fn header_summary(header: &Value) -> Value {
+    json!({
+        "praetore_mcp_version": header["praetore_mcp_version"],
+        "agent": header["agent"],
+        "server": header["server"],
+        "mode": header["mode"],
+        "started_at": header["started_at"],
+        "ended_at": header["ended_at"],
+        "generated_at": header["generated_at"],
+        "seq": header["seq"],
+        "summary": header["summary"],
+        "verify": {
+            "result": header["verify"]["result"],
+            "session_receipts": header["verify"]["session_receipts"],
+            "session_verified": header["verify"]["session_verified"],
+        },
+    })
+}
+
+/// The session reports in `DIR/reports/`, newest session first. Each item
+/// is a report written at close with its JSON (size and SHA-256) and PDF,
+/// and under it, apart, the pairs `praetore-mcp report` wrote later
+/// (`.regen-`), oldest first. Only files [`report_path`] would serve are
+/// listed. `file` reads one file (cached by [`Cache::reports`]).
+fn reports_view(home: &Home, mut file: impl FnMut(&Path) -> ReportFile) -> Value {
+    let Ok(root) = home.root.canonicalize() else {
+        return json!({"items": [], "error": null});
+    };
+    let dir = root.join("reports");
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({"items": [], "error": null});
+        }
+        Err(error) => {
+            return json!({"items": [], "error": format!("cannot read reports/: {error}")});
+        }
+    };
+    let mut groups: BTreeMap<String, ReportGroup> = BTreeMap::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(parsed) = report::parse_report_name(&name) else {
+            continue;
+        };
+        if report_path(home, &name).is_none() {
+            continue;
+        }
+        let group = groups.entry(parsed.close_stem.clone()).or_default();
+        group.session_id = parsed.session_id.clone();
+        let slot = match &parsed.regenerated_at {
+            None => (&mut group.json, &mut group.pdf),
+            Some(at) => {
+                let pair = group.regenerated.entry(at.clone()).or_default();
+                (&mut pair.0, &mut pair.1)
+            }
+        };
+        if parsed.pdf {
+            *slot.1 = Some(name);
+        } else {
+            *slot.0 = Some(name);
+        }
+    }
+    let mut describe = |json_name: &Option<String>, pdf_name: &Option<String>| {
+        let json_file = json_name.as_ref().map(|name| (name, file(&dir.join(name))));
+        let pdf_file = pdf_name.as_ref().map(|name| (name, file(&dir.join(name))));
+        let header = json_file
+            .as_ref()
+            .and_then(|(_, f)| f.header.as_ref())
+            .map(header_summary);
+        json!({
+            "header": header,
+            "json": json_file.map(|(name, f)| json!({
+                "name": name, "bytes": f.bytes, "sha256": f.sha256, "error": f.error,
+            })),
+            "pdf": pdf_file.map(|(name, f)| json!({"name": name, "bytes": f.bytes})),
+        })
+    };
+    let items: Vec<Value> = groups
+        .iter()
+        .rev()
+        .map(|(stem, group)| {
+            let mut item = describe(&group.json, &group.pdf);
+            item["session_id"] = json!(group.session_id);
+            item["stem"] = json!(stem);
+            item["regenerations"] = group
+                .regenerated
+                .iter()
+                .map(|(at, (json_name, pdf_name))| {
+                    let mut regen = describe(json_name, pdf_name);
+                    regen["regenerated_at"] = json!(at);
+                    regen
+                })
+                .collect();
+            item
+        })
+        .collect();
+    json!({"items": items, "error": null})
+}
+
 /// Everything, read and verified now, with every receipt in journal order.
 /// The page uses [`page_state`]; this is the whole view, for tests.
 pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
@@ -716,6 +1011,7 @@ pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
         "pending": pending,
         "verify": snapshot.verify,
         "receipts": receipts,
+        "reports": reports_view(home, ReportFile::read),
     })
 }
 

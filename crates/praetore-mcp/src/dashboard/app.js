@@ -111,6 +111,20 @@ const I18N = {
     cli_hint: "Para decidir, ejecuta uno de estos comandos en una terminal de este computador", copy_approve: "Copiar comando para aprobar",
     copy: "Copiar", copied: "Copiado",
     toast_pending: "Nueva acción esperando tu aprobación",
+    nav_sessions: "Sesiones", sub_sessions: "Los informes de cada sesión de wrap, para leer o descargar",
+    s_none_t: "Aún no hay informes de sesión.", s_none_d: "wrap escribe un informe (JSON y PDF) en reports/ al cerrar cada sesión con recibos.",
+    s_session: "Sesión", s_agent: "Agente", s_server: "Servidor", s_mode: "Modo", s_opened: "Apertura", s_closed: "Cierre",
+    s_version: "Versión", s_decisions: "Decisiones (una por llamada, de los recibos firmados)",
+    s_statuses: "Estado de las aprobaciones (de las llamadas retenidas; no son más llamadas)",
+    d_allow: "ALLOW", d_deny: "DENY", d_held: "HELD", d_forwarded: "FORWARDED", d_would_ask: "WOULD ASK",
+    a_approved: "APPROVED", a_rejected: "REJECTED", a_pending: "PENDING", a_expired: "EXPIRED",
+    s_verify_passed: "verify pasó", s_verify_failed: "verify FALLÓ", s_no_header: "sin cabecera legible",
+    s_dl_pdf: "Descargar PDF", s_dl_json: "Descargar JSON", s_sha: "SHA-256 del JSON",
+    s_no_pdf: "PDF no encontrado", s_no_json: "JSON no encontrado",
+    s_regens: (n) => n === 1 ? "1 regeneración (praetore-mcp report), aparte del original" : `${n} regeneraciones (praetore-mcp report), aparte del original`,
+    s_regen_at: "Escrita", s_original_missing: "El informe escrito al cierre no está en reports/.",
+    s_note: "Un informe es una vista del journal: no firma nada y no prueba que una persona lo revisó. Solo es tamper-evident si comparas los heads con una copia guardada fuera de este equipo.",
+    s_ready: (id) => `Informe listo · sesión ${id}`,
     toast_new: (n) => n === 1 ? "1 decisión nueva" : `${n} decisiones nuevas`,
     search_ph: "Buscar por archivo, herramienta, regla o id…",
     all: "Todas", all_tools: "Todas las herramientas", shown: (n, t) => `${n} de ${t}`,
@@ -264,6 +278,20 @@ const I18N = {
     cli_hint: "To decide, run one of these commands in a terminal on this computer", copy_approve: "Copy approve command",
     copy: "Copy", copied: "Copied",
     toast_pending: "New action waiting for your approval",
+    nav_sessions: "Sessions", sub_sessions: "The report of each wrap session, to read or download",
+    s_none_t: "No session reports yet.", s_none_d: "wrap writes a report (JSON and PDF) in reports/ when each session with receipts ends.",
+    s_session: "Session", s_agent: "Agent", s_server: "Server", s_mode: "Mode", s_opened: "Opened", s_closed: "Closed",
+    s_version: "Version", s_decisions: "Decisions (one per call, from the signed receipts)",
+    s_statuses: "Approval status (of the held calls; not more calls)",
+    d_allow: "ALLOW", d_deny: "DENY", d_held: "HELD", d_forwarded: "FORWARDED", d_would_ask: "WOULD ASK",
+    a_approved: "APPROVED", a_rejected: "REJECTED", a_pending: "PENDING", a_expired: "EXPIRED",
+    s_verify_passed: "verify passed", s_verify_failed: "verify FAILED", s_no_header: "no readable header",
+    s_dl_pdf: "Download PDF", s_dl_json: "Download JSON", s_sha: "SHA-256 of the JSON",
+    s_no_pdf: "PDF not found", s_no_json: "JSON not found",
+    s_regens: (n) => n === 1 ? "1 regeneration (praetore-mcp report), apart from the original" : `${n} regenerations (praetore-mcp report), apart from the original`,
+    s_regen_at: "Written", s_original_missing: "The report written at close is not in reports/.",
+    s_note: "A report is a view of the journal: it signs nothing and does not prove that a person reviewed it. It is tamper-evident only when you compare the heads with a copy kept off this machine.",
+    s_ready: (id) => `Report ready · session ${id}`,
     toast_new: (n) => n === 1 ? "1 new decision" : `${n} new decisions`,
     search_ph: "Search by file, tool, rule or id…",
     all: "All", all_tools: "All tools", shown: (n, t) => `${n} of ${t}`,
@@ -417,6 +445,20 @@ const I18N = {
     cli_hint: "Para decidir, execute um destes comandos em um terminal deste computador", copy_approve: "Copiar comando para aprovar",
     copy: "Copiar", copied: "Copiado",
     toast_pending: "Nova ação aguardando sua aprovação",
+    nav_sessions: "Sessões", sub_sessions: "O relatório de cada sessão do wrap, para ler ou baixar",
+    s_none_t: "Ainda não há relatórios de sessão.", s_none_d: "O wrap escreve um relatório (JSON e PDF) em reports/ ao fechar cada sessão com recibos.",
+    s_session: "Sessão", s_agent: "Agente", s_server: "Servidor", s_mode: "Modo", s_opened: "Abertura", s_closed: "Fechamento",
+    s_version: "Versão", s_decisions: "Decisões (uma por chamada, dos recibos assinados)",
+    s_statuses: "Estado das aprovações (das chamadas retidas; não são mais chamadas)",
+    d_allow: "ALLOW", d_deny: "DENY", d_held: "HELD", d_forwarded: "FORWARDED", d_would_ask: "WOULD ASK",
+    a_approved: "APPROVED", a_rejected: "REJECTED", a_pending: "PENDING", a_expired: "EXPIRED",
+    s_verify_passed: "verify passou", s_verify_failed: "verify FALHOU", s_no_header: "sem cabeçalho legível",
+    s_dl_pdf: "Baixar PDF", s_dl_json: "Baixar JSON", s_sha: "SHA-256 do JSON",
+    s_no_pdf: "PDF não encontrado", s_no_json: "JSON não encontrado",
+    s_regens: (n) => n === 1 ? "1 regeneração (praetore-mcp report), à parte do original" : `${n} regenerações (praetore-mcp report), à parte do original`,
+    s_regen_at: "Escrita", s_original_missing: "O relatório escrito no fechamento não está em reports/.",
+    s_note: "Um relatório é uma vista do journal: não assina nada e não prova que uma pessoa o revisou. Só é tamper-evident se você comparar os heads com uma cópia guardada fora deste computador.",
+    s_ready: (id) => `Relatório pronto · sessão ${id}`,
     toast_new: (n) => n === 1 ? "1 decisão nova" : `${n} decisões novas`,
     search_ph: "Buscar por arquivo, ferramenta, regra ou id…",
     all: "Todas", all_tools: "Todas as ferramentas", shown: (n, t) => `${n} de ${t}`,
@@ -491,7 +533,7 @@ const I18N = {
   },
 };
 
-const VIEWS = ["home", "live", "chain", "info"];
+const VIEWS = ["home", "live", "chain", "sessions", "info"];
 const INFO_TABS = ["approvals", "policy", "integrity", "stats"];
 const LIVE_KEY = "praetore-mcp-dashboard-live";
 const LANG_KEY = "praetore-mcp-dashboard-lang";
@@ -511,6 +553,8 @@ let decisionFilter = "";
 let fingerprint = null;
 let knownIds = null;
 let knownPending = null;
+let knownReports = null;
+let focusSession = null; // the session named by #/sessions/<id>
 const freshIds = new Set();
 let loading = false;
 let live = true;
@@ -2059,6 +2103,129 @@ function renderIntegrity() {
     el("p", { class: "muted section-gap" }, t("observe_note"))));
 }
 
+// ---------- sessions ----------
+//
+// The reports in DIR/reports/, as /api/state lists them. Each report
+// written at close is one card; the pairs `praetore-mcp report` wrote later
+// are grouped under it, apart. The page only links to /reports/<file>: it
+// writes, regenerates and signs nothing.
+
+function reports() {
+  return state && state.reports && Array.isArray(state.reports.items) ? state.reports.items : [];
+}
+
+function reportHref(name) {
+  return `/reports/${encodeURIComponent(name)}`;
+}
+
+function bothTimes(iso) {
+  return iso ? `${localText(iso)} · ${utcText(iso)}` : "-";
+}
+
+function verifyChip(header) {
+  if (!header) return el("span", { class: "chip bad" }, t("s_no_header"));
+  const passed = header.verify && header.verify.result === "passed";
+  return el("span", { class: passed ? "chip ok" : "chip bad" }, t(passed ? "s_verify_passed" : "s_verify_failed"));
+}
+
+function downloads(entry) {
+  const box = el("div", { class: "session-actions" });
+  box.append(entry.pdf
+    ? el("a", { class: "btn-primary", href: reportHref(entry.pdf.name), download: entry.pdf.name }, t("s_dl_pdf"))
+    : el("span", { class: "muted" }, t("s_no_pdf")));
+  box.append(entry.json
+    ? el("a", { class: "btn-sm", href: reportHref(entry.json.name), download: entry.json.name }, t("s_dl_json"))
+    : el("span", { class: "muted" }, t("s_no_json")));
+  if (entry.json && entry.json.sha256) {
+    box.append(el("span", { class: "session-sha" },
+      el("span", { class: "label-sm" }, t("s_sha")), " ",
+      el("span", { class: "mono" }, entry.json.sha256), copyButton(entry.json.sha256)));
+  }
+  return box;
+}
+
+// Decisions (one per call) and approval statuses (of the held calls) in two
+// rows on fixed columns, every column shown even at 0.
+function sessionCounts(summary) {
+  const s = summary || {};
+  const row = (title, cells) => el("div", { class: "session-counts" },
+    el("div", { class: "label-sm" }, title),
+    el("div", { class: "session-cells" }, cells.map(([key, value, cls]) =>
+      el("div", { class: `session-cell ${cls}` }, el("span", { class: "label-sm" }, t(key)),
+        el("strong", { class: "mono" }, String(Number(value) || 0))))));
+  return el("div", { class: "session-spectrum" },
+    row(t("s_decisions"), [
+      ["d_allow", s.allow, "allow"], ["d_deny", s.deny, "deny"], ["d_held", s.held, "ask"],
+      ["d_forwarded", s.forwarded_with_approval, ""], ["d_would_ask", s.observe_would_ask, ""],
+    ]),
+    row(t("s_statuses"), [
+      ["a_approved", s.approved, ""], ["a_rejected", s.rejected, "deny"], ["a_pending", s.pending, "ask"],
+      ["a_expired", s.expired, ""],
+    ]));
+}
+
+function sessionCard(item) {
+  const h = item.header;
+  const card = el("article", { class: `session${item.session_id === focusSession ? " focus" : ""}`,
+    id: `session-${item.session_id}`, "data-session-id": item.session_id });
+  card.append(el("div", { class: "session-head" },
+    el("h2", null, `${t("s_session")} `, el("span", { class: "mono" }, item.session_id)), verifyChip(h)));
+  if (!item.json && !item.pdf) card.append(el("p", { class: "muted" }, t("s_original_missing")));
+  if (h) {
+    card.append(kv([
+      [t("s_agent"), h.agent], [t("s_server"), h.server], [t("s_mode"), h.mode],
+      [t("s_opened"), bothTimes(h.started_at)], [t("s_closed"), bothTimes(h.ended_at)],
+      [t("s_version"), h.praetore_mcp_version],
+    ]));
+    card.append(sessionCounts(h.summary));
+  }
+  if (item.json || item.pdf) card.append(downloads(item));
+  const regens = Array.isArray(item.regenerations) ? item.regenerations : [];
+  if (regens.length) {
+    const box = el("div", { class: "session-regens" }, el("h3", { class: "label-sm" }, t("s_regens", regens.length)));
+    for (const regen of regens) {
+      const written = regen.header ? regen.header.generated_at : null;
+      box.append(el("div", { class: "session-regen", "data-regenerated-at": regen.regenerated_at },
+        el("div", { class: "session-head" },
+          el("span", null, `${t("s_regen_at")}: ${written ? bothTimes(written) : regen.regenerated_at}`),
+          verifyChip(regen.header)),
+        downloads(regen)));
+    }
+    card.append(box);
+  }
+  return card;
+}
+
+function renderSessions() {
+  const box = document.getElementById("sessions-list");
+  const items = reports();
+  const error = state && state.reports ? state.reports.error : null;
+  box.replaceChildren(
+    error ? el("p", { class: "alert bad" }, error) : "",
+    el("p", { class: "caption" }, t("s_note")),
+    ...(items.length ? items.map(sessionCard)
+      : [el("div", { class: "empty" }, el("strong", null, t("s_none_t")), el("p", null, t("s_none_d")))]));
+  if (view === "sessions" && focusSession) {
+    const node = document.getElementById(`session-${focusSession}`);
+    if (node && node.scrollIntoView) node.scrollIntoView({ block: "start" });
+  }
+}
+
+// A report written at close that was not there on the last refresh: a
+// short notice with its download button.
+function reportToast(item) {
+  const node = el("div", { class: "toast ok report-ready" },
+    el("span", null, t("s_ready", item.session_id)), " ",
+    item.pdf ? el("a", { href: reportHref(item.pdf.name), download: item.pdf.name }, t("s_dl_pdf")) : "");
+  node.addEventListener("click", (event) => {
+    if (event.target && event.target.tagName === "A") return;
+    location.hash = `#/sessions/${item.session_id}`;
+    node.remove();
+  });
+  document.getElementById("toasts").append(node);
+  setTimeout(() => node.remove(), 12000);
+}
+
 // ---------- render + load ----------
 
 function renderSubnav() {
@@ -2085,6 +2252,7 @@ function renderAll() {
   renderPolicy();
   renderIntegrity();
   renderStats();
+  renderSessions();
   renderDrawer();
 }
 
@@ -2094,6 +2262,9 @@ function fingerprintOf(s) {
     s.verify && s.verify.approval, s.pending, s.policy && s.policy.digest, s.policy && s.policy.status,
     s.page.offset, s.page.matching, s.page.receipts.map((r) => [r.evidence_id, r.approval]),
     s.recent.map((r) => [r.evidence_id, r.approval]),
+    s.reports && s.reports.error,
+    (s.reports && Array.isArray(s.reports.items) ? s.reports.items : []).map((i) => [i.stem,
+      i.json && i.json.sha256, i.pdf && i.pdf.name, (i.regenerations || []).map((r) => r.regenerated_at)]),
   ]);
 }
 
@@ -2110,6 +2281,12 @@ function announce(next) {
   }
   knownIds = ids;
   knownPending = pendingIds;
+  const items = next.reports && Array.isArray(next.reports.items) ? next.reports.items : [];
+  const closed = items.filter((i) => i.json || i.pdf);
+  if (knownReports) {
+    for (const item of closed) if (!knownReports.has(item.stem)) reportToast(item);
+  }
+  knownReports = new Set(closed.map((i) => i.stem));
 }
 
 async function load() {
@@ -2173,6 +2350,13 @@ function routeFromHash() {
     if (state) openEvidence(decodeURIComponent(evidence[1]));
     return;
   }
+  const session = hash.match(/^#\/sessions$|^#\/sessions\/([0-9a-f]{8})$/);
+  if (session) {
+    view = "sessions";
+    focusSession = session[1] || null;
+    return;
+  }
+  focusSession = null;
   const match = hash.match(/^#\/([a-z]+)(?:\/([a-z]+))?/);
   let [name, tab] = match ? [match[1], match[2]] : ["home", undefined];
   if (LEGACY[name]) [name, tab] = LEGACY[name];
@@ -2182,6 +2366,7 @@ function routeFromHash() {
 }
 
 function currentRoute() {
+  if (view === "sessions" && focusSession) return `sessions/${focusSession}`;
   return view === "info" ? `info/${infoTab}` : view;
 }
 

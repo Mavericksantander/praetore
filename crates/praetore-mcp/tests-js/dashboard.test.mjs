@@ -596,3 +596,116 @@ test("a new receipt is scanned in and the sweep runs once", async () => {
   assert.ok(frames > 10 && frames < 200, `${frames} frames, then the page is still`);
   assert.equal(p.frames.length, 0);
 });
+
+// ---------- sessions ----------
+
+// The article nodes of the Sessions view, one per report written at close.
+function sessionCards(p) {
+  return p.byId.get("sessions-list").all().filter((n) => n.getAttribute("data-session-id") !== null);
+}
+
+function links(root) {
+  return root.all().filter((n) => n.tagName === "A").map((n) => ({
+    href: n.getAttribute("href"), download: n.getAttribute("download"), text: n.textContent,
+  }));
+}
+
+test("the sessions view lists each close report with its regenerations grouped apart", async () => {
+  const state = fixture("sessions");
+  const items = state.reports.items;
+  assert.equal(items.length, 2);
+  const withRegen = items.find((i) => i.regenerations.length === 1);
+  assert.ok(withRegen, JSON.stringify(items.map((i) => i.stem)));
+  const regen = withRegen.regenerations[0];
+  assert.match(regen.json.name, /^session-\d{8}T\d{6}Z-[0-9a-f]{8}\.regen-\d{8}T\d{6}Z\.json$/);
+
+  const p = page({ hash: "#/sessions" });
+  await p.start(state);
+  const cards = sessionCards(p);
+  // One card per close report; the regeneration is not a card of its own.
+  assert.deepEqual(cards.map((c) => c.getAttribute("data-session-id")), items.map((i) => i.session_id));
+  const card = cards.find((c) => c.getAttribute("data-session-id") === withRegen.session_id);
+  const regenBox = card.all().find((n) => n.className === "session-regens");
+  assert.ok(regenBox, "regenerations are grouped under their close report");
+  const regenRows = regenBox.all().filter((n) => n.getAttribute("data-regenerated-at") !== null);
+  assert.deepEqual(regenRows.map((n) => n.getAttribute("data-regenerated-at")), [regen.regenerated_at]);
+  assert.ok(regenBox.textContent.includes("1 regeneración (praetore-mcp report), aparte del original"));
+
+  // The close report's own buttons name the close files; the regeneration's
+  // name its own pair, and only inside the group.
+  const regenLinks = links(regenBox);
+  const ownLinks = links(card).filter((l) => !regenLinks.some((r) => r.href === l.href));
+  assert.deepEqual(ownLinks.map((l) => [l.text, l.href, l.download]), [
+    ["Descargar PDF", `/reports/${withRegen.pdf.name}`, withRegen.pdf.name],
+    ["Descargar JSON", `/reports/${withRegen.json.name}`, withRegen.json.name],
+  ]);
+  assert.deepEqual(regenLinks.map((l) => [l.text, l.href]), [
+    ["Descargar PDF", `/reports/${regen.pdf.name}`],
+    ["Descargar JSON", `/reports/${regen.json.name}`],
+  ]);
+  // The SHA-256 of each JSON is shown next to its button.
+  assert.ok(card.textContent.includes(withRegen.json.sha256));
+  assert.ok(regenBox.textContent.includes(regen.json.sha256));
+  // The other session has no regeneration group.
+  const other = cards.find((c) => c !== card);
+  assert.ok(!other.all().some((n) => n.className === "session-regens"));
+  // Agent, server, mode, open and close in local time and UTC, verify.
+  const h = withRegen.header;
+  for (const text of [h.agent, h.server, h.mode, `${h.started_at.slice(0, 19).replace("T", " ")} UTC`,
+    `${h.ended_at.slice(0, 19).replace("T", " ")} UTC`, "verify pasó", h.praetore_mcp_version]) {
+    assert.ok(card.textContent.includes(text), text);
+  }
+  // What a report is, said once on the view.
+  assert.ok(p.text("sessions-list").includes("no firma nada y no prueba que una persona lo revisó"));
+});
+
+test("decisions and approval statuses are two rows on fixed columns, zeros shown", async () => {
+  const p = page({ hash: "#/sessions" });
+  await p.start(fixture("sessions"));
+  const card = sessionCards(p)[0];
+  const rows = card.all().filter((n) => n.className === "session-counts");
+  assert.equal(rows.length, 2);
+  const labels = (row) => row.all().filter((n) => (n.className || "").split(" ")[0] === "session-cell")
+    .map((n) => n.children[0].textContent);
+  assert.deepEqual(labels(rows[0]), ["ALLOW", "DENY", "HELD", "FORWARDED", "WOULD ASK"]);
+  assert.deepEqual(labels(rows[1]), ["APPROVED", "REJECTED", "PENDING", "EXPIRED"]);
+  assert.ok(rows[1].textContent.startsWith("Estado de las aprobaciones (de las llamadas retenidas; no son más llamadas)"));
+  // Every column has a number, 0 included.
+  const values = rows.flatMap((row) => row.all().filter((n) => n.tagName === "STRONG").map((n) => n.textContent));
+  assert.equal(values.length, 9);
+  assert.ok(values.includes("0"), values.join(","));
+});
+
+test("a new close report shows 'report ready' with its download on the next refresh", async () => {
+  const before = fixture("healthy");
+  const after = fixture("pending");
+  assert.equal(after.reports.items.length, before.reports.items.length + 1);
+  const added = after.reports.items.find((i) => !before.reports.items.some((b) => b.stem === i.stem));
+  const p = page({ now: pendingNow() });
+  await p.start(before);
+  // The toasts box exists once the page has written a toast in it.
+  const ready = () => (p.byId.has("toasts") ? p.byId.get("toasts").all() : [])
+    .filter((n) => (n.className || "").includes("report-ready"));
+  assert.equal(ready().length, 0, "nothing on the first load");
+  await p.poll(after);
+  assert.equal(ready().length, 1);
+  assert.ok(ready()[0].textContent.includes(`Informe listo · sesión ${added.session_id}`));
+  assert.deepEqual(links(ready()[0]).map((l) => [l.href, l.download]), [[`/reports/${added.pdf.name}`, added.pdf.name]]);
+  // A regeneration is not a new session: no second notice.
+  await p.poll(fixture("sessions"));
+  assert.equal(ready().length, 1);
+});
+
+test("#/sessions/<id> opens the Sessions view on that session", async () => {
+  const state = fixture("sessions");
+  const id = state.reports.items[1].session_id;
+  const p = page({ hash: `#/sessions/${id}` });
+  await p.start(state);
+  assert.equal(p.byId.get("view-sessions").hidden, false);
+  const focused = sessionCards(p).filter((c) => c.className.includes("focus"));
+  assert.deepEqual(focused.map((c) => c.getAttribute("data-session-id")), [id]);
+  // An id that is not 8 hex characters is not a session link.
+  const q = page({ hash: "#/sessions/../x" });
+  await q.start(state);
+  assert.ok(!sessionCards(q).some((c) => c.className.includes("focus")));
+});

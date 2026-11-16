@@ -1730,11 +1730,11 @@ fn every_function_the_page_calls_is_defined() {
 fn views_have_routes_and_old_links_still_land() {
     let html = include_str!("../src/dashboard/index.html");
     let js = include_str!("../src/dashboard/app.js");
-    assert!(js.contains("const VIEWS = [\"home\", \"live\", \"chain\", \"info\"];"));
+    assert!(js.contains("const VIEWS = [\"home\", \"live\", \"chain\", \"sessions\", \"info\"];"));
     assert!(
         js.contains("const INFO_TABS = [\"approvals\", \"policy\", \"integrity\", \"stats\"];")
     );
-    for view in ["home", "live", "chain", "info"] {
+    for view in ["home", "live", "chain", "sessions", "info"] {
         assert!(html.contains(&format!("<a href=\"#/{view}\" data-view=\"{view}\">")));
         assert!(html.contains(&format!("id=\"view-{view}\"")));
     }
@@ -1743,7 +1743,13 @@ fn views_have_routes_and_old_links_still_land() {
     assert!(js.contains(
         "operation: [\"home\"], overview: [\"home\"], approvals: [\"live\"], activity: [\"chain\"],"
     ));
-    for function in ["renderHome", "renderLive", "renderChain", "renderStats"] {
+    for function in [
+        "renderHome",
+        "renderLive",
+        "renderChain",
+        "renderStats",
+        "renderSessions",
+    ] {
         assert!(
             js.split("function renderAll() {")
                 .nth(1)

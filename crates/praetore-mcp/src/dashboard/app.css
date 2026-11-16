@@ -356,6 +356,27 @@ table.mini th { color: var(--quiet); font: 500 10.5px var(--sans); letter-spacin
 .toast.bad, .toast.warn { border-left-color: var(--accent); }
 @keyframes rise { from { transform: translateY(6px); opacity: 0; } }
 
+/* ---------- sessions ---------- */
+.session { border-top: 1px solid var(--rule); padding: 20px 0 24px; }
+.session.focus { border-top-color: var(--accent); }
+.session h2 { margin: 0; font: 500 15px var(--sans); }
+.session-head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 10px; }
+.session-spectrum { margin: 14px 0; display: grid; gap: 10px; }
+.session-counts + .session-counts { border-top: 1px dashed var(--rule); padding-top: 10px; }
+.session-cells { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 4px; }
+.session-cell strong { display: block; font-size: 18px; }
+.session-cell.allow strong { color: var(--allow); }
+.session-cell.deny strong { color: var(--deny); }
+.session-cell.ask strong { color: var(--ask); }
+.session-actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.session-actions a { text-decoration: none; }
+.session-sha { font-size: 11px; color: var(--quiet); overflow-wrap: anywhere; }
+.session-regens { margin: 16px 0 0 16px; padding-left: 12px; border-left: 1px solid var(--rule); }
+.session-regens h3 { margin: 0 0 8px; }
+.session-regen { padding: 8px 0; }
+.session-regen + .session-regen { border-top: 1px solid var(--rule-2); }
+.toast.report-ready a { color: inherit; margin-left: 8px; }
+
 /* ---------- home, live, chain ---------- */
 .view-head { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; flex-wrap: wrap; margin-bottom: 12px; }
 .caption { margin: 0; color: var(--ink-2); font-size: 15px; }
@@ -416,3 +437,4 @@ table.mini th { color: var(--quiet); font: 500 10.5px var(--sans); letter-spacin
   .drawer-head, .tabs, .drawer-body { padding-left: 20px; padding-right: 20px; }
   .modal { padding: 24px; }
 }
+.session .label-sm { margin-top: 0; }

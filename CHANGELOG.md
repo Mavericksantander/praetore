@@ -31,8 +31,37 @@
   the PDF say so. The PDF is written in Rust with `pdf-writer` (MIT OR
   Apache-2.0; adds no other crate to the lockfile), with no network access
   and no external process.
+- **praetore-mcp: session reports in the dashboard.** A new Sessions view
+  (Spanish, English, Portuguese) lists the reports in `DIR/reports/`, newest
+  first: session id, agent, server, mode, open and close time (local and
+  UTC), the decisions and, apart, the approval statuses, the result of
+  `verify`, and buttons to download the PDF and the JSON (with the JSON's
+  SHA-256). The pairs `report` wrote later are grouped under the report they
+  came from. `GET /reports/<file>` serves a file only when its name is
+  exactly a report file name, it is a regular file and its real path is in
+  `DIR/reports/`; anything else gets 404, any method but GET 405. While the
+  page is open, a new session shows up on the next refresh with a "Report
+  ready" notice. At close, `wrap` prints, after the report path, the
+  command that starts the dashboard on the home (absolute and quoted) and
+  the link `http://127.0.0.1:8787/#/sessions/<id>`. The dashboard still
+  writes nothing: it does not write, regenerate or sign a report. The view
+  signs nothing, does not prove that a person reviewed a session, and is
+  tamper-evident only against an external copy of the heads.
 
 ### Changed
+
+- **praetore-mcp: the dashboard refuses a request whose `Origin` is not
+  its own** (`http://127.0.0.1:PORT` or `http://localhost:PORT`), with 403,
+  on top of the `Host` check.
+- **praetore-mcp: the report header names the build.** `praetore_mcp_version`
+  (JSON) and the PDF header are the version for a release build and
+  `<version>-dev+<short commit>` (or `<version>-dev`) for any other build.
+- **praetore-mcp: the decision tiles of the report PDF are two fixed rows.**
+  The first counts decisions, one per call, from the receipts (ALLOW, DENY,
+  HELD, FORWARDED, WOULD ASK); the second, labeled apart, counts the
+  approval status of the held calls (APPROVED, REJECTED, PENDING,
+  EXPIRED). Every tile is shown, 0 included, so HELD and PENDING no longer
+  read as two events of the same call.
 
 - **praetore-mcp: with reports on, `wrap` writes the report before it ends
   by SIGINT or SIGTERM (macOS and Linux).** Before, the signal ended `wrap`

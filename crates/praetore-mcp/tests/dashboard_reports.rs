@@ -1,0 +1,439 @@
+//! The Sessions view of `praetore-mcp dashboard`: the session reports in
+//! `DIR/reports/` listed with their regenerations grouped apart, and
+//! `GET /reports/<file>` serving one for download, read-only, on loopback,
+//! for exact report file names inside `DIR/reports/` only.
+
+use praetore_mcp::{dashboard, store::Home};
+use serde_json::{Value, json};
+use sha2::Digest;
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::{Read, Write},
+    net::{Ipv4Addr, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    time::SystemTime,
+};
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_praetore-mcp")
+}
+
+fn fake_server() -> PathBuf {
+    let path = Path::new(bin())
+        .parent()
+        .unwrap()
+        .join("examples")
+        .join(format!("fake_server{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        path.exists(),
+        "{} missing: run via `cargo test`",
+        path.display()
+    );
+    path
+}
+
+fn run(args: &[&str], stdin: &str) -> Output {
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn wrap_one_call(dir: &str, text: &str) {
+    let calls = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"echo","arguments":{"text": text}}}),
+    ];
+    let input: String = calls.iter().map(|c| format!("{c}\n")).collect();
+    let server = fake_server();
+    let out = run(
+        &[
+            "wrap",
+            "--dir",
+            dir,
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+            "--",
+            server.to_str().unwrap(),
+        ],
+        &input,
+    );
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// Two sessions, each with its close report; the second one regenerated
+/// once with `praetore-mcp report --last`.
+fn home_with_reports() -> (tempfile::TempDir, Home) {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("home");
+    let dir = root.to_str().unwrap();
+    assert!(run(&["init", "--dir", dir], "").status.success());
+    let out = run(
+        &[
+            "policy",
+            "allow",
+            "--id",
+            "allow-echo",
+            "--server",
+            "fake",
+            "--tool",
+            "echo",
+            "--dir",
+            dir,
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{out:?}");
+    wrap_one_call(dir, "one");
+    // Report file names carry the start second: keep the sessions apart.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    wrap_one_call(dir, "two");
+    let out = run(&["report", "--dir", dir, "--last"], "");
+    assert!(out.status.success(), "{out:?}");
+    (temp, Home::new(root))
+}
+
+fn reports(home: &Home) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(home.root.join("reports"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+fn close_json(home: &Home) -> String {
+    reports(home)
+        .into_iter()
+        .find(|name| name.ends_with(".json") && !name.contains(".regen-"))
+        .unwrap()
+}
+
+fn get(home: &Home, target: &str) -> dashboard::Response {
+    request(home, "GET", target, "")
+}
+
+fn request(home: &Home, method: &str, target: &str, extra: &str) -> dashboard::Response {
+    let raw = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n{extra}\r\n");
+    dashboard::respond(&raw, home, None, 8787)
+}
+
+fn http(port: u16, request: &str) -> Vec<u8> {
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).unwrap();
+    response
+}
+
+fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (u64, SystemTime)> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            if meta.is_dir() {
+                stack.push(entry.path());
+            }
+            out.insert(entry.path(), (meta.len(), meta.modified().unwrap()));
+        }
+    }
+    out
+}
+
+/// The value of the only header `name` in `head`.
+fn header<'a>(head: &'a str, name: &str) -> &'a str {
+    let values: Vec<&str> = head
+        .split("\r\n")
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+        .collect();
+    assert_eq!(values.len(), 1, "{name} in {head}");
+    values[0]
+}
+
+#[test]
+fn pdf_and_json_download_byte_for_byte_with_attachment_headers() {
+    let (_temp, home) = home_with_reports();
+    let before = snapshot(&home.root);
+    let names = reports(&home);
+    assert_eq!(names.len(), 6, "{names:?}");
+    let listener = dashboard::bind(0).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let served = home.clone();
+    let count = names.len();
+    let server = std::thread::spawn(move || {
+        dashboard::serve(&listener, &served, None, Some(count)).unwrap();
+    });
+    for name in &names {
+        let response = http(
+            port,
+            &format!("GET /reports/{name} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+        );
+        let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = std::str::from_utf8(&response[..split]).unwrap();
+        let body = &response[split + 4..];
+        assert!(head.starts_with("HTTP/1.1 200 "), "{name}: {head}");
+        assert_eq!(
+            body,
+            fs::read(home.root.join("reports").join(name)).unwrap(),
+            "{name}"
+        );
+        let pdf = name.ends_with(".pdf");
+        assert_eq!(
+            header(head, "Content-Type"),
+            if pdf {
+                "application/pdf"
+            } else {
+                "application/json"
+            }
+        );
+        assert_eq!(
+            header(head, "Content-Disposition"),
+            format!("attachment; filename=\"{name}\"")
+        );
+        assert_eq!(header(head, "X-Content-Type-Options"), "nosniff");
+        assert_eq!(header(head, "Cache-Control"), "no-store");
+        assert_eq!(header(head, "Content-Length"), body.len().to_string());
+    }
+    server.join().unwrap();
+    assert_eq!(
+        before,
+        snapshot(&home.root),
+        "the dashboard wrote under DIR"
+    );
+}
+
+#[test]
+fn names_that_are_not_exactly_a_report_file_are_404() {
+    let (temp, home) = home_with_reports();
+    let good = close_json(&home);
+    let stem = good.strip_suffix(".json").unwrap();
+    // Files a bad name could reach, all present.
+    fs::write(home.root.join("reports").join("notes.txt"), "x").unwrap();
+    fs::write(temp.path().join("outside.json"), "{}").unwrap();
+    for target in [
+        "/reports/".to_owned(),
+        "/reports/notes.txt".to_owned(),
+        "/reports/../config.toml".to_owned(),
+        "/reports/../policy.json".to_owned(),
+        "/reports/..".to_owned(),
+        "/reports/%2e%2e".to_owned(),
+        "/reports/%2e%2e%2fpolicy.json".to_owned(),
+        "/reports/..%2fpolicy.json".to_owned(),
+        "/reports/..%2f..%2foutside.json".to_owned(),
+        format!("/reports/{stem}%2ejson"),
+        format!("/reports/x%2f{good}"),
+        format!("/reports/./{good}"),
+        format!("/reports//{good}"),
+        format!("/reports/{good}/"),
+        format!("/reports/{}", good.to_uppercase()),
+        format!("/reports/{stem}.JSON"),
+        format!("/reports/{stem}.txt"),
+        format!("/reports/{stem}.json.bak"),
+        format!("/reports/{stem}.regen-.json"),
+        format!("/reports/{stem}.regen-20260101T000000Z.regen-20260101T000000Z.json"),
+        format!("/reports/x{good}"),
+        "/reports/session-20260101T000000Z-0123abcg.json".to_owned(),
+        "/reports/session-20260101T000000-0123abcd.json".to_owned(),
+        "/reports/session-20260101T000000Z-0123abc.json".to_owned(),
+        // A valid name for a file that does not exist.
+        "/reports/session-20260101T000000Z-0123abcd.pdf".to_owned(),
+        "/reports/session-20260101T000000Z-0123abcd.regen-20260101T000001Z.json".to_owned(),
+    ] {
+        let response = get(&home, &target);
+        assert_eq!(response.status, 404, "{target}");
+        assert!(response.disposition.is_none(), "{target}");
+        assert!(response.body.len() < 64, "{target}");
+    }
+    // The good name itself is served, through the same function.
+    assert_eq!(get(&home, &format!("/reports/{good}")).status, 200);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_and_directories_are_not_served() {
+    use std::os::unix::fs::symlink;
+    let (temp, home) = home_with_reports();
+    let reports = home.root.join("reports");
+    // Named before any symlink is added (they sort first).
+    let real_pdf = reports.join(close_json(&home).replace(".json", ".pdf"));
+    assert!(real_pdf.is_file());
+    let secret = temp.path().join("secret.json");
+    fs::write(&secret, "secret").unwrap();
+    // A report name that is a symlink to a file outside DIR/reports.
+    let linked = "session-20260101T000000Z-0123abcd.json";
+    symlink(&secret, reports.join(linked)).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{linked}")).status, 404);
+    // A symlink to a real report inside DIR/reports is still a symlink.
+    let inner = "session-20260101T000000Z-0123abce.pdf";
+    symlink(&real_pdf, reports.join(inner)).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{inner}")).status, 404);
+    // A directory with a report name.
+    let dir_name = "session-20260101T000000Z-0123abcf.json";
+    fs::create_dir(reports.join(dir_name)).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{dir_name}")).status, 404);
+    // None of them is listed either.
+    let state = dashboard::state(&home, None);
+    let listed = state["reports"].to_string();
+    for name in [linked, inner, dir_name] {
+        assert!(!listed.contains(name), "{name} listed");
+    }
+}
+
+/// `DIR/reports` itself a symlink to a directory elsewhere: every file
+/// name in it is a regular file and a valid report name, but none is in
+/// DIR/reports. Only the canonical path check refuses them.
+#[cfg(unix)]
+#[test]
+fn files_outside_dir_reports_are_not_served_when_reports_is_a_symlink() {
+    let (temp, home) = home_with_reports();
+    let reports = home.root.join("reports");
+    let elsewhere = temp.path().join("elsewhere");
+    fs::rename(&reports, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &reports).unwrap();
+    let names = reports_in(&elsewhere);
+    assert_eq!(names.len(), 6);
+    for name in &names {
+        let response = get(&home, &format!("/reports/{name}"));
+        assert_eq!(
+            response.status, 404,
+            "{name} served from outside DIR/reports"
+        );
+    }
+    assert_eq!(dashboard::state(&home, None)["reports"]["items"], json!([]));
+    // Back in place, the same files are served.
+    fs::remove_file(&reports).unwrap();
+    fs::rename(&elsewhere, &reports).unwrap();
+    for name in &names {
+        assert_eq!(
+            get(&home, &format!("/reports/{name}")).status,
+            200,
+            "{name}"
+        );
+    }
+}
+
+fn reports_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn reports_are_get_only_and_need_this_host_and_no_other_origin() {
+    let (_temp, home) = home_with_reports();
+    let target = format!("/reports/{}", close_json(&home));
+    for method in ["POST", "PUT", "DELETE", "PATCH", "HEAD"] {
+        assert_eq!(request(&home, method, &target, "").status, 405, "{method}");
+    }
+    let foreign = dashboard::respond(
+        &format!("GET {target} HTTP/1.1\r\nHost: attacker.example\r\n\r\n"),
+        &home,
+        None,
+        8787,
+    );
+    assert_eq!(foreign.status, 403);
+    let rebound = dashboard::respond(
+        &format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:8788\r\n\r\n"),
+        &home,
+        None,
+        8787,
+    );
+    assert_eq!(rebound.status, 403);
+    for (origin, status) in [
+        ("Origin: http://127.0.0.1:8787\r\n", 200),
+        ("Origin: http://localhost:8787\r\n", 200),
+        ("Origin: http://attacker.example\r\n", 403),
+        ("Origin: null\r\n", 403),
+        ("Origin: http://127.0.0.1:8788\r\n", 403),
+        (
+            "Origin: http://127.0.0.1:8787\r\nOrigin: http://attacker.example\r\n",
+            403,
+        ),
+    ] {
+        assert_eq!(
+            request(&home, "GET", &target, origin).status,
+            status,
+            "{origin:?}"
+        );
+        // The same check for the state the page reads.
+        assert_eq!(
+            request(&home, "GET", "/api/state", origin).status,
+            status,
+            "{origin:?}"
+        );
+    }
+}
+
+#[test]
+fn the_state_lists_close_reports_with_regenerations_grouped_apart() {
+    let (_temp, home) = home_with_reports();
+    let mut cache = dashboard::Cache::default();
+    let raw = "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n";
+    let response = dashboard::respond_with(raw, &home, None, 8787, &mut cache);
+    assert_eq!(response.status, 200);
+    let state: Value = serde_json::from_slice(&response.body).unwrap();
+    let items = state["reports"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{}", state["reports"]);
+    // Newest session first; the regeneration is under it, not an item.
+    let (newest, oldest) = (&items[0], &items[1]);
+    assert!(newest["stem"].as_str() > oldest["stem"].as_str());
+    assert_eq!(oldest["regenerations"], json!([]));
+    let regens = newest["regenerations"].as_array().unwrap();
+    assert_eq!(regens.len(), 1);
+    let stem = newest["stem"].as_str().unwrap();
+    let regen_json = regens[0]["json"]["name"].as_str().unwrap();
+    assert!(
+        regen_json.starts_with(&format!("{stem}.regen-")),
+        "{regen_json}"
+    );
+    assert_eq!(
+        regens[0]["pdf"]["name"],
+        regen_json.replace(".json", ".pdf")
+    );
+    for item in items {
+        let stem = item["stem"].as_str().unwrap();
+        assert_eq!(item["json"]["name"], format!("{stem}.json"));
+        assert_eq!(item["pdf"]["name"], format!("{stem}.pdf"));
+        assert_eq!(item["session_id"], &stem[stem.len() - 8..]);
+        // The SHA-256 shown is the file's.
+        let bytes = fs::read(home.root.join("reports").join(format!("{stem}.json"))).unwrap();
+        assert_eq!(
+            item["json"]["sha256"],
+            hex::encode(sha2::Sha256::digest(&bytes))
+        );
+        let header = &item["header"];
+        assert_eq!(header["server"], "fake");
+        assert_eq!(header["mode"], "enforce");
+        assert_eq!(header["verify"]["result"], "passed");
+        assert_eq!(header["summary"]["allow"], 1);
+        assert!(header["agent"].is_string() && header["started_at"].is_string());
+        assert!(header["ended_at"].is_string());
+    }
+    assert_eq!(regens[0]["header"]["verify"]["result"], "passed");
+    // A second request reads only what changed; the answer is the same.
+    let again = dashboard::respond_with(raw, &home, None, 8787, &mut cache);
+    let again: Value = serde_json::from_slice(&again.body).unwrap();
+    assert_eq!(again["reports"], state["reports"]);
+}

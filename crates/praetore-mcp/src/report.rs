@@ -42,8 +42,68 @@ pub const STATEMENT: &str =
 /// Failures copied into the JSON header and the PDF (the count is exact).
 const MAX_LISTED_FAILURES: usize = 50;
 
+/// The version in the report header: the crate version for a release
+/// build, `<version>-dev+<short commit>` (or `<version>-dev`) for any other
+/// build. Set by `build.rs`.
+pub const BUILD_VERSION: &str = env!("PRAETORE_MCP_BUILD_VERSION");
+
 pub fn reports_dir(home: &Home) -> PathBuf {
     home.root.join("reports")
+}
+
+/// A report file name, as `wrap` and `report` write it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportName {
+    /// `session-<start UTC>-<id>`, the stem of the report written at close.
+    pub close_stem: String,
+    /// The session id, eight lowercase hex characters.
+    pub session_id: String,
+    /// `<now UTC>` of a `.regen-<now UTC>` file; `None` for the close one.
+    pub regenerated_at: Option<String>,
+    /// `.pdf` rather than `.json`.
+    pub pdf: bool,
+}
+
+/// `YYYYMMDDTHHMMSSZ`, digits only where digits go.
+fn is_compact_utc(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 16
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 => *byte == b'T',
+            15 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// Parses exactly `session-<UTC>-<id>.json|.pdf` or
+/// `session-<UTC>-<id>.regen-<UTC>.json|.pdf`. Anything else (another
+/// prefix or extension, a separator, `..`, upper case, a missing or extra
+/// part) is `None`.
+pub fn parse_report_name(name: &str) -> Option<ReportName> {
+    let (rest, pdf) = match (name.strip_suffix(".json"), name.strip_suffix(".pdf")) {
+        (Some(rest), _) => (rest, false),
+        (None, Some(rest)) => (rest, true),
+        (None, None) => return None,
+    };
+    let (close_stem, regenerated_at) = match rest.split_once(REGEN_MARK) {
+        Some((stem, at)) => (stem, Some(at)),
+        None => (rest, None),
+    };
+    if regenerated_at.is_some_and(|at| !is_compact_utc(at)) {
+        return None;
+    }
+    let body = close_stem.strip_prefix("session-")?;
+    let (start, id) = body.split_at_checked(16)?;
+    let id = id.strip_prefix('-')?;
+    if !is_compact_utc(start) || !valid_session_id(id) {
+        return None;
+    }
+    Some(ReportName {
+        close_stem: close_stem.to_owned(),
+        session_id: id.to_owned(),
+        regenerated_at: regenerated_at.map(str::to_owned),
+        pdf,
+    })
 }
 
 /// Evidence ids of the receipts one `wrap` session journaled, in order.
@@ -748,7 +808,7 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         ),
     };
     let mut report = Report {
-        version: env!("CARGO_PKG_VERSION"),
+        version: BUILD_VERSION,
         meta: source.meta,
         agent,
         generated_at: now,
@@ -841,13 +901,19 @@ fn session_files(home: &Home) -> Result<Vec<PathBuf>, String> {
 
 /// The header of a session JSON file. It is the first line of the file,
 /// which the receipts follow one per line, so only that line is read.
-fn read_header(path: &Path) -> Option<Value> {
+pub fn read_header(path: &Path) -> Option<Value> {
     use std::io::BufRead;
     let mut first = String::new();
     std::io::BufReader::new(fs::File::open(path).ok()?)
         .read_line(&mut first)
         .ok()?;
-    let document: Value = serde_json::from_str(&format!("{}]}}", first.trim_end())).ok()?;
+    header_of_first_line(&first)
+}
+
+/// The header in the first line of a session JSON file (the line ends with
+/// `"receipts":[`, so `]}` closes the document).
+pub fn header_of_first_line(line: &str) -> Option<Value> {
+    let document: Value = serde_json::from_str(&format!("{}]}}", line.trim_end())).ok()?;
     (document["schema"] == SCHEMA).then(|| document["header"].clone())
 }
 
