@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed
+
+- **praetore-mcp: control characters in paths and names are escaped where
+  a person reads them.** Terminal messages, the dashboard and the PDF
+  report write control characters (C0 with `\r`, `\n`, NUL and ESC, DEL,
+  C1), zero-width and bidi characters as `\u{..}`, so a file or home name
+  cannot clear or fake the line it is shown in. Printed commands write such
+  a path as `$'...'` with `\xHH` escapes. JSON output and the report JSON
+  keep the exact value.
+
 ## 0.3.6 - 2026-11-16
 
 ### Added

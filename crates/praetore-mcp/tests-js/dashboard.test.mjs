@@ -264,6 +264,7 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
     canvas(id) { return getElementById(id).getContext(); },
     text(id) { return getElementById(id).textContent; },
     table() { return tbody.textContent; },
+    tbody,
   };
 }
 
@@ -825,4 +826,56 @@ test("an approval that expired undecided reads Expired in the visual and the lis
     select.listeners.get("change")[0]();
     assert.ok(p.text("hud-list").includes(label), `${code}: ${p.text("hud-list")}`);
   }
+});
+
+// m5: a path or a name may hold a terminal escape, \r or \n. The page and
+// both drawings show them as \u{..}, never raw: page text, titles, <pre>
+// blocks, the canvas texts cut to fit (clipText) and wrapped (wrapText).
+async function controlCharsShown(name) {
+  const evil = "x\u001b[2K\r\nfake\u009b";
+  const escaped = "x\\u{1b}[2K\\u{d}\\u{a}fake\\u{9b}";
+  const state = fixture(name);
+  state.home = `/home/user/${evil}`;
+  state.policy.path = `/home/user/${evil}/policy.json`;
+  for (const r of [...state.recent, ...state.page.receipts]) {
+    r.server = evil;
+    r.tool = `t${evil}`;
+    if (r.arguments && typeof r.arguments === "object") r.arguments.from = `/srv/${evil}`;
+    if (typeof r.order === "string") r.order = `${r.order} ${evil}`;
+  }
+  for (const held of state.pending || []) {
+    held.server = evil;
+    held.tool = `t${evil}`;
+    // Canonical JSON escapes C0 itself; C1 and bidi stay raw in it.
+    held.arguments_canonical = `{"from":"/srv/x\u009b‮"}`;
+  }
+  const p = page({ now: pendingNow() });
+  await p.start(state);
+  const roots = () => [...p.byId.values(), p.tbody];
+  const texts = [];
+  const drawings = [];
+  for (const view of ["#/home", "#/live", "#/chain", "#/info", "#/live"]) {
+    p.go(view);
+    drawings.push(...drawn(p, "hud"), ...drawn(p, "chain"));
+    for (const node of roots()) {
+      texts.push(node.textContent);
+      for (const n of node.all()) if (n.getAttribute("title") !== null) texts.push(n.getAttribute("title"));
+    }
+  }
+  const text = texts.join("\n");
+  assert.ok(!/[\u001b\r\u009b‮]/.test(text), `${name}: raw control in the page`);
+  assert.ok(!text.includes("[2K\n"), `${name}: raw newline from a name in the page`);
+  assert.ok(text.includes(escaped), `${name}: the escaped name is in the page`);
+  const drawnText = drawings.map((t) => t.text);
+  for (const t of drawnText) assert.ok(!/[\u0000-\u001f\u007f-\u009f]/.test(t), `${name}: raw control drawn: ${JSON.stringify(t)}`);
+  assert.ok(drawnText.some((t) => t.includes("\\u{1b}[2K")), drawnText.join("\n"));
+  return { text, drawnText };
+}
+
+test("paths and names with control characters are shown escaped in the page and the drawings", async () => {
+  const pending = await controlCharsShown("pending");
+  assert.ok(pending.text.includes("\\u{9b}\\u{202e}"), "the canonical arguments <pre>");
+  const cut = await controlCharsShown("cut");
+  // The verify reason of the cut receipt is wrapped over several lines.
+  assert.ok(cut.drawnText.some((t) => t.includes("fake\\u{9b}")), cut.drawnText.join("\n"));
 });

@@ -474,7 +474,7 @@ fn decide_verdict(
 pub fn display_safe(value: &str) -> String {
     // Control, zero-width and bidi characters are written as `\u{XXXX}`
     // (G7), so a tool name cannot pass for another in a table or log line.
-    praetore_core::display::escape_bounded(value, 200)
+    crate::shown::bounded(value, 200)
 }
 
 pub fn outcome_label(outcome: DecisionOutcome) -> &'static str {

@@ -573,11 +573,31 @@ function t(key, ...args) {
   return typeof value === "function" ? value(...args) : value;
 }
 
+// m5: paths and names come from the agent, the server and the file system.
+// Control characters (C0 with \r, \n, NUL and ESC, DEL, C1) and zero-width
+// or bidi characters are written as \u{..}, as praetore-mcp does in the
+// terminal and the PDF (src/shown.rs), so a name cannot hide or fake text.
+// A backslash is kept as is: in the page it moves nothing, and commands
+// shown for copying keep their $'\x..' escapes readable. Every text the
+// page writes goes through here: el() text and titles, and clipText and
+// wrapText for the canvases.
+const INVISIBLE = /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb\u{e0000}-\u{e0fff}]/gu;
+
+function shown(text) {
+  return String(text).replace(INVISIBLE, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+}
+
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
+  // In <pre> the page's own line breaks stay; each line is escaped. Data
+  // shown there (canonical JSON, commands, journal lines) has no raw newline.
+  const text = tag === "pre"
+    ? (value) => String(value).split("\n").map(shown).join("\n")
+    : shown;
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === null || v === undefined || v === false) continue;
     if (k === "class") node.className = v;
+    else if (k === "title") node.setAttribute(k, shown(v));
     // The CSP has no 'unsafe-inline' for styles: a style attribute would be
     // dropped, so styles go through the CSSOM.
     else if (k === "style") node.style.cssText = v;
@@ -586,7 +606,7 @@ function el(tag, attrs, ...children) {
   }
   for (const child of children.flat()) {
     if (child === null || child === undefined || child === false) continue;
-    node.append(child instanceof Node ? child : String(child));
+    node.append(child instanceof Node ? child : text(child));
   }
   return node;
 }
@@ -865,7 +885,8 @@ function canvasWidth(canvas) {
 // Splits `text` into lines no wider than `width`, at spaces (a word wider
 // than a line is split). With more than `max` lines the last one ends in
 // "…" and `cut` is true.
-function wrapText(ctx, text, width, max) {
+function wrapText(ctx, raw, width, max) {
+  const text = shown(raw);
   const lines = [];
   let line = "";
   for (const word of text.split(" ")) {
@@ -914,7 +935,8 @@ function brackets(ctx, x, y, w, h, color, size = 7) {
   ctx.stroke();
 }
 
-function clipText(ctx, text, width) {
+function clipText(ctx, raw, width) {
+  const text = shown(raw);
   if (ctx.measureText(text).width <= width) return text;
   let out = text;
   while (out.length > 1 && ctx.measureText(`${out}…`).width > width) out = out.slice(0, -1);

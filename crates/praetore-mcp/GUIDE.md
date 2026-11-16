@@ -77,6 +77,13 @@ for a POSIX shell. They run as printed even when the binary is not on your
 `praetore-mcp`, which needs it on `PATH`. On Windows they are written as
 before.
 
+A path or a name that holds a control character (an escape sequence,
+`\r`, `\n`) or a zero-width or bidi character is never printed as is. In
+messages, in the dashboard and in the PDF report it is written as
+`\u{..}`: a home named `a<ESC>[2Kb` shows as `a\u{1b}[2Kb`. In a
+command to copy, such a path is written as `$'...'` with `\xHH` escapes,
+which bash and zsh read back as the exact path.
+
 Checking the Sigstore signature of `SHA256SUMS` is optional. It needs
 `cosign`. For v0.3.5, pass
 `--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
