@@ -962,6 +962,94 @@ fn without_the_report_sigterm_ends_wrap_at_once() {
     assert!(!reports_dir(&home).exists());
 }
 
+/// SIGTERM while `wrap` writes the report (its server already gone, the
+/// `.json` not yet published): the report is finished and `wrap` then ends
+/// by SIGTERM. A first session of `seed` receipts journaled with
+/// `--no-report` makes `verify`, and so the report, take a while. If the
+/// report is already there when the signal would be sent, the round says
+/// so and the next one seeds more; if every round is too fast, the test
+/// says it was skipped.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for seed in [150_usize, 300] {
+        let what = format!("seed {seed}");
+        let (_temp, home) = init_home();
+        let calls: Vec<Value> = (0..seed)
+            .map(|i| call(100 + i as i64, "echo", json!({"text": format!("seed {i}")})))
+            .collect();
+        let first = wrap(&home, &["--no-report"], &calls);
+        assert_eq!(first.status.code(), Some(0), "{what}: {first:?}");
+        assert_eq!(journal_lines(&home).len(), seed, "{what}");
+        assert!(!reports_dir(&home).exists(), "{what}");
+
+        let server = fake_server();
+        let mut child = spawn_wrap(&home, &[], &[server.to_str().unwrap()]);
+        let err = stderr_text(&mut child);
+        let mut stdout = child.stdout.take().unwrap();
+        std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+        let mut stdin = child.stdin.take().unwrap();
+        stdin
+            .write_all(input(&[call(20, "echo", json!({"text": "one"}))]).as_bytes())
+            .unwrap();
+        stdin.flush().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while journal_lines(&home).len() == seed {
+            assert!(std::time::Instant::now() < deadline, "{what}: no receipt");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let server = server_pid(&child);
+        // Close the session from the client side and wait for the server
+        // to be gone (reaped by wrap, which then writes the report).
+        drop(stdin);
+        loop {
+            // SAFETY: `kill` with signal 0 sends nothing and takes no pointers.
+            let result = unsafe { libc::kill(server, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: server {server} still exists"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !json_reports(&home).is_empty() {
+            eprintln!("{what}: the report was written before the signal; seeding more");
+            let _ = wait_within(&mut child, std::time::Duration::from_secs(10), &what);
+            continue;
+        }
+        // SAFETY: `kill` takes no pointers; the pid is this test's child.
+        assert_eq!(
+            unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+            0
+        );
+        let status = wait_within(&mut child, std::time::Duration::from_secs(10), &what);
+        let err = err.join().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "{what}: {status:?} {err}"
+        );
+        assert!(err.contains("session report:"), "{what}: {err}");
+        let reports = json_reports(&home);
+        assert_eq!(reports.len(), 1, "{what}: {err}");
+        assert!(reports[0].with_extension("pdf").exists(), "{what}");
+        assert_eq!(
+            document(&reports[0])["receipts"].as_array().unwrap().len(),
+            1,
+            "{what}"
+        );
+        return;
+    }
+    eprintln!(
+        "SKIPPED a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report: \
+         the report was written before the signal in every round"
+    );
+}
+
 #[test]
 fn a_backslash_in_a_tool_name_is_escaped_once_in_the_pdf() {
     let (_temp, home) = init_home();
