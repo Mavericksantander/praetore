@@ -410,6 +410,67 @@ can still open the page and read what it shows, tool arguments included,
 so run it only while you are using it. Texts are in Spanish, English and
 Portuguese.
 
+### A report of each session
+
+From 0.3.6, when a `wrap` session ends (the client or the server closes,
+or SIGINT/SIGTERM on macOS and Linux) and it recorded at least one receipt,
+two files are written to `DIR/reports/`:
+
+```
+session-<start UTC>-<id>.json   header + the session's receipts
+session-<start UTC>-<id>.pdf    the same session, for a person to read
+```
+
+The JSON header has the praetore-mcp version, agent, server, mode, seq
+range, the heads of the receipts and approval journals when the session
+closed, and the result of `verify`. Each receipt is the journal line
+itself, on a line of its own, copied byte for byte. The session's approval
+records are the lines of `approvals/journal.jsonl` copied byte for byte
+too; if that journal cannot be read, the header says why in
+`approval_journal_error` and the PDF says so in its approvals table. The PDF has the
+summary (ALLOW, DENY, held, approved, expired), the calls, the approvals
+with the approver key id and time, the result of `verify`, both heads and
+the SHA-256 of the JSON file. Times are local with UTC next to them. If
+`verify` fails, the first page says `VERIFY FAILED` and both files are
+still written.
+
+```sh
+praetore-mcp report                    # a new report of the last session
+praetore-mcp report --session a41f9c2e # the id after the start time
+praetore-mcp wrap --no-report -- ...   # this session writes no report
+```
+
+`report` writes a new pair next to the original; the report written at
+close is never replaced. The new files are
+`session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, and the new
+header names the close report in `regenerated_from`. They read the journal
+as it is now and run `verify` again, so after a change to the journal the
+close report and the new one can disagree, and both stay. `--last` and
+`--session` only look at reports written at close.
+
+SIGINT and SIGTERM on macOS and Linux: with reports on, `wrap` waits up to
+300 ms for the server to end, forwards the signal to it, waits up to 2 s
+more, kills it if it is still running, writes the report, and then ends by
+that same signal, as before reports existed. A second signal ends `wrap`
+at once without the report. With `--no-report` or `report = false`, `wrap`
+installs no handler: the signal ends it at once, as in 0.3.5.
+
+`report = false` in `DIR/config.toml` turns reports off for every session
+of that home. `praetore-mcp install` does not add `--no-report`.
+
+The report is a view of the journal: it signs nothing, changes no journal
+and takes no part in a decision. If it cannot be written, the reason goes
+to stderr and the session ends with the same exit code. It is
+tamper-evident on this machine; verify against an external copy of the
+heads. Someone who can write the home can rewrite a report as well as the
+journal, so keep the heads (or the PDF) somewhere the wrapped servers
+cannot write. `verify` at close reads the whole journal, so the report
+takes longer as the journal grows. Reports contain tool names and
+arguments; they are created with mode 0600, and `DIR/reports/` is set to
+0700 each time a report is written (also when it already existed). They
+are never deleted or replaced by `praetore-mcp`. A session can be regenerated only if it
+wrote a report. On Windows a session ended with Ctrl-C writes none.
+
 ## Limits
 
 Read these before relying on anything above.

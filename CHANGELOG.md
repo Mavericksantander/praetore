@@ -2,6 +2,49 @@
 
 ## Unreleased
 
+### Added
+
+- **praetore-mcp: a report of each `wrap` session.** When a session ends
+  (the client or the server closes, or SIGINT/SIGTERM on macOS and Linux)
+  and it recorded at least one receipt, `wrap` writes
+  `DIR/reports/session-<start UTC>-<id>.json` and `.pdf`. The JSON has a
+  header (praetore-mcp version, agent, server, mode, seq range, the heads
+  of the receipts and approval journals at close, the result of `verify`)
+  and the session's receipts, each one the journal line copied byte for
+  byte. The PDF shows the same session for a person: PRÆTOR TECHNOLOGIES
+  wordmark, local time with UTC next to it, summary (ALLOW, DENY, held,
+  approved, expired), the calls (time, tool, decision, rule, short reason),
+  the approvals with the approver key id and time, the result of `verify`,
+  both heads and the SHA-256 of the JSON. If `verify` fails the first page
+  says `VERIFY FAILED` and both files are still written. The report is a
+  view: it signs nothing and does not change the journal; if it cannot be
+  written the reason goes to stderr and the exit code and every decision
+  stay the same. `wrap --no-report` and `report = false` in
+  `DIR/config.toml` (new, optional file) turn it off.
+  `praetore-mcp report [--dir DIR] [--session ID | --last]` writes a new
+  report of a session from the journal as it is now (exit code 1 if it
+  says verify failed): a new pair,
+  `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, next to the
+  original, with `regenerated_from` in its header. The report written at
+  close is never replaced. The session's approval records are copied from
+  the approval journal byte for byte; if it cannot be read, the header and
+  the PDF say so. The PDF is written in Rust with `pdf-writer` (MIT OR
+  Apache-2.0; adds no other crate to the lockfile), with no network access
+  and no external process.
+
+### Changed
+
+- **praetore-mcp: with reports on, `wrap` writes the report before it ends
+  by SIGINT or SIGTERM (macOS and Linux).** Before, the signal ended `wrap`
+  at once. Now, when the session report is on, `wrap` waits up to 300 ms
+  for the server to end, forwards the signal to it, waits up to 2 s more,
+  kills it if it is still running, writes the report, and then ends by that
+  same signal, so the parent still sees `wrap` terminated by SIGINT or
+  SIGTERM, as in 0.3.5. A second signal ends it at once without the report.
+  With `--no-report` or `report = false` no handler is installed and the
+  signal ends `wrap` at once, as in 0.3.5. A signal that was ignored when
+  `wrap` started stays ignored.
+
 ### Fixed
 
 - **praetore-mcp: printed commands run when the binary is not on `PATH`.**

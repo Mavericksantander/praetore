@@ -13,15 +13,18 @@
 use crate::{
     gate::{Evaluator, Gate, GateError, Mode, Verdict},
     proxy::handle_client_line,
+    report::{self, SessionLog, SessionMeta},
     store::Home,
 };
 use serde_json::Value;
 use std::{
     io::{self, BufRead, BufReader, Write},
     process::{Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, mpsc},
     thread,
+    time::Duration,
 };
+use time::OffsetDateTime;
 
 /// Maximum client line kept in memory for classification (32 MiB).
 pub const MAX_CLIENT_LINE_BYTES: usize = 32 * 1024 * 1024;
@@ -32,6 +35,8 @@ pub struct WrapOptions {
     pub mode: Mode,
     pub command: String,
     pub args: Vec<String>,
+    /// Write the session report under `DIR/reports/` when the session ends.
+    pub report: bool,
 }
 
 /// Evaluator that fails every call when the gate could not be loaded, so
@@ -48,6 +53,206 @@ impl Evaluator for GateOrError {
         }
     }
 }
+
+/// Records which receipts this session journaled, for the session report.
+/// It only reads the verdict; the verdict itself is returned unchanged.
+struct Recording<E> {
+    inner: E,
+    log: SessionLog,
+}
+
+impl<E: Evaluator> Evaluator for Recording<E> {
+    fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
+        let verdict = self.inner.evaluate(server, params)?;
+        if verdict.journaled.is_ok() {
+            self.log.record(&verdict.evidence_id);
+        }
+        Ok(verdict)
+    }
+}
+
+/// Why `wrap` stops waiting.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+enum End {
+    /// The server closed its stdout.
+    ServerClosed,
+    /// SIGINT or SIGTERM arrived.
+    Signal(i32),
+}
+
+/// With the session report on, SIGINT and SIGTERM end the session in
+/// order so its report is written: the handler writes the signal number to
+/// a pipe and a thread turns it into an [`End::Signal`]. After the report,
+/// `wrap` ends by that same signal ([`die_by`]), as it did without a
+/// handler. A second signal ends `wrap` at once, without the report.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod signals {
+    use super::End;
+    use std::{
+        fs::File,
+        io::Read,
+        os::fd::FromRawFd,
+        sync::{
+            atomic::{AtomicI32, AtomicU32, Ordering},
+            mpsc::Sender,
+        },
+        thread,
+    };
+
+    static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+    static RECEIVED: AtomicU32 = AtomicU32::new(0);
+    /// The first signal received, 0 for none. Set in the handler, so a
+    /// signal is seen even when its byte is still in the pipe.
+    static FIRST: AtomicI32 = AtomicI32::new(0);
+
+    #[cfg(target_os = "linux")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: returns this thread's errno; no arguments.
+        unsafe { libc::__errno_location() }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: returns this thread's errno; no arguments.
+        unsafe { libc::__error() }
+    }
+
+    extern "C" fn on_signal(signal: libc::c_int) {
+        // The interrupted code may be about to read errno: keep it.
+        let errno = errno_location();
+        // SAFETY: errno_location points at this thread's errno.
+        let saved = unsafe { *errno };
+        if RECEIVED.fetch_add(1, Ordering::SeqCst) > 0 {
+            // A second signal: stop now, without the report. `signal` and
+            // `raise` are async-signal-safe; the raised signal is delivered
+            // with the default action when this handler returns.
+            // SAFETY: plain calls with no pointers.
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+        } else {
+            FIRST.store(signal, Ordering::SeqCst);
+            let fd = PIPE_WRITE.load(Ordering::Relaxed);
+            if fd >= 0 {
+                let byte = signal as u8;
+                // SAFETY: `write` is async-signal-safe; `byte` lives for the
+                // call.
+                unsafe {
+                    libc::write(fd, (&raw const byte).cast(), 1);
+                }
+            }
+        }
+        // SAFETY: as above.
+        unsafe { *errno = saved };
+    }
+
+    /// The first SIGINT or SIGTERM the handler received, if any.
+    pub fn first() -> Option<i32> {
+        match FIRST.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// Ends the process by `signal` with its default action, so the parent
+    /// sees `wrap` terminated by that signal.
+    pub fn die_by(signal: i32) {
+        // SAFETY: plain calls with no pointers.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    /// Whether `signal` is ignored in this process (inherited SIG_IGN, for
+    /// example a background job). An ignored signal keeps being ignored.
+    fn ignored(signal: libc::c_int) -> bool {
+        // SAFETY: `old` is fully written by `sigaction` when it returns 0; a
+        // null new action only reads the current one.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &raw mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+        }
+    }
+
+    /// Installs the handlers. If the pipe cannot be created the default
+    /// actions stay in place (the session ends without a report).
+    pub fn install(events: Sender<End>) {
+        let mut fds = [-1; 2];
+        // SAFETY: `pipe` fills the two descriptors of the array it is given.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return;
+        }
+        PIPE_WRITE.store(fds[1], Ordering::Relaxed);
+        // SAFETY: `fds[0]` is a descriptor this function just created and
+        // nothing else owns.
+        let mut reader = unsafe { File::from_raw_fd(fds[0]) };
+        thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            while reader.read_exact(&mut byte).is_ok() {
+                if events.send(End::Signal(i32::from(byte[0]))).is_err() {
+                    break;
+                }
+            }
+        });
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            if ignored(signal) {
+                continue;
+            }
+            // SAFETY: `action` is fully initialized before `sigaction` reads
+            // it, and the handler only calls async-signal-safe functions.
+            unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&raw mut action.sa_mask);
+                libc::sigaction(signal, &raw const action, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// Sends `signal` to the server.
+    pub fn forward(pid: u32, signal: i32) {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: `kill` takes no pointers.
+            unsafe {
+                libc::kill(pid, signal);
+            }
+        }
+    }
+}
+
+/// How often `wrap` checks whether the server exited while it waits for a
+/// server that closed its stdout.
+const EXIT_POLL: Duration = Duration::from_millis(50);
+
+/// Whether the server exits within `limit`.
+fn exits_within(child: &mut std::process::Child, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Passes `signal` on to the server (Linux and macOS).
+fn forward_signal(child: &std::process::Child, signal: i32) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    signals::forward(child.id(), signal);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (child, signal);
+}
+
+/// Time the server gets to end by itself after a signal before the signal
+/// is forwarded to it, and then before it is killed.
+const SIGNAL_GRACE: [Duration; 2] = [Duration::from_millis(300), Duration::from_secs(2)];
 
 /// Windows-style command lookup: a bare name (no separator, no extension)
 /// is searched in `path` with each `pathext` extension, so `npx` finds
@@ -210,6 +415,7 @@ pub fn other_namespace_launcher(command: &str, args: &[String]) -> Option<String
 }
 
 pub fn run(options: WrapOptions) -> i32 {
+    let started_at = OffsetDateTime::now_utc();
     let gate = Gate::load(&options.home, options.mode);
     // Without a gate no receipt can be written, so there is nothing to
     // observe: both modes refuse every tools/call (fail closed) and gate the
@@ -232,7 +438,11 @@ pub fn run(options: WrapOptions) -> i32 {
             "praetore-mcp: WARNING the server is started through {launcher:?}, which usually runs it in another mount namespace or on another host. Path rules are checked against THIS machine's filesystem; the server may resolve the same path to a different file. This setup is not supported by the path check (defense in depth only)."
         );
     }
-    let mut evaluator = GateOrError(gate);
+    let log = SessionLog::default();
+    let mut evaluator = Recording {
+        inner: GateOrError(gate),
+        log: log.clone(),
+    };
 
     #[cfg(windows)]
     let program = resolve_command(
@@ -268,8 +478,10 @@ pub fn run(options: WrapOptions) -> i32 {
 
     let stdout = Arc::new(Mutex::new(io::stdout()));
 
+    let (events, ended) = mpsc::channel();
     let server_to_client = {
         let stdout = Arc::clone(&stdout);
+        let events = events.clone();
         thread::spawn(move || {
             let mut reader = BufReader::new(child_stdout);
             let mut buf = Vec::new();
@@ -284,8 +496,19 @@ pub fn run(options: WrapOptions) -> i32 {
                     }
                 }
             }
+            let _ = events.send(End::ServerClosed);
         })
     };
+    // Without the report, SIGINT and SIGTERM keep their default action:
+    // `wrap` ends at once, as in 0.3.5.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if options.report {
+        signals::install(events);
+    } else {
+        drop(events);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    drop(events);
 
     let name = options.name.clone();
     let client_stdout = Arc::clone(&stdout);
@@ -332,12 +555,107 @@ pub fn run(options: WrapOptions) -> i32 {
         // Dropping child_stdin closes the server's stdin (client went away).
     });
 
-    let _ = server_to_client.join();
+    let mut by_signal = None;
+    match ended.recv() {
+        Ok(End::Signal(signal)) => {
+            by_signal = Some(signal);
+            // The client is going away. Give the server a moment to end by
+            // itself (a terminal's Ctrl-C reaches it too), then pass the
+            // signal on, then stop waiting for it.
+            if !matches!(ended.recv_timeout(SIGNAL_GRACE[0]), Ok(End::ServerClosed)) {
+                forward_signal(&child, signal);
+                if !matches!(ended.recv_timeout(SIGNAL_GRACE[1]), Ok(End::ServerClosed)) {
+                    let _ = child.kill();
+                }
+            }
+        }
+        Ok(End::ServerClosed) | Err(_) => {
+            let _ = server_to_client.join();
+            // The server closed its stdout but may still be running. Wait
+            // for it while listening for a signal, which then ends it the
+            // same way as above (its stdout is already closed, so the end
+            // is seen by its exit).
+            loop {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                match ended.recv_timeout(EXIT_POLL) {
+                    Ok(End::Signal(signal)) => {
+                        by_signal = Some(signal);
+                        if !exits_within(&mut child, SIGNAL_GRACE[0]) {
+                            forward_signal(&child, signal);
+                            if !exits_within(&mut child, SIGNAL_GRACE[1]) {
+                                let _ = child.kill();
+                            }
+                        }
+                        break;
+                    }
+                    Ok(End::ServerClosed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    // No handler (no report): nothing to listen for.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+    }
     let status = child.wait();
     let _ = stdout.lock().map(|out| out.lock().flush());
-    match status {
+    let code = match status {
         Ok(status) => status.code().unwrap_or(1),
         Err(_) => 1,
+    };
+    if options.report {
+        write_report(&options, started_at, &log);
+    }
+    // A signal that came while waiting for the server or writing the
+    // report still ends `wrap` by that signal.
+    while let Ok(event) = ended.try_recv() {
+        if let End::Signal(signal) = event {
+            by_signal.get_or_insert(signal);
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(signal) = signals::first() {
+        by_signal.get_or_insert(signal);
+    }
+    // Ended by SIGINT or SIGTERM: after the report, end by that signal, so
+    // the parent sees what it saw before the report existed.
+    if let Some(signal) = by_signal {
+        let _ = io::stderr().flush();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        signals::die_by(signal);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = signal;
+    }
+    code
+}
+
+/// Writes the session report. Whatever happens here goes to stderr and
+/// nowhere else: the exit code and every decision already made stay as
+/// they are.
+fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &SessionLog) {
+    let meta = SessionMeta {
+        id: report::new_session_id(),
+        server: options.name.clone(),
+        mode: options.mode.as_str().to_owned(),
+        started_at,
+        ended_at: OffsetDateTime::now_utc(),
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        report::close_session(&options.home, meta, log)
+    }));
+    match outcome {
+        Ok(Ok(Some(generated))) => eprintln!(
+            "praetore-mcp: session report: {}{}",
+            generated.pdf.display(),
+            if generated.verify_passed {
+                ""
+            } else {
+                " (verify FAILED; see the report)"
+            }
+        ),
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => eprintln!("praetore-mcp: session report not written: {error}"),
+        Err(_) => eprintln!("praetore-mcp: session report not written: internal error"),
     }
 }
 

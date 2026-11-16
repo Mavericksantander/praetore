@@ -158,6 +158,7 @@ praetore-mcp receipts --tail 20
 praetore-mcp verify
 #    or look at receipts and the same checks in a read-only page on 127.0.0.1
 praetore-mcp dashboard    # from 0.3.5; see GUIDE.md
+praetore-mcp report       # from 0.3.6; writes the last session's report again
 
 # 7. Add rules (no JSON editing), check them, then restart the client.
 #    The policy from init has no rules: in enforce, a tool no ALLOW rule
@@ -882,3 +883,5 @@ each evidence receipt on its own.
 | `policy.json` | v2 policy |
 | `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
 | `receipts/.journal.lock` | lock held while one entry is appended |
+| `reports/session-<start UTC>-<id>.json`, `.pdf` | report of one `wrap` session, written when it ends (0600); a view of the journal, see GUIDE.md |
+| `config.toml` | optional; `report = false` turns the session reports off |
