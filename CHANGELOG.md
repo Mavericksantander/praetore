@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
+  in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
+  open, even when the MCP client starts `wrap` with a filtered environment.
+  `PRAETORE_MCP_APPROVAL_TTL_SECONDS` still wins over it, and
+  `approvals/ttl-seconds` is still read after it. `wrap` now checks the TTL
+  before it starts the server: a value out of range, not an integer, or a
+  `config.toml` that cannot be read stops it with exit code 2.
+
 ## 0.3.6 - 2026-11-16
 
 ### Added

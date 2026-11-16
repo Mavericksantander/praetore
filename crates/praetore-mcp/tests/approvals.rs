@@ -1275,3 +1275,153 @@ fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
         );
     }
 }
+
+/// Runs `wrap` the way the MCP SDK's `stdio_client` launches a server: with
+/// only a few inherited variables (HOME, PATH, ...) and no
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` unless `env` names it.
+fn wrap_filtered_env(home: &Home, input: &str, env: &[(&str, &str)]) -> Output {
+    let server = fake_server();
+    let mut command = Command::new(bin());
+    command
+        .args([
+            "wrap",
+            "--dir",
+            home.root.to_str().unwrap(),
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+            "--",
+            server.to_str().unwrap(),
+        ])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for key in ["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// Seconds between `created_at` and `expires_at` of the pending call that
+/// the response with `id` names.
+fn held_window(home: &Home, out: &Output, id: i64) -> i64 {
+    let stdout = String::from_utf8(out.stdout.clone()).unwrap();
+    let responses: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let approval = approval_id_from(tool_text(by_id(&responses, id)));
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{approval}.json"));
+    let pending: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let at = |key: &str| {
+        time::OffsetDateTime::parse(
+            pending[key].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    (at("expires_at") - at("created_at")).whole_seconds()
+}
+
+/// n18: `approval_ttl_seconds` in `config.toml` sets the approval window
+/// even when the client launches `wrap` with a filtered environment, and
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` wins over it when it is set.
+#[test]
+fn the_config_ttl_holds_under_a_filtered_environment_and_the_env_wins() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    fs::write(
+        home.root.join("config.toml"),
+        "approval_ttl_seconds = 1800 # half an hour\n",
+    )
+    .unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &[]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(held_window(&home, &out, 7), 1800, "{out:?}");
+
+    let out = wrap_filtered_env(
+        &home,
+        &session(echo(8, json!({"n": 2}))),
+        &[("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "120")],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(held_window(&home, &out, 8), 120, "{out:?}");
+
+    // Without the config line, the old file and then the default apply.
+    fs::write(home.root.join("config.toml"), "report = true\n").unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(9, json!({"n": 3}))), &[]);
+    assert_eq!(held_window(&home, &out, 9), 600, "{out:?}");
+}
+
+/// n18: an approval TTL out of 1..=86400, not a number, malformed, or a
+/// `config.toml` that cannot be read stops `wrap` at startup (exit 2, no
+/// server started, the cause on stderr) instead of using another value.
+#[test]
+fn a_bad_approval_ttl_stops_wrap_at_startup() {
+    let (_temp, home) = init_home();
+    let config = home.root.join("config.toml");
+    let cases: [(&str, Option<&str>, &str); 6] = [
+        (
+            "approval_ttl_seconds = 0\n",
+            None,
+            "from 1 to 86400 seconds, got 0",
+        ),
+        ("approval_ttl_seconds = 86401\n", None, "got 86401"),
+        (
+            "approval_ttl_seconds = abc\n",
+            None,
+            "\"abc\" is not an integer",
+        ),
+        ("approval_ttl_seconds 300\n", None, "line 1: expected"),
+        (
+            "",
+            Some("0"),
+            "PRAETORE_MCP_APPROVAL_TTL_SECONDS must be from 1",
+        ),
+        (
+            "",
+            Some("soon"),
+            "PRAETORE_MCP_APPROVAL_TTL_SECONDS \"soon\"",
+        ),
+    ];
+    for (text, env, says) in cases {
+        fs::write(&config, text).unwrap();
+        let env: Vec<_> = env
+            .map(|value| ("PRAETORE_MCP_APPROVAL_TTL_SECONDS", value))
+            .into_iter()
+            .collect();
+        let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{text:?} {env:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{text:?}: the server answered");
+        assert!(
+            stderr.contains("wrap did not start") && stderr.contains(says),
+            "{text:?} {env:?}: {stderr}"
+        );
+    }
+    // Unreadable: config.toml is a directory.
+    fs::remove_file(&config).unwrap();
+    fs::create_dir(&config).unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("cannot read"), "{stderr}");
+}

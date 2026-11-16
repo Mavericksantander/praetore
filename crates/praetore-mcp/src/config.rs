@@ -1,14 +1,18 @@
 //! Optional `DIR/config.toml`: settings that never affect a policy decision.
 //!
 //! The file is a flat list of `key = value` lines (a TOML subset; `#` starts
-//! a comment). The only key is `report`:
+//! a comment). The keys are `report` and `approval_ttl_seconds`:
 //!
 //! ```toml
 //! report = false   # do not write session reports under DIR/reports/
+//! approval_ttl_seconds = 1800   # pending approvals last 30 minutes
 //! ```
 //!
-//! A missing file means the defaults. A line that cannot be read is reported
-//! as a warning and skipped, so a typo here never stops `wrap`.
+//! A missing file means the defaults. For `report`, a line that cannot be
+//! read is a warning and is skipped, so a typo there never stops `wrap`.
+//! `approval_ttl_seconds` is read strictly by [`approval_ttl_seconds`]: an
+//! unreadable file, a malformed or repeated key is an error, and `wrap`
+//! refuses to start on it.
 
 use crate::store::Home;
 use std::{fs, io, path::PathBuf};
@@ -27,6 +31,49 @@ impl Default for Config {
 
 pub fn path(home: &Home) -> PathBuf {
     home.root.join("config.toml")
+}
+
+/// The key of the approval TTL in `config.toml`.
+pub const APPROVAL_TTL_KEY: &str = "approval_ttl_seconds";
+
+/// The raw `approval_ttl_seconds` value of `config.toml`, or `None` when the
+/// file or the key is absent. Unlike [`load`], this fails on a file that
+/// cannot be read, on a line naming the key without `= value`, and on the
+/// key given twice: an approval window must never fall back to a default
+/// the user did not choose. The range is checked by the caller.
+pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
+    let path = path(home);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let mut found: Option<(usize, String)> = None;
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or_default().trim();
+        let at = index + 1;
+        let (key, value) = match line.split_once('=') {
+            Some((key, value)) => (key.trim(), Some(value.trim())),
+            None => (line, None),
+        };
+        if key != APPROVAL_TTL_KEY && !key.starts_with(&format!("{APPROVAL_TTL_KEY} ")) {
+            continue;
+        }
+        let (Some(value), true) = (value, key == APPROVAL_TTL_KEY) else {
+            return Err(format!(
+                "{} line {at}: expected `{APPROVAL_TTL_KEY} = <seconds>`",
+                path.display()
+            ));
+        };
+        if let Some((first, _)) = found {
+            return Err(format!(
+                "{} line {at}: {APPROVAL_TTL_KEY} is already set on line {first}",
+                path.display()
+            ));
+        }
+        found = Some((at, value.to_owned()));
+    }
+    Ok(found.map(|(_, value)| value))
 }
 
 /// The config of `home` and the warnings found while reading it.
@@ -71,6 +118,8 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             ("report", other) => problems.push(format!(
                 "line {at}: report must be true or false, got {other:?}; ignored"
             )),
+            // Checked strictly by `approval_ttl_seconds`.
+            (APPROVAL_TTL_KEY, _) => {}
             (other, _) => problems.push(format!("line {at}: unknown key {other:?}; ignored")),
         }
     }
@@ -98,5 +147,32 @@ mod tests {
         assert_eq!(problems.len(), 3);
         assert!(problems[0].contains("line 1"));
         assert!(problems[1].contains("unknown key"));
+    }
+
+    #[test]
+    fn approval_ttl_is_read_strictly() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = Home::new(temp.path().to_path_buf());
+        assert_eq!(approval_ttl_seconds(&home), Ok(None));
+        let write = |text: &str| fs::write(path(&home), text).unwrap();
+        write("report = false\n");
+        assert_eq!(approval_ttl_seconds(&home), Ok(None));
+        write("report = false\napproval_ttl_seconds = 1800 # half an hour\n");
+        assert_eq!(approval_ttl_seconds(&home), Ok(Some("1800".into())));
+        assert!(parse("approval_ttl_seconds = 1800").1.is_empty());
+        for (text, says) in [
+            ("approval_ttl_seconds 1800\n", "line 1: expected"),
+            (
+                "approval_ttl_seconds = 1\napproval_ttl_seconds = 2\n",
+                "already set on line 1",
+            ),
+        ] {
+            write(text);
+            let error = approval_ttl_seconds(&home).unwrap_err();
+            assert!(error.contains(says), "{text:?}: {error}");
+        }
+        // A key that only starts like it is another key.
+        write("approval_ttl_seconds_x = 1\n");
+        assert_eq!(approval_ttl_seconds(&home), Ok(None));
     }
 }
