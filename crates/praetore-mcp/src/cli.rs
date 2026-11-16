@@ -520,11 +520,11 @@ fn warn_allow_all(home: &Home) {
         .filter(|rule| crate::policy::is_allow_all(rule))
     {
         let id = crate::proxy::display_safe(&rule.id);
+        let program = crate::commands::program();
+        let dir = dir_suffix(home);
         println!(
-            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`praetore-mcp policy allow --id ID --server NAME --tool NAME`; `praetore-mcp policy coverage` lists what each tool gets), then run:\n    {} policy remove --id {id}{}",
+            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`{program} policy allow --id ID --server NAME --tool NAME{dir}`; `{program} policy coverage{dir} -- <server command>` lists what each tool gets), then run:\n    {program} policy remove --id {id}{dir}",
             home.policy().display(),
-            crate::commands::program(),
-            dir_suffix(home)
         );
     }
 }
@@ -1120,7 +1120,11 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                     1
                 }
                 Ok((parsed_policy, digest)) => {
-                    let warnings = policy::lint(&parsed_policy);
+                    let warnings = policy::lint(
+                        &parsed_policy,
+                        &crate::commands::program(),
+                        &dir_suffix(&home),
+                    );
                     for warning in &warnings {
                         println!("warning: {warning}");
                     }
@@ -1237,12 +1241,14 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             println!("added {effect_name} rule {:?}", spec.id);
             if let Ok(saved) = praetore_core::Policy::from_json(&updated) {
                 let rule_tag = format!("rule {:?}:", spec.id);
-                for warning in policy::lint(&saved) {
+                let program = crate::commands::program();
+                let dir = dir_suffix(&home);
+                for warning in policy::lint(&saved, &program, &dir) {
                     if warning.starts_with(&rule_tag) {
                         println!("warning: {warning}");
                     }
                 }
-                if let Some(warning) = policy::allow_all_warning(&saved) {
+                if let Some(warning) = policy::allow_all_warning(&saved, &program, &dir) {
                     println!("warning: {warning}");
                 }
             }
