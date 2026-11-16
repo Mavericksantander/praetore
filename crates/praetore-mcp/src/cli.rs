@@ -649,13 +649,15 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
         if !home.is_initialized() {
             if dry_run {
                 eprintln!(
-                    "praetore-mcp: note: {} is not initialized yet; run `praetore-mcp init` before installing",
-                    home.root.display()
+                    "praetore-mcp: note: {} is not initialized yet; run `{}` before installing",
+                    home.root.display(),
+                    crate::commands::command("init", &home.root)
                 );
             } else {
                 return Err(format!(
-                    "{} is not initialized; run `praetore-mcp init` first",
-                    home.root.display()
+                    "{} is not initialized; run `{}` first",
+                    home.root.display(),
+                    crate::commands::command("init", &home.root)
                 ));
             }
         }
@@ -1053,7 +1055,7 @@ impl PolicyLock {
                 Ok(Self(path))
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
-                "another `praetore-mcp policy` command is running (lock {}); if none is, remove that file",
+                "another praetore-mcp policy command is running on this home (lock {}); if none is, remove that file",
                 path.display()
             )),
             Err(error) => Err(format!("cannot create lock {}: {error}", path.display())),
@@ -1073,8 +1075,9 @@ fn read_policy(home: &Home) -> Result<(String, praetore_core::Policy), String> {
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let policy = praetore_core::Policy::from_json(&text).map_err(|e| {
         format!(
-            "{} is invalid ({e}); fix it (see `praetore-mcp policy check`) or restore a backup",
-            path.display()
+            "{} is invalid ({e}); fix it (see `{}`) or restore a backup",
+            path.display(),
+            crate::commands::command("policy check", &home.root)
         )
     })?;
     Ok((text, policy))

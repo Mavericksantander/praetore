@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+
+- **praetore-mcp: error messages name the binary and the home.** The
+  not-initialized notes of `install`, the approval and receipt journal
+  errors that say to run `verify` or `init`, and the invalid-policy error
+  now print the command with the binary's absolute path and `--dir`, like
+  the other printed commands.
+
 ## 0.3.6 - 2026-11-16
 
 ### Added
