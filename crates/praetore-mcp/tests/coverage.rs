@@ -218,6 +218,124 @@ fn init_prints_how_to_allow_a_tool() {
     assert!(!text.contains("warning"), "{text}");
 }
 
+/// The printed commands of `text`: each line from where [`program`]
+/// starts in it.
+fn command_lines(text: &str) -> Vec<&str> {
+    let program = program();
+    text.lines()
+        .filter_map(|line| line.find(&program).map(|at| &line[at..]))
+        .collect()
+}
+
+/// With PRAETORE_MCP_HOME set and no --dir, the home is the default one:
+/// the commands init, its allow-all warning and coverage print still name
+/// it with --dir, so they act on it wherever they are pasted.
+#[test]
+fn with_the_default_home_printed_commands_still_name_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let env = [("PRAETORE_MCP_HOME", home.to_str().unwrap())];
+    let check = |what: &str, text: &str, at_least: usize| {
+        let lines = command_lines(text);
+        assert!(lines.len() >= at_least, "{what}: {lines:?}\n{text}");
+        let dir = format!(" --dir {}", quoted_dir(&home));
+        for line in lines {
+            assert!(line.contains(&dir), "{what}: no{dir} in {line:?}");
+        }
+    };
+
+    let out = run_env(&["init"], &env);
+    assert!(out.status.success(), "{out:?}");
+    check("init", &stdout(&out), 3);
+
+    write_legacy_policy(&home);
+    let out = run_env(&["init"], &env);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("warning"), "{text}");
+    check("allow-all warning", &text, 1);
+
+    let fake = fake_server();
+    let out = run_env(
+        &[
+            "policy",
+            "coverage",
+            "--server",
+            "filesystem",
+            "--",
+            fake.to_str().unwrap(),
+        ],
+        &[env[0], FS_TOOLS_ENV[0]],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    check("coverage", &stdout(&out), 1);
+}
+
+/// Commands written by hand as `praetore-mcp ...` in printed text: lines
+/// that start with it once indented, and spans in backticks.
+fn hand_written_commands(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let mut candidates = vec![line.trim_start()];
+        candidates.extend(line.split('`').skip(1).step_by(2));
+        found.extend(
+            candidates
+                .into_iter()
+                .filter(|candidate| candidate.starts_with("praetore-mcp "))
+                .map(str::to_owned),
+        );
+    }
+    found
+}
+
+/// Every command init, policy check, policy allow and policy coverage
+/// print (including the allow-all warnings) starts with the binary that
+/// printed it ([`program`]), never with a bare `praetore-mcp`.
+#[test]
+fn printed_commands_never_start_with_a_bare_program_name() {
+    let (_temp, home) = init();
+    let dir = home.to_str().unwrap();
+    let mut outputs = vec![("init", run(&["init", "--dir", &format!("{dir}-fresh")]))];
+    outputs.push(("check, no ALLOW", run(&["policy", "check", "--dir", dir])));
+    legacy_with_tool_denies(&home);
+    outputs.push(("init, allow-all", run(&["init", "--dir", dir])));
+    outputs.push(("check, allow-all", run(&["policy", "check", "--dir", dir])));
+    outputs.push((
+        "allow, allow-all",
+        run(&[
+            "policy",
+            "allow",
+            "--id",
+            "allow-read",
+            "--server",
+            "filesystem",
+            "--tool",
+            "read_file",
+            "--dir",
+            dir,
+        ]),
+    ));
+    outputs.push((
+        "coverage",
+        coverage(&home, Some("filesystem"), FS_TOOLS_ENV),
+    ));
+    let program = program();
+    for (what, out) in &outputs {
+        let text = format!("{}{}", stdout(out), String::from_utf8_lossy(&out.stderr));
+        assert!(
+            text.contains(&program),
+            "{what}: no printed command\n{text}"
+        );
+        let bare = hand_written_commands(&text);
+        assert!(
+            bare.is_empty(),
+            "{what}: printed command(s) {bare:?} start with a bare `praetore-mcp`; \
+             build them with commands::program() so they name the binary that \
+             printed them, which may not be on PATH"
+        );
+    }
+}
+
 #[test]
 fn init_on_a_home_with_allow_all_warns_and_keeps_the_rule() {
     let (_temp, home) = init();

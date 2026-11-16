@@ -520,22 +520,20 @@ fn warn_allow_all(home: &Home) {
         .filter(|rule| crate::policy::is_allow_all(rule))
     {
         let id = crate::proxy::display_safe(&rule.id);
+        let program = crate::commands::program();
+        let dir = dir_suffix(home);
         println!(
-            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`praetore-mcp policy allow --id ID --server NAME --tool NAME`; `praetore-mcp policy coverage` lists what each tool gets), then run:\n    {} policy remove --id {id}{}",
+            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`{program} policy allow --id ID --server NAME --tool NAME{dir}`; `{program} policy coverage{dir} -- <server command>` lists what each tool gets), then run:\n    {program} policy remove --id {id}{dir}",
             home.policy().display(),
-            crate::commands::program(),
-            dir_suffix(home)
         );
     }
 }
 
-/// ` --dir DIR` when DIR is not the default home, so a printed command
-/// acts on the same home. DIR is absolute and quoted ([`crate::commands`]).
+/// ` --dir DIR`, so a printed command acts on the same home whatever
+/// PRAETORE_MCP_HOME is where it runs. DIR is absolute and quoted
+/// ([`crate::commands`]).
 fn dir_suffix(home: &Home) -> String {
-    match store::resolve_home(None) {
-        Ok(default) if default == home.root => String::new(),
-        _ => format!(" --dir {}", crate::commands::dir(&home.root)),
-    }
+    format!(" --dir {}", crate::commands::dir(&home.root))
 }
 
 pub(crate) fn valid_server_name(name: &str) -> bool {
@@ -879,15 +877,22 @@ fn cmd_approvals(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     let home = parsed.home()?;
+    let now = time::OffsetDateTime::now_utc();
     for item in pending {
-        let commands = crate::approvals::DecisionCommands::new(&home, &item.approval_id);
         println!("id         {}", item.approval_id);
         println!("server     {}", crate::proxy::display_safe(&item.server));
         println!("tool       {}", crate::proxy::display_safe(&item.tool));
         println!("expires    {}", expiry_line(&item.expiry));
         println!("arguments  {}", item.arguments_preview);
-        println!("approve    {}", commands.approve);
-        println!("reject     {}", commands.reject);
+        match item.decision(&home, now) {
+            crate::approvals::PendingDecision::Open(commands) => {
+                println!("approve    {}", commands.approve);
+                println!("reject     {}", commands.reject);
+            }
+            crate::approvals::PendingDecision::Expired => {
+                println!("{}", crate::approvals::EXPIRED_PENDING);
+            }
+        }
         println!();
     }
     Ok(0)
@@ -1122,7 +1127,11 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                     1
                 }
                 Ok((parsed_policy, digest)) => {
-                    let warnings = policy::lint(&parsed_policy);
+                    let warnings = policy::lint(
+                        &parsed_policy,
+                        &crate::commands::program(),
+                        &dir_suffix(&home),
+                    );
                     for warning in &warnings {
                         println!("warning: {warning}");
                     }
@@ -1239,12 +1248,14 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             println!("added {effect_name} rule {:?}", spec.id);
             if let Ok(saved) = praetore_core::Policy::from_json(&updated) {
                 let rule_tag = format!("rule {:?}:", spec.id);
-                for warning in policy::lint(&saved) {
+                let program = crate::commands::program();
+                let dir = dir_suffix(&home);
+                for warning in policy::lint(&saved, &program, &dir) {
                     if warning.starts_with(&rule_tag) {
                         println!("warning: {warning}");
                     }
                 }
-                if let Some(warning) = policy::allow_all_warning(&saved) {
+                if let Some(warning) = policy::allow_all_warning(&saved, &program, &dir) {
                     println!("warning: {warning}");
                 }
             }

@@ -195,6 +195,7 @@ pub fn on_require_approval(
         }
         let pending = reuse_or_create_pending(
             home,
+            &entries,
             &binding,
             &evidence.evidence_id.to_string(),
             now,
@@ -815,8 +816,14 @@ fn first_unused_approval(
     Ok(None)
 }
 
+/// The open pending call for `binding`, or a new one. `entries` is the
+/// approval journal, read under the same lock: a pending file whose id
+/// already has a decision is what a `decide` cut before it removed the file
+/// leaves. That id can never be decided again, so it is not handed out;
+/// its file is removed, the step `decide` did not reach.
 fn reuse_or_create_pending(
     home: &Home,
+    entries: &[JournalEntry],
     binding: &Binding,
     evidence_id: &str,
     now: OffsetDateTime,
@@ -824,6 +831,16 @@ fn reuse_or_create_pending(
 ) -> Result<PendingInfo, String> {
     for pending in list_pending(home)? {
         let path = pending_path(home, &pending.approval_id);
+        if !matches!(find_decision(entries, &pending.approval_id), Ok(None)) {
+            fs::remove_file(&path).map_err(|e| {
+                format!(
+                    "approval {} is already decided but its pending file {} cannot be removed: {e}",
+                    pending.approval_id,
+                    path.display()
+                )
+            })?;
+            continue;
+        }
         let text = fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let value: Value = serde_json::from_str(&text)
@@ -1091,6 +1108,29 @@ impl DecisionCommands {
         Self {
             approve: crate::commands::command(&format!("approve {approval_id}"), &home.root),
             reject: crate::commands::command(&format!("reject {approval_id}"), &home.root),
+        }
+    }
+}
+
+/// What `approvals` prints for an expired pending call, in place of the
+/// commands: `approve` and `reject` of it sign nothing.
+pub const EXPIRED_PENDING: &str = "expired: run the agent again so the call is held again";
+
+/// What can be done with a pending call at a given time: decide it while
+/// it is open, nothing once it expired (the rule of `decide`,
+/// [`Expiry::is_expired_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDecision {
+    Open(DecisionCommands),
+    Expired,
+}
+
+impl PendingInfo {
+    pub fn decision(&self, home: &Home, now: OffsetDateTime) -> PendingDecision {
+        if self.expiry.is_expired_at(now) {
+            PendingDecision::Expired
+        } else {
+            PendingDecision::Open(DecisionCommands::new(home, &self.approval_id))
         }
     }
 }

@@ -1096,29 +1096,87 @@ fn expiry_is_strictly_after_expires_at_whatever_the_offset() {
 }
 
 /// The same call held again after its pending call expired gets a new
-/// approval id: an expired pending call is not reused.
+/// approval id: an expired pending call is not reused, whether its
+/// `expires_at` is a past time or cannot be read.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_same_call_after_its_pending_call_expired_is_held_with_a_new_id() {
     let (_temp, home) = init_home();
     require_echo(&home);
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
-    let first = approval_id_from(tool_text(by_id(&responses, 7)));
+    let mut current = approval_id_from(tool_text(by_id(&responses, 7)));
     // Held again while it is still open: the same id.
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
-    assert_eq!(approval_id_from(tool_text(by_id(&responses, 8))), first);
-    let path = home
-        .root
-        .join("approvals")
-        .join("pending")
-        .join(format!("{first}.json"));
-    let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    pending["expires_at"] = json!("2000-01-01T00:00:00Z");
-    fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-    let (responses, _, _) = wrap(&home, "enforce", &session(echo(9, json!({"n": 1}))), &[]);
-    let second = approval_id_from(tool_text(by_id(&responses, 9)));
-    assert_ne!(second, first, "an expired pending call was reused");
-    assert!(home.approvals_pending(&second));
+    assert_eq!(approval_id_from(tool_text(by_id(&responses, 8))), current);
+    for (id, expires_at) in [(9, "2000-01-01T00:00:00Z"), (10, "not a time")] {
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{current}.json"));
+        let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        pending["expires_at"] = json!(expires_at);
+        fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(id, json!({"n": 1}))), &[]);
+        let next = approval_id_from(tool_text(by_id(&responses, id)));
+        assert_ne!(
+            next, current,
+            "{expires_at}: an expired pending call was reused"
+        );
+        assert!(home.approvals_pending(&next), "{expires_at}");
+        current = next;
+    }
+}
+
+/// `approvals` prints `approve` and `reject` only for an open pending call.
+/// For an expired one, or one whose `expires_at` cannot be read, it says to
+/// run the agent again instead, as the dashboard does.
+#[test]
+fn approvals_prints_no_commands_for_an_expired_pending_call() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let mut ids = Vec::new();
+    for n in 1..=3 {
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": n}))), &[]);
+        ids.push(approval_id_from(tool_text(by_id(&responses, 7))));
+    }
+    for (id, expires_at) in ids[1..].iter().zip(["2000-01-01T00:00:00Z", "not a time"]) {
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{id}.json"));
+        let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        pending["expires_at"] = json!(expires_at);
+        fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    }
+    let out = run(&["approvals", "--dir", home.root.to_str().unwrap()], "");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    let block = |id: &str| {
+        text.split("\n\n")
+            .find(|block| block.starts_with(&format!("id         {id}\n")))
+            .unwrap_or_else(|| panic!("no block for {id}:\n{text}"))
+            .to_owned()
+    };
+    let open = block(&ids[0]);
+    assert!(
+        open.contains(&format!(" approve {} --dir ", ids[0]))
+            && open.contains(&format!(" reject {} --dir ", ids[0]))
+            && !open.contains("expired:"),
+        "{open}"
+    );
+    for (id, what) in ids[1..].iter().zip(["expired", "unreadable expiry"]) {
+        let block = block(id);
+        assert!(
+            block.contains("\nexpired: run the agent again so the call is held again"),
+            "{what}: {block}"
+        );
+        assert!(
+            !block.contains("\napprove ") && !block.contains("\nreject "),
+            "{what}: commands printed for an expired call: {block}"
+        );
+    }
 }
 
 /// `approve` on a terminal for a pending call whose `expires_at` cannot be
@@ -1147,4 +1205,73 @@ fn approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code() {
     assert!(!text.contains("confirmation:"), "asked for a code: {text}");
     assert!(!home.root.join("approvals").join("journal.jsonl").exists());
     assert!(home.approvals_pending(&id), "the pending file is kept");
+}
+
+/// A `decide` cut between appending the decision and removing the pending
+/// file leaves both. Seeded here with the real `decide` and the pending
+/// file written back. The same call held again must not get the decided
+/// id (it could never be decided again, so the call would be stuck until
+/// it expired), and the rejected id is never executed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
+    use praetore_mcp::approvals::{self, HumanOutcome};
+    for outcome in [HumanOutcome::Reject, HumanOutcome::Approve] {
+        let (_temp, home) = init_home();
+        require_echo(&home);
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+        let decided = approval_id_from(tool_text(by_id(&responses, 7)));
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{decided}.json"));
+        let pending = fs::read(&path).unwrap();
+        approvals::decide(&home, &decided, outcome, None).unwrap();
+        assert!(!path.exists());
+        fs::write(&path, &pending).unwrap();
+
+        // An approval is used once: the first retry runs, then the call is
+        // held again. A rejection runs nothing.
+        let mut next_id = 8;
+        if outcome == HumanOutcome::Approve {
+            let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
+            assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+            next_id = 9;
+        }
+        let (responses, stderr, _) = wrap(
+            &home,
+            "enforce",
+            &session(echo(next_id, json!({"n": 1}))),
+            &[],
+        );
+        assert_eq!(stderr.matches("EXECUTED echo").count(), 0, "{stderr}");
+        let text = tool_text(by_id(&responses, next_id));
+        let held = approval_id_from(text);
+        assert_ne!(
+            held, decided,
+            "{outcome:?}: the decided id was handed out again: {text}"
+        );
+        assert!(home.approvals_pending(&held));
+        assert!(
+            !path.exists(),
+            "{outcome:?}: the decided id's pending file is left"
+        );
+        // The new id can be decided.
+        approvals::decide(&home, &held, HumanOutcome::Reject, None).unwrap();
+        let journal =
+            fs::read_to_string(home.root.join("approvals").join("journal.jsonl")).unwrap();
+        let executions_of_decided = journal
+            .lines()
+            .filter(|line| line.contains("\"execution\"") && line.contains(&decided))
+            .count();
+        let expected = usize::from(outcome == HumanOutcome::Approve);
+        assert_eq!(executions_of_decided, expected, "{outcome:?}");
+        let verify = verify(&home);
+        assert!(
+            verify.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verify.stdout)
+        );
+    }
 }

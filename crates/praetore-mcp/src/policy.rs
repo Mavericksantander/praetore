@@ -13,7 +13,7 @@ use praetore_core::{MatchOperator, Policy, PolicyCondition, PolicyEffect, Policy
 use serde_json::Value;
 
 /// Printed after every policy command.
-pub const RESTART_REMINDER: &str = "note: running `praetore-mcp wrap` processes load policy.json when they start; restart your MCP client (or the wrapped servers) to apply policy changes.";
+pub const RESTART_REMINDER: &str = "note: each praetore-mcp wrap process reads policy.json when it starts; restart your MCP client (or the wrapped servers) to apply policy changes.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgOperator {
@@ -256,7 +256,9 @@ pub fn render_list(policy: &Policy) -> String {
 }
 
 /// Non-fatal findings that predict surprising decisions in HighAssurance.
-pub fn lint(policy: &Policy) -> Vec<String> {
+/// `program` starts each printed command and `dir_suffix` ends it (see
+/// [`crate::commands`]).
+pub fn lint(policy: &Policy, program: &str, dir_suffix: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     if policy.semantics_version != 2 {
         warnings.push(
@@ -265,12 +267,11 @@ pub fn lint(policy: &Policy) -> Vec<String> {
         );
     }
     if !policy.rules.iter().any(|r| r.effect == PolicyEffect::Allow) {
-        warnings.push(
-            "no ALLOW rule: in enforce mode every tools/call is denied by default; allow a tool with `praetore-mcp policy allow --id ID --server NAME --tool NAME`"
-                .into(),
-        );
+        warnings.push(format!(
+            "no ALLOW rule: in enforce mode every tools/call is denied by default; allow a tool with `{program} policy allow --id ID --server NAME --tool NAME{dir_suffix}`"
+        ));
     }
-    if let Some(warning) = allow_all_warning(policy) {
+    if let Some(warning) = allow_all_warning(policy, program, dir_suffix) {
         warnings.push(warning);
     }
     for rule in &policy.rules {
@@ -369,8 +370,9 @@ fn named_tool(rule: &PolicyRule) -> Option<&str> {
 }
 
 /// Warns when an allow-all rule sits next to DENY or REQUIRE_APPROVAL rules
-/// that name tools: every tool those rules do not name is allowed.
-pub fn allow_all_warning(policy: &Policy) -> Option<String> {
+/// that name tools: every tool those rules do not name is allowed. Printed
+/// commands are built as in [`lint`].
+pub fn allow_all_warning(policy: &Policy, program: &str, dir_suffix: &str) -> Option<String> {
     let allow_all: Vec<&str> = policy
         .rules
         .iter()
@@ -398,14 +400,14 @@ pub fn allow_all_warning(policy: &Policy) -> Option<String> {
         .iter()
         .map(|id| {
             format!(
-                "`praetore-mcp policy remove --id {}`",
+                "`{program} policy remove --id {}{dir_suffix}`",
                 crate::proxy::display_safe(id)
             )
         })
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
-        "allow-all rule {ids} with DENY/REQUIRE_APPROVAL rules for specific tools ({}): every tool those rules do not name is ALLOWED, including tools a server adds later. Run `praetore-mcp policy coverage -- <server command>` to list them; to deny by default instead, allow the tools you want and run {remove}",
+        "allow-all rule {ids} with DENY/REQUIRE_APPROVAL rules for specific tools ({}): every tool those rules do not name is ALLOWED, including tools a server adds later. Run `{program} policy coverage{dir_suffix} -- <server command>` to list them; to deny by default instead, allow the tools you want and run {remove}",
         named.join(", ")
     ))
 }
@@ -570,8 +572,6 @@ pub fn coverage(policy: &Policy, server: &str, tools: &[String]) -> Vec<ToolCove
         .collect()
 }
 
-/// `dir_suffix` is appended to the printed `policy remove` commands
-/// (` --dir DIR` for a home other than the default one).
 /// A tool name `policy coverage` prints inside a suggested command without
 /// quoting: the MCP tool name characters, 1 to 128 of them.
 fn plain_tool_name(name: &str) -> bool {
@@ -745,9 +745,9 @@ pub fn render_coverage(
             .collect();
         ids.sort_unstable();
         ids.dedup();
-        out.push_str(
-            "  allow the tools you want with `praetore-mcp policy allow --id ID --server NAME --tool NAME`, then remove the allow-all rule:\n",
-        );
+        out.push_str(&format!(
+            "  allow the tools you want with `{program} policy allow --id ID --server NAME --tool NAME{dir_suffix}`, then remove the allow-all rule:\n",
+        ));
         for id in ids {
             out.push_str(&format!(
                 "  {program} policy remove --id {}{dir_suffix}\n",
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(policy.version, 2);
         // The only finding is that nothing is allowed (default deny).
-        let warnings = lint(&policy);
+        let warnings = lint(&policy, "praetore-mcp", "");
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("no ALLOW rule"), "{warnings:?}");
     }
@@ -933,7 +933,7 @@ mod tests {
                     json!("/x"),
                 )),
         );
-        let warnings = lint(&policy).join("\n");
+        let warnings = lint(&policy, "praetore-mcp", "").join("\n");
         assert!(
             warnings.contains("\"dotted\"") && warnings.contains("nested"),
             "{warnings}"
@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(other[0].outcome, Some(Outcome::Deny));
         assert!(other[0].rules.is_empty());
         // The lint names the allow-all rule and the denied tool.
-        let warning = allow_all_warning(&policy).unwrap();
+        let warning = allow_all_warning(&policy, "praetore-mcp", "").unwrap();
         assert!(
             warning.contains("\"allow-fs\"") && warning.contains("write"),
             "{warning}"
@@ -1050,7 +1050,7 @@ mod tests {
         policy.rules.push(rule("via-alias", root.join("alias")));
         policy.rules.push(rule("canonical", root.join("real")));
         policy.rules.push(rule("not-yet", root.join("missing")));
-        let warnings = lint(&policy).join("\n");
+        let warnings = lint(&policy, "praetore-mcp", "").join("\n");
         assert!(
             warnings.contains("\"via-alias\"") && warnings.contains("resolves to"),
             "{warnings}"
@@ -1079,7 +1079,7 @@ mod tests {
                     )),
             );
         }
-        let warnings = lint(&policy).join("\n");
+        let warnings = lint(&policy, "praetore-mcp", "").join("\n");
         assert!(
             warnings.contains("\"data-spelling\"") && warnings.contains("firmlinked"),
             "{warnings}"
