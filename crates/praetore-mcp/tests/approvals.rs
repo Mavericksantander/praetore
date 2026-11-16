@@ -1155,3 +1155,72 @@ fn approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code() {
     assert!(!home.root.join("approvals").join("journal.jsonl").exists());
     assert!(home.approvals_pending(&id), "the pending file is kept");
 }
+
+/// A `decide` cut between appending the decision and removing the pending
+/// file leaves both. Seeded here with the real `decide` and the pending
+/// file written back. The same call held again must not get the decided
+/// id (it could never be decided again, so the call would be stuck until
+/// it expired), and the rejected id is never executed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
+    use praetore_mcp::approvals::{self, HumanOutcome};
+    for outcome in [HumanOutcome::Reject, HumanOutcome::Approve] {
+        let (_temp, home) = init_home();
+        require_echo(&home);
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+        let decided = approval_id_from(tool_text(by_id(&responses, 7)));
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{decided}.json"));
+        let pending = fs::read(&path).unwrap();
+        approvals::decide(&home, &decided, outcome, None).unwrap();
+        assert!(!path.exists());
+        fs::write(&path, &pending).unwrap();
+
+        // An approval is used once: the first retry runs, then the call is
+        // held again. A rejection runs nothing.
+        let mut next_id = 8;
+        if outcome == HumanOutcome::Approve {
+            let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
+            assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+            next_id = 9;
+        }
+        let (responses, stderr, _) = wrap(
+            &home,
+            "enforce",
+            &session(echo(next_id, json!({"n": 1}))),
+            &[],
+        );
+        assert_eq!(stderr.matches("EXECUTED echo").count(), 0, "{stderr}");
+        let text = tool_text(by_id(&responses, next_id));
+        let held = approval_id_from(text);
+        assert_ne!(
+            held, decided,
+            "{outcome:?}: the decided id was handed out again: {text}"
+        );
+        assert!(home.approvals_pending(&held));
+        assert!(
+            !path.exists(),
+            "{outcome:?}: the decided id's pending file is left"
+        );
+        // The new id can be decided.
+        approvals::decide(&home, &held, HumanOutcome::Reject, None).unwrap();
+        let journal =
+            fs::read_to_string(home.root.join("approvals").join("journal.jsonl")).unwrap();
+        let executions_of_decided = journal
+            .lines()
+            .filter(|line| line.contains("\"execution\"") && line.contains(&decided))
+            .count();
+        let expected = usize::from(outcome == HumanOutcome::Approve);
+        assert_eq!(executions_of_decided, expected, "{outcome:?}");
+        let verify = verify(&home);
+        assert!(
+            verify.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verify.stdout)
+        );
+    }
+}
