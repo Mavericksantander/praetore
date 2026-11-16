@@ -56,13 +56,14 @@ refuses every tools/call in both modes.
 Exit codes:
   0    success (also --help and --version)
   1    the command ran and found a problem: `verify` found a failed receipt,
-       `report` wrote a report that says verify failed, `policy check` found an invalid policy or engine, `policy coverage`
-       found a tool allowed only by an allow-all rule, or `install` /
-       `uninstall` could not read, parse or write a config (or was not
-       confirmed)
+       `report` wrote a report that says verify failed, `policy check`
+       found an invalid policy or engine, `policy coverage` found a tool
+       allowed only by an allow-all rule, or `install` / `uninstall` could
+       not read, parse or write a config (or was not confirmed)
   2    usage error, or the command could not run (message on stderr)
   wrap exits with the MCP server's exit code; 127 if the server cannot be
-       started, 1 if it was killed by a signal";
+       started, 1 if the server was killed by a signal. SIGINT or SIGTERM
+       to wrap ends wrap by that signal";
 
 const INIT_HELP: &str = "Usage: praetore-mcp init [--dir DIR]
 
@@ -107,8 +108,17 @@ session is written to DIR/reports/ as session-<start UTC>-<id>.json and
 it changes no decision, and if it cannot be written the reason goes to
 stderr and the exit code is the same.
 
-Exit code: the server's; 127 if it cannot be started, 1 if it was killed by
-a signal, 2 on a usage error.";
+SIGINT and SIGTERM (macOS and Linux): with the report on, wrap waits up to
+300 ms for the server to end, forwards the signal to it, waits up to 2 s
+more, kills it if it is still running, writes the report, and then ends by
+that same signal. A second signal ends wrap at once, without the report.
+With --no-report (or `report = false`) wrap installs no handler and the
+signal ends it at once, as in 0.3.5. A signal that was already ignored
+when wrap started stays ignored.
+
+Exit code: the server's; 127 if it cannot be started, 1 if the server was
+killed by a signal, 2 on a usage error. Ended by SIGINT or SIGTERM, wrap
+terminates by that signal (no exit code).";
 
 const INSTALL_HELP: &str = "Usage: praetore-mcp install [--client claude-desktop|cursor|vscode] [--config FILE] [--dir DIR]
                             [--mode observe|enforce] [--dry-run] [--yes]
@@ -232,12 +242,15 @@ runs until stopped.";
 
 const REPORT_HELP: &str = "Usage: praetore-mcp report [--dir DIR] [--session ID | --last]
 
-Writes again the report of one `wrap` session: DIR/reports/session-<start
-UTC>-<id>.json and .pdf. The session is the one named by ID (the eight
-characters at the end of the file name) or, by default and with --last, the
-most recent one. Its receipts are read from the journal as it is now and
-`verify` runs again; the two journal heads shown are the ones recorded when
-the session closed.
+Writes a new report of one `wrap` session from the journal as it is now:
+DIR/reports/session-<start UTC>-<id>.regen-<now UTC>.json and .pdf. It
+writes a new pair next to the original; the report written at close is
+never replaced. The new header names it in `regenerated_from`. The session
+is the one named by ID (the eight characters after the start time in the
+file name) or, by default and with --last, the one that closed last; only
+the reports written at close are looked at. Its receipts are read from the
+journal as it is now and `verify` runs again; the two journal heads shown
+are the ones recorded when the session closed.
 
 The JSON file has a header (praetore-mcp version, agent, server, mode, seq
 range, both journal heads, the result of verify) and the session's receipts,

@@ -135,8 +135,31 @@ fn reports_dir(home: &Home) -> PathBuf {
     home.root.join("reports")
 }
 
-/// The session JSON files, in name order.
+/// The JSON files written at close (no `.regen-`), in name order.
 fn json_reports(home: &Home) -> Vec<PathBuf> {
+    all_json(home)
+        .into_iter()
+        .filter(|path| !name(path).contains(".regen-"))
+        .collect()
+}
+
+/// The JSON files `report` wrote (`.regen-`), in name order.
+fn regen_reports(home: &Home) -> Vec<PathBuf> {
+    all_json(home)
+        .into_iter()
+        .filter(|path| name(path).contains(".regen-"))
+        .collect()
+}
+
+fn name(path: &Path) -> &str {
+    path.file_name().unwrap().to_str().unwrap()
+}
+
+fn sha256(path: &Path) -> String {
+    hex::encode(Sha256::digest(fs::read(path).unwrap()))
+}
+
+fn all_json(home: &Home) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = fs::read_dir(reports_dir(home))
         .map(|entries| {
             entries
@@ -248,14 +271,27 @@ fn a_session_with_allow_deny_and_an_approval_writes_both_files() {
     assert_eq!(header["verify"]["journal_receipts"], 4);
     assert_eq!(header["verify"]["session_verified"], 3);
 
-    // Who approved and when: the signed decision and the execution.
+    // Who approved and when: the signed decision and the execution, as
+    // the journal lines themselves.
     let records = document["approvals"].as_array().unwrap();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0]["kind"], "decision");
-    assert_eq!(records[0]["outcome"], "approve");
-    assert!(records[0]["approver_key_id"].is_string());
-    assert!(records[0]["decided_at"].is_string());
-    assert_eq!(records[1]["kind"], "execution");
+    assert_eq!(records[0]["record"]["kind"], "decision");
+    assert_eq!(records[0]["record"]["outcome"], "approve");
+    assert!(records[0]["record"]["approver_key_id"].is_string());
+    assert!(records[0]["record"]["decided_at"].is_string());
+    assert_eq!(records[1]["record"]["kind"], "execution");
+    assert!(header["approval_journal_error"].is_null());
+    let approval_journal =
+        fs::read_to_string(home.root.join("approvals").join("journal.jsonl")).unwrap();
+    let text = fs::read_to_string(&json_path).unwrap();
+    let start = text.find("\"approvals\":[").unwrap() + "\"approvals\":[".len();
+    let copied = &text[start..start + text[start..].find("],\"receipts\":[").unwrap()];
+    let journal_approvals: Vec<&str> = approval_journal
+        .lines()
+        .filter(|line| copied.contains(line))
+        .collect();
+    assert_eq!(journal_approvals.len(), 2, "{copied}");
+    assert_eq!(copied, journal_approvals.join(","));
 
     let pdf = fs::read(&pdf_path).unwrap();
     assert!(pdf.starts_with(b"%PDF-"));
@@ -337,7 +373,7 @@ fn the_json_receipts_are_the_journal_lines_byte_for_byte() {
 }
 
 #[test]
-fn an_altered_journal_gives_a_pdf_that_says_verify_failed() {
+fn report_never_replaces_the_report_written_at_close() {
     let (_temp, home) = init_home();
     let out = wrap(
         &home,
@@ -351,6 +387,13 @@ fn an_altered_journal_gives_a_pdf_that_says_verify_failed() {
     let json_path = json_reports(&home).remove(0);
     let pdf_path = json_path.with_extension("pdf");
     assert!(!has(&fs::read(&pdf_path).unwrap(), "VERIFY FAILED"));
+    let (json_sha, pdf_sha) = (sha256(&json_path), sha256(&pdf_path));
+    let close_text = fs::read_to_string(&json_path).unwrap();
+    let original = close_text
+        .lines()
+        .find(|line| line.contains("\"tool\":\"delete_file\""))
+        .unwrap()
+        .to_owned();
     let journal_before = journal_lines(&home);
 
     // Someone turns the DENY into an ALLOW-looking tool name.
@@ -364,15 +407,38 @@ fn an_altered_journal_gives_a_pdf_that_says_verify_failed() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(String::from_utf8_lossy(&out.stdout).contains("verify FAILED"));
 
-    // Both files are written again, and the PDF says it on its cover.
-    let pdf = fs::read(&pdf_path).unwrap();
+    // The report written at close is untouched, with its original line.
+    assert_eq!(sha256(&json_path), json_sha);
+    assert_eq!(sha256(&pdf_path), pdf_sha);
+    assert!(fs::read_to_string(&json_path).unwrap().contains(&original));
+    assert_eq!(json_reports(&home), vec![json_path.clone()]);
+
+    // A new pair sits next to it and says verify failed.
+    let regen = regen_reports(&home);
+    assert_eq!(regen.len(), 1, "{regen:?}");
+    let regen_json = &regen[0];
+    let stem = name(&json_path).strip_suffix(".json").unwrap();
+    let regen_name = name(regen_json);
+    let stamp = regen_name
+        .strip_prefix(&format!("{stem}.regen-"))
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .unwrap_or_else(|| panic!("{regen_name}"));
+    assert_eq!(stamp.len(), "20260101T000000Z".len(), "{stamp}");
+    assert!(
+        stamp.ends_with('Z') && stamp.as_bytes()[8] == b'T',
+        "{stamp}"
+    );
+    let pdf = fs::read(regen_json.with_extension("pdf")).unwrap();
     assert!(pdf.starts_with(b"%PDF-"));
     assert!(has(&pdf, "VERIFY FAILED"));
     assert!(has(&pdf, "INTEGRITY ALERT"));
+    assert!(has(&pdf, "THIS SESSION"));
     assert!(has(&pdf, STATEMENT));
-    let document = document(&json_path);
+    assert!(has(&pdf, name(&json_path)));
+    let document = document(regen_json);
     assert_eq!(document["header"]["verify"]["result"], "failed");
     assert_eq!(document["header"]["regenerated"], true);
+    assert_eq!(document["header"]["regenerated_from"], name(&json_path));
     assert_eq!(document["header"]["verify"]["session_verified"], 1);
     assert!(
         !document["header"]["verify"]["failures"]
@@ -381,9 +447,18 @@ fn an_altered_journal_gives_a_pdf_that_says_verify_failed() {
             .is_empty()
     );
     // The altered line is copied as it now is in the journal.
-    let text = fs::read_to_string(&json_path).unwrap();
+    let text = fs::read_to_string(regen_json).unwrap();
     assert!(text.contains("\"tool\":\"read_file\""));
     assert!(has(&pdf, &hex::encode(Sha256::digest(text.as_bytes()))));
+
+    // `--last` still means the session's close report: a second run writes
+    // another pair (a second later) and still leaves the first ones alone.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(regen_reports(&home).len(), 2);
+    assert_eq!(sha256(&json_path), json_sha);
+    assert_eq!(sha256(&pdf_path), pdf_sha);
 
     // The report is a view: the journal was not touched by it.
     assert_eq!(fs::read_to_string(&daily).unwrap(), altered);
@@ -409,7 +484,7 @@ fn a_removed_receipt_is_reported_as_missing() {
 
     let out = run(&["report", "--dir", dir(&home)], "");
     assert_eq!(out.status.code(), Some(1), "{out:?}");
-    let json_path = json_reports(&home).remove(0);
+    let json_path = regen_reports(&home).remove(0);
     let document = document(&json_path);
     assert_eq!(document["header"]["verify"]["result"], "failed");
     assert_eq!(
@@ -533,10 +608,20 @@ fn report_regenerates_a_session_by_id_and_rejects_unknown_ones() {
 
     let out = run(&["report", "--dir", dir(&home), "--session", id], "");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert!(pdf.exists());
-    let again = document(&reports[0]);
+    // A missing close PDF is not written again: the new pair is beside it.
+    assert!(!pdf.exists());
+    let regen = regen_reports(&home);
+    assert_eq!(regen.len(), 1);
+    let stem = name(&reports[0]).strip_suffix(".json").unwrap();
+    assert!(name(&regen[0]).starts_with(&format!("{stem}.regen-")));
+    assert!(regen[0].with_extension("pdf").exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(name(&regen[0])), "{stdout}");
+    let again = document(&regen[0]);
     assert_eq!(again["receipts"], first["receipts"]);
     assert_eq!(again["header"]["regenerated"], true);
+    assert_eq!(again["header"]["regenerated_from"], name(&reports[0]));
+    assert_eq!(document(&reports[0]), first);
     // The heads recorded at close are kept; verify sees the journal as it is.
     assert_eq!(
         again["header"]["receipt_journal_head"],
@@ -559,65 +644,218 @@ fn report_regenerates_a_session_by_id_and_rejects_unknown_ones() {
     }
 }
 
-/// SIGTERM while the client is still connected: the session ends in order
-/// and its report is written.
+/// A `wrap` child with one answered call and stdin still open, plus the pid
+/// of its server.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wrap_in_session(
+    home: &Home,
+    extra: &[&str],
+) -> (std::process::Child, std::process::ChildStdin, i32) {
+    use std::io::{BufRead, BufReader};
+    let server = fake_server();
+    let mut child = Command::new(bin())
+        .args([
+            "wrap",
+            "--dir",
+            dir(home),
+            "--name",
+            "fake",
+            "--mode",
+            "enforce",
+        ])
+        .args(extra)
+        .arg("--")
+        .arg(&server)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(input(&[call(20, "echo", json!({"text": "one"}))]).as_bytes())
+        .unwrap();
+    stdin.flush().unwrap();
+    // Wait for the reply to the call, with stdin still open.
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert_ne!(
+            stdout.read_line(&mut line).unwrap(),
+            0,
+            "server closed early"
+        );
+        if serde_json::from_str::<Value>(&line).unwrap()["id"] == 20 {
+            break;
+        }
+    }
+    // Keep draining stdout so wrap never blocks on a full pipe.
+    std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
+    let pgrep = Command::new("pgrep")
+        .args(["-P", &child.id().to_string()])
+        .output()
+        .unwrap();
+    let pids: Vec<i32> = String::from_utf8_lossy(&pgrep.stdout)
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 1, "server pid: {pgrep:?}");
+    (child, stdin, pids[0])
+}
+
+/// `kill(pid, 0)` fails with ESRCH within 10 s.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn assert_gone(pid: i32, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        // SAFETY: `kill` with signal 0 sends nothing and takes no pointers.
+        let result = unsafe { libc::kill(pid, 0) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        if result == -1 && errno == Some(libc::ESRCH) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: server {pid} still exists ({result}, {errno:?})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// SIGTERM or SIGINT while the client is still connected: wrap ends by
+/// that same signal, its server is gone and, unless `--no-report`, the
+/// report was written first.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn sigterm_and_sigint_still_write_the_report() {
-    use std::io::{BufRead, BufReader};
+fn sigterm_and_sigint_end_wrap_by_the_signal_with_and_without_a_report() {
+    use std::os::unix::process::ExitStatusExt;
+
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        for report in [true, false] {
+            let what = format!("signal {signal}, report {report}");
+            let (_temp, home) = init_home();
+            let extra: &[&str] = if report { &[] } else { &["--no-report"] };
+            let (mut child, stdin, server) = wrap_in_session(&home, extra);
+            // SAFETY: `kill` takes no pointers; the pid is this test's child.
+            assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
+            let status = child.wait().unwrap();
+            let mut err = String::new();
+            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
+            drop(stdin);
+            assert_eq!(status.signal(), Some(signal), "{what}: {status:?} {err}");
+            assert_eq!(status.code(), None, "{what}");
+            assert_gone(server, &what);
+            let reports = json_reports(&home);
+            if report {
+                assert!(err.contains("session report:"), "{what}: {err}");
+                assert_eq!(reports.len(), 1, "{what}");
+                assert!(reports[0].with_extension("pdf").exists(), "{what}");
+                assert_eq!(
+                    document(&reports[0])["header"]["verify"]["result"],
+                    "passed",
+                    "{what}"
+                );
+            } else {
+                assert!(!err.contains("session report"), "{what}: {err}");
+                assert!(!reports_dir(&home).exists(), "{what}");
+            }
+            assert_eq!(journal_lines(&home).len(), 1, "{what}");
+        }
+    }
+}
+
+/// A second signal while the first is being handled ends wrap at once by
+/// that signal, without the report.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_second_signal_ends_wrap_without_the_report() {
+    use std::os::unix::process::ExitStatusExt;
 
     for signal in [libc::SIGTERM, libc::SIGINT] {
         let (_temp, home) = init_home();
-        let server = fake_server();
-        let mut child = Command::new(bin())
-            .args([
-                "wrap",
-                "--dir",
-                dir(&home),
-                "--name",
-                "fake",
-                "--mode",
-                "enforce",
-                "--",
-            ])
-            .arg(&server)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        stdin
-            .write_all(input(&[call(20, "echo", json!({"text": "one"}))]).as_bytes())
-            .unwrap();
-        stdin.flush().unwrap();
-        // Wait for the reply to the call, with stdin still open.
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        loop {
-            let mut line = String::new();
-            assert_ne!(
-                stdout.read_line(&mut line).unwrap(),
-                0,
-                "server closed early"
-            );
-            if serde_json::from_str::<Value>(&line).unwrap()["id"] == 20 {
-                break;
-            }
-        }
+        let (mut child, stdin, server) = wrap_in_session(&home, &[]);
+        let pid = child.id() as libc::pid_t;
         // SAFETY: `kill` takes no pointers; the pid is this test's child.
-        assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
-        let out = child.wait_with_output().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        let status = child.wait().unwrap();
         drop(stdin);
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("session report:"),
-            "signal {signal}: {out:?}"
-        );
-        let reports = json_reports(&home);
-        assert_eq!(reports.len(), 1, "signal {signal}");
-        assert!(reports[0].with_extension("pdf").exists());
-        assert_eq!(
-            document(&reports[0])["header"]["verify"]["result"],
-            "passed"
-        );
+        assert_eq!(status.signal(), Some(signal), "signal {signal}: {status:?}");
+        assert!(!reports_dir(&home).exists(), "signal {signal}");
+        // The server loses its stdin with wrap and exits too.
+        assert_gone(server, &format!("signal {signal}, second"));
     }
+}
+
+#[test]
+fn a_backslash_in_a_tool_name_is_escaped_once_in_the_pdf() {
+    let (_temp, home) = init_home();
+    let out = wrap(&home, &[], &[call(20, "a\\b", json!({}))]);
+    assert!(out.status.success(), "{out:?}");
+    let pdf = fs::read(json_reports(&home)[0].with_extension("pdf")).unwrap();
+    // Shown as `a\\b` (the display escape), which the PDF string writes as
+    // four backslashes; eight would be the escape done twice.
+    assert!(has(&pdf, "a\\\\\\\\b"));
+    assert!(!has(&pdf, "a\\\\\\\\\\\\\\\\b"));
+}
+
+#[test]
+fn the_call_log_shows_utc_under_local_time() {
+    let (_temp, home) = init_home();
+    let out = wrap(&home, &[], &[call(20, "echo", json!({"text": "one"}))]);
+    assert!(out.status.success(), "{out:?}");
+    let path = json_reports(&home).remove(0);
+    let decided = document(&path)["receipts"][0]["evidence"]["decided_at"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // `2026-11-15T23:34:40.123Z` -> `23:34:40 UTC`.
+    let clock = &decided[11..19];
+    let pdf = fs::read(path.with_extension("pdf")).unwrap();
+    assert!(has(&pdf, &format!("{clock} UTC")), "{clock}");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_existing_reports_directory_is_made_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, home) = init_home();
+    fs::create_dir(reports_dir(&home)).unwrap();
+    fs::set_permissions(reports_dir(&home), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = wrap(&home, &[], &[call(20, "echo", json!({"text": "one"}))]);
+    assert!(out.status.success(), "{out:?}");
+    let mode = fs::metadata(reports_dir(&home))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    for file in [
+        json_reports(&home)[0].clone(),
+        json_reports(&home)[0].with_extension("pdf"),
+    ] {
+        let mode = fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "{}: {mode:o}", file.display());
+    }
+}
+
+#[test]
+fn an_unreadable_approval_journal_is_said_in_the_header_and_the_pdf() {
+    let (_temp, home) = init_home();
+    let approvals = home.root.join("approvals");
+    fs::create_dir_all(&approvals).unwrap();
+    fs::write(approvals.join("journal.jsonl"), "not json\n").unwrap();
+    let out = wrap(&home, &[], &[call(20, "echo", json!({"text": "one"}))]);
+    assert!(out.status.success(), "{out:?}");
+    let path = json_reports(&home).remove(0);
+    let document = document(&path);
+    let error = document["header"]["approval_journal_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{}", document["header"]));
+    assert!(error.contains("journal.jsonl:1:"), "{error}");
+    assert!(!error.contains(home.root.to_str().unwrap()), "{error}");
+    assert_eq!(document["approvals"], json!([]));
+    let pdf = fs::read(path.with_extension("pdf")).unwrap();
+    assert!(has(&pdf, "The approval journal could not be read"));
+    assert!(!has(&pdf, "No approval record"));
 }

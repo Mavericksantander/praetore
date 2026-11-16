@@ -9,7 +9,8 @@
 //! All coordinates below are in points from the top-left corner of an A4
 //! page; [`Canvas`] converts them to PDF space.
 
-use crate::report::{ApprovalRow, ApprovalStatus, Label, Report, Row, STATEMENT, local_offset};
+use crate::report::{ApprovalRow, ApprovalStatus, Label, Report, Row, STATEMENT};
+use crate::when::local_offset;
 use pdf_writer::{Content, Filter, Finish, Name, Pdf, Rect, Ref, Str, TextStr};
 use time::{OffsetDateTime, UtcOffset};
 
@@ -24,7 +25,11 @@ const PAGE_H: f32 = 842.0;
 const LEFT: f32 = 56.0;
 const RIGHT: f32 = 539.0;
 const BODY_BOTTOM: f32 = 780.0;
-const ROW_H: f32 = 17.0;
+/// A table row: local time on the first line, UTC under it.
+const ROW_H: f32 = 22.0;
+/// Where a row's second line (UTC) and its rule go, below its first line.
+const ROW_SECOND: f32 = 8.5;
+const ROW_RULE: f32 = 12.0;
 
 type Rgb = (f32, f32, f32);
 const INK: Rgb = (0.07, 0.07, 0.08);
@@ -110,6 +115,15 @@ fn ascii(text: &str) -> String {
         .collect()
 }
 
+/// Text already made printable ([`ascii`], [`fit`] or text this module
+/// writes) as the PDF draws it: anything outside printable ASCII becomes
+/// `?`. It does not escape again, so a `\` written by [`ascii`] stays one.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if matches!(c, ' '..='~') { c } else { '?' })
+        .collect()
+}
+
 /// `text` cut to fit `max` points, ending in `...` when it was cut.
 fn fit(font: Font, size: f32, max: f32, text: &str) -> String {
     let text = ascii(text);
@@ -141,10 +155,11 @@ impl Canvas {
         }
     }
 
-    /// Text at (`x`, `y`) with `spacing` points after each glyph.
+    /// Text at (`x`, `y`) with `spacing` points after each glyph. Text from
+    /// the journal or the session goes through [`ascii`] or [`fit`] first.
     fn text_spaced(&mut self, face: (Font, f32, f32), color: Rgb, x: f32, y: f32, text: &str) {
         let (font, size, spacing) = face;
-        let text = ascii(text);
+        let text = printable(text);
         self.content
             .begin_text()
             .set_font(font.resource(), size)
@@ -160,7 +175,7 @@ impl Canvas {
     }
 
     fn text_right(&mut self, font: Font, size: f32, color: Rgb, right: f32, y: f32, text: &str) {
-        let text = ascii(text);
+        let text = printable(text);
         let x = right - width(font, size, 0.0, &text);
         self.text(font, size, color, x, y, &text);
     }
@@ -309,6 +324,14 @@ fn utc_clock(at: Option<OffsetDateTime>) -> String {
     })
 }
 
+/// A time cell: local time, and UTC under it in small type.
+fn time_cell(c: &mut Canvas, x: f32, y: f32, at: Option<OffsetDateTime>) {
+    c.text(Font::Mono, 7.8, INK, x, y, &local_clock(at));
+    if at.is_some() {
+        c.text(Font::Mono, 5.8, MUTED, x, y + ROW_SECOND, &utc_clock(at));
+    }
+}
+
 fn label_color(label: Label) -> Rgb {
     match label {
         Label::Allow => GREEN,
@@ -346,9 +369,14 @@ fn ring(canvas: &mut Canvas, report: &Report, cx: f32, cy: f32) {
             .get(from..to.min(rows.len()))
             .is_some_and(|slice| !slice.is_empty() && slice.iter().all(|row| row.verified));
         let start = sweep * segment as f32 + gap / 2.0;
+        // When verify fails, the receipts of this session that verified are
+        // gray, not green: the ring is about this session only and the
+        // journal as a whole did not verify.
         canvas.arc(
-            if ok {
+            if ok && passed {
                 GREEN
+            } else if ok {
+                GRAY
             } else if rows.is_empty() {
                 HAIR
             } else {
@@ -376,13 +404,18 @@ fn ring(canvas: &mut Canvas, report: &Report, cx: f32, cy: f32) {
         cy + 16.0,
         word,
     );
+    if !passed {
+        let note = "THIS SESSION";
+        let w = width(Font::Mono, 6.8, 1.1, note);
+        canvas.label(MUTED, cx - w / 2.0, cy - 16.0, note);
+    }
 }
 
 /// A labelled value with a short accent bar on its left.
 fn block(canvas: &mut Canvas, y: f32, label: &str, value: &str) {
     canvas.rect(ACCENT, LEFT, y - 7.0, 1.6, 22.0);
     canvas.label(ACCENT, LEFT + 9.0, y, label);
-    canvas.text(Font::Mono, 8.2, INK, LEFT + 9.0, y + 12.0, value);
+    canvas.text(Font::Mono, 8.2, INK, LEFT + 9.0, y + 12.0, &ascii(value));
 }
 
 fn cover(report: &Report) -> Canvas {
@@ -417,9 +450,17 @@ fn cover(report: &Report) -> Canvas {
         c.label(ACCENT, LEFT, 140.0, "DOCUMENT TYPE");
         c.text_spaced((Font::Sans, 30.0, 2.4), INK, LEFT, 178.0, "SESSION REPORT");
     }
+    let count = report.rows.len();
     let seq = report.seq.map_or_else(
-        || "NO CHAINED RECEIPTS".to_owned(),
-        |(first, last)| format!("SEQ {first} -> {last}"),
+        || format!("NO CHAINED RECEIPTS ({count} RECEIPTS)"),
+        |(first, last)| {
+            let chained = report.rows.iter().filter(|row| row.seq.is_some()).count();
+            let contiguous = usize::try_from(last - first + 1).ok() == Some(chained);
+            format!(
+                "SEQ {first} -> {last} ({count} RECEIPTS{})",
+                if contiguous { "" } else { ", NOT CONTIGUOUS" }
+            )
+        },
     );
     c.text(
         Font::Mono,
@@ -499,7 +540,14 @@ fn cover(report: &Report) -> Canvas {
     let (closed, closed_utc) = local_and_utc(report.meta.ended_at);
     let columns = [LEFT, LEFT + 250.0];
     c.label(ACCENT, columns[0], y, "AGENT");
-    c.text(Font::Mono, 8.2, INK, columns[0], y + 12.0, &report.agent);
+    c.text(
+        Font::Mono,
+        8.2,
+        INK,
+        columns[0],
+        y + 12.0,
+        &fit(Font::Mono, 8.2, 240.0, &report.agent),
+    );
     c.label(ACCENT, columns[1], y, "SERVER");
     c.text(
         Font::Sans,
@@ -516,7 +564,7 @@ fn cover(report: &Report) -> Canvas {
         INK,
         columns[1] + 150.0,
         y + 12.0,
-        &report.meta.mode,
+        &ascii(&report.meta.mode),
     );
     y += 34.0;
     c.label(ACCENT, columns[0], y, "OPENED");
@@ -555,6 +603,9 @@ fn cover(report: &Report) -> Canvas {
         ("APPROVED", s.approved, ACCENT),
         ("EXPIRED", s.expired, MUTED),
     ];
+    if s.pending > 0 {
+        tiles.push(("PENDING", s.pending, AMBER));
+    }
     if s.rejected > 0 {
         tiles.push(("REJECTED", s.rejected, RED));
     }
@@ -637,6 +688,22 @@ fn cover(report: &Report) -> Canvas {
         when.push_str(". Regenerated from the journal; heads above are those recorded at close.");
     }
     c.text(Font::Sans, 8.0, MUTED, LEFT, y, &when);
+    if let Some(from) = &report.regenerated_from {
+        y += 11.0;
+        c.text(
+            Font::Mono,
+            7.0,
+            MUTED,
+            LEFT,
+            y,
+            &fit(
+                Font::Mono,
+                7.0,
+                RIGHT - LEFT,
+                &format!("report written at close (not replaced): {from}"),
+            ),
+        );
+    }
     if report.regenerated && report.verify.heads != report.close_heads {
         y += 11.0;
         let now = report
@@ -758,14 +825,7 @@ const APPROVAL_COLUMNS: [(f32, &str); 5] = [
 fn call_row(c: &mut Canvas, y: f32, row: &Row) {
     let color = label_color(row.label);
     c.diamond(color, row.verified, LEFT + 4.0, y - 2.6, 3.0);
-    c.text(
-        Font::Mono,
-        7.8,
-        INK,
-        COL_TIME,
-        y,
-        &local_clock(row.decided_at),
-    );
+    time_cell(c, COL_TIME, y, row.decided_at);
     c.text(
         Font::Mono,
         7.8,
@@ -803,7 +863,7 @@ fn call_row(c: &mut Canvas, y: f32, row: &Row) {
         y,
         &fit(Font::Sans, 7.6, RIGHT - COL_REASON, &reason),
     );
-    c.line(HAIR, 0.3, LEFT, y + 5.5, RIGHT, y + 5.5);
+    c.line(HAIR, 0.3, LEFT, y + ROW_RULE, RIGHT, y + ROW_RULE);
 }
 
 fn approval_row(c: &mut Canvas, y: f32, row: &ApprovalRow) {
@@ -816,7 +876,7 @@ fn approval_row(c: &mut Canvas, y: f32, row: &ApprovalRow) {
     c.diamond(color, false, LEFT + 4.0, y - 2.6, 3.0);
     // The time of the decision; an undecided approval has none.
     let decided = row.approver.as_ref().and(row.at);
-    c.text(Font::Mono, 7.8, INK, COL_TIME, y, &local_clock(decided));
+    time_cell(c, COL_TIME, y, decided);
     c.text(
         Font::Mono,
         7.8,
@@ -845,17 +905,17 @@ fn approval_row(c: &mut Canvas, y: f32, row: &ApprovalRow) {
         },
     );
     c.text(Font::Mono, 7.2, MUTED, COL_RULE, y, &approver);
-    let detail = match (row.status, row.used_at) {
+    // What happened next, in local time, with UTC under it. The decision
+    // time is in the TIME column.
+    let (detail, at) = match (row.status, row.used_at) {
         (ApprovalStatus::Approved, Some(used)) if row.used_here => {
-            format!("{}, used {}", utc_clock(row.at), local_clock(Some(used)))
+            (format!("used {}", local_clock(Some(used))), Some(used))
         }
-        (ApprovalStatus::Approved, Some(_)) => {
-            format!("{}, used in another session", utc_clock(row.at))
-        }
-        (ApprovalStatus::Approved, None) => format!("{}, not used", utc_clock(row.at)),
-        (ApprovalStatus::Rejected, _) => utc_clock(row.at),
-        (ApprovalStatus::Pending, _) => format!("expires {}", utc_clock(row.at)),
-        (ApprovalStatus::Expired, _) => format!("expired {}", utc_clock(row.at)),
+        (ApprovalStatus::Approved, Some(_)) => ("used in another session".to_owned(), None),
+        (ApprovalStatus::Approved, None) => ("not used".to_owned(), None),
+        (ApprovalStatus::Rejected, _) => ("rejected".to_owned(), None),
+        (ApprovalStatus::Pending, _) => (format!("expires {}", local_clock(row.at)), row.at),
+        (ApprovalStatus::Expired, _) => (format!("expired {}", local_clock(row.at)), row.at),
     };
     c.text(
         Font::Sans,
@@ -865,7 +925,17 @@ fn approval_row(c: &mut Canvas, y: f32, row: &ApprovalRow) {
         y,
         &fit(Font::Sans, 7.6, RIGHT - COL_REASON, &detail),
     );
-    c.line(HAIR, 0.3, LEFT, y + 5.5, RIGHT, y + 5.5);
+    if at.is_some() {
+        c.text(
+            Font::Mono,
+            5.8,
+            MUTED,
+            COL_REASON,
+            y + ROW_SECOND,
+            &utc_clock(at),
+        );
+    }
+    c.line(HAIR, 0.3, LEFT, y + ROW_RULE, RIGHT, y + ROW_RULE);
 }
 
 fn log_pages(report: &Report) -> Vec<Canvas> {
@@ -890,11 +960,27 @@ fn log_pages(report: &Report) -> Vec<Canvas> {
     flow.y += 18.0;
     let title = format!("HUMAN APPROVALS // {}", report.approvals.len());
     flow.section(&title, &APPROVAL_COLUMNS);
+    if let Some(error) = &report.approval_journal_error {
+        let y = flow.row_start("HUMAN APPROVALS", &APPROVAL_COLUMNS);
+        flow.canvas().text(
+            Font::SansBold,
+            8.0,
+            RED,
+            COL_TIME,
+            y,
+            &fit(
+                Font::SansBold,
+                8.0,
+                RIGHT - COL_TIME,
+                &format!("The approval journal could not be read: {error}"),
+            ),
+        );
+    }
     for row in &report.approvals {
         let y = flow.row_start("HUMAN APPROVALS", &APPROVAL_COLUMNS);
         approval_row(flow.canvas(), y, row);
     }
-    if report.approvals.is_empty() {
+    if report.approvals.is_empty() && report.approval_journal_error.is_none() {
         let y = flow.row_start("HUMAN APPROVALS", &APPROVAL_COLUMNS);
         flow.canvas().text(
             Font::Sans,
@@ -1062,6 +1148,8 @@ mod tests {
             agent: "agent".into(),
             generated_at: at,
             regenerated: false,
+            regenerated_from: None,
+            approval_journal_error: None,
             rows: (0..rows)
                 .map(|index| Row {
                     seq: Some(index as u64),
@@ -1121,6 +1209,79 @@ mod tests {
         let failed = render(&sample(0, false));
         assert_eq!(count(&failed, b"(VERIFY FAILED)"), 1);
         assert_eq!(count(&failed, STATEMENT.as_bytes()), 1);
+    }
+
+    #[test]
+    fn a_backslash_in_a_tool_name_is_escaped_once() {
+        let mut report = sample(1, true);
+        report.rows[0].tool = "a\\b".into();
+        let pdf = render(&report);
+        // ascii() writes the display escape `a\\b`; the PDF string escapes
+        // each `\` once more, so the bytes hold four, never eight.
+        assert!(count(&pdf, b"(a\\\\\\\\b)") >= 1);
+        assert_eq!(count(&pdf, b"a\\\\\\\\\\\\\\\\b"), 0, "escaped twice");
+        assert_eq!(printable("x\\y"), "x\\y");
+        assert_eq!(printable("caf\u{e9}"), "caf?");
+    }
+
+    #[test]
+    fn rows_show_local_time_with_utc_under_it() {
+        let report = sample(1, true);
+        let pdf = render(&report);
+        let at = report.rows[0].decided_at.unwrap();
+        let utc = format!("({})", utc_clock(Some(at)));
+        assert!(count(&pdf, utc.as_bytes()) >= 1, "{utc}");
+        assert!(count(&pdf, format!("({})", local_clock(Some(at))).as_bytes()) >= 1);
+    }
+
+    #[test]
+    fn the_cover_counts_receipts_and_says_when_seq_is_not_contiguous() {
+        let mut report = sample(3, true);
+        report.seq = Some((0, 2));
+        assert_eq!(count(&render(&report), b"SEQ 0 -> 2 (3 RECEIPTS)"), 1);
+        report.rows[2].seq = Some(7);
+        report.seq = Some((0, 7));
+        assert_eq!(
+            count(&render(&report), b"SEQ 0 -> 7 (3 RECEIPTS, NOT CONTIGUOUS)"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_failed_verify_labels_the_ring_this_session_and_grays_good_receipts() {
+        let passed = render(&sample(2, true));
+        assert_eq!(count(&passed, b"(THIS SESSION)"), 0);
+        let mut failed = sample(2, false);
+        failed.rows.iter_mut().for_each(|row| row.verified = true);
+        failed.verify.session_verified = 2;
+        let pdf = render(&failed);
+        assert_eq!(count(&pdf, b"(THIS SESSION)"), 1);
+        // GRAY as the stroke color of the ring segments, never GREEN there.
+        let gray = format!("{} {} {} RG", GRAY.0, GRAY.1, GRAY.2);
+        assert!(count(&pdf, gray.as_bytes()) >= 2, "no gray segment");
+    }
+
+    #[test]
+    fn the_pending_tile_shows_only_when_something_is_pending() {
+        let mut report = sample(1, true);
+        assert_eq!(count(&render(&report), b"(PENDING)"), 0);
+        report.summary.pending = 1;
+        assert_eq!(count(&render(&report), b"(PENDING)"), 1);
+    }
+
+    #[test]
+    fn an_unreadable_approval_journal_is_said_in_the_pdf() {
+        let mut report = sample(1, true);
+        report.approval_journal_error = Some("approvals/journal.jsonl:1: not JSON".into());
+        let pdf = render(&report);
+        assert_eq!(
+            count(
+                &pdf,
+                b"The approval journal could not be read: approvals/journal.jsonl:1: not JSON"
+            ),
+            1
+        );
+        assert_eq!(count(&pdf, b"No approval record for this session."), 0);
     }
 
     #[test]

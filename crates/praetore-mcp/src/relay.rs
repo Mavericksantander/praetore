@@ -80,9 +80,11 @@ enum End {
     Signal(i32),
 }
 
-/// SIGINT and SIGTERM end the session in order, so its report is written:
-/// the handler writes the signal number to a pipe and a thread turns it
-/// into an [`End::Signal`].
+/// With the session report on, SIGINT and SIGTERM end the session in
+/// order so its report is written: the handler writes the signal number to
+/// a pipe and a thread turns it into an [`End::Signal`]. After the report,
+/// `wrap` ends by that same signal ([`die_by`]), as it did without a
+/// handler. A second signal ends `wrap` at once, without the report.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod signals {
     use super::End;
@@ -91,22 +93,75 @@ mod signals {
         io::Read,
         os::fd::FromRawFd,
         sync::{
-            atomic::{AtomicI32, Ordering},
+            atomic::{AtomicI32, AtomicU32, Ordering},
             mpsc::Sender,
         },
         thread,
     };
 
     static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+    static RECEIVED: AtomicU32 = AtomicU32::new(0);
+
+    #[cfg(target_os = "linux")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: returns this thread's errno; no arguments.
+        unsafe { libc::__errno_location() }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn errno_location() -> *mut libc::c_int {
+        // SAFETY: returns this thread's errno; no arguments.
+        unsafe { libc::__error() }
+    }
 
     extern "C" fn on_signal(signal: libc::c_int) {
-        let fd = PIPE_WRITE.load(Ordering::Relaxed);
-        if fd >= 0 {
-            let byte = signal as u8;
-            // SAFETY: `write` is async-signal-safe; `byte` lives for the call.
+        // The interrupted code may be about to read errno: keep it.
+        let errno = errno_location();
+        // SAFETY: errno_location points at this thread's errno.
+        let saved = unsafe { *errno };
+        if RECEIVED.fetch_add(1, Ordering::SeqCst) > 0 {
+            // A second signal: stop now, without the report. `signal` and
+            // `raise` are async-signal-safe; the raised signal is delivered
+            // with the default action when this handler returns.
+            // SAFETY: plain calls with no pointers.
             unsafe {
-                libc::write(fd, (&raw const byte).cast(), 1);
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
             }
+        } else {
+            let fd = PIPE_WRITE.load(Ordering::Relaxed);
+            if fd >= 0 {
+                let byte = signal as u8;
+                // SAFETY: `write` is async-signal-safe; `byte` lives for the
+                // call.
+                unsafe {
+                    libc::write(fd, (&raw const byte).cast(), 1);
+                }
+            }
+        }
+        // SAFETY: as above.
+        unsafe { *errno = saved };
+    }
+
+    /// Ends the process by `signal` with its default action, so the parent
+    /// sees `wrap` terminated by that signal.
+    pub fn die_by(signal: i32) {
+        // SAFETY: plain calls with no pointers.
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+    }
+
+    /// Whether `signal` is ignored in this process (inherited SIG_IGN, for
+    /// example a background job). An ignored signal keeps being ignored.
+    fn ignored(signal: libc::c_int) -> bool {
+        // SAFETY: `old` is fully written by `sigaction` when it returns 0; a
+        // null new action only reads the current one.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &raw mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
         }
     }
 
@@ -131,8 +186,11 @@ mod signals {
             }
         });
         for signal in [libc::SIGINT, libc::SIGTERM] {
+            if ignored(signal) {
+                continue;
+            }
             // SAFETY: `action` is fully initialized before `sigaction` reads
-            // it, and the handler only calls `write`.
+            // it, and the handler only calls async-signal-safe functions.
             unsafe {
                 let mut action: libc::sigaction = std::mem::zeroed();
                 action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
@@ -403,8 +461,14 @@ pub fn run(options: WrapOptions) -> i32 {
             let _ = events.send(End::ServerClosed);
         })
     };
+    // Without the report, SIGINT and SIGTERM keep their default action:
+    // `wrap` ends at once, as in 0.3.5.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    signals::install(events);
+    if options.report {
+        signals::install(events);
+    } else {
+        drop(events);
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     drop(events);
 
@@ -453,8 +517,10 @@ pub fn run(options: WrapOptions) -> i32 {
         // Dropping child_stdin closes the server's stdin (client went away).
     });
 
+    let mut by_signal = None;
     match ended.recv() {
         Ok(End::Signal(signal)) => {
+            by_signal = Some(signal);
             // The client is going away. Give the server a moment to end by
             // itself (a terminal's Ctrl-C reaches it too), then pass the
             // signal on, then stop waiting for it.
@@ -480,6 +546,15 @@ pub fn run(options: WrapOptions) -> i32 {
     };
     if options.report {
         write_report(&options, started_at, &log);
+    }
+    // Ended by SIGINT or SIGTERM: after the report, end by that signal, so
+    // the parent sees what it saw before the report existed.
+    if let Some(signal) = by_signal {
+        let _ = io::stderr().flush();
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        signals::die_by(signal);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let _ = signal;
     }
     code
 }

@@ -427,6 +427,27 @@ pub fn records(home: &Home) -> Result<Vec<Value>, String> {
         .collect())
 }
 
+/// Each line of the approval journal exactly as written, with its record.
+/// Fails if the journal cannot be read or a line is not a valid entry.
+pub fn raw_records(home: &Home) -> Result<Vec<(String, Value)>, String> {
+    let path = journal_path(home);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = parse_journal_text(line)
+            .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
+        out.push((line.to_owned(), entry.record));
+    }
+    Ok(out)
+}
+
 /// Evidence id → short status for `receipts`. Not a signature check; `verify`
 /// does that. A missing approval directory yields an empty map.
 pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, String> {

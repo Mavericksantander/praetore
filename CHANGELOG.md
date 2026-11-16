@@ -21,19 +21,29 @@
   written the reason goes to stderr and the exit code and every decision
   stay the same. `wrap --no-report` and `report = false` in
   `DIR/config.toml` (new, optional file) turn it off.
-  `praetore-mcp report [--dir DIR] [--session ID | --last]` writes a
-  session's report again from the journal as it is now (exit code 1 if it
-  says verify failed). The PDF is written in Rust with `pdf-writer` (MIT OR
+  `praetore-mcp report [--dir DIR] [--session ID | --last]` writes a new
+  report of a session from the journal as it is now (exit code 1 if it
+  says verify failed): a new pair,
+  `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, next to the
+  original, with `regenerated_from` in its header. The report written at
+  close is never replaced. The session's approval records are copied from
+  the approval journal byte for byte; if it cannot be read, the header and
+  the PDF say so. The PDF is written in Rust with `pdf-writer` (MIT OR
   Apache-2.0; adds no other crate to the lockfile), with no network access
   and no external process.
 
 ### Changed
 
-- **praetore-mcp: `wrap` handles SIGINT and SIGTERM on macOS and Linux.**
-  Before, the signal ended `wrap` at once. Now `wrap` waits up to 300 ms for
-  the server to end, forwards the signal to it, waits up to 2 s more, kills
-  it if it is still running, and then writes the session report. The exit
-  code is the server's, or 1 if it was killed by a signal.
+- **praetore-mcp: with reports on, `wrap` writes the report before it ends
+  by SIGINT or SIGTERM (macOS and Linux).** Before, the signal ended `wrap`
+  at once. Now, when the session report is on, `wrap` waits up to 300 ms
+  for the server to end, forwards the signal to it, waits up to 2 s more,
+  kills it if it is still running, writes the report, and then ends by that
+  same signal, so the parent still sees `wrap` terminated by SIGINT or
+  SIGTERM, as in 0.3.5. A second signal ends it at once without the report.
+  With `--no-report` or `report = false` no handler is installed and the
+  signal ends `wrap` at once, as in 0.3.5. A signal that was ignored when
+  `wrap` started stays ignored.
 
 ### Fixed
 

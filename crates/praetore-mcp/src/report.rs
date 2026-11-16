@@ -13,6 +13,11 @@
 //! The report is a view. It writes nothing to the journals, signs nothing
 //! and takes no part in any policy decision. A failure here is reported on
 //! stderr by the caller and changes nothing else.
+//!
+//! A report file is never replaced. `praetore-mcp report` writes a new pair
+//! next to the one written at close,
+//! `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, whose header
+//! names the close report in `regenerated_from`.
 
 use crate::{
     approvals,
@@ -100,7 +105,9 @@ pub struct Source {
     pub close_heads: Option<Heads>,
     /// Agent recorded by an earlier report, used when no receipt names it.
     pub agent: Option<String>,
-    pub regenerated: bool,
+    /// For `praetore-mcp report`: the file name of the report written at
+    /// close. `None` when the session closes.
+    pub regenerated_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +225,10 @@ pub struct Report {
     pub agent: String,
     pub generated_at: OffsetDateTime,
     pub regenerated: bool,
+    /// File name of the close report this one was regenerated from.
+    pub regenerated_from: Option<String>,
+    /// Why the approval journal could not be read, if it could not.
+    pub approval_journal_error: Option<String>,
     pub rows: Vec<Row>,
     pub approvals: Vec<ApprovalRow>,
     pub summary: Summary,
@@ -236,18 +247,25 @@ pub struct Generated {
 }
 
 pub fn file_stem(meta: &SessionMeta) -> String {
-    let at = meta.started_at.to_offset(UtcOffset::UTC);
+    format!("session-{}-{}", compact_utc(meta.started_at), meta.id)
+}
+
+/// `20261115T144207Z`.
+fn compact_utc(at: OffsetDateTime) -> String {
+    let at = at.to_offset(UtcOffset::UTC);
     format!(
-        "session-{:04}{:02}{:02}T{:02}{:02}{:02}Z-{}",
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
         at.year(),
         u8::from(at.month()),
         at.day(),
         at.hour(),
         at.minute(),
-        at.second(),
-        meta.id
+        at.second()
     )
 }
+
+/// The marker in the file name of a regenerated report.
+const REGEN_MARK: &str = ".regen-";
 
 fn rfc3339(at: OffsetDateTime) -> String {
     at.to_offset(UtcOffset::UTC)
@@ -259,29 +277,6 @@ fn rfc3339(at: OffsetDateTime) -> String {
 
 fn parse_time(value: &Value) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value.as_str()?, &Rfc3339).ok()
-}
-
-/// The local UTC offset at `at`, where the platform can tell without
-/// reading more than the time zone database (`None` elsewhere: the PDF
-/// then shows UTC only).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn local_offset(at: OffsetDateTime) -> Option<UtcOffset> {
-    let seconds = libc::time_t::try_from(at.unix_timestamp()).ok()?;
-    // SAFETY: `tm` is plain data that `localtime_r` fills in. Both pointers
-    // are valid for the call and nothing is kept after it returns.
-    let offset = unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&seconds, &mut tm).is_null() {
-            return None;
-        }
-        tm.tm_gmtoff
-    };
-    UtcOffset::from_whole_seconds(i32::try_from(offset).ok()?).ok()
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-pub fn local_offset(_at: OffsetDateTime) -> Option<UtcOffset> {
-    None
 }
 
 /// One journal line that belongs to the session.
@@ -487,6 +482,8 @@ fn header_json(report: &Report) -> Value {
         "ended_at": rfc3339(report.meta.ended_at),
         "generated_at": rfc3339(report.generated_at),
         "regenerated": report.regenerated,
+        "regenerated_from": report.regenerated_from,
+        "approval_journal_error": report.approval_journal_error,
         "seq": {
             "first": report.seq.map(|(first, _)| first),
             "last": report.seq.map(|(_, last)| last),
@@ -525,14 +522,15 @@ fn header_json(report: &Report) -> Value {
     })
 }
 
-/// The JSON file: one line of header, then each receipt on its own line,
-/// exactly as it is in the journal.
-fn render_json(report: &Report, approvals: &[&Value], lines: &[SessionLine]) -> String {
+/// The JSON file: one line of header and approvals, then each receipt on
+/// its own line. Receipts and approval records are the journal lines
+/// exactly as written (an approval line is `{seq, prev, record}`).
+fn render_json(report: &Report, approvals: &[&str], lines: &[SessionLine]) -> String {
     let mut out = format!(
-        "{{\"schema\":{},\"header\":{},\"approvals\":{},\"receipts\":[\n",
+        "{{\"schema\":{},\"header\":{},\"approvals\":[{}],\"receipts\":[\n",
         json!(SCHEMA),
         header_json(report),
-        json!(approvals)
+        approvals.join(",")
     );
     for (index, line) in lines.iter().enumerate() {
         out.push_str(&line.text);
@@ -545,9 +543,8 @@ fn render_json(report: &Report, approvals: &[&Value], lines: &[SessionLine]) -> 
     out
 }
 
-/// Replaces `path` with `bytes` through a private temporary file.
-fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let fail = |e: std::io::Error| format!("cannot write {}: {e}", path.display());
+/// `bytes` in a private (0600) temporary file next to `path`.
+fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -558,9 +555,61 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes)?;
         file.sync_all()
     });
-    if let Err(error) = written.and_then(|()| fs::rename(&temp, path)) {
-        let _ = fs::remove_file(&temp);
-        return Err(fail(error));
+    match written {
+        Ok(()) => Ok(temp),
+        Err(error) => {
+            let _ = fs::remove_file(&temp);
+            Err(format!("cannot write {}: {error}", path.display()))
+        }
+    }
+}
+
+/// Gives `temp` the name `path`. A hard link, not a rename: an existing
+/// `path` is never replaced (`AlreadyExists` is an error).
+fn publish(temp: &Path, path: &Path) -> Result<(), String> {
+    let linked = fs::hard_link(temp, path);
+    let _ = fs::remove_file(temp);
+    linked.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("{} already exists; it was not replaced", path.display())
+        } else {
+            format!("cannot write {}: {error}", path.display())
+        }
+    })
+}
+
+/// Writes both files of a report, or neither: both temporary files are
+/// written first, and both are published only if both were written.
+fn write_pair(json: (&Path, &[u8]), pdf: (&Path, &[u8])) -> Result<(), String> {
+    let json_temp = write_temp(json.0, json.1)?;
+    let pdf_temp = match write_temp(pdf.0, pdf.1) {
+        Ok(temp) => temp,
+        Err(error) => {
+            let _ = fs::remove_file(&json_temp);
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish(&json_temp, json.0) {
+        let _ = fs::remove_file(&pdf_temp);
+        return Err(error);
+    }
+    if let Err(error) = publish(&pdf_temp, pdf.0) {
+        // The JSON was published by this call a moment ago: take it back so
+        // no half pair is left.
+        let _ = fs::remove_file(json.0);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Makes `DIR/reports/` exist with mode 0700, also when it already existed.
+fn ensure_reports_dir(dir: &Path) -> Result<(), String> {
+    store::ensure_dir(dir, false)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot set the mode of {}: {e}", dir.display()))?;
     }
     Ok(())
 }
@@ -608,7 +657,16 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         .cloned()
         .collect();
 
-    let records = approvals::records(home).unwrap_or_default();
+    // The approval journal: each line as written, with its record. If it
+    // cannot be read the report says so and lists no approval record.
+    let (raw_approvals, approval_journal_error) = match approvals::raw_records(home) {
+        Ok(lines) => (lines, None),
+        Err(error) => (Vec::new(), Some(strip_home(home, &error))),
+    };
+    let records: Vec<Value> = raw_approvals
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect();
     let executed: BTreeMap<&str, &Value> = records
         .iter()
         .filter(|record| record["kind"] == "execution")
@@ -620,13 +678,14 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         .iter()
         .map(|row| row.approval_id.as_str())
         .collect();
-    let approval_records: Vec<&Value> = records
+    let approval_lines: Vec<&str> = raw_approvals
         .iter()
-        .filter(|record| {
+        .filter(|(_, record)| {
             record["approval_id"]
                 .as_str()
                 .is_some_and(|id| shown.contains(id))
         })
+        .map(|(line, _)| line.as_str())
         .collect();
 
     let session_verified = rows.iter().filter(|row| row.verified).count();
@@ -680,13 +739,22 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         })
         .unwrap_or_else(|| "unknown".into());
     let seqs: Vec<u64> = rows.iter().filter_map(|row| row.seq).collect();
-    let stem = file_stem(&source.meta);
+    let stem = match &source.regenerated_from {
+        None => file_stem(&source.meta),
+        Some(_) => format!(
+            "{}{REGEN_MARK}{}",
+            file_stem(&source.meta),
+            compact_utc(now)
+        ),
+    };
     let mut report = Report {
         version: env!("CARGO_PKG_VERSION"),
         meta: source.meta,
         agent,
         generated_at: now,
-        regenerated: source.regenerated,
+        regenerated: source.regenerated_from.is_some(),
+        regenerated_from: source.regenerated_from,
+        approval_journal_error,
         summary: summarize(&rows, &approval_rows),
         rows,
         approvals: approval_rows,
@@ -697,16 +765,15 @@ pub fn generate(home: &Home, source: Source) -> Result<Generated, String> {
         json_sha256: String::new(),
     };
 
-    let json_text = render_json(&report, &approval_records, &lines);
+    let json_text = render_json(&report, &approval_lines, &lines);
     report.json_sha256 = hex::encode(Sha256::digest(json_text.as_bytes()));
     let pdf_bytes = crate::report_pdf::render(&report);
 
     let dir = reports_dir(home);
-    store::ensure_dir(&dir, false)?;
+    ensure_reports_dir(&dir)?;
     let json = dir.join(&report.json_name);
     let pdf = dir.join(format!("{stem}.pdf"));
-    write_private(&json, json_text.as_bytes())?;
-    write_private(&pdf, &pdf_bytes)?;
+    write_pair((&json, json_text.as_bytes()), (&pdf, &pdf_bytes))?;
     let _ = crate::fsutil::sync_dir(&dir);
     Ok(Generated {
         json,
@@ -733,7 +800,7 @@ pub fn close_session(
             evidence_ids,
             close_heads: None,
             agent: None,
-            regenerated: false,
+            regenerated_from: None,
         },
     )
     .map(Some)
@@ -746,7 +813,8 @@ pub enum Selector {
     Session(String),
 }
 
-/// The session JSON files in `DIR/reports/`, oldest first.
+/// The JSON files written at close in `DIR/reports/` (not the regenerated
+/// ones), oldest first.
 fn session_files(home: &Home) -> Result<Vec<PathBuf>, String> {
     let dir = reports_dir(home);
     let entries = match fs::read_dir(&dir) {
@@ -760,7 +828,11 @@ fn session_files(home: &Home) -> Result<Vec<PathBuf>, String> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("session-") && name.ends_with(".json"))
+                .is_some_and(|name| {
+                    name.starts_with("session-")
+                        && name.ends_with(".json")
+                        && !name.contains(REGEN_MARK)
+                })
         })
         .collect();
     files.sort();
@@ -791,10 +863,11 @@ fn last_closed(files: &[PathBuf]) -> Option<&PathBuf> {
         .map(|(_, path)| path)
 }
 
-/// Regenerates the report of a session from its earlier JSON file (which
-/// names the session's receipts) and the journal as it is now. `Last` is the
-/// session that closed last. The heads
-/// recorded at close are kept; `verify` runs again.
+/// Writes a new report of a session from the JSON file written at close
+/// (which names the session's receipts) and the journal as it is now.
+/// `Last` is the session that closed last. The heads recorded at close are
+/// kept; `verify` runs again. The new pair is written next to the close
+/// report, which is never replaced.
 pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String> {
     let files = session_files(home)?;
     let path = match selector {
@@ -859,7 +932,7 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
             evidence_ids,
             close_heads: Some(close_heads),
             agent: header["agent"].as_str().map(str::to_owned),
-            regenerated: true,
+            regenerated_from: path.file_name().and_then(|n| n.to_str()).map(str::to_owned),
         },
     )
 }
