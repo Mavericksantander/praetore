@@ -434,7 +434,7 @@ pub fn run(args: &[String]) -> i32 {
             Ok(0)
         }
         "-V" | "--version" | "version" => {
-            println!("praetore-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("praetore-mcp {}", crate::report::BUILD_VERSION);
             Ok(0)
         }
         other => Err(format!("unknown command {other:?}\n\n{USAGE}")),

@@ -1934,7 +1934,7 @@ fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
 /// the `decided_at` of the decision in the approval journal, apart from
 /// the time of the held receipt.
 #[test]
-fn approval_history_carries_the_time_of_the_human_decision() {
+fn approval_history_and_live_rows_carry_the_time_of_the_human_decision() {
     let (_temp, home) = home_with_receipts();
     let mut cache = dashboard::Cache::default();
     let (_, before) = api(&home, &mut cache, "");
@@ -1964,4 +1964,25 @@ fn approval_history_carries_the_time_of_the_human_decision() {
     );
     assert_eq!(row["approval_decided_at"], decided_at);
     assert_ne!(row["approval_decided_at"], row["decided_at"]);
+    // The Live rows (state.recent) carry the same time; calls that were
+    // not held carry no such field.
+    let recent = after["recent"].as_array().unwrap();
+    let live = recent
+        .iter()
+        .find(|r| r["evidence_id"] == pending[0].evidence_id.as_str())
+        .unwrap();
+    assert_eq!(live["approval_decided_at"], decided_at);
+    assert!(
+        recent
+            .iter()
+            .filter(|r| r["decision"] != "REQUIRE_APPROVAL")
+            .all(|r| r.get("approval_decided_at").is_none())
+    );
+    let before_live = before["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["evidence_id"] == pending[0].evidence_id.as_str())
+        .unwrap();
+    assert_eq!(before_live["approval_decided_at"], Value::Null);
 }

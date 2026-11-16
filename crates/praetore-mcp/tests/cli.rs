@@ -77,15 +77,25 @@ fn top_level_help_documents_exit_codes() {
     }
 }
 
+/// The build version, the one the session reports name: the crate version
+/// for a release build, `<version>-dev+<commit>` or `<version>-dev`
+/// otherwise (rules in `build_version.rs`).
 #[test]
-fn version_prints_crate_version() {
+fn version_prints_the_build_version() {
+    let build = praetore_mcp::report::BUILD_VERSION;
+    let rest = build.strip_prefix(env!("CARGO_PKG_VERSION")).unwrap();
+    assert!(
+        rest.is_empty()
+            || rest == "-dev"
+            || rest.strip_prefix("-dev+").is_some_and(|c| {
+                (7..=40).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit())
+            }),
+        "{build}"
+    );
     for flag in ["--version", "-V", "version"] {
         let out = run(&[flag]);
         assert_eq!(out.status.code(), Some(0), "{flag}: {out:?}");
-        assert_eq!(
-            stdout(&out).trim(),
-            format!("praetore-mcp {}", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(stdout(&out), format!("praetore-mcp {build}\n"));
     }
 }
 

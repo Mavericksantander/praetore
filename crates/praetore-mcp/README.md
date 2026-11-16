@@ -256,7 +256,9 @@ praetore-mcp wrap --name my-server --mode observe -- node server.js --flag
 (or `-h`) prints that command's options, for example `praetore-mcp wrap
 --help` or `praetore-mcp policy deny --help`. For `wrap`, anything after
 `--` belongs to the MCP server, so `wrap -- server --help` starts the server
-with `--help`. `praetore-mcp --version` prints the version.
+with `--help`. `praetore-mcp --version` prints the build version, the
+one the session reports name: `praetore-mcp 0.3.6` for a release build,
+`praetore-mcp 0.3.6-dev+<commit>` or `praetore-mcp 0.3.6-dev` otherwise.
 
 | Exit code | Meaning |
 |---|---|

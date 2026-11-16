@@ -437,8 +437,8 @@ content must be a report: a `.json` must parse as a report with the schema
 separator (also percent-encoded, such as `%2e%2e` or `%2f`), a symlink, a
 hard link, a file of another user, a file outside `DIR/reports/`, content
 that is not a report or a file that does not exist gets 404. A file larger
-than 64 MiB gets 413 and is not read. A report listed in the view is one
-this check accepts. Any local process
+than 64 MiB gets 413 and is not read. The Sessions view lists a file only
+when this same check accepts it, so every file it lists downloads. Any local process
 can still open the page and read what it shows, tool arguments included,
 so run it only while you are using it. Texts are in Spanish, English and
 Portuguese.
@@ -477,6 +477,10 @@ the repository git finds is this one (its top level holds
 `crates/praetore-mcp/build.rs`); a build with no `.git`, inside some other
 repository or with no `git` on `PATH` takes it from
 `PRAETORE_MCP_BUILD_COMMIT` (7 to 40 hex characters) or has none.
+`praetore-mcp --version` prints the same build version. In CI, the job
+that builds the release archives fails on a tag that is not
+`v<crate version>`, on a tag build whose `--version` is not exactly that
+version, and on any other build whose version has no `-dev+<commit>`.
 
 When the report is written, `wrap` prints where to see it, after its path:
 

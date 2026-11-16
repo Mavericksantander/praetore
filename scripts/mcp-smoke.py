@@ -20,6 +20,7 @@ Exit code 0 when every check passes; every check is printed.
 import json
 import os
 import pty
+import re
 import select
 import subprocess
 import sys
@@ -186,7 +187,13 @@ def main():
     with open(os.path.join(root, "a.txt"), "w", encoding="utf-8") as handle:
         handle.write("hola\n")
 
-    check("--version", run(binary, "--version").returncode == 0)
+    version = run(binary, "--version")
+    check(
+        "--version prints the build version",
+        version.returncode == 0
+        and re.fullmatch(r"praetore-mcp \d+\.\d+\.\d+(-dev(\+[0-9a-f]{7,40})?)?\n", version.stdout)
+        is not None,
+    )
     check("init", run(binary, "init", "--dir", home).returncode == 0)
     with open(os.path.join(home, "policy.json"), encoding="utf-8") as handle:
         check("init writes no rules (default deny)", json.load(handle).get("rules") == [])

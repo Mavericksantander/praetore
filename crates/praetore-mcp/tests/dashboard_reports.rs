@@ -516,10 +516,18 @@ fn only_report_contents_are_served() {
     let reports = home.root.join("reports");
     let close = close_json(&home);
     let stem = close.strip_suffix(".json").unwrap();
-    let cases: [(&str, &[u8]); 5] = [
+    let cases: [(&str, &[u8]); 8] = [
+        // A PDF whose JSON opens but is not a report.
+        ("session-20260101T000000Z-00000007.json", b"{}"),
+        ("session-20260101T000000Z-00000007.pdf", b"%PDF-1.7\n"),
         (
             "session-20260101T000000Z-00000001.json",
             b"{\"schema\":\"something-else/1\"}",
+        ),
+        // The report schema, but no header.
+        (
+            "session-20260101T000000Z-00000006.json",
+            b"{\"schema\":\"praetore-mcp.session-report/1\",\"receipts\":[]}",
         ),
         ("session-20260101T000000Z-00000002.json", b"not json"),
         // A report header line alone, cut where the receipts begin.
@@ -545,10 +553,155 @@ fn only_report_contents_are_served() {
             "{name}"
         );
     }
+    // A real report, header and all, under another schema.
+    let mut other: Value =
+        serde_json::from_slice(&fs::read(reports.join(&close)).unwrap()).unwrap();
+    assert!(other["header"].is_object());
+    other["schema"] = json!("praetore-mcp.session-report/2");
+    let name = "session-20260101T000000Z-00000008.json";
+    fs::write(reports.join(name), serde_json::to_vec(&other).unwrap()).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{name}")).status, 404);
     // The real pair is served.
     assert_eq!(get(&home, &format!("/reports/{close}")).status, 200);
     assert_eq!(get(&home, &format!("/reports/{stem}.pdf")).status, 200);
     // A real PDF whose JSON is gone is no longer served.
     fs::remove_file(reports.join(&close)).unwrap();
     assert_eq!(get(&home, &format!("/reports/{stem}.pdf")).status, 404);
+}
+
+/// Every file name the Sessions view lists, regenerations included.
+fn listed_names(reports: &Value) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut add = |entry: &Value| {
+        for kind in ["json", "pdf"] {
+            if let Some(name) = entry[kind]["name"].as_str() {
+                names.push(name.to_owned());
+            }
+        }
+    };
+    for item in reports["items"].as_array().unwrap() {
+        add(item);
+        for regen in item["regenerations"].as_array().unwrap() {
+            add(regen);
+        }
+    }
+    names.sort();
+    names
+}
+
+/// The names in DIR/reports that `GET /reports/` serves (200).
+fn served_names(home: &Home) -> Vec<String> {
+    reports(home)
+        .into_iter()
+        .filter(|name| get(home, &format!("/reports/{name}")).status == 200)
+        .collect()
+}
+
+fn api_reports(home: &Home, cache: &mut dashboard::Cache) -> Value {
+    let raw = "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n";
+    let response = dashboard::respond_with(raw, home, None, 8787, cache);
+    assert_eq!(response.status, 200);
+    serde_json::from_slice::<Value>(&response.body).unwrap()["reports"].clone()
+}
+
+/// The Sessions view lists a file exactly when `GET /reports/` serves it,
+/// for every kind of file in DIR/reports that is refused, with and without
+/// the cache of the running server; a PDF leaves the list when its JSON
+/// stops being a report.
+#[test]
+fn the_view_lists_exactly_the_files_the_download_serves() {
+    let (_temp, home) = home_with_reports();
+    let reports = home.root.join("reports");
+    let close = close_json(&home);
+    let stem = close.strip_suffix(".json").unwrap().to_owned();
+    let real = fs::read(reports.join(&close)).unwrap();
+    let header_line = real.split(|b| *b == b'\n').next().unwrap().to_vec();
+    let mut cases: Vec<(String, Vec<u8>)> = vec![
+        (
+            "session-20260101T000000Z-00000001.json".into(),
+            b"{\"schema\":\"something-else/1\",\"header\":{}}".to_vec(),
+        ),
+        (
+            "session-20260101T000000Z-00000002.json".into(),
+            b"not json".to_vec(),
+        ),
+        ("session-20260101T000000Z-00000003.json".into(), header_line),
+        (
+            "session-20260101T000000Z-00000004.pdf".into(),
+            b"%PDF-1.7\n".to_vec(),
+        ),
+        (
+            "session-20260101T000000Z-00000005.json".into(),
+            real.clone(),
+        ),
+        (
+            "session-20260101T000000Z-00000005.pdf".into(),
+            b"PK\x03\x04".to_vec(),
+        ),
+        (
+            "session-20260101T000000Z-00000006.json".into(),
+            b"{\"schema\":\"something-else/1\"}".to_vec(),
+        ),
+        (
+            "session-20260101T000000Z-00000006.pdf".into(),
+            b"%PDF-1.7\n".to_vec(),
+        ),
+    ];
+    cases.sort();
+    for (name, bytes) in &cases {
+        fs::write(reports.join(name), bytes).unwrap();
+    }
+    let big = fs::File::create(reports.join("session-20260101T000000Z-00000007.json")).unwrap();
+    big.set_len(dashboard::MAX_REPORT_BYTES + 1).unwrap();
+    #[cfg(unix)]
+    {
+        let key = home.root.join("keys").join("approver.local-dev.key");
+        fs::hard_link(&key, reports.join("session-20260101T000000Z-00000008.json")).unwrap();
+        std::os::unix::fs::symlink(
+            reports.join(&close),
+            reports.join(format!("{stem}.regen-20990101T000000Z.json")),
+        )
+        .unwrap();
+    }
+    let served = served_names(&home);
+    assert!(
+        served.contains(&close) && served.contains(&format!("{stem}.pdf")),
+        "{served:?}"
+    );
+    assert!(served.contains(&"session-20260101T000000Z-00000005.json".to_owned()));
+    let mut cache = dashboard::Cache::default();
+    assert_eq!(
+        listed_names(&dashboard::state(&home, None)["reports"]),
+        served
+    );
+    assert_eq!(listed_names(&api_reports(&home, &mut cache)), served);
+    // The JSON of a listed PDF stops being a report: both leave the list,
+    // in the cached view too.
+    fs::write(reports.join(&close), b"{\"schema\":\"something-else/1\"}").unwrap();
+    let served = served_names(&home);
+    assert!(!served.contains(&format!("{stem}.pdf")), "{served:?}");
+    assert_eq!(listed_names(&api_reports(&home, &mut cache)), served);
+    assert_eq!(
+        listed_names(&dashboard::state(&home, None)["reports"]),
+        served
+    );
+}
+
+/// The rule `open_report` applies to the metadata of the open file, on
+/// its own: the other user's file is the case a test cannot create
+/// without root.
+#[test]
+fn servable_needs_a_regular_file_with_one_link_of_this_user() {
+    assert!(dashboard::servable(1, 501, 501, true));
+    assert!(!dashboard::servable(2, 501, 501, true), "a second link");
+    assert!(!dashboard::servable(1, 0, 501, true), "another user's file");
+    assert!(
+        !dashboard::servable(1, 502, 501, true),
+        "another user's file"
+    );
+    assert!(
+        !dashboard::servable(1, 501, 501, false),
+        "not a regular file"
+    );
+    assert!(!dashboard::servable(0, 501, 501, true), "no link");
 }

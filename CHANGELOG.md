@@ -49,8 +49,10 @@
   command that starts the dashboard on the home with `--port 8787`
   (absolute and quoted) and the link `http://127.0.0.1:8787/#/sessions/<id>`,
   saying that on another port the page is `#/sessions/<id>` there. In the
-  approval history, an approved call shows the time of the person's
-  decision from the approval journal. The Live caption says how many rows
+  approval history and in the Live list, an approved or rejected call
+  shows the time of the person's decision from the approval journal
+  (`approval_decided_at` on the held rows of `/api/state`), noted as such.
+  The Sessions view lists a file only when `GET /reports/` serves it. The Live caption says how many rows
   it shows and since when. The dashboard still
   writes nothing: it does not write, regenerate or sign a report. The view
   signs nothing, does not prove that a person reviewed a session, and is
@@ -67,7 +69,10 @@
   A release build is only one whose commit carries the exact tag
   `v<crate version>`, or one built with `PRAETORE_MCP_RELEASE=1`. The
   commit comes from git only when the repository found is this one;
-  otherwise from `PRAETORE_MCP_BUILD_COMMIT`, or none.
+  otherwise from `PRAETORE_MCP_BUILD_COMMIT`, or none. `praetore-mcp
+  --version` prints the same build version. CI fails a tag that is not
+  `v<crate version>`, a tag build that does not print exactly that version
+  and any other build without `-dev+<commit>`.
 - **praetore-mcp: the decision tiles of the report PDF are two fixed rows.**
   The first counts decisions, one per call, from the receipts (ALLOW, DENY,
   HELD, FORWARDED, WOULD ASK); the second, labeled apart, counts the

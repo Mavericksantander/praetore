@@ -1248,6 +1248,11 @@ function startHud() {
   else hud.frame = requestAnimationFrame(hudLoop);
 }
 
+function hudTime(r) {
+  const { at, note } = rowTime(r);
+  return el("time", {}, localText(at), el("small", {}, utcText(at)), note ? el("small", { class: "muted" }, note) : null);
+}
+
 function hudList() {
   const pending = pendingIds();
   const list = el("ul", { class: "feed" });
@@ -1267,7 +1272,7 @@ function hudList() {
         waiting ? el("div", { class: "unsigned" }, t("l_pending")) : null,
         cut ? el("div", { class: "bad-text mono" }, `✕ ${t("l_unverified")}: ${cut}`) : null),
       outcome ? el("span", { class: `tag ${outcome.cls}` }, outcome.text) : decisionTag(r.decision),
-      el("time", {}, localText(r.decided_at), el("small", {}, utcText(r.decided_at)))), () => openDrawer(r), r.evidence_id));
+      hudTime(r)), () => openDrawer(r), r.evidence_id));
   }
   if (!list.children.length) list.append(el("li", { class: "muted" }, t("empty_recent")));
   return list;
@@ -1707,14 +1712,20 @@ function approvalCard(p) {
   return card;
 }
 
-// When a person approved or rejected the call: the decided_at of that
-// decision in the approval journal. Before a decision: when the call was
-// held (the receipt).
-function historyWhen(r) {
+// The time a row shows. For a held call a person approved or rejected:
+// the decided_at of that decision in the approval journal, with a note
+// saying so; before a decision, when the call was held (the receipt),
+// noted too. Any other call: its receipt, no note.
+function rowTime(r) {
   const human = r.approval_decided_at || null;
-  const at = human || r.decided_at;
+  const held = r.decision === "REQUIRE_APPROVAL";
+  return { at: human || r.decided_at, note: held ? t(human ? "hist_decided" : "hist_held") : null };
+}
+
+function historyWhen(r) {
+  const { at, note } = rowTime(r);
   return el("td", { class: "cell-when" }, relativeText(at), el("small", {}, localText(at)),
-    el("small", {}, utcText(at)), el("small", { class: "muted" }, t(human ? "hist_decided" : "hist_held")));
+    el("small", {}, utcText(at)), note ? el("small", { class: "muted" }, note) : null);
 }
 
 function historyCard() {

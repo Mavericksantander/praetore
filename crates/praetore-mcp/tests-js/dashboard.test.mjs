@@ -765,3 +765,30 @@ test("the live caption says how many rows it shows and from when, in each view",
   caption = p.text("live-caption");
   assert.ok(caption.endsWith(`Se muestran las 12 más recientes, desde ${localEs(recent[11].decided_at)}.`), caption);
 });
+
+test("the live list shows when the person decided an approved call, not when it was held", async () => {
+  const state = fixture("pending");
+  const held = state.recent.find((r) => r.decision === "REQUIRE_APPROVAL");
+  assert.ok(held, "the pending fixture has a held call in recent");
+  assert.equal(held.approval_decided_at, null, "the server sends the field, null before a decision");
+  const approved = structuredClone(state);
+  const row = approved.recent.find((r) => r.evidence_id === held.evidence_id);
+  const decidedAt = new Date(Date.parse(row.decided_at) + 7 * 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+  row.approval = "approve by 0123456789abcdef, executed once";
+  row.approval_decided_at = decidedAt;
+  approved.pending = [];
+  const p = page({ hash: "#/live", now: pendingNow() });
+  await p.start(approved);
+  p.byId.get("live-list").listeners.get("click")[0]();
+  const text = p.text("hud-list");
+  assert.ok(text.includes(`${decidedAt.slice(0, 19).replace("T", " ")} UTC`), text);
+  assert.ok(!text.includes(`${held.decided_at.slice(0, 19).replace("T", " ")} UTC`), "the held receipt's time is not shown");
+  assert.ok(text.includes("hora de la decisión humana"), text);
+  // Before a decision: the time it was held, said so.
+  const q = page({ hash: "#/live", now: pendingNow() });
+  await q.start(state);
+  q.byId.get("live-list").listeners.get("click")[0]();
+  const before = q.text("hud-list");
+  assert.ok(before.includes(`${held.decided_at.slice(0, 19).replace("T", " ")} UTC`), before);
+  assert.ok(before.includes("hora en que se retuvo"), before);
+});

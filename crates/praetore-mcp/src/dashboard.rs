@@ -345,7 +345,7 @@ pub struct Cache {
     verifications: usize,
     /// SHA-256 and header of each report file, by path, kept while the
     /// file has the same stamp.
-    report_files: HashMap<PathBuf, (FileStamp, ReportFile)>,
+    report_files: HashMap<PathBuf, (Vec<FileStamp>, Option<ReportFile>)>,
 }
 
 impl Cache {
@@ -375,12 +375,20 @@ impl Cache {
     pub fn reports(&mut self, home: &Home) -> Value {
         let mut seen = HashMap::new();
         let view = reports_view(home, |path, name| {
-            let stamp = stamp(path);
+            // Whether a PDF is listed depends on its JSON too.
+            let mut stamps = vec![stamp(path)];
+            if let Some(json) = json_of_pdf(name) {
+                stamps.push(stamp(&path.with_file_name(json)));
+            }
             let file = match self.report_files.remove(path) {
-                Some((old, file)) if old == stamp && stamp.meta.is_some() => file,
+                Some((old, file))
+                    if old == stamps && stamps.iter().all(|stamp| stamp.meta.is_some()) =>
+                {
+                    file
+                }
                 _ => ReportFile::read(home, name),
             };
-            seen.insert(path.to_path_buf(), (stamp, file.clone()));
+            seen.insert(path.to_path_buf(), (stamps, file.clone()));
             file
         });
         self.report_files = seen;
@@ -717,28 +725,30 @@ fn percent_decode(text: &str) -> Result<String, String> {
 pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
     let now = OffsetDateTime::now_utc();
     let approval_status = crate::approvals::status_by_evidence(home).unwrap_or_default();
-    let view = |index: usize| receipt_view(&snapshot.lines[index], &approval_status);
+    // A held call carries, once a person decided it, the time of that
+    // decision from the approval journal (not the time of the receipt).
+    let decided_at = crate::approvals::decided_at_by_evidence(home);
+    let view = |index: usize| {
+        let mut row = receipt_view(&snapshot.lines[index], &approval_status);
+        if row["decision"] == "REQUIRE_APPROVAL" {
+            let at = row["evidence_id"]
+                .as_str()
+                .and_then(|id| decided_at.get(id))
+                .cloned();
+            row["approval_decided_at"] = json!(at);
+        }
+        row
+    };
     let newest_first = || (0..snapshot.rows.len()).rev();
     let recent: Vec<Value> = newest_first()
         .filter(|&i| snapshot.rows[i].decision.is_some())
         .take(RECENT)
         .map(view)
         .collect();
-    // Each held call with, when a person decided it, the time of that
-    // decision from the approval journal (not the time of the receipt).
-    let decided_at = crate::approvals::decided_at_by_evidence(home);
     let approval_history: Vec<Value> = newest_first()
         .filter(|&i| snapshot.rows[i].decision == Some("REQUIRE_APPROVAL"))
         .take(APPROVAL_HISTORY)
-        .map(|index| {
-            let mut row = view(index);
-            let at = row["evidence_id"]
-                .as_str()
-                .and_then(|id| decided_at.get(id))
-                .cloned();
-            row["approval_decided_at"] = json!(at);
-            row
-        })
+        .map(view)
         .collect();
     let matching = snapshot.matching(query);
     let receipts: Vec<Value> = matching
@@ -783,7 +793,6 @@ pub const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
 /// A report file opened for reading, with the metadata of the open file.
 struct OpenReport {
     file: fs::File,
-    path: PathBuf,
     len: u64,
 }
 
@@ -794,6 +803,13 @@ enum Refused {
     NotFound,
     /// Over [`MAX_REPORT_BYTES`]: 413.
     TooLarge,
+}
+
+/// Whether an open file may be read as a report: a regular file with a
+/// single link (a hard link to another file of the home, a key for
+/// example, has two), owned by `euid`, the user this process runs as.
+pub fn servable(nlink: u64, uid: u32, euid: u32, is_file: bool) -> bool {
+    is_file && nlink == 1 && uid == euid
 }
 
 /// Opens the report file `name` in `DIR/reports/` if it may be read:
@@ -825,17 +841,17 @@ fn open_report(home: &Home, name: &str) -> Result<OpenReport, Refused> {
     }
     let file = options.open(&path).map_err(|_| Refused::NotFound)?;
     let meta = file.metadata().map_err(|_| Refused::NotFound)?;
-    if !meta.is_file() {
-        return Err(Refused::NotFound);
-    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
+    let may = {
         use std::os::unix::fs::MetadataExt;
         // SAFETY: geteuid takes no arguments and cannot fail.
-        let uid = unsafe { libc::geteuid() };
-        if meta.nlink() != 1 || meta.uid() != uid {
-            return Err(Refused::NotFound);
-        }
+        let euid = unsafe { libc::geteuid() };
+        servable(meta.nlink(), meta.uid(), euid, meta.is_file())
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let may = meta.is_file();
+    if !may {
+        return Err(Refused::NotFound);
     }
     // `reports` (or a directory above it) may be a symlink to somewhere
     // else; the file is read only if it really is in DIR/reports.
@@ -856,7 +872,6 @@ fn open_report(home: &Home, name: &str) -> Result<OpenReport, Refused> {
     }
     Ok(OpenReport {
         file,
-        path: real,
         len: meta.len(),
     })
 }
@@ -875,54 +890,68 @@ impl OpenReport {
     }
 }
 
-/// Whether `bytes` are a session report JSON file: one JSON document whose
-/// `schema` is [`report::SCHEMA`].
-fn is_report_json(bytes: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(bytes)
-        .is_ok_and(|document| document["schema"] == report::SCHEMA)
+/// A report file [`load_report`] accepted.
+struct Report {
+    pdf: bool,
+    body: Vec<u8>,
+    /// The header of a JSON report; `None` for a PDF.
+    header: Option<Value>,
 }
 
-/// The path of the report file `name` in `DIR/reports/`, if
-/// [`open_report`] accepts it.
-pub fn report_path(home: &Home, name: &str) -> Option<PathBuf> {
-    open_report(home, name).ok().map(|open| open.path)
+/// The name of the JSON file next to the PDF `name`; `None` for a JSON.
+fn json_of_pdf(name: &str) -> Option<String> {
+    name.strip_suffix(".pdf").map(|stem| format!("{stem}.json"))
 }
 
-/// `GET /reports/<name>`: the report file as a download, 404, or 413 when
-/// it is over [`MAX_REPORT_BYTES`]. A JSON file must be a session report
-/// (its `schema`); a PDF must start with `%PDF` and have its JSON next to
-/// it.
-fn serve_report(home: &Home, name: &str) -> Response {
-    let not_found = || Response::text(404, "no such report");
-    let Some(parsed) = report::parse_report_name(name) else {
-        return not_found();
-    };
-    let open = match open_report(home, name) {
-        Ok(open) => open,
-        Err(Refused::TooLarge) => return Response::text(413, "report too large"),
-        Err(Refused::NotFound) => return not_found(),
-    };
-    let Ok(body) = open.read_all() else {
-        return not_found();
-    };
-    let is_report = if parsed.pdf {
-        let sibling = format!("{}.json", name.strip_suffix(".pdf").unwrap_or(name));
-        body.starts_with(b"%PDF") && open_report(home, &sibling).is_ok()
-    } else {
-        is_report_json(&body)
-    };
-    if !is_report {
-        return not_found();
+/// The report file `name`, if the dashboard lists and serves it: it passes
+/// [`open_report`] and its content is a report. A JSON file is one JSON
+/// document whose `schema` is [`report::SCHEMA`], with a `header` object; a
+/// PDF starts with `%PDF` and the JSON next to it is accepted too. The
+/// Sessions view ([`reports_view`]) and `GET /reports/` ([`serve_report`])
+/// both take their files from here, so every file listed downloads.
+fn load_report(home: &Home, name: &str) -> Result<Report, Refused> {
+    let body = open_report(home, name)?
+        .read_all()
+        .map_err(|_| Refused::NotFound)?;
+    if let Some(json) = json_of_pdf(name) {
+        return if body.starts_with(b"%PDF") && load_report(home, &json).is_ok() {
+            Ok(Report {
+                pdf: true,
+                body,
+                header: None,
+            })
+        } else {
+            Err(Refused::NotFound)
+        };
     }
+    let document: Value = serde_json::from_slice(&body).map_err(|_| Refused::NotFound)?;
+    if document["schema"] != report::SCHEMA || !document["header"].is_object() {
+        return Err(Refused::NotFound);
+    }
+    Ok(Report {
+        pdf: false,
+        header: Some(document["header"].clone()),
+        body,
+    })
+}
+
+/// `GET /reports/<name>`: the report file [`load_report`] accepts, as a
+/// download; 413 when it is over [`MAX_REPORT_BYTES`], 404 otherwise.
+fn serve_report(home: &Home, name: &str) -> Response {
+    let report = match load_report(home, name) {
+        Ok(report) => report,
+        Err(Refused::TooLarge) => return Response::text(413, "report too large"),
+        Err(Refused::NotFound) => return Response::text(404, "no such report"),
+    };
     Response {
         status: 200,
-        content_type: if parsed.pdf {
+        content_type: if report.pdf {
             "application/pdf"
         } else {
             "application/json"
         },
-        body,
-        // `name` is only letters, digits, `-` and `.` here.
+        body: report.body,
+        // `name` is a report file name here: letters, digits, `-` and `.`.
         disposition: Some(format!("attachment; filename=\"{name}\"")),
     }
 }
@@ -934,50 +963,18 @@ struct ReportFile {
     /// JSON files only.
     sha256: Option<String>,
     header: Option<Value>,
-    error: Option<String>,
 }
 
 impl ReportFile {
-    fn read(home: &Home, name: &str) -> Self {
-        let open = match open_report(home, name) {
-            Ok(open) => open,
-            Err(Refused::TooLarge) => return Self::failed("over the size limit".into()),
-            Err(Refused::NotFound) => return Self::failed("cannot be read".into()),
-        };
-        if name.ends_with(".pdf") {
-            return Self {
-                bytes: open.len,
-                sha256: None,
-                header: None,
-                error: None,
-            };
-        }
-        match open.read_all() {
-            Ok(bytes) => {
-                let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
-                let header = std::str::from_utf8(first)
-                    .ok()
-                    .and_then(report::header_of_first_line);
-                Self {
-                    bytes: bytes.len() as u64,
-                    sha256: Some(hex::encode(Sha256::digest(&bytes))),
-                    error: header
-                        .is_none()
-                        .then(|| "no session report header".to_owned()),
-                    header,
-                }
-            }
-            Err(error) => Self::failed(error.to_string()),
-        }
-    }
-
-    fn failed(error: String) -> Self {
-        Self {
-            bytes: 0,
-            sha256: None,
-            header: None,
-            error: Some(error),
-        }
+    /// What the view shows of `name`; `None` when [`load_report`] refuses
+    /// it, and then it is not listed.
+    fn read(home: &Home, name: &str) -> Option<Self> {
+        let report = load_report(home, name).ok()?;
+        Some(Self {
+            bytes: report.body.len() as u64,
+            sha256: (!report.pdf).then(|| hex::encode(Sha256::digest(&report.body))),
+            header: report.header,
+        })
     }
 }
 
@@ -985,11 +982,14 @@ impl ReportFile {
 #[derive(Default)]
 struct ReportGroup {
     session_id: String,
-    json: Option<String>,
-    pdf: Option<String>,
+    json: Option<Listed>,
+    pdf: Option<Listed>,
     /// `<now UTC>` of the file name -> (json, pdf).
-    regenerated: BTreeMap<String, (Option<String>, Option<String>)>,
+    regenerated: BTreeMap<String, (Option<Listed>, Option<Listed>)>,
 }
+
+/// A file name in `DIR/reports/` and what [`load_report`] read of it.
+type Listed = (String, ReportFile);
 
 /// The fields of a report header the Sessions view shows.
 fn header_summary(header: &Value) -> Value {
@@ -1014,9 +1014,10 @@ fn header_summary(header: &Value) -> Value {
 /// The session reports in `DIR/reports/`, newest session first. Each item
 /// is a report written at close with its JSON (size and SHA-256) and PDF,
 /// and under it, apart, the pairs `praetore-mcp report` wrote later
-/// (`.regen-`), oldest first. Only files [`report_path`] would serve are
-/// listed. `file` reads one file (cached by [`Cache::reports`]).
-fn reports_view(home: &Home, mut file: impl FnMut(&Path, &str) -> ReportFile) -> Value {
+/// (`.regen-`), oldest first. `file` reads one file (cached by
+/// [`Cache::reports`]) and is `None` for a file [`load_report`] refuses,
+/// which is left out: every file listed downloads.
+fn reports_view(home: &Home, mut file: impl FnMut(&Path, &str) -> Option<ReportFile>) -> Value {
     let Ok(root) = home.root.canonicalize() else {
         return json!({"items": [], "error": null});
     };
@@ -1038,9 +1039,9 @@ fn reports_view(home: &Home, mut file: impl FnMut(&Path, &str) -> ReportFile) ->
         let Some(parsed) = report::parse_report_name(&name) else {
             continue;
         };
-        if report_path(home, &name).is_none() {
+        let Some(read) = file(&dir.join(&name), &name) else {
             continue;
-        }
+        };
         let group = groups.entry(parsed.close_stem.clone()).or_default();
         group.session_id = parsed.session_id.clone();
         let slot = match &parsed.regenerated_at {
@@ -1050,29 +1051,20 @@ fn reports_view(home: &Home, mut file: impl FnMut(&Path, &str) -> ReportFile) ->
                 (&mut pair.0, &mut pair.1)
             }
         };
+        let listed = Some((name, read));
         if parsed.pdf {
-            *slot.1 = Some(name);
+            *slot.1 = listed;
         } else {
-            *slot.0 = Some(name);
+            *slot.0 = listed;
         }
     }
-    let mut describe = |json_name: &Option<String>, pdf_name: &Option<String>| {
-        let json_file = json_name
-            .as_ref()
-            .map(|name| (name, file(&dir.join(name), name)));
-        let pdf_file = pdf_name
-            .as_ref()
-            .map(|name| (name, file(&dir.join(name), name)));
-        let header = json_file
-            .as_ref()
-            .and_then(|(_, f)| f.header.as_ref())
-            .map(header_summary);
+    let describe = |json: &Option<Listed>, pdf: &Option<Listed>| {
         json!({
-            "header": header,
-            "json": json_file.map(|(name, f)| json!({
-                "name": name, "bytes": f.bytes, "sha256": f.sha256, "error": f.error,
+            "header": json.as_ref().and_then(|(_, f)| f.header.as_ref()).map(header_summary),
+            "json": json.as_ref().map(|(name, f)| json!({
+                "name": name, "bytes": f.bytes, "sha256": f.sha256,
             })),
-            "pdf": pdf_file.map(|(name, f)| json!({"name": name, "bytes": f.bytes})),
+            "pdf": pdf.as_ref().map(|(name, f)| json!({"name": name, "bytes": f.bytes})),
         })
     };
     let items: Vec<Value> = groups
