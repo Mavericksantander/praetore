@@ -92,7 +92,7 @@ const I18N = {
     tools_title: "Herramientas más usadas", tools_sub: "Llamadas por herramienta",
     empty_recent: "Todavía no hay actividad.",
     d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pidió aprobación",
-    ap_pending: "Esperando decisión", ap_held: "Retenida (sin decisión)", ap_approve: "Aprobada",
+    ap_pending: "Esperando decisión", ap_expired: "Vencida", ap_held: "Retenida (sin decisión)", ap_approve: "Aprobada",
     ap_reject: "Rechazada", ap_executed: "Ejecutada tras aprobación", ap_would: "En enforce pediría aprobación",
     pend_none_t: "Nada pendiente.", pend_none_d: "No hay acciones esperando aprobación.",
     agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
@@ -261,7 +261,7 @@ const I18N = {
     tools_title: "Most used tools", tools_sub: "Calls per tool",
     empty_recent: "No activity yet.",
     d_ALLOW: "Allowed", d_DENY: "Blocked", d_REQUIRE_APPROVAL: "Asked for approval",
-    ap_pending: "Waiting for decision", ap_held: "Held (no decision)", ap_approve: "Approved",
+    ap_pending: "Waiting for decision", ap_expired: "Expired", ap_held: "Held (no decision)", ap_approve: "Approved",
     ap_reject: "Rejected", ap_executed: "Executed after approval", ap_would: "Enforce would ask",
     pend_none_t: "Nothing pending.", pend_none_d: "No actions are waiting for approval.",
     agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
@@ -430,7 +430,7 @@ const I18N = {
     tools_title: "Ferramentas mais usadas", tools_sub: "Chamadas por ferramenta",
     empty_recent: "Ainda não há atividade.",
     d_ALLOW: "Permitida", d_DENY: "Bloqueada", d_REQUIRE_APPROVAL: "Pediu aprovação",
-    ap_pending: "Aguardando decisão", ap_held: "Retida (sem decisão)", ap_approve: "Aprovada",
+    ap_pending: "Aguardando decisão", ap_expired: "Vencida", ap_held: "Retida (sem decisão)", ap_approve: "Aprovada",
     ap_reject: "Rejeitada", ap_executed: "Executada após aprovação", ap_would: "Em enforce pediria aprovação",
     pend_none_t: "Nada pendente.", pend_none_d: "Não há ações aguardando aprovação.",
     agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
@@ -681,6 +681,7 @@ function relativeText(iso) {
 function approvalLabel(value) {
   if (!value) return null;
   if (value === "pending") return { text: t("ap_pending"), cls: "warn" };
+  if (value === "expired") return { text: t("ap_expired"), cls: "bad" };
   if (value === "held") return { text: t("ap_held"), cls: "neutral" };
   if (value === "executed once") return { text: t("ap_executed"), cls: "ok" };
   if (value === "enforce would ask") return { text: t("ap_would"), cls: "neutral" };
@@ -775,15 +776,6 @@ function pending() {
   return state && Array.isArray(state.pending) ? state.pending : [];
 }
 
-function isExpired(p) {
-  const at = new Date(p.expires_at).getTime();
-  return !Number.isNaN(at) && at <= Date.now();
-}
-
-// Pending calls that can still be decided.
-function activePending() {
-  return pending().filter((p) => !isExpired(p));
-}
 
 // ---------- shell ----------
 
@@ -808,7 +800,7 @@ function renderShell() {
   }
   for (const name of VIEWS) document.getElementById(`view-${name}`).hidden = name !== view;
   if (!state) return;
-  const count = activePending().length;
+  const count = pending().length;
   const badge = document.getElementById("nav-badge");
   badge.hidden = count === 0;
   badge.textContent = String(count);
@@ -954,8 +946,11 @@ function breakReason(r) {
   return r.verified ? null : t("st_fail");
 }
 
-function pendingIds() {
-  return new Set(activePending().map((p) => p.evidence_id));
+// Whether a receipt is a held call that can still be decided, as the
+// server labels it (approvals::status_by_evidence_at, which also builds the
+// pending list).
+function isWaiting(r) {
+  return r.decision === "REQUIRE_APPROVAL" && r.approval === "pending";
 }
 
 function stat(label, color, value, sub) {
@@ -1001,7 +996,7 @@ function renderHome() {
   const numbers = el("dl", { class: "home-numbers" },
     stat(t("h_allow"), "var(--allow)", String(s.allow)),
     stat(t("h_deny"), "var(--deny)", String(s.deny)),
-    stat(t("h_pending"), "var(--ask)", String(activePending().length), t("h_pending_sub")));
+    stat(t("h_pending"), "var(--ask)", String(pending().length), t("h_pending_sub")));
   root.append(el("div", { class: "home" },
     ident, numbers,
     s.total === 0 ? el("p", { class: "home-empty" }, noReceiptsText()) : null,
@@ -1024,7 +1019,6 @@ function renderHome() {
 const hud = { rows: [], seen: null, frame: 0, readAt: null, geo: null, liveKey: null };
 
 function syncHud() {
-  const pending = pendingIds();
   const rows = state.recent.filter((r) => !r.parse_error).slice(0, LIVE_ROWS);
   const now = performance.now();
   const known = new Map(hud.rows.map((row) => [row.r.evidence_id, row]));
@@ -1033,7 +1027,7 @@ function syncHud() {
   hud.rows = rows.map((r) => {
     const row = known.get(r.evidence_id) || { born: null };
     row.r = r;
-    row.pending = r.decision === "REQUIRE_APPROVAL" && pending.has(r.evidence_id);
+    row.pending = isWaiting(r);
     // What verify said about this receipt, as the server sent it.
     row.cut = breakReason(r);
     const fresh = firstLoad ? false : !hud.seen.has(r.evidence_id);
@@ -1254,12 +1248,11 @@ function hudTime(r) {
 }
 
 function hudList() {
-  const pending = pendingIds();
   const list = el("ul", { class: "feed" });
   for (const r of state.recent) {
     if (r.parse_error) continue;
     const target = targetOf(r.arguments);
-    const waiting = r.decision === "REQUIRE_APPROVAL" && pending.has(r.evidence_id);
+    const waiting = isWaiting(r);
     const cut = breakReason(r);
     const outcome = r.decision === "REQUIRE_APPROVAL" ? approvalLabel(r.approval) : null;
     const cls = outcome ? outcome.cls : decisionClass(r.decision);
@@ -1317,7 +1310,7 @@ function renderLive() {
 
   const root = document.getElementById("live-rest");
   root.replaceChildren();
-  const active = activePending();
+  const active = pending();
   const decide = el("section", { class: "op-section" },
     el("h2", { class: "eyebrow" }, active.length ? t("sec_decide_n", active.length) : t("sec_decide")));
   if (active.length === 0) decide.append(el("p", { class: "calm" }, t("decide_none")));
@@ -1452,7 +1445,7 @@ function drawChain() {
       continue;
     }
     const color = r.decision === "ALLOW" ? c.hud : r.decision === "DENY" ? c.wall : c.ask;
-    const pending = r.decision === "REQUIRE_APPROVAL" && pendingIds().has(r.evidence_id);
+    const pending = isWaiting(r);
     // Node and branch.
     ctx.fillStyle = color;
     ctx.beginPath();

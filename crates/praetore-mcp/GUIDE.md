@@ -306,6 +306,8 @@ before it asks for the code: `this approval expired at 20:34 (local time)
 the new id.` Its exit code is 2, as for every refused `approve`. In the
 dashboard, a call that was approved but not retried before the approval
 expired is marked expired, apart from one that was approved and executed.
+A held call nobody decided before it expired reads Expired (Vencida) in
+every view, and is no longer listed to decide.
 `praetore-mcp reject <id>` records a rejection, and that call is not
 forwarded. A pending call expires after 10 minutes by default. The
 terminal check is cooperative: a process that can act as this user can
@@ -479,8 +481,11 @@ repository or with no `git` on `PATH` takes it from
 `PRAETORE_MCP_BUILD_COMMIT` (7 to 40 hex characters) or has none.
 `praetore-mcp --version` prints the same build version. In CI, the job
 that builds the release archives fails on a tag that is not
-`v<crate version>`, on a tag build whose `--version` is not exactly that
-version, and on any other build whose version has no `-dev+<commit>`.
+`v<crate version>`, on a tag build whose `--version` is not exactly
+`praetore-mcp <crate version>`, on any other build whose `--version` is
+not exactly `praetore-mcp <crate version>-dev+<commit>`, and when the
+binary cannot run on the runner (x86_64 on Apple silicon runs under
+Rosetta 2). The version is read only from what the binary prints.
 
 When the report is written, `wrap` prints where to see it, after its path:
 
