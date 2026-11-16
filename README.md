@@ -69,8 +69,8 @@ flowchart LR
 Requirements: Rust 1.88 or newer and Cargo.
 
 Readers who want a prebuilt `praetore-mcp` binary and no Rust can install
-from the published v0.3.4 release:
-[Install from the v0.3.4 release](docs/install-prebuilt.md).
+from the published v0.3.5 release:
+[Install from the v0.3.5 release](docs/install-prebuilt.md).
 The commands in this Quickstart stay a from-source path.
 
 Run the self-contained example from the repository root:
@@ -116,8 +116,8 @@ hash-linked evidence chain and tamper detection), run `make demo`; see
 ## Install with your AI coding agent
 
 This section is for a person who wants an assistant to install the published
-`praetore-mcp` v0.3.4 binary. The same steps are written out in
-[Install from the v0.3.4 release](docs/install-prebuilt.md). Copy the prompt
+`praetore-mcp` v0.3.5 binary. The same steps are written out in
+[Install from the v0.3.5 release](docs/install-prebuilt.md). Copy the prompt
 below and paste it into the assistant. The assistant should explain every
 step and wait for an explicit yes before it changes anything on the computer.
 When no stdio server is configured, the prompt can add one test filesystem
@@ -128,8 +128,8 @@ approve the held call in your own terminal. The assistant does not run
 `approve`. Each of those waits for its own yes.
 
 The prebuilt binaries come from the published
-[v0.3.4 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4),
-built from commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`. They are not a
+[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5),
+built from commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`. They are not a
 build of the current `main` branch. This install does not use Rust and does
 not clone the repository. On macOS, verification is `praetore-mcp verify`
 only.
@@ -140,11 +140,11 @@ guarantees. It is not a network service; it runs on the person's computer.
 ### Prompt to copy
 
 ```text
-Install praetore-mcp (PRÆTORE) for me from the published v0.3.4 release,
+Install praetore-mcp (PRÆTORE) for me from the published v0.3.5 release,
 without cloning the repository and without installing Rust. The prebuilt
 binaries come from
-https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4
-and were built from commit a606c111d788bfb927a8c5b953e30bf1d8c37421.
+https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5
+and were built from commit b6d668acb8e153a47a9478fe96b92a0c9eafb423.
 They are not a build of the current main branch. Follow these rules exactly.
 If docs/install-prebuilt.md is already on this machine, you may read it.
 Do not clone the repository to get it. The steps below are complete.
@@ -177,12 +177,12 @@ Ground rules
 - Do not install cosign, and do not verify the Sigstore signature, unless
   I ask. That check is optional. The required check is the SHA256 list in
   step 3. If I ask, pass
-  `--certificate-github-workflow-sha a606c111d788bfb927a8c5b953e30bf1d8c37421`
+  `--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
   literally. Do not clone the repository to run `git rev-parse`.
 - Only use commands and flags shown by `praetore-mcp --help` and
   `praetore-mcp <command> --help`. If something you need is not there,
   stop and tell me.
-- v0.3.4 has no Windows binary and no Linux ARM binary, and there is no
+- v0.3.5 has no Windows binary and no Linux ARM binary, and there is no
   brew installer. If this machine is not macOS (Apple silicon or Intel)
   or Linux x86_64, stop and tell me.
 - Never point a filesystem MCP server at my home directory or at a
@@ -191,21 +191,21 @@ Ground rules
 
 Steps
 1. Choose the one archive that matches this machine. Stop if none matches.
-     macOS Apple silicon: praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz
-     macOS Intel:         praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz
-     Linux x86_64:        praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
+     macOS Apple silicon: praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz
+     macOS Intel:         praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz
+     Linux x86_64:        praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
 2. In a directory under my home, download SHA256SUMS and that one archive
    from
-   https://github.com/Mavericksantander/praetore/releases/download/v0.3.4/
+   https://github.com/Mavericksantander/praetore/releases/download/v0.3.5/
    Do not download the other archives. Do not download praetore-verify.
 3. Check the archive against SHA256SUMS before you open it.
    On macOS:  shasum -a 256 -c SHA256SUMS --ignore-missing
    On Linux:  sha256sum -c SHA256SUMS --ignore-missing
    The published SHA256SUMS is:
-     1e29d46c47dbec7289d9b8291dfd79f13f4ac516c0319a474fbdad03899fafe0  praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz
-     d8e539e96217238318643f3bdf283c68b5b2492b62facf5d8fbf273c928195bb  praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz
-     7a7ae8c683f5aff6de204d03675f3bf5622b6fd733cf9c28eb992a6c222839ad  praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
-     31114a527f3d221c66abe0acf29ea4eafb2158aeb1978707c42a3d395d634916  praetore-verify
+     e72444786f5e7d84a7c17718b3c1d7cfa247cd9e441f5878502f6f1aba771003  praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz
+     54afcc6256f12257119e89ceac80fa4de108fdf779d2344565156777bd913464  praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz
+     935eb8be2577dcc7619c012f03d70e82aac8afc3a9a413a0f46c5911c45aec7d  praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
+     764af894c4461b659b0c1c60c23fc1b3922a5d17a306082da8abc04a712cda37  praetore-verify
    The praetore-verify line is there so you can recognize the file. Do not
    download that binary. Show me the check output. If the archive line is
    not OK, or if SHA256SUMS does not match this list, stop. Do not clear a
@@ -227,7 +227,7 @@ Steps
    ~/.local/bin, run `xattr -d com.apple.quarantine praetore-mcp` again.
    If ~/.local/bin is not on PATH, add it for my user shell only. Show me
    `command -v praetore-mcp` and `praetore-mcp --version`. The version line
-   must be `praetore-mcp 0.3.4`, and the command must be
+   must be `praetore-mcp 0.3.5`, and the command must be
    ~/.local/bin/praetore-mcp. If either check fails, stop.
 7. Run `praetore-mcp init`. Show me the files it created and explain them.
    Do not print private keys.
@@ -375,8 +375,8 @@ Steps
 Before you approve any step, the assistant should explain these points in
 plain language:
 
-- **Where the binary comes from.** The published v0.3.4 release, built from
-  commit `a606c111d788bfb927a8c5b953e30bf1d8c37421`, checked against
+- **Where the binary comes from.** The published v0.3.5 release, built from
+  commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`, checked against
   `SHA256SUMS`. It is not a build of the current `main` branch.
 - **What it is.** `praetore-mcp` sits on this computer, between the client
   and its MCP servers, and records a signed receipt for each governed call.
@@ -396,7 +396,7 @@ plain language:
   empty. It does not mean a server was wrapped. On macOS, do not download
   or run the release's `praetore-verify` binary. It is a Linux ELF x86_64
   file. The Sigstore check of `SHA256SUMS` is optional and needs `cosign`.
-  For v0.3.4 the workflow commit is the literal value in the prompt. The
+  For v0.3.5 the workflow commit is the literal value in the prompt. The
   required check is the SHA256 list. The v0.3.3 `praetore-mcp verify` does
   not read 0.3.4 receipts. A 0.3.4 journal line is
   `{"seq","prev","evidence"}`. v0.3.3 reads each line as a bare evidence
@@ -438,7 +438,7 @@ plain language:
   config can remove the wrapper.
 - **macOS.** The binaries are not signed or notarized. After the checksum,
   the quarantine command is `xattr -d com.apple.quarantine praetore-mcp`.
-- **Platforms.** v0.3.4 has no Windows binary and no Linux ARM binary, and
+- **Platforms.** v0.3.5 has no Windows binary and no Linux ARM binary, and
   there is no brew installer.
 - **Where things live.** The program is `~/.local/bin/praetore-mcp`. Keys,
   policy and receipts are in `~/.praetore/mcp` (or `$PRAETORE_MCP_HOME`).
@@ -915,7 +915,7 @@ is not a production deployment or an external-agent integration.
 
 ## Documentation
 
-* [Install `praetore-mcp` from the v0.3.4 release (no Rust)](docs/install-prebuilt.md)
+* [Install `praetore-mcp` from the v0.3.5 release (no Rust)](docs/install-prebuilt.md)
 * [Policy language and evaluation semantics](docs/policy-language.md)
 * [Crypto, canonical encoding, and mode semantics](docs/crypto-and-policy.md)
 * [Threat model and residual risks](docs/threat-model.md)

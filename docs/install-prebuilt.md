@@ -1,9 +1,9 @@
-# Install praetore-mcp from the published v0.3.4 release
+# Install praetore-mcp from the published v0.3.5 release
 
 This page installs the `praetore-mcp` binary from the published
-[v0.3.4 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.4).
+[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5).
 That release was built from commit
-`a606c111d788bfb927a8c5b953e30bf1d8c37421`. It is not a build of the
+`b6d668acb8e153a47a9478fe96b92a0c9eafb423`. It is not a build of the
 current `main` branch. You do not clone the repository, and you do not
 install Rust.
 
@@ -18,14 +18,14 @@ on macOS.
 
 ## Which archive
 
-Download one archive from the release. v0.3.4 has no Windows binary, no
+Download one archive from the release. v0.3.5 has no Windows binary, no
 Linux ARM binary, and no brew installer.
 
 | Machine | Archive |
 | --- | --- |
-| macOS Apple silicon | `praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz` |
 
 The Linux archive is the `x86_64-unknown-linux-gnu` build from that release.
 It was built on GitHub's `ubuntu-latest` runner and needs a glibc at least
@@ -41,18 +41,18 @@ you unpack it. These are the published digests. If the downloaded
 `SHA256SUMS` does not match this list, stop.
 
 ```text
-1e29d46c47dbec7289d9b8291dfd79f13f4ac516c0319a474fbdad03899fafe0  praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz
-d8e539e96217238318643f3bdf283c68b5b2492b62facf5d8fbf273c928195bb  praetore-mcp-v0.3.4-x86_64-apple-darwin.tar.gz
-7a7ae8c683f5aff6de204d03675f3bf5622b6fd733cf9c28eb992a6c222839ad  praetore-mcp-v0.3.4-x86_64-unknown-linux-gnu.tar.gz
-31114a527f3d221c66abe0acf29ea4eafb2158aeb1978707c42a3d395d634916  praetore-verify
+e72444786f5e7d84a7c17718b3c1d7cfa247cd9e441f5878502f6f1aba771003  praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz
+54afcc6256f12257119e89ceac80fa4de108fdf779d2344565156777bd913464  praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz
+935eb8be2577dcc7619c012f03d70e82aac8afc3a9a413a0f46c5911c45aec7d  praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz
+764af894c4461b659b0c1c60c23fc1b3922a5d17a306082da8abc04a712cda37  praetore-verify
 ```
 
 The `praetore-verify` line is part of the published file. This install does
 not use that binary. Do not download or run it on macOS.
 
 The release also includes `SHA256SUMS.sigstore.json`. Checking that
-signature is optional for this install. It needs `cosign`. For v0.3.4,
-pass `--certificate-github-workflow-sha a606c111d788bfb927a8c5b953e30bf1d8c37421`
+signature is optional for this install. It needs `cosign`. For v0.3.5,
+pass `--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
 so the check does not need a clone (`git rev-parse` does). What the
 signature proves is described in
 [Release artifact integrity](operations.md#release-artifact-integrity).
@@ -64,11 +64,11 @@ Replace the archive name in the example with the one for your machine.
 The example uses the Apple silicon archive. Do not use `sudo`.
 
 ```sh
-mkdir -p "$HOME/praetore-v0.3.4"
-cd "$HOME/praetore-v0.3.4"
-base=https://github.com/Mavericksantander/praetore/releases/download/v0.3.4
+mkdir -p "$HOME/praetore-v0.3.5"
+cd "$HOME/praetore-v0.3.5"
+base=https://github.com/Mavericksantander/praetore/releases/download/v0.3.5
 curl -fsSL -O "$base/SHA256SUMS"
-curl -fsSL -O "$base/praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz"
+curl -fsSL -O "$base/praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz"
 ```
 
 On macOS:
@@ -87,8 +87,8 @@ The line for your archive must say `OK`. If it does not, stop. Do not clear
 a quarantine attribute, and do not copy the binary.
 
 ```sh
-tar -xzf praetore-mcp-v0.3.4-aarch64-apple-darwin.tar.gz
-cd praetore-mcp-v0.3.4-aarch64-apple-darwin
+tar -xzf praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz
+cd praetore-mcp-v0.3.5-aarch64-apple-darwin
 ```
 
 On macOS, after the checksum matches, clear the quarantine attribute on the
@@ -135,7 +135,7 @@ praetore-mcp --version
 ```
 
 `command -v` should print `$HOME/.local/bin/praetore-mcp`. The version line
-should be `praetore-mcp 0.3.4`. If either check fails, stop.
+should be `praetore-mcp 0.3.5`. If either check fails, stop.
 
 ```sh
 praetore-mcp init
@@ -317,7 +317,7 @@ install or upgrade Node.
 - This is pre-release software, not independently audited, with no security
   guarantees. It is not a network service; it runs on the person's computer.
 - macOS binaries are not signed or notarized.
-- v0.3.4 has no Windows binary, no Linux ARM binary, and no brew installer.
+- v0.3.5 has no Windows binary, no Linux ARM binary, and no brew installer.
 - Enforcement is still cooperative (someone who can edit the client config
   can remove the wrapper).
 - `praetore-mcp verify` checks this installation's receipt journal
