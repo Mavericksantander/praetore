@@ -477,6 +477,8 @@ fn approval_rows(
         if !ids.contains(pending.evidence_id.as_str()) {
             continue;
         }
+        #[expect(clippy::disallowed_methods, reason = "display only")]
+        let at = pending.expiry.at();
         rows.push(ApprovalRow {
             approval_id: pending.approval_id,
             tool: pending.tool,
@@ -486,7 +488,7 @@ fn approval_rows(
                 ApprovalStatus::Pending
             },
             approver: None,
-            at: pending.expiry.at(),
+            at,
             used_at: None,
             used_here: false,
         });

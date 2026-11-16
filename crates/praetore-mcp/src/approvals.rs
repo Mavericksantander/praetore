@@ -103,7 +103,6 @@ pub struct PendingInfo {
 }
 
 /// The `expires_at` of a pending call, read once with the pending file.
-/// Whether it has passed is asked only through [`Expiry::is_expired_at`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expiry {
     text: String,
@@ -124,6 +123,7 @@ impl Expiry {
     }
 
     /// The time, to show it; `None` when `expires_at` is not RFC 3339.
+    /// `clippy.toml` refuses a call to it unless it is marked display only.
     pub fn at(&self) -> Option<OffsetDateTime> {
         self.at
     }
@@ -301,6 +301,7 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
 
 /// Why `approve` or `reject` of an expired pending call signs nothing, and
 /// what to do next.
+#[expect(clippy::disallowed_methods, reason = "display only")]
 pub fn expired_message(approval_id: &str, expiry: &Expiry, outcome: HumanOutcome) -> String {
     let at = expiry.at().map_or_else(
         || format!("an unreadable time ({:?})", expiry.text()),
@@ -1041,6 +1042,7 @@ fn pending_info(value: &Value) -> Result<PendingInfo, String> {
     })
 }
 
+#[expect(clippy::disallowed_methods, reason = "display only")]
 fn hold_message(home: &Home, pending: &PendingInfo) -> String {
     let commands = DecisionCommands::new(home, &pending.approval_id);
     let expires = pending
