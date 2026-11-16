@@ -2,7 +2,8 @@
 # Rebuilds the /api/state fixtures used by the dashboard page tests from
 # real homes: `init`, a policy, calls through `wrap` to the test MCP
 # server, then the state the dashboard serves. The temporary home path is
-# replaced by /home/user/.praetore/mcp.
+# replaced by /home/user/.praetore/mcp, and the binary's path (in the
+# approve and reject commands) by /home/user/.local/bin/praetore-mcp.
 #
 # From the repository root:
 #   cargo build -p praetore-mcp --examples
@@ -14,6 +15,7 @@ OUT=crates/praetore-mcp/tests-js/fixtures
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 REAL=$(cd "$WORK" && pwd -P)
+EXE=$(cd "$(dirname "$BIN")" && pwd -P)/$(basename "$BIN")
 
 init_line='{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fixture","version":"0"}}}'
 call() { printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$1" "$2" "$3"; }
@@ -49,7 +51,8 @@ dump() {
     sleep 0.3
   done
   curl -fsS "http://127.0.0.1:$port/api/state$query" |
-    sed -e "s|$REAL/$1|/home/user/.praetore/mcp|g" -e "s|$WORK/$1|/home/user/.praetore/mcp|g" >"$OUT/$name.json"
+    sed -e "s|$REAL/$1|/home/user/.praetore/mcp|g" -e "s|$WORK/$1|/home/user/.praetore/mcp|g" \
+      -e "s|$EXE|/home/user/.local/bin/praetore-mcp|g" >"$OUT/$name.json"
   kill "$pid"
   wait "$pid" 2>/dev/null || true
 }

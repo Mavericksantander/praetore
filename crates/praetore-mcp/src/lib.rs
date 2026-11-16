@@ -4,6 +4,7 @@
 
 pub mod approvals;
 pub mod cli;
+pub mod commands;
 pub mod coverage;
 pub mod dashboard;
 pub mod fsutil;
@@ -16,3 +17,4 @@ pub mod proxy;
 pub mod receipts;
 pub mod relay;
 pub mod store;
+pub mod when;
