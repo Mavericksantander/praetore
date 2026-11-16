@@ -1307,12 +1307,12 @@ fn wrap_filtered_env(home: &Home, input: &str, env: &[(&str, &str)]) -> Output {
         command.env(key, value);
     }
     let mut child = command.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Ok(()) => {}
+        // `wrap` refuses to start before it reads stdin (bad TTL).
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("write stdin: {error}"),
+    }
     child.wait_with_output().unwrap()
 }
 
@@ -1408,7 +1408,14 @@ fn a_bad_approval_ttl_stops_wrap_at_startup() {
             .map(|value| ("PRAETORE_MCP_APPROVAL_TTL_SECONDS", value))
             .into_iter()
             .collect();
-        let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &env);
+        // More than a pipe buffer: `wrap` exits before reading it, so the
+        // write always meets a closed pipe, as it did on a CI runner.
+        let padded = format!(
+            "{}{}",
+            session(echo(7, json!({"n": 1}))),
+            "\n".repeat(1 << 20)
+        );
+        let out = wrap_filtered_env(&home, &padded, &env);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{text:?} {env:?}: {stderr}");
         assert!(out.stdout.is_empty(), "{text:?}: the server answered");
