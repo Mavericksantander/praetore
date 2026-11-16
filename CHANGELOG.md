@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **praetore-mcp: a full disk no longer leaves a cut line in the receipts
+  journal.** Each receipt is one `write` of the JSON line plus its newline,
+  then an fsync. If that write is short or fails, the file is truncated
+  back to its previous length and the error is returned: the receipt is
+  not persisted, and `verify` does not fail with `not JSON` on a tail left
+  by `ENOSPC`.
+
 ## 0.3.5 - 2026-11-15
 
 praetore-mcp: `init` writes a default-deny policy (no

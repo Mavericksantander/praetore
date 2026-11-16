@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -1254,6 +1254,8 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
 
 /// Hash-linked JSONL journal: `receipts/<UTC date>.jsonl`, one chained
 /// entry per line (see [`crate::journal`]), fsynced after each write.
+/// A short or failed write is truncated back to the previous length, so
+/// a full disk does not leave a cut line.
 pub struct Journal {
     dir: PathBuf,
 }
@@ -1298,7 +1300,38 @@ impl Journal {
     }
 }
 
-fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// A file the receipts journal can append one line to.
+///
+/// [`std::fs::File`] is the production writer. Tests supply a writer that
+/// accepts a few bytes and then reports a full disk: a short count, or
+/// `ENOSPC` after the file has already grown. That is what `write(2)` does
+/// when the current block still has room and the next one cannot be allocated.
+trait JournalWriter {
+    fn len(&self) -> io::Result<u64>;
+    fn write_bytes(&mut self, buf: &[u8]) -> io::Result<usize>;
+    fn sync_data(&mut self) -> io::Result<()>;
+    fn set_len(&mut self, len: u64) -> io::Result<()>;
+}
+
+impl JournalWriter for fs::File {
+    fn len(&self) -> io::Result<u64> {
+        Ok(self.metadata()?.len())
+    }
+
+    fn write_bytes(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Write::write(self, buf)
+    }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        fs::File::sync_data(self)
+    }
+
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        fs::File::set_len(self, len)
+    }
+}
+
+fn append_line(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut options = fs::OpenOptions::new();
     options.append(true);
     #[cfg(unix)]
@@ -1312,19 +1345,79 @@ fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // directory too, or a crash could lose the file with its receipts.
     let (mut file, created) = match options.open(path) {
         Ok(file) => (file, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             (options.create_new(true).open(path)?, true)
         }
         Err(error) => return Err(error),
     };
-    // One write per line; the journal lock keeps concurrent wrappers (one
-    // per server) from interleaving.
-    file.write_all(bytes)?;
-    file.sync_data()?;
+    // The journal lock keeps concurrent wrappers (one per server) from
+    // interleaving. `bytes` is one chained line, newline included.
+    commit_journal_line(&mut file, bytes)?;
     if created && let Some(dir) = path.parent() {
         crate::fsutil::sync_dir(dir)?;
     }
     Ok(())
+}
+
+/// Writes `bytes` (one journal line, including its trailing newline) with a
+/// single `write`, then fsyncs.
+///
+/// A short count or a write error is rolled back to the length from before
+/// this attempt, and that truncation is fsynced. The returned error means
+/// the line was not persisted. `write(2)` on a full disk returns a short
+/// count once the current block is full; `write_all` would stop on the
+/// next `ENOSPC` and leave that prefix in the file, which `verify` then
+/// reads (`str::lines` keeps a tail with no newline) and rejects as
+/// `not JSON`.
+///
+/// Truncating here, rather than teaching `verify` to skip a tail with no
+/// newline, is what keeps the journal appendable. A torn tail still blocks
+/// the next append and fails `verify`: that remains the signal for a crash
+/// in the window between the short write and this truncate. Ignoring it
+/// would hide that crash and would disagree with the checks that already
+/// treat a cut line as damage.
+///
+/// An `fsync` error after a complete write is returned as-is and does not
+/// truncate. The line is whole, so `verify` can read it; dropping it would
+/// discard a receipt the kernel has accepted.
+fn commit_journal_line(file: &mut impl JournalWriter, bytes: &[u8]) -> io::Result<()> {
+    let previous_len = file.len()?;
+    let written = write_once(file, bytes);
+    if matches!(written, Ok(n) if n == bytes.len()) {
+        return file.sync_data();
+    }
+    let write_error = match written {
+        Ok(n) => io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!("short write ({n} of {} bytes)", bytes.len()),
+        ),
+        Err(error) => error,
+    };
+    match restore_journal_len(file, previous_len) {
+        Ok(()) => Err(write_error),
+        Err(rollback) => Err(io::Error::new(
+            write_error.kind(),
+            format!(
+                "{write_error}; failed to restore the journal to {previous_len} bytes: {rollback}"
+            ),
+        )),
+    }
+}
+
+/// One `write` of the whole line. `Interrupted` before any byte is written
+/// is retried; a short count is returned to the caller, which rolls it back.
+fn write_once(file: &mut impl JournalWriter, bytes: &[u8]) -> io::Result<usize> {
+    loop {
+        match file.write_bytes(bytes) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            other => return other,
+        }
+    }
+}
+
+fn restore_journal_len(file: &mut impl JournalWriter, previous_len: u64) -> io::Result<()> {
+    file.set_len(previous_len)?;
+    file.sync_data()
 }
 
 #[cfg(test)]
@@ -2696,6 +2789,154 @@ mod tests {
             assert!(append_line(&link, b"z\n").is_err());
             assert_eq!(fs::read(&path).unwrap(), b"x\ny\n");
         }
+    }
+
+    /// Writer that fills up the way a full filesystem does: `room` bytes are
+    /// stored, then the call either returns that short count or `ENOSPC`
+    /// after the file has already grown.
+    struct FullDisk {
+        data: Vec<u8>,
+        room: usize,
+        /// `true`: return `Ok(room)` once `room` is used up. `false`: store
+        /// those bytes and return `StorageFull`.
+        short: bool,
+        durable: Vec<u8>,
+    }
+
+    impl JournalWriter for FullDisk {
+        fn len(&self) -> io::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+
+        fn write_bytes(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() <= self.room {
+                self.data.extend_from_slice(buf);
+                self.room -= buf.len();
+                return Ok(buf.len());
+            }
+            let n = self.room;
+            self.data.extend_from_slice(&buf[..n]);
+            self.room = 0;
+            if self.short {
+                Ok(n)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "No space left on device",
+                ))
+            }
+        }
+
+        fn sync_data(&mut self) -> io::Result<()> {
+            self.durable.clone_from(&self.data);
+            Ok(())
+        }
+
+        fn set_len(&mut self, len: u64) -> io::Result<()> {
+            let len = usize::try_from(len).expect("journal length fits usize");
+            if len > self.data.len() {
+                return Err(io::Error::other("refusing to extend a full disk"));
+            }
+            self.data.truncate(len);
+            Ok(())
+        }
+    }
+
+    /// A full disk must not leave a cut JSON line. `verify` reads that tail
+    /// with `str::lines` (a final newline is optional) and reports `not JSON`.
+    /// The failed receipt is not persisted: the writer is restored to the
+    /// previous complete line and the call returns an error.
+    #[test]
+    fn enospc_does_not_persist_a_cut_json_line() {
+        let (_temp, root) = canonical_tempdir();
+        let home = Home::new(root.join("home"));
+        store::init(&home).unwrap();
+        let gate = Gate::load(&home, Mode::Observe).unwrap();
+        let evidence = gate
+            .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 1}}))
+            .unwrap();
+        let path = gate.journal.append(&evidence).unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(
+            original.ends_with(b"\n"),
+            "a persisted receipt ends on a line"
+        );
+        let persisted = String::from_utf8(original.clone()).unwrap();
+        crate::journal::parse_line(persisted.lines().next_back().unwrap()).unwrap();
+
+        let line = format!(
+            "{{\"seq\":1,\"prev\":\"{}\",\"evidence\":{}}}\n",
+            "ab".repeat(32),
+            "x".repeat(180)
+        );
+        let torn: Vec<u8> = original
+            .iter()
+            .copied()
+            .chain(line.bytes().take(20))
+            .collect();
+        let torn_text = String::from_utf8(torn).unwrap();
+        let torn_line = torn_text.lines().next_back().unwrap();
+        let torn_error = crate::journal::parse_line(torn_line).unwrap_err();
+        assert!(
+            torn_error.contains("not JSON"),
+            "a 20-byte tail is the failure verify reports, got {torn_error}"
+        );
+
+        for short in [true, false] {
+            let mut writer = FullDisk {
+                data: original.clone(),
+                room: 20,
+                short,
+                durable: Vec::new(),
+            };
+            let error = commit_journal_line(&mut writer, line.as_bytes()).unwrap_err();
+            let tail =
+                String::from_utf8_lossy(&writer.data[writer.data.len().saturating_sub(48)..]);
+            assert!(
+                writer.data == original,
+                "short={short}: cut line left in the journal ({} bytes, was {}), tail {tail}",
+                writer.data.len(),
+                original.len()
+            );
+            assert_eq!(
+                writer.durable, original,
+                "short={short}: durable image is not the last complete line"
+            );
+            assert!(
+                writer.data.ends_with(b"\n"),
+                "short={short}: journal no longer ends on a line"
+            );
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::StorageFull,
+                "short={short}: {error}"
+            );
+            // The journal still accepts a later line. The failed one is absent.
+            writer.room = usize::MAX;
+            commit_journal_line(&mut writer, b"{\"seq\":2}\n").unwrap();
+            assert_eq!(&writer.data[..original.len()], original.as_slice());
+            assert!(writer.data.ends_with(b"{\"seq\":2}\n"));
+            assert!(
+                !writer
+                    .data
+                    .windows(line.len())
+                    .any(|chunk| chunk == line.as_bytes())
+            );
+        }
+
+        // Nothing was written after the real receipt.
+        assert_eq!(fs::read(&path).unwrap(), original);
+        let report = crate::receipts::verify_journal(&home, None).unwrap();
+        assert!(
+            report
+                .failures
+                .iter()
+                .all(|failure| !failure.contains("not JSON")),
+            "{:?}",
+            report.failures
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.ok, 1);
     }
 
     #[test]
