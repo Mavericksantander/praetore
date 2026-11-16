@@ -1096,29 +1096,36 @@ fn expiry_is_strictly_after_expires_at_whatever_the_offset() {
 }
 
 /// The same call held again after its pending call expired gets a new
-/// approval id: an expired pending call is not reused.
+/// approval id: an expired pending call is not reused, whether its
+/// `expires_at` is a past time or cannot be read.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_same_call_after_its_pending_call_expired_is_held_with_a_new_id() {
     let (_temp, home) = init_home();
     require_echo(&home);
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
-    let first = approval_id_from(tool_text(by_id(&responses, 7)));
+    let mut current = approval_id_from(tool_text(by_id(&responses, 7)));
     // Held again while it is still open: the same id.
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
-    assert_eq!(approval_id_from(tool_text(by_id(&responses, 8))), first);
-    let path = home
-        .root
-        .join("approvals")
-        .join("pending")
-        .join(format!("{first}.json"));
-    let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    pending["expires_at"] = json!("2000-01-01T00:00:00Z");
-    fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
-    let (responses, _, _) = wrap(&home, "enforce", &session(echo(9, json!({"n": 1}))), &[]);
-    let second = approval_id_from(tool_text(by_id(&responses, 9)));
-    assert_ne!(second, first, "an expired pending call was reused");
-    assert!(home.approvals_pending(&second));
+    assert_eq!(approval_id_from(tool_text(by_id(&responses, 8))), current);
+    for (id, expires_at) in [(9, "2000-01-01T00:00:00Z"), (10, "not a time")] {
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{current}.json"));
+        let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        pending["expires_at"] = json!(expires_at);
+        fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(id, json!({"n": 1}))), &[]);
+        let next = approval_id_from(tool_text(by_id(&responses, id)));
+        assert_ne!(
+            next, current,
+            "{expires_at}: an expired pending call was reused"
+        );
+        assert!(home.approvals_pending(&next), "{expires_at}");
+        current = next;
+    }
 }
 
 /// `approve` on a terminal for a pending call whose `expires_at` cannot be
