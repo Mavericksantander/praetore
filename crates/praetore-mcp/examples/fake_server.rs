@@ -2,7 +2,9 @@
 //!
 //! Tools: `echo` (returns its arguments), `delete_file` (pretends to
 //! delete `arguments.path`) and `append` (really appends `arguments.text` to
-//! `arguments.path`, for path-alias tests). Every executed tools/call is also logged to
+//! `arguments.path`, for path-alias tests). An unlisted `write_text` call
+//! does exactly what `append` does, for the evasion test of one tool used for
+//! another's effect (tests/evasion.rs). Every executed tools/call is also logged to
 //! stderr as `fake_server: EXECUTED <tool>` so tests can see what ran.
 //!
 //! For `policy coverage` tests:
@@ -108,7 +110,7 @@ fn main() {
             Some("tools/call") => {
                 let name = message["params"]["name"].as_str().unwrap_or("?").to_owned();
                 eprintln!("fake_server: EXECUTED {name}");
-                if name == "append" {
+                if name == "append" || name == "write_text" {
                     let arguments = &message["params"]["arguments"];
                     let path = arguments["path"].as_str().unwrap_or_default();
                     let text = arguments["text"].as_str().unwrap_or_default();
