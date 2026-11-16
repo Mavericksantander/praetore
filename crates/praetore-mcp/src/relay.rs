@@ -101,6 +101,9 @@ mod signals {
 
     static PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
     static RECEIVED: AtomicU32 = AtomicU32::new(0);
+    /// The first signal received, 0 for none. Set in the handler, so a
+    /// signal is seen even when its byte is still in the pipe.
+    static FIRST: AtomicI32 = AtomicI32::new(0);
 
     #[cfg(target_os = "linux")]
     fn errno_location() -> *mut libc::c_int {
@@ -129,6 +132,7 @@ mod signals {
                 libc::raise(signal);
             }
         } else {
+            FIRST.store(signal, Ordering::SeqCst);
             let fd = PIPE_WRITE.load(Ordering::Relaxed);
             if fd >= 0 {
                 let byte = signal as u8;
@@ -141,6 +145,14 @@ mod signals {
         }
         // SAFETY: as above.
         unsafe { *errno = saved };
+    }
+
+    /// The first SIGINT or SIGTERM the handler received, if any.
+    pub fn first() -> Option<i32> {
+        match FIRST.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
     }
 
     /// Ends the process by `signal` with its default action, so the parent
@@ -210,6 +222,32 @@ mod signals {
             }
         }
     }
+}
+
+/// How often `wrap` checks whether the server exited while it waits for a
+/// server that closed its stdout.
+const EXIT_POLL: Duration = Duration::from_millis(50);
+
+/// Whether the server exits within `limit`.
+fn exits_within(child: &mut std::process::Child, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Passes `signal` on to the server (Linux and macOS).
+fn forward_signal(child: &std::process::Child, signal: i32) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    signals::forward(child.id(), signal);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = (child, signal);
 }
 
 /// Time the server gets to end by itself after a signal before the signal
@@ -525,10 +563,7 @@ pub fn run(options: WrapOptions) -> i32 {
             // itself (a terminal's Ctrl-C reaches it too), then pass the
             // signal on, then stop waiting for it.
             if !matches!(ended.recv_timeout(SIGNAL_GRACE[0]), Ok(End::ServerClosed)) {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                signals::forward(child.id(), signal);
-                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-                let _ = signal;
+                forward_signal(&child, signal);
                 if !matches!(ended.recv_timeout(SIGNAL_GRACE[1]), Ok(End::ServerClosed)) {
                     let _ = child.kill();
                 }
@@ -536,6 +571,30 @@ pub fn run(options: WrapOptions) -> i32 {
         }
         Ok(End::ServerClosed) | Err(_) => {
             let _ = server_to_client.join();
+            // The server closed its stdout but may still be running. Wait
+            // for it while listening for a signal, which then ends it the
+            // same way as above (its stdout is already closed, so the end
+            // is seen by its exit).
+            loop {
+                if !matches!(child.try_wait(), Ok(None)) {
+                    break;
+                }
+                match ended.recv_timeout(EXIT_POLL) {
+                    Ok(End::Signal(signal)) => {
+                        by_signal = Some(signal);
+                        if !exits_within(&mut child, SIGNAL_GRACE[0]) {
+                            forward_signal(&child, signal);
+                            if !exits_within(&mut child, SIGNAL_GRACE[1]) {
+                                let _ = child.kill();
+                            }
+                        }
+                        break;
+                    }
+                    Ok(End::ServerClosed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    // No handler (no report): nothing to listen for.
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
     }
     let status = child.wait();
@@ -546,6 +605,17 @@ pub fn run(options: WrapOptions) -> i32 {
     };
     if options.report {
         write_report(&options, started_at, &log);
+    }
+    // A signal that came while waiting for the server or writing the
+    // report still ends `wrap` by that signal.
+    while let Ok(event) = ended.try_recv() {
+        if let End::Signal(signal) = event {
+            by_signal.get_or_insert(signal);
+        }
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(signal) = signals::first() {
+        by_signal.get_or_insert(signal);
     }
     // Ended by SIGINT or SIGTERM: after the report, end by that signal, so
     // the parent sees what it saw before the report existed.

@@ -644,16 +644,15 @@ fn report_regenerates_a_session_by_id_and_rejects_unknown_ones() {
     }
 }
 
-/// A `wrap` child with one answered call and stdin still open, plus the pid
-/// of its server.
+/// `wrap` for the server `server` (program and arguments), with piped
+/// stdio. SIGINT and SIGTERM are set back to their default action before
+/// the exec: `wrap` keeps an ignored signal ignored, and `cargo test` may
+/// have been started with one ignored.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn wrap_in_session(
-    home: &Home,
-    extra: &[&str],
-) -> (std::process::Child, std::process::ChildStdin, i32) {
-    use std::io::{BufRead, BufReader};
-    let server = fake_server();
-    let mut child = Command::new(bin())
+fn spawn_wrap(home: &Home, extra: &[&str], server: &[&str]) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(bin());
+    command
         .args([
             "wrap",
             "--dir",
@@ -665,17 +664,109 @@ fn wrap_in_session(
         ])
         .args(extra)
         .arg("--")
-        .arg(&server)
+        .args(server)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // SAFETY: the closure runs in the child between fork and exec and only
+    // calls `signal`, `sigemptyset`, `sigaddset` and `sigprocmask`, which
+    // are async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            for signal in [libc::SIGINT, libc::SIGTERM] {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::sigaddset(&raw mut set, signal);
+            }
+            libc::sigprocmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+            Ok(())
+        });
+    }
+    command.spawn().unwrap()
+}
+
+/// Waits for `child` at most `limit`; past it, kills it and fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wait_within(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    what: &str,
+) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}: wrap still running after {limit:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Reads all of `child`'s stderr on a thread, so it never fills.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn stderr_text(child: &mut std::process::Child) -> std::thread::JoinHandle<String> {
+    let mut stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    })
+}
+
+/// The pid of `wrap`'s one child process, its server.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn server_pid(child: &std::process::Child) -> i32 {
+    let pgrep = Command::new("pgrep")
+        .args(["-P", &child.id().to_string()])
+        .output()
         .unwrap();
+    let pids: Vec<i32> = String::from_utf8_lossy(&pgrep.stdout)
+        .split_whitespace()
+        .map(|pid| pid.parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 1, "server pid: {pgrep:?}");
+    pids[0]
+}
+
+/// Sends one `echo` call and waits until its receipt is in the journal,
+/// so `wrap` is past installing its handlers. Returns stdin, still open.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn one_receipt(home: &Home, child: &mut std::process::Child) -> std::process::ChildStdin {
     let mut stdin = child.stdin.take().unwrap();
     stdin
         .write_all(input(&[call(20, "echo", json!({"text": "one"}))]).as_bytes())
         .unwrap();
     stdin.flush().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while receipts::read_journal(home).map_or(0, |lines| lines.len()) == 0 {
+        assert!(std::time::Instant::now() < deadline, "no receipt");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    stdin
+}
+
+/// A `wrap` child of the fake server with one answered call and stdin
+/// still open, its stderr reader, and the pid of its server.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn wrap_in_session(
+    home: &Home,
+    extra: &[&str],
+) -> (
+    std::process::Child,
+    std::process::ChildStdin,
+    std::thread::JoinHandle<String>,
+    i32,
+) {
+    use std::io::{BufRead, BufReader};
+    let server = fake_server();
+    let mut child = spawn_wrap(home, extra, &[server.to_str().unwrap()]);
+    let err = stderr_text(&mut child);
+    let stdin = one_receipt(home, &mut child);
     // Wait for the reply to the call, with stdin still open.
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     loop {
@@ -691,16 +782,8 @@ fn wrap_in_session(
     }
     // Keep draining stdout so wrap never blocks on a full pipe.
     std::thread::spawn(move || std::io::copy(&mut stdout, &mut std::io::sink()));
-    let pgrep = Command::new("pgrep")
-        .args(["-P", &child.id().to_string()])
-        .output()
-        .unwrap();
-    let pids: Vec<i32> = String::from_utf8_lossy(&pgrep.stdout)
-        .split_whitespace()
-        .map(|pid| pid.parse().unwrap())
-        .collect();
-    assert_eq!(pids.len(), 1, "server pid: {pgrep:?}");
-    (child, stdin, pids[0])
+    let server = server_pid(&child);
+    (child, stdin, err, server)
 }
 
 /// `kill(pid, 0)` fails with ESRCH within 10 s.
@@ -735,16 +818,15 @@ fn sigterm_and_sigint_end_wrap_by_the_signal_with_and_without_a_report() {
             let what = format!("signal {signal}, report {report}");
             let (_temp, home) = init_home();
             let extra: &[&str] = if report { &[] } else { &["--no-report"] };
-            let (mut child, stdin, server) = wrap_in_session(&home, extra);
+            let (mut child, stdin, err, server) = wrap_in_session(&home, extra);
             // SAFETY: `kill` takes no pointers; the pid is this test's child.
             assert_eq!(unsafe { libc::kill(child.id() as libc::pid_t, signal) }, 0);
-            let status = child.wait().unwrap();
-            let mut err = String::new();
-            std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err).unwrap();
+            let status = wait_within(&mut child, std::time::Duration::from_secs(10), &what);
             drop(stdin);
-            assert_eq!(status.signal(), Some(signal), "{what}: {status:?} {err}");
+            assert_eq!(status.signal(), Some(signal), "{what}: {status:?}");
             assert_eq!(status.code(), None, "{what}");
             assert_gone(server, &what);
+            let err = err.join().unwrap();
             let reports = json_reports(&home);
             if report {
                 assert!(err.contains("session report:"), "{what}: {err}");
@@ -772,20 +854,96 @@ fn a_second_signal_ends_wrap_without_the_report() {
     use std::os::unix::process::ExitStatusExt;
 
     for signal in [libc::SIGTERM, libc::SIGINT] {
+        let what = format!("signal {signal}, second");
         let (_temp, home) = init_home();
-        let (mut child, stdin, server) = wrap_in_session(&home, &[]);
+        let (mut child, stdin, _err, server) = wrap_in_session(&home, &[]);
         let pid = child.id() as libc::pid_t;
         // SAFETY: `kill` takes no pointers; the pid is this test's child.
         assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
-        let status = child.wait().unwrap();
+        let status = wait_within(&mut child, std::time::Duration::from_secs(10), &what);
         drop(stdin);
-        assert_eq!(status.signal(), Some(signal), "signal {signal}: {status:?}");
-        assert!(!reports_dir(&home).exists(), "signal {signal}");
+        assert_eq!(status.signal(), Some(signal), "{what}: {status:?}");
+        assert!(!reports_dir(&home).exists(), "{what}");
         // The server loses its stdin with wrap and exits too.
-        assert_gone(server, &format!("signal {signal}, second"));
+        assert_gone(server, &what);
     }
+}
+
+/// A server that closes its stdout and keeps running: a SIGTERM to wrap
+/// while it waits for that server still ends the server and then wrap,
+/// by SIGTERM, after the report.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_signal_after_the_server_closed_stdout_still_ends_wrap_by_it() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_temp, home) = init_home();
+    let mut child = spawn_wrap(&home, &[], &["/bin/sh", "-c", "exec >&-; exec sleep 6"]);
+    let err = stderr_text(&mut child);
+    let stdin = one_receipt(&home, &mut child);
+    let server = server_pid(&child);
+    let sent = std::time::Instant::now();
+    // SAFETY: `kill` takes no pointers; the pid is this test's child.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let status = wait_within(
+        &mut child,
+        std::time::Duration::from_secs(3),
+        "closed stdout",
+    );
+    let elapsed = sent.elapsed();
+    drop(stdin);
+    let err = err.join().unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?} {err}");
+    assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
+    assert_gone(server, "closed stdout");
+    assert!(err.contains("session report:"), "{err}");
+    let reports = json_reports(&home);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(
+        document(&reports[0])["header"]["verify"]["result"],
+        "passed"
+    );
+}
+
+/// With `--no-report` no handler is installed: SIGTERM ends wrap at once,
+/// with no grace period, even when the server ignores SIGTERM.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn without_the_report_sigterm_ends_wrap_at_once() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_temp, home) = init_home();
+    let mut child = spawn_wrap(
+        &home,
+        &["--no-report"],
+        &["/bin/sh", "-c", "trap '' TERM INT; exec sleep 30"],
+    );
+    let _err = stderr_text(&mut child);
+    let stdin = one_receipt(&home, &mut child);
+    let server = server_pid(&child);
+    let sent = std::time::Instant::now();
+    // SAFETY: `kill` takes no pointers; the pid is this test's child.
+    assert_eq!(
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    let status = wait_within(&mut child, std::time::Duration::from_secs(5), "no report");
+    let elapsed = sent.elapsed();
+    drop(stdin);
+    // The server ignores SIGTERM and outlives wrap: end it here.
+    // SAFETY: `kill` takes no pointers; the pid is this test's grandchild.
+    unsafe { libc::kill(server, libc::SIGKILL) };
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(200),
+        "wrap took {elapsed:?}"
+    );
+    assert!(!reports_dir(&home).exists());
 }
 
 #[test]
