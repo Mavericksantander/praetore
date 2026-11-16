@@ -102,6 +102,15 @@ pub struct PendingInfo {
     pub evidence_id: String,
 }
 
+impl PendingInfo {
+    /// Whether the call can no longer be decided at `now`: past its
+    /// `expires_at`, or with an `expires_at` that cannot be read. `approve`,
+    /// `reject` and every view of the approval use this one rule.
+    pub fn is_expired_at(&self, now: OffsetDateTime) -> bool {
+        parse_time(&self.expires_at).map_or(true, |expires| now > expires)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Decided {
     pub approval_id: String,
@@ -313,7 +322,7 @@ pub fn decide(
         }
         let now = now_utc()?;
         let expires = parse_time(&info.expires_at)?;
-        if now > expires {
+        if info.is_expired_at(now) {
             return Err(expired_message(approval_id, expires, outcome));
         }
         let binding = binding_from_pending(&pending)?;
@@ -454,7 +463,8 @@ pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, Strin
     status_by_evidence_at(home, OffsetDateTime::now_utc())
 }
 
-/// [`status_by_evidence`] at `now`. The held receipt of an approved call
+/// [`status_by_evidence`] at `now`. A held call nobody decided is
+/// `pending` until its `expires_at`, then `expired`. The held receipt of an approved call
 /// reads `approve by KEY` while the approval can still be used,
 /// `approve by KEY, executed once` once the retried call ran, and
 /// `approve by KEY, expired unused` when it expired before any retry ran.
@@ -508,9 +518,10 @@ pub fn status_by_evidence_at(
     }
     if let Ok(pending) = list_pending(home) {
         for item in pending {
+            let open = !item.is_expired_at(now);
             status
                 .entry(item.evidence_id)
-                .or_insert_with(|| "pending".into());
+                .or_insert_with(|| if open { "pending" } else { "expired" }.into());
         }
     }
     Ok(status)

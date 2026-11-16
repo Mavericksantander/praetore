@@ -71,8 +71,12 @@
   commit comes from git only when the repository found is this one;
   otherwise from `PRAETORE_MCP_BUILD_COMMIT`, or none. `praetore-mcp
   --version` prints the same build version. CI fails a tag that is not
-  `v<crate version>`, a tag build that does not print exactly that version
-  and any other build without `-dev+<commit>`.
+  `v<crate version>`, a tag build that does not print exactly
+  `praetore-mcp <crate version>`, any other build that does not print
+  exactly `praetore-mcp <crate version>-dev+<commit>`, and a binary that
+  cannot run on the runner (Rosetta 2 is installed for x86_64 on Apple
+  silicon). The end-to-end smoke test compares `--version` with the crate
+  version (`cargo metadata`, or `--expect-version`), prereleases included.
 - **praetore-mcp: the decision tiles of the report PDF are two fixed rows.**
   The first counts decisions, one per call, from the receipts (ALLOW, DENY,
   HELD, FORWARDED, WOULD ASK); the second, labeled apart, counts the
@@ -92,6 +96,15 @@
   `wrap` started stays ignored.
 
 ### Fixed
+
+- **praetore-mcp: an approval that expired undecided reads Expired.**
+  Before, the dashboard's Live view showed such a call as waiting for a
+  decision while "To decide" listed nothing. The server now labels a held
+  call nobody decided `expired` once its `expires_at` has passed (or
+  cannot be read, as for `approve`), and lists to decide only the calls it
+  labels `pending`, from the same map. The drawing, the Live list, the
+  approval history and the drawer show Vencida / Expired / Vencida. The
+  journal and the signed receipts are unchanged.
 
 - **praetore-mcp: printed commands run when the binary is not on `PATH`.**
   The `approve` and `reject` commands in the tool error of a held call, in

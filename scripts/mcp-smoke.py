@@ -12,7 +12,12 @@ The server comes from scripts/mcp-smoke/, installed from its committed
 lockfile; the script does not download anything:
 
     npm ci --ignore-scripts --prefix scripts/mcp-smoke
-    python3 -I scripts/mcp-smoke.py path/to/praetore-mcp
+    python3 -I scripts/mcp-smoke.py path/to/praetore-mcp [--expect-version VERSION]
+
+VERSION is the crate version the binary was built from; without it, the
+version of praetore-mcp in this checkout (cargo metadata). `--version`
+must print that version, or that version with -dev and an optional
++<commit>.
 
 Exit code 0 when every check passes; every check is printed.
 """
@@ -167,10 +172,33 @@ def approval_id_from(message):
     return text.split(marker, 1)[1].split()[0]
 
 
+def version_ok(printed, expected):
+    """Whether `printed` (the output of `--version`) is the build version of
+    crate version `expected`: `praetore-mcp <expected>` for a release build,
+    or `praetore-mcp <expected>-dev` with an optional `+<7 to 40 hex>`."""
+    pattern = rf"praetore-mcp {re.escape(expected)}(-dev(\+[0-9a-f]{{7,40}})?)?\n"
+    return re.fullmatch(pattern, printed) is not None
+
+
+def crate_version():
+    """The version of the praetore-mcp crate in this checkout."""
+    manifest = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Cargo.toml")
+    out = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version", "1", "--manifest-path", manifest],
+        capture_output=True, text=True, timeout=120, check=True,
+    ).stdout
+    return next(p["version"] for p in json.loads(out)["packages"] if p["name"] == "praetore-mcp")
+
+
 def main():
-    if len(sys.argv) != 2:
+    args = sys.argv[1:]
+    if len(args) == 3 and args[1] == "--expect-version":
+        expected = args[2]
+    elif len(args) == 1:
+        expected = crate_version()
+    else:
         sys.exit(__doc__)
-    binary = os.path.realpath(sys.argv[1])
+    binary = os.path.realpath(args[0])
     server = server_command()
     failures = []
 
@@ -189,10 +217,9 @@ def main():
 
     version = run(binary, "--version")
     check(
-        "--version prints the build version",
-        version.returncode == 0
-        and re.fullmatch(r"praetore-mcp \d+\.\d+\.\d+(-dev(\+[0-9a-f]{7,40})?)?\n", version.stdout)
-        is not None,
+        f"--version prints the build version of {expected}",
+        version.returncode == 0 and version_ok(version.stdout, expected),
+        version.stdout.strip(),
     )
     check("init", run(binary, "init", "--dir", home).returncode == 0)
     with open(os.path.join(home, "policy.json"), encoding="utf-8") as handle:

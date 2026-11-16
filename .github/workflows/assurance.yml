@@ -739,54 +739,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked --package praetore-mcp --target ${{ matrix.target }}
+      # The version check runs the x86_64 binary on Apple silicon.
+      - name: Install Rosetta 2 for the x86_64 version check
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: softwareupdate --install-rosetta --agree-to-license
       - name: Show binary architecture
         run: file target/${{ matrix.target }}/release/praetore-mcp
       # The version the binary prints (and writes in its session reports)
-      # is worked out by crates/praetore-mcp/build_version.rs. On a tag it
-      # must be the tag, which must be the crate version; on any other ref,
-      # a -dev+<commit> build.
+      # comes from crates/praetore-mcp/build_version.rs; the rules are in
+      # scripts/check-build-version.sh, tested first.
+      - name: Self-test of the build version check
+        run: scripts/test-check-build-version.sh
       - name: Check the build version against the ref
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/praetore-mcp"
           crate=$(cargo metadata --no-deps --format-version 1 --locked |
             python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "praetore-mcp"))')
-          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            if [[ "${GITHUB_REF_NAME}" != "v${crate}" ]]; then
-              echo "error: tag ${GITHUB_REF_NAME} is not v${crate}, the version in crates/praetore-mcp/Cargo.toml. Tag the commit v${crate} or set the crate version to ${GITHUB_REF_NAME#v}."
-              exit 1
-            fi
-          fi
-          # x86_64-apple-darwin is cross-built on Apple silicon and runs
-          # under Rosetta 2. Without Rosetta the printed line cannot be
-          # read; the version string compiled into the binary is checked
-          # with strings instead.
-          if printed=$("${bin}" --version); then
-            echo "printed: ${printed}"
-            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-              want="praetore-mcp ${GITHUB_REF_NAME#v}"
-              if [[ "${printed}" != "${want}" ]]; then
-                echo "error: on tag ${GITHUB_REF_NAME} --version printed '${printed}', not '${want}'. build_version.rs makes a release build only when git finds this repository with the tag on HEAD: check that the checkout has the tag and .git."
-                exit 1
-              fi
-            elif [[ "${printed}" != *-dev+* ]]; then
-              echo "error: off a tag --version printed '${printed}', without -dev+<commit>. build_version.rs reads the commit from this repository's git: check that the checkout has .git."
-              exit 1
-            fi
-          else
-            echo "the binary does not run here; checking its strings"
-            strings -a "${bin}" > "${RUNNER_TEMP}/praetore-mcp.strings"
-            if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-              if grep -Eq "${crate//./\\.}-dev" "${RUNNER_TEMP}/praetore-mcp.strings"; then
-                echo "error: on tag ${GITHUB_REF_NAME} the binary carries a -dev build version, not ${crate}. Check that the checkout has the tag and .git."
-                exit 1
-              fi
-            elif ! grep -Eq "${crate//./\\.}-dev\+[0-9a-f]{7}" "${RUNNER_TEMP}/praetore-mcp.strings"; then
-              echo "error: off a tag the binary carries no ${crate}-dev+<commit> build version. Check that the checkout has .git."
-              exit 1
-            fi
-          fi
+          scripts/check-build-version.sh "target/${{ matrix.target }}/release/praetore-mcp" "${crate}" "${GITHUB_REF}" "${GITHUB_REF_NAME}"
       - name: Package binary with its checksum
         shell: bash
         run: |
@@ -854,6 +824,10 @@ jobs:
       # @modelcontextprotocol/server-filesystem@2.3.0 and its dependencies
       # exactly as in scripts/mcp-smoke/package-lock.json.
       - run: npm ci --ignore-scripts --no-audit --no-fund --prefix scripts/mcp-smoke
+      # The smoke reads the crate version with cargo metadata.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Version comparison of the smoke test (release, dev, rc)
+        run: python3 -I scripts/test-mcp-smoke-version.py
       # A real tools/call allowed and one denied, then `verify`.
       - name: End-to-end smoke test of the packaged binary
         run: python3 -I scripts/mcp-smoke.py "$MCP_BINARY"

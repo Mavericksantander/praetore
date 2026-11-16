@@ -724,7 +724,7 @@ fn percent_decode(text: &str) -> Result<String, String> {
 /// query, newest first.
 pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
     let now = OffsetDateTime::now_utc();
-    let approval_status = crate::approvals::status_by_evidence(home).unwrap_or_default();
+    let approval_status = crate::approvals::status_by_evidence_at(home, now).unwrap_or_default();
     // A held call carries, once a person decided it, the time of that
     // decision from the approval journal (not the time of the receipt).
     let decided_at = crate::approvals::decided_at_by_evidence(home);
@@ -757,7 +757,7 @@ pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
         .take(query.limit)
         .map(|&index| view(index))
         .collect();
-    let pending = pending_view(home, Some((snapshot, &approval_status)));
+    let pending = pending_view(home, snapshot, &approval_status);
     let pending_count = pending.as_array().map_or(0, Vec::len);
     let format = |at: &Option<OffsetDateTime>| at.and_then(|at| at.format(&Rfc3339).ok());
     json!({
@@ -1099,7 +1099,7 @@ pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
         .iter()
         .map(|line| receipt_view(line, &approval_status))
         .collect();
-    let pending = pending_view(home, Some((&snapshot, &approval_status)));
+    let pending = pending_view(home, &snapshot, &approval_status);
     let pending_count = pending.as_array().map_or(0, Vec::len);
     json!({
         "generated_at_utc": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default(),
@@ -1118,16 +1118,23 @@ pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
 /// held call. A pending file is not signed and `verify` does not check it:
 /// each item says so with `signed: false`. Read only: deciding stays with
 /// `praetore-mcp approve` / `reject` in a terminal.
-fn pending_view(home: &Home, receipts: Option<(&Snapshot, &BTreeMap<String, String>)>) -> Value {
+/// The calls that can still be decided: those `status`
+/// ([`crate::approvals::status_by_evidence_at`]) calls `pending`. An expired
+/// one is left out here and labeled `expired` on its receipt, from the same
+/// map, so the list and the labels cannot disagree.
+fn pending_view(home: &Home, snapshot: &Snapshot, status: &BTreeMap<String, String>) -> Value {
     match crate::approvals::list_pending(home) {
         Ok(list) => Value::Array(
             list.into_iter()
+                .filter(|item| {
+                    status.get(&item.evidence_id).map(String::as_str) == Some("pending")
+                })
                 .map(|item| {
                     let full = crate::approvals::pending_call(home, &item.approval_id);
-                    let receipt = receipts.and_then(|(snapshot, status)| {
-                        let index = *snapshot.by_evidence.get(&item.evidence_id)?;
-                        Some(receipt_view(&snapshot.lines[index], status))
-                    });
+                    let receipt = snapshot
+                        .by_evidence
+                        .get(&item.evidence_id)
+                        .map(|&index| receipt_view(&snapshot.lines[index], status));
                     // The page shows and copies these strings as they are.
                     let commands =
                         crate::approvals::DecisionCommands::new(home, &item.approval_id);

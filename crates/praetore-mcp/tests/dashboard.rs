@@ -1986,3 +1986,61 @@ fn approval_history_and_live_rows_carry_the_time_of_the_human_decision() {
         .unwrap();
     assert_eq!(before_live["approval_decided_at"], Value::Null);
 }
+
+/// A held call nobody decided before its `expires_at`: the server says
+/// `expired` on its receipt everywhere the page reads it, and leaves it out
+/// of the calls to decide. An `expires_at` that cannot be read counts as
+/// expired, as for `approve`.
+#[test]
+fn an_undecided_approval_past_its_expiry_is_expired_in_the_state() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (_, before) = api(&home, &mut cache, "");
+    let pending = praetore_mcp::approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1);
+    let id = pending[0].evidence_id.clone();
+    let held = |state: &Value, list: &str| -> Value {
+        state[list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["evidence_id"] == id.as_str())
+            .unwrap()["approval"]
+            .clone()
+    };
+    assert_eq!(held(&before, "recent"), "pending");
+    assert_eq!(before["pending"].as_array().unwrap().len(), 1);
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{}.json", pending[0].approval_id));
+    for expires_at in ["2000-01-01T00:00:00Z", "not a time"] {
+        let mut file: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file["expires_at"] = json!(expires_at);
+        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let (status, after) = api(&home, &mut cache, "");
+        assert_eq!(status, 200);
+        for list in ["recent", "approval_history"] {
+            assert_eq!(held(&after, list), "expired", "{expires_at}: {list}");
+        }
+        assert_eq!(
+            after["page"]["receipts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["evidence_id"] == id.as_str())
+                .unwrap()["approval"],
+            "expired"
+        );
+        assert_eq!(after["pending"], json!([]), "{expires_at}");
+        let drawer = dashboard::respond(
+            &format!("GET /api/receipt?id={id} HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n"),
+            &home,
+            None,
+            8787,
+        );
+        let drawer: Value = serde_json::from_slice(&drawer.body).unwrap();
+        assert_eq!(drawer["approval"], "expired", "{expires_at}: drawer");
+    }
+}

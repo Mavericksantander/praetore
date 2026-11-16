@@ -792,3 +792,37 @@ test("the live list shows when the person decided an approved call, not when it 
   assert.ok(before.includes(`${held.decided_at.slice(0, 19).replace("T", " ")} UTC`), before);
   assert.ok(before.includes("hora en que se retuvo"), before);
 });
+
+test("an approval that expired undecided reads Expired in the visual and the list, and nothing is left to decide", async () => {
+  const state = fixture("pending");
+  const held = state.recent.find((r) => r.decision === "REQUIRE_APPROVAL");
+  assert.equal(held.approval, "pending");
+  // What the server sends once expires_at has passed: the label on every
+  // copy of the receipt, and no call left to decide.
+  const expired = structuredClone(state);
+  for (const list of [expired.recent, expired.approval_history, expired.page.receipts]) {
+    for (const r of list) if (r.evidence_id === held.evidence_id) r.approval = "expired";
+  }
+  expired.pending = [];
+  const p = page({ hash: "#/live", now: pendingNow() });
+  await p.start(expired);
+  const texts = drawn(p, "hud").map((t) => t.text);
+  assert.ok(texts.includes("Vencida"), texts.join(" | "));
+  assert.ok(!texts.some((t) => t.includes("Esperando decisión") || t.startsWith("pendiente")), texts.join(" | "));
+  assert.ok(p.text("live-rest").includes("Nada por decidir"), p.text("live-rest"));
+  p.byId.get("live-list").listeners.get("click")[0]();
+  const list = p.text("hud-list");
+  assert.ok(list.includes("Vencida"), list);
+  assert.ok(!list.includes("Esperando decisión") && !list.includes("pendiente ·"), list);
+  // The approval history and the drawer say the same.
+  const q = page({ hash: "#/info/approvals", now: pendingNow() });
+  await q.start(expired);
+  assert.ok(q.text("info-approvals").includes("Vencida"), q.text("info-approvals"));
+  // The same label in English and Portuguese, picked with the selector.
+  for (const [code, label] of [["en", "Expired"], ["pt", "Vencida"]]) {
+    const select = p.byId.get("lang");
+    select.value = code;
+    select.listeners.get("change")[0]();
+    assert.ok(p.text("hud-list").includes(label), `${code}: ${p.text("hud-list")}`);
+  }
+});
