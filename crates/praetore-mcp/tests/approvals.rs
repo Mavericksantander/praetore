@@ -19,6 +19,21 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
 
+/// `value` quoted for a POSIX shell, as praetore-mcp prints paths.
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// How printed commands start: the binary's canonical path, quoted.
+fn program() -> String {
+    quote(fs::canonicalize(bin()).unwrap().to_str().unwrap())
+}
+
+/// The `--dir` value of printed commands: the canonical home, quoted.
+fn quoted_dir(home: &Home) -> String {
+    quote(fs::canonicalize(&home.root).unwrap().to_str().unwrap())
+}
+
 fn fake_server() -> PathBuf {
     let path = PathBuf::from(bin())
         .parent()
@@ -245,10 +260,14 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
         thread::sleep(Duration::from_millis(20));
     };
     let Some(code) = code else {
-        panic!(
-            "pty closed before the confirmation code:\n{}",
-            String::from_utf8_lossy(&buf)
-        );
+        // `approve` exited before asking for the code (an unknown or expired
+        // id): what it wrote is in `buf`.
+        let status = child.wait().unwrap();
+        return Output {
+            status,
+            stdout: buf,
+            stderr: Vec::new(),
+        };
     };
     master.write_all(format!("{code}\n").as_bytes()).unwrap();
     let started = std::time::Instant::now();
@@ -299,17 +318,51 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     assert!(text.contains("waiting for local human approval"), "{text}");
     assert_eq!(by_id(&responses, 7)["result"]["isError"], true);
     let id = approval_id_from(text);
-    let dir = home.root.display().to_string();
-    assert!(
-        text.contains(&format!("praetore-mcp approve {id} --dir {dir}")),
-        "{text}"
-    );
-    assert!(
-        text.contains(&format!("praetore-mcp reject {id} --dir {dir}")),
-        "{text}"
-    );
+    // The commands name the running binary and the home by absolute paths,
+    // quoted for a POSIX shell, so they run as printed off PATH.
+    let approve = format!("{} approve {id} --dir {}", program(), quoted_dir(&home));
+    let reject = format!("{} reject {id} --dir {}", program(), quoted_dir(&home));
+    assert!(text.contains(&format!("\n{approve}\n")), "{text}");
+    assert!(text.contains(&format!("\n{reject}\n")), "{text}");
+    assert!(text.contains("Expires (UTC): "), "{text}");
+    assert!(text.contains(" local time (UTC"), "{text}");
+    assert!(text.contains(" UTC (in "), "{text}");
     let listed = run(&["approvals", "--dir", home.root.to_str().unwrap()], "");
     let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.contains(&format!("approve    {approve}\n")),
+        "{listed}"
+    );
+    assert!(
+        listed.contains(&format!("reject     {reject}\n")),
+        "{listed}"
+    );
+    // The dashboard sends the same commands for the binary that serves it
+    // (here the test binary); the page shows and copies them unchanged.
+    let state = praetore_mcp::dashboard::state(&home, None);
+    let served = praetore_mcp::commands::program();
+    assert!(served.starts_with("'/"), "{served}");
+    assert_eq!(
+        state["pending"][0]["commands"]["approve"],
+        format!("{served} approve {id} --dir {}", quoted_dir(&home)).as_str()
+    );
+    assert_eq!(
+        state["pending"][0]["commands"]["reject"],
+        format!("{served} reject {id} --dir {}", quoted_dir(&home)).as_str()
+    );
+    // As printed, through sh with an empty PATH, the reject command runs.
+    let ran = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&reject)
+        .env("PATH", "")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{reject}\n{ran:?}");
+    assert!(
+        String::from_utf8_lossy(&ran.stdout).contains(&format!("reject {id}")),
+        "{ran:?}"
+    );
     assert!(listed.contains(&id), "{listed}");
     assert!(listed.contains("fake"), "{listed}");
     assert!(listed.contains("echo"), "{listed}");
@@ -446,6 +499,12 @@ fn approved_call_forwards_once_and_a_second_retry_asks_again() {
     let approved = approve_on_tty(&home, &id);
     let approved_text = String::from_utf8_lossy(&approved.stdout);
     assert!(approved.status.success(), "{approved_text}");
+    assert!(
+        approved_text.contains("Now run the agent again before ")
+            && approved_text.contains(" (local time) / ")
+            && approved_text.contains(" UTC so the call runs once."),
+        "{approved_text}"
+    );
     let before_code = approved_text.split("confirmation:").next().unwrap();
     assert!(
         before_code.contains("tool") && before_code.contains("echo"),
@@ -604,9 +663,18 @@ fn expired_pending_and_expired_approval_do_not_pass() {
     thread::sleep(Duration::from_secs(2));
     let expired = approve_on_tty(&home, &id);
     let text = String::from_utf8_lossy(&expired.stdout);
-    assert!(!expired.status.success(), "{text}");
-    assert!(text.contains("expired"), "{text}");
+    // The exit code of a refused approve is 2, as before.
+    assert_eq!(expired.status.code(), Some(2), "{text}");
+    assert!(text.contains("this approval expired at "), "{text}");
+    assert!(text.contains(" (local time) / "), "{text}");
+    assert!(
+        text.contains("run the agent again so the call is held again"),
+        "{text}"
+    );
+    assert!(text.contains("nothing was signed"), "{text}");
+    assert!(!text.contains("confirmation:"), "asked for a code: {text}");
     assert!(!home.root.join("approvals").join("journal.jsonl").exists());
+    assert!(home.approvals_pending(&id), "the pending file is kept");
 
     let (_temp, home) = init_home();
     require_echo(&home);
@@ -839,4 +907,100 @@ fn verify_rejects_an_execution_after_the_approval_window() {
     let report = String::from_utf8_lossy(&checked.stdout);
     assert_eq!(checked.status.code(), Some(1), "{report}");
     assert!(report.contains("outside the approval window"), "{report}");
+}
+
+#[test]
+fn approvals_show_the_expiry_in_local_time_with_utc_and_what_is_left() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    let file: Value = serde_json::from_str(
+        &fs::read_to_string(
+            home.root
+                .join("approvals")
+                .join("pending")
+                .join(format!("{id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let utc = file["expires_at"].as_str().unwrap();
+    // 2026-11-15T23:34:40Z -> "2026-11-15 23:34:40"
+    let utc_text = utc.trim_end_matches('Z').replace('T', " ");
+    let listed = run_env(
+        &["approvals", "--dir", home.root.to_str().unwrap()],
+        "",
+        &[("TZ", "Asia/Kolkata")],
+    );
+    let text = String::from_utf8_lossy(&listed.stdout);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("expires    "))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains(" local time (UTC+05:30) / "), "{line}");
+    assert!(line.contains(&format!(" / {utc_text} UTC (in ")), "{line}");
+    assert!(line.contains(" min ") && line.ends_with(" s)"), "{line}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_status_tells_an_expired_unused_approval_from_an_executed_one() {
+    // Approved, then expired before any retry ran.
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "3")];
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    assert!(approve_on_tty(&home, &id).status.success());
+    let held = held_evidence_id(&home);
+    let status = praetore_mcp::approvals::status_by_evidence(&home).unwrap();
+    assert!(status[&held].starts_with("approve by "), "{status:?}");
+    assert!(!status[&held].contains(','), "still usable: {status:?}");
+    thread::sleep(Duration::from_secs(4));
+    let status = praetore_mcp::approvals::status_by_evidence(&home).unwrap();
+    assert!(status[&held].ends_with(", expired unused"), "{status:?}");
+    let state = praetore_mcp::dashboard::state(&home, None);
+    let row = state["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["evidence_id"] == held.as_str())
+        .unwrap();
+    assert!(
+        row["approval"]
+            .as_str()
+            .unwrap()
+            .ends_with(", expired unused"),
+        "{row}"
+    );
+
+    // Approved and retried in time: executed, not expired.
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "3")];
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    assert!(approve_on_tty(&home, &id).status.success());
+    let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
+    assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
+    thread::sleep(Duration::from_secs(4));
+    let held = held_evidence_id(&home);
+    let status = praetore_mcp::approvals::status_by_evidence(&home).unwrap();
+    assert!(status[&held].ends_with(", executed once"), "{status:?}");
+    assert!(status.values().any(|v| v == "executed once"), "{status:?}");
+    assert!(
+        !status.values().any(|v| v.contains("expired")),
+        "{status:?}"
+    );
+}
+
+/// The evidence id of the held (REQUIRE_APPROVAL) receipt.
+fn held_evidence_id(home: &Home) -> String {
+    evidence(home)
+        .into_iter()
+        .find(|item| item.decision.outcome == DecisionOutcome::RequireApproval)
+        .unwrap()
+        .evidence_id
+        .to_string()
 }

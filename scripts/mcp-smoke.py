@@ -34,6 +34,11 @@ NODE_PROJECT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "mcp-sm
 TIMEOUT_SECONDS = 180
 
 
+
+def sh_quote(value):
+    """`value` in single quotes for a POSIX shell, as praetore-mcp prints paths."""
+    return "'" + value.replace("'", "'\\''") + "'"
+
 def server_command():
     """`node <entry point>` of the server installed by `npm ci` in NODE_PROJECT.
 
@@ -290,17 +295,30 @@ def main():
     held = wrap_session(binary, home, root, server, hold_requests, {4})
     held_msg = held.get(4, {})
     approval_id = approval_id_from(held_msg)
-    held_text = json.dumps(held_msg.get("result", {}).get("content", []))
+    held_text = "\n".join(
+        item.get("text", "") for item in held_msg.get("result", {}).get("content", [])
+    )
+    # The printed command names the binary and the home by absolute paths,
+    # single-quoted for a POSIX shell, so it runs as printed off PATH.
+    approve_command = (
+        f"{sh_quote(os.path.realpath(binary))} approve {approval_id} "
+        f"--dir {sh_quote(os.path.realpath(home))}"
+    )
     check(
         "list_directory is held for approval",
         held_msg.get("result", {}).get("isError") is True
         and "waiting for local human approval" in held_text
-        and f"praetore-mcp approve {approval_id} --dir {home}" in held_text
+        and f"\n{approve_command}\n" in held_text
         and len(approval_id) == 64,
-        held_text[:400],
+        held_text[:600],
     )
     pending = run(binary, "approvals", "--dir", home)
     check("approvals lists the pending id", approval_id in pending.stdout, pending.stdout)
+    check(
+        "approvals prints the same approve command",
+        f"approve    {approve_command}\n" in pending.stdout,
+        pending.stdout,
+    )
     code, approve_text = approve_on_pty(binary, home, approval_id)
     check("approve on a pty exits 0", code == 0, approve_text)
 

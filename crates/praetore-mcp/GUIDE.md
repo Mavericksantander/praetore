@@ -50,11 +50,27 @@ installer. Check the archive before you open it. On macOS:
 It contains a directory of the same name with `praetore-mcp`, `LICENSE` and
 `NOTICE`.
 
-Move `praetore-mcp` to a directory on your `PATH` that you will keep, for
-example `~/.local/bin`, before you run `install`. `install` records the
-absolute path of the binary that is running. Moving or replacing that file
-later leaves the client config pointing at the old path. Run `install`
-again after you move it.
+Put `praetore-mcp` on your `PATH` before you run `install`. We recommend
+`~/.local/bin`. From the directory the archive was extracted to, with
+`<dir>` that directory's absolute path:
+
+```sh
+mkdir -p ~/.local/bin && ln -sf <dir>/praetore-mcp ~/.local/bin/praetore-mcp && hash -r
+```
+
+If `~/.local/bin` is not on your `PATH` yet, add it in your shell profile.
+`install` records the absolute path of the binary that is running.
+Moving or replacing that file later leaves the client config pointing at
+the old path. Run `install` again after you move it.
+
+Commands that praetore-mcp prints for you to copy (`approve` and `reject`
+for a held call, in the tool error, in `approvals` and in the dashboard;
+`init` and the `policy` suggestions) start with the absolute path of the
+running binary and pass `--dir` as an absolute path, both in single quotes
+for a POSIX shell. They run as printed even when the binary is not on your
+`PATH`. If the binary's path cannot be read, they start with
+`praetore-mcp`, which needs it on `PATH`. On Windows they are written as
+before.
 
 Checking the Sigstore signature of `SHA256SUMS` is optional. It needs
 `cosign`. For v0.3.4, pass
@@ -279,6 +295,17 @@ praetore-mcp approve <id>
 ```
 
 After you approve, ask for the same call again. It is forwarded once.
+`approve` ends with the time to retry before, for example
+`Now run the agent again before 20:34 (local time) / 23:34 UTC so the call
+runs once.` `approvals`, `approve` and the dashboard show the expiry in
+local time with UTC beside it and the time left
+(`2026-11-15 20:34:40 local time (UTC-03:00) / 2026-11-15 23:34:40 UTC (in
+9 min 40 s)`). `approve` on an expired call signs nothing and says so
+before it asks for the code: `this approval expired at 20:34 (local time)
+/ 23:34 UTC; run the agent again so the call is held again, then approve
+the new id.` Its exit code is 2, as for every refused `approve`. In the
+dashboard, a call that was approved but not retried before the approval
+expired is marked expired, apart from one that was approved and executed.
 `praetore-mcp reject <id>` records a rejection, and that call is not
 forwarded. A pending call expires after 10 minutes by default. The
 terminal check is cooperative: a process that can act as this user can
@@ -316,7 +343,9 @@ in the result of `verify`; nothing is drawn that PRÆTORE does not record.
   the engine check. In observe mode the bar is only outlined, since the
   call went through. A call waiting for approval stops at an amber dashed
   bar marked "pending, notice not signed, not checked by verify", with the
-  `praetore-mcp approve` and `reject` commands to run in a terminal. A
+  `approve` and `reject` commands to run in a terminal, as the server
+  writes them (absolute binary path and `--dir`); the copy button copies
+  the `approve` line exactly as shown. A
   receipt that `verify` rejects is marked, with the reason `verify` gives,
   over up to three lines in the drawing and in the list; a longer one
   continues in the receipt detail. A call that arrives while the page is
@@ -449,11 +478,13 @@ Read these before relying on anything above.
    receipts.
 3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
    call is not forwarded. The tool error names an approval id and the
-   command to run, for example `praetore-mcp approve <id> --dir <home>`.
+   command to run, for example `'/home/user/.local/bin/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
+   (the absolute paths of the running binary and of the home).
    `praetore-mcp approvals` lists pending calls (server, tool, a short form
    of the arguments, expiry). `approve` works only in an interactive
    terminal. Before it asks for a short code, it prints the server, the
-   tool, the UTC expiry, and the full arguments. It continues only if that
+   tool, the expiry (local time, UTC and the time left), and the full
+   arguments. It continues only if that
    code is typed back. `reject <id>` records a rejection and the call is not
    forwarded. The approval matches one server, one tool and the canonical
    arguments, expires after 10 minutes unless

@@ -263,6 +263,24 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
     ))
 }
 
+/// Why `approve` or `reject` of an expired pending call signs nothing, and
+/// what to do next.
+pub fn expired_message(
+    approval_id: &str,
+    expires: OffsetDateTime,
+    outcome: HumanOutcome,
+) -> String {
+    let at = crate::when::clock_local(expires);
+    match outcome {
+        HumanOutcome::Approve => format!(
+            "this approval expired at {at}; run the agent again so the call is held again, then approve the new id. Approval {approval_id} expired; nothing was signed"
+        ),
+        HumanOutcome::Reject => format!(
+            "this approval expired at {at}; the call was not forwarded and there is nothing left to reject. Approval {approval_id} expired; nothing was signed"
+        ),
+    }
+}
+
 /// Signs a decision for a pending id and appends it to the approval journal.
 /// The `approve` command is what requires an interactive terminal.
 pub fn decide(
@@ -296,10 +314,7 @@ pub fn decide(
         let now = now_utc()?;
         let expires = parse_time(&info.expires_at)?;
         if now > expires {
-            return Err(format!(
-                "approval {approval_id} expired at {}; nothing was signed",
-                info.expires_at
-            ));
+            return Err(expired_message(approval_id, expires, outcome));
         }
         let binding = binding_from_pending(&pending)?;
         if let Some(shown) = shown {
@@ -415,8 +430,24 @@ pub fn records(home: &Home) -> Result<Vec<Value>, String> {
 /// Evidence id → short status for `receipts`. Not a signature check; `verify`
 /// does that. A missing approval directory yields an empty map.
 pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, String> {
+    status_by_evidence_at(home, OffsetDateTime::now_utc())
+}
+
+/// [`status_by_evidence`] at `now`. The held receipt of an approved call
+/// reads `approve by KEY` while the approval can still be used,
+/// `approve by KEY, executed once` once the retried call ran, and
+/// `approve by KEY, expired unused` when it expired before any retry ran.
+pub fn status_by_evidence_at(
+    home: &Home,
+    now: OffsetDateTime,
+) -> Result<BTreeMap<String, String>, String> {
     let mut status = BTreeMap::new();
     if let Ok(entries) = read_journal_unlocked(home) {
+        let executed: BTreeSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.record["kind"].as_str() == Some("execution"))
+            .filter_map(|entry| entry.record["approval_id"].as_str())
+            .collect();
         for entry in &entries {
             match entry.record["kind"].as_str() {
                 Some("decision") => {
@@ -430,7 +461,19 @@ pub fn status_by_evidence(home: &Home) -> Result<BTreeMap<String, String>, Strin
                         .chars()
                         .take(16)
                         .collect();
-                    status.insert(id.to_owned(), format!("{outcome} by {key}"));
+                    let mut text = format!("{outcome} by {key}");
+                    if outcome == HumanOutcome::Approve.as_str() {
+                        let approval_id = entry.record["approval_id"].as_str().unwrap_or("");
+                        let expires = entry.record["expires_at"]
+                            .as_str()
+                            .and_then(|t| parse_time(t).ok());
+                        if executed.contains(approval_id) {
+                            text.push_str(", executed once");
+                        } else if expires.is_some_and(|expires| now > expires) {
+                            text.push_str(", expired unused");
+                        }
+                    }
+                    status.insert(id.to_owned(), text);
                 }
                 Some("execution") => {
                     let Some(id) = entry.record["evidence_id"].as_str() else {
@@ -922,40 +965,53 @@ fn pending_info(value: &Value) -> Result<PendingInfo, String> {
 }
 
 fn hold_message(home: &Home, pending: &PendingInfo) -> String {
-    let dir = shell_quote(&home.root.display().to_string());
+    let commands = DecisionCommands::new(home, &pending.approval_id);
+    let expires = crate::when::parse(&pending.expires_at)
+        .map(crate::when::expiry_now)
+        .unwrap_or_else(|| pending.expires_at.clone());
     let mut message = format!(
         "This tool call is waiting for local human approval and was not executed.\n\
          Approval id: {id}\n\
          Server: {server}\n\
          Tool: {tool}\n\
-         Expires (UTC): {expires}\n\
+         Expires (UTC): {expires_utc}\n\
+         Expires: {expires}\n\
          A person at this computer has to approve it in a terminal:\n\
-           praetore-mcp approve {id} --dir {dir}\n\
+           {approve}\n\
          To reject it:\n\
-           praetore-mcp reject {id} --dir {dir}\n\
+           {reject}\n\
          Evidence id: {evidence}\n",
         id = pending.approval_id,
         server = crate::proxy::display_safe(&pending.server),
         tool = crate::proxy::display_safe(&pending.tool),
-        expires = pending.expires_at,
+        expires_utc = pending.expires_at,
+        approve = commands.approve,
+        reject = commands.reject,
         evidence = pending.evidence_id,
     );
     if !home.approver_key().is_file() || !home.approver_pin().is_file() {
         message.push_str(&format!(
-            "This home has no approver key yet. Run `praetore-mcp init --dir {dir}` first; it adds that key and leaves existing keys and receipts in place.\n"
+            "This home has no approver key yet. Run `{}` first; it adds that key and leaves existing keys and receipts in place.\n",
+            crate::commands::command("init", &home.root)
         ));
     }
     message
 }
 
-fn shell_quote(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "/._-".contains(c))
-    {
-        value.to_owned()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
+/// The `approve` and `reject` commands for one pending id, as printed by
+/// `wrap`, `approvals` and the dashboard (see [`crate::commands`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionCommands {
+    pub approve: String,
+    pub reject: String,
+}
+
+impl DecisionCommands {
+    pub fn new(home: &Home, approval_id: &str) -> Self {
+        Self {
+            approve: crate::commands::command(&format!("approve {approval_id}"), &home.root),
+            reject: crate::commands::command(&format!("reject {approval_id}"), &home.root),
+        }
     }
 }
 

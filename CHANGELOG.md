@@ -35,6 +35,33 @@
   it if it is still running, and then writes the session report. The exit
   code is the server's, or 1 if it was killed by a signal.
 
+### Fixed
+
+- **praetore-mcp: printed commands run when the binary is not on `PATH`.**
+  The `approve` and `reject` commands in the tool error of a held call, in
+  `approvals` and in the dashboard, and the commands `init`, the
+  not-initialized errors and `policy coverage` print, start with the
+  absolute path of the running binary (`std::env::current_exe`,
+  canonicalized) and pass `--dir` as an absolute path, both single-quoted
+  for a POSIX shell (`'` written as `'\''`). Before, they started with
+  `praetore-mcp`, and a binary extracted to a folder off `PATH` answered
+  "command not found". If the binary's path cannot be read the commands
+  start with `praetore-mcp`, as before. The dashboard shows and copies the
+  strings the server sends, unchanged. On Windows nothing changes.
+- **praetore-mcp: approval expiry is shown in local time, with what is
+  left.** `approvals`, `approve` and the dashboard show the expiry in local
+  time with UTC beside it and the time left (`in 9 min 40 s`); the tool
+  error of a held call adds that line after `Expires (UTC)`. After an
+  approval, `approve` prints the time to retry before. `approve` on an
+  expired call says so before it asks for the confirmation code
+  (`this approval expired at HH:MM (local time) / HH:MM UTC; run the agent
+  again so the call is held again`) and signs nothing; its exit code stays
+  2. The dashboard marks an approval that expired before any retry ran as
+  expired, apart from one that was approved and executed (`receipts` shows
+  `approve by KEY, expired unused` or `approve by KEY, executed once`).
+  Approval is unchanged: bound to the exact call, single use, the same
+  TTL, decided only in a terminal; the dashboard stays read-only.
+
 ## 0.3.5 - 2026-11-15
 
 praetore-mcp: `init` writes a default-deny policy (no
