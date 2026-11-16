@@ -501,7 +501,7 @@ When the report is written, `wrap` prints where to see it, after its path:
 
 ```
 praetore-mcp: session report: /home/user/.praetore/mcp/reports/session-20261116T030240Z-560f69f7.pdf
-praetore-mcp: to see and download it, run '/home/user/praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
+praetore-mcp: to see and download it, run '<dir>/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
 ```
 
 The dashboard writes nothing under the home, so `wrap` cannot tell whether
@@ -580,8 +580,8 @@ Read these before relying on anything above.
    receipts.
 3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
    call is not forwarded. The tool error names an approval id and the
-   command to run, for example `'/home/user/praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
-   (the real paths of the running binary, here in the directory the
+   command to run, for example `'<dir>/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
+   (the real paths of the running binary, `<dir>` being the directory the
    archive was extracted to, and of the home).
    `praetore-mcp approvals` lists pending calls (server, tool, a short form
    of the arguments, expiry). `approve` works only in an interactive
