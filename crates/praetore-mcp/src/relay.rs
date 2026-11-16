@@ -629,12 +629,27 @@ pub fn run(options: WrapOptions) -> i32 {
     code
 }
 
+/// Where to see and download the report. The dashboard writes nothing
+/// under the home, so whether one is running (and on which port) cannot be
+/// known without connecting to a local port: the hint names the command
+/// that starts it with `--port 8787` written out, the page of the session
+/// on that port, and says to open the same page on another port.
+pub fn dashboard_hint(home: &crate::store::Home, session_id: &str) -> String {
+    let port = crate::dashboard::DEFAULT_PORT;
+    format!(
+        "to see and download it, run {} dashboard --dir {} --port {port} and open http://127.0.0.1:{port}/#/sessions/{session_id} (a dashboard on another port: #/sessions/{session_id} there)",
+        crate::commands::program(),
+        crate::commands::dir(&home.root),
+    )
+}
+
 /// Writes the session report. Whatever happens here goes to stderr and
 /// nowhere else: the exit code and every decision already made stay as
 /// they are.
 fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &SessionLog) {
+    let id = report::new_session_id();
     let meta = SessionMeta {
-        id: report::new_session_id(),
+        id: id.clone(),
         server: options.name.clone(),
         mode: options.mode.as_str().to_owned(),
         started_at,
@@ -644,15 +659,18 @@ fn write_report(options: &WrapOptions, started_at: OffsetDateTime, log: &Session
         report::close_session(&options.home, meta, log)
     }));
     match outcome {
-        Ok(Ok(Some(generated))) => eprintln!(
-            "praetore-mcp: session report: {}{}",
-            generated.pdf.display(),
-            if generated.verify_passed {
-                ""
-            } else {
-                " (verify FAILED; see the report)"
-            }
-        ),
+        Ok(Ok(Some(generated))) => {
+            eprintln!(
+                "praetore-mcp: session report: {}{}",
+                generated.pdf.display(),
+                if generated.verify_passed {
+                    ""
+                } else {
+                    " (verify FAILED; see the report)"
+                }
+            );
+            eprintln!("praetore-mcp: {}", dashboard_hint(&options.home, &id));
+        }
         Ok(Ok(None)) => {}
         Ok(Err(error)) => eprintln!("praetore-mcp: session report not written: {error}"),
         Err(_) => eprintln!("praetore-mcp: session report not written: internal error"),

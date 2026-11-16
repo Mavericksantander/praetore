@@ -596,30 +596,59 @@ fn cover(report: &Report) -> Canvas {
         x += w;
     }
     y += 24.0;
-    let mut tiles = vec![
+    // Two fixed rows on the same columns, every tile shown even at 0. The
+    // first counts receipts, one decision per call; the second counts the
+    // approval records of the held calls, a status and not another event.
+    let decisions = [
         ("ALLOW", s.allow, GREEN),
         ("DENY", s.deny, RED),
         ("HELD", s.held, AMBER),
+        ("FORWARDED", s.forwarded, ACCENT),
+        ("WOULD ASK", s.would_ask, GRAY),
+    ];
+    let statuses = [
         ("APPROVED", s.approved, ACCENT),
+        ("REJECTED", s.rejected, RED),
+        ("PENDING", s.pending, AMBER),
         ("EXPIRED", s.expired, MUTED),
     ];
-    if s.pending > 0 {
-        tiles.push(("PENDING", s.pending, AMBER));
-    }
-    if s.rejected > 0 {
-        tiles.push(("REJECTED", s.rejected, RED));
-    }
-    if s.would_ask > 0 {
-        tiles.push(("WOULD ASK", s.would_ask, GRAY));
-    }
-    let step = (RIGHT - LEFT) / tiles.len() as f32;
-    for (index, (name, count, color)) in tiles.into_iter().enumerate() {
-        let x = LEFT + step * index as f32;
-        c.diamond(color, true, x + 3.0, y - 2.5, 3.0);
-        c.label(MUTED, x + 11.0, y, name);
-        c.text(Font::Sans, 20.0, INK, x, y + 24.0, &count.to_string());
-    }
-    y += 50.0;
+    let step = (RIGHT - LEFT) / decisions.len() as f32;
+    let tile_row =
+        |c: &mut Canvas, y: f32, title: &str, note: &str, tiles: &[(&str, usize, Rgb)]| {
+            c.label(ACCENT, LEFT, y, title);
+            c.text(
+                Font::Sans,
+                7.5,
+                MUTED,
+                LEFT + width(Font::Mono, 6.8, 1.1, title) + 10.0,
+                y,
+                note,
+            );
+            let y = y + 16.0;
+            for (index, (name, count, color)) in tiles.iter().enumerate() {
+                let x = LEFT + step * index as f32;
+                c.diamond(*color, true, x + 3.0, y - 2.5, 3.0);
+                c.label(MUTED, x + 11.0, y, name);
+                c.text(Font::Sans, 20.0, INK, x, y + 24.0, &count.to_string());
+            }
+        };
+    tile_row(
+        &mut c,
+        y,
+        "DECISIONS",
+        "one per call, from the signed receipts",
+        &decisions,
+    );
+    y += 64.0;
+    c.line(HAIR, 0.6, LEFT, y - 14.0, RIGHT, y - 14.0);
+    tile_row(
+        &mut c,
+        y,
+        "APPROVAL STATUS",
+        "of the held calls, from the approval journal; not more calls",
+        &statuses,
+    );
+    y += 66.0;
     if report.meta.mode == "observe" {
         c.text(
             Font::Sans,
@@ -1262,11 +1291,51 @@ mod tests {
     }
 
     #[test]
-    fn the_pending_tile_shows_only_when_something_is_pending() {
-        let mut report = sample(1, true);
-        assert_eq!(count(&render(&report), b"(PENDING)"), 0);
-        report.summary.pending = 1;
-        assert_eq!(count(&render(&report), b"(PENDING)"), 1);
+    fn decisions_and_approval_statuses_are_two_fixed_rows_with_zeros() {
+        // Every tile at 0: all nine are drawn, in two labeled rows.
+        let report = sample(0, true);
+        let pdf = render(&report);
+        for name in [
+            "ALLOW",
+            "DENY",
+            "HELD",
+            "FORWARDED",
+            "WOULD ASK",
+            "APPROVED",
+            "REJECTED",
+            "PENDING",
+            "EXPIRED",
+        ] {
+            assert_eq!(count(&pdf, format!("({name})").as_bytes()), 1, "{name}");
+        }
+        assert_eq!(count(&pdf, b"(DECISIONS)"), 1);
+        assert_eq!(count(&pdf, b"(APPROVAL STATUS)"), 1);
+        assert_eq!(
+            count(
+                &pdf,
+                b"(of the held calls, from the approval journal; not more calls)"
+            ),
+            1
+        );
+        // HELD is in the first row, PENDING in the second: PENDING is drawn
+        // lower on the page (a smaller y in PDF space) at the same x as HELD.
+        let at = |name: &str| -> (f32, f32) {
+            let text = String::from_utf8_lossy(&pdf).into_owned();
+            let end = text.find(&format!("({name}) Tj")).unwrap();
+            let line = text[..end].rsplit(" Td").next().unwrap();
+            let before = &text[..end - line.len() - 3];
+            let numbers: Vec<f32> = before
+                .rsplit('\n')
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            (numbers[numbers.len() - 2], numbers[numbers.len() - 1])
+        };
+        let (held, pending) = (at("HELD"), at("PENDING"));
+        assert!((held.0 - pending.0).abs() < 0.01, "{held:?} {pending:?}");
+        assert!(pending.1 < held.1, "{held:?} {pending:?}");
     }
 
     #[test]

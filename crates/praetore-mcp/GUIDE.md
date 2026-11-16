@@ -327,7 +327,7 @@ praetore-mcp dashboard --port 0   # a free port, printed at startup
 
 `dashboard` serves a read-only page over `receipts/*.jsonl` on 127.0.0.1
 only. It is in 0.3.5. It is not in v0.3.4. There is no option to listen on
-another address. Stop it with Ctrl-C. The page has four views. Each mark
+another address. Stop it with Ctrl-C. The page has five views. Each mark
 it draws stands for a value in a receipt, in a pending approval file or
 in the result of `verify`; nothing is drawn that PRÆTORE does not record.
 
@@ -358,6 +358,18 @@ in the result of `verify`; nothing is drawn that PRÆTORE does not record.
   server, 100 receipts per page, newest first; the receipts outside the
   page are drawn as one node each side that opens the next page, and only
   the rows on screen are drawn.
+- **Sessions** (from 0.3.6): the session reports in `DIR/reports/` (see
+  [A report of each session](#a-report-of-each-session)), newest first.
+  Each report written at close is one entry: session id, agent, server,
+  mode, open and close time (local and UTC), the decisions of the session
+  and, apart, the status of its approvals, the result of `verify` in the
+  report, and the buttons **Download PDF** and **Download JSON**, with the
+  SHA-256 of the JSON next to them. The pairs `praetore-mcp report` wrote
+  later (`.regen-`) are listed under the report they came from, each with
+  its own buttons, never mixed with it. `#/sessions/<id>` opens the view on
+  that session. When a session ends while the page is open, the next
+  refresh shows it with a short "Report ready" notice and its download
+  button.
 - **Information**: approvals, the policy rules, the verification detail
   and statistics (counts per decision, activity per hour or day, the most
   used tools). A summary of the policy (id, version, digest) and a warning
@@ -404,8 +416,29 @@ approving or rejecting is done with `praetore-mcp approve` and
 `praetore-mcp reject` in a terminal.
 
 The page is embedded in the binary and loads nothing from the network.
-`dashboard` writes nothing under the home. It answers only GET requests
-whose `Host` is `127.0.0.1:PORT` or `localhost:PORT`. Any local process
+`dashboard` writes nothing under the home: it does not write, regenerate
+or sign a report. It answers only GET requests (anything else gets 405)
+whose `Host` is `127.0.0.1:PORT` or `localhost:PORT`; a request with an
+`Origin` header other than `http://127.0.0.1:PORT` or
+`http://localhost:PORT` is refused (403).
+
+`GET /reports/<file>` serves one report file as a download
+(`Content-Disposition: attachment`, `application/pdf` or
+`application/json`, `X-Content-Type-Options: nosniff`, not cached). Only a
+name that is exactly a report file name is served:
+`session-<UTC>-<id>.json` or `.pdf`, or the same with `.regen-<UTC>` before
+the extension. The file is opened without following a symlink, and the
+open file must be a regular file with a single link (no hard link to
+another file), owned by the user the dashboard runs as, whose real path,
+with every symlink on the way resolved, is in the real `DIR/reports/`. Its
+content must be a report: a `.json` must parse as a report with the schema
+`praetore-mcp.session-report/1`; a `.pdf` must start with `%PDF` and its
+`.json` next to it must pass the same checks. Any other name, `..`, a
+separator (also percent-encoded, such as `%2e%2e` or `%2f`), a symlink, a
+hard link, a file of another user, a file outside `DIR/reports/`, content
+that is not a report or a file that does not exist gets 404. A file larger
+than 64 MiB gets 413 and is not read. The Sessions view lists a file only
+when this same check accepts it, so every file it lists downloads. Any local process
 can still open the page and read what it shows, tool arguments included,
 so run it only while you are using it. Texts are in Spanish, English and
 Portuguese.
@@ -433,6 +466,41 @@ with the approver key id and time, the result of `verify`, both heads and
 the SHA-256 of the JSON file. Times are local with UTC next to them. If
 `verify` fails, the first page says `VERIFY FAILED` and both files are
 still written.
+
+The JSON header and the PDF name the build that wrote them: the version
+for a release build (`0.3.6`), or the version with `-dev+<short commit>`
+for any other build (`0.3.6-dev+1a2b3c4`), or `-dev` alone (`0.3.6-dev`).
+A release build is one whose checked out commit of this repository carries
+the exact tag `v<crate version>` (another `v*` tag does not count), or one
+built with `PRAETORE_MCP_RELEASE=1`. The commit is read from git only when
+the repository git finds is this one (its top level holds
+`crates/praetore-mcp/build.rs`); a build with no `.git`, inside some other
+repository or with no `git` on `PATH` takes it from
+`PRAETORE_MCP_BUILD_COMMIT` (7 to 40 hex characters) or has none.
+`praetore-mcp --version` prints the same build version. In CI, the job
+that builds the release archives fails on a tag that is not
+`v<crate version>`, on a tag build whose `--version` is not exactly that
+version, and on any other build whose version has no `-dev+<commit>`.
+
+When the report is written, `wrap` prints where to see it, after its path:
+
+```
+praetore-mcp: session report: /home/user/.praetore/mcp/reports/session-20261116T030240Z-560f69f7.pdf
+praetore-mcp: to see and download it, run '/home/user/.local/bin/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
+```
+
+The dashboard writes nothing under the home, so `wrap` cannot tell whether
+one is running, or on which port, without connecting to a local port. It
+does not try: it prints the command (absolute binary path and `--dir`,
+quoted for a POSIX shell) with `--port 8787`, the default port, and the
+link to the page of the session on that port. If a dashboard on that port
+is already open, the link works as it is; for a dashboard on another port,
+open `#/sessions/<id>` on that one.
+
+The Sessions view of the dashboard lists the reports and downloads them;
+like the report itself, it is a view. It signs nothing and does not prove
+that a person reviewed a session. A report is tamper-evident only against
+a copy of the heads kept somewhere else.
 
 ```sh
 praetore-mcp report                    # a new report of the last session

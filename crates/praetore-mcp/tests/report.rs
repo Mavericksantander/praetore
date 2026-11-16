@@ -239,7 +239,23 @@ fn a_session_with_allow_deny_and_an_approval_writes_both_files() {
 
     let header = &document["header"];
     assert_eq!(document["schema"], "praetore-mcp.session-report/1");
-    assert_eq!(header["praetore_mcp_version"], env!("CARGO_PKG_VERSION"));
+    // The crate version, plus `-dev+<commit>` (or `-dev`) when this is not
+    // a release build.
+    let version = header["praetore_mcp_version"].as_str().unwrap();
+    assert_eq!(version, praetore_mcp::report::BUILD_VERSION);
+    let rest = version.strip_prefix(env!("CARGO_PKG_VERSION")).unwrap();
+    assert!(
+        rest.is_empty()
+            || rest == "-dev"
+            || rest.strip_prefix("-dev+").is_some_and(
+                |commit| commit.len() >= 7 && commit.bytes().all(|b| b.is_ascii_hexdigit())
+            ),
+        "{version}"
+    );
+    assert!(
+        has(&fs::read(&pdf_path).unwrap(), version),
+        "PDF has no {version}"
+    );
     assert_eq!(header["server"], "fake");
     assert_eq!(header["mode"], "enforce");
     let agent: Value = serde_json::from_str(&fs::read_to_string(home.agent()).unwrap()).unwrap();
@@ -1016,4 +1032,73 @@ fn an_unreadable_approval_journal_is_said_in_the_header_and_the_pdf() {
     let pdf = fs::read(path.with_extension("pdf")).unwrap();
     assert!(has(&pdf, "The approval journal could not be read"));
     assert!(!has(&pdf, "No approval record"));
+}
+
+/// After "session report: <pdf>", wrap names the command that starts the
+/// dashboard on this home (absolute, quoted for sh) and the page of the
+/// session there.
+#[test]
+fn the_close_line_names_the_dashboard_command_and_the_session_link() {
+    let (_temp, home) = init_home();
+    let out = wrap(&home, &[], &[call(20, "echo", json!({"text": "one"}))]);
+    assert!(out.status.success(), "{out:?}");
+    let err = stderr(&out);
+    let id = document(&json_reports(&home)[0])["header"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let exe = Path::new(bin()).canonicalize().unwrap();
+    let root = home.root.canonicalize().unwrap();
+    let expected = format!(
+        "praetore-mcp: to see and download it, run '{}' dashboard --dir '{}' --port 8787 and open http://127.0.0.1:8787/#/sessions/{id} (a dashboard on another port: #/sessions/{id} there)",
+        exe.display(),
+        root.display()
+    );
+    let lines: Vec<&str> = err.lines().collect();
+    let report = lines
+        .iter()
+        .position(|line| line.starts_with("praetore-mcp: session report: "))
+        .unwrap_or_else(|| panic!("{err}"));
+    assert_eq!(
+        lines.get(report + 1).copied(),
+        Some(expected.as_str()),
+        "{err}"
+    );
+
+    // The command works as printed: through sh, it names this binary and
+    // this home.
+    let words = expected
+        .split_once(" run ")
+        .unwrap()
+        .1
+        .split_once(" and open ")
+        .unwrap()
+        .0;
+    let echoed = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "for word in {words}; do printf '%s\\n' \"$word\"; done"
+        ))
+        .output()
+        .unwrap();
+    let echoed = String::from_utf8(echoed.stdout).unwrap();
+    assert_eq!(
+        echoed.lines().collect::<Vec<_>>(),
+        vec![
+            exe.to_str().unwrap(),
+            "dashboard",
+            "--dir",
+            root.to_str().unwrap(),
+            "--port",
+            "8787"
+        ]
+    );
+
+    // Without a report there is nothing to point at.
+    let out = wrap(
+        &home,
+        &["--no-report"],
+        &[call(21, "echo", json!({"text": "two"}))],
+    );
+    assert!(!stderr(&out).contains("#/sessions/"), "{}", stderr(&out));
 }

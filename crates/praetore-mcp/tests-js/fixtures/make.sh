@@ -4,6 +4,8 @@
 # server, then the state the dashboard serves. The temporary home path is
 # replaced by /home/user/.praetore/mcp, and the binary's path (in the
 # approve and reject commands) by /home/user/.local/bin/praetore-mcp.
+# Each wrap session also writes its report in reports/, which /api/state
+# lists under "reports".
 #
 # From the repository root:
 #   cargo build -p praetore-mcp --examples
@@ -79,4 +81,9 @@ dump healthy healthy-allow '?decision=ALLOW'
   call 5 move_file '{"from":"/srv/a","to":"/srv/b"}'
 } | "$BIN" wrap --dir "$WORK/healthy" --name fake --mode enforce -- "$FAKE" >/dev/null 2>&1
 dump healthy pending
-echo "wrote $OUT/{healthy,healthy-allow,pending,cut,unreadable}.json"
+# Sessions: the same home after `report --last`, which writes a new pair
+# next to the report of the last session (two close reports, one with a
+# regeneration grouped under it).
+"$BIN" report --dir "$WORK/healthy" --last >/dev/null
+dump healthy sessions
+echo "wrote $OUT/{healthy,healthy-allow,pending,sessions,cut,unreadable}.json"

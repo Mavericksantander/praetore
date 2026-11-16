@@ -1730,11 +1730,11 @@ fn every_function_the_page_calls_is_defined() {
 fn views_have_routes_and_old_links_still_land() {
     let html = include_str!("../src/dashboard/index.html");
     let js = include_str!("../src/dashboard/app.js");
-    assert!(js.contains("const VIEWS = [\"home\", \"live\", \"chain\", \"info\"];"));
+    assert!(js.contains("const VIEWS = [\"home\", \"live\", \"chain\", \"sessions\", \"info\"];"));
     assert!(
         js.contains("const INFO_TABS = [\"approvals\", \"policy\", \"integrity\", \"stats\"];")
     );
-    for view in ["home", "live", "chain", "info"] {
+    for view in ["home", "live", "chain", "sessions", "info"] {
         assert!(html.contains(&format!("<a href=\"#/{view}\" data-view=\"{view}\">")));
         assert!(html.contains(&format!("id=\"view-{view}\"")));
     }
@@ -1743,7 +1743,13 @@ fn views_have_routes_and_old_links_still_land() {
     assert!(js.contains(
         "operation: [\"home\"], overview: [\"home\"], approvals: [\"live\"], activity: [\"chain\"],"
     ));
-    for function in ["renderHome", "renderLive", "renderChain", "renderStats"] {
+    for function in [
+        "renderHome",
+        "renderLive",
+        "renderChain",
+        "renderStats",
+        "renderSessions",
+    ] {
         assert!(
             js.split("function renderAll() {")
                 .nth(1)
@@ -1922,4 +1928,61 @@ fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
         assert!(drawer.contains(field), "drawer has no {field}");
     }
     assert!(drawer.contains("el(\"pre\", { class: \"json\" }, argsText(r.arguments))"));
+}
+
+/// A held call that a person approved: its approval history row carries
+/// the `decided_at` of the decision in the approval journal, apart from
+/// the time of the held receipt.
+#[test]
+fn approval_history_and_live_rows_carry_the_time_of_the_human_decision() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (_, before) = api(&home, &mut cache, "");
+    let row = &before["approval_history"][0];
+    assert_eq!(row["approval"], "pending");
+    assert_eq!(row["approval_decided_at"], Value::Null);
+    // Receipt and decision times are whole seconds: keep them apart.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let pending = praetore_mcp::approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1);
+    praetore_mcp::approvals::decide(
+        &home,
+        &pending[0].approval_id,
+        praetore_mcp::approvals::HumanOutcome::Approve,
+        None,
+    )
+    .unwrap();
+    let journal = fs::read_to_string(home.root.join("approvals").join("journal.jsonl")).unwrap();
+    let decision: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    let decided_at = decision["record"]["decided_at"].as_str().unwrap();
+    let (_, after) = api(&home, &mut cache, "");
+    let row = &after["approval_history"][0];
+    assert_eq!(row["evidence_id"], pending[0].evidence_id.as_str());
+    assert!(
+        row["approval"].as_str().unwrap().starts_with("approve by "),
+        "{row}"
+    );
+    assert_eq!(row["approval_decided_at"], decided_at);
+    assert_ne!(row["approval_decided_at"], row["decided_at"]);
+    // The Live rows (state.recent) carry the same time; calls that were
+    // not held carry no such field.
+    let recent = after["recent"].as_array().unwrap();
+    let live = recent
+        .iter()
+        .find(|r| r["evidence_id"] == pending[0].evidence_id.as_str())
+        .unwrap();
+    assert_eq!(live["approval_decided_at"], decided_at);
+    assert!(
+        recent
+            .iter()
+            .filter(|r| r["decision"] != "REQUIRE_APPROVAL")
+            .all(|r| r.get("approval_decided_at").is_none())
+    );
+    let before_live = before["recent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["evidence_id"] == pending[0].evidence_id.as_str())
+        .unwrap();
+    assert_eq!(before_live["approval_decided_at"], Value::Null);
 }

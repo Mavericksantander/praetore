@@ -31,8 +31,54 @@
   the PDF say so. The PDF is written in Rust with `pdf-writer` (MIT OR
   Apache-2.0; adds no other crate to the lockfile), with no network access
   and no external process.
+- **praetore-mcp: session reports in the dashboard.** A new Sessions view
+  (Spanish, English, Portuguese) lists the reports in `DIR/reports/`, newest
+  first: session id, agent, server, mode, open and close time (local and
+  UTC), the decisions and, apart, the approval statuses, the result of
+  `verify`, and buttons to download the PDF and the JSON (with the JSON's
+  SHA-256). The pairs `report` wrote later are grouped under the report they
+  came from. `GET /reports/<file>` serves a file only when its name is
+  exactly a report file name, it opens without following a symlink as a
+  regular file with a single link, owned by the dashboard's user, its real
+  path is in `DIR/reports/` and its content is a report (a JSON with the
+  report schema; a PDF that starts with `%PDF` and whose JSON passes the
+  same checks); anything else gets 404, a file over 64 MiB 413 (not read),
+  any method but GET 405. While the
+  page is open, a new session shows up on the next refresh with a "Report
+  ready" notice. At close, `wrap` prints, after the report path, the
+  command that starts the dashboard on the home with `--port 8787`
+  (absolute and quoted) and the link `http://127.0.0.1:8787/#/sessions/<id>`,
+  saying that on another port the page is `#/sessions/<id>` there. In the
+  approval history and in the Live list, an approved or rejected call
+  shows the time of the person's decision from the approval journal
+  (`approval_decided_at` on the held rows of `/api/state`), noted as such.
+  The Sessions view lists a file only when `GET /reports/` serves it. The Live caption says how many rows
+  it shows and since when. The dashboard still
+  writes nothing: it does not write, regenerate or sign a report. The view
+  signs nothing, does not prove that a person reviewed a session, and is
+  tamper-evident only against an external copy of the heads.
 
 ### Changed
+
+- **praetore-mcp: the dashboard refuses a request whose `Origin` is not
+  its own** (`http://127.0.0.1:PORT` or `http://localhost:PORT`), with 403,
+  on top of the `Host` check.
+- **praetore-mcp: the report header names the build.** `praetore_mcp_version`
+  (JSON) and the PDF header are the version for a release build and
+  `<version>-dev+<short commit>` (or `<version>-dev`) for any other build.
+  A release build is only one whose commit carries the exact tag
+  `v<crate version>`, or one built with `PRAETORE_MCP_RELEASE=1`. The
+  commit comes from git only when the repository found is this one;
+  otherwise from `PRAETORE_MCP_BUILD_COMMIT`, or none. `praetore-mcp
+  --version` prints the same build version. CI fails a tag that is not
+  `v<crate version>`, a tag build that does not print exactly that version
+  and any other build without `-dev+<commit>`.
+- **praetore-mcp: the decision tiles of the report PDF are two fixed rows.**
+  The first counts decisions, one per call, from the receipts (ALLOW, DENY,
+  HELD, FORWARDED, WOULD ASK); the second, labeled apart, counts the
+  approval status of the held calls (APPROVED, REJECTED, PENDING,
+  EXPIRED). Every tile is shown, 0 included, so HELD and PENDING no longer
+  read as two events of the same call.
 
 - **praetore-mcp: with reports on, `wrap` writes the report before it ends
   by SIGINT or SIGTERM (macOS and Linux).** Before, the signal ended `wrap`

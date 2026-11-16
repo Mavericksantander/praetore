@@ -225,10 +225,13 @@ run in a terminal, and the latest decisions) and, apart, the full log, each
 receipt (full JSON, path_check, the agent, attester and authority
 signatures with their key ids), the active policy's rules and the result of
 the same checks `verify` runs, per receipt and for the whole journal, with
-the journal head. The page refreshes itself every few seconds while it is
-visible. It is embedded in the binary and loads nothing from the network.
-Nothing is written under DIR. Each refresh reads DIR again. Stop it with
-Ctrl-C.
+the journal head. The Sessions view lists the session reports in
+DIR/reports/ (the regenerated ones grouped under the report written at
+close) and downloads them from /reports/<file>; only exact report file
+names inside DIR/reports/ are served. The page refreshes itself every few
+seconds while it is visible. It is embedded in the binary and loads nothing
+from the network. Nothing is written under DIR: no report is written,
+regenerated or signed. Each refresh reads DIR again. Stop it with Ctrl-C.
 
 Any local process of any user can open the page and read what it shows
 (tool names and arguments included): run it only while you use it.
@@ -431,7 +434,7 @@ pub fn run(args: &[String]) -> i32 {
             Ok(0)
         }
         "-V" | "--version" | "version" => {
-            println!("praetore-mcp {}", env!("CARGO_PKG_VERSION"));
+            println!("praetore-mcp {}", crate::report::BUILD_VERSION);
             Ok(0)
         }
         other => Err(format!("unknown command {other:?}\n\n{USAGE}")),

@@ -159,6 +159,9 @@ praetore-mcp verify
 #    or look at receipts and the same checks in a read-only page on 127.0.0.1
 praetore-mcp dashboard    # from 0.3.5; see GUIDE.md
 praetore-mcp report       # from 0.3.6; writes the last session's report again
+#    the dashboard's Sessions view (from 0.3.6) lists each session report and
+#    downloads its PDF and JSON; like the report, it is a view: it signs
+#    nothing and does not prove a person reviewed the session
 
 # 7. Add rules (no JSON editing), check them, then restart the client.
 #    The policy from init has no rules: in enforce, a tool no ALLOW rule
@@ -253,7 +256,9 @@ praetore-mcp wrap --name my-server --mode observe -- node server.js --flag
 (or `-h`) prints that command's options, for example `praetore-mcp wrap
 --help` or `praetore-mcp policy deny --help`. For `wrap`, anything after
 `--` belongs to the MCP server, so `wrap -- server --help` starts the server
-with `--help`. `praetore-mcp --version` prints the version.
+with `--help`. `praetore-mcp --version` prints the build version, the
+one the session reports name: `praetore-mcp 0.3.6` for a release build,
+`praetore-mcp 0.3.6-dev+<commit>` or `praetore-mcp 0.3.6-dev` otherwise.
 
 | Exit code | Meaning |
 |---|---|
