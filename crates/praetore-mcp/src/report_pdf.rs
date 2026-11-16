@@ -450,14 +450,17 @@ fn cover(report: &Report) -> Canvas {
         c.label(ACCENT, LEFT, 140.0, "DOCUMENT TYPE");
         c.text_spaced((Font::Sans, 30.0, 2.4), INK, LEFT, 178.0, "SESSION REPORT");
     }
-    let count = report.rows.len();
+    let receipts = match report.rows.len() {
+        1 => "1 RECEIPT".to_owned(),
+        count => format!("{count} RECEIPTS"),
+    };
     let seq = report.seq.map_or_else(
-        || format!("NO CHAINED RECEIPTS ({count} RECEIPTS)"),
+        || format!("NO CHAINED RECEIPTS ({receipts})"),
         |(first, last)| {
             let chained = report.rows.iter().filter(|row| row.seq.is_some()).count();
             let contiguous = usize::try_from(last - first + 1).ok() == Some(chained);
             format!(
-                "SEQ {first} -> {last} ({count} RECEIPTS{})",
+                "SEQ {first} -> {last} ({receipts}{})",
                 if contiguous { "" } else { ", NOT CONTIGUOUS" }
             )
         },
@@ -1274,6 +1277,17 @@ mod tests {
             count(&render(&report), b"SEQ 0 -> 7 (3 RECEIPTS, NOT CONTIGUOUS)"),
             1
         );
+        // One receipt is RECEIPT, with seq or without.
+        let mut one = sample(1, true);
+        one.seq = Some((4, 4));
+        let pdf = render(&one);
+        assert_eq!(count(&pdf, b"SEQ 4 -> 4 (1 RECEIPT)"), 1);
+        assert_eq!(count(&pdf, b"1 RECEIPTS"), 0);
+        one.seq = None;
+        one.rows[0].seq = None;
+        let pdf = render(&one);
+        assert_eq!(count(&pdf, b"NO CHAINED RECEIPTS (1 RECEIPT)"), 1);
+        assert_eq!(count(&pdf, b"1 RECEIPTS"), 0);
     }
 
     #[test]
