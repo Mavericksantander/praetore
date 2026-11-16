@@ -161,6 +161,22 @@ fn verify(home: &Home) -> Output {
     run(&["verify", "--dir", home.root.to_str().unwrap()], "")
 }
 
+/// Reads whatever the master still has queued. Non-blocking; EIO and EOF end it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn drain_master(master: &mut std::fs::File, buf: &mut Vec<u8>) {
+    use std::io::Read;
+    let mut chunk = [0u8; 1024];
+    loop {
+        match master.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+            Err(error) => panic!("read pty: {error}"),
+        }
+    }
+}
+
 /// Drives `approve` on a pseudo-terminal and types the code the command prints.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn approve_on_tty(home: &Home, id: &str) -> Output {
@@ -190,6 +206,12 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
     let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
     let slave_in = slave.try_clone().unwrap();
     let slave_out = slave.try_clone().unwrap();
+    // Keep one slave fd open until this function returns. Hypothesis, not
+    // verified on macOS: the last close of the slave revokes the pty, a
+    // master read then returns EIO, and the output queue can be discarded.
+    // Linux returns the queued bytes and only then EIO. An unknown id exits
+    // before "confirmation:", so that close races the read below.
+    let _slave_hold = slave.try_clone().unwrap();
     let mut child = Command::new(bin())
         .args(["approve", id, "--dir", home.root.to_str().unwrap()])
         .stdin(Stdio::from(slave_in))
@@ -212,10 +234,14 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
     let code = loop {
         let mut chunk = [0u8; 1024];
         match master.read(&mut chunk) {
-            Ok(0) => break None,
+            Ok(0) => {}
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => break None,
+            // EIO is the hangup on both platforms. macOS also returns it when
+            // the slave is not the controlling terminal. It is not, by itself,
+            // "the pty closed before the prompt": the child may already have
+            // exited with its message in `buf`.
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
             Err(error) => panic!("read pty: {error}"),
         }
         let text = String::from_utf8_lossy(&buf);
@@ -227,7 +253,7 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
             && code.len() == 6
         {
             before_code();
-            break Some(code.to_owned());
+            break code.to_owned();
         }
         if started.elapsed() > Duration::from_secs(10) {
             panic!(
@@ -236,6 +262,7 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
             );
         }
         if let Some(status) = child.try_wait().unwrap() {
+            drain_master(&mut master, &mut buf);
             return Output {
                 status,
                 stdout: buf,
@@ -243,12 +270,6 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
             };
         }
         thread::sleep(Duration::from_millis(20));
-    };
-    let Some(code) = code else {
-        panic!(
-            "pty closed before the confirmation code:\n{}",
-            String::from_utf8_lossy(&buf)
-        );
     };
     master.write_all(format!("{code}\n").as_bytes()).unwrap();
     let started = std::time::Instant::now();
