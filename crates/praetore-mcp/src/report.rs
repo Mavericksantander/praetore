@@ -477,17 +477,16 @@ fn approval_rows(
         if !ids.contains(pending.evidence_id.as_str()) {
             continue;
         }
-        let expires = OffsetDateTime::parse(&pending.expires_at, &Rfc3339).ok();
         rows.push(ApprovalRow {
             approval_id: pending.approval_id,
             tool: pending.tool,
-            status: if expires.is_some_and(|expires| expires < as_of) {
+            status: if pending.expiry.is_expired_at(as_of) {
                 ApprovalStatus::Expired
             } else {
                 ApprovalStatus::Pending
             },
             approver: None,
-            at: expires,
+            at: pending.expiry.at(),
             used_at: None,
             used_here: false,
         });

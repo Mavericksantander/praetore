@@ -20,6 +20,8 @@ prints dev_other "praetore-mcp 0.3.5-dev+abc1234"
 prints dev_dots "praetore-mcp 0x3x6-dev+abc1234"
 prints dev_suffix "praetore-mcp 0.3.6-dev+abc1234 extra"
 prints rc "praetore-mcp 0.3.7-rc.1"
+prints build_meta "praetore-mcp 1.0.0+b1-dev+abc1234"
+prints build_meta_plus "praetore-mcp 1.0.00b1-dev+abc1234"
 prints rc_dev "praetore-mcp 0.3.7-rc.1-dev+abc1234"
 printf 'not a program' > "$work/norun"
 
@@ -48,6 +50,8 @@ check "tag, dev build" 1 dev 0.3.6 refs/tags/v0.3.6 v0.3.6
 check "tag is not the crate version" 1 release 0.3.6 refs/tags/v0.3.7 v0.3.7
 check "rc tag, rc build" 0 rc 0.3.7-rc.1 refs/tags/v0.3.7-rc.1 v0.3.7-rc.1
 check "rc dev build off a tag" 0 rc_dev 0.3.7-rc.1 "$branch" main
+check "build metadata in the crate version" 0 build_meta 1.0.0+b1 "$branch" main
+check "+ in the crate version is not a pattern" 1 build_meta_plus 1.0.0+b1 "$branch" main
 check "binary that does not run" 1 norun 0.3.6 "$branch" main
 check "binary that does not run, tag" 1 norun 0.3.6 refs/tags/v0.3.6 v0.3.6
 got=0

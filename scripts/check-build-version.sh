@@ -33,8 +33,8 @@ if [[ "${ref}" == refs/tags/v* ]]; then
     exit 1
   fi
 else
-  escaped=${crate//./\\.}
-  if ! [[ "${printed}" =~ ^praetore-mcp\ ${escaped}-dev\+[0-9a-f]{7,40}$ ]]; then
+  # The crate version is quoted: matched as literal text, not a pattern.
+  if ! [[ "${printed}" =~ ^praetore-mcp\ "${crate}"-dev\+[0-9a-f]{7,40}$ ]]; then
     echo "error: off a tag --version printed '${printed}', not 'praetore-mcp ${crate}-dev+<commit>'. build_version.rs reads the commit from this repository's git: check that the checkout has .git."
     exit 1
   fi

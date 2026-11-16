@@ -98,16 +98,42 @@ pub struct PendingInfo {
     pub server: String,
     pub tool: String,
     pub arguments_preview: String,
-    pub expires_at: String,
+    pub expiry: Expiry,
     pub evidence_id: String,
 }
 
-impl PendingInfo {
-    /// Whether the call can no longer be decided at `now`: past its
-    /// `expires_at`, or with an `expires_at` that cannot be read. `approve`,
-    /// `reject` and every view of the approval use this one rule.
+/// The `expires_at` of a pending call, read once with the pending file.
+/// Whether it has passed is asked only through [`Expiry::is_expired_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Expiry {
+    text: String,
+    at: Option<OffsetDateTime>,
+}
+
+impl Expiry {
+    pub fn parse(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            at: parse_time(text).ok(),
+        }
+    }
+
+    /// `expires_at` as written in the pending file.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The time, to show it; `None` when `expires_at` is not RFC 3339.
+    pub fn at(&self) -> Option<OffsetDateTime> {
+        self.at
+    }
+
+    /// Whether the call can no longer be decided at `now`: strictly past
+    /// `expires_at`, or with an `expires_at` that cannot be read. Holding a
+    /// call again, `approve`, `reject`, the dashboard and the session
+    /// report use this one rule.
     pub fn is_expired_at(&self, now: OffsetDateTime) -> bool {
-        parse_time(&self.expires_at).map_or(true, |expires| now > expires)
+        self.at.is_none_or(|expires| now > expires)
     }
 }
 
@@ -117,7 +143,7 @@ pub struct Decided {
     pub outcome: String,
     pub server: String,
     pub tool: String,
-    pub expires_at: String,
+    pub expiry: Expiry,
     pub approver_key_id: String,
 }
 
@@ -202,8 +228,9 @@ pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
         listed.push(pending_info(&value).map_err(|e| format!("{}: {e}", path.display()))?);
     }
     listed.sort_by(|a, b| {
-        a.expires_at
-            .cmp(&b.expires_at)
+        a.expiry
+            .text()
+            .cmp(b.expiry.text())
             .then(a.approval_id.cmp(&b.approval_id))
     });
     Ok(listed)
@@ -214,7 +241,7 @@ pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
 pub struct PendingCall {
     pub server: String,
     pub tool: String,
-    pub expires_at: String,
+    pub expiry: Expiry,
     pub evidence_id: String,
     /// Canonical JSON of the arguments, not truncated.
     pub arguments_canonical: String,
@@ -246,7 +273,7 @@ pub fn pending_call(home: &Home, approval_id: &str) -> Result<PendingCall, Strin
     Ok(PendingCall {
         server: info.server,
         tool: info.tool,
-        expires_at: info.expires_at,
+        expiry: info.expiry,
         evidence_id: info.evidence_id,
         arguments_canonical: canonical,
     })
@@ -274,12 +301,11 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
 
 /// Why `approve` or `reject` of an expired pending call signs nothing, and
 /// what to do next.
-pub fn expired_message(
-    approval_id: &str,
-    expires: OffsetDateTime,
-    outcome: HumanOutcome,
-) -> String {
-    let at = crate::when::clock_local(expires);
+pub fn expired_message(approval_id: &str, expiry: &Expiry, outcome: HumanOutcome) -> String {
+    let at = expiry.at().map_or_else(
+        || format!("an unreadable time ({:?})", expiry.text()),
+        crate::when::clock_local,
+    );
     match outcome {
         HumanOutcome::Approve => format!(
             "this approval expired at {at}; run the agent again so the call is held again, then approve the new id. Approval {approval_id} expired; nothing was signed"
@@ -321,9 +347,8 @@ pub fn decide(
             return Err(format!("{} does not match its approval id", path.display()));
         }
         let now = now_utc()?;
-        let expires = parse_time(&info.expires_at)?;
-        if info.is_expired_at(now) {
-            return Err(expired_message(approval_id, expires, outcome));
+        if info.expiry.is_expired_at(now) {
+            return Err(expired_message(approval_id, &info.expiry, outcome));
         }
         let binding = binding_from_pending(&pending)?;
         if let Some(shown) = shown {
@@ -374,7 +399,7 @@ pub fn decide(
             "arguments": arguments,
             "pending_evidence_id": info.evidence_id,
             "created_at": created_at,
-            "expires_at": info.expires_at,
+            "expires_at": info.expiry.text(),
             "decided_at": timestamp(now)?,
         });
         let signed = sign_record(&record, DECISION_DOMAIN, &approver)?;
@@ -386,7 +411,7 @@ pub fn decide(
             outcome: outcome.as_str().to_owned(),
             server: info.server,
             tool: info.tool,
-            expires_at: info.expires_at,
+            expiry: info.expiry,
             approver_key_id,
         })
     })
@@ -518,7 +543,7 @@ pub fn status_by_evidence_at(
     }
     if let Ok(pending) = list_pending(home) {
         for item in pending {
-            let open = !item.is_expired_at(now);
+            let open = !item.expiry.is_expired_at(now);
             status
                 .entry(item.evidence_id)
                 .or_insert_with(|| if open { "pending" } else { "expired" }.into());
@@ -803,8 +828,7 @@ fn reuse_or_create_pending(
         let value: Value = serde_json::from_str(&text)
             .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
         let existing = binding_from_pending(&value)?;
-        let expires = parse_time(&pending.expires_at)?;
-        if existing == *binding && now <= expires {
+        if existing == *binding && !pending.expiry.is_expired_at(now) {
             return pending_info(&value);
         }
     }
@@ -1012,16 +1036,17 @@ fn pending_info(value: &Value) -> Result<PendingInfo, String> {
         server: required_str(value, "server")?.to_owned(),
         tool: required_str(value, "tool")?.to_owned(),
         arguments_preview: crate::proxy::display_safe(&preview),
-        expires_at: required_str(value, "expires_at")?.to_owned(),
+        expiry: Expiry::parse(required_str(value, "expires_at")?),
         evidence_id: required_str(value, "evidence_id")?.to_owned(),
     })
 }
 
 fn hold_message(home: &Home, pending: &PendingInfo) -> String {
     let commands = DecisionCommands::new(home, &pending.approval_id);
-    let expires = crate::when::parse(&pending.expires_at)
-        .map(crate::when::expiry_now)
-        .unwrap_or_else(|| pending.expires_at.clone());
+    let expires = pending
+        .expiry
+        .at()
+        .map_or_else(|| pending.expiry.text().to_owned(), crate::when::expiry_now);
     let mut message = format!(
         "This tool call is waiting for local human approval and was not executed.\n\
          Approval id: {id}\n\
@@ -1037,7 +1062,7 @@ fn hold_message(home: &Home, pending: &PendingInfo) -> String {
         id = pending.approval_id,
         server = crate::proxy::display_safe(&pending.server),
         tool = crate::proxy::display_safe(&pending.tool),
-        expires_utc = pending.expires_at,
+        expires_utc = pending.expiry.text(),
         approve = commands.approve,
         reject = commands.reject,
         evidence = pending.evidence_id,

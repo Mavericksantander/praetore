@@ -1004,3 +1004,118 @@ fn held_evidence_id(home: &Home) -> String {
         .evidence_id
         .to_string()
 }
+
+/// `reject` of a call that expired undecided signs nothing: exit 2, the
+/// reason, and no approval journal. The CLI checks nothing before
+/// `approvals::decide` for a rejection, so this is the guard in `decide`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn reject_of_an_expired_pending_call_signs_nothing() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "1")];
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    // Past the one second the call was held for.
+    thread::sleep(Duration::from_secs(2));
+    let out = run(&["reject", &id, "--dir", home.root.to_str().unwrap()], "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("nothing left to reject"), "{stderr}");
+    assert!(stderr.contains("nothing was signed"), "{stderr}");
+    assert!(!home.root.join("approvals").join("journal.jsonl").exists());
+}
+
+/// `approvals::decide` itself refuses an expired pending call, for approve
+/// as for reject, without the CLI's check before the confirmation code.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn decide_refuses_an_expired_pending_call_without_the_cli_check() {
+    use praetore_mcp::approvals::{self, HumanOutcome};
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{id}.json"));
+    let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    pending["expires_at"] = json!("2000-01-01T00:00:00Z");
+    fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    for outcome in [HumanOutcome::Approve, HumanOutcome::Reject] {
+        let error = approvals::decide(&home, &id, outcome, None).unwrap_err();
+        assert!(
+            error.contains("expired") && error.contains("nothing was signed"),
+            "{error}"
+        );
+    }
+    assert!(!home.root.join("approvals").join("journal.jsonl").exists());
+    assert!(path.is_file(), "the pending file is kept");
+}
+
+/// The boundary of the one expiry rule: at `expires_at` exactly the call
+/// can still be decided, one nanosecond later it cannot. The offset of
+/// `expires_at` does not change the instant. An `expires_at` that is not
+/// RFC 3339 (no offset, empty, not a date) counts as expired.
+#[test]
+fn expiry_is_strictly_after_expires_at_whatever_the_offset() {
+    use praetore_mcp::approvals::Expiry;
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+    let now = OffsetDateTime::now_utc();
+    for text in [
+        "2026-11-16T05:00:00Z",
+        "2026-11-16T02:00:00-03:00",
+        "2026-11-16T10:30:00+05:30",
+    ] {
+        let expiry = Expiry::parse(text);
+        let at = OffsetDateTime::parse(text, &Rfc3339).unwrap();
+        assert_eq!(expiry.at(), Some(at));
+        assert!(!expiry.is_expired_at(at), "{text}: at expires_at");
+        assert!(
+            expiry.is_expired_at(at + time::Duration::nanoseconds(1)),
+            "{text}: 1 ns later"
+        );
+        assert!(
+            !expiry.is_expired_at(at - time::Duration::seconds(1)),
+            "{text}: 1 s before"
+        );
+        // The same instant in UTC.
+        let utc = at.to_offset(time::UtcOffset::UTC);
+        assert!(!expiry.is_expired_at(utc));
+        assert!(expiry.is_expired_at(utc + time::Duration::nanoseconds(1)));
+    }
+    for text in ["2026-11-16T05:00:00", "", "not a date"] {
+        let expiry = Expiry::parse(text);
+        assert_eq!(expiry.at(), None, "{text:?}");
+        assert!(expiry.is_expired_at(now), "{text:?}");
+        assert_eq!(expiry.text(), text);
+    }
+}
+
+/// The same call held again after its pending call expired gets a new
+/// approval id: an expired pending call is not reused.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_same_call_after_its_pending_call_expired_is_held_with_a_new_id() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+    let first = approval_id_from(tool_text(by_id(&responses, 7)));
+    // Held again while it is still open: the same id.
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
+    assert_eq!(approval_id_from(tool_text(by_id(&responses, 8))), first);
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{first}.json"));
+    let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    pending["expires_at"] = json!("2000-01-01T00:00:00Z");
+    fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(9, json!({"n": 1}))), &[]);
+    let second = approval_id_from(tool_text(by_id(&responses, 9)));
+    assert_ne!(second, first, "an expired pending call was reused");
+    assert!(home.approvals_pending(&second));
+}
