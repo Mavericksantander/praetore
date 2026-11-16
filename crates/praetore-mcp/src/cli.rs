@@ -895,6 +895,7 @@ fn cmd_approvals(args: &[String]) -> Result<i32, String> {
 
 /// An RFC 3339 expiry as `approvals` and `approve` print it: local time,
 /// UTC and what is left (see [`crate::when`]).
+#[expect(clippy::disallowed_methods, reason = "display only")]
 fn expiry_line(expiry: &crate::approvals::Expiry) -> String {
     expiry
         .at()
@@ -936,6 +937,7 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
     println!("expires    {}", expiry_line(&decided.expiry));
     if outcome == crate::approvals::HumanOutcome::Approve {
         println!("The agent can retry this exact call once before it expires.");
+        #[expect(clippy::disallowed_methods, reason = "display only")]
         let before = decided.expiry.at().map_or_else(
             || decided.expiry.text().to_owned(),
             crate::when::clock_local,

@@ -1060,6 +1060,7 @@ fn decide_refuses_an_expired_pending_call_without_the_cli_check() {
 /// `expires_at` does not change the instant. An `expires_at` that is not
 /// RFC 3339 (no offset, empty, not a date) counts as expired.
 #[test]
+#[expect(clippy::disallowed_methods, reason = "checks the time at() reads")]
 fn expiry_is_strictly_after_expires_at_whatever_the_offset() {
     use praetore_mcp::approvals::Expiry;
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -1118,4 +1119,32 @@ fn the_same_call_after_its_pending_call_expired_is_held_with_a_new_id() {
     let second = approval_id_from(tool_text(by_id(&responses, 9)));
     assert_ne!(second, first, "an expired pending call was reused");
     assert!(home.approvals_pending(&second));
+}
+
+/// `approve` on a terminal for a pending call whose `expires_at` cannot be
+/// read: refused before the confirmation code, as an expired call, by the
+/// same rule as `decide` (`Expiry::is_expired_at`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+    let id = approval_id_from(tool_text(by_id(&responses, 7)));
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{id}.json"));
+    let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    pending["expires_at"] = json!("not a time");
+    fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    let out = approve_on_tty(&home, &id);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("expired at an unreadable time"), "{text}");
+    assert!(text.contains("nothing was signed"), "{text}");
+    assert!(!text.contains("confirmation:"), "asked for a code: {text}");
+    assert!(!home.root.join("approvals").join("journal.jsonl").exists());
+    assert!(home.approvals_pending(&id), "the pending file is kept");
 }

@@ -1,0 +1,3 @@
+disallowed-methods = [
+    { path = "praetore_mcp::approvals::Expiry::at", reason = "whether an approval expired is Expiry::is_expired_at; at() is only to show the time (mark such a use with #[expect(clippy::disallowed_methods, reason = \"display only\")])" },
+]
