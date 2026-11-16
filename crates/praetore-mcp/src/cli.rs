@@ -873,26 +873,31 @@ fn cmd_report(args: &[String]) -> Result<i32, String> {
 
 fn cmd_approvals(args: &[String]) -> Result<i32, String> {
     let parsed = parse(args, &["--dir"], &[], false)?;
-    let pending = crate::approvals::list_pending(&parsed.home()?)?;
+    let home = parsed.home()?;
+    let pending = crate::approvals::pending_decisions(&home, time::OffsetDateTime::now_utc())?;
     if pending.is_empty() {
         println!("no pending approvals");
         return Ok(0);
     }
-    let home = parsed.home()?;
-    let now = time::OffsetDateTime::now_utc();
-    for item in pending {
+    for (item, decision) in pending {
         println!("id         {}", item.approval_id);
         println!("server     {}", crate::proxy::display_safe(&item.server));
         println!("tool       {}", crate::proxy::display_safe(&item.tool));
         println!("expires    {}", expiry_line(&item.expiry));
         println!("arguments  {}", item.arguments_preview);
-        match item.decision(&home, now) {
+        match decision {
             crate::approvals::PendingDecision::Open(commands) => {
                 println!("approve    {}", commands.approve);
                 println!("reject     {}", commands.reject);
             }
             crate::approvals::PendingDecision::Expired => {
                 println!("{}", crate::approvals::EXPIRED_PENDING);
+            }
+            crate::approvals::PendingDecision::Decided(outcome) => {
+                println!(
+                    "decided: {outcome} already; {}",
+                    crate::approvals::DECIDED_PENDING
+                );
             }
         }
         println!();

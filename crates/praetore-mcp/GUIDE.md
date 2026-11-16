@@ -314,7 +314,10 @@ expired is marked expired, apart from one that was approved and executed.
 A held call nobody decided before it expired reads Expired (Vencida) in
 every view, and is no longer listed to decide: `approvals` prints
 `expired: run the agent again so the call is held again` for it in place
-of the `approve` and `reject` commands.
+of the `approve` and `reject` commands. If an `approve` or `reject` stopped
+after it signed the decision and before it removed the pending file,
+`approvals` prints `decided: <outcome> already; ...` for that id and no
+commands; holding the same call again removes the file.
 `praetore-mcp reject <id>` records a rejection, and that call is not
 forwarded. A pending call expires after 10 minutes by default. The
 terminal check is cooperative: a process that can act as this user can

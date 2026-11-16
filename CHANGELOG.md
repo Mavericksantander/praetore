@@ -9,6 +9,13 @@
   errors that say to run `verify` or `init`, and the invalid-policy error
   now print the command with the binary's absolute path and `--dir`, like
   the other printed commands.
+- **praetore-mcp: an id that is already decided is not offered again.**
+  If `approve` or `reject` stopped after it signed the decision and before
+  it removed the pending file, `approvals` listed that id with its
+  `approve` and `reject` commands, and the session report counted it as
+  pending as well as decided. `approvals` now prints
+  `decided: <outcome> already; ...` with no commands, and the report counts
+  it once, as decided.
 
 ## 0.3.6 - 2026-11-16
 

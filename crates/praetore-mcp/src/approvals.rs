@@ -1116,23 +1116,58 @@ impl DecisionCommands {
 /// commands: `approve` and `reject` of it sign nothing.
 pub const EXPIRED_PENDING: &str = "expired: run the agent again so the call is held again";
 
-/// What can be done with a pending call at a given time: decide it while
-/// it is open, nothing once it expired (the rule of `decide`,
-/// [`Expiry::is_expired_at`]).
+/// What `approvals` prints for a pending file whose id is already decided,
+/// in place of the commands, after the outcome.
+pub const DECIDED_PENDING: &str =
+    "a decide was interrupted before it removed this file; holding the call again removes it";
+
+/// What can be done with a pending call at a given time: nothing once the
+/// approval journal has a decision for it (a `decide` that stopped between
+/// appending the decision and removing the pending file), nothing once it
+/// expired (the rule of `decide`, [`Expiry::is_expired_at`]), and decide it
+/// otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDecision {
     Open(DecisionCommands),
     Expired,
+    /// The journal's outcome for this id, `approve` or `reject`.
+    Decided(String),
 }
 
 impl PendingInfo {
-    pub fn decision(&self, home: &Home, now: OffsetDateTime) -> PendingDecision {
-        if self.expiry.is_expired_at(now) {
+    fn decision(
+        &self,
+        home: &Home,
+        entries: &[JournalEntry],
+        now: OffsetDateTime,
+    ) -> Result<PendingDecision, String> {
+        if let Some(record) = find_decision(entries, &self.approval_id)? {
+            let outcome = record["outcome"].as_str().unwrap_or("?").to_owned();
+            return Ok(PendingDecision::Decided(outcome));
+        }
+        Ok(if self.expiry.is_expired_at(now) {
             PendingDecision::Expired
         } else {
             PendingDecision::Open(DecisionCommands::new(home, &self.approval_id))
-        }
+        })
     }
+}
+
+/// Every pending file with what can be done with it at `now`, read against
+/// the approval journal. An unreadable journal is an error: a pending id is
+/// never offered for a decision without knowing whether it has one.
+pub fn pending_decisions(
+    home: &Home,
+    now: OffsetDateTime,
+) -> Result<Vec<(PendingInfo, PendingDecision)>, String> {
+    let entries = read_journal_unlocked(home)?;
+    list_pending(home)?
+        .into_iter()
+        .map(|item| {
+            let decision = item.decision(home, &entries, now)?;
+            Ok((item, decision))
+        })
+        .collect()
 }
 
 fn exact_keys(record: &Value, expected: &[&str]) -> Result<(), String> {
