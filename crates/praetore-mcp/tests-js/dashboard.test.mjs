@@ -166,13 +166,14 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
     },
   };
   const storage = new Map();
+  const copied = [];
   const context = {
     console,
     Node,
     document,
     location: { hash },
     history: { replaceState() {} },
-    navigator: { language: "es", clipboard: { writeText: async () => {} } },
+    navigator: { language: "es", clipboard: { writeText: async (text) => { copied.push(String(text)); } } },
     localStorage: {
       getItem: (k) => (storage.has(k) ? storage.get(k) : null),
       setItem: (k, v) => storage.set(k, String(v)),
@@ -225,6 +226,8 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
     byId,
     frames,
     clock,
+    // What the page wrote to the clipboard, in order.
+    copied,
     hud: p.hud,
     // Starts the page on `state`, as the browser does on DOMContentLoaded.
     async start(state) {
@@ -467,12 +470,76 @@ test("a pending call is an unsigned notice, apart from its signed receipt", asyn
   // The card for the notice says it is not signed, with the commands.
   const card = p.text("live-rest");
   assert.ok(card.includes("Sin firma"), card);
-  assert.ok(card.includes(state.pending[0].approval_id.slice(0, 12)) || card.includes("praetore-mcp approve"), card);
+  assert.ok(card.includes(state.pending[0].commands.approve), card);
   // On the chain, the mark is the receipt's.
   p.go("#/chain");
   const chain = p.canvas("chain").texts.map((t) => t.text);
   assert.ok(chain.includes("recibo ✓"), chain.join("\n"));
   assert.ok(chain.includes("pendiente · aviso sin firma · verify no lo comprueba"));
+});
+
+// Every node under `root` whose own text is `text`.
+function nodesWithText(root, text) {
+  return root.all().filter((n) => n.children.length === 1 && n.textContent === text);
+}
+
+test("the approval card shows and copies the server's commands unchanged", async () => {
+  const state = fixture("pending");
+  const { approve, reject } = state.pending[0].commands;
+  // As the server writes them: absolute binary and --dir, quoted for sh.
+  assert.ok(approve.startsWith("'/home/user/.local/bin/praetore-mcp' approve "), approve);
+  assert.ok(approve.endsWith(" --dir '/home/user/.praetore/mcp'"), approve);
+  const p = page({ now: pendingNow() });
+  await p.start(state);
+  const root = p.byId.get("live-rest");
+  const shown = root.all().find((n) => n.tagName === "PRE" && n.textContent.includes(" approve "));
+  assert.ok(shown, p.text("live-rest"));
+  assert.equal(shown.textContent, `${approve}\n${reject}`);
+  const [button] = nodesWithText(root, "Copiar comando para aprobar");
+  assert.ok(button, p.text("live-rest"));
+  await button.listeners.get("click")[0]();
+  assert.deepEqual(p.copied, [approve]);
+  assert.equal(p.copied[0], shown.textContent.split("\n")[0], "copied = first line shown");
+});
+
+test("the approval card says when it expires in local time, with UTC and what is left", async () => {
+  const state = fixture("pending");
+  const expires = state.pending[0].expires_at;
+  const p = page({ now: Date.parse(expires) - (9 * 60 + 40) * 1000 });
+  await p.start(state);
+  const card = p.text("live-rest");
+  const utc = `${expires.slice(0, 19).replace("T", " ")} UTC`;
+  const local = new Date(expires).toLocaleString("es", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  assert.ok(card.includes(`Vence a las ${local} (hora local) / ${utc}`), card);
+  assert.ok(card.includes("Vence en 9 min 40 s"), card);
+});
+
+test("an approval that expired unused is marked expired, apart from approved and executed", async () => {
+  const state = fixture("pending");
+  const asked = state.recent.filter((r) => r.decision === "REQUIRE_APPROVAL");
+  assert.ok(asked.length >= 1);
+  const expired = structuredClone(asked[0]);
+  expired.evidence_id = "00000000-0000-4000-8000-000000000001";
+  expired.approval = "approve by 0123456789abcdef, expired unused";
+  const executed = structuredClone(asked[0]);
+  executed.evidence_id = "00000000-0000-4000-8000-000000000002";
+  executed.approval = "approve by 0123456789abcdef, executed once";
+  const live = structuredClone(asked[0]);
+  live.evidence_id = "00000000-0000-4000-8000-000000000003";
+  live.approval = "approve by 0123456789abcdef";
+  state.approval_history = [expired, executed, live];
+  const p = page({ now: pendingNow(), hash: "#/info/approvals" });
+  await p.start(state);
+  const history = p.byId.get("info-approvals");
+  const tags = history.all().filter((n) => n.tagName === "SPAN" && n.className.startsWith("tag "));
+  const texts = tags.map((n) => [n.textContent, n.className]);
+  assert.deepEqual(texts, [
+    ["Vencida: se aprobó pero no se ejecutó a tiempo", "tag bad"],
+    ["Aprobada y ejecutada", "tag ok"],
+    ["Aprobada", "tag ok"],
+  ]);
 });
 
 test("an unreadable journal is said to be unreadable, not empty", async () => {

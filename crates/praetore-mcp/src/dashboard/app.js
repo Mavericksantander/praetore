@@ -96,7 +96,9 @@ const I18N = {
     ap_reject: "Rechazada", ap_executed: "Ejecutada tras aprobación", ap_would: "En enforce pediría aprobación",
     pend_none_t: "Nada pendiente.", pend_none_d: "No hay acciones esperando aprobación.",
     agent_wants: "El agente quiere", on_server: (s) => `en el servidor ${s}`,
-    expires_in: (m, s) => `Vence en ${m}:${String(s).padStart(2, "0")}`,
+    expires_in: (m, s) => `Vence en ${m} min ${s} s`,
+    expires_at_text: (local, utc) => `Vence a las ${local} (hora local) / ${utc}`,
+    ap_expired_unused: "Vencida: se aprobó pero no se ejecutó a tiempo", ap_approved_executed: "Aprobada y ejecutada",
     expired: "Vencida: ya no se puede aprobar",
     unsigned_tag: "Sin firma",
     unsigned_note: "Este aviso sale de approvals/pending: no está firmado y verify no lo comprueba. El recibo de la llamada retenida sí está firmado y verify lo comprueba.",
@@ -247,7 +249,9 @@ const I18N = {
     ap_reject: "Rejected", ap_executed: "Executed after approval", ap_would: "Enforce would ask",
     pend_none_t: "Nothing pending.", pend_none_d: "No actions are waiting for approval.",
     agent_wants: "The agent wants to", on_server: (s) => `on server ${s}`,
-    expires_in: (m, s) => `Expires in ${m}:${String(s).padStart(2, "0")}`,
+    expires_in: (m, s) => `Expires in ${m} min ${s} s`,
+    expires_at_text: (local, utc) => `Expires at ${local} (local time) / ${utc}`,
+    ap_expired_unused: "Expired: approved but not executed in time", ap_approved_executed: "Approved and executed",
     expired: "Expired: it can no longer be approved",
     unsigned_tag: "Not signed",
     unsigned_note: "This notice comes from approvals/pending: it is not signed and verify does not check it. The receipt of the held call is signed and verify checks it.",
@@ -398,7 +402,9 @@ const I18N = {
     ap_reject: "Rejeitada", ap_executed: "Executada após aprovação", ap_would: "Em enforce pediria aprovação",
     pend_none_t: "Nada pendente.", pend_none_d: "Não há ações aguardando aprovação.",
     agent_wants: "O agente quer", on_server: (s) => `no servidor ${s}`,
-    expires_in: (m, s) => `Expira em ${m}:${String(s).padStart(2, "0")}`,
+    expires_in: (m, s) => `Expira em ${m} min ${s} s`,
+    expires_at_text: (local, utc) => `Expira às ${local} (hora local) / ${utc}`,
+    ap_expired_unused: "Expirada: aprovada mas não executada a tempo", ap_approved_executed: "Aprovada e executada",
     expired: "Expirada: não pode mais ser aprovada",
     unsigned_tag: "Sem assinatura",
     unsigned_note: "Este aviso vem de approvals/pending: não está assinado e o verify não o verifica. O recibo da chamada retida está assinado e o verify o verifica.",
@@ -628,6 +634,9 @@ function approvalLabel(value) {
   if (value === "held") return { text: t("ap_held"), cls: "neutral" };
   if (value === "executed once") return { text: t("ap_executed"), cls: "ok" };
   if (value === "enforce would ask") return { text: t("ap_would"), cls: "neutral" };
+  // The held receipt of an approved call (approvals::status_by_evidence_at).
+  if (value.startsWith("approve") && value.endsWith(", expired unused")) return { text: t("ap_expired_unused"), cls: "bad" };
+  if (value.startsWith("approve") && value.endsWith(", executed once")) return { text: t("ap_approved_executed"), cls: "ok" };
   if (value.startsWith("approve")) return { text: t("ap_approve"), cls: "ok" };
   if (value.startsWith("reject")) return { text: t("ap_reject"), cls: "bad" };
   return { text: value, cls: "neutral" };
@@ -1607,6 +1616,7 @@ function approvalCard(p) {
   if (p.signed === false) {
     card.append(el("p", { class: "unsigned" }, el("span", { class: "tag neutral" }, t("unsigned_tag")), ` ${t("unsigned_note")}`));
   }
+  card.append(el("p", { class: "muted expires-at" }, t("expires_at_text", localText(p.expires_at), utcText(p.expires_at))));
   card.append(el("div", { class: "countdown-bar" },
     el("span", { class: "countdown-fill", "data-expires": p.expires_at, "data-total": String(total),
       style: `width:${Math.max(0, Math.min(100, (left / total) * 100))}%` })));
@@ -1619,15 +1629,16 @@ function approvalCard(p) {
   card.append(el("div", { class: "code-box" }, el("pre", {}, p.arguments_canonical)));
   card.append(el("p", { class: "muted" }, t("exact_args_hint")));
 
-  if (!expired) {
-    const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}\npraetore-mcp reject ${p.approval_id} --dir ${state.home}`;
+  // The commands come from the server (absolute binary path and --dir,
+  // quoted for a POSIX shell): the page shows and copies them unchanged.
+  const commands = p.commands && typeof p.commands.approve === "string" ? p.commands : null;
+  if (!expired && commands) {
     card.append(el("div", { class: "label-sm" }, t("cli_hint")));
-    card.append(el("div", { class: "code-box" }, el("pre", {}, commands)));
+    card.append(el("div", { class: "code-box" }, el("pre", {}, `${commands.approve}\n${commands.reject}`)));
   }
   const actions = el("div", { class: "actions" });
-  if (!expired) {
-    const commands = `praetore-mcp approve ${p.approval_id} --dir ${state.home}`;
-    actions.append(copyButtonLabeled(commands, t("copy_approve")));
+  if (!expired && commands) {
+    actions.append(copyButtonLabeled(commands.approve, t("copy_approve")));
   }
   if (receipt) {
     actions.append(el("button", { type: "button", onclick: () => openDrawer(receipt) }, t("view_receipt")));

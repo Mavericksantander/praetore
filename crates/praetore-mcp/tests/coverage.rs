@@ -32,6 +32,21 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
 
+/// `value` quoted for a POSIX shell, as praetore-mcp prints paths.
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// How printed commands start: the binary's canonical path, quoted.
+fn program() -> String {
+    quote(fs::canonicalize(bin()).unwrap().to_str().unwrap())
+}
+
+/// The `--dir` value of printed commands: the canonical home, quoted.
+fn quoted_dir(home: &Path) -> String {
+    quote(fs::canonicalize(home).unwrap().to_str().unwrap())
+}
+
 fn fake_server() -> PathBuf {
     let path = Path::new(bin())
         .parent()
@@ -193,7 +208,11 @@ fn init_prints_how_to_allow_a_tool() {
     assert!(out.status.success(), "{text}");
     assert!(text.contains("no rules: default deny"), "{text}");
     assert!(
-        text.contains("praetore-mcp policy allow --id ID --server NAME --tool NAME"),
+        text.contains(&format!(
+            "    {} policy allow --id ID --server NAME --tool NAME --dir {}\n",
+            program(),
+            quoted_dir(&home)
+        )),
         "{text}"
     );
     assert!(!text.contains("warning"), "{text}");
@@ -215,7 +234,9 @@ fn init_on_a_home_with_allow_all_warns_and_keeps_the_rule() {
     );
     assert!(
         text.contains(&format!(
-            "praetore-mcp policy remove --id {LEGACY_ALLOW_ALL_RULE} --dir {dir}"
+            "    {} policy remove --id {LEGACY_ALLOW_ALL_RULE} --dir {}\n",
+            program(),
+            quoted_dir(&home)
         )),
         "{text}"
     );
@@ -357,7 +378,9 @@ fn coverage_exits_1_when_a_tool_is_allowed_only_by_allow_all() {
     }
     assert!(
         section.contains(&format!(
-            "praetore-mcp policy remove --id {LEGACY_ALLOW_ALL_RULE}"
+            "  {} policy remove --id {LEGACY_ALLOW_ALL_RULE} --dir {}",
+            program(),
+            quoted_dir(&home)
         )),
         "{section}"
     );
@@ -569,7 +592,7 @@ fn coverage_suggested_lines_run_as_printed() {
         .unwrap_or_else(|| panic!("no suggestion section:\n{text}"));
     let lines: Vec<&str> = section
         .lines()
-        .filter(|l| l.starts_with("  praetore-mcp policy allow "))
+        .filter(|l| l.starts_with(&format!("  {} policy allow ", program())))
         .collect();
     assert_eq!(lines.len(), 14, "{section}");
     for tool in ["read_text_file", "edit_file"] {
@@ -580,12 +603,13 @@ fn coverage_suggested_lines_run_as_printed() {
         .find(|l| l.contains("--tool copy_file "))
         .unwrap_or_else(|| panic!("no copy_file line:\n{section}"));
 
-    // The line, as printed, through a POSIX shell.
-    let line = copy.trim().replacen("praetore-mcp", "\"$PRAETORE_MCP\"", 1);
-    let ran = Command::new("sh")
+    // The line exactly as printed, through a POSIX shell with an empty PATH:
+    // it names the binary by its absolute path.
+    let line = copy.trim();
+    let ran = Command::new("/bin/sh")
         .arg("-c")
-        .arg(&line)
-        .env("PRAETORE_MCP", bin())
+        .arg(line)
+        .env("PATH", "")
         .stdin(Stdio::null())
         .output()
         .unwrap();

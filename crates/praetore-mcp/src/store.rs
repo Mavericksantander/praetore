@@ -488,9 +488,9 @@ pub fn load_policy(home: &Home) -> Result<Policy, String> {
 pub fn load(home: &Home) -> Result<LoadedHome, String> {
     if !home.is_initialized() {
         return Err(format!(
-            "{} is not initialized; run `praetore-mcp init --dir {}`",
+            "{} is not initialized; run `{}`",
             home.root.display(),
-            home.root.display()
+            crate::commands::command("init", &home.root)
         ));
     }
     let agent_secret = read_secret(&home.agent_key(), "agent")?;

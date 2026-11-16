@@ -734,11 +734,15 @@ fn pending_view(home: &Home, receipts: Option<(&Snapshot, &BTreeMap<String, Stri
                         let index = *snapshot.by_evidence.get(&item.evidence_id)?;
                         Some(receipt_view(&snapshot.lines[index], status))
                     });
+                    // The page shows and copies these strings as they are.
+                    let commands =
+                        crate::approvals::DecisionCommands::new(home, &item.approval_id);
                     json!({
                         "approval_id": item.approval_id,
                         "server": item.server,
                         "tool": item.tool,
                         "expires_at": item.expires_at,
+                        "commands": {"approve": commands.approve, "reject": commands.reject},
                         "evidence_id": item.evidence_id,
                         "signed": false,
                         "arguments_canonical": full.as_ref().ok().map(|c| c.arguments_canonical.clone()),

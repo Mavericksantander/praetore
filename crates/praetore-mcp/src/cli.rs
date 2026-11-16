@@ -433,10 +433,12 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
             println!("  mode never blocks. To allow a tool:");
-            println!("    praetore-mcp policy allow --id ID --server NAME --tool NAME");
+            let program = crate::commands::program();
+            let dir = dir_suffix(&home);
+            println!("    {program} policy allow --id ID --server NAME --tool NAME{dir}");
             println!("  To see what the policy decides for each tool of a server:");
-            println!("    praetore-mcp policy coverage --server NAME -- <server command>");
-            println!("  Next: praetore-mcp install --dry-run");
+            println!("    {program} policy coverage --server NAME{dir} -- <server command>");
+            println!("  Next: {program} install --dry-run{dir}");
         }
     }
     if !matches!(outcome, InitOutcome::Created) {
@@ -461,22 +463,20 @@ fn warn_allow_all(home: &Home) {
     {
         let id = crate::proxy::display_safe(&rule.id);
         println!(
-            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`praetore-mcp policy allow --id ID --server NAME --tool NAME`; `praetore-mcp policy coverage` lists what each tool gets), then run:\n    praetore-mcp policy remove --id {id}{}",
+            "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`praetore-mcp policy allow --id ID --server NAME --tool NAME`; `praetore-mcp policy coverage` lists what each tool gets), then run:\n    {} policy remove --id {id}{}",
             home.policy().display(),
+            crate::commands::program(),
             dir_suffix(home)
         );
     }
 }
 
 /// ` --dir DIR` when DIR is not the default home, so a printed command
-/// acts on the same home.
+/// acts on the same home. DIR is absolute and quoted ([`crate::commands`]).
 fn dir_suffix(home: &Home) -> String {
     match store::resolve_home(None) {
         Ok(default) if default == home.root => String::new(),
-        _ => format!(
-            " --dir {}",
-            crate::policy::shell_word(&home.root.display().to_string())
-        ),
+        _ => format!(" --dir {}", crate::commands::dir(&home.root)),
     }
 }
 
@@ -789,15 +789,25 @@ fn cmd_approvals(args: &[String]) -> Result<i32, String> {
         println!("no pending approvals");
         return Ok(0);
     }
+    let home = parsed.home()?;
     for item in pending {
+        let commands = crate::approvals::DecisionCommands::new(&home, &item.approval_id);
         println!("id         {}", item.approval_id);
         println!("server     {}", crate::proxy::display_safe(&item.server));
         println!("tool       {}", crate::proxy::display_safe(&item.tool));
-        println!("expires    {}", item.expires_at);
+        println!("expires    {}", expiry_line(&item.expires_at));
         println!("arguments  {}", item.arguments_preview);
+        println!("approve    {}", commands.approve);
+        println!("reject     {}", commands.reject);
         println!();
     }
     Ok(0)
+}
+
+/// An RFC 3339 expiry as `approvals` and `approve` print it: local time,
+/// UTC and what is left (see [`crate::when`]).
+fn expiry_line(expires_at: &str) -> String {
+    crate::when::parse(expires_at).map_or_else(|| expires_at.to_owned(), crate::when::expiry_now)
 }
 
 fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Result<i32, String> {
@@ -805,9 +815,9 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
     let home = store::resolve_home(dir.as_deref()).map(Home::new)?;
     if !home.is_initialized() {
         return Err(format!(
-            "{} is not initialized; run `praetore-mcp init --dir {}`",
+            "{} is not initialized; run `{}`",
             home.root.display(),
-            home.root.display()
+            crate::commands::command("init", &home.root)
         ));
     }
     if outcome == crate::approvals::HumanOutcome::Approve && !interactive_terminal() {
@@ -832,8 +842,12 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
         crate::proxy::display_safe(&decided.tool),
         decided.expires_at
     );
+    println!("expires    {}", expiry_line(&decided.expires_at));
     if outcome == crate::approvals::HumanOutcome::Approve {
         println!("The agent can retry this exact call once before it expires.");
+        let before = crate::when::parse(&decided.expires_at)
+            .map_or_else(|| decided.expires_at.clone(), crate::when::clock_local);
+        println!("Now run the agent again before {before} so the call runs once.");
     } else {
         println!("The call will not be forwarded. A new attempt asks for approval again.");
     }
@@ -846,10 +860,21 @@ fn interactive_terminal() -> bool {
 
 fn confirm_approval(home: &Home, id: &str) -> Result<crate::approvals::PendingCall, String> {
     let pending = crate::approvals::pending_call(home, id)?;
+    // An expired call cannot be approved: say so before asking for the code.
+    // `decide` checks again, in case it expires while the code is typed.
+    if let Some(expires) = crate::when::parse(&pending.expires_at)
+        && time::OffsetDateTime::now_utc() > expires
+    {
+        return Err(crate::approvals::expired_message(
+            id,
+            expires,
+            crate::approvals::HumanOutcome::Approve,
+        ));
+    }
     let show = praetore_core::display::escape_for_display;
     eprintln!("server     {}", show(&pending.server));
     eprintln!("tool       {}", show(&pending.tool));
-    eprintln!("expires    {}", pending.expires_at);
+    eprintln!("expires    {}", expiry_line(&pending.expires_at));
     eprintln!("arguments  {}", show(&pending.arguments_canonical));
     let code = confirmation_code();
     eprintln!("Type {code} to approve {id}.");
@@ -1051,7 +1076,13 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             let report = policy::coverage(&policy, &server, &tools);
             print!(
                 "{}",
-                policy::render_coverage(&policy, &server, &report, &dir_suffix(&home))
+                policy::render_coverage(
+                    &policy,
+                    &server,
+                    &report,
+                    &crate::commands::program(),
+                    &dir_suffix(&home)
+                )
             );
             // Read only: no restart reminder.
             return Ok(if report.iter().any(|item| item.only_allow_all) {

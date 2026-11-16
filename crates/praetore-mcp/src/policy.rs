@@ -614,6 +614,7 @@ fn render_allow_suggestions(
     policy: &Policy,
     server: &str,
     report: &[ToolCoverage],
+    program: &str,
     dir_suffix: &str,
 ) -> String {
     let denied: Vec<&ToolCoverage> = report
@@ -649,7 +650,7 @@ fn render_allow_suggestions(
         }
         taken.insert(id.clone());
         out.push_str(&format!(
-            "  praetore-mcp policy allow --id {id} --server {} --tool {}{dir_suffix}\n",
+            "  {program} policy allow --id {id} --server {} --tool {}{dir_suffix}\n",
             shell_word(server),
             item.tool
         ));
@@ -663,10 +664,13 @@ fn render_allow_suggestions(
     out
 }
 
+/// `program` starts each printed command and `dir_suffix` ends it (see
+/// [`crate::commands`]).
 pub fn render_coverage(
     policy: &Policy,
     server: &str,
     report: &[ToolCoverage],
+    program: &str,
     dir_suffix: &str,
 ) -> String {
     let mut out = format!(
@@ -717,7 +721,7 @@ pub fn render_coverage(
         ));
     }
     out.push_str(&render_allow_suggestions(
-        policy, server, report, dir_suffix,
+        policy, server, report, program, dir_suffix,
     ));
     let loose: Vec<&ToolCoverage> = report.iter().filter(|item| item.only_allow_all).collect();
     out.push('\n');
@@ -746,7 +750,7 @@ pub fn render_coverage(
         );
         for id in ids {
             out.push_str(&format!(
-                "  praetore-mcp policy remove --id {}{dir_suffix}\n",
+                "  {program} policy remove --id {}{dir_suffix}\n",
                 crate::proxy::display_safe(id)
             ));
         }
@@ -1124,7 +1128,7 @@ mod tests {
             .map(|t| t.to_string())
             .collect();
         let report = coverage(&policy, "my fs", &tools);
-        let text = render_coverage(&policy, "my fs", &report, " --dir '/h h'");
+        let text = render_coverage(&policy, "my fs", &report, "praetore-mcp", " --dir '/h h'");
         assert!(
             text.contains("denied because no rule names them (2)"),
             "{text}"
@@ -1142,7 +1146,7 @@ mod tests {
 
         // Nothing denied by default: no section.
         let report = coverage(&policy, "my fs", &["write".to_owned()]);
-        let text = render_coverage(&policy, "my fs", &report, "");
+        let text = render_coverage(&policy, "my fs", &report, "praetore-mcp", "");
         assert!(!text.contains("no rule names"), "{text}");
     }
 }
