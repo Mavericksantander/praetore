@@ -59,14 +59,19 @@ mkdir -p ~/.local/bin && ln -sf <dir>/praetore-mcp ~/.local/bin/praetore-mcp && 
 ```
 
 If `~/.local/bin` is not on your `PATH` yet, add it in your shell profile.
-`install` records the absolute path of the binary that is running.
-Moving or replacing that file later leaves the client config pointing at
-the old path. Run `install` again after you move it.
+`install` records the absolute path of the binary that is running, with
+symlinks resolved. With the link above that is the file in the extracted
+directory, `<dir>/praetore-mcp`, not `~/.local/bin/praetore-mcp`. Keep
+that directory: if you delete it, the client config and the commands
+praetore-mcp printed point at a file that no longer exists. Moving or
+replacing that file later leaves the client config pointing at the old
+path. Run `install` again after you move it.
 
 Commands that praetore-mcp prints for you to copy (`approve` and `reject`
 for a held call, in the tool error, in `approvals` and in the dashboard;
-`init` and the `policy` suggestions) start with the absolute path of the
-running binary and pass `--dir` as an absolute path, both in single quotes
+`init` and the `policy` suggestions) start with the real absolute path of
+the running binary (symlinks resolved, so `<dir>/praetore-mcp` with the
+link above) and pass `--dir` as an absolute path, both in single quotes
 for a POSIX shell. They run as printed even when the binary is not on your
 `PATH`. If the binary's path cannot be read, they start with
 `praetore-mcp`, which needs it on `PATH`. On Windows they are written as
@@ -493,7 +498,7 @@ When the report is written, `wrap` prints where to see it, after its path:
 
 ```
 praetore-mcp: session report: /home/user/.praetore/mcp/reports/session-20261116T030240Z-560f69f7.pdf
-praetore-mcp: to see and download it, run '/home/user/.local/bin/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
+praetore-mcp: to see and download it, run '/home/user/praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
 ```
 
 The dashboard writes nothing under the home, so `wrap` cannot tell whether
@@ -572,8 +577,9 @@ Read these before relying on anything above.
    receipts.
 3. **Local approval is cooperative.** In enforce mode a REQUIRE_APPROVAL
    call is not forwarded. The tool error names an approval id and the
-   command to run, for example `'/home/user/.local/bin/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
-   (the absolute paths of the running binary and of the home).
+   command to run, for example `'/home/user/praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu/praetore-mcp' approve <id> --dir '/home/user/.praetore/mcp'`
+   (the real paths of the running binary, here in the directory the
+   archive was extracted to, and of the home).
    `praetore-mcp approvals` lists pending calls (server, tool, a short form
    of the arguments, expiry). `approve` works only in an interactive
    terminal. Before it asks for a short code, it prints the server, the
