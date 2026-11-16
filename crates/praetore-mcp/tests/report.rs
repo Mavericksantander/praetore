@@ -1044,10 +1044,24 @@ fn a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report() {
         );
         return;
     }
-    eprintln!(
-        "SKIPPED a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report: \
-         the report was written before the signal in every round"
+    skip_or_fail_in_ci(
+        "a_sigterm_while_the_report_is_written_ends_wrap_by_it_after_the_report",
+        "the report was written before the signal in every round (seeds 150 and 300)",
     );
+}
+
+/// A test that could not reach the case it checks. On a developer's
+/// machine it says so on stderr; in CI (the `CI` variable is set), where
+/// stderr of a passing test is not shown, it fails with the cause, so a
+/// case that never ran is never reported as passed.
+fn skip_or_fail_in_ci(test: &str, cause: &str) {
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "{test} did not reach its case: {cause}. In CI a skip fails instead of passing \
+             unseen; raise the seed or make the window reachable on this runner"
+        );
+    }
+    eprintln!("SKIPPED {test}: {cause}");
 }
 
 #[test]
