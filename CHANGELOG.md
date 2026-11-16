@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.6 - 2026-11-16
+
 ### Added
 
 - **praetore-mcp: a report of each `wrap` session.** When a session ends
@@ -107,16 +109,22 @@
   `praetore-mcp receipts` shows `expired`. The session report uses the same
   rule, so a pending call whose `expires_at` cannot be read is Expired
   there too (before, it stayed Pending), and so do `approve`, `reject` and
-  holding the same call again. The journal and the signed receipts are
-  unchanged.
+  holding the same call again. `praetore-mcp approvals` prints
+  `expired: run the agent again so the call is held again` for such a call
+  in place of its `approve` and `reject` commands. The journal and the
+  signed receipts are unchanged.
 
 - **praetore-mcp: printed commands run when the binary is not on `PATH`.**
   The `approve` and `reject` commands in the tool error of a held call, in
-  `approvals` and in the dashboard, and the commands `init`, the
-  not-initialized errors and `policy coverage` print, start with the
+  `approvals` and in the dashboard, and the commands that `init` (its
+  allow-all warning included), `policy check`, `policy allow`,
+  `policy coverage` and the not-initialized errors print, start with the
   absolute path of the running binary (`std::env::current_exe`,
-  canonicalized) and pass `--dir` as an absolute path, both single-quoted
-  for a POSIX shell (`'` written as `'\''`). Before, they started with
+  canonicalized, so a symlink such as `~/.local/bin/praetore-mcp` prints
+  the file it points to) and always pass `--dir` as an absolute path, also
+  for the default home, both single-quoted for a POSIX shell (`'` written
+  as `'\''`). The not-initialized notes of `install` still say
+  `praetore-mcp init`. Before, they started with
   `praetore-mcp`, and a binary extracted to a folder off `PATH` answered
   "command not found". If the binary's path cannot be read the commands
   start with `praetore-mcp`, as before. The dashboard shows and copies the
@@ -134,6 +142,22 @@
   `approve by KEY, expired unused` or `approve by KEY, executed once`).
   Approval is unchanged: bound to the exact call, single use, the same
   TTL, decided only in a terminal; the dashboard stays read-only.
+- **praetore-mcp: a decided approval id is not handed out again after a
+  crash.** `approve` and `reject` append the decision to the approval
+  journal and then remove the pending file. If the process stopped between
+  the two, holding the same call again reused the decided id, so a
+  rejected call stayed held under it until it expired. A pending file
+  whose id already has a decision is now removed and the call is held with
+  a new id. A rejected id still never runs, and an approved id runs at
+  most once.
+- **praetore-mcp: the report PDF says `1 RECEIPT`** for a session with one
+  receipt (it said `1 RECEIPTS`).
+
+### Internal
+
+- praetore-mcp: clippy keeps `Expiry::at` for display only, a test refuses
+  an allow of that lint anywhere in the crate, and new tests cover a
+  signal while the report is written and the fixes above.
 
 ## 0.3.5 - 2026-11-15
 
