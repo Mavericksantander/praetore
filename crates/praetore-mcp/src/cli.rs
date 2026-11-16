@@ -877,15 +877,22 @@ fn cmd_approvals(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     let home = parsed.home()?;
+    let now = time::OffsetDateTime::now_utc();
     for item in pending {
-        let commands = crate::approvals::DecisionCommands::new(&home, &item.approval_id);
         println!("id         {}", item.approval_id);
         println!("server     {}", crate::proxy::display_safe(&item.server));
         println!("tool       {}", crate::proxy::display_safe(&item.tool));
         println!("expires    {}", expiry_line(&item.expiry));
         println!("arguments  {}", item.arguments_preview);
-        println!("approve    {}", commands.approve);
-        println!("reject     {}", commands.reject);
+        match item.decision(&home, now) {
+            crate::approvals::PendingDecision::Open(commands) => {
+                println!("approve    {}", commands.approve);
+                println!("reject     {}", commands.reject);
+            }
+            crate::approvals::PendingDecision::Expired => {
+                println!("{}", crate::approvals::EXPIRED_PENDING);
+            }
+        }
         println!();
     }
     Ok(0)

@@ -1128,6 +1128,57 @@ fn the_same_call_after_its_pending_call_expired_is_held_with_a_new_id() {
     }
 }
 
+/// `approvals` prints `approve` and `reject` only for an open pending call.
+/// For an expired one, or one whose `expires_at` cannot be read, it says to
+/// run the agent again instead, as the dashboard does.
+#[test]
+fn approvals_prints_no_commands_for_an_expired_pending_call() {
+    let (_temp, home) = init_home();
+    require_echo(&home);
+    let mut ids = Vec::new();
+    for n in 1..=3 {
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": n}))), &[]);
+        ids.push(approval_id_from(tool_text(by_id(&responses, 7))));
+    }
+    for (id, expires_at) in ids[1..].iter().zip(["2000-01-01T00:00:00Z", "not a time"]) {
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{id}.json"));
+        let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        pending["expires_at"] = json!(expires_at);
+        fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+    }
+    let out = run(&["approvals", "--dir", home.root.to_str().unwrap()], "");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    let block = |id: &str| {
+        text.split("\n\n")
+            .find(|block| block.starts_with(&format!("id         {id}\n")))
+            .unwrap_or_else(|| panic!("no block for {id}:\n{text}"))
+            .to_owned()
+    };
+    let open = block(&ids[0]);
+    assert!(
+        open.contains(&format!(" approve {} --dir ", ids[0]))
+            && open.contains(&format!(" reject {} --dir ", ids[0]))
+            && !open.contains("expired:"),
+        "{open}"
+    );
+    for (id, what) in ids[1..].iter().zip(["expired", "unreadable expiry"]) {
+        let block = block(id);
+        assert!(
+            block.contains("\nexpired: run the agent again so the call is held again"),
+            "{what}: {block}"
+        );
+        assert!(
+            !block.contains("\napprove ") && !block.contains("\nreject "),
+            "{what}: commands printed for an expired call: {block}"
+        );
+    }
+}
+
 /// `approve` on a terminal for a pending call whose `expires_at` cannot be
 /// read: refused before the confirmation code, as an expired call, by the
 /// same rule as `decide` (`Expiry::is_expired_at`).

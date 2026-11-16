@@ -1112,6 +1112,29 @@ impl DecisionCommands {
     }
 }
 
+/// What `approvals` prints for an expired pending call, in place of the
+/// commands: `approve` and `reject` of it sign nothing.
+pub const EXPIRED_PENDING: &str = "expired: run the agent again so the call is held again";
+
+/// What can be done with a pending call at a given time: decide it while
+/// it is open, nothing once it expired (the rule of `decide`,
+/// [`Expiry::is_expired_at`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingDecision {
+    Open(DecisionCommands),
+    Expired,
+}
+
+impl PendingInfo {
+    pub fn decision(&self, home: &Home, now: OffsetDateTime) -> PendingDecision {
+        if self.expiry.is_expired_at(now) {
+            PendingDecision::Expired
+        } else {
+            PendingDecision::Open(DecisionCommands::new(home, &self.approval_id))
+        }
+    }
+}
+
 fn exact_keys(record: &Value, expected: &[&str]) -> Result<(), String> {
     let keys: BTreeSet<&str> = record
         .as_object()

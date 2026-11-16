@@ -307,7 +307,9 @@ the new id.` Its exit code is 2, as for every refused `approve`. In the
 dashboard, a call that was approved but not retried before the approval
 expired is marked expired, apart from one that was approved and executed.
 A held call nobody decided before it expired reads Expired (Vencida) in
-every view, and is no longer listed to decide.
+every view, and is no longer listed to decide: `approvals` prints
+`expired: run the agent again so the call is held again` for it in place
+of the `approve` and `reject` commands.
 `praetore-mcp reject <id>` records a rejection, and that call is not
 forwarded. A pending call expires after 10 minutes by default. The
 terminal check is cooperative: a process that can act as this user can
