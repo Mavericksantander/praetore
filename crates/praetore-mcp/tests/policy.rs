@@ -266,7 +266,10 @@ fn concurrent_policy_writes_are_locked_out() {
         dir,
     ));
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("another praetore-mcp policy command is running"));
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("another praetore-mcp policy command is running")
+    );
     assert_eq!(fs::read(home.join("policy.json")).unwrap(), before);
     fs::remove_file(home.join("policy.json.lock")).unwrap();
     let out = run(&with_dir(
