@@ -1142,7 +1142,7 @@ fn pending_view(home: &Home, snapshot: &Snapshot, status: &BTreeMap<String, Stri
                         "approval_id": item.approval_id,
                         "server": item.server,
                         "tool": item.tool,
-                        "expires_at": item.expires_at,
+                        "expires_at": item.expiry.text(),
                         "commands": {"approve": commands.approve, "reject": commands.reject},
                         "evidence_id": item.evidence_id,
                         "signed": false,

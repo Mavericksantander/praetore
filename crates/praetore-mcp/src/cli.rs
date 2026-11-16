@@ -884,7 +884,7 @@ fn cmd_approvals(args: &[String]) -> Result<i32, String> {
         println!("id         {}", item.approval_id);
         println!("server     {}", crate::proxy::display_safe(&item.server));
         println!("tool       {}", crate::proxy::display_safe(&item.tool));
-        println!("expires    {}", expiry_line(&item.expires_at));
+        println!("expires    {}", expiry_line(&item.expiry));
         println!("arguments  {}", item.arguments_preview);
         println!("approve    {}", commands.approve);
         println!("reject     {}", commands.reject);
@@ -895,8 +895,10 @@ fn cmd_approvals(args: &[String]) -> Result<i32, String> {
 
 /// An RFC 3339 expiry as `approvals` and `approve` print it: local time,
 /// UTC and what is left (see [`crate::when`]).
-fn expiry_line(expires_at: &str) -> String {
-    crate::when::parse(expires_at).map_or_else(|| expires_at.to_owned(), crate::when::expiry_now)
+fn expiry_line(expiry: &crate::approvals::Expiry) -> String {
+    expiry
+        .at()
+        .map_or_else(|| expiry.text().to_owned(), crate::when::expiry_now)
 }
 
 fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Result<i32, String> {
@@ -929,13 +931,15 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
         "server {} tool {} expires {}",
         crate::proxy::display_safe(&decided.server),
         crate::proxy::display_safe(&decided.tool),
-        decided.expires_at
+        decided.expiry.text()
     );
-    println!("expires    {}", expiry_line(&decided.expires_at));
+    println!("expires    {}", expiry_line(&decided.expiry));
     if outcome == crate::approvals::HumanOutcome::Approve {
         println!("The agent can retry this exact call once before it expires.");
-        let before = crate::when::parse(&decided.expires_at)
-            .map_or_else(|| decided.expires_at.clone(), crate::when::clock_local);
+        let before = decided.expiry.at().map_or_else(
+            || decided.expiry.text().to_owned(),
+            crate::when::clock_local,
+        );
         println!("Now run the agent again before {before} so the call runs once.");
     } else {
         println!("The call will not be forwarded. A new attempt asks for approval again.");
@@ -951,19 +955,20 @@ fn confirm_approval(home: &Home, id: &str) -> Result<crate::approvals::PendingCa
     let pending = crate::approvals::pending_call(home, id)?;
     // An expired call cannot be approved: say so before asking for the code.
     // `decide` checks again, in case it expires while the code is typed.
-    if let Some(expires) = crate::when::parse(&pending.expires_at)
-        && time::OffsetDateTime::now_utc() > expires
+    if pending
+        .expiry
+        .is_expired_at(time::OffsetDateTime::now_utc())
     {
         return Err(crate::approvals::expired_message(
             id,
-            expires,
+            &pending.expiry,
             crate::approvals::HumanOutcome::Approve,
         ));
     }
     let show = praetore_core::display::escape_for_display;
     eprintln!("server     {}", show(&pending.server));
     eprintln!("tool       {}", show(&pending.tool));
-    eprintln!("expires    {}", expiry_line(&pending.expires_at));
+    eprintln!("expires    {}", expiry_line(&pending.expiry));
     eprintln!("arguments  {}", show(&pending.arguments_canonical));
     let code = confirmation_code();
     eprintln!("Type {code} to approve {id}.");

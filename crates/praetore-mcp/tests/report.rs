@@ -1102,3 +1102,49 @@ fn the_close_line_names_the_dashboard_command_and_the_session_link() {
     );
     assert!(!stderr(&out).contains("#/sessions/"), "{}", stderr(&out));
 }
+
+/// A held call whose pending `expires_at` cannot be read: the session
+/// report and the dashboard, over the same home, both say expired, by the
+/// one rule (`approvals::Expiry::is_expired_at`).
+#[test]
+fn an_unreadable_expiry_is_expired_in_the_report_and_the_dashboard() {
+    let (_temp, home) = init_home();
+    let out = wrap(&home, &[], &[call(2, "append", json!({"text": "x"}))]);
+    assert!(out.status.success(), "{out:?}");
+    let (_, closed) = report_with(&home, 1);
+    assert_eq!(closed["header"]["summary"]["pending"], 1);
+    assert_eq!(closed["header"]["summary"]["expired"], 0);
+    let pending = approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1);
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{}.json", pending[0].approval_id));
+    let mut file: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    file["expires_at"] = json!("not a time");
+    fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+    let out = run(&["report", "--dir", dir(&home), "--last"], "");
+    assert!(out.status.success(), "{out:?}");
+    let regen = document(regen_reports(&home).last().unwrap());
+    assert_eq!(
+        regen["header"]["summary"]["pending"], 0,
+        "{}",
+        regen["header"]["summary"]
+    );
+    assert_eq!(
+        regen["header"]["summary"]["expired"], 1,
+        "{}",
+        regen["header"]["summary"]
+    );
+
+    let state = praetore_mcp::dashboard::state(&home, None);
+    let held = state["receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["evidence_id"] == pending[0].evidence_id.as_str())
+        .unwrap();
+    assert_eq!(held["approval"], "expired");
+}

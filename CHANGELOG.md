@@ -103,8 +103,12 @@
   call nobody decided `expired` once its `expires_at` has passed (or
   cannot be read, as for `approve`), and lists to decide only the calls it
   labels `pending`, from the same map. The drawing, the Live list, the
-  approval history and the drawer show Vencida / Expired / Vencida. The
-  journal and the signed receipts are unchanged.
+  approval history and the drawer show Vencida / Expired / Vencida, and
+  `praetore-mcp receipts` shows `expired`. The session report uses the same
+  rule, so a pending call whose `expires_at` cannot be read is Expired
+  there too (before, it stayed Pending), and so do `approve`, `reject` and
+  holding the same call again. The journal and the signed receipts are
+  unchanged.
 
 - **praetore-mcp: printed commands run when the binary is not on `PATH`.**
   The `approve` and `reject` commands in the tool error of a held call, in
