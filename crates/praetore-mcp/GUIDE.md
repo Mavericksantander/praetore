@@ -427,12 +427,18 @@ whose `Host` is `127.0.0.1:PORT` or `localhost:PORT`; a request with an
 `application/json`, `X-Content-Type-Options: nosniff`, not cached). Only a
 name that is exactly a report file name is served:
 `session-<UTC>-<id>.json` or `.pdf`, or the same with `.regen-<UTC>` before
-the extension. The file must be a regular file (not a symlink, not a
-directory) and its real path, with every symlink on the way resolved, must
-be in the real `DIR/reports/`. Any other name, `..`, a separator (also
-percent-encoded, such as `%2e%2e` or `%2f`), a symlink, a file outside
-`DIR/reports/` or a file that does not exist gets 404. A report listed in
-the view is one this check accepts. Any local process
+the extension. The file is opened without following a symlink, and the
+open file must be a regular file with a single link (no hard link to
+another file), owned by the user the dashboard runs as, whose real path,
+with every symlink on the way resolved, is in the real `DIR/reports/`. Its
+content must be a report: a `.json` must parse as a report with the schema
+`praetore-mcp.session-report/1`; a `.pdf` must start with `%PDF` and its
+`.json` next to it must pass the same checks. Any other name, `..`, a
+separator (also percent-encoded, such as `%2e%2e` or `%2f`), a symlink, a
+hard link, a file of another user, a file outside `DIR/reports/`, content
+that is not a report or a file that does not exist gets 404. A file larger
+than 64 MiB gets 413 and is not read. A report listed in the view is one
+this check accepts. Any local process
 can still open the page and read what it shows, tool arguments included,
 so run it only while you are using it. Texts are in Spanish, English and
 Portuguese.
@@ -463,22 +469,29 @@ still written.
 
 The JSON header and the PDF name the build that wrote them: the version
 for a release build (`0.3.6`), or the version with `-dev+<short commit>`
-for any other build (`0.3.6-dev+1a2b3c4`, or `0.3.6-dev` when the commit
-cannot be read).
+for any other build (`0.3.6-dev+1a2b3c4`), or `-dev` alone (`0.3.6-dev`).
+A release build is one whose checked out commit of this repository carries
+the exact tag `v<crate version>` (another `v*` tag does not count), or one
+built with `PRAETORE_MCP_RELEASE=1`. The commit is read from git only when
+the repository git finds is this one (its top level holds
+`crates/praetore-mcp/build.rs`); a build with no `.git`, inside some other
+repository or with no `git` on `PATH` takes it from
+`PRAETORE_MCP_BUILD_COMMIT` (7 to 40 hex characters) or has none.
 
 When the report is written, `wrap` prints where to see it, after its path:
 
 ```
 praetore-mcp: session report: /home/user/.praetore/mcp/reports/session-20261116T030240Z-560f69f7.pdf
-praetore-mcp: to see and download it, run '/home/user/.local/bin/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' and open http://127.0.0.1:8787/#/sessions/560f69f7
+praetore-mcp: to see and download it, run '/home/user/.local/bin/praetore-mcp' dashboard --dir '/home/user/.praetore/mcp' --port 8787 and open http://127.0.0.1:8787/#/sessions/560f69f7 (a dashboard on another port: #/sessions/560f69f7 there)
 ```
 
 The dashboard writes nothing under the home, so `wrap` cannot tell whether
 one is running, or on which port, without connecting to a local port. It
 does not try: it prints the command (absolute binary path and `--dir`,
-quoted for a POSIX shell) that starts the dashboard on its default port,
-and the page of the session there. If a dashboard on that port is already
-open, the link works as it is.
+quoted for a POSIX shell) with `--port 8787`, the default port, and the
+link to the page of the session on that port. If a dashboard on that port
+is already open, the link works as it is; for a dashboard on another port,
+open `#/sessions/<id>` on that one.
 
 The Sessions view of the dashboard lists the reports and downloads them;
 like the report itself, it is a view. It signs nothing and does not prove

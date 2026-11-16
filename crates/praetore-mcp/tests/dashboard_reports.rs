@@ -437,3 +437,118 @@ fn the_state_lists_close_reports_with_regenerations_grouped_apart() {
     let again: Value = serde_json::from_slice(&again.body).unwrap();
     assert_eq!(again["reports"], state["reports"]);
 }
+
+/// A hard link to a key of the home, with a report name, in DIR/reports:
+/// a regular file, in place, of this user, but with two links. Not served,
+/// not listed.
+#[cfg(unix)]
+#[test]
+fn a_hard_link_to_a_key_with_a_report_name_is_404() {
+    let (_temp, home) = home_with_reports();
+    let key = home.root.join("keys").join("approver.local-dev.key");
+    assert!(key.is_file());
+    let name = "session-20260101T000000Z-0123abcd.json";
+    fs::hard_link(&key, home.root.join("reports").join(name)).unwrap();
+    let response = get(&home, &format!("/reports/{name}"));
+    assert_eq!(response.status, 404);
+    let secret = fs::read(&key).unwrap();
+    assert!(
+        !response
+            .body
+            .windows(secret.len().min(16))
+            .any(|w| secret.starts_with(w))
+    );
+    let pdf = "session-20260101T000000Z-0123abcd.pdf";
+    fs::hard_link(&key, home.root.join("reports").join(pdf)).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{pdf}")).status, 404);
+    let listed = dashboard::state(&home, None)["reports"].to_string();
+    assert!(!listed.contains("0123abcd"), "{listed}");
+}
+
+/// A symlink with a report name that points at a real report in the same
+/// DIR/reports: the target is a regular file with one link, of this user,
+/// whose real path is in DIR/reports. Only opening without following the
+/// name (O_NOFOLLOW) refuses it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_symlink_to_a_real_report_is_refused_by_not_following_it() {
+    let (_temp, home) = home_with_reports();
+    let reports = home.root.join("reports");
+    let close = close_json(&home);
+    let stem = close.strip_suffix(".json").unwrap();
+    // Names `report` could have written, next to the real files.
+    for (link, target) in [
+        (format!("{stem}.regen-20990101T000000Z.json"), close.clone()),
+        (
+            format!("{stem}.regen-20990101T000000Z.pdf"),
+            format!("{stem}.pdf"),
+        ),
+    ] {
+        std::os::unix::fs::symlink(reports.join(&target), reports.join(&link)).unwrap();
+        assert_eq!(get(&home, &format!("/reports/{target}")).status, 200);
+        assert_eq!(
+            get(&home, &format!("/reports/{link}")).status,
+            404,
+            "{link}"
+        );
+    }
+}
+
+#[test]
+fn a_file_over_the_size_limit_is_413_and_nothing_is_read() {
+    let (_temp, home) = home_with_reports();
+    let name = "session-20260101T000000Z-0123abcd.json";
+    let file = fs::File::create(home.root.join("reports").join(name)).unwrap();
+    // Sparse: no 64 MiB written to disk.
+    file.set_len(dashboard::MAX_REPORT_BYTES + 1).unwrap();
+    let response = get(&home, &format!("/reports/{name}"));
+    assert_eq!(response.status, 413);
+    assert!(response.body.len() < 64);
+    assert!(response.disposition.is_none());
+    // At the limit it is read, and refused as not a report.
+    file.set_len(dashboard::MAX_REPORT_BYTES).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{name}")).status, 404);
+}
+
+#[test]
+fn only_report_contents_are_served() {
+    let (_temp, home) = home_with_reports();
+    let reports = home.root.join("reports");
+    let close = close_json(&home);
+    let stem = close.strip_suffix(".json").unwrap();
+    let cases: [(&str, &[u8]); 5] = [
+        (
+            "session-20260101T000000Z-00000001.json",
+            b"{\"schema\":\"something-else/1\"}",
+        ),
+        ("session-20260101T000000Z-00000002.json", b"not json"),
+        // A report header line alone, cut where the receipts begin.
+        (
+            "session-20260101T000000Z-00000003.json",
+            b"{\"schema\":\"praetore-mcp.session-report/1\",\"receipts\":[",
+        ),
+        // A PDF without its JSON.
+        ("session-20260101T000000Z-00000004.pdf", b"%PDF-1.7\n"),
+        // Not a PDF, though its JSON is there.
+        ("session-20260101T000000Z-00000005.pdf", b"PK\x03\x04"),
+    ];
+    fs::write(
+        reports.join("session-20260101T000000Z-00000005.json"),
+        fs::read(reports.join(&close)).unwrap(),
+    )
+    .unwrap();
+    for (name, bytes) in cases {
+        fs::write(reports.join(name), bytes).unwrap();
+        assert_eq!(
+            get(&home, &format!("/reports/{name}")).status,
+            404,
+            "{name}"
+        );
+    }
+    // The real pair is served.
+    assert_eq!(get(&home, &format!("/reports/{close}")).status, 200);
+    assert_eq!(get(&home, &format!("/reports/{stem}.pdf")).status, 200);
+    // A real PDF whose JSON is gone is no longer served.
+    fs::remove_file(reports.join(&close)).unwrap();
+    assert_eq!(get(&home, &format!("/reports/{stem}.pdf")).status, 404);
+}

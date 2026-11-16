@@ -171,6 +171,7 @@ impl Response {
             403 => "Forbidden",
             404 => "Not Found",
             405 => "Method Not Allowed",
+            413 => "Content Too Large",
             431 => "Request Header Fields Too Large",
             _ => "Error",
         };
@@ -373,11 +374,11 @@ impl Cache {
     /// again only the files that changed.
     pub fn reports(&mut self, home: &Home) -> Value {
         let mut seen = HashMap::new();
-        let view = reports_view(home, |path| {
+        let view = reports_view(home, |path, name| {
             let stamp = stamp(path);
             let file = match self.report_files.remove(path) {
                 Some((old, file)) if old == stamp && stamp.meta.is_some() => file,
-                _ => ReportFile::read(path),
+                _ => ReportFile::read(home, name),
             };
             seen.insert(path.to_path_buf(), (stamp, file.clone()));
             file
@@ -723,10 +724,21 @@ pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
         .take(RECENT)
         .map(view)
         .collect();
+    // Each held call with, when a person decided it, the time of that
+    // decision from the approval journal (not the time of the receipt).
+    let decided_at = crate::approvals::decided_at_by_evidence(home);
     let approval_history: Vec<Value> = newest_first()
         .filter(|&i| snapshot.rows[i].decision == Some("REQUIRE_APPROVAL"))
         .take(APPROVAL_HISTORY)
-        .map(view)
+        .map(|index| {
+            let mut row = view(index);
+            let at = row["evidence_id"]
+                .as_str()
+                .and_then(|id| decided_at.get(id))
+                .cloned();
+            row["approval_decided_at"] = json!(at);
+            row
+        })
         .collect();
     let matching = snapshot.matching(query);
     let receipts: Vec<Value> = matching
@@ -765,64 +777,153 @@ pub fn page_state(home: &Home, snapshot: &Snapshot, query: &Query) -> Value {
     })
 }
 
-/// The path of the report file `name` in `DIR/reports/`, if it may be
-/// served: `name` is exactly a report file name
-/// ([`report::parse_report_name`]), it is a regular file and not a symlink,
-/// and its real path (every symlink on the way resolved) is in the real
-/// `DIR/reports/`. Anything else is `None`.
-pub fn report_path(home: &Home, name: &str) -> Option<PathBuf> {
-    report::parse_report_name(name)?;
-    let dir = home.root.canonicalize().ok()?.join("reports");
-    let path = dir.join(name);
-    if !fs::symlink_metadata(&path).ok()?.file_type().is_file() {
-        return None;
-    }
-    // `reports` (or a directory above it) may be a symlink to somewhere
-    // else; the file is served only if it really is in DIR/reports.
-    let real = path.canonicalize().ok()?;
-    (real.parent() == Some(dir.as_path())).then_some(real)
+/// Largest report file the dashboard reads or serves.
+pub const MAX_REPORT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A report file opened for reading, with the metadata of the open file.
+struct OpenReport {
+    file: fs::File,
+    path: PathBuf,
+    len: u64,
 }
 
-/// Reads a regular file without following a symlink at its last component.
-fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+/// Why a report file is not opened.
+enum Refused {
+    /// Not there, not a report name, not a plain file of this user in
+    /// `DIR/reports/`: 404.
+    NotFound,
+    /// Over [`MAX_REPORT_BYTES`]: 413.
+    TooLarge,
+}
+
+/// Opens the report file `name` in `DIR/reports/` if it may be read:
+///
+/// * `name` is exactly a report file name ([`report::parse_report_name`]);
+/// * it is opened without following a symlink at its name (`O_NOFOLLOW`,
+///   Linux and macOS), so a symlink is refused whatever it points at;
+/// * the open file is a regular file with one link (a hard link to another
+///   file of the home, a key for example, has two) owned by the user this
+///   process runs as;
+/// * its real path, with every symlink on the way resolved, is in the real
+///   `DIR/reports/`, and is the file that was opened (same device and
+///   inode);
+/// * it is at most [`MAX_REPORT_BYTES`].
+fn open_report(home: &Home, name: &str) -> Result<OpenReport, Refused> {
+    report::parse_report_name(name).ok_or(Refused::NotFound)?;
+    let dir = home
+        .root
+        .canonicalize()
+        .map_err(|_| Refused::NotFound)?
+        .join("reports");
+    let path = dir.join(name);
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("not a regular file"));
+    let file = options.open(&path).map_err(|_| Refused::NotFound)?;
+    let meta = file.metadata().map_err(|_| Refused::NotFound)?;
+    if !meta.is_file() {
+        return Err(Refused::NotFound);
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        if meta.nlink() != 1 || meta.uid() != uid {
+            return Err(Refused::NotFound);
+        }
+    }
+    // `reports` (or a directory above it) may be a symlink to somewhere
+    // else; the file is read only if it really is in DIR/reports.
+    let real = path.canonicalize().map_err(|_| Refused::NotFound)?;
+    if real.parent() != Some(dir.as_path()) {
+        return Err(Refused::NotFound);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let there = fs::metadata(&real).map_err(|_| Refused::NotFound)?;
+        if (there.dev(), there.ino()) != (meta.dev(), meta.ino()) {
+            return Err(Refused::NotFound);
+        }
+    }
+    if meta.len() > MAX_REPORT_BYTES {
+        return Err(Refused::TooLarge);
+    }
+    Ok(OpenReport {
+        file,
+        path: real,
+        len: meta.len(),
+    })
 }
 
-/// `GET /reports/<name>`: the report file as a download, or 404.
+impl OpenReport {
+    /// The whole file, at most [`MAX_REPORT_BYTES`].
+    fn read_all(mut self) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.len as usize);
+        (&mut self.file)
+            .take(MAX_REPORT_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_REPORT_BYTES {
+            return Err(std::io::Error::other("report too large"));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Whether `bytes` are a session report JSON file: one JSON document whose
+/// `schema` is [`report::SCHEMA`].
+fn is_report_json(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .is_ok_and(|document| document["schema"] == report::SCHEMA)
+}
+
+/// The path of the report file `name` in `DIR/reports/`, if
+/// [`open_report`] accepts it.
+pub fn report_path(home: &Home, name: &str) -> Option<PathBuf> {
+    open_report(home, name).ok().map(|open| open.path)
+}
+
+/// `GET /reports/<name>`: the report file as a download, 404, or 413 when
+/// it is over [`MAX_REPORT_BYTES`]. A JSON file must be a session report
+/// (its `schema`); a PDF must start with `%PDF` and have its JSON next to
+/// it.
 fn serve_report(home: &Home, name: &str) -> Response {
     let not_found = || Response::text(404, "no such report");
     let Some(parsed) = report::parse_report_name(name) else {
         return not_found();
     };
-    let Some(path) = report_path(home, name) else {
+    let open = match open_report(home, name) {
+        Ok(open) => open,
+        Err(Refused::TooLarge) => return Response::text(413, "report too large"),
+        Err(Refused::NotFound) => return not_found(),
+    };
+    let Ok(body) = open.read_all() else {
         return not_found();
     };
-    match read_regular(&path) {
-        Ok(body) => Response {
-            status: 200,
-            content_type: if parsed.pdf {
-                "application/pdf"
-            } else {
-                "application/json"
-            },
-            body,
-            // `name` is only letters, digits, `-` and `.` here.
-            disposition: Some(format!("attachment; filename=\"{name}\"")),
+    let is_report = if parsed.pdf {
+        let sibling = format!("{}.json", name.strip_suffix(".pdf").unwrap_or(name));
+        body.starts_with(b"%PDF") && open_report(home, &sibling).is_ok()
+    } else {
+        is_report_json(&body)
+    };
+    if !is_report {
+        return not_found();
+    }
+    Response {
+        status: 200,
+        content_type: if parsed.pdf {
+            "application/pdf"
+        } else {
+            "application/json"
         },
-        Err(_) => not_found(),
+        body,
+        // `name` is only letters, digits, `-` and `.` here.
+        disposition: Some(format!("attachment; filename=\"{name}\"")),
     }
 }
 
@@ -837,20 +938,21 @@ struct ReportFile {
 }
 
 impl ReportFile {
-    fn read(path: &Path) -> Self {
-        let pdf = path.extension().is_some_and(|ext| ext == "pdf");
-        if pdf {
-            return match fs::metadata(path) {
-                Ok(meta) => Self {
-                    bytes: meta.len(),
-                    sha256: None,
-                    header: None,
-                    error: None,
-                },
-                Err(error) => Self::failed(error.to_string()),
+    fn read(home: &Home, name: &str) -> Self {
+        let open = match open_report(home, name) {
+            Ok(open) => open,
+            Err(Refused::TooLarge) => return Self::failed("over the size limit".into()),
+            Err(Refused::NotFound) => return Self::failed("cannot be read".into()),
+        };
+        if name.ends_with(".pdf") {
+            return Self {
+                bytes: open.len,
+                sha256: None,
+                header: None,
+                error: None,
             };
         }
-        match read_regular(path) {
+        match open.read_all() {
             Ok(bytes) => {
                 let first = bytes.split(|b| *b == b'\n').next().unwrap_or_default();
                 let header = std::str::from_utf8(first)
@@ -914,7 +1016,7 @@ fn header_summary(header: &Value) -> Value {
 /// and under it, apart, the pairs `praetore-mcp report` wrote later
 /// (`.regen-`), oldest first. Only files [`report_path`] would serve are
 /// listed. `file` reads one file (cached by [`Cache::reports`]).
-fn reports_view(home: &Home, mut file: impl FnMut(&Path) -> ReportFile) -> Value {
+fn reports_view(home: &Home, mut file: impl FnMut(&Path, &str) -> ReportFile) -> Value {
     let Ok(root) = home.root.canonicalize() else {
         return json!({"items": [], "error": null});
     };
@@ -955,8 +1057,12 @@ fn reports_view(home: &Home, mut file: impl FnMut(&Path) -> ReportFile) -> Value
         }
     }
     let mut describe = |json_name: &Option<String>, pdf_name: &Option<String>| {
-        let json_file = json_name.as_ref().map(|name| (name, file(&dir.join(name))));
-        let pdf_file = pdf_name.as_ref().map(|name| (name, file(&dir.join(name))));
+        let json_file = json_name
+            .as_ref()
+            .map(|name| (name, file(&dir.join(name), name)));
+        let pdf_file = pdf_name
+            .as_ref()
+            .map(|name| (name, file(&dir.join(name), name)));
         let header = json_file
             .as_ref()
             .and_then(|(_, f)| f.header.as_ref())
@@ -1011,7 +1117,7 @@ pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
         "pending": pending,
         "verify": snapshot.verify,
         "receipts": receipts,
-        "reports": reports_view(home, ReportFile::read),
+        "reports": reports_view(home, |_, name| ReportFile::read(home, name)),
     })
 }
 

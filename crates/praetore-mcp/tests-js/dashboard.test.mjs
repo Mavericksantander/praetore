@@ -709,3 +709,59 @@ test("#/sessions/<id> opens the Sessions view on that session", async () => {
   await q.start(state);
   assert.ok(!sessionCards(q).some((c) => c.className.includes("focus")));
 });
+
+// ---------- approval history and live caption ----------
+
+function localEs(iso) {
+  return new Date(iso).toLocaleString("es", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+}
+
+test("an approved call shows when the person decided it, not when it was held", async () => {
+  const state = fixture("pending");
+  const held = state.approval_history[0];
+  assert.equal(held.approval_decided_at, null, "the server sends the field, null before a decision");
+  // The same call after a person approved it, 7 minutes after the receipt.
+  const approved = structuredClone(state);
+  const row = approved.approval_history[0];
+  const decidedAt = new Date(Date.parse(row.decided_at) + 7 * 60_000).toISOString().replace(/\.\d+Z$/, "Z");
+  row.approval = "approve by 0123456789abcdef, executed once";
+  row.approval_decided_at = decidedAt;
+  approved.pending = [];
+  const p = page({ hash: "#/info/approvals", now: pendingNow() });
+  await p.start(approved);
+  const text = p.text("info-approvals");
+  assert.ok(text.includes(`${decidedAt.slice(0, 19).replace("T", " ")} UTC`), text);
+  assert.ok(!text.includes(`${row.decided_at.slice(0, 19).replace("T", " ")} UTC`), "the held receipt's time is not shown");
+  assert.ok(text.includes("hora de la decisión humana"), text);
+  // Before a decision: the time it was held, said so.
+  const q = page({ hash: "#/info/approvals", now: pendingNow() });
+  await q.start(state);
+  const before = q.text("info-approvals");
+  assert.ok(before.includes(`${held.decided_at.slice(0, 19).replace("T", " ")} UTC`), before);
+  assert.ok(before.includes("hora en que se retuvo"), before);
+});
+
+test("the live caption says how many rows it shows and from when, in each view", async () => {
+  // Twelve decisions in the last 15 minutes: more than the drawing shows.
+  const base = fixture("healthy");
+  const now = Date.parse("2026-01-01T00:00:00Z");
+  const sample = base.recent.find((r) => !r.parse_error);
+  const recent = Array.from({ length: 12 }, (_, i) => {
+    const r = structuredClone(sample);
+    r.evidence_id = `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`;
+    r.decided_at = new Date(now - (i + 1) * 30_000).toISOString().replace(/\.\d+Z$/, "Z");
+    return r;
+  });
+  const state = { ...structuredClone(base), recent, summary: { ...base.summary, total: 12 } };
+  const p = page({ hash: "#/live", now });
+  await p.start(state);
+  let caption = p.text("live-caption");
+  assert.ok(caption.startsWith("12 decisiones en los últimos 15 minutos."), caption);
+  assert.ok(caption.endsWith(`Se muestran las 8 más recientes, desde ${localEs(recent[7].decided_at)}.`), caption);
+  // The list view shows all twelve and says so.
+  p.byId.get("live-list").listeners.get("click")[0]();
+  caption = p.text("live-caption");
+  assert.ok(caption.endsWith(`Se muestran las 12 más recientes, desde ${localEs(recent[11].decided_at)}.`), caption);
+});

@@ -111,6 +111,8 @@ const I18N = {
     cli_hint: "Para decidir, ejecuta uno de estos comandos en una terminal de este computador", copy_approve: "Copiar comando para aprobar",
     copy: "Copiar", copied: "Copiado",
     toast_pending: "Nueva acción esperando tu aprobación",
+    l_cap_rows: (n, since) => n === 1 ? `Se muestra la más reciente, de ${since}.` : `Se muestran las ${n} más recientes, desde ${since}.`,
+    hist_decided: "hora de la decisión humana", hist_held: "hora en que se retuvo",
     nav_sessions: "Sesiones", sub_sessions: "Los informes de cada sesión de wrap, para leer o descargar",
     s_none_t: "Aún no hay informes de sesión.", s_none_d: "wrap escribe un informe (JSON y PDF) en reports/ al cerrar cada sesión con recibos.",
     s_session: "Sesión", s_agent: "Agente", s_server: "Servidor", s_mode: "Modo", s_opened: "Apertura", s_closed: "Cierre",
@@ -278,6 +280,8 @@ const I18N = {
     cli_hint: "To decide, run one of these commands in a terminal on this computer", copy_approve: "Copy approve command",
     copy: "Copy", copied: "Copied",
     toast_pending: "New action waiting for your approval",
+    l_cap_rows: (n, since) => n === 1 ? `Showing the newest one, from ${since}.` : `Showing the ${n} newest, since ${since}.`,
+    hist_decided: "time of the human decision", hist_held: "time it was held",
     nav_sessions: "Sessions", sub_sessions: "The report of each wrap session, to read or download",
     s_none_t: "No session reports yet.", s_none_d: "wrap writes a report (JSON and PDF) in reports/ when each session with receipts ends.",
     s_session: "Session", s_agent: "Agent", s_server: "Server", s_mode: "Mode", s_opened: "Opened", s_closed: "Closed",
@@ -445,6 +449,8 @@ const I18N = {
     cli_hint: "Para decidir, execute um destes comandos em um terminal deste computador", copy_approve: "Copiar comando para aprovar",
     copy: "Copiar", copied: "Copiado",
     toast_pending: "Nova ação aguardando sua aprovação",
+    l_cap_rows: (n, since) => n === 1 ? `Mostra-se a mais recente, de ${since}.` : `Mostram-se as ${n} mais recentes, desde ${since}.`,
+    hist_decided: "hora da decisão humana", hist_held: "hora em que foi retida",
     nav_sessions: "Sessões", sub_sessions: "O relatório de cada sessão do wrap, para ler ou baixar",
     s_none_t: "Ainda não há relatórios de sessão.", s_none_d: "O wrap escreve um relatório (JSON e PDF) em reports/ ao fechar cada sessão com recibos.",
     s_session: "Sessão", s_agent: "Agente", s_server: "Servidor", s_mode: "Modo", s_opened: "Abertura", s_closed: "Fechamento",
@@ -1275,9 +1281,19 @@ function liveCaption() {
   return t("l_cap_quiet", relativeText(state.recent[0] && state.recent[0].decided_at));
 }
 
+// The 15-minute count above reads up to the 40 newest receipts; the
+// drawing shows the 8 newest and the list the 40 newest. This says how
+// many rows are on screen and from when, so the two can be compared.
+function shownText() {
+  const shown = liveMode === "list" ? state.recent.filter((r) => !r.parse_error) : hud.rows.map((row) => row.r);
+  if (!shown.length) return "";
+  const oldest = shown[shown.length - 1].decided_at;
+  return t("l_cap_rows", shown.length, oldest ? localText(oldest) : "-");
+}
+
 function renderLive() {
   syncHud();
-  document.getElementById("live-caption").textContent = liveCaption();
+  document.getElementById("live-caption").textContent = [liveCaption(), shownText()].filter(Boolean).join(" ");
   for (const [id, mode] of [["live-visual", "visual"], ["live-list", "list"]]) {
     const button = document.getElementById(id);
     button.classList.toggle("on", liveMode === mode);
@@ -1691,6 +1707,16 @@ function approvalCard(p) {
   return card;
 }
 
+// When a person approved or rejected the call: the decided_at of that
+// decision in the approval journal. Before a decision: when the call was
+// held (the receipt).
+function historyWhen(r) {
+  const human = r.approval_decided_at || null;
+  const at = human || r.decided_at;
+  return el("td", { class: "cell-when" }, relativeText(at), el("small", {}, localText(at)),
+    el("small", {}, utcText(at)), el("small", { class: "muted" }, t(human ? "hist_decided" : "hist_held")));
+}
+
 function historyCard() {
   const rows = state.approval_history;
   const card = el("div", { class: "card flush" });
@@ -1705,8 +1731,7 @@ function historyCard() {
     const target = targetOf(r.arguments);
     const label = approvalLabel(r.approval);
     body.append(activatable(el("tr", { onclick: () => openDrawer(r) },
-      el("td", { class: "cell-when" }, relativeText(r.decided_at), el("small", {}, localText(r.decided_at)),
-        el("small", {}, utcText(r.decided_at))),
+      historyWhen(r),
       el("td", { class: "cell-action" }, el("strong", {}, toolLabel(r.tool)),
         el("div", { class: "target", title: target.full }, target.short)),
       el("td", {}, label ? el("span", { class: `tag ${label.cls}` }, label.text) : "-")), () => openDrawer(r), r.evidence_id));

@@ -632,12 +632,14 @@ pub fn run(options: WrapOptions) -> i32 {
 /// Where to see and download the report. The dashboard writes nothing
 /// under the home, so whether one is running (and on which port) cannot be
 /// known without connecting to a local port: the hint names the command
-/// that starts it on its default port and the page of the session there.
+/// that starts it with `--port 8787` written out, the page of the session
+/// on that port, and says to open the same page on another port.
 pub fn dashboard_hint(home: &crate::store::Home, session_id: &str) -> String {
+    let port = crate::dashboard::DEFAULT_PORT;
     format!(
-        "to see and download it, run {} and open http://127.0.0.1:{}/#/sessions/{session_id}",
-        crate::commands::command("dashboard", &home.root),
-        crate::dashboard::DEFAULT_PORT,
+        "to see and download it, run {} dashboard --dir {} --port {port} and open http://127.0.0.1:{port}/#/sessions/{session_id} (a dashboard on another port: #/sessions/{session_id} there)",
+        crate::commands::program(),
+        crate::commands::dir(&home.root),
     )
 }
 

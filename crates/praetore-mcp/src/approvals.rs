@@ -516,6 +516,27 @@ pub fn status_by_evidence_at(
     Ok(status)
 }
 
+/// Evidence id of a held call -> `decided_at` of the human decision on it
+/// (approve or reject), from the approval journal. Not a signature check;
+/// `verify` does that. An unreadable or absent journal yields an empty map.
+pub fn decided_at_by_evidence(home: &Home) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Ok(entries) = read_journal_unlocked(home) {
+        for entry in &entries {
+            if entry.record["kind"].as_str() != Some("decision") {
+                continue;
+            }
+            if let (Some(id), Some(at)) = (
+                entry.record["pending_evidence_id"].as_str(),
+                entry.record["decided_at"].as_str(),
+            ) {
+                out.insert(id.to_owned(), at.to_owned());
+            }
+        }
+    }
+    out
+}
+
 /// Checks the approval journal: signatures, binding to the named receipts,
 /// expiry, and single use. An absent journal is success (homes from v0.3.3).
 pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, String> {

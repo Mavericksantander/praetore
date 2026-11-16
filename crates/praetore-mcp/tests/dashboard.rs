@@ -1929,3 +1929,39 @@ fn the_chain_is_cut_where_verify_fails_and_the_receipt_is_rebuilt() {
     }
     assert!(drawer.contains("el(\"pre\", { class: \"json\" }, argsText(r.arguments))"));
 }
+
+/// A held call that a person approved: its approval history row carries
+/// the `decided_at` of the decision in the approval journal, apart from
+/// the time of the held receipt.
+#[test]
+fn approval_history_carries_the_time_of_the_human_decision() {
+    let (_temp, home) = home_with_receipts();
+    let mut cache = dashboard::Cache::default();
+    let (_, before) = api(&home, &mut cache, "");
+    let row = &before["approval_history"][0];
+    assert_eq!(row["approval"], "pending");
+    assert_eq!(row["approval_decided_at"], Value::Null);
+    // Receipt and decision times are whole seconds: keep them apart.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let pending = praetore_mcp::approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1);
+    praetore_mcp::approvals::decide(
+        &home,
+        &pending[0].approval_id,
+        praetore_mcp::approvals::HumanOutcome::Approve,
+        None,
+    )
+    .unwrap();
+    let journal = fs::read_to_string(home.root.join("approvals").join("journal.jsonl")).unwrap();
+    let decision: Value = serde_json::from_str(journal.lines().next().unwrap()).unwrap();
+    let decided_at = decision["record"]["decided_at"].as_str().unwrap();
+    let (_, after) = api(&home, &mut cache, "");
+    let row = &after["approval_history"][0];
+    assert_eq!(row["evidence_id"], pending[0].evidence_id.as_str());
+    assert!(
+        row["approval"].as_str().unwrap().starts_with("approve by "),
+        "{row}"
+    );
+    assert_eq!(row["approval_decided_at"], decided_at);
+    assert_ne!(row["approval_decided_at"], row["decided_at"]);
+}

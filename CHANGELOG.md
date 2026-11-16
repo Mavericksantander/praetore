@@ -38,12 +38,20 @@
   `verify`, and buttons to download the PDF and the JSON (with the JSON's
   SHA-256). The pairs `report` wrote later are grouped under the report they
   came from. `GET /reports/<file>` serves a file only when its name is
-  exactly a report file name, it is a regular file and its real path is in
-  `DIR/reports/`; anything else gets 404, any method but GET 405. While the
+  exactly a report file name, it opens without following a symlink as a
+  regular file with a single link, owned by the dashboard's user, its real
+  path is in `DIR/reports/` and its content is a report (a JSON with the
+  report schema; a PDF that starts with `%PDF` and whose JSON passes the
+  same checks); anything else gets 404, a file over 64 MiB 413 (not read),
+  any method but GET 405. While the
   page is open, a new session shows up on the next refresh with a "Report
   ready" notice. At close, `wrap` prints, after the report path, the
-  command that starts the dashboard on the home (absolute and quoted) and
-  the link `http://127.0.0.1:8787/#/sessions/<id>`. The dashboard still
+  command that starts the dashboard on the home with `--port 8787`
+  (absolute and quoted) and the link `http://127.0.0.1:8787/#/sessions/<id>`,
+  saying that on another port the page is `#/sessions/<id>` there. In the
+  approval history, an approved call shows the time of the person's
+  decision from the approval journal. The Live caption says how many rows
+  it shows and since when. The dashboard still
   writes nothing: it does not write, regenerate or sign a report. The view
   signs nothing, does not prove that a person reviewed a session, and is
   tamper-evident only against an external copy of the heads.
@@ -56,6 +64,10 @@
 - **praetore-mcp: the report header names the build.** `praetore_mcp_version`
   (JSON) and the PDF header are the version for a release build and
   `<version>-dev+<short commit>` (or `<version>-dev`) for any other build.
+  A release build is only one whose commit carries the exact tag
+  `v<crate version>`, or one built with `PRAETORE_MCP_RELEASE=1`. The
+  commit comes from git only when the repository found is this one;
+  otherwise from `PRAETORE_MCP_BUILD_COMMIT`, or none.
 - **praetore-mcp: the decision tiles of the report PDF are two fixed rows.**
   The first counts decisions, one per call, from the receipts (ALLOW, DENY,
   HELD, FORWARDED, WOULD ASK); the second, labeled apart, counts the

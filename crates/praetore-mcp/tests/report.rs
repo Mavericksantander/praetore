@@ -1050,7 +1050,7 @@ fn the_close_line_names_the_dashboard_command_and_the_session_link() {
     let exe = Path::new(bin()).canonicalize().unwrap();
     let root = home.root.canonicalize().unwrap();
     let expected = format!(
-        "praetore-mcp: to see and download it, run '{}' dashboard --dir '{}' and open http://127.0.0.1:8787/#/sessions/{id}",
+        "praetore-mcp: to see and download it, run '{}' dashboard --dir '{}' --port 8787 and open http://127.0.0.1:8787/#/sessions/{id} (a dashboard on another port: #/sessions/{id} there)",
         exe.display(),
         root.display()
     );
@@ -1088,7 +1088,9 @@ fn the_close_line_names_the_dashboard_command_and_the_session_link() {
             exe.to_str().unwrap(),
             "dashboard",
             "--dir",
-            root.to_str().unwrap()
+            root.to_str().unwrap(),
+            "--port",
+            "8787"
         ]
     );
 
