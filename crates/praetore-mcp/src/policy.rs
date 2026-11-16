@@ -570,8 +570,6 @@ pub fn coverage(policy: &Policy, server: &str, tools: &[String]) -> Vec<ToolCove
         .collect()
 }
 
-/// `dir_suffix` is appended to the printed `policy remove` commands
-/// (` --dir DIR` for a home other than the default one).
 /// A tool name `policy coverage` prints inside a suggested command without
 /// quoting: the MCP tool name characters, 1 to 128 of them.
 fn plain_tool_name(name: &str) -> bool {

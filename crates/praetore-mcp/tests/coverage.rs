@@ -218,6 +218,59 @@ fn init_prints_how_to_allow_a_tool() {
     assert!(!text.contains("warning"), "{text}");
 }
 
+/// The printed commands of `text`: each line from where [`program`]
+/// starts in it.
+fn command_lines(text: &str) -> Vec<&str> {
+    let program = program();
+    text.lines()
+        .filter_map(|line| line.find(&program).map(|at| &line[at..]))
+        .collect()
+}
+
+/// With PRAETORE_MCP_HOME set and no --dir, the home is the default one:
+/// the commands init, its allow-all warning and coverage print still name
+/// it with --dir, so they act on it wherever they are pasted.
+#[test]
+fn with_the_default_home_printed_commands_still_name_dir() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let env = [("PRAETORE_MCP_HOME", home.to_str().unwrap())];
+    let check = |what: &str, text: &str, at_least: usize| {
+        let lines = command_lines(text);
+        assert!(lines.len() >= at_least, "{what}: {lines:?}\n{text}");
+        let dir = format!(" --dir {}", quoted_dir(&home));
+        for line in lines {
+            assert!(line.contains(&dir), "{what}: no{dir} in {line:?}");
+        }
+    };
+
+    let out = run_env(&["init"], &env);
+    assert!(out.status.success(), "{out:?}");
+    check("init", &stdout(&out), 3);
+
+    write_legacy_policy(&home);
+    let out = run_env(&["init"], &env);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("warning"), "{text}");
+    check("allow-all warning", &text, 1);
+
+    let fake = fake_server();
+    let out = run_env(
+        &[
+            "policy",
+            "coverage",
+            "--server",
+            "filesystem",
+            "--",
+            fake.to_str().unwrap(),
+        ],
+        &[env[0], FS_TOOLS_ENV[0]],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    check("coverage", &stdout(&out), 1);
+}
+
 #[test]
 fn init_on_a_home_with_allow_all_warns_and_keeps_the_rule() {
     let (_temp, home) = init();

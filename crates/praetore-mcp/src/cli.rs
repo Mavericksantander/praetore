@@ -529,13 +529,11 @@ fn warn_allow_all(home: &Home) {
     }
 }
 
-/// ` --dir DIR` when DIR is not the default home, so a printed command
-/// acts on the same home. DIR is absolute and quoted ([`crate::commands`]).
+/// ` --dir DIR`, so a printed command acts on the same home whatever
+/// PRAETORE_MCP_HOME is where it runs. DIR is absolute and quoted
+/// ([`crate::commands`]).
 fn dir_suffix(home: &Home) -> String {
-    match store::resolve_home(None) {
-        Ok(default) if default == home.root => String::new(),
-        _ => format!(" --dir {}", crate::commands::dir(&home.root)),
-    }
+    format!(" --dir {}", crate::commands::dir(&home.root))
 }
 
 pub(crate) fn valid_server_name(name: &str) -> bool {
