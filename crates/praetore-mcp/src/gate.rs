@@ -1040,7 +1040,7 @@ impl Gate {
             policy_digest,
             mode,
             home: home.clone(),
-            journal: Journal::new(home.receipts_dir()),
+            journal: Journal::new(home),
             path_keys,
             path_prefixes,
         })
@@ -1257,11 +1257,16 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
 /// entry per line (see [`crate::journal`]), fsynced after each write.
 pub struct Journal {
     dir: PathBuf,
+    /// `verify` on this journal's home, for the errors that send there.
+    verify: String,
 }
 
 impl Journal {
-    pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    pub fn new(home: &Home) -> Self {
+        Self {
+            dir: home.receipts_dir(),
+            verify: crate::commands::command("verify", &home.root),
+        }
     }
 
     pub fn path_for(&self, now: OffsetDateTime) -> PathBuf {
@@ -1284,8 +1289,11 @@ impl Journal {
         // Held until the entry is on disk: the position read below must
         // still be the end of the journal when the line is written.
         let _lock = crate::journal::JournalLock::acquire(&self.dir)?;
-        let (path, position) =
-            crate::journal::next_append(&self.dir, self.path_for(OffsetDateTime::now_utc()))?;
+        let (path, position) = crate::journal::next_append(
+            &self.dir,
+            self.path_for(OffsetDateTime::now_utc()),
+            &self.verify,
+        )?;
         if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(format!("{} is a symlink; refusing to append", path.shown()));
         }
@@ -2698,8 +2706,11 @@ mod tests {
 
     #[test]
     fn journal_file_name_is_utc_date() {
-        let journal = Journal::new(PathBuf::from("/r"));
+        let journal = Journal::new(&Home::new(PathBuf::from("/")));
         let at = OffsetDateTime::from_unix_timestamp(1_780_000_000).unwrap();
-        assert_eq!(journal.path_for(at), PathBuf::from("/r/2026-05-28.jsonl"));
+        assert_eq!(
+            journal.path_for(at),
+            PathBuf::from("/receipts/2026-05-28.jsonl")
+        );
     }
 }

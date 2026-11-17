@@ -474,20 +474,22 @@ fn approval_rows(
             used_here,
         });
     }
-    for pending in approvals::list_pending(home).unwrap_or_default() {
+    for (pending, decision) in approvals::pending_decisions(home, as_of).unwrap_or_default() {
         if !ids.contains(pending.evidence_id.as_str()) {
             continue;
         }
+        let status = match decision {
+            // Its decision record is already a row above.
+            approvals::PendingDecision::Decided(_) => continue,
+            approvals::PendingDecision::Expired => ApprovalStatus::Expired,
+            approvals::PendingDecision::Open(_) => ApprovalStatus::Pending,
+        };
         #[expect(clippy::disallowed_methods, reason = "display only")]
         let at = pending.expiry.at();
         rows.push(ApprovalRow {
             approval_id: pending.approval_id,
             tool: pending.tool,
-            status: if pending.expiry.is_expired_at(as_of) {
-                ApprovalStatus::Expired
-            } else {
-                ApprovalStatus::Pending
-            },
+            status,
             approver: None,
             at,
             used_at: None,

@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- **praetore-mcp: error messages name the binary and the home.** The
+  not-initialized notes of `install`, the approval and receipt journal
+  errors that say to run `verify` or `init`, and the invalid-policy error
+  now print the command with the binary's absolute path and `--dir`, like
+  the other printed commands.
+- **praetore-mcp: an id that is already decided is not offered again.**
+  If `approve` or `reject` stopped after it signed the decision and before
+  it removed the pending file, `approvals` listed that id with its
+  `approve` and `reject` commands, and the session report counted it as
+  pending as well as decided. `approvals` now prints
+  `decided: <outcome> already; ...` with no commands, and the report counts
+  it once, as decided.
 - **praetore-mcp: control characters in paths and names are escaped where
   a person reads them.** Terminal messages, the dashboard and the PDF
   report write control characters (C0 with `\r`, `\n`, NUL and ESC, DEL,

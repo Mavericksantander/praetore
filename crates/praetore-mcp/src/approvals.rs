@@ -180,7 +180,7 @@ pub fn on_require_approval(
     }
     binding_matches_evidence(&binding, evidence)?;
     with_lock(home, |journal| {
-        let entries = read_journal(journal)?;
+        let entries = read_journal(home, journal)?;
         let now = now_utc()?;
         if let Some(approval_id) = first_unused_approval(home, &entries, &binding, now)? {
             append_execution(
@@ -333,7 +333,7 @@ pub fn decide(
         ));
     }
     with_lock(home, |journal| {
-        if let Some(existing) = find_decision(&read_journal(journal)?, approval_id)? {
+        if let Some(existing) = find_decision(&read_journal(home, journal)?, approval_id)? {
             let previous = existing["outcome"].as_str().unwrap_or("?");
             return Err(format!(
                 "approval {approval_id} was already decided ({previous}); nothing new was signed"
@@ -406,7 +406,7 @@ pub fn decide(
             "decided_at": timestamp(now)?,
         });
         let signed = sign_record(&record, DECISION_DOMAIN, &approver)?;
-        let entries = read_journal(journal)?;
+        let entries = read_journal(home, journal)?;
         append_signed(journal, &entries, &signed)?;
         fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.shown()))?;
         Ok(Decided {
@@ -434,7 +434,7 @@ pub fn record_duplicate_execution(
         return Err("approval id is not 64 lowercase hex characters".into());
     }
     with_lock(home, |journal| {
-        let entries = read_journal(journal)?;
+        let entries = read_journal(home, journal)?;
         let decision = find_decision(&entries, approval_id)?
             .ok_or_else(|| format!("no signed decision for {approval_id}"))?;
         if decision["outcome"] != "approve" {
@@ -803,10 +803,10 @@ fn first_unused_approval(
             continue;
         }
         let Some(approver) = approver.as_ref() else {
-            return Err(
-                "an approval is signed but approver-public-key.hex is missing; run `praetore-mcp init` to add the approver key"
-                    .into(),
-            );
+            return Err(format!(
+                "an approval is signed but approver-public-key.hex is missing; run `{}` to add the approver key",
+                crate::commands::command("init", &home.root)
+            ));
         };
         check_signature(&entry.record, DECISION_DOMAIN, approver)?;
         if required_str(&entry.record, "approver_key_id")? != hex::encode(approver.as_bytes()) {
@@ -1117,23 +1117,58 @@ impl DecisionCommands {
 /// commands: `approve` and `reject` of it sign nothing.
 pub const EXPIRED_PENDING: &str = "expired: run the agent again so the call is held again";
 
-/// What can be done with a pending call at a given time: decide it while
-/// it is open, nothing once it expired (the rule of `decide`,
-/// [`Expiry::is_expired_at`]).
+/// What `approvals` prints for a pending file whose id is already decided,
+/// in place of the commands, after the outcome.
+pub const DECIDED_PENDING: &str =
+    "a decide was interrupted before it removed this file; holding the call again removes it";
+
+/// What can be done with a pending call at a given time: nothing once the
+/// approval journal has a decision for it (a `decide` that stopped between
+/// appending the decision and removing the pending file), nothing once it
+/// expired (the rule of `decide`, [`Expiry::is_expired_at`]), and decide it
+/// otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingDecision {
     Open(DecisionCommands),
     Expired,
+    /// The journal's outcome for this id, `approve` or `reject`.
+    Decided(String),
 }
 
 impl PendingInfo {
-    pub fn decision(&self, home: &Home, now: OffsetDateTime) -> PendingDecision {
-        if self.expiry.is_expired_at(now) {
+    fn decision(
+        &self,
+        home: &Home,
+        entries: &[JournalEntry],
+        now: OffsetDateTime,
+    ) -> Result<PendingDecision, String> {
+        if let Some(record) = find_decision(entries, &self.approval_id)? {
+            let outcome = record["outcome"].as_str().unwrap_or("?").to_owned();
+            return Ok(PendingDecision::Decided(outcome));
+        }
+        Ok(if self.expiry.is_expired_at(now) {
             PendingDecision::Expired
         } else {
             PendingDecision::Open(DecisionCommands::new(home, &self.approval_id))
-        }
+        })
     }
+}
+
+/// Every pending file with what can be done with it at `now`, read against
+/// the approval journal. An unreadable journal is an error: a pending id is
+/// never offered for a decision without knowing whether it has one.
+pub fn pending_decisions(
+    home: &Home,
+    now: OffsetDateTime,
+) -> Result<Vec<(PendingInfo, PendingDecision)>, String> {
+    let entries = read_journal_unlocked(home)?;
+    list_pending(home)?
+        .into_iter()
+        .map(|item| {
+            let decision = item.decision(home, &entries, now)?;
+            Ok((item, decision))
+        })
+        .collect()
 }
 
 fn exact_keys(record: &Value, expected: &[&str]) -> Result<(), String> {
@@ -1302,7 +1337,7 @@ impl ApprovalLock {
     }
 }
 
-fn read_journal(path: &Path) -> Result<Vec<JournalEntry>, String> {
+fn read_journal(home: &Home, path: &Path) -> Result<Vec<JournalEntry>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -1322,9 +1357,10 @@ fn read_journal(path: &Path) -> Result<Vec<JournalEntry>, String> {
     for entry in &entries {
         if entry.seq != expected_seq || entry.prev != expected_prev {
             return Err(format!(
-                "{}: approval journal seq {} does not follow the previous record; run `praetore-mcp verify`",
+                "{}: approval journal seq {} does not follow the previous record; run `{}`",
                 path.shown(),
-                entry.seq
+                entry.seq,
+                crate::commands::command("verify", &home.root)
             ));
         }
         expected_prev = hex::encode(link_bytes(entry.seq, &entry.prev, &entry.canonical));

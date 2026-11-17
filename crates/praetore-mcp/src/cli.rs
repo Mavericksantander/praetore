@@ -650,13 +650,15 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
         if !home.is_initialized() {
             if dry_run {
                 eprintln!(
-                    "praetore-mcp: note: {} is not initialized yet; run `praetore-mcp init` before installing",
-                    home.root.shown()
+                    "praetore-mcp: note: {} is not initialized yet; run `{}` before installing",
+                    home.root.shown(),
+                    crate::commands::command("init", &home.root)
                 );
             } else {
                 return Err(format!(
-                    "{} is not initialized; run `praetore-mcp init` first",
-                    home.root.shown()
+                    "{} is not initialized; run `{}` first",
+                    home.root.shown(),
+                    crate::commands::command("init", &home.root)
                 ));
             }
         }
@@ -872,26 +874,31 @@ fn cmd_report(args: &[String]) -> Result<i32, String> {
 
 fn cmd_approvals(args: &[String]) -> Result<i32, String> {
     let parsed = parse(args, &["--dir"], &[], false)?;
-    let pending = crate::approvals::list_pending(&parsed.home()?)?;
+    let home = parsed.home()?;
+    let pending = crate::approvals::pending_decisions(&home, time::OffsetDateTime::now_utc())?;
     if pending.is_empty() {
         println!("no pending approvals");
         return Ok(0);
     }
-    let home = parsed.home()?;
-    let now = time::OffsetDateTime::now_utc();
-    for item in pending {
+    for (item, decision) in pending {
         println!("id         {}", item.approval_id);
         println!("server     {}", crate::proxy::display_safe(&item.server));
         println!("tool       {}", crate::proxy::display_safe(&item.tool));
         println!("expires    {}", expiry_line(&item.expiry));
         println!("arguments  {}", item.arguments_preview);
-        match item.decision(&home, now) {
+        match decision {
             crate::approvals::PendingDecision::Open(commands) => {
                 println!("approve    {}", commands.approve);
                 println!("reject     {}", commands.reject);
             }
             crate::approvals::PendingDecision::Expired => {
                 println!("{}", crate::approvals::EXPIRED_PENDING);
+            }
+            crate::approvals::PendingDecision::Decided(outcome) => {
+                println!(
+                    "decided: {outcome} already; {}",
+                    crate::approvals::DECIDED_PENDING
+                );
             }
         }
         println!();
@@ -1054,7 +1061,7 @@ impl PolicyLock {
                 Ok(Self(path))
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
-                "another `praetore-mcp policy` command is running (lock {}); if none is, remove that file",
+                "another praetore-mcp policy command is running on this home (lock {}); if none is, remove that file",
                 path.shown()
             )),
             Err(error) => Err(format!("cannot create lock {}: {error}", path.shown())),
@@ -1074,8 +1081,9 @@ fn read_policy(home: &Home) -> Result<(String, praetore_core::Policy), String> {
         fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let policy = praetore_core::Policy::from_json(&text).map_err(|e| {
         format!(
-            "{} is invalid ({e}); fix it (see `praetore-mcp policy check`) or restore a backup",
-            path.shown()
+            "{} is invalid ({e}); fix it (see `{}`) or restore a backup",
+            path.shown(),
+            crate::commands::command("policy check", &home.root)
         )
     })?;
     Ok((text, policy))
