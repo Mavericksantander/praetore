@@ -761,10 +761,14 @@ What is signed, with the approver key from `init`:
 * the server, the tool and the canonical arguments of the pending call
 * when the pending call was created and when it expires
 
-Default expiry is 10 minutes from the hold. Set
-`PRAETORE_MCP_APPROVAL_TTL_SECONDS` (an integer from 1 to 86400) for one
-process, or write that integer to `DIR/approvals/ttl-seconds` for the home.
-The environment variable wins.
+Default expiry is 10 minutes from the hold. Set `approval_ttl_seconds`
+(an integer from 1 to 86400) in `DIR/config.toml` for the home, or
+`PRAETORE_MCP_APPROVAL_TTL_SECONDS` for one process; the environment
+variable wins, then the config, then the older `DIR/approvals/ttl-seconds`.
+An MCP client may start `wrap` with a filtered environment, so prefer the
+config line there. Every source that is set is checked: a bad value in
+any of them stops `wrap` at startup (exit 2) and names the source, even
+when a higher one is valid; see the GUIDE section "Approval TTL".
 
 After `approve`, the agent retries the same `tools/call`. The proxy
 forwards it once, then appends an execution record signed with the
@@ -906,9 +910,9 @@ each evidence receipt on its own.
 | `approver-public-key.hex` | approver public key. `praetore-mcp verify` checks approval signatures against it |
 | `approvals/pending/<id>.json` | one held call waiting for `approve` or `reject` (0600) |
 | `approvals/journal.jsonl` | hash-linked approval decisions and the one execution that consumed each approval |
-| `approvals/ttl-seconds` | optional lifetime, in seconds, used when `PRAETORE_MCP_APPROVAL_TTL_SECONDS` is unset |
+| `approvals/ttl-seconds` | optional lifetime, in seconds, used when neither `PRAETORE_MCP_APPROVAL_TTL_SECONDS` nor `approval_ttl_seconds` in `config.toml` is set |
 | `policy.json` | v2 policy |
 | `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
 | `receipts/.journal.lock` | lock held while one entry is appended |
 | `reports/session-<start UTC>-<id>.json`, `.pdf` | report of one `wrap` session, written when it ends (0600); a view of the journal, see GUIDE.md |
-| `config.toml` | optional; `report = false` turns the session reports off |
+| `config.toml` | optional; `report = false` turns the session reports off; `approval_ttl_seconds = <1..86400>` sets the approval lifetime |

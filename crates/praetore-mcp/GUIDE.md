@@ -548,6 +548,45 @@ installs no handler: the signal ends it at once, as in 0.3.5.
 `report = false` in `DIR/config.toml` turns reports off for every session
 of that home. `praetore-mcp install` does not add `--no-report`.
 
+### Approval TTL
+
+A pending approval stays open 10 minutes by default. To change it for a
+home, add this line to `DIR/config.toml`:
+
+```toml
+approval_ttl_seconds = 1800
+```
+
+`wrap` reads and checks every source that is set, then uses the first
+one in this order:
+
+1. `PRAETORE_MCP_APPROVAL_TTL_SECONDS` in the environment of `wrap`;
+2. `approval_ttl_seconds` in `DIR/config.toml`;
+3. the integer in `DIR/approvals/ttl-seconds` (older setting, still read);
+4. 600 seconds.
+
+Use the config line when an MCP client starts `wrap`. Many clients pass
+only a few variables to the servers they start (the MCP Python SDK's
+`stdio_client` passes HOME, PATH and a few more), so an exported
+`PRAETORE_MCP_APPROVAL_TTL_SECONDS` may never reach `wrap`. The config
+file is read from the home, whatever the environment.
+
+`wrap` checks the TTL before it starts the server. A value outside 1 to
+86400 or not an integer in any of the three sources, a malformed or
+repeated `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` with a
+colon included), a `config.toml` that starts with a byte order mark, or a
+`config.toml` or `ttl-seconds` that cannot be read stops `wrap` with exit code 2 and the cause, naming
+the source, on stderr. That holds even when a source of higher priority
+is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
+`approval_ttl_seconds = 90000` still stops `wrap`:
+
+```
+praetore-mcp: approval TTL: config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000; wrap did not start
+```
+
+A bad value is never skipped in favour of another source. Other problems in `config.toml`
+(a bad `report` value, an unknown key) stay warnings.
+
 The report is a view of the journal: it signs nothing, changes no journal
 and takes no part in a decision. If it cannot be written, the reason goes
 to stderr and the session ends with the same exit code. It is
@@ -597,11 +636,10 @@ Read these before relying on anything above.
    arguments. It continues only if that
    code is typed back. `reject <id>` records a rejection and the call is not
    forwarded. The approval matches one server, one tool and the canonical
-   arguments, expires after 10 minutes unless
-   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says
-   otherwise (1 to 86400 seconds), and is consumed by one later call, as
-   long as the approval journal is not edited; see
-   [the evasion matrix](../../docs/security/evasion-matrix.md). A
+   arguments, expires after 10 minutes unless the approval TTL says
+   otherwise (1 to 86400 seconds, see "Approval TTL" below), and is
+   consumed by one later call, as long as the approval journal is not
+   edited; see [the evasion matrix](../../docs/security/evasion-matrix.md). A
    second identical call asks again. Different arguments do not match.
    A process that can act as this user can open a terminal and approve.
    That is not a guarantee that a person reviewed the call. The terminal

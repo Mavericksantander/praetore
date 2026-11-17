@@ -200,7 +200,7 @@ pub fn on_require_approval(
             &binding,
             &evidence.evidence_id.to_string(),
             now,
-            ttl(home)?,
+            approval_ttl(home)?,
         )?;
         Ok(HoldOrForward::Hold {
             message: hold_message(home, &pending),
@@ -1238,18 +1238,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn ttl(home: &Home) -> Result<Duration, String> {
-    let seconds = if let Some(raw) = std::env::var_os("PRAETORE_MCP_APPROVAL_TTL_SECONDS") {
-        let raw = raw
-            .to_str()
-            .ok_or("PRAETORE_MCP_APPROVAL_TTL_SECONDS is not UTF-8")?;
-        parse_ttl(raw, "PRAETORE_MCP_APPROVAL_TTL_SECONDS")?
-    } else if let Some(raw) = read_ttl_file(home)? {
-        parse_ttl(raw.trim(), "approvals/ttl-seconds")?
-    } else {
-        DEFAULT_TTL_SECONDS
+/// How long a pending approval stays open. Every source that is set is
+/// read and checked first: `PRAETORE_MCP_APPROVAL_TTL_SECONDS`,
+/// `approval_ttl_seconds` in `DIR/config.toml` and the file
+/// `DIR/approvals/ttl-seconds`. A value out of 1..=86400, not a number or
+/// unreadable in any of them is an error that names its source, even when
+/// a source of higher priority is valid. Then the first set source in that
+/// order is used, or 600. `wrap` calls this before it starts, so a bad
+/// value stops it at startup; the config value also reaches `wrap` when
+/// the MCP client passes it a filtered environment.
+pub fn approval_ttl(home: &Home) -> Result<Duration, String> {
+    let env = match std::env::var_os("PRAETORE_MCP_APPROVAL_TTL_SECONDS") {
+        Some(raw) => {
+            let raw = raw
+                .to_str()
+                .ok_or("PRAETORE_MCP_APPROVAL_TTL_SECONDS is not UTF-8")?;
+            Some(parse_ttl(raw, "PRAETORE_MCP_APPROVAL_TTL_SECONDS")?)
+        }
+        None => None,
     };
-    Ok(Duration::seconds(seconds))
+    let config = match crate::config::approval_ttl_seconds(home)? {
+        Some(raw) => Some(parse_ttl(&raw, "config.toml approval_ttl_seconds")?),
+        None => None,
+    };
+    let file = match read_ttl_file(home)? {
+        Some(raw) => Some(parse_ttl(raw.trim(), "approvals/ttl-seconds")?),
+        None => None,
+    };
+    Ok(Duration::seconds(
+        env.or(config).or(file).unwrap_or(DEFAULT_TTL_SECONDS),
+    ))
 }
 
 fn parse_ttl(raw: &str, source: &str) -> Result<i64, String> {
