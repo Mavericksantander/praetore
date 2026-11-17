@@ -12,6 +12,7 @@
 //! read as unchained entries. They may only come before the first chained
 //! entry, and `verify` counts them apart.
 
+use crate::shown::Show;
 use praetore_core::{
     Evidence,
     journal_chain::{ChainLink, receipt_link},
@@ -119,7 +120,7 @@ pub fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
             .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
             .collect(),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.shown())),
     };
     files.sort();
     Ok(files)
@@ -129,7 +130,7 @@ pub fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// A last line without a newline (interrupted write) is an error: nothing
 /// is appended after it until someone looks at the journal.
 fn last_line(path: &Path, verify: &str) -> Result<Option<String>, String> {
-    let fail = |e: io::Error| format!("cannot read {}: {e}", path.display());
+    let fail = |e: io::Error| format!("cannot read {}: {e}", path.shown());
     let mut file = fs::File::open(path).map_err(fail)?;
     let len = file.metadata().map_err(fail)?.len();
     if len == 0 {
@@ -142,17 +143,17 @@ fn last_line(path: &Path, verify: &str) -> Result<Option<String>, String> {
     let Some(body) = tail.strip_suffix(b"\n") else {
         return Err(format!(
             "{} does not end with a newline (interrupted write?); run `{verify}`",
-            path.display()
+            path.shown()
         ));
     };
     let line = match body.iter().rposition(|&b| b == b'\n') {
         Some(index) => &body[index + 1..],
         None if start == 0 => body,
-        None => return Err(format!("{}: last line is too long", path.display())),
+        None => return Err(format!("{}: last line is too long", path.shown())),
     };
     String::from_utf8(line.to_vec())
         .map(Some)
-        .map_err(|_| format!("{}: last line is not UTF-8", path.display()))
+        .map_err(|_| format!("{}: last line is not UTF-8", path.shown()))
 }
 
 /// Where the next entry goes: the newest daily file that is not older than
@@ -176,7 +177,7 @@ pub fn next_append(
         let entry = parse_line(&text).map_err(|e| {
             format!(
                 "last entry of {} is unreadable ({e}); run `{verify}`",
-                file.display()
+                file.shown()
             )
         })?;
         return Ok(match entry.position {
@@ -208,7 +209,7 @@ impl JournalLock {
         }
         let file = options
             .open(&path)
-            .map_err(|e| format!("cannot open lock {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot open lock {}: {e}", path.shown()))?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             use std::os::fd::AsRawFd;
@@ -218,7 +219,7 @@ impl JournalLock {
             if rc != 0 {
                 return Err(format!(
                     "cannot lock {}: {}",
-                    path.display(),
+                    path.shown(),
                     io::Error::last_os_error()
                 ));
             }

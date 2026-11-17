@@ -573,11 +573,41 @@ function t(key, ...args) {
   return typeof value === "function" ? value(...args) : value;
 }
 
+// m5, m1: paths and names come from the agent, the server and the file
+// system. shown() writes as \u{..} every character praetore_core escapes
+// (praetore_core::display::is_invisible, also used for the terminal and
+// the PDF in src/shown.rs): control characters (C0 with \r, \n, NUL and
+// ESC, DEL, C1), format characters (zero-width, bidi, the byte order mark,
+// soft hyphen, tag characters) and every Unicode space other than U+0020.
+// The class below is those ranges, from tests-js/fixtures/invisible-ranges.json;
+// the tests hold that file equal to praetore_core and this class equal to
+// that file, over every code point. A backslash is kept as is: in the page
+// it moves nothing, and commands shown for copying keep their $'\x..'
+// escapes readable. Every text the page writes goes through here: el()
+// text and titles, and clipText and wrapText for the canvases. Dates and
+// times the page formats with Intl go through intlText() first, which turns
+// the no-break spaces Intl may write (U+00A0, U+202F) into plain spaces.
+const INVISIBLE = /[\u0000-\u001f\u007f-\u00a0\u00ad\u034f\u0600-\u0605\u061c\u06dd\u070f\u115f-\u1160\u1680\u17b4-\u17b5\u180b-\u180f\u2000-\u200f\u2028-\u202f\u205f-\u206f\u3000\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff9-\ufffb\u{110bd}\u{110cd}\u{1bca0}-\u{1bca3}\u{1d173}-\u{1d17a}\u{e0000}-\u{e0fff}]/gu;
+
+function intlText(text) {
+  return String(text).replace(/[\u00a0\u202f]/g, " ");
+}
+
+function shown(text) {
+  return String(text).replace(INVISIBLE, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+}
+
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
+  // In <pre> the page's own line breaks stay; each line is escaped. Data
+  // shown there (canonical JSON, commands, journal lines) has no raw newline.
+  const text = tag === "pre"
+    ? (value) => String(value).split("\n").map(shown).join("\n")
+    : shown;
   for (const [k, v] of Object.entries(attrs || {})) {
     if (v === null || v === undefined || v === false) continue;
     if (k === "class") node.className = v;
+    else if (k === "title") node.setAttribute(k, shown(v));
     // The CSP has no 'unsafe-inline' for styles: a style attribute would be
     // dropped, so styles go through the CSSOM.
     else if (k === "style") node.style.cssText = v;
@@ -586,7 +616,7 @@ function el(tag, attrs, ...children) {
   }
   for (const child of children.flat()) {
     if (child === null || child === undefined || child === false) continue;
-    node.append(child instanceof Node ? child : String(child));
+    node.append(child instanceof Node ? child : text(child));
   }
   return node;
 }
@@ -661,9 +691,9 @@ function localText(iso) {
   if (!iso) return "-";
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleString(lang, {
+  return intlText(date.toLocaleString(lang, {
     year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
+  }));
 }
 
 function relativeText(iso) {
@@ -672,10 +702,10 @@ function relativeText(iso) {
   const seconds = Math.round((date.getTime() - Date.now()) / 1000);
   const rtf = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
   const abs = Math.abs(seconds);
-  if (abs < 45) return rtf.format(seconds, "second");
-  if (abs < 2700) return rtf.format(Math.round(seconds / 60), "minute");
-  if (abs < 79200) return rtf.format(Math.round(seconds / 3600), "hour");
-  return rtf.format(Math.round(seconds / 86400), "day");
+  if (abs < 45) return intlText(rtf.format(seconds, "second"));
+  if (abs < 2700) return intlText(rtf.format(Math.round(seconds / 60), "minute"));
+  if (abs < 79200) return intlText(rtf.format(Math.round(seconds / 3600), "hour"));
+  return intlText(rtf.format(Math.round(seconds / 86400), "day"));
 }
 
 function approvalLabel(value) {
@@ -865,7 +895,8 @@ function canvasWidth(canvas) {
 // Splits `text` into lines no wider than `width`, at spaces (a word wider
 // than a line is split). With more than `max` lines the last one ends in
 // "…" and `cut` is true.
-function wrapText(ctx, text, width, max) {
+function wrapText(ctx, raw, width, max) {
+  const text = shown(raw);
   const lines = [];
   let line = "";
   for (const word of text.split(" ")) {
@@ -914,7 +945,8 @@ function brackets(ctx, x, y, w, h, color, size = 7) {
   ctx.stroke();
 }
 
-function clipText(ctx, text, width) {
+function clipText(ctx, raw, width) {
+  const text = shown(raw);
   if (ctx.measureText(text).width <= width) return text;
   let out = text;
   while (out.length > 1 && ctx.measureText(`${out}…`).width > width) out = out.slice(0, -1);
@@ -1587,14 +1619,14 @@ function chartCard() {
     for (let i = 23; i >= 0; i -= 1) {
       const start = new Date(end.getTime() - i * 3600 * 1000);
       buckets.push({ start, end: new Date(start.getTime() + 3600 * 1000),
-        label: start.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" }) });
+        label: intlText(start.toLocaleTimeString(lang, { hour: "2-digit", minute: "2-digit" })) });
     }
   } else {
     const end = new Date(now); end.setHours(0, 0, 0, 0);
     for (let i = 13; i >= 0; i -= 1) {
       const start = new Date(end); start.setDate(end.getDate() - i);
       const stop = new Date(start); stop.setDate(start.getDate() + 1);
-      buckets.push({ start, end: stop, label: start.toLocaleDateString(lang, { day: "2-digit", month: "short" }) });
+      buckets.push({ start, end: stop, label: intlText(start.toLocaleDateString(lang, { day: "2-digit", month: "short" })) });
     }
   }
   for (const b of buckets) { b.ALLOW = 0; b.DENY = 0; b.REQUIRE_APPROVAL = 0; }

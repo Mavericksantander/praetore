@@ -1,6 +1,7 @@
 //! Evaluates one MCP `tools/call` with the PRÆTORE HighAssurance engine and
 //! appends the attested evidence to the receipts journal.
 
+use crate::shown::Show;
 use crate::store::{self, ACTION_TYPE, AUDIENCE, CAPABILITY, Home, LoadedHome};
 use praetore_core::{
     Action, AgentIdentity, AgentKeyPair, Authority, AuthorizationRequest, ClassifiedAction,
@@ -1294,14 +1295,11 @@ impl Journal {
             &self.verify,
         )?;
         if fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(format!(
-                "{} is a symlink; refusing to append",
-                path.display()
-            ));
+            return Err(format!("{} is a symlink; refusing to append", path.shown()));
         }
         let line = crate::journal::chained_line(&position, &evidence_json);
         append_line(&path, line.as_bytes())
-            .map_err(|e| format!("cannot append to {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot append to {}: {e}", path.shown()))?;
         Ok(path)
     }
 }
@@ -1561,7 +1559,7 @@ mod tests {
 
         let same = |path: PathBuf| {
             let (check, resolved) = resolve_path(&text(&path));
-            assert_eq!(check, PathCheck::Same, "{}", path.display());
+            assert_eq!(check, PathCheck::Same, "{}", path.shown());
             assert_eq!(resolved.as_deref(), Some(text(&path).as_str()));
         };
         same(sandbox.join("file"));
@@ -1593,7 +1591,7 @@ mod tests {
                 resolve_path(&text(&path)),
                 (PathCheck::Unresolved, None),
                 "{}",
-                path.display()
+                path.shown()
             );
         }
     }
@@ -1843,7 +1841,7 @@ mod tests {
                 check(&path),
                 (UNRESOLVED_PATH.to_owned(), "ambiguous".to_owned()),
                 "{}",
-                path.display()
+                path.shown()
             );
         }
         for path in [
@@ -1856,7 +1854,7 @@ mod tests {
                 check(&path),
                 (text(&path), "same".to_owned()),
                 "{}",
-                path.display()
+                path.shown()
             );
         }
     }
@@ -2496,7 +2494,7 @@ mod tests {
     fn apfs_case_and_normalization_behaviour() {
         let (_temp, root) = canonical_tempdir();
         let mode = dir_insensitivity(&text(&root));
-        eprintln!("APFS: dir_insensitivity({}) = {mode:?}", root.display());
+        eprintln!("APFS: dir_insensitivity({}) = {mode:?}", root.shown());
         assert!(mode.normalization);
 
         // realpath(3) returns the stored spelling of existing entries.
@@ -2567,7 +2565,7 @@ mod tests {
     fn linux_case_sensitive_filesystems_do_not_fold() {
         let (_temp, root) = canonical_tempdir();
         let mode = dir_insensitivity(&text(&root));
-        eprintln!("linux: dir_insensitivity({}) = {mode:?}", root.display());
+        eprintln!("linux: dir_insensitivity({}) = {mode:?}", root.shown());
         let rules = prefixes(&[&text(&root.join("secret"))]);
         let keys = BTreeSet::from(["arguments.path".to_owned()]);
         let upper = text(&root.join("SECRET"));

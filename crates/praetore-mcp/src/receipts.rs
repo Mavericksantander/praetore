@@ -3,6 +3,7 @@
 //! `verify_attester_signature`, `verify_agent_intent`, issuer pins).
 
 use crate::journal::{self, ChainCheck, Position};
+use crate::shown::Show;
 use crate::{
     gate::MODE_CONTEXT_KEY,
     store::{self, AUDIENCE, Home},
@@ -21,8 +22,8 @@ pub struct JournalLine {
 pub fn read_journal(home: &Home) -> Result<Vec<JournalLine>, String> {
     let mut lines = Vec::new();
     for file in journal::journal_files(&home.receipts_dir())? {
-        let text = fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read {}: {e}", file.display()))?;
+        let text =
+            fs::read_to_string(&file).map_err(|e| format!("cannot read {}: {e}", file.shown()))?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -139,7 +140,7 @@ pub fn render_table(
             }
             Err(error) => out.push_str(&format!(
                 "INVALID {}:{}: {error}\n",
-                line.file.display(),
+                line.file.shown(),
                 line.line_number
             )),
         }
@@ -381,7 +382,7 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
     let mut parsed_evidence = Vec::new();
     for line in read_journal(home)? {
         report.total += 1;
-        let at = format!("{}:{}", line.file.display(), line.line_number);
+        let at = format!("{}:{}", line.file.shown(), line.line_number);
         let mut verdict = LineVerdict {
             file: line.file,
             line_number: line.line_number,

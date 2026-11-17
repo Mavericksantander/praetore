@@ -19,5 +19,6 @@ pub mod receipts;
 pub mod relay;
 pub mod report;
 pub mod report_pdf;
+pub mod shown;
 pub mod store;
 pub mod when;
