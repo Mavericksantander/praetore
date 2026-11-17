@@ -29,6 +29,10 @@ pub const PROXY_CONTEXT_KEY: &str = "praetore.proxy";
 /// Context key recording, for each argument a `PathPrefix` rule covers, the
 /// value the client sent, the value it resolves to and the check result.
 pub const PATH_CHECK_CONTEXT_KEY: &str = "praetore.path_check";
+/// Context key naming, in the receipt of a call forwarded with a local
+/// approval, the approval id it consumed. It is signed with the intent, so
+/// the receipts journal records which approval each forwarded call used.
+pub const APPROVAL_CONTEXT_KEY: &str = "praetore.approval_id";
 /// Value the engine sees instead of a path that does not resolve to itself.
 /// It is not absolute, so core's `PathPrefix` treats it as unsafe: it
 /// matches every DENY / REQUIRE_APPROVAL `PathPrefix` rule and no ALLOW one.
@@ -1090,6 +1094,17 @@ impl Gate {
 
     /// Evaluates and returns the attested evidence without journaling it.
     pub fn evaluate_evidence(&self, server: &str, params: &Value) -> Result<Evidence, GateError> {
+        self.evaluate_evidence_with(server, params, None)
+    }
+
+    /// [`Gate::evaluate_evidence`], with `approval_id` signed into the
+    /// context under [`APPROVAL_CONTEXT_KEY`] when it is `Some`.
+    pub fn evaluate_evidence_with(
+        &self,
+        server: &str,
+        params: &Value,
+        approval_id: Option<&str>,
+    ) -> Result<Evidence, GateError> {
         // G7: classify first. A declared Safety call stops here with no
         // evaluation and no receipt; an unclassified one is refused by the
         // engine with a signed DENY, without evaluating any rule.
@@ -1131,6 +1146,7 @@ impl Gate {
                 )
                 .map_err(failed)?,
                 None,
+                None,
             )?;
             return self.engine.refuse_unclassified(request).map_err(failed);
         }
@@ -1144,6 +1160,7 @@ impl Gate {
             AuthorizationRequest::new(self.agent.clone(), self.authority.clone(), action)
                 .map_err(failed)?,
             path_check,
+            approval_id,
         )?;
         self.engine.evaluate(request).map_err(failed)
     }
@@ -1153,6 +1170,7 @@ impl Gate {
         &self,
         request: AuthorizationRequest<A>,
         path_check: Option<Value>,
+        approval_id: Option<&str>,
     ) -> Result<AuthorizationRequest<A>, GateError> {
         let mut request = request
             .with_context(MODE_CONTEXT_KEY, Value::String(self.mode.as_str().into()))
@@ -1162,6 +1180,9 @@ impl Gate {
             );
         if let Some(record) = path_check {
             request = request.with_context(PATH_CHECK_CONTEXT_KEY, record);
+        }
+        if let Some(id) = approval_id {
+            request = request.with_context(APPROVAL_CONTEXT_KEY, Value::String(id.to_owned()));
         }
         let now = OffsetDateTime::now_utc();
         request
@@ -1204,28 +1225,60 @@ pub const UNCLASSIFIED_TOOL_ACTION_TYPE: &str = "praetore-mcp unclassified tool 
 impl Evaluator for Gate {
     fn evaluate(&mut self, server: &str, params: &Value) -> Result<Verdict, GateError> {
         let evidence = self.evaluate_evidence(server, params)?;
-        let journaled = self.journal.append(&evidence);
-        let mut verdict = verdict_from(&evidence, journaled);
-        if verdict.journaled.is_ok()
-            && self.mode == Mode::Enforce
-            && verdict.outcome == DecisionOutcome::RequireApproval
+        if self.mode != Mode::Enforce
+            || evidence.decision.outcome != DecisionOutcome::RequireApproval
         {
-            match crate::approvals::on_require_approval(&self.home, server, params, &evidence) {
-                Ok(crate::approvals::HoldOrForward::Forward { approval_id }) => {
-                    verdict.consumed_approval = Some(approval_id);
-                }
-                Ok(crate::approvals::HoldOrForward::Hold { message }) => {
-                    verdict.hold_message = Some(message);
-                }
-                Err(error) => {
-                    verdict.hold_message = Some(format!(
-                        "This tool call was not executed. Local approval could not be recorded ({error}). Evidence id: {}",
-                        evidence.evidence_id
-                    ));
-                }
-            }
+            let journaled = self.journal.append(&evidence);
+            return Ok(verdict_from(&evidence, journaled));
         }
-        Ok(verdict)
+        let sign_forward = |approval_id: &str| {
+            self.evaluate_evidence_with(server, params, Some(approval_id))
+                .map_err(|error| error.to_string())
+        };
+        let journal = |evidence: &Evidence| self.journal.append(evidence);
+        use crate::approvals::HoldOrForward;
+        Ok(
+            match crate::approvals::on_require_approval(
+                &self.home,
+                server,
+                params,
+                &evidence,
+                &sign_forward,
+                &journal,
+            ) {
+                HoldOrForward::Forward {
+                    approval_id,
+                    evidence,
+                    journaled,
+                } => {
+                    let mut verdict = verdict_from(&evidence, Ok(journaled));
+                    verdict.consumed_approval = Some(approval_id);
+                    verdict
+                }
+                HoldOrForward::Hold { journaled, message } => {
+                    let mut verdict = verdict_from(&evidence, Ok(journaled));
+                    verdict.hold_message = Some(message);
+                    verdict
+                }
+                HoldOrForward::Failed {
+                    evidence,
+                    journaled,
+                    error,
+                } => {
+                    let ok = journaled.is_ok();
+                    let mut verdict = verdict_from(&evidence, journaled);
+                    // A receipt that is not journaled blocks the call on its
+                    // own; the proxy says so.
+                    if ok {
+                        verdict.hold_message = Some(format!(
+                            "This tool call was not executed. Local approval could not be recorded ({error}). Evidence id: {}",
+                            evidence.evidence_id
+                        ));
+                    }
+                    verdict
+                }
+            },
+        )
     }
 }
 

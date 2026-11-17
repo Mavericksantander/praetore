@@ -13,6 +13,16 @@
   `verify_command`, and the last section of the PDF). The README check of
   a saved approval head uses the flag.
 
+- **praetore-mcp: the receipt of a call forwarded on an approval names it.**
+  The receipt carries `context["praetore.approval_id"]`, signed with the
+  intent. Before forwarding, `wrap` treats an approval as used when the
+  approval journal has its execution or a receipt in the receipts journal
+  names it, so cutting the approval journal alone no longer frees a used
+  approval. `verify` fails when two receipts name one approval, when a
+  receipt names an approval with no signed decision or a rejected one, or
+  when the approval journal has no execution of it for that receipt.
+  Receipts without the key (v0.3.6 and before) verify as before.
+
 - **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
   in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
   open, even when the MCP client starts `wrap` with a filtered environment.
