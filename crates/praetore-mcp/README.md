@@ -387,7 +387,10 @@ rule, and declares the action type `mcp.tools/call` as `Mission` in
 **Default deny in enforce (from 0.3.5).** With no rule matching, a
 `tools/call` is DENY. In enforce mode, every tool that is not allowed is
 denied, including tools a server adds in a later version. Observe mode
-never blocks: it records DENY and forwards the call. `init` needs no rule
+records DENY and forwards the call, with three exceptions it refuses in
+both modes: a `tools/call` the policy does not classify, a client line it
+cannot parse that may name a `safety*` tool, and every `tools/call` when
+the home cannot be loaded (before `init`, for example). `init` needs no rule
 for the client to start the server: only `tools/call` is evaluated, so
 `initialize`, `tools/list`, notifications and every other message pass
 through. Allow tools one by one:

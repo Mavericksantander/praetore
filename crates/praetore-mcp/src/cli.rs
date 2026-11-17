@@ -47,7 +47,9 @@ DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys, including a separate approver
 key. The policy written by `init` has no rules: in enforce mode every
 tools/call is denied until a `policy allow` rule allows it. Observe mode
-records decisions but never blocks. Enforce mode blocks DENY. A
+records a DENY and forwards the call; it still refuses unclassified
+calls and unparseable lines that may name a safety* tool. Enforce mode
+blocks DENY. A
 REQUIRE_APPROVAL call is not forwarded until someone runs `approve`
 for that exact call. `approve` reads a confirmation from an interactive
 terminal; that check is cooperative (a process that can act as this user
@@ -75,7 +77,10 @@ DIR. The approver key is separate from the issuer, agent and attester keys.
 With no rules, every tools/call is denied by default in enforce mode. Only
 tools/call is evaluated: initialize, tools/list and the rest of the MCP
 traffic pass, so a client can start the server and list its tools. Observe
-mode never blocks. Allow tools with
+mode records a DENY and forwards the call, but it still refuses a tools/call
+the policy does not classify, a client line it cannot parse that may name a
+safety* tool, and every tools/call when the home cannot be loaded (before
+init, for example). Allow tools with
 `praetore-mcp policy allow --id ID --server NAME --tool NAME`.
 
 Running init again on an initialized DIR adds the approver key when it is
@@ -500,7 +505,10 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!(
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
-            println!("  mode never blocks. To allow a tool:");
+            println!(
+                "  mode records a DENY and forwards the call, but still refuses unclassified"
+            );
+            println!("  calls. To allow a tool:");
             let program = crate::commands::program();
             let dir = dir_suffix(&home);
             println!("    {program} policy allow --id ID --server NAME --tool NAME{dir}");
