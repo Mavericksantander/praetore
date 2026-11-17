@@ -772,7 +772,9 @@ when a higher one is valid; see the GUIDE section "Approval TTL".
 
 After `approve`, the agent retries the same `tools/call`. The proxy
 forwards it once, then appends an execution record signed with the
-attester key. A second retry asks for a new approval. A different argument
+attester key. A second retry asks for a new approval, as long as the
+approval journal is not edited; see
+[the evasion matrix](../../docs/security/evasion-matrix.md). A different argument
 value does not match, including a different JSON value for the same field.
 Key order in the argument object does not matter: the binding is canonical
 JSON. A rejected or expired approval does not forward the call.
@@ -794,9 +796,28 @@ the receipt line format is unchanged. A home with no approval journal
 approval journal is hash-linked. Deleting or truncating
 `approvals/journal.jsonl` lets an approval be used again. `verify` does
 not notice: a missing file is `approval journal: none` and still exits 0.
-There is no flag for an expected approval head. The only check is to
-compare, by hand, the approval head that `verify` prints with a copy kept
-somewhere else.
+There is no flag for an expected approval head. The check is a saved head:
+after a run you trust, print it and keep it off this machine; later, that
+head must still be the current one or the `prev` of a later record:
+
+```sh
+# DIR is the home, for example ~/.praetore/mcp.
+# After a run you trust: print the approval head; keep it off this machine.
+praetore-mcp verify --dir "$DIR" | sed -n 's/^approval journal: .* head //p'
+
+# Later, with that value:
+SAVED=<approval head kept off this machine>
+if out=$(praetore-mcp verify --dir "$DIR") &&
+   { printf '%s\n' "$out" | grep -qx "approval journal: .* head $SAVED" ||
+     grep -qF "\"prev\":\"$SAVED\"" "$DIR/approvals/journal.jsonl"; }; then
+  echo "approval journal still holds $SAVED"
+else
+  echo "approval journal changed or verify failed"
+fi
+```
+
+New approvals after the saved head keep it in the chain, so the check
+still passes. Deleting the journal or cutting it before that head fails it.
 
 `praetore-verify` does not read this approval journal. It still verifies
 each evidence receipt on its own.
@@ -841,10 +862,11 @@ each evidence receipt on its own.
   `DIR/approvals/`, and approve. That is not a guarantee that a person
   reviewed the call. The approval expires (default 10 minutes) and is
   consumed by one later call with the same server, tool and canonical
-  arguments. Deleting or truncating `approvals/journal.jsonl` lets that
-  approval be used again. `verify` does not detect that unless you compare,
-  by hand, the approval head it prints. There is no flag for that head.
-  See Local approval.
+  arguments, as long as the approval journal is not edited (see
+  [the evasion matrix](../../docs/security/evasion-matrix.md)). Deleting
+  or truncating `approvals/journal.jsonl` lets that approval be used
+  again. `verify` does not detect that unless you check a saved approval
+  head; the command is in Local approval. There is no flag for that head.
 * The keys are LOCAL/DEV keys. See the trust model.
 * Observe is not enforcement. Observe receipts are labeled with the signed
   `praetore.mode: observe`.
