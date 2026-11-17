@@ -10,6 +10,7 @@
 //!   entries with `"type": "stdio" | "http" | "sse"`.
 
 use crate::json::JsonValue;
+use crate::shown::Show;
 use std::path::{Path, PathBuf};
 
 pub const WRAP_SUBCOMMAND: &str = "wrap";
@@ -345,7 +346,7 @@ pub fn unwrap_config(doc: &mut JsonValue, client: Client) -> Vec<Change> {
 }
 
 pub fn render_changes(path: &Path, changes: &[Change]) -> String {
-    let mut out = format!("{}\n", path.display());
+    let mut out = format!("{}\n", path.shown());
     if changes.is_empty() {
         out.push_str("  (no MCP servers found)\n");
     }

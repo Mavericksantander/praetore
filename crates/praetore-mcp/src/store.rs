@@ -1,6 +1,7 @@
 //! The local praetore-mcp home: LOCAL/DEV keys, signed authority, trust pins
 //! in `praetore-verify` formats, the policy, and the receipts journal.
 
+use crate::shown::Show;
 use praetore_core::{
     AgentId, AgentIdentity, AgentKeyPair, Authority, EvidenceAttesterKey, Policy,
     TrustedAuthorityIssuer, authority::Validity,
@@ -155,7 +156,7 @@ pub fn init(home: &Home) -> Result<InitOutcome, String> {
         .all_files()
         .into_iter()
         .filter(|path| path.exists())
-        .map(|path| path.display().to_string())
+        .map(|path| path.shown().to_string())
         .collect();
     if !existing.is_empty() {
         return Err(format!(
@@ -231,8 +232,8 @@ fn ensure_approver_key(home: &Home) -> Result<bool, String> {
         (true, true) => Ok(false),
         (true, false) | (false, true) => Err(format!(
             "approver key is incomplete ({} and {} must both exist, or neither). Nothing was overwritten; move the leftover file away and run init again",
-            home.approver_key().display(),
-            home.approver_pin().display()
+            home.approver_key().shown(),
+            home.approver_pin().shown()
         )),
         (false, false) => {
             let secret = random_secret();
@@ -332,14 +333,14 @@ fn write_new(path: &Path, contents: &str, mode: u32) -> Result<(), String> {
     let _ = mode;
     let mut file = options
         .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot create {}: {e}", path.shown()))?;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.sync_all())
         .and_then(|()| match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => crate::fsutil::sync_dir(dir),
             _ => Ok(()),
         })
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+        .map_err(|e| format!("cannot write {}: {e}", path.shown()))
 }
 
 /// Ensures `path` is a directory. Directories this tool creates get 0700
@@ -350,10 +351,10 @@ pub fn ensure_dir(path: &Path, allow_symlink: bool) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() && !allow_symlink => Err(format!(
             "{} is a symlink; refusing to follow it",
-            path.display()
+            path.shown()
         )),
         Ok(_) if path.is_dir() => Ok(()),
-        Ok(_) => Err(format!("{} exists and is not a directory", path.display())),
+        Ok(_) => Err(format!("{} exists and is not a directory", path.shown())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true);
@@ -371,9 +372,9 @@ pub fn ensure_dir(path: &Path, allow_symlink: bool) -> Result<(), String> {
                     }
                     _ => Ok(()),
                 })
-                .map_err(|e| format!("cannot create {}: {e}", path.display()))
+                .map_err(|e| format!("cannot create {}: {e}", path.shown()))
         }
-        Err(error) => Err(format!("cannot stat {}: {error}", path.display())),
+        Err(error) => Err(format!("cannot stat {}: {error}", path.shown())),
     }
 }
 
@@ -389,30 +390,30 @@ pub struct LoadedHome {
 }
 
 fn read(path: &Path) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))
+    fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.shown()))
 }
 
 fn read_secret(path: &Path, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     check_secret_permissions(path)?;
     let text = Zeroizing::new(read(path)?);
     let file: KeyFile = serde_json::from_str(&text)
-        .map_err(|_| format!("{} is not a praetore-mcp key file", path.display()))?;
+        .map_err(|_| format!("{} is not a praetore-mcp key file", path.shown()))?;
     let hex_secret = Zeroizing::new(file.secret_key_hex);
     if file.role != role || file.algorithm != "ed25519" {
         return Err(format!(
             "{} has role/algorithm {}/{}, expected {role}/ed25519",
-            path.display(),
+            path.shown(),
             file.role,
             file.algorithm
         ));
     }
     let bytes = Zeroizing::new(
         hex::decode(hex_secret.as_bytes())
-            .map_err(|_| format!("{} has an invalid secret", path.display()))?,
+            .map_err(|_| format!("{} has an invalid secret", path.shown()))?,
     );
     let mut secret = Zeroizing::new([0u8; 32]);
     if bytes.len() != 32 {
-        return Err(format!("{} has an invalid secret length", path.display()));
+        return Err(format!("{} has an invalid secret length", path.shown()));
     }
     secret.copy_from_slice(&bytes);
     Ok(secret)
@@ -422,15 +423,15 @@ fn read_secret(path: &Path, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
 fn check_secret_permissions(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .map_err(|e| format!("cannot read {}: {e}", path.shown()))?
         .permissions()
         .mode();
     if mode & 0o077 != 0 {
         return Err(format!(
             "{} is accessible by group/others (mode {:o}); run: chmod 600 {}",
-            path.display(),
+            path.shown(),
             mode & 0o777,
-            path.display()
+            path.shown()
         ));
     }
     Ok(())
@@ -452,9 +453,9 @@ pub(crate) fn attester_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String
 pub fn read_attester_pin(path: &Path) -> Result<praetore_core::VerifiedPublicKey, String> {
     let text = read(path)?;
     let bytes = hex::decode(text.trim())
-        .map_err(|_| format!("{} is not a hex public key", path.display()))?;
+        .map_err(|_| format!("{} is not a hex public key", path.shown()))?;
     praetore_core::VerifiedPublicKey::from_bytes(&bytes)
-        .map_err(|e| format!("{} is not a valid Ed25519 key: {e}", path.display()))
+        .map_err(|e| format!("{} is not a valid Ed25519 key: {e}", path.shown()))
 }
 
 pub fn read_issuer_pins(path: &Path) -> Result<Vec<TrustedAuthorityIssuer>, String> {
@@ -463,11 +464,11 @@ pub fn read_issuer_pins(path: &Path) -> Result<Vec<TrustedAuthorityIssuer>, Stri
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             TrustedAuthorityIssuer::from_pin_json(line)
-                .map_err(|e| format!("{}: invalid issuer pin: {e}", path.display()))
+                .map_err(|e| format!("{}: invalid issuer pin: {e}", path.shown()))
         })
         .collect::<Result<Vec<_>, _>>()?;
     if pins.is_empty() {
-        return Err(format!("{} has no issuer pins", path.display()));
+        return Err(format!("{} has no issuer pins", path.shown()));
     }
     Ok(pins)
 }
@@ -477,11 +478,11 @@ pub fn load_policy(home: &Home) -> Result<Policy, String> {
         let hint = match e {
             praetore_core::PraetoreError::PolicyFormatUnsupported { found: 1, .. } => format!(
                 " (policy format 1, written before G7: add \"format_version\": 2 and \"action_classes\": {{\"{ACTION_TYPE}\": \"Mission\"}}, or run `praetore policy classify --policy {}` to propose the table)",
-                home.policy().display()
+                home.policy().shown()
             ),
             _ => String::new(),
         };
-        format!("{}: invalid policy: {e}{hint}", home.policy().display())
+        format!("{}: invalid policy: {e}{hint}", home.policy().shown())
     })
 }
 
@@ -489,7 +490,7 @@ pub fn load(home: &Home) -> Result<LoadedHome, String> {
     if !home.is_initialized() {
         return Err(format!(
             "{} is not initialized; run `{}`",
-            home.root.display(),
+            home.root.shown(),
             crate::commands::command("init", &home.root)
         ));
     }
@@ -498,16 +499,16 @@ pub fn load(home: &Home) -> Result<LoadedHome, String> {
     let attester_secret = read_secret(&home.attester_key(), "evidence-attester")?;
     let attester_key = EvidenceAttesterKey::from_secret_bytes(&attester_secret);
     let agent = AgentIdentity::from_json(&read(&home.agent())?)
-        .map_err(|e| format!("{}: {e}", home.agent().display()))?;
+        .map_err(|e| format!("{}: {e}", home.agent().shown()))?;
     if agent
         .verified_public_key()
-        .map_err(|e| format!("{}: {e}", home.agent().display()))?
+        .map_err(|e| format!("{}: {e}", home.agent().shown()))?
         != agent_key.public_key()
     {
         return Err("agent.json does not match the agent key".into());
     }
     let authority = Authority::from_json(&read(&home.authority())?)
-        .map_err(|e| format!("{}: {e}", home.authority().display()))?;
+        .map_err(|e| format!("{}: {e}", home.authority().shown()))?;
     let attester_public_key = read_attester_pin(&home.attester_pin())?;
     if attester_key
         .public_key()

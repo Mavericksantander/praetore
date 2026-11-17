@@ -1,5 +1,6 @@
 //! Command-line interface (hand-parsed; the workspace has no clap).
 
+use crate::shown::Show;
 use crate::{
     gate::Mode,
     install::{self, Client, WrapTarget},
@@ -456,35 +457,35 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
         InitOutcome::AlreadyInitialized => {
             println!(
                 "praetore-mcp: {} is already initialized; nothing was changed.",
-                home.root.display()
+                home.root.shown()
             );
         }
         InitOutcome::ApproverKeyAdded => {
             println!(
                 "praetore-mcp: added a local approver key to {}. Existing keys, authority, policy and receipts were not changed.",
-                home.root.display()
+                home.root.shown()
             );
-            println!("    {}", home.approver_key().display());
-            println!("    {}", home.approver_pin().display());
+            println!("    {}", home.approver_key().shown());
+            println!("    {}", home.approver_pin().shown());
         }
         InitOutcome::Created => {
-            println!("praetore-mcp: initialized {}", home.root.display());
+            println!("praetore-mcp: initialized {}", home.root.shown());
             println!();
             println!("  LOCAL/DEV keys (0600, never printed):");
-            println!("    {}", home.issuer_key().display());
-            println!("    {}", home.agent_key().display());
-            println!("    {}", home.attester_key().display());
-            println!("    {}", home.approver_key().display());
+            println!("    {}", home.issuer_key().shown());
+            println!("    {}", home.agent_key().shown());
+            println!("    {}", home.attester_key().shown());
+            println!("    {}", home.approver_key().shown());
             println!("  trust files for third-party verification (praetore-verify formats):");
-            println!("    {}", home.issuer_pins().display());
-            println!("    {}", home.attester_pin().display());
-            println!("    {}", home.approver_pin().display());
-            println!("  signed authority: {}", home.authority().display());
+            println!("    {}", home.issuer_pins().shown());
+            println!("    {}", home.attester_pin().shown());
+            println!("    {}", home.approver_pin().shown());
+            println!("  signed authority: {}", home.authority().shown());
             println!(
                 "  policy (v2, no rules: default deny): {}",
-                home.policy().display()
+                home.policy().shown()
             );
-            println!("  receipts journal: {}", home.receipts_dir().display());
+            println!("  receipts journal: {}", home.receipts_dir().shown());
             println!();
             println!("  These are LOCAL/DEV keys for one machine. They are not a production PKI.");
             println!(
@@ -524,7 +525,7 @@ fn warn_allow_all(home: &Home) {
         let dir = dir_suffix(home);
         println!(
             "praetore-mcp: warning: {} has the allow-all rule {id:?}: every tools/call that no other rule matches is ALLOWED, including tools no rule names. init now writes a default-deny policy but did not change this one. To deny by default, allow the tools you want (`{program} policy allow --id ID --server NAME --tool NAME{dir}`; `{program} policy coverage{dir} -- <server command>` lists what each tool gets), then run:\n    {program} policy remove --id {id}{dir}",
-            home.policy().display(),
+            home.policy().shown(),
         );
     }
 }
@@ -590,11 +591,11 @@ fn confirm(path: &Path, yes: bool) -> bool {
     if !std::io::stdin().is_terminal() {
         eprintln!(
             "praetore-mcp: not modifying {} without confirmation; re-run with --yes",
-            path.display()
+            path.shown()
         );
         return false;
     }
-    eprint!("Apply these changes to {}? [y/N] ", path.display());
+    eprint!("Apply these changes to {}? [y/N] ", path.shown());
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
     if std::io::stdin().lock().read_line(&mut answer).is_err() {
@@ -630,7 +631,7 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                     if path.is_file() {
                         found.push((client, path));
                     } else {
-                        println!("  ({}: no config at {})", client.name(), path.display());
+                        println!("  ({}: no config at {})", client.name(), path.shown());
                     }
                 }
             }
@@ -650,13 +651,13 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             if dry_run {
                 eprintln!(
                     "praetore-mcp: note: {} is not initialized yet; run `{}` before installing",
-                    home.root.display(),
+                    home.root.shown(),
                     crate::commands::command("init", &home.root)
                 );
             } else {
                 return Err(format!(
                     "{} is not initialized; run `{}` first",
-                    home.root.display(),
+                    home.root.shown(),
                     crate::commands::command("init", &home.root)
                 ));
             }
@@ -683,7 +684,7 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
         let original = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) => {
-                eprintln!("praetore-mcp: cannot read {}: {error}", path.display());
+                eprintln!("praetore-mcp: cannot read {}: {error}", path.shown());
                 code = 1;
                 continue;
             }
@@ -693,7 +694,7 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
             Err(error) => {
                 eprintln!(
                     "praetore-mcp: {} is not strict JSON ({error}); comments/trailing commas are not supported, file NOT modified",
-                    path.display()
+                    path.shown()
                 );
                 code = 1;
                 continue;
@@ -727,9 +728,9 @@ fn cmd_install(args: &[String], uninstall: bool) -> Result<i32, String> {
                 if real == path {
                     String::new()
                 } else {
-                    format!(" {} (symlink target)", real.display())
+                    format!(" {} (symlink target)", real.shown())
                 },
-                backup.display(),
+                backup.shown(),
                 client.name()
             ),
             Err(error) => {
@@ -793,8 +794,8 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     println!(
         "checked: integrity hash, attester signature ({}), agent intent signature, authority signature against {} at decision time, praetore.mode binding, journal order (seq and hash link)",
-        home.attester_pin().display(),
-        home.issuer_pins().display()
+        home.attester_pin().shown(),
+        home.issuer_pins().shown()
     );
     match report.head {
         Some(head) => println!(
@@ -840,7 +841,7 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
         .local_addr()
         .map_err(|e| format!("cannot read the listening address: {e}"))?;
     println!("praetore-mcp dashboard (read-only): http://{address}/");
-    println!("home: {}", home.root.display());
+    println!("home: {}", home.root.shown());
     println!("listening on 127.0.0.1 only; stop with Ctrl-C");
     crate::dashboard::serve(&listener, &home, expected_head, None)?;
     Ok(0)
@@ -860,8 +861,8 @@ fn cmd_report(args: &[String]) -> Result<i32, String> {
         (None, _) => Selector::Last,
     };
     let generated = report::regenerate(&parsed.home()?, &selector)?;
-    println!("{}", generated.json.display());
-    println!("{}", generated.pdf.display());
+    println!("{}", generated.json.shown());
+    println!("{}", generated.pdf.shown());
     if generated.verify_passed {
         println!("verify passed");
         Ok(0)
@@ -920,7 +921,7 @@ fn cmd_decide(args: &[String], outcome: crate::approvals::HumanOutcome) -> Resul
     if !home.is_initialized() {
         return Err(format!(
             "{} is not initialized; run `{}`",
-            home.root.display(),
+            home.root.shown(),
             crate::commands::command("init", &home.root)
         ));
     }
@@ -1061,9 +1062,9 @@ impl PolicyLock {
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
                 "another praetore-mcp policy command is running on this home (lock {}); if none is, remove that file",
-                path.display()
+                path.shown()
             )),
-            Err(error) => Err(format!("cannot create lock {}: {error}", path.display())),
+            Err(error) => Err(format!("cannot create lock {}: {error}", path.shown())),
         }
     }
 }
@@ -1077,11 +1078,11 @@ impl Drop for PolicyLock {
 fn read_policy(home: &Home) -> Result<(String, praetore_core::Policy), String> {
     let path = home.policy();
     let text =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let policy = praetore_core::Policy::from_json(&text).map_err(|e| {
         format!(
             "{} is invalid ({e}); fix it (see `{}`) or restore a backup",
-            path.display(),
+            path.shown(),
             crate::commands::command("policy check", &home.root)
         )
     })?;
@@ -1095,8 +1096,8 @@ fn save_policy(home: &Home, original: &str, updated: &str) -> Result<(), String>
         .map_err(|e| format!("written policy failed to re-validate: {e}"))?;
     println!(
         "updated {} (digest {digest}); backup at {}",
-        home.policy().display(),
-        backup.display()
+        home.policy().shown(),
+        backup.shown()
     );
     Ok(())
 }
@@ -1118,10 +1119,10 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
             let home = parsed.home()?;
             let path = home.policy();
             let text = fs::read_to_string(&path)
-                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                .map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
             match praetore_core::Policy::from_json(&text).and_then(|p| p.digest().map(|d| (p, d))) {
                 Err(error) => {
-                    println!("INVALID {}: {error}", path.display());
+                    println!("INVALID {}: {error}", path.shown());
                     if matches!(
                         error,
                         praetore_core::PraetoreError::PolicyFormatUnsupported { found: 1, .. }
@@ -1129,7 +1130,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                         println!(
                             "hint: policy format 1 was written before G7, and until it is migrated every tool call is refused. Add \"format_version\": 2 and \"action_classes\": {{\"{}\": \"Mission\"}}, or run `praetore policy classify --policy {}` to propose the table (see docs/policy-language.md); the digest changes, so receipts already written keep verifying only against the old document.",
                             crate::store::ACTION_TYPE,
-                            path.display()
+                            path.shown()
                         );
                     }
                     1
@@ -1148,13 +1149,13 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                     let engine = if home.is_initialized() {
                         crate::gate::Gate::load(&home, Mode::Observe).map(|_| ())
                     } else {
-                        Err(format!("{} is not initialized", home.root.display()))
+                        Err(format!("{} is not initialized", home.root.shown()))
                     };
                     match engine {
                         Ok(()) => {
                             println!(
                                 "OK {} policy {} v{}: {} rule(s), digest {digest}, {} warning(s); HighAssurance engine starts",
-                                path.display(),
+                                path.shown(),
                                 parsed_policy.id,
                                 parsed_policy.version,
                                 parsed_policy.rules.len(),
