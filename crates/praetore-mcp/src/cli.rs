@@ -574,6 +574,10 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
     for warning in warnings {
         eprintln!("praetore-mcp: warning: {warning}");
     }
+    // Fail closed at startup: a bad approval window must not wait for the
+    // first held call to show up, and must never fall back to a default.
+    crate::approvals::approval_ttl(&home)
+        .map_err(|error| format!("approval TTL: {error}; wrap did not start"))?;
     Ok(relay::run(relay::WrapOptions {
         home,
         name,
