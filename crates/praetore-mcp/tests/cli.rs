@@ -138,12 +138,35 @@ fn init_help_says_what_observe_mode_still_refuses() {
     let top = words(&stdout(&run(&["--help"])));
     assert!(
         top.contains(
-            "it still refuses unclassified calls and unparseable lines that may name a \
-             safety* tool."
+            "it still refuses unclassified calls, unparseable lines that may name a \
+             safety* tool, lines over 32 MiB and batches with a refused call, and, when the \
+             home cannot be loaded, every tools/call."
         ),
         "{top}"
     );
     for text in [&init, &top] {
         assert!(!text.contains("never blocks"), "{text}");
     }
+}
+
+/// The text `init` prints about observe mode, not only its help.
+#[test]
+fn init_output_says_what_observe_mode_still_refuses() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("home");
+    let out = run(&["init", "--dir", dir.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let text = stdout(&out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        text.contains(
+            "In enforce mode every tools/call is denied unless a rule allows it. Observe \
+             mode records a DENY and forwards the call, but it still refuses calls the \
+             policy does not classify and client lines it cannot check (see `init --help`)."
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("never blocks"), "{text}");
 }
