@@ -513,6 +513,54 @@ fn truncating_both_journals_runs_an_approval_again_and_only_the_saved_heads_find
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
 }
 
+/// (c) and (d) Bloqueado and detectado. The forwarded receipt cut in half,
+/// so that its line still holds `praetore.approval_id` but is not JSON, and
+/// the execution record dropped from the approval journal. `wrap` cannot
+/// tell which approval that line names, so the approval path fails closed
+/// and the retry is held; `verify` fails on the line. A later receipt keeps
+/// the cut line off the end of the journal, so `wrap` can still append.
+#[test]
+fn a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify() {
+    let (temp, home) = init_home();
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(
+        &home,
+        &[
+            call(11, "append", arguments.clone()),
+            call(12, "echo", json!({"text": "after"})),
+        ],
+    );
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    assert_eq!(executed(&stderr, "echo"), 1, "{stderr}");
+    assert!(named_approval(&receipts(&home)[1]).is_some());
+
+    let key = "praetore.approval_id";
+    rewrite_receipts(&home, |index, line| {
+        Some(if index == 1 {
+            let end = line.find(key).unwrap() + key.len() + 8;
+            line[..end].to_owned()
+        } else {
+            line.to_owned()
+        })
+    });
+    let text = fs::read_to_string(&receipt_files(&home)[0]).unwrap();
+    let cut = text.lines().nth(1).unwrap();
+    assert!(cut.contains(key), "{cut}");
+    assert!(serde_json::from_str::<Value>(cut).is_err(), "{cut}");
+    let journal = approval_journal(&home);
+    let approvals = fs::read_to_string(&journal).unwrap();
+    let first = approvals.lines().next().unwrap().to_owned();
+    fs::write(&journal, format!("{first}\n")).unwrap();
+
+    let (_, stderr) = wrap(&home, &[call(13, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 0, "held: {stderr}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a");
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
 /// The approval id is signed: changing it in the forwarded receipt fails
 /// `verify` (the receipt no longer matches its attester signature).
 #[test]
