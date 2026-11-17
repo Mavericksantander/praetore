@@ -1378,7 +1378,7 @@ fn the_config_ttl_holds_under_a_filtered_environment_and_the_env_wins() {
 fn a_bad_approval_ttl_stops_wrap_at_startup() {
     let (_temp, home) = init_home();
     let config = home.root.join("config.toml");
-    let cases: [(&str, Option<&str>, &str); 6] = [
+    let cases: [(&str, Option<&str>, &str); 7] = [
         (
             "approval_ttl_seconds = 0\n",
             None,
@@ -1391,6 +1391,7 @@ fn a_bad_approval_ttl_stops_wrap_at_startup() {
             "\"abc\" is not an integer",
         ),
         ("approval_ttl_seconds 300\n", None, "line 1: expected"),
+        ("approval_ttl_seconds\t300\n", None, "line 1: expected"),
         (
             "",
             Some("0"),

@@ -52,14 +52,20 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
     for (index, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or_default().trim();
         let at = index + 1;
-        let (key, value) = match line.split_once('=') {
-            Some((key, value)) => (key.trim(), Some(value.trim())),
-            None => (line, None),
-        };
-        if key != APPROVAL_TTL_KEY && !key.starts_with(&format!("{APPROVAL_TTL_KEY} ")) {
+        // A line whose first word (up to white space or `=`) is the key is
+        // about the TTL: anything but `key = value` is an error.
+        let first = line
+            .split(|c: char| c.is_whitespace() || c == '=')
+            .next()
+            .unwrap_or_default();
+        if first != APPROVAL_TTL_KEY {
             continue;
         }
-        let (Some(value), true) = (value, key == APPROVAL_TTL_KEY) else {
+        let value = line
+            .split_once('=')
+            .filter(|(key, _)| key.trim() == APPROVAL_TTL_KEY)
+            .map(|(_, value)| value.trim());
+        let Some(value) = value else {
             return Err(format!(
                 "{} line {at}: expected `{APPROVAL_TTL_KEY} = <seconds>`",
                 path.display()
@@ -162,6 +168,8 @@ mod tests {
         assert!(parse("approval_ttl_seconds = 1800").1.is_empty());
         for (text, says) in [
             ("approval_ttl_seconds 1800\n", "line 1: expected"),
+            ("approval_ttl_seconds\t1800\n", "line 1: expected"),
+            ("approval_ttl_seconds\n", "line 1: expected"),
             (
                 "approval_ttl_seconds = 1\napproval_ttl_seconds = 2\n",
                 "already set on line 1",
