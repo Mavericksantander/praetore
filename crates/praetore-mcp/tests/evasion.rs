@@ -476,6 +476,43 @@ fn truncating_the_approval_journal_holds_a_used_approval_and_fails_verify() {
     assert_eq!(named, [None, Some(approval_id.as_str()), None]);
 }
 
+/// (c) and (d) Detectado después con los dos heads (guardados fuera de la
+/// máquina); limitación conocida sin ellos. Cutting the end of both
+/// journals, the execution record and the forwarded receipt that names the
+/// approval, leaves an unused approval and two consistent, shorter
+/// journals: the same call runs again and plain `verify` passes.
+/// `--expected-head` and `--expected-approval-head` with the heads printed
+/// after the first run fail.
+#[test]
+fn truncating_both_journals_runs_an_approval_again_and_only_the_saved_heads_find_it() {
+    let (temp, home) = init_home();
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let out = verify(&home);
+    let receipts_head = printed_head(&out);
+    let approval_head = printed_approval_head(&out);
+
+    let journal = approval_journal(&home);
+    let text = fs::read_to_string(&journal).unwrap();
+    let first = text.lines().next().unwrap().to_owned();
+    fs::write(&journal, format!("{first}\n")).unwrap();
+    assert!(named_approval(&receipts(&home)[1]).is_some());
+    rewrite_receipts(&home, |index, line| (index == 0).then(|| line.to_owned()));
+
+    let (_, stderr) = wrap(&home, &[call(12, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 1, "forwarded again: {stderr}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "aa");
+    let out = verify(&home);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let out = verify_with_head(&home, &receipts_head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let out = verify_with_approval_head(&home, &approval_head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
 /// The approval id is signed: changing it in the forwarded receipt fails
 /// `verify` (the receipt no longer matches its attester signature).
 #[test]
