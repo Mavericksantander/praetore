@@ -349,15 +349,42 @@ fn a_receipts_journal_cut_mid_line_fails_verify() {
     assert!(!out.status.success(), "{}", stdout(&out));
 }
 
-/// (c) Limitación conocida. Dropping the last receipts whole, or deleting
-/// the journal, leaves a valid shorter chain (or none): `verify` passes.
-/// Only a head kept outside the home shows it (`verify` prints the head;
-/// the session report records it at close). Closing it needs `verify` to
-/// check against an external head, or the head sent off the machine.
+/// The receipts journal head that `verify` prints.
+fn printed_head(out: &Output) -> String {
+    let text = stdout(out);
+    let at = text.find(" head ").expect("verify prints the journal head") + " head ".len();
+    let head = &text[at..at + 64];
+    assert!(head.chars().all(|c| c.is_ascii_hexdigit()), "{text}");
+    head.to_owned()
+}
+
+fn verify_with_head(home: &Home, head: &str) -> Output {
+    cli(&[
+        "verify",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--expected-head",
+        head,
+    ])
+}
+
+/// (c) Detectado después con `--expected-head` (head guardado fuera de la
+/// máquina); limitación conocida sin él. Dropping the last receipts whole,
+/// or deleting the journal, leaves a valid shorter chain (or none): plain
+/// `verify` passes. `verify --expected-head` with the head printed before
+/// fails in both cases. It detects only if that head was kept where the
+/// agent cannot write.
 #[test]
-fn dropping_the_last_receipts_or_the_whole_journal_passes_verify() {
+fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected_head() {
     let (_temp, home) = three_receipts();
-    let head_before = stdout(&verify(&home));
+    let before = verify(&home);
+    let head = printed_head(&before);
+    assert!(
+        verify_with_head(&home, &head).status.success(),
+        "{}",
+        stdout(&before)
+    );
+
     rewrite_receipts(&home, |index, line| (index < 2).then(|| line.to_owned()));
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
@@ -366,7 +393,8 @@ fn dropping_the_last_receipts_or_the_whole_journal_passes_verify() {
         "{}",
         stdout(&out)
     );
-    assert_ne!(stdout(&out), head_before, "only the printed head differs");
+    let out = verify_with_head(&home, &head);
+    assert!(!out.status.success(), "trimmed: {}", stdout(&out));
 
     for file in receipt_files(&home) {
         fs::remove_file(file).unwrap();
@@ -378,6 +406,8 @@ fn dropping_the_last_receipts_or_the_whole_journal_passes_verify() {
         "{}",
         stdout(&out)
     );
+    let out = verify_with_head(&home, &head);
+    assert!(!out.status.success(), "deleted: {}", stdout(&out));
 }
 
 /// (c) and (d) Limitación conocida. Dropping the execution record from the
@@ -411,9 +441,12 @@ fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
 /// (c) Bloqueado for the call, limitación conocida for the trace. Deleting
 /// `approvals/journal.jsonl` before the approved call ran erases the
 /// decision with it: the call is held again. Deleting it after the call ran
-/// erases the decision and the execution; `verify` reads only the receipts
-/// journal and still passes. Closing it needs `verify` to require, for
-/// each receipt forwarded on an approval, the signed decision it names.
+/// erases the decision and the execution. `verify` reads
+/// `approvals/journal.jsonl` when it is there (approver signature, binding
+/// to the held receipt, expiry, single use), but with the file gone there is
+/// no record to check, and no receipt names the approval, so it passes.
+/// Closing it needs `verify` to require, for each receipt forwarded on an
+/// approval, the signed decision it names.
 #[test]
 fn deleting_the_approval_journal_holds_the_call_and_verify_still_passes() {
     let (temp, home) = init_home();
