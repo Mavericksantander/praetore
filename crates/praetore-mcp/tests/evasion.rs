@@ -21,6 +21,8 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+const TTL_ENV: &str = "PRAETORE_MCP_APPROVAL_TTL_SECONDS";
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
@@ -40,8 +42,16 @@ fn fake_server() -> PathBuf {
 }
 
 fn run(program: &Path, args: &[&str], stdin: &str) -> Output {
+    run_env(program, args, stdin, &[])
+}
+
+/// [`run`] with `env` set on top of the test's environment, minus any
+/// approval TTL the test runner may have exported.
+fn run_env(program: &Path, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Output {
     let mut child = Command::new(program)
         .args(args)
+        .env_remove(TTL_ENV)
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -118,8 +128,14 @@ fn wrap(home: &Home, calls: &[Value]) -> (Output, String) {
 
 /// [`wrap`] with the server registered under `name` (`--name`).
 fn wrap_as(home: &Home, name: &str, calls: &[Value]) -> (Output, String) {
+    wrap_full(home, name, calls, &[])
+}
+
+/// [`wrap_as`] with `env` set for `wrap`, as an MCP client config's `env`
+/// block sets it.
+fn wrap_full(home: &Home, name: &str, calls: &[Value], env: &[(&str, &str)]) -> (Output, String) {
     let server = fake_server();
-    let out = run(
+    let out = run_env(
         Path::new(bin()),
         &[
             "wrap",
@@ -134,6 +150,7 @@ fn wrap_as(home: &Home, name: &str, calls: &[Value]) -> (Output, String) {
             server.to_str().unwrap(),
         ],
         &session(calls),
+        env,
     );
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     (out, stderr)
@@ -723,4 +740,75 @@ fn another_allowed_tool_with_the_same_effect_is_forwarded() {
         "allow-write-text"
     );
     assert!(verify(&home).status.success());
+}
+
+// ---------- (b) the approval window ----------
+
+/// Holds `append` once through `wrap` with `env`, approves it, and returns
+/// the window (`expires_at - created_at`, in seconds) of the pending file
+/// and of the signed decision in `approvals/journal.jsonl`.
+fn approval_window(home: &Home, env: &[(&str, &str)]) -> (i64, i64) {
+    let arguments = json!({"path": home.root.join("w.txt").to_str().unwrap(), "text": "w"});
+    let (out, stderr) = wrap_full(home, "fake", &[call(10, "append", arguments)], env);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(executed(&stderr, "append"), 0, "held, not forwarded");
+    let pending = approvals::list_pending(home).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let id = &pending[0].approval_id;
+    let file = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{id}.json"));
+    let file: Value = serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap();
+    approvals::decide(home, id, HumanOutcome::Approve, None).unwrap();
+    let line = fs::read_to_string(approval_journal(home)).unwrap();
+    let decision: Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+    (window_of(&file), window_of(&decision))
+}
+
+fn window_of(value: &Value) -> i64 {
+    let at = |key: &str| {
+        time::OffsetDateTime::parse(
+            &string_under(value, key).unwrap_or_else(|| panic!("{key} in {value}")),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    };
+    (at("expires_at") - at("created_at")).whole_seconds()
+}
+
+/// (b) Limitación conocida, con rastro. `PRAETORE_MCP_APPROVAL_TTL_SECONDS`
+/// in the `env` block of the MCP client config reaches `wrap`, so a process
+/// that can edit that config can stretch the window of every new approval
+/// up to 24 h. The window is signed into each decision (`created_at`,
+/// `expires_at` in `approvals/journal.jsonl`), and `verify` passes: it
+/// checks that an execution is inside the window, not how long the window
+/// is. Closing it needs the TTL set where the agent cannot write, or
+/// `verify` checking each window against a maximum kept outside the home.
+#[test]
+fn the_ttl_env_var_in_the_client_config_stretches_new_approvals() {
+    let (_temp, home) = init_home();
+    assert_eq!(approval_window(&home, &[]), (600, 600), "default");
+    let (_temp, home) = init_home();
+    assert_eq!(
+        approval_window(&home, &[(TTL_ENV, "86400")]),
+        (86400, 86400)
+    );
+    let out = verify(&home);
+    assert!(out.status.success(), "{}", stdout(&out));
+}
+
+/// (b) Limitación conocida, con rastro. `DIR/approvals/ttl-seconds` is read
+/// from the home, so a process that can write the home can stretch the
+/// window of every new approval up to 24 h, whatever the client config
+/// says. Same trace and same `verify` result as the env var.
+#[test]
+fn the_ttl_seconds_file_in_the_home_stretches_new_approvals() {
+    let (_temp, home) = init_home();
+    fs::create_dir_all(home.root.join("approvals")).unwrap();
+    fs::write(home.root.join("approvals").join("ttl-seconds"), "86400\n").unwrap();
+    assert_eq!(approval_window(&home, &[]), (86400, 86400));
+    let out = verify(&home);
+    assert!(out.status.success(), "{}", stdout(&out));
 }
