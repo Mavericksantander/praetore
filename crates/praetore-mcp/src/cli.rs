@@ -505,9 +505,7 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!(
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
-            println!(
-                "  mode records a DENY and forwards the call, but still refuses unclassified"
-            );
+            println!("  mode records a DENY and forwards the call, but still refuses unclassified");
             println!("  calls. To allow a tool:");
             let program = crate::commands::program();
             let dir = dir_suffix(&home);
