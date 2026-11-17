@@ -1307,13 +1307,57 @@ fn wrap_filtered_env(home: &Home, input: &str, env: &[(&str, &str)]) -> Output {
         command.env(key, value);
     }
     let mut child = command.spawn().unwrap();
-    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+    // stdin is written and stdout and stderr are read on their own
+    // threads: written from here, a large input would block while `wrap`
+    // blocks writing its answers, and neither would end.
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_owned();
+    let writer = thread::spawn(move || match stdin.write_all(input.as_bytes()) {
         Ok(()) => {}
         // `wrap` refuses to start before it reads stdin (bad TTL).
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
         Err(error) => panic!("write stdin: {error}"),
+    });
+    let read = |mut pipe: Box<dyn std::io::Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let stdout = read(Box::new(child.stdout.take().unwrap()));
+    let stderr = read(Box::new(child.stderr.take().unwrap()));
+    let status = wait_or_kill(&mut child, WRAP_TIMEOUT);
+    writer.join().unwrap();
+    Output {
+        status,
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
+}
+
+/// How long a wrap test waits for `wrap` to end.
+const WRAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The exit status of `child`, waiting at most `limit`. Past it the
+/// process is killed and the test fails: a `wrap` that does not end must
+/// fail the test in seconds, not hang the run.
+fn wait_or_kill(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "wrap did not finish within {} s; killed it",
+                limit.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Seconds between `created_at` and `expires_at` of the pending call that
