@@ -561,6 +561,61 @@ fn a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify() 
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
 }
 
+/// m1: the forwarded receipt is journaled, then the execution record cannot
+/// be written (`approvals/journal.jsonl` read-only, as a full disk or a
+/// crash between the two would leave it). The call is not executed,
+/// `verify` reports that receipt as having no execution, and the approval
+/// is spent: once the file is writable again, the retry is held under a new
+/// pending id.
+#[cfg(unix)]
+#[test]
+fn an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, home) = init_home();
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let approved = fs::read_to_string(approval_journal(&home)).unwrap();
+    let decision: Value = serde_json::from_str(approved.lines().next().unwrap()).unwrap();
+    let approval_id = string_under(&decision, "approval_id").unwrap();
+
+    let journal = approval_journal(&home);
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o400)).unwrap();
+    if fs::OpenOptions::new().append(true).open(&journal).is_ok() {
+        // Running as root: the mode does not stop the write.
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        eprintln!("skipped: a 0400 file is still writable by this user");
+        return;
+    }
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(executed(&stderr, "append"), 0, "not executed: {stderr}");
+    assert!(!target.exists());
+    let all = receipts(&home);
+    assert_eq!(all.len(), 2, "held, then the forwarded receipt");
+    assert_eq!(named_approval(&all[1]), Some(approval_id.as_str()));
+    assert_eq!(
+        fs::read_to_string(&journal).unwrap(),
+        approved,
+        "no execution"
+    );
+
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("has no execution of it for that receipt"),
+        "{}",
+        stdout(&out)
+    );
+
+    assert!(approvals::list_pending(&home).unwrap().is_empty());
+    let (_, stderr) = wrap(&home, &[call(12, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 0, "held again: {stderr}");
+    let pending = approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_ne!(pending[0].approval_id, approval_id, "a new pending id");
+}
+
 /// The approval id is signed: changing it in the forwarded receipt fails
 /// `verify` (the receipt no longer matches its attester signature).
 #[test]

@@ -782,6 +782,17 @@ value does not match, including a different JSON value for the same field.
 Key order in the argument object does not matter: the binding is canonical
 JSON. A rejected or expired approval does not forward the call.
 
+The receipt is written before the execution record. If `wrap` stops
+between the two (a crash, a full disk, an approval journal it cannot
+write), the call is not forwarded, and from then on `verify` reports that
+receipt, every time: `receipt ... names approval ... and the approval
+journal has no execution of it for that receipt` (exit 1). The approval is
+spent, because the receipt names it: the same call is held again under a
+new pending id. To go on, check the disk or the file mode of
+`approvals/journal.jsonl`, let the agent retry, and approve the new id.
+The failure of the old receipt stays in `verify`; note why it happened
+next to the heads you keep.
+
 `praetore-mcp receipts` prints an `APPROVAL` column: `pending`,
 `approve by <key id prefix>`, `reject by …`, `executed once`, or, in
 observe mode, `enforce would ask`. Observe still forwards the call. The

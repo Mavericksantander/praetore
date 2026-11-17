@@ -338,6 +338,15 @@ column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
 
+If `wrap` writes the receipt of an approved call and then cannot write
+its execution record (a crash, a full disk, `approvals/journal.jsonl` not
+writable), the call is not forwarded. From then on `verify` reports that
+receipt, every time, with `has no execution of it for that receipt` and
+exit code 1. The approval is spent: the same call is held again under a
+new pending id. Fix the disk or the file mode, ask for the call again,
+and approve the new id. The old failure stays in `verify`; write down why
+it happened next to the heads you keep.
+
 ### Looking at the receipts in a browser
 
 ```sh
