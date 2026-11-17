@@ -312,8 +312,10 @@ install or upgrade Node.
 
 - Only `tools/call` requests that go through a wrapped MCP server are
   governed. The client's own built-in tools are not.
-- Observe mode (the arrival mode) does not block: a DENY receipt records
-  what enforce would have blocked, but the call still runs.
+- Observe mode (the arrival mode) does not block DENY: a DENY receipt
+  records what enforce would have blocked, but the call still runs. Observe
+  still refuses a call the policy does not classify and client lines it
+  cannot check; the praetore-mcp README lists them.
 - This is pre-release software, not independently audited, with no security
   guarantees. It is not a network service; it runs on the person's computer.
 - macOS binaries are not signed or notarized.

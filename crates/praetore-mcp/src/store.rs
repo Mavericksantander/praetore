@@ -277,7 +277,7 @@ fn write_approver_pair(home: &Home, secret: &[u8; 32]) -> Result<(), String> {
 }
 
 /// The policy `init` writes: no rules, so every `tools/call` is denied by
-/// default (in enforce mode; observe never blocks). Only `tools/call` is
+/// default (in enforce mode; observe records DENY and forwards). Only `tools/call` is
 /// evaluated, so `initialize`, `tools/list` and every other message reach
 /// the server without a rule and a client can start it and list its tools.
 pub fn default_policy() -> Policy {

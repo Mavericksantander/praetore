@@ -180,9 +180,10 @@ wrapped.
 **From 0.3.5, the policy `init` writes is default deny.** It has no rules
 and no `allow-all-mcp-tool-calls` rule. In enforce mode every `tools/call`
 that no rule allows is denied, including tools you have not looked at and
-tools a server adds later. Observe mode does not block anything, so the
-observe step above works with no rules: the receipts show `DENY` with no
-rule id. `init` needs no rule for the client to start the server or list
+tools a server adds later. Observe mode forwards a DENY instead of blocking
+it, so the observe step above works with no rules: the receipts show `DENY`
+with no rule id. Observe still refuses what both modes refuse (see
+"Limits", item 6). `init` needs no rule for the client to start the server or list
 its tools: only `tools/call` is evaluated. `init` in v0.3.4 and earlier
 wrote an allow-all rule instead (`allow-all-mcp-tool-calls`); see "A home
 from v0.3.4" below.
@@ -688,10 +689,15 @@ Read these before relying on anything above.
    the file afterwards. Anything that changes the filesystem in between (for
    example replacing a directory with a symlink) is not seen by the
    decision.
-6. **Observe mode does not block anything.** It records what enforce would
-   have decided, labeled `praetore.mode: observe` in the signed receipt. Use
-   it to try a policy, not to stop calls. In enforce, a tool that no rule
-   allows is denied by default.
+6. **Observe mode does not block DENY.** It records what enforce would
+   have decided, labeled `praetore.mode: observe` in the signed receipt, and
+   forwards the call. Use it to try a policy, not to stop calls. It still
+   refuses, as enforce does: a `tools/call` the policy does not classify, a
+   client line it cannot parse that may name a `safety*` tool, a client
+   line over 32 MiB, and a whole batch when a `tools/call` in it is refused.
+   When the home cannot be loaded, every `tools/call` and every client line
+   that cannot be parsed is refused. In enforce, a tool that no rule allows
+   is denied by default.
 7. **The proxy is cooperative.** Whoever can edit the client config can
    remove the wrapper. The proxy does not see actions the server takes on its
    own initiative.

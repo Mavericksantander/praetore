@@ -294,9 +294,11 @@ Checked with the real apps on macOS (arm64): Claude Desktop
 (`~/Library/Application Support/Claude/claude_desktop_config.json`) and
 Cursor (`~/.cursor/mcp.json`), each with `install --mode enforce` in front of
 `@modelcontextprotocol/server-filesystem@2.1.0` launched with `npx`, and a
-`deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused
-with the rule and evidence id shown in the chat, the file was not created,
-and `verify` checked every receipt. Not checked: Windows, Linux, VS Code.
+`deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused,
+the file was not created, and `verify` checked every receipt. On a DENY the
+client sees only `Denied by PRÆTORE. Evidence id: <id>`, whatever decided
+it; the rule is on stderr and in the signed receipt. Not checked: Windows,
+Linux, VS Code.
 
 A config file that two default paths resolve to (for example Cursor's
 `~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
@@ -387,7 +389,12 @@ rule, and declares the action type `mcp.tools/call` as `Mission` in
 **Default deny in enforce (from 0.3.5).** With no rule matching, a
 `tools/call` is DENY. In enforce mode, every tool that is not allowed is
 denied, including tools a server adds in a later version. Observe mode
-never blocks: it records DENY and forwards the call. `init` needs no rule
+records DENY and forwards the call, except what both modes refuse: a
+`tools/call` the policy does not classify, a client line it cannot parse
+that may name a `safety*` tool, a client line over 32 MiB, and a whole
+batch when a `tools/call` in it is refused. When the home cannot be loaded
+(before `init`, for example), both modes refuse every `tools/call` and
+every client line they cannot parse. `init` needs no rule
 for the client to start the server: only `tools/call` is evaluated, so
 `initialize`, `tools/list`, notifications and every other message pass
 through. Allow tools one by one:

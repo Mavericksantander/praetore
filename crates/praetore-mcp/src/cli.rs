@@ -47,12 +47,15 @@ DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys, including a separate approver
 key. The policy written by `init` has no rules: in enforce mode every
 tools/call is denied until a `policy allow` rule allows it. Observe mode
-records decisions but never blocks. Enforce mode blocks DENY. A
-REQUIRE_APPROVAL call is not forwarded until someone runs `approve`
-for that exact call. `approve` reads a confirmation from an interactive
-terminal; that check is cooperative (a process that can act as this user
-can still approve). If the home cannot be loaded (e.g. no `init`), `wrap`
-refuses every tools/call in both modes.
+records a DENY and forwards the call; it still refuses unclassified calls,
+unparseable lines that may name a safety* tool, lines over 32 MiB and
+batches with a refused call, and, when the home cannot be loaded, every
+tools/call. Enforce mode blocks DENY. A REQUIRE_APPROVAL call is not
+forwarded until someone runs `approve` for that exact call. `approve`
+reads a confirmation from an interactive terminal; that check is
+cooperative (a process that can act as this user can still approve). If
+the home cannot be loaded (e.g. no `init`), `wrap` refuses every tools/call
+and every unparseable client line in both modes.
 
 Exit codes:
   0    success (also --help and --version)
@@ -75,7 +78,12 @@ DIR. The approver key is separate from the issuer, agent and attester keys.
 With no rules, every tools/call is denied by default in enforce mode. Only
 tools/call is evaluated: initialize, tools/list and the rest of the MCP
 traffic pass, so a client can start the server and list its tools. Observe
-mode never blocks. Allow tools with
+mode records a DENY and forwards the call, but it still refuses a tools/call
+the policy does not classify, a client line it cannot parse that may name a
+safety* tool, a client line over 32 MiB, and a whole batch when a tools/call
+in it is refused. When the home cannot be loaded (before init, for example),
+every tools/call and every client line that cannot be parsed is refused.
+Allow tools with
 `praetore-mcp policy allow --id ID --server NAME --tool NAME`.
 
 Running init again on an initialized DIR adds the approver key when it is
@@ -96,7 +104,9 @@ passed to the server unchanged (including any --help).
   --dir DIR     home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --name SERVER server name used in policy rules and receipts
                 (default: the command's file name)
-  --mode MODE   observe (default): forward every call, record the decision
+  --mode MODE   observe (default): record the decision and forward the call;
+                unclassified calls and client lines that cannot be checked
+                are still refused (see `praetore-mcp init --help`)
                 enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
                 `praetore-mcp approve <id>` for that exact call
   --no-report   do not write the session report (same as `report = false`
@@ -500,7 +510,9 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!(
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
-            println!("  mode never blocks. To allow a tool:");
+            println!("  mode records a DENY and forwards the call, but it still refuses calls the");
+            println!("  policy does not classify and client lines it cannot check (see");
+            println!("  `init --help`). To allow a tool:");
             let program = crate::commands::program();
             let dir = dir_suffix(&home);
             println!("    {program} policy allow --id ID --server NAME --tool NAME{dir}");

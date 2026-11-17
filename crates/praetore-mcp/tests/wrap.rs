@@ -696,7 +696,8 @@ fn deny_path_prefix_catches_symlinks_into_it_and_unresolvable_paths() {
     assert!(verify_cli(&home).status.success());
 }
 
-/// Observe still forwards everything, and its receipts record the check.
+/// Observe forwards these path-checked calls, DENY included, and its
+/// receipts record the check.
 #[cfg(unix)]
 #[test]
 fn observe_records_the_path_check_and_forwards() {
