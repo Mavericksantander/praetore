@@ -1,4 +1,9 @@
-//! Optional `DIR/config.toml`: settings that never affect a policy decision.
+//! Optional `DIR/config.toml`: whether session reports are written, and the
+//! approval window. Neither changes the outcome a rule gives a call (ALLOW,
+//! DENY or REQUIRE_APPROVAL), but `approval_ttl_seconds` decides how long a
+//! held call can still be approved, and so whether a later matching call
+//! runs. tests/evasion.rs
+//! `config_toml_changes_no_rule_outcome_only_the_approval_window` pins both.
 //!
 //! The file is a flat list of `key = value` lines (a TOML subset; `#` starts
 //! a comment). The keys are `report` and `approval_ttl_seconds`:

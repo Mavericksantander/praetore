@@ -830,3 +830,64 @@ fn the_ttl_in_config_toml_stretches_new_approvals() {
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
 }
+
+/// What `config.toml` can and cannot change (the module doc of
+/// `src/config.rs`): the same calls get the same rule outcomes under the
+/// same policy digest with and without a config, and only the approval
+/// window differs.
+#[test]
+fn config_toml_changes_no_rule_outcome_only_the_approval_window() {
+    let outcomes = |home: &Home| -> Vec<(String, String)> {
+        let (out, stderr) = wrap(
+            home,
+            &[
+                call(2, "echo", json!({"n": 1})),
+                call(
+                    3,
+                    "append",
+                    json!({"path": home.root.join("o.txt").to_str().unwrap(), "text": "o"}),
+                ),
+                call(4, "other", json!({})),
+            ],
+        );
+        assert!(out.status.success(), "{stderr}");
+        receipts(home)
+            .iter()
+            .map(|r| {
+                (
+                    r["evidence"]["decision"]["outcome"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                    r["evidence"]["policy_digest"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let (_plain_temp, plain) = init_home();
+    let (_config_temp, configured) = init_home();
+    fs::write(
+        configured.root.join("config.toml"),
+        "report = false\napproval_ttl_seconds = 86400\n",
+    )
+    .unwrap();
+    let without = outcomes(&plain);
+    let with = outcomes(&configured);
+    let kinds: Vec<&str> = without
+        .iter()
+        .map(|(outcome, _)| outcome.as_str())
+        .collect();
+    assert_eq!(kinds, ["Allow", "RequireApproval", "Deny"]);
+    assert_eq!(without, with, "same outcomes and policy digest");
+
+    let window = |home: &Home| {
+        let id = &approvals::list_pending(home).unwrap()[0].approval_id;
+        let file = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{id}.json"));
+        window_of(&serde_json::from_str(&fs::read_to_string(file).unwrap()).unwrap())
+    };
+    assert_eq!((window(&plain), window(&configured)), (600, 86400));
+}
