@@ -67,8 +67,16 @@ The defences above were checked by removing each one and running `tests/evasion.
 | Approvals named in the receipts journal (`first_unused_approval` counts only execution records) | `truncating_the_approval_journal_holds_a_used_approval_and_fails_verify` |
 | A receipts line with the key that is not JSON (`approvals_named_in_receipts` skips it, `let Ok(entry) = parse_line(..) else { continue }`, instead of holding the call) | `a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify` |
 | A receipt whose approval id is malformed (`approvals_named_in_receipts` skips it instead of holding the call) | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` |
-| Two receipts naming one approval (`verify` check removed) | `two_receipts_naming_one_approval_fail_verify` |
+| Two receipts naming one approval (`verify` check removed) | `two_receipts_naming_one_approval_fail_verify`, by its message only (see below) |
 | A receipt naming an approval with no signed decision (`verify` check removed) | `deleting_the_approval_journal_holds_the_call_and_fails_verify_after_it_ran` |
-| A receipt naming a rejected approval (`verify` check removed) | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` |
+| A receipt naming a rejected approval (`verify` check removed) | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify`, by its message only when the whole check is removed (see below) |
 | A receipt naming an approval with no execution for it (`verify` check removed) | `truncating_the_approval_journal_holds_a_used_approval_and_fails_verify` |
 | A malformed approval id in a receipt (`verify` ignores it) | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` |
+| The execution record that cannot be written ignored (`let _ = append_execution(..)`, the call forwarded anyway) | `an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify` |
+
+The duplicate and the rejected checks are caught by the message the test asserts, not by the exit code. With either check removed, `verify` still exits 1 because another check fails on the same journals:
+
+- Duplicate: in the test each of the two receipts has an execution record, so the reuse check (`... was reused: 2 execution records ...`) fails. With one execution record, the no-execution check would fail for the other receipt.
+- Rejected: with the whole check removed, the receipt falls through to the no-execution check (`... has no execution of it for that receipt`). Removing only its message while it still skips the receipt (`continue`) makes `verify` pass, and the test fails on the exit code.
+
+So these two checks add the reason `verify` gives, not a case it would otherwise accept.
