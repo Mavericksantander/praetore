@@ -256,16 +256,16 @@ fn offending_lines(source: &str, hit: impl Fn(&str) -> bool) -> Vec<(usize, Stri
         .collect()
 }
 
-/// Uses of `hit` in src not covered by `exceptions`, and exceptions that
-/// no longer match a line (so the list cannot outlive the code).
+/// Lines `find` reports in src and no exception covers, and exceptions
+/// that no longer match a line (so the list cannot outlive the code).
 fn check_guard(
     exceptions: &[Exception],
-    hit: impl Fn(&str) -> bool + Copy,
+    find: impl Fn(&str) -> Vec<(usize, String)>,
 ) -> (Vec<String>, Vec<String>) {
     let mut found = Vec::new();
     let mut used = vec![false; exceptions.len()];
     for (file, source) in src_files() {
-        for (number, line) in offending_lines(&source, hit) {
+        for (number, line) in find(&source) {
             match exceptions
                 .iter()
                 .position(|e| e.file == file && e.line == line)
@@ -289,7 +289,9 @@ fn check_guard(
 /// as they are. The exceptions keep the exact path as data.
 #[test]
 fn src_formats_paths_with_shown_not_display() {
-    let (found, stale) = check_guard(DISPLAY_EXCEPTIONS, |code| code.contains(".display()"));
+    let (found, stale) = check_guard(DISPLAY_EXCEPTIONS, |source| {
+        offending_lines(source, |code| code.contains(".display()"))
+    });
     assert!(
         found.is_empty(),
         "format these paths with `.shown()` (use crate::shown::Show), or add an exception with its exact line and reason:\n{}",
@@ -354,4 +356,96 @@ fn the_dashboard_fixture_holds_the_invisible_ranges_of_praetore_core() {
         "{} differs from praetore_core::display::is_invisible; run this test with PRAETORE_WRITE_FIXTURES=1 and update shown() in src/dashboard/app.js",
         path.display()
     );
+}
+
+/// Macros that build text for a person or a message.
+const FORMAT_MACROS: &[&str] = &[
+    "format", "print", "println", "eprint", "eprintln", "write", "writeln",
+];
+
+/// Lines (1-based, as written) where `needle` is inside the arguments of
+/// one of `FORMAT_MACROS`, in the lexed code of `source`.
+fn inside_format_macros(source: &str, needle: &str) -> Vec<(usize, String)> {
+    let code = lex::lex(source).code;
+    let bytes = code.as_bytes();
+    let mut lines = std::collections::BTreeSet::new();
+    for name in FORMAT_MACROS {
+        let open = format!("{name}!");
+        let mut from = 0;
+        while let Some(at) = code[from..].find(&open).map(|i| from + i) {
+            from = at + open.len();
+            let ident_before =
+                at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_');
+            let mut start = from;
+            while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+                start += 1;
+            }
+            let close = match bytes.get(start) {
+                Some(b'(') => b')',
+                Some(b'[') => b']',
+                Some(b'{') => b'}',
+                _ => continue,
+            };
+            if ident_before {
+                continue;
+            }
+            let opening = bytes[start];
+            let mut depth = 0;
+            let mut end = start;
+            for (offset, &b) in bytes[start..].iter().enumerate() {
+                if b == opening {
+                    depth += 1;
+                } else if b == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + offset;
+                        break;
+                    }
+                }
+            }
+            let span = &code[start..end];
+            let mut search = 0;
+            while let Some(i) = span[search..].find(needle).map(|i| search + i) {
+                lines.insert(code[..start + i].matches('\n').count() + 1);
+                search = i + needle.len();
+            }
+        }
+    }
+    let source_lines: Vec<&str> = source.lines().collect();
+    lines
+        .into_iter()
+        .map(|n| (n, source_lines[n - 1].trim().to_owned()))
+        .collect()
+}
+
+/// Lines that may format `to_string_lossy()` in a message: none today.
+const LOSSY_EXCEPTIONS: &[Exception] = &[];
+
+/// m4: `to_string_lossy()` writes control characters as they are, like
+/// `Path::display`. Inside a formatting macro it must be `.shown()`.
+#[test]
+fn src_formats_no_to_string_lossy_in_a_message() {
+    let (found, stale) = check_guard(LOSSY_EXCEPTIONS, |source| {
+        inside_format_macros(source, ".to_string_lossy()")
+    });
+    assert!(
+        found.is_empty(),
+        "format these with `.shown()`, or add an exception with its exact line and reason:\n{}",
+        found.join("\n")
+    );
+    assert!(
+        stale.is_empty(),
+        "exceptions that match no line any more:\n{}",
+        stale.join("\n")
+    );
+}
+
+#[test]
+fn the_lossy_guard_finds_each_macro_and_spans_lines() {
+    let source = "fn f(p: &Path, out: &mut String) {\n    let a = p.to_string_lossy();\n    eprintln!(\"open http://x/ {}\", p.to_string_lossy());\n    let _ = format!(\n        \"{}\",\n        p.to_string_lossy()\n    );\n    let _ = write!(out, \"{}\", p.to_string_lossy());\n    // println!(\"{}\", p.to_string_lossy());\n    let s = \"format!({}) p.to_string_lossy()\";\n    myformat!(p.to_string_lossy());\n}\n";
+    let lines: Vec<usize> = inside_format_macros(source, ".to_string_lossy()")
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(lines, [3, 6, 8]);
 }
