@@ -458,8 +458,20 @@ mod tests {
             stdout.contains("running 1 test"),
             "probe did not run as its own process"
         );
-        assert!(stdout.contains("PROBE RECEIPTS intact"), "{stdout}");
-        assert!(stdout.contains("PROBE APPROVALS intact"), "{stdout}");
+        // Linux cuts an O_APPEND write at RLIMIT_FSIZE, so the rollback runs.
+        // macOS (APFS, checked on 27.0) does not apply the limit to an
+        // O_APPEND write: the line is stored whole (see `probe_one`).
+        let outcome = if cfg!(target_os = "linux") {
+            "intact"
+        } else {
+            ""
+        };
+        for label in ["RECEIPTS", "APPROVALS"] {
+            assert!(
+                stdout.contains(&format!("PROBE {label} {outcome}")),
+                "{label}: {stdout}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -482,7 +494,26 @@ mod tests {
     fn probe_one(label: &str, home: &crate::store::Home, path: &Path, before: &[u8]) {
         let limit = (before.len() as u64).saturating_add(PROBE_ROOM as u64);
         set_fsize_limit(limit);
-        let error = append_journal_file(path, &line_of_401()).expect_err("append must fail");
+        let result = append_journal_file(path, &line_of_401());
+        if !cfg!(target_os = "linux")
+            && let Ok(()) = result
+        {
+            // Not cut, so nothing to roll back: the line must be there whole.
+            let after = fs::read(path).expect("read journal");
+            assert_eq!(
+                after,
+                [before, line_of_401().as_slice()].concat(),
+                "{label}: an append past RLIMIT_FSIZE is either cut and rolled back or whole"
+            );
+            println!(
+                "PROBE {label} whole before={} after={} limit={limit} line={PROBE_LINE_LEN} (this OS does not apply RLIMIT_FSIZE to an O_APPEND write)",
+                before.len(),
+                after.len()
+            );
+            fs::write(path, before).expect("restore journal");
+            return;
+        }
+        let error = result.expect_err("append must fail");
         let after = fs::read(path).expect("read journal");
         let report = crate::receipts::verify_journal(home, None).expect("verify");
         let ends_nl = after.ends_with(b"\n");
