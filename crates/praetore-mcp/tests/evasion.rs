@@ -282,9 +282,9 @@ fn an_edited_policy_allows_a_denied_call_and_shows_only_as_a_new_policy_digest()
 
 /// (b) Limitación conocida. `report = false` in `config.toml` stops the
 /// session reports; the receipts are still written and verified. The
-/// config never changes a decision. Closing it is not needed for
-/// decisions; a home that must keep reports would need the config signed
-/// like the policy.
+/// approval window that `config.toml` can also set has its own test,
+/// [`the_ttl_in_config_toml_stretches_new_approvals`]. A home that must
+/// keep reports would need the config signed like the policy.
 #[test]
 fn an_edited_config_turns_reports_off_but_not_the_receipts() {
     let (_temp, home) = init_home();
@@ -808,6 +808,24 @@ fn the_ttl_seconds_file_in_the_home_stretches_new_approvals() {
     let (_temp, home) = init_home();
     fs::create_dir_all(home.root.join("approvals")).unwrap();
     fs::write(home.root.join("approvals").join("ttl-seconds"), "86400\n").unwrap();
+    assert_eq!(approval_window(&home, &[]), (86400, 86400));
+    let out = verify(&home);
+    assert!(out.status.success(), "{}", stdout(&out));
+}
+
+/// (b) Limitación conocida, con rastro. `approval_ttl_seconds` in
+/// `DIR/config.toml` is read from the home, whatever environment the client
+/// passes, so a process that can write the home can stretch the window of
+/// every new approval up to 24 h. Same trace and same `verify` result as
+/// the env var and `approvals/ttl-seconds`.
+#[test]
+fn the_ttl_in_config_toml_stretches_new_approvals() {
+    let (_temp, home) = init_home();
+    fs::write(
+        home.root.join("config.toml"),
+        "approval_ttl_seconds = 86400\n",
+    )
+    .unwrap();
     assert_eq!(approval_window(&home, &[]), (86400, 86400));
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
