@@ -10,8 +10,9 @@
   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` still wins over it, and
   `approvals/ttl-seconds` is still read after it. `wrap` now reads and
   checks every TTL source that is set before it starts the server: a value
-  out of range or not an integer in any of them, or a `config.toml` that
-  cannot be read, stops it with exit code 2 and names the source, even when
+  out of range or not an integer in any of them, a malformed
+  `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` included), or a
+  `config.toml` that cannot be read or starts with a byte order mark, stops it with exit code 2 and names the source, even when
   a source of higher priority is valid.
 
 ### Fixed

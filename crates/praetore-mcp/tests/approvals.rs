@@ -1608,6 +1608,42 @@ fn a_bad_approval_ttl_stops_wrap_at_startup() {
     assert!(stderr.contains("cannot read"), "{stderr}");
 }
 
+/// Runs `wrap` with `config.toml` holding `text` and checks that it refused
+/// to start (exit 2, no server output) with a message naming `config.toml`
+/// and containing `says`.
+fn assert_config_stops_wrap(text: &str, says: &str) {
+    let (_temp, home) = init_home();
+    fs::write(home.root.join("config.toml"), text).unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{text:?}: {stderr}");
+    assert!(out.stdout.is_empty(), "{text:?}: the server answered");
+    assert!(
+        stderr.contains("wrap did not start")
+            && stderr.contains("config.toml")
+            && stderr.contains(says),
+        "{text:?}: {stderr}"
+    );
+}
+
+/// n1: `approval_ttl_seconds: 90000` (YAML style) names the key, so it is
+/// an error at startup, never a warning followed by the default 600.
+#[test]
+fn a_ttl_line_with_a_colon_stops_wrap_at_startup() {
+    assert_config_stops_wrap(
+        "approval_ttl_seconds: 90000\n",
+        "line 1: expected `approval_ttl_seconds = <seconds>`",
+    );
+}
+
+/// n1: a `config.toml` that starts with a byte order mark is an error at
+/// startup. Read as text, the BOM would hide the key on the first line and
+/// the default 600 would apply.
+#[test]
+fn a_config_toml_with_a_byte_order_mark_stops_wrap_at_startup() {
+    assert_config_stops_wrap("\u{feff}approval_ttl_seconds = 1800\n", "byte order mark");
+}
+
 /// M1: every TTL source that is set is read and checked, then the one of
 /// highest priority is used. An invalid value in any source stops `wrap`
 /// at startup (exit 2) and the message names that source, even when a

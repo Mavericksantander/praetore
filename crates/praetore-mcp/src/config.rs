@@ -53,7 +53,8 @@ fn unquoted(key: &str) -> &str {
 
 /// The raw `approval_ttl_seconds` value of `config.toml`, or `None` when the
 /// file or the key is absent. Unlike [`load`], this fails on a file that
-/// cannot be read, on a line naming the key without `= value`, and on the
+/// cannot be read or starts with a byte order mark, on a line naming the key
+/// without `= value` (`key: value` included), and on the
 /// key given twice: an approval window must never fall back to a default
 /// the user did not choose. The range is checked by the caller.
 pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
@@ -63,14 +64,22 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("cannot read {}: {error}", path.shown())),
     };
+    // A byte order mark is not part of the first key. Read as text it would
+    // hide that key, and the default would apply without a word.
+    if text.starts_with('\u{feff}') {
+        return Err(format!(
+            "{} starts with a byte order mark (U+FEFF); save it as UTF-8 without one",
+            path.shown()
+        ));
+    }
     let mut found: Option<(usize, String)> = None;
     for (index, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or_default().trim();
         let at = index + 1;
-        // A line whose first word (up to white space or `=`) is the key is
-        // about the TTL: anything but `key = value` is an error.
+        // A line whose first word (up to white space, `=` or `:`) is the key
+        // is about the TTL: anything but `key = value` is an error.
         let first = line
-            .split(|c: char| c.is_whitespace() || c == '=')
+            .split(|c: char| c.is_whitespace() || c == '=' || c == ':')
             .next()
             .unwrap_or_default();
         if unquoted(first) != APPROVAL_TTL_KEY {
@@ -185,6 +194,10 @@ mod tests {
             ("approval_ttl_seconds 1800\n", "line 1: expected"),
             ("approval_ttl_seconds\t1800\n", "line 1: expected"),
             ("approval_ttl_seconds\n", "line 1: expected"),
+            ("approval_ttl_seconds: 90000\n", "line 1: expected"),
+            ("approval_ttl_seconds:90000\n", "line 1: expected"),
+            ("\u{feff}approval_ttl_seconds = 1800\n", "byte order mark"),
+            ("\u{feff}report = false\n", "byte order mark"),
             (
                 "approval_ttl_seconds = 1\napproval_ttl_seconds = 2\n",
                 "already set on line 1",

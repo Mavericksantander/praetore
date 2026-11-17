@@ -573,8 +573,9 @@ file is read from the home, whatever the environment.
 
 `wrap` checks the TTL before it starts the server. A value outside 1 to
 86400 or not an integer in any of the three sources, a malformed or
-repeated `approval_ttl_seconds` line, or a `config.toml` or `ttl-seconds`
-that cannot be read stops `wrap` with exit code 2 and the cause, naming
+repeated `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` with a
+colon included), a `config.toml` that starts with a byte order mark, or a
+`config.toml` or `ttl-seconds` that cannot be read stops `wrap` with exit code 2 and the cause, naming
 the source, on stderr. That holds even when a source of higher priority
 is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
 `approval_ttl_seconds = 90000` still stops `wrap`:
