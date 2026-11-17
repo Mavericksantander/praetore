@@ -412,9 +412,12 @@ fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected
 
 /// (c) and (d) Limitación conocida. Dropping the execution record from the
 /// end of `approvals/journal.jsonl` makes a used approval unused again: the
-/// same call is forwarded a second time. `verify` does not flag it. Closing
-/// it needs the approval head kept outside the home, or the execution
-/// bound into the receipts chain so `verify` sees two executions.
+/// same call is forwarded a second time and `verify` passes. The receipts
+/// do not show it: the held call and each forwarded call all record
+/// REQUIRE_APPROVAL and none carries the approval id, and `--expected-head`
+/// covers only the receipts journal. Closing it needs a head for the
+/// approval journal kept outside the home, or the execution bound into the
+/// receipts chain so `verify` sees two executions of one approval.
 #[test]
 fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
     let (temp, home) = init_home();

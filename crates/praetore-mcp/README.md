@@ -768,7 +768,9 @@ The environment variable wins.
 
 After `approve`, the agent retries the same `tools/call`. The proxy
 forwards it once, then appends an execution record signed with the
-attester key. A second retry asks for a new approval. A different argument
+attester key. A second retry asks for a new approval, as long as the
+approval journal is not edited; see
+[the evasion matrix](../../docs/security/evasion-matrix.md). A different argument
 value does not match, including a different JSON value for the same field.
 Key order in the argument object does not matter: the binding is canonical
 JSON. A rejected or expired approval does not forward the call.
@@ -837,8 +839,10 @@ each evidence receipt on its own.
   `DIR/approvals/`, and approve. That is not a guarantee that a person
   reviewed the call. The approval expires (default 10 minutes) and is
   consumed by one later call with the same server, tool and canonical
-  arguments. Deleting or truncating `approvals/journal.jsonl` lets that
-  approval be used again. `verify` does not detect that unless you compare,
+  arguments, as long as the approval journal is not edited (see
+  [the evasion matrix](../../docs/security/evasion-matrix.md)). Deleting
+  or truncating `approvals/journal.jsonl` lets that approval be used
+  again. `verify` does not detect that unless you compare,
   by hand, the approval head it prints. There is no flag for that head.
   See Local approval.
 * The keys are LOCAL/DEV keys. See the trust model.

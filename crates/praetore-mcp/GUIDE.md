@@ -589,7 +589,9 @@ Read these before relying on anything above.
    forwarded. The approval matches one server, one tool and the canonical
    arguments, expires after 10 minutes unless
    `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says
-   otherwise (1 to 86400 seconds), and is consumed by one later call. A
+   otherwise (1 to 86400 seconds), and is consumed by one later call, as
+   long as the approval journal is not edited; see
+   [the evasion matrix](../../docs/security/evasion-matrix.md). A
    second identical call asks again. Different arguments do not match.
    A process that can act as this user can open a terminal and approve.
    That is not a guarantee that a person reviewed the call. The terminal
