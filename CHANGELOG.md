@@ -21,7 +21,9 @@
   approval. `verify` fails when two receipts name one approval, when a
   receipt names an approval with no signed decision or a rejected one, or
   when the approval journal has no execution of it for that receipt.
-  Receipts without the key (v0.3.6 and before) verify as before.
+  Receipts without the key (v0.3.6 and before) verify as before, with
+  `praetore-mcp verify` and with `praetore-verify`; tests pin a home
+  written by 0.3.6 and one written with the key.
 
 - **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
   in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
