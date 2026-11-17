@@ -14,6 +14,7 @@
 //! unreadable file, a malformed or repeated key is an error, and `wrap`
 //! refuses to start on it.
 
+use crate::shown::Show;
 use crate::store::Home;
 use std::{fs, io, path::PathBuf};
 
@@ -104,7 +105,7 @@ pub fn load(home: &Home) -> (Config, Vec<String>) {
             let (config, problems) = parse(&text);
             let warnings = problems
                 .into_iter()
-                .map(|problem| format!("{}: {problem}", path.display()))
+                .map(|problem| format!("{}: {problem}", path.shown()))
                 .collect();
             (config, warnings)
         }
@@ -113,7 +114,7 @@ pub fn load(home: &Home) -> (Config, Vec<String>) {
             Config::default(),
             vec![format!(
                 "cannot read {}: {error}; using the defaults",
-                path.display()
+                path.shown()
             )],
         ),
     }

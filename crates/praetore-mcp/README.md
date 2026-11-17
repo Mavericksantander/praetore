@@ -27,21 +27,21 @@ what it does not cover, and has a troubleshooting table.
 
 ## Install
 
-To install `praetore-mcp` v0.3.5 without Rust and without cloning the
+To install `praetore-mcp` v0.3.6 without Rust and without cloning the
 repository, download one archive and `SHA256SUMS` from the published
-[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`, not a build of the
+[v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`, not a build of the
 current `main` branch):
 
-- macOS Apple silicon: `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz`
-- macOS Intel: `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz`
-- Linux x86_64: `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Apple silicon: `praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz`
+- macOS Intel: `praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz`
+- Linux x86_64: `praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz`
 
-v0.3.5 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.6 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you unpack it
 (`shasum -a 256 -c SHA256SUMS --ignore-missing` on macOS,
 `sha256sum -c SHA256SUMS --ignore-missing` on Linux). The published digests
-are in [Install from the v0.3.5 release](../../docs/install-prebuilt.md).
+are in [Install from the v0.3.6 release](../../docs/install-prebuilt.md).
 If `SHA256SUMS` does not match that list, stop. Unpack with `tar -xzf`,
 then move `praetore-mcp` to a directory on your `PATH` that you will keep,
 for example `~/.local/bin`, before you run `install`. `install` records
@@ -87,20 +87,20 @@ as the `release-assets-<tag>` artifact.
 
 For a `v*` tag, CI also signs `SHA256SUMS` with Sigstore keyless signing
 (`SHA256SUMS.sigstore.json`) and publishes the archives, `SHA256SUMS` and
-the signature as a GitHub Release. The v0.3.5 files are on
-[the v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`). That release has no
+the signature as a GitHub Release. The v0.3.6 files are on
+[the v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`). That release has no
 Windows binary and no Linux ARM binary.
 
 The install check is the digest. Download `SHA256SUMS` and the one archive
 for this machine, then run the `shasum` or `sha256sum` command below. The
 published digests are listed in
-[Install from the v0.3.5 release](../../docs/install-prebuilt.md). If the
+[Install from the v0.3.6 release](../../docs/install-prebuilt.md). If the
 file does not match, stop.
 
 Checking the Sigstore signature is optional for that install. It needs
-`cosign`. For v0.3.5, pass
-`--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
+`cosign`. For v0.3.6, pass
+`--certificate-github-workflow-sha 27ceddbbd295162ca351ea5dfa47fe8bb37315a3`
 instead of `git rev-parse`, which needs a clone. The command and what the
 signature does prove are in
 [`docs/operations.md`](../../docs/operations.md#release-artifact-integrity).

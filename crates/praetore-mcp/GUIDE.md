@@ -31,21 +31,21 @@ macOS arm64 run on 2026-10-30 did not include local approval.
 ### Without Rust
 
 Download one archive and `SHA256SUMS` from the published
-[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`). That release is not a
+[v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`). That release is not a
 build of the current `main` branch. You do not clone the repository.
 
 | Machine | Archive |
 | --- | --- |
-| macOS Apple silicon | `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz` |
 
-v0.3.5 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.6 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you open it. On macOS:
 `shasum -a 256 -c SHA256SUMS --ignore-missing`. On Linux:
 `sha256sum -c SHA256SUMS --ignore-missing`. The published digests are in
-[Install from the v0.3.5 release](../../docs/install-prebuilt.md). If
+[Install from the v0.3.6 release](../../docs/install-prebuilt.md). If
 `SHA256SUMS` does not match that list, stop. Then `tar -xzf` the archive.
 It contains a directory of the same name with `praetore-mcp`, `LICENSE` and
 `NOTICE`.
@@ -77,9 +77,16 @@ for a POSIX shell. They run as printed even when the binary is not on your
 `praetore-mcp`, which needs it on `PATH`. On Windows they are written as
 before.
 
+A path or a name that holds a control character (an escape sequence,
+`\r`, `\n`) or a zero-width or bidi character is never printed as is. In
+messages, in the dashboard and in the PDF report it is written as
+`\u{..}`: a home named `a<ESC>[2Kb` shows as `a\u{1b}[2Kb`. In a
+command to copy, such a path is written as `$'...'` with `\xHH` escapes,
+which bash and zsh read back as the exact path.
+
 Checking the Sigstore signature of `SHA256SUMS` is optional. It needs
-`cosign`. For v0.3.5, pass
-`--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
+`cosign`. For v0.3.6, pass
+`--certificate-github-workflow-sha 27ceddbbd295162ca351ea5dfa47fe8bb37315a3`
 so the check does not need a clone. See
 [Release artifact integrity](../../docs/operations.md#release-artifact-integrity).
 The required check is the digest command above.

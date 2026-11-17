@@ -105,7 +105,7 @@ fn width(font: Font, size: f32, spacing: f32, text: &str) -> f32 {
 /// journal (control, zero-width and bidi characters become `\u{..}`), then
 /// reduced to printable ASCII.
 fn ascii(text: &str) -> String {
-    praetore_core::display::escape_bounded(text, 400)
+    crate::shown::bounded(text, 400)
         .chars()
         .map(|c| match c {
             ' '..='~' => c,
