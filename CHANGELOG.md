@@ -53,6 +53,19 @@
 
 ### Fixed
 
+- **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
+  help, the `init` output, the READMEs and the GUIDE said observe mode
+  never blocks (the 0.3.5 entry below says so too). It records a DENY and
+  forwards the call, but it still refuses, as enforce does, a `tools/call`
+  the policy does not classify, a client line it cannot parse that may
+  name a `safety*` tool, a client line over 32 MiB, and a whole batch when
+  a `tools/call` in it is refused; when the home cannot be loaded, every
+  `tools/call` and every client line that cannot be parsed. The texts now
+  say so, and tests pin the `init` help, the top-level help and the `init`
+  output. The README also said a DENY shows the rule in the chat: the
+  client sees only `Denied by PRÆTORE. Evidence id: <id>`, and the rule is
+  on stderr and in the receipt. A test skipped as root now prints why.
+
 - **praetore-mcp: error messages name the binary and the home.** The
   not-initialized notes of `install`, the approval and receipt journal
   errors that say to run `verify` or `init`, and the invalid-policy error
