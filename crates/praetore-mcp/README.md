@@ -766,8 +766,9 @@ Default expiry is 10 minutes from the hold. Set `approval_ttl_seconds`
 `PRAETORE_MCP_APPROVAL_TTL_SECONDS` for one process; the environment
 variable wins, then the config, then the older `DIR/approvals/ttl-seconds`.
 An MCP client may start `wrap` with a filtered environment, so prefer the
-config line there. A bad value stops `wrap` at startup (exit 2); see the
-GUIDE section "Approval TTL".
+config line there. Every source that is set is checked: a bad value in
+any of them stops `wrap` at startup (exit 2) and names the source, even
+when a higher one is valid; see the GUIDE section "Approval TTL".
 
 After `approve`, the agent retries the same `tools/call`. The proxy
 forwards it once, then appends an execution record signed with the

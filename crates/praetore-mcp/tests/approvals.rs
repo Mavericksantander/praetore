@@ -1432,3 +1432,64 @@ fn a_bad_approval_ttl_stops_wrap_at_startup() {
     assert_eq!(out.status.code(), Some(2), "{stderr}");
     assert!(stderr.contains("cannot read"), "{stderr}");
 }
+
+/// M1: every TTL source that is set is read and checked, then the one of
+/// highest priority is used. An invalid value in any source stops `wrap`
+/// at startup (exit 2) and the message names that source, even when a
+/// source of higher priority is valid.
+#[test]
+fn every_ttl_source_is_checked_even_when_a_higher_one_wins() {
+    let (_temp, home) = init_home();
+    let config = home.root.join("config.toml");
+    let file = home.root.join("approvals").join("ttl-seconds");
+    let cases: [(&str, Option<&str>, Option<&str>, &str); 3] = [
+        (
+            "approval_ttl_seconds = 90000\n",
+            Some("120"),
+            None,
+            "config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000",
+        ),
+        (
+            "approval_ttl_seconds = abc\n",
+            Some("120"),
+            None,
+            "config.toml approval_ttl_seconds \"abc\" is not an integer",
+        ),
+        (
+            "approval_ttl_seconds = 1800\n",
+            None,
+            Some("0\n"),
+            "approvals/ttl-seconds must be from 1 to 86400 seconds, got 0",
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (text, env, ttl_file, says) in cases {
+        fs::write(&config, text).unwrap();
+        match ttl_file {
+            Some(value) => {
+                fs::create_dir_all(file.parent().unwrap()).unwrap();
+                fs::write(&file, value).unwrap();
+            }
+            None => {
+                let _ = fs::remove_file(&file);
+            }
+        }
+        let env: Vec<_> = env
+            .map(|value| ("PRAETORE_MCP_APPROVAL_TTL_SECONDS", value))
+            .into_iter()
+            .collect();
+        let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(2)
+            || !out.stdout.is_empty()
+            || !stderr.contains("wrap did not start")
+            || !stderr.contains(says)
+        {
+            failed.push(format!(
+                "{text:?} env {env:?} ttl-seconds {ttl_file:?}: exit {:?}, stderr {stderr}",
+                out.status.code()
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

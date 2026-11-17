@@ -547,7 +547,8 @@ home, add this line to `DIR/config.toml`:
 approval_ttl_seconds = 1800
 ```
 
-The first source that is set wins:
+`wrap` reads and checks every source that is set, then uses the first
+one in this order:
 
 1. `PRAETORE_MCP_APPROVAL_TTL_SECONDS` in the environment of `wrap`;
 2. `approval_ttl_seconds` in `DIR/config.toml`;
@@ -561,15 +562,18 @@ only a few variables to the servers they start (the MCP Python SDK's
 file is read from the home, whatever the environment.
 
 `wrap` checks the TTL before it starts the server. A value outside 1 to
-86400, a value that is not an integer, a malformed or repeated
-`approval_ttl_seconds` line, or a `config.toml` that cannot be read stops
-`wrap` with exit code 2 and the cause on stderr, for example:
+86400 or not an integer in any of the three sources, a malformed or
+repeated `approval_ttl_seconds` line, or a `config.toml` or `ttl-seconds`
+that cannot be read stops `wrap` with exit code 2 and the cause, naming
+the source, on stderr. That holds even when a source of higher priority
+is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
+`approval_ttl_seconds = 90000` still stops `wrap`:
 
 ```
 praetore-mcp: approval TTL: config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000; wrap did not start
 ```
 
-It never falls back to the next source. Other problems in `config.toml`
+A bad value is never skipped in favour of another source. Other problems in `config.toml`
 (a bad `report` value, an unknown key) stay warnings.
 
 The report is a view of the journal: it signs nothing, changes no journal
