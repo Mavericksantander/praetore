@@ -61,7 +61,7 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.shown())),
     };
     let mut found: Option<(usize, String)> = None;
     for (index, raw) in text.lines().enumerate() {
@@ -83,13 +83,13 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
         let Some(value) = value else {
             return Err(format!(
                 "{} line {at}: expected `{APPROVAL_TTL_KEY} = <seconds>`",
-                path.display()
+                path.shown()
             ));
         };
         if let Some((first, _)) = found {
             return Err(format!(
                 "{} line {at}: {APPROVAL_TTL_KEY} is already set on line {first}",
-                path.display()
+                path.shown()
             ));
         }
         found = Some((at, value.to_owned()));
