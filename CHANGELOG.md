@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Added
+
+- **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
+  in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
+  open, even when the MCP client starts `wrap` with a filtered environment.
+  `PRAETORE_MCP_APPROVAL_TTL_SECONDS` still wins over it, and
+  `approvals/ttl-seconds` is still read after it. `wrap` now reads and
+  checks every TTL source that is set before it starts the server: a value
+  out of range or not an integer in any of them, a malformed
+  `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` included), or a
+  `config.toml` that cannot be read or starts with a byte order mark, stops it with exit code 2 and names the source, even when
+  a source of higher priority is valid.
+
+### Breaking
+
+- **praetore-mcp: an invalid TTL source stops `wrap` even when another one
+  wins.** Before, only the source in use was read:
+  `PRAETORE_MCP_APPROVAL_TTL_SECONDS` hid a bad `approvals/ttl-seconds`
+  (`0`, `soon`, a value over 86400), and `wrap` started. Now every source
+  that is set is checked, so an existing home with such a file next to a
+  valid env var stops at startup with exit code 2 and
+  `approval TTL: approvals/ttl-seconds ...; wrap did not start`. The same
+  holds for a bad `approval_ttl_seconds` in `config.toml`. Action: fix or
+  delete the file the message names.
+
 ### Fixed
 
 - **praetore-mcp: error messages name the binary and the home.** The
@@ -16,6 +41,13 @@
   pending as well as decided. `approvals` now prints
   `decided: <outcome> already; ...` with no commands, and the report counts
   it once, as decided.
+- **praetore-mcp: control characters in paths and names are escaped where
+  a person reads them.** Terminal messages, the dashboard and the PDF
+  report write control characters (C0 with `\r`, `\n`, NUL and ESC, DEL,
+  C1), zero-width and bidi characters as `\u{..}`, so a file or home name
+  cannot clear or fake the line it is shown in. Printed commands write such
+  a path as `$'...'` with `\xHH` escapes. JSON output and the report JSON
+  keep the exact value.
 
 ## 0.3.6 - 2026-11-16
 

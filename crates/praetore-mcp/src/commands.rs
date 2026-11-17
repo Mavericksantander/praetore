@@ -18,9 +18,39 @@ use std::path::{Path, PathBuf};
 /// The word a command starts with when the binary's path is unknown.
 pub const FALLBACK_PROGRAM: &str = "praetore-mcp";
 
-/// `value` as one POSIX shell word: `'value'`, with each `'` as `'\''`.
+/// `value` as one shell word: `'value'`, with each `'` as `'\''`.
+///
+/// A value with a control, zero-width or bidi character (m5: a home named
+/// with `\x1b[2K` or `\r` would rewrite the line the command is printed
+/// in) is written as `$'...'` instead, with every byte outside printable
+/// ASCII as `\xHH`. The printed command then holds no such character and
+/// still gives the exact path when pasted into bash or zsh.
 pub fn quote(value: &str) -> String {
+    if value.chars().any(praetore_core::display::is_invisible) {
+        return dollar_quote(value);
+    }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// `$'value'` with `\`, `'` and every byte outside printable ASCII
+/// escaped.
+fn dollar_quote(value: &str) -> String {
+    let mut out = String::from("$'");
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            ' '..='~' => out.push(c),
+            _ => {
+                let mut bytes = [0; 4];
+                for byte in c.encode_utf8(&mut bytes).bytes() {
+                    out.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// The first word of a printed command, for the running binary.
@@ -86,6 +116,30 @@ mod tests {
             assert!(word.starts_with('\'') && word.ends_with('\''), "{word}");
             if cfg!(unix) {
                 assert_eq!(through_sh(&word), value, "{word}");
+            }
+        }
+    }
+
+    /// m5: a path with a terminal escape, `\r`, `\n`, a C1 control or a
+    /// zero-width space is printed with none of them and still pastes as the
+    /// exact path in bash.
+    #[test]
+    fn quote_writes_control_characters_as_escapes_that_bash_reads_back() {
+        for value in ["/tmp/a\x1b[2K\r\nb", "/tmp/it's\t\u{9b}x\u{200b}y\\z é"] {
+            let word = quote(value);
+            assert!(
+                !word.chars().any(praetore_core::display::is_invisible),
+                "{word:?}"
+            );
+            assert!(word.starts_with("$'") && word.ends_with('\''), "{word}");
+            if cfg!(unix) {
+                let out = Command::new("bash")
+                    .arg("-c")
+                    .arg(format!("printf %s {word}"))
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "{out:?}");
+                assert_eq!(String::from_utf8(out.stdout).unwrap(), value, "{word}");
             }
         }
     }

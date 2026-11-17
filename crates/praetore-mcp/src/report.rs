@@ -19,6 +19,7 @@
 //! `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, whose header
 //! names the close report in `regenerated_from`.
 
+use crate::shown::Show;
 use crate::{
     approvals,
     receipts::{self, VerifyReport},
@@ -357,7 +358,7 @@ fn evidence_id_of(value: &Value) -> Option<&str> {
 }
 
 fn strip_home(home: &Home, text: &str) -> String {
-    let root = home.root.display().to_string();
+    let root = home.root.to_string_lossy().into_owned();
     text.replace(&format!("{root}/"), "")
         .replace(&format!("{root}\\"), "")
 }
@@ -622,7 +623,7 @@ fn write_temp(path: &Path, bytes: &[u8]) -> Result<PathBuf, String> {
         Ok(()) => Ok(temp),
         Err(error) => {
             let _ = fs::remove_file(&temp);
-            Err(format!("cannot write {}: {error}", path.display()))
+            Err(format!("cannot write {}: {error}", path.shown()))
         }
     }
 }
@@ -634,9 +635,9 @@ fn publish(temp: &Path, path: &Path) -> Result<(), String> {
     let _ = fs::remove_file(temp);
     linked.map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
-            format!("{} already exists; it was not replaced", path.display())
+            format!("{} already exists; it was not replaced", path.shown())
         } else {
-            format!("cannot write {}: {error}", path.display())
+            format!("cannot write {}: {error}", path.shown())
         }
     })
 }
@@ -672,7 +673,7 @@ fn ensure_reports_dir(dir: &Path) -> Result<(), String> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("cannot set the mode of {}: {e}", dir.display()))?;
+            .map_err(|e| format!("cannot set the mode of {}: {e}", dir.shown()))?;
     }
     Ok(())
 }
@@ -883,7 +884,7 @@ fn session_files(home: &Home) -> Result<Vec<PathBuf>, String> {
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.shown())),
     };
     let mut files: Vec<PathBuf> = entries
         .filter_map(Result::ok)
@@ -953,12 +954,12 @@ pub fn regenerate(home: &Home, selector: &Selector) -> Result<Generated, String>
     .ok_or_else(|| {
         format!(
             "no session report found in {}; a report can only be regenerated for a session that wrote one",
-            reports_dir(home).display()
+            reports_dir(home).shown()
         )
     })?;
     let text =
-        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let bad = |what: &str| format!("{} is not a session report ({what})", path.display());
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
+    let bad = |what: &str| format!("{} is not a session report ({what})", path.shown());
     let document: Value = serde_json::from_str(&text).map_err(|e| bad(&e.to_string()))?;
     if document["schema"] != SCHEMA {
         return Err(bad("unknown schema"));

@@ -11,6 +11,7 @@
 //! retry are ordinary evidence lines. Putting decisions in that chain would
 //! have changed how v0.3.3 lines are linked.
 
+use crate::shown::Show;
 use crate::store::{self, Home};
 use ed25519_dalek::{Signer, SigningKey};
 use praetore_core::{DecisionOutcome, Evidence, VerifiedPublicKey};
@@ -201,7 +202,7 @@ pub fn on_require_approval(
             &binding,
             &evidence.evidence_id.to_string(),
             now,
-            ttl(home)?,
+            approval_ttl(home)?,
         )?;
         Ok(HoldOrForward::Hold {
             message: hold_message(home, &pending),
@@ -216,19 +217,19 @@ pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(listed),
-        Err(error) => return Err(format!("cannot read {}: {error}", dir.display())),
+        Err(error) => return Err(format!("cannot read {}: {error}", dir.shown())),
     };
     for entry in entries {
-        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.shown()))?;
         let path = entry.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
         let value: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
-        listed.push(pending_info(&value).map_err(|e| format!("{}: {e}", path.display()))?);
+            .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
+        listed.push(pending_info(&value).map_err(|e| format!("{}: {e}", path.shown()))?);
     }
     listed.sort_by(|a, b| {
         a.expiry
@@ -262,10 +263,10 @@ pub fn pending_call(home: &Home, approval_id: &str) -> Result<PendingCall, Strin
         format!("no pending approval {approval_id} (unknown id, or already decided)")
     })?;
     let pending: Value =
-        serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
     let info = pending_info(&pending)?;
     if info.approval_id != approval_id {
-        return Err(format!("{} does not match its approval id", path.display()));
+        return Err(format!("{} does not match its approval id", path.shown()));
     }
     let arguments = pending
         .get("arguments")
@@ -287,7 +288,7 @@ fn load_signed_receipt(home: &Home, evidence_id: &str) -> Result<Evidence, Strin
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
     for line in crate::receipts::read_journal(home)? {
         let parsed = crate::journal::parse_line(&line.text)
-            .map_err(|error| format!("{}:{}: {error}", line.file.display(), line.line_number))?;
+            .map_err(|error| format!("{}:{}: {error}", line.file.shown(), line.line_number))?;
         if parsed.evidence.evidence_id.to_string() != evidence_id {
             continue;
         }
@@ -345,10 +346,10 @@ pub fn decide(
             format!("no pending approval {approval_id} (unknown id, or already decided)")
         })?;
         let pending: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+            .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
         let info = pending_info(&pending)?;
         if info.approval_id != approval_id {
-            return Err(format!("{} does not match its approval id", path.display()));
+            return Err(format!("{} does not match its approval id", path.shown()));
         }
         let now = now_utc()?;
         if info.expiry.is_expired_at(now) {
@@ -409,7 +410,7 @@ pub fn decide(
         let signed = sign_record(&record, DECISION_DOMAIN, &approver)?;
         let entries = read_journal(home, journal)?;
         append_signed(journal, &entries, &signed)?;
-        fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
+        fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.shown()))?;
         Ok(Decided {
             approval_id: approval_id.to_owned(),
             outcome: outcome.as_str().to_owned(),
@@ -473,14 +474,14 @@ pub fn raw_records(home: &Home) -> Result<Vec<(String, Value)>, String> {
         return Ok(Vec::new());
     }
     let text =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let mut out = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.is_empty() {
             continue;
         }
-        let entry = parse_journal_text(line)
-            .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?;
+        let entry =
+            parse_journal_text(line).map_err(|e| format!("{}:{}: {e}", path.shown(), index + 1))?;
         out.push((line.to_owned(), entry.record));
     }
     Ok(out)
@@ -603,7 +604,7 @@ pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, Stri
     let mut executions_of: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen_decision: BTreeSet<String> = BTreeSet::new();
     for entry in &entries {
-        let at = format!("{} seq {}", path.display(), entry.seq);
+        let at = format!("{} seq {}", path.shown(), entry.seq);
         if entry.seq != expected_seq || entry.prev != expected_prev {
             report.failures.push(format!(
                 "FAIL {at}: approval journal does not follow the previous record (expected seq {expected_seq})"
@@ -838,15 +839,15 @@ fn reuse_or_create_pending(
                 format!(
                     "approval {} is already decided but its pending file {} cannot be removed: {e}",
                     pending.approval_id,
-                    path.display()
+                    path.shown()
                 )
             })?;
             continue;
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
         let value: Value = serde_json::from_str(&text)
-            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+            .map_err(|e| format!("{} is not JSON: {e}", path.shown()))?;
         let existing = binding_from_pending(&value)?;
         if existing == *binding && !pending.expiry.is_expired_at(now) {
             return pending_info(&value);
@@ -1239,18 +1240,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn ttl(home: &Home) -> Result<Duration, String> {
-    let seconds = if let Some(raw) = std::env::var_os("PRAETORE_MCP_APPROVAL_TTL_SECONDS") {
-        let raw = raw
-            .to_str()
-            .ok_or("PRAETORE_MCP_APPROVAL_TTL_SECONDS is not UTF-8")?;
-        parse_ttl(raw, "PRAETORE_MCP_APPROVAL_TTL_SECONDS")?
-    } else if let Some(raw) = read_ttl_file(home)? {
-        parse_ttl(raw.trim(), "approvals/ttl-seconds")?
-    } else {
-        DEFAULT_TTL_SECONDS
+/// How long a pending approval stays open. Every source that is set is
+/// read and checked first: `PRAETORE_MCP_APPROVAL_TTL_SECONDS`,
+/// `approval_ttl_seconds` in `DIR/config.toml` and the file
+/// `DIR/approvals/ttl-seconds`. A value out of 1..=86400, not a number or
+/// unreadable in any of them is an error that names its source, even when
+/// a source of higher priority is valid. Then the first set source in that
+/// order is used, or 600. `wrap` calls this before it starts, so a bad
+/// value stops it at startup; the config value also reaches `wrap` when
+/// the MCP client passes it a filtered environment.
+pub fn approval_ttl(home: &Home) -> Result<Duration, String> {
+    let env = match std::env::var_os("PRAETORE_MCP_APPROVAL_TTL_SECONDS") {
+        Some(raw) => {
+            let raw = raw
+                .to_str()
+                .ok_or("PRAETORE_MCP_APPROVAL_TTL_SECONDS is not UTF-8")?;
+            Some(parse_ttl(raw, "PRAETORE_MCP_APPROVAL_TTL_SECONDS")?)
+        }
+        None => None,
     };
-    Ok(Duration::seconds(seconds))
+    let config = match crate::config::approval_ttl_seconds(home)? {
+        Some(raw) => Some(parse_ttl(&raw, "config.toml approval_ttl_seconds")?),
+        None => None,
+    };
+    let file = match read_ttl_file(home)? {
+        Some(raw) => Some(parse_ttl(raw.trim(), "approvals/ttl-seconds")?),
+        None => None,
+    };
+    Ok(Duration::seconds(
+        env.or(config).or(file).unwrap_or(DEFAULT_TTL_SECONDS),
+    ))
 }
 
 fn parse_ttl(raw: &str, source: &str) -> Result<i64, String> {
@@ -1270,7 +1289,7 @@ fn read_ttl_file(home: &Home) -> Result<Option<String>, String> {
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!("cannot read {}: {error}", path.display())),
+        Err(error) => Err(format!("cannot read {}: {error}", path.shown())),
     }
 }
 
@@ -1320,7 +1339,7 @@ impl ApprovalLock {
         }
         let file = options
             .open(&path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+            .map_err(|e| format!("cannot open {}: {e}", path.shown()))?;
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             use std::os::fd::AsRawFd;
@@ -1329,7 +1348,7 @@ impl ApprovalLock {
             if rc != 0 {
                 return Err(format!(
                     "cannot lock {}: {}",
-                    path.display(),
+                    path.shown(),
                     std::io::Error::last_os_error()
                 ));
             }
@@ -1343,15 +1362,14 @@ fn read_journal(home: &Home, path: &Path) -> Result<Vec<JournalEntry>, String> {
         return Ok(Vec::new());
     }
     let text =
-        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let mut entries = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.is_empty() {
             continue;
         }
         entries.push(
-            parse_journal_text(line)
-                .map_err(|e| format!("{}:{}: {e}", path.display(), index + 1))?,
+            parse_journal_text(line).map_err(|e| format!("{}:{}: {e}", path.shown(), index + 1))?,
         );
     }
     let mut expected_seq = 0u64;
@@ -1360,7 +1378,7 @@ fn read_journal(home: &Home, path: &Path) -> Result<Vec<JournalEntry>, String> {
         if entry.seq != expected_seq || entry.prev != expected_prev {
             return Err(format!(
                 "{}: approval journal seq {} does not follow the previous record; run `{}`",
-                path.display(),
+                path.shown(),
                 entry.seq,
                 crate::commands::command("verify", &home.root)
             ));
@@ -1377,7 +1395,7 @@ fn read_journal_unlocked(home: &Home) -> Result<Vec<JournalEntry>, String> {
         return Ok(Vec::new());
     }
     let text =
-        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
     let mut entries = Vec::new();
     for (index, line) in text.lines().enumerate() {
         if line.is_empty() {
@@ -1386,7 +1404,7 @@ fn read_journal_unlocked(home: &Home) -> Result<Vec<JournalEntry>, String> {
         match parse_journal_text(line) {
             Ok(entry) => entries.push(entry),
             Err(error) => {
-                return Err(format!("{}:{}: {error}", path.display(), index + 1));
+                return Err(format!("{}:{}: {error}", path.shown(), index + 1));
             }
         }
     }
@@ -1440,7 +1458,7 @@ fn link_bytes(seq: u64, prev: &str, canonical: &[u8]) -> [u8; 32] {
 
 fn append_line(path: &Path, bytes: &[u8]) -> Result<(), String> {
     crate::journal_io::append_journal_file(path, bytes)
-        .map_err(|e| format!("cannot append to {}: {e}", path.display()))
+        .map_err(|e| format!("cannot append to {}: {e}", path.shown()))
 }
 
 fn write_private(path: &Path, contents: &str) -> Result<(), String> {
@@ -1453,13 +1471,13 @@ fn write_private(path: &Path, contents: &str) -> Result<(), String> {
     }
     let mut file = options
         .open(path)
-        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot create {}: {e}", path.shown()))?;
     file.write_all(contents.as_bytes())
         .and_then(|()| file.write_all(b"\n"))
         .and_then(|()| file.sync_all())
-        .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        .map_err(|e| format!("cannot write {}: {e}", path.shown()))?;
     if let Some(dir) = path.parent() {
-        crate::fsutil::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))?;
+        crate::fsutil::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.shown()))?;
     }
     Ok(())
 }

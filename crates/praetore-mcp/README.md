@@ -27,21 +27,21 @@ what it does not cover, and has a troubleshooting table.
 
 ## Install
 
-To install `praetore-mcp` v0.3.5 without Rust and without cloning the
+To install `praetore-mcp` v0.3.6 without Rust and without cloning the
 repository, download one archive and `SHA256SUMS` from the published
-[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`, not a build of the
+[v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`, not a build of the
 current `main` branch):
 
-- macOS Apple silicon: `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz`
-- macOS Intel: `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz`
-- Linux x86_64: `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz`
+- macOS Apple silicon: `praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz`
+- macOS Intel: `praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz`
+- Linux x86_64: `praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz`
 
-v0.3.5 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.6 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you unpack it
 (`shasum -a 256 -c SHA256SUMS --ignore-missing` on macOS,
 `sha256sum -c SHA256SUMS --ignore-missing` on Linux). The published digests
-are in [Install from the v0.3.5 release](../../docs/install-prebuilt.md).
+are in [Install from the v0.3.6 release](../../docs/install-prebuilt.md).
 If `SHA256SUMS` does not match that list, stop. Unpack with `tar -xzf`,
 then move `praetore-mcp` to a directory on your `PATH` that you will keep,
 for example `~/.local/bin`, before you run `install`. `install` records
@@ -87,20 +87,20 @@ as the `release-assets-<tag>` artifact.
 
 For a `v*` tag, CI also signs `SHA256SUMS` with Sigstore keyless signing
 (`SHA256SUMS.sigstore.json`) and publishes the archives, `SHA256SUMS` and
-the signature as a GitHub Release. The v0.3.5 files are on
-[the v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`). That release has no
+the signature as a GitHub Release. The v0.3.6 files are on
+[the v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`). That release has no
 Windows binary and no Linux ARM binary.
 
 The install check is the digest. Download `SHA256SUMS` and the one archive
 for this machine, then run the `shasum` or `sha256sum` command below. The
 published digests are listed in
-[Install from the v0.3.5 release](../../docs/install-prebuilt.md). If the
+[Install from the v0.3.6 release](../../docs/install-prebuilt.md). If the
 file does not match, stop.
 
 Checking the Sigstore signature is optional for that install. It needs
-`cosign`. For v0.3.5, pass
-`--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
+`cosign`. For v0.3.6, pass
+`--certificate-github-workflow-sha 27ceddbbd295162ca351ea5dfa47fe8bb37315a3`
 instead of `git rev-parse`, which needs a clone. The command and what the
 signature does prove are in
 [`docs/operations.md`](../../docs/operations.md#release-artifact-integrity).
@@ -761,14 +761,20 @@ What is signed, with the approver key from `init`:
 * the server, the tool and the canonical arguments of the pending call
 * when the pending call was created and when it expires
 
-Default expiry is 10 minutes from the hold. Set
-`PRAETORE_MCP_APPROVAL_TTL_SECONDS` (an integer from 1 to 86400) for one
-process, or write that integer to `DIR/approvals/ttl-seconds` for the home.
-The environment variable wins.
+Default expiry is 10 minutes from the hold. Set `approval_ttl_seconds`
+(an integer from 1 to 86400) in `DIR/config.toml` for the home, or
+`PRAETORE_MCP_APPROVAL_TTL_SECONDS` for one process; the environment
+variable wins, then the config, then the older `DIR/approvals/ttl-seconds`.
+An MCP client may start `wrap` with a filtered environment, so prefer the
+config line there. Every source that is set is checked: a bad value in
+any of them stops `wrap` at startup (exit 2) and names the source, even
+when a higher one is valid; see the GUIDE section "Approval TTL".
 
 After `approve`, the agent retries the same `tools/call`. The proxy
 forwards it once, then appends an execution record signed with the
-attester key. A second retry asks for a new approval. A different argument
+attester key. A second retry asks for a new approval, as long as the
+approval journal is not edited; see
+[the evasion matrix](../../docs/security/evasion-matrix.md). A different argument
 value does not match, including a different JSON value for the same field.
 Key order in the argument object does not matter: the binding is canonical
 JSON. A rejected or expired approval does not forward the call.
@@ -790,9 +796,28 @@ the receipt line format is unchanged. A home with no approval journal
 approval journal is hash-linked. Deleting or truncating
 `approvals/journal.jsonl` lets an approval be used again. `verify` does
 not notice: a missing file is `approval journal: none` and still exits 0.
-There is no flag for an expected approval head. The only check is to
-compare, by hand, the approval head that `verify` prints with a copy kept
-somewhere else.
+There is no flag for an expected approval head. The check is a saved head:
+after a run you trust, print it and keep it off this machine; later, that
+head must still be the current one or the `prev` of a later record:
+
+```sh
+# DIR is the home, for example ~/.praetore/mcp.
+# After a run you trust: print the approval head; keep it off this machine.
+praetore-mcp verify --dir "$DIR" | sed -n 's/^approval journal: .* head //p'
+
+# Later, with that value:
+SAVED=<approval head kept off this machine>
+if out=$(praetore-mcp verify --dir "$DIR") &&
+   { printf '%s\n' "$out" | grep -qx "approval journal: .* head $SAVED" ||
+     grep -qF "\"prev\":\"$SAVED\"" "$DIR/approvals/journal.jsonl"; }; then
+  echo "approval journal still holds $SAVED"
+else
+  echo "approval journal changed or verify failed"
+fi
+```
+
+New approvals after the saved head keep it in the chain, so the check
+still passes. Deleting the journal or cutting it before that head fails it.
 
 `praetore-verify` does not read this approval journal. It still verifies
 each evidence receipt on its own.
@@ -837,10 +862,11 @@ each evidence receipt on its own.
   `DIR/approvals/`, and approve. That is not a guarantee that a person
   reviewed the call. The approval expires (default 10 minutes) and is
   consumed by one later call with the same server, tool and canonical
-  arguments. Deleting or truncating `approvals/journal.jsonl` lets that
-  approval be used again. `verify` does not detect that unless you compare,
-  by hand, the approval head it prints. There is no flag for that head.
-  See Local approval.
+  arguments, as long as the approval journal is not edited (see
+  [the evasion matrix](../../docs/security/evasion-matrix.md)). Deleting
+  or truncating `approvals/journal.jsonl` lets that approval be used
+  again. `verify` does not detect that unless you check a saved approval
+  head; the command is in Local approval. There is no flag for that head.
 * The keys are LOCAL/DEV keys. See the trust model.
 * Observe is not enforcement. Observe receipts are labeled with the signed
   `praetore.mode: observe`.
@@ -884,9 +910,9 @@ each evidence receipt on its own.
 | `approver-public-key.hex` | approver public key. `praetore-mcp verify` checks approval signatures against it |
 | `approvals/pending/<id>.json` | one held call waiting for `approve` or `reject` (0600) |
 | `approvals/journal.jsonl` | hash-linked approval decisions and the one execution that consumed each approval |
-| `approvals/ttl-seconds` | optional lifetime, in seconds, used when `PRAETORE_MCP_APPROVAL_TTL_SECONDS` is unset |
+| `approvals/ttl-seconds` | optional lifetime, in seconds, used when neither `PRAETORE_MCP_APPROVAL_TTL_SECONDS` nor `approval_ttl_seconds` in `config.toml` is set |
 | `policy.json` | v2 policy |
 | `receipts/YYYY-MM-DD.jsonl` | hash-linked evidence journal (`seq`, `prev`, `evidence`) |
 | `receipts/.journal.lock` | lock held while one entry is appended |
 | `reports/session-<start UTC>-<id>.json`, `.pdf` | report of one `wrap` session, written when it ends (0600); a view of the journal, see GUIDE.md |
-| `config.toml` | optional; `report = false` turns the session reports off |
+| `config.toml` | optional; `report = false` turns the session reports off; `approval_ttl_seconds = <1..86400>` sets the approval lifetime |

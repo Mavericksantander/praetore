@@ -31,21 +31,21 @@ macOS arm64 run on 2026-10-30 did not include local approval.
 ### Without Rust
 
 Download one archive and `SHA256SUMS` from the published
-[v0.3.5 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.5)
-(commit `b6d668acb8e153a47a9478fe96b92a0c9eafb423`). That release is not a
+[v0.3.6 release](https://github.com/Mavericksantander/praetore/releases/tag/v0.3.6)
+(commit `27ceddbbd295162ca351ea5dfa47fe8bb37315a3`). That release is not a
 build of the current `main` branch. You do not clone the repository.
 
 | Machine | Archive |
 | --- | --- |
-| macOS Apple silicon | `praetore-mcp-v0.3.5-aarch64-apple-darwin.tar.gz` |
-| macOS Intel | `praetore-mcp-v0.3.5-x86_64-apple-darwin.tar.gz` |
-| Linux x86_64 | `praetore-mcp-v0.3.5-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple silicon | `praetore-mcp-v0.3.6-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `praetore-mcp-v0.3.6-x86_64-apple-darwin.tar.gz` |
+| Linux x86_64 | `praetore-mcp-v0.3.6-x86_64-unknown-linux-gnu.tar.gz` |
 
-v0.3.5 has no Windows binary and no Linux ARM binary, and there is no brew
+v0.3.6 has no Windows binary and no Linux ARM binary, and there is no brew
 installer. Check the archive before you open it. On macOS:
 `shasum -a 256 -c SHA256SUMS --ignore-missing`. On Linux:
 `sha256sum -c SHA256SUMS --ignore-missing`. The published digests are in
-[Install from the v0.3.5 release](../../docs/install-prebuilt.md). If
+[Install from the v0.3.6 release](../../docs/install-prebuilt.md). If
 `SHA256SUMS` does not match that list, stop. Then `tar -xzf` the archive.
 It contains a directory of the same name with `praetore-mcp`, `LICENSE` and
 `NOTICE`.
@@ -77,9 +77,16 @@ for a POSIX shell. They run as printed even when the binary is not on your
 `praetore-mcp`, which needs it on `PATH`. On Windows they are written as
 before.
 
+A path or a name that holds a control character (an escape sequence,
+`\r`, `\n`) or a zero-width or bidi character is never printed as is. In
+messages, in the dashboard and in the PDF report it is written as
+`\u{..}`: a home named `a<ESC>[2Kb` shows as `a\u{1b}[2Kb`. In a
+command to copy, such a path is written as `$'...'` with `\xHH` escapes,
+which bash and zsh read back as the exact path.
+
 Checking the Sigstore signature of `SHA256SUMS` is optional. It needs
-`cosign`. For v0.3.5, pass
-`--certificate-github-workflow-sha b6d668acb8e153a47a9478fe96b92a0c9eafb423`
+`cosign`. For v0.3.6, pass
+`--certificate-github-workflow-sha 27ceddbbd295162ca351ea5dfa47fe8bb37315a3`
 so the check does not need a clone. See
 [Release artifact integrity](../../docs/operations.md#release-artifact-integrity).
 The required check is the digest command above.
@@ -541,6 +548,45 @@ installs no handler: the signal ends it at once, as in 0.3.5.
 `report = false` in `DIR/config.toml` turns reports off for every session
 of that home. `praetore-mcp install` does not add `--no-report`.
 
+### Approval TTL
+
+A pending approval stays open 10 minutes by default. To change it for a
+home, add this line to `DIR/config.toml`:
+
+```toml
+approval_ttl_seconds = 1800
+```
+
+`wrap` reads and checks every source that is set, then uses the first
+one in this order:
+
+1. `PRAETORE_MCP_APPROVAL_TTL_SECONDS` in the environment of `wrap`;
+2. `approval_ttl_seconds` in `DIR/config.toml`;
+3. the integer in `DIR/approvals/ttl-seconds` (older setting, still read);
+4. 600 seconds.
+
+Use the config line when an MCP client starts `wrap`. Many clients pass
+only a few variables to the servers they start (the MCP Python SDK's
+`stdio_client` passes HOME, PATH and a few more), so an exported
+`PRAETORE_MCP_APPROVAL_TTL_SECONDS` may never reach `wrap`. The config
+file is read from the home, whatever the environment.
+
+`wrap` checks the TTL before it starts the server. A value outside 1 to
+86400 or not an integer in any of the three sources, a malformed or
+repeated `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` with a
+colon included), a `config.toml` that starts with a byte order mark, or a
+`config.toml` or `ttl-seconds` that cannot be read stops `wrap` with exit code 2 and the cause, naming
+the source, on stderr. That holds even when a source of higher priority
+is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
+`approval_ttl_seconds = 90000` still stops `wrap`:
+
+```
+praetore-mcp: approval TTL: config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000; wrap did not start
+```
+
+A bad value is never skipped in favour of another source. Other problems in `config.toml`
+(a bad `report` value, an unknown key) stay warnings.
+
 The report is a view of the journal: it signs nothing, changes no journal
 and takes no part in a decision. If it cannot be written, the reason goes
 to stderr and the session ends with the same exit code. It is
@@ -590,16 +636,17 @@ Read these before relying on anything above.
    arguments. It continues only if that
    code is typed back. `reject <id>` records a rejection and the call is not
    forwarded. The approval matches one server, one tool and the canonical
-   arguments, expires after 10 minutes unless
-   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or `approvals/ttl-seconds` says
-   otherwise (1 to 86400 seconds), and is consumed by one later call. A
+   arguments, expires after 10 minutes unless the approval TTL says
+   otherwise (1 to 86400 seconds, see "Approval TTL" below), and is
+   consumed by one later call, as long as the approval journal is not
+   edited; see [the evasion matrix](../../docs/security/evasion-matrix.md). A
    second identical call asks again. Different arguments do not match.
    A process that can act as this user can open a terminal and approve.
    That is not a guarantee that a person reviewed the call. The terminal
    check is cooperative. Deleting or truncating `approvals/journal.jsonl`
    lets an approval be used again. `verify` does not detect that deletion
-   or truncation unless you compare, by hand, the approval head it prints.
-   There is no flag for that head. The v0.3.3 `praetore-mcp verify` does
+   or truncation unless you check a saved approval head; the command is in
+   the README, Local approval. There is no flag for that head. The v0.3.3 `praetore-mcp verify` does
    not read 0.3.4 receipts. Observe mode
    does not hold the call; `praetore-mcp receipts` shows
    `enforce would ask` on that receipt.
