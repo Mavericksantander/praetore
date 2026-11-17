@@ -1608,6 +1608,41 @@ fn a_bad_approval_ttl_stops_wrap_at_startup() {
     assert!(stderr.contains("cannot read"), "{stderr}");
 }
 
+/// n2: an invalid `approvals/ttl-seconds` stops `wrap` even when a valid
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` would win. A home that kept a bad
+/// file next to the env var used to start; it no longer does (see the
+/// CHANGELOG).
+#[test]
+fn an_invalid_ttl_file_stops_wrap_even_with_a_valid_env_var() {
+    let (_temp, home) = init_home();
+    let file = home.root.join("approvals").join("ttl-seconds");
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let mut failed = Vec::new();
+    for (value, says) in [
+        (
+            "0\n",
+            "approvals/ttl-seconds must be from 1 to 86400 seconds, got 0",
+        ),
+        ("soon\n", "approvals/ttl-seconds \"soon\" is not an integer"),
+    ] {
+        fs::write(&file, value).unwrap();
+        let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "120")];
+        let out = wrap_filtered_env(&home, &session(echo(7, json!({"n": 1}))), &env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if out.status.code() != Some(2)
+            || !out.stdout.is_empty()
+            || !stderr.contains("wrap did not start")
+            || !stderr.contains(says)
+        {
+            failed.push(format!(
+                "ttl-seconds {value:?} with env 120: exit {:?}, stderr {stderr}",
+                out.status.code()
+            ));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Runs `wrap` with `config.toml` holding `text` and checks that it refused
 /// to start (exit 2, no server output) with a message naming `config.toml`
 /// and containing `says`.

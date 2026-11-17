@@ -15,6 +15,18 @@
   `config.toml` that cannot be read or starts with a byte order mark, stops it with exit code 2 and names the source, even when
   a source of higher priority is valid.
 
+### Breaking
+
+- **praetore-mcp: an invalid TTL source stops `wrap` even when another one
+  wins.** Before, only the source in use was read:
+  `PRAETORE_MCP_APPROVAL_TTL_SECONDS` hid a bad `approvals/ttl-seconds`
+  (`0`, `soon`, a value over 86400), and `wrap` started. Now every source
+  that is set is checked, so an existing home with such a file next to a
+  valid env var stops at startup with exit code 2 and
+  `approval TTL: approvals/ttl-seconds ...; wrap did not start`. The same
+  holds for a bad `approval_ttl_seconds` in `config.toml`. Action: fix or
+  delete the file the message names.
+
 ### Fixed
 
 - **praetore-mcp: error messages name the binary and the home.** The
