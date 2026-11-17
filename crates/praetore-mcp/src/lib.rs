@@ -12,6 +12,7 @@ pub mod fsutil;
 pub mod gate;
 pub mod install;
 pub mod journal;
+pub(crate) mod journal_io;
 pub mod json;
 pub mod policy;
 pub mod proxy;

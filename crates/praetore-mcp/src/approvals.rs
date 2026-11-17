@@ -4,6 +4,8 @@
 //! live under `DIR/approvals/pending/`. Signed decisions and the one
 //! execution that consumes an approval live in `DIR/approvals/journal.jsonl`,
 //! a hash-linked file that `verify` reads next to the receipts journal.
+//! Both journals append through `journal_io`: a short or failed write is
+//! truncated back to the previous length.
 //!
 //! The receipts journal itself is unchanged: a held call and the later
 //! retry are ordinary evidence lines. Putting decisions in that chain would
@@ -1437,33 +1439,8 @@ fn link_bytes(seq: u64, prev: &str, canonical: &[u8]) -> [u8; 32] {
 }
 
 fn append_line(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut options = fs::OpenOptions::new();
-    options.append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        options.custom_flags(crate::journal::nofollow_flag());
-    }
-    let (mut file, created) = match options.open(path) {
-        Ok(file) => (file, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
-            options
-                .create_new(true)
-                .open(path)
-                .map_err(|e| format!("cannot create {}: {e}", path.display()))?,
-            true,
-        ),
-        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
-    };
-    file.write_all(bytes)
-        .and_then(|()| file.sync_data())
-        .map_err(|e| format!("cannot append to {}: {e}", path.display()))?;
-    if created && let Some(dir) = path.parent() {
-        crate::fsutil::sync_dir(dir).map_err(|e| format!("cannot sync {}: {e}", dir.display()))?;
-    }
-    Ok(())
+    crate::journal_io::append_journal_file(path, bytes)
+        .map_err(|e| format!("cannot append to {}: {e}", path.display()))
 }
 
 fn write_private(path: &Path, contents: &str) -> Result<(), String> {
@@ -1501,4 +1478,87 @@ fn pending_path(home: &Home, approval_id: &str) -> PathBuf {
 
 fn journal_path(home: &Home) -> PathBuf {
     approvals_dir(home).join("journal.jsonl")
+}
+
+/// One signed decision, so `verify` has a real approval journal to keep.
+#[cfg(test)]
+pub(crate) fn seed_one_decision(home: &Home) -> PathBuf {
+    use crate::gate::{Evaluator, Gate, Mode};
+    use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+
+    let mut policy = store::default_policy();
+    policy.rules.push(
+        PolicyRule::new(
+            "approve-echo",
+            store::ACTION_TYPE,
+            PolicyEffect::RequireApproval,
+        )
+        .with_capability(store::CAPABILITY)
+        .with_parameter_condition(PolicyCondition::exact("tool", json!("echo"))),
+    );
+    fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+    let mut gate = Gate::load(home, Mode::Enforce).unwrap();
+    let verdict = Evaluator::evaluate(
+        &mut gate,
+        "fake",
+        &json!({"name": "echo", "arguments": {"n": 1}}),
+    )
+    .unwrap();
+    assert!(
+        verdict.journaled.is_ok(),
+        "receipt was not stored: {:?}",
+        verdict.journaled
+    );
+    assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+    let pending = list_pending(home).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    decide(home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap();
+    let path = journal_path(home);
+    assert!(fs::metadata(&path).unwrap().len() > 0);
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A writer that stores 180 bytes of a 401-byte line and then stops.
+    /// The approval file stays at its previous length and `verify` still passes.
+    #[test]
+    fn approval_journal_short_write_keeps_previous_length() {
+        fail_approval_append(
+            crate::journal_io::FaultMode::Short,
+            std::io::ErrorKind::StorageFull,
+        );
+    }
+
+    /// Same prefix, then `FileTooLarge` (EFBIG) after the file has grown.
+    #[test]
+    fn approval_journal_file_too_large_keeps_previous_length() {
+        fail_approval_append(
+            crate::journal_io::FaultMode::FileTooLarge,
+            std::io::ErrorKind::FileTooLarge,
+        );
+    }
+
+    fn fail_approval_append(mode: crate::journal_io::FaultMode, kind: std::io::ErrorKind) {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let path = seed_one_decision(&home);
+        let original = fs::read(&path).unwrap();
+        assert!(original.ends_with(b"\n"));
+        let report = crate::receipts::verify_journal(&home, None).unwrap();
+        assert!(
+            report.failures.is_empty(),
+            "seed verify: {:?}",
+            report.failures
+        );
+        let mut writer =
+            crate::journal_io::FaultyFile::open(&path, crate::journal_io::PROBE_ROOM, mode)
+                .unwrap();
+        let error =
+            crate::journal_io::commit_journal_line(&mut writer, &crate::journal_io::line_of_401())
+                .unwrap_err();
+        crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
+        assert_eq!(report.approval_decisions, 1, "{report:?}");
+    }
 }

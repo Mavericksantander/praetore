@@ -526,3 +526,83 @@ fn the_guard_finds_each_way_to_allow_the_lint() {
     assert!(flags_silence(&config_rustflags(config)));
     assert!(!flags_silence(&config_rustflags("[build]\njobs = 4\n")));
 }
+
+/// Journal lines are appended only by `journal_io`. Clippy's
+/// `disallowed-methods` cannot say "no `write_all` on a journal file": it
+/// matches a method path for the whole crate, and `write_all` is the right
+/// call for pending files, reports and the dashboard. This test is the
+/// check that fits. `journal_io` writes a line once; a retry of the tail is
+/// what leaves a cut JSON line when the disk fills.
+#[test]
+fn journal_append_does_not_call_write_all_outside_the_helper() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("src");
+    let helper_path = src.join("journal_io.rs");
+    let helper = fs::read_to_string(&helper_path).unwrap();
+    assert!(
+        !helper.contains("write_all("),
+        "journal_io must write each line once"
+    );
+    assert!(helper.contains("fn commit_journal_line"));
+    assert!(helper.contains("fn append_journal_file"));
+
+    let mut files = Vec::new();
+    rust_files(&src, &mut files);
+    let mut append_open = Vec::new();
+    for path in &files {
+        let text = fs::read_to_string(path).unwrap();
+        if text.contains(".append(true)") {
+            append_open.push(path.strip_prefix(&src).unwrap().display().to_string());
+        }
+    }
+    append_open.sort();
+    assert_eq!(
+        append_open,
+        vec!["journal_io.rs".to_string()],
+        "a journal opened for append outside journal_io"
+    );
+
+    let gate = fs::read_to_string(src.join("gate.rs")).unwrap();
+    let approvals = fs::read_to_string(src.join("approvals.rs")).unwrap();
+    assert!(
+        gate.contains("journal_io::append_journal_file"),
+        "receipts journal does not use the shared append"
+    );
+    assert!(
+        approvals.contains("journal_io::append_journal_file"),
+        "approval journal does not use the shared append"
+    );
+    assert!(
+        !gate.contains("write_all("),
+        "receipts journal calls write_all"
+    );
+
+    let write_all_lines: Vec<usize> = approvals
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains("write_all("))
+        .map(|(index, _)| index + 1)
+        .collect();
+    let private_at = approvals
+        .lines()
+        .position(|line| line.starts_with("fn write_private("))
+        .expect("write_private")
+        + 1;
+    let private_end = approvals
+        .lines()
+        .enumerate()
+        .skip(private_at)
+        .find(|(_, line)| line.starts_with("fn "))
+        .map(|(index, _)| index + 1)
+        .unwrap_or(usize::MAX);
+    assert!(
+        write_all_lines
+            .iter()
+            .all(|line| *line > private_at && *line < private_end),
+        "write_all in approvals.rs outside write_private (pending files, not the journal) at {write_all_lines:?}; write_private is {private_at}..{private_end}"
+    );
+    assert!(
+        !write_all_lines.is_empty(),
+        "write_private no longer writes its pending file; the allow-range in this test is stale"
+    );
+}
