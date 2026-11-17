@@ -1374,6 +1374,22 @@ fn the_config_ttl_holds_under_a_filtered_environment_and_the_env_wins() {
     let out = wrap_filtered_env(&home, &session(echo(10, json!({"n": 4}))), &[]);
     assert_eq!(held_window(&home, &out, 10), 1800, "{out:?}");
 
+    // m4: the config wins over approvals/ttl-seconds.
+    fs::create_dir_all(home.root.join("approvals")).unwrap();
+    fs::write(home.root.join("approvals").join("ttl-seconds"), "300\n").unwrap();
+    fs::write(
+        home.root.join("config.toml"),
+        "approval_ttl_seconds = 1800\n",
+    )
+    .unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(11, json!({"n": 5}))), &[]);
+    assert_eq!(
+        held_window(&home, &out, 11),
+        1800,
+        "config over ttl-seconds: {out:?}"
+    );
+    fs::remove_file(home.root.join("approvals").join("ttl-seconds")).unwrap();
+
     // Without the config line, the old file and then the default apply.
     fs::write(home.root.join("config.toml"), "report = true\n").unwrap();
     let out = wrap_filtered_env(&home, &session(echo(9, json!({"n": 3}))), &[]);
