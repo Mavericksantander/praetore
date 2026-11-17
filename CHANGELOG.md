@@ -4,6 +4,18 @@
 
 ### Added
 
+- **praetore-mcp: `install --client claude-code`** (alias `cc`). Wraps the
+  stdio servers of `~/.claude.json` (user scope) and `./.mcp.json`
+  (project scope): an entry with no `type` or `"type": "stdio"`, a
+  `command` and no `url`. Remote entries (`http`, `sse`, `ws`,
+  `streamable-http`, `sdk`, an unknown `type`, any `url`) are listed as
+  `not wrapped (remote server)`. Local-scope servers are not wrapped: each
+  is listed, a local entry that overrides a wrapped user entry is named,
+  and `install` ends with a WARNING. Only the `mcpServers` value is
+  rewritten. A file that changes while `install` runs is not written.
+  `install` without `--client` now also processes `~/.claude.json` when it
+  exists.
+
 - **praetore-mcp: `verify --expected-approval-head HEX`.** The approval
   journal must end at a head printed earlier, as `--expected-head` does
   for the receipts journal: records cut from the end, or the whole file

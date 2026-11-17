@@ -277,6 +277,7 @@ These codes are checked by `crates/praetore-mcp/tests/cli.rs`.
 | Claude Desktop | macOS `~/Library/Application Support/Claude/claude_desktop_config.json`; Windows `%APPDATA%\Claude\claude_desktop_config.json`; Linux `~/.config/Claude/claude_desktop_config.json` | `{"mcpServers": {name: {command, args, env}}}` |
 | Cursor | `~/.cursor/mcp.json`, and `.cursor/mcp.json` in the current directory | `{"mcpServers": {...}}`. Stdio entries may have `"type": "stdio"` and `envFile`; remote entries have `url` |
 | VS Code | user profile `mcp.json` (macOS `~/Library/Application Support/Code/User/mcp.json`, Windows `%APPDATA%\Code\User\mcp.json`, Linux `~/.config/Code/User/mcp.json`), and `.vscode/mcp.json` in the current directory | `{"servers": {...}, "inputs": [...]}`. Entries have `"type": "stdio" \| "http" \| "sse"` |
+| Claude Code (`--client claude-code`, alias `cc`) | `~/.claude.json` (user scope), and `.mcp.json` in the current directory (project scope) | `{"mcpServers": {...}}`. An entry with no `type` is stdio; remote entries have `"type": "http" \| "sse" \| "ws" \| "streamable-http"` and `url`. Local scope (`projects["<path>"].mcpServers` in `~/.claude.json`) is not wrapped; see below |
 
 Use `--client NAME --config FILE` to point at any other file in one of these
 formats. Remote entries (`url`, or `type` other than `stdio`) and entries that
@@ -301,6 +302,48 @@ and `verify` checked every receipt. Not checked: Windows, Linux, VS Code.
 A config file that two default paths resolve to (for example Cursor's
 `~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
 symlink) is processed once.
+
+### Claude Code
+
+`install --client claude-code` wraps an entry of `~/.claude.json` (user
+scope) or `./.mcp.json` (project scope) when it has no `type` or
+`"type": "stdio"`, a `command`, and no `url`. It keeps `type`, `env`,
+`${VAR}` references and the key order. Every other entry (`http`, `sse`,
+`ws`, `streamable-http`, `sdk`, an unknown `type`, or any `url`) is left as
+is and listed as `not wrapped (remote server)`.
+
+Local scope is NOT wrapped in this version. `claude mcp add` without
+`--scope` writes there (`projects["<path>"].mcpServers` in
+`~/.claude.json`). `install` lists each of those servers as
+`not wrapped (local scope, project <path>)` and ends with a WARNING on
+stderr. Claude Code gives local scope precedence over user scope, so a local
+entry with the name of a wrapped user entry is reported as
+`a local-scope entry named X overrides the wrapped user-scope X; that server
+is NOT governed`. To govern such a server, remove it
+(`claude mcp remove NAME --scope local`), add it again with `--scope user`
+or `--scope project`, and run `install` again.
+
+Only the `mcpServers` value is rewritten; every other byte of the file is
+kept, and `uninstall` puts the entries back byte for byte. A missing
+`mcpServers` key is added; a missing `~/.claude.json` is created (0600) only
+with an explicit `--client claude-code`. Claude Code rewrites
+`~/.claude.json` while it runs: if the file changes between the read and
+the write, nothing is written and `install` asks you to quit Claude Code
+and try again. `CLAUDE_CONFIG_DIR` is ignored (with a warning); where Claude
+Code keeps its servers when it is set was not checked.
+
+Checked on macOS (arm64) with Claude Code 2.1.325, in observe mode: a
+server added with `claude mcp add --scope user` in front of
+`@modelcontextprotocol/server-filesystem` launched with `npx`; after
+`install --client claude-code`, `claude mcp list` showed it running through
+`praetore-mcp wrap` and connected; a non-interactive `claude -p` session
+called `list_directory` and `read_text_file` through it; `receipts` listed
+both calls and `verify` exited 0. Claude Code rewrote `~/.claude.json`
+during that session and the entry stayed wrapped. `uninstall` restored the
+entry byte for byte and left the rest of the file unchanged. Not checked:
+an interactive session, enforce mode, whether Claude Code asks again to
+approve a wrapped `.mcp.json` server, a Claude Code already running while
+`install` writes, local scope beyond the listing, Windows and Linux.
 
 ## What a receipt is
 
