@@ -582,9 +582,17 @@ fn an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_veri
     let journal = approval_journal(&home);
     fs::set_permissions(&journal, fs::Permissions::from_mode(0o400)).unwrap();
     if fs::OpenOptions::new().append(true).open(&journal).is_ok() {
-        // Running as root: the mode does not stop the write.
+        // Running as root: the mode does not stop the write. The reason is
+        // written to the process stderr, not through `eprintln!`, which the
+        // test harness captures and hides for a test that passes.
         fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
-        eprintln!("skipped: a 0400 file is still writable by this user");
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify: \
+             a 0400 file is still writable by this user (running as root?), so the failed \
+             execution record cannot be simulated"
+        );
         return;
     }
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);

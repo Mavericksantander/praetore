@@ -704,7 +704,10 @@ pub fn decided_at_by_evidence(home: &Home) -> BTreeMap<String, String> {
 }
 
 /// Checks the approval journal: signatures, binding to the named receipts,
-/// expiry, and single use. Then the receipts that name an approval in their
+/// expiry, and one use per approval (an approval whose execution and
+/// forwarded receipt are both cut from the end of the journals can run
+/// again; only the saved heads, `--expected-head` and
+/// `--expected-approval-head`, detect it). Then the receipts that name an approval in their
 /// signed context: one receipt per approval, a signed approve decision for
 /// it, and its execution for that receipt. An absent journal is success
 /// when no receipt names an approval (homes from v0.3.3).
