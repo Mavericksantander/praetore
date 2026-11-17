@@ -113,6 +113,11 @@ fn session(calls: &[Value]) -> String {
 /// One enforce session through `wrap`; returns the server's stderr too,
 /// where `fake_server` logs `EXECUTED <tool>` for each forwarded call.
 fn wrap(home: &Home, calls: &[Value]) -> (Output, String) {
+    wrap_as(home, "fake", calls)
+}
+
+/// [`wrap`] with the server registered under `name` (`--name`).
+fn wrap_as(home: &Home, name: &str, calls: &[Value]) -> (Output, String) {
     let server = fake_server();
     let out = run(
         Path::new(bin()),
@@ -121,7 +126,7 @@ fn wrap(home: &Home, calls: &[Value]) -> (Output, String) {
             "--dir",
             home.root.to_str().unwrap(),
             "--name",
-            "fake",
+            name,
             "--mode",
             "enforce",
             "--no-report",
@@ -477,6 +482,49 @@ fn an_approval_does_not_cover_other_arguments() {
     }
     assert!(!other.exists());
     let (_, stderr) = wrap(&home, &[call(12, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+}
+
+/// (e) Bloqueado. The approval also binds the server name and the tool:
+/// the same arguments sent to the same tool under another `--name`, or to
+/// another held tool, are held and not run, and the approved call still
+/// passes once afterwards.
+#[test]
+fn an_approval_does_not_cover_another_server_or_another_held_tool() {
+    let (temp, home) = init_home();
+    write_policy(
+        &home,
+        vec![rule(
+            "approve-write-text",
+            "write_text",
+            PolicyEffect::RequireApproval,
+        )],
+    );
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+
+    // Same tool and arguments, server registered as `other`; the
+    // approve-append rule has no server condition, so it holds there too.
+    let (out, stderr) = wrap_as(&home, "other", &[call(11, "append", arguments.clone())]);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(executed(&stderr, "append"), 0, "other server: {stderr}");
+    assert!(
+        stderr.contains("other/append waiting for local approval"),
+        "{stderr}"
+    );
+
+    // Another held tool, same arguments.
+    let (_, stderr) = wrap(&home, &[call(12, "write_text", arguments.clone())]);
+    assert_eq!(executed(&stderr, "write_text"), 0, "other tool: {stderr}");
+    assert!(
+        stderr.contains("fake/write_text waiting for local approval"),
+        "{stderr}"
+    );
+    assert!(!target.exists(), "nothing was written");
+
+    // The approval is still unused: the approved call passes once.
+    let (_, stderr) = wrap(&home, &[call(13, "append", arguments)]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
 }
 

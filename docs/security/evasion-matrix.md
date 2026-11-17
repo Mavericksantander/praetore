@@ -24,7 +24,8 @@ The threat model behind these rows is in [../threat-model.md](../threat-model.md
 | c | Delete `approvals/journal.jsonl` after the approved call ran | limitación conocida | `deleting_the_approval_journal_holds_the_call_and_verify_still_passes` | `verify` requiring, for each receipt forwarded on an approval, the signed decision it names |
 | c, d | Drop the execution record at the end of `approvals/journal.jsonl` so the same approval runs again | limitación conocida | `truncating_the_approval_journal_lets_a_used_approval_run_again` | The approval head kept outside the home, or the execution bound into the receipts chain so `verify` sees two executions of one approval |
 | d | Send the approved call twice | bloqueado | `an_approval_is_used_once` | Already blocked |
-| e | Change the server, tool or arguments after approval | bloqueado | `an_approval_does_not_cover_other_arguments` | Already blocked |
+| e | Change the arguments after approval | bloqueado | `an_approval_does_not_cover_other_arguments` | Already blocked |
+| e | Same tool and arguments under another `--name`, or another held tool with the same arguments | bloqueado | `an_approval_does_not_cover_another_server_or_another_held_tool` | Already blocked |
 | f | Use another allowed tool with the same effect | limitación conocida | `another_allowed_tool_with_the_same_effect_is_forwarded` | Rules over the effect (paths, resources) for every tool of the server; `policy coverage` shows which tools a rule leaves open |
 
 ## Details
@@ -39,7 +40,7 @@ The threat model behind these rows is in [../threat-model.md](../threat-model.md
 
 **d. Reuse.** An approval is used by one call. The same call again is held. This holds only while the execution record stays in the approval journal (see c).
 
-**e. Other arguments.** An approval binds the server, the tool and the canonical arguments. A different path, a different text or an extra argument is held.
+**e. Other arguments, server or tool.** An approval binds the server name, the tool and the canonical arguments. A different path, a different text or an extra argument is held. So is the same call under another `--name`, even when one rule holds the tool for every server, and so is another held tool with the same arguments.
 
 **f. Same effect, other tool.** Rules match the tool name and arguments. They do not match what a tool does. If one tool is held and another tool with the same effect is allowed, the second one runs. The receipt records the rule that allowed it.
 
@@ -51,4 +52,6 @@ The defences above were checked by removing each one and running `tests/evasion.
 |---|---|
 | Approval used once (`first_unused_approval` ignores execution records) | `an_approval_is_used_once` |
 | Approval binding (`first_unused_approval` ignores the binding) | `an_approval_does_not_cover_other_arguments` |
+| Server in the binding (`first_unused_approval` compares only tool and arguments) | `an_approval_does_not_cover_another_server_or_another_held_tool` |
+| Tool in the binding (`first_unused_approval` compares only server and arguments) | `an_approval_does_not_cover_another_server_or_another_held_tool` |
 | Chain order in `verify` (the seq/prev problem dropped) | `a_receipt_removed_from_the_middle_fails_verify` |
