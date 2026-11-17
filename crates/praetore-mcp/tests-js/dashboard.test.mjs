@@ -218,7 +218,7 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
   vm.runInContext(`${source}
 ;globalThis.__page = {
   get state() { return state; },
-  hud, chain, load,
+  hud, chain, load, shown,
 };`, context, { filename: "app.js" });
   const p = context.__page;
   let requested = 0;
@@ -265,6 +265,9 @@ function page({ reduced = false, hash = "#/live", now = Date.parse("2026-01-01T0
     text(id) { return getElementById(id).textContent; },
     table() { return tbody.textContent; },
     tbody,
+    shown: (text) => p.shown(text),
+    // Runs `code` in the page's context (before start, to stand in for a browser).
+    run: (code) => vm.runInContext(code, context),
   };
 }
 
@@ -878,4 +881,37 @@ test("paths and names with control characters are shown escaped in the page and 
   const cut = await controlCharsShown("cut");
   // The verify reason of the cut receipt is wrapped over several lines.
   assert.ok(cut.drawnText.some((t) => t.includes("fake\\u{9b}")), cut.drawnText.join("\n"));
+});
+
+// m1: shown() escapes exactly the code points praetore_core does
+// (fixtures/invisible-ranges.json, held equal to
+// praetore_core::display::is_invisible by tests/control_chars.rs).
+test("shown() escapes exactly the code points of praetore_core", () => {
+  const { ranges } = fixture("invisible-ranges");
+  const p = page();
+  const differ = [];
+  let k = 0;
+  for (let cp = 0; cp <= 0x10ffff; cp += 1) {
+    if (cp >= 0xd800 && cp <= 0xdfff) continue;
+    while (k < ranges.length && ranges[k][1] < cp) k += 1;
+    const core = k < ranges.length && ranges[k][0] <= cp;
+    const page_ = p.shown(String.fromCodePoint(cp)) !== String.fromCodePoint(cp);
+    if (core !== page_) differ.push(cp.toString(16).toUpperCase().padStart(4, "0"));
+  }
+  assert.deepEqual(differ, [], `${differ.length} code points differ: U+${differ.join(" U+")}`);
+});
+
+// m1: Intl can write U+00A0 or U+202F inside dates and times (browsers do
+// in "12:30 PM"). Those are invisible for praetore_core, so the page turns
+// them into plain spaces before shown(): its own dates never show \u{..}.
+test("dates the page formats with Intl never show escaped spaces", async () => {
+  const p = page({ now: pendingNow() });
+  p.run(`{
+    const real = Date.prototype.toLocaleString;
+    Date.prototype.toLocaleString = function (...a) { return real.apply(this, a).replace(/ /g, "\u202f").replace(",", ",\u00a0"); };
+  }`);
+  await p.start(fixture("pending"));
+  const card = p.text("live-rest");
+  assert.ok(/\d\d:\d\d/.test(card), card);
+  assert.ok(!card.includes("\\u{202f}") && !card.includes("\\u{a0}"), card);
 });

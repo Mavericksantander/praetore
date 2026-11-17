@@ -311,3 +311,47 @@ fn the_guard_sees_code_after_a_double_slash_in_a_string() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0].0, 2);
 }
+
+/// The code points `praetore_core::display::is_invisible` escapes, as
+/// inclusive `[first, last]` ranges.
+fn invisible_ranges() -> Vec<[u32; 2]> {
+    let mut ranges: Vec<[u32; 2]> = Vec::new();
+    for c in (0..=0x10FFFFu32).filter_map(char::from_u32) {
+        if !praetore_core::display::is_invisible(c) {
+            continue;
+        }
+        let cp = c as u32;
+        match ranges.last_mut() {
+            Some(last) if last[1] + 1 == cp => last[1] = cp,
+            _ => ranges.push([cp, cp]),
+        }
+    }
+    ranges
+}
+
+/// m1: the dashboard escapes with the rule of praetore_core, not a copy
+/// kept by hand. This test holds tests-js/fixtures/invisible-ranges.json
+/// equal to `is_invisible` over every code point; the JS test "shown()
+/// escapes exactly the code points of praetore_core" holds `shown()` in
+/// app.js equal to that file. Rewrite it with PRAETORE_WRITE_FIXTURES=1.
+#[test]
+fn the_dashboard_fixture_holds_the_invisible_ranges_of_praetore_core() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests-js/fixtures/invisible-ranges.json");
+    let expected = format!(
+        "{}\n",
+        json!({
+            "source": "praetore_core::display::is_invisible",
+            "ranges": invisible_ranges(),
+        })
+    );
+    if std::env::var_os("PRAETORE_WRITE_FIXTURES").is_some() {
+        fs::write(&path, &expected).unwrap();
+    }
+    let written = fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        written == expected,
+        "{} differs from praetore_core::display::is_invisible; run this test with PRAETORE_WRITE_FIXTURES=1 and update shown() in src/dashboard/app.js",
+        path.display()
+    );
+}
