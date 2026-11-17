@@ -329,13 +329,23 @@ commands; holding the same call again removes the file.
 forwarded. A pending call expires after 10 minutes by default. The
 terminal check is cooperative: a process that can act as this user can
 open a terminal and approve. It is not a guarantee that a person reviewed
-the call. Deleting or truncating `approvals/journal.jsonl` lets an
-approval be used again. A DENY rule on the same tool wins: the call is
+the call. Cutting or deleting `approvals/journal.jsonl` alone does not
+let a used approval run again; cutting the end of the receipts journal as
+well does, and only a saved head finds it (point 3 below). A DENY rule on the same tool wins: the call is
 refused and approval is not asked. Limits of that flow are in point 3
 below. The evidence id in the chat matches the `EVIDENCE ID`
 column. To undo:
 `praetore-mcp uninstall --client cursor --yes`, or restore the
 `.praetore-backup-*` file next to the config, then restart the client.
+
+If `wrap` writes the receipt of an approved call and then cannot write
+its execution record (a crash, a full disk, `approvals/journal.jsonl` not
+writable), the call is not forwarded. From then on `verify` reports that
+receipt, every time, with `has no execution of it for that receipt` and
+exit code 1. The approval is spent: the same call is held again under a
+new pending id. Fix the disk or the file mode, ask for the call again,
+and approve the new id. The old failure stays in `verify`; write down why
+it happened next to the heads you keep.
 
 ### Looking at the receipts in a browser
 
@@ -418,7 +428,7 @@ The verification status, per receipt and for the whole journal, comes from
 the same code as `praetore-mcp verify` and is also shown in the sidebar. It
 covers the receipts only. It includes the journal order (seq/prev) and the
 journal head. Keep the head outside this machine. `--expected-head HEX`
-works as it does for `verify`. The result is kept in memory and computed
+and `--expected-approval-head HEX` work as they do for `verify`. The result is kept in memory and computed
 again when any file `verify` reads (the journal files, the attester and
 issuer pins, the approver pin, the approval journal) changes length,
 modification time, change time or inode. On a platform without change times
@@ -638,15 +648,18 @@ Read these before relying on anything above.
    forwarded. The approval matches one server, one tool and the canonical
    arguments, expires after 10 minutes unless the approval TTL says
    otherwise (1 to 86400 seconds, see "Approval TTL" below), and is
-   consumed by one later call, as long as the approval journal is not
-   edited; see [the evasion matrix](../../docs/security/evasion-matrix.md). A
+   consumed by one later call; see
+   [the evasion matrix](../../docs/security/evasion-matrix.md). A
    second identical call asks again. Different arguments do not match.
    A process that can act as this user can open a terminal and approve.
    That is not a guarantee that a person reviewed the call. The terminal
-   check is cooperative. Deleting or truncating `approvals/journal.jsonl`
-   lets an approval be used again. `verify` does not detect that deletion
-   or truncation unless you check a saved approval head; the command is in
-   the README, Local approval. There is no flag for that head. The v0.3.3 `praetore-mcp verify` does
+   check is cooperative. The forwarded call's receipt names the approval
+   id, so cutting or deleting `approvals/journal.jsonl` alone does not let
+   a used approval run again, and `verify` fails on that receipt. Cutting
+   the end of the receipts journal as well lets it run again; `verify`
+   detects that only with `--expected-head HEX` or
+   `--expected-approval-head HEX`, a head printed earlier and kept off this
+   machine; the command is in the README, Local approval. The v0.3.3 `praetore-mcp verify` does
    not read 0.3.4 receipts. Observe mode
    does not hold the call; `praetore-mcp receipts` shows
    `enforce would ask` on that receipt.

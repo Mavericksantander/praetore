@@ -178,6 +178,7 @@ const I18N = {
     head_none: (c, u) => `Sin head (${c} encadenadas, ${u} sin encadenar)`,
     head_warn: "Guarda este head fuera de esta máquina y pásalo como --expected-head: sin él no se detectan entradas borradas al final del journal.",
     expected_head: (h) => `Comparado con --expected-head ${h}.`,
+    expected_approval_head: (h) => `Comparado con --expected-approval-head ${h}.`,
     failures: "Fallas reportadas por verify",
     appr_journal: "Journal de aprobaciones",
     appr_text: (d, e) => `${d} decisiones, ${e} ejecuciones`, appr_none: "Todavía no hay decisiones de aprobación.",
@@ -189,7 +190,7 @@ const I18N = {
       `Firma de la autoridad contra ${i} a la hora de la decisión`,
       "Vínculo de praetore.mode",
       "Orden del journal (seq y enlace hash)",
-      "Journal de aprobaciones: firma del aprobador, vínculo con la llamada retenida, vencimiento, uso único",
+      "Journal de aprobaciones: firma del aprobador, vínculo con la llamada retenida, vencimiento, un uso por aprobación (una aprobación cuya ejecución y cuyo recibo reenviado se recortan ambos del final de los journals puede volver a correr; pasa los dos heads guardados para detectarlo)",
     ],
     observe_note: "Un recibo observe registra una decisión que NO se aplicó.",
     verify_error: "verify no pudo correr",
@@ -347,6 +348,7 @@ const I18N = {
     head_none: (c, u) => `No head (${c} chained, ${u} unchained)`,
     head_warn: "Keep this head outside this machine and pass it as --expected-head: without it, entries removed at the end of the journal are not detected.",
     expected_head: (h) => `Compared with --expected-head ${h}.`,
+    expected_approval_head: (h) => `Compared with --expected-approval-head ${h}.`,
     failures: "Failures reported by verify",
     appr_journal: "Approval journal",
     appr_text: (d, e) => `${d} decision(s), ${e} execution(s)`, appr_none: "No approval decisions yet.",
@@ -358,7 +360,7 @@ const I18N = {
       `Authority signature against ${i} at decision time`,
       "praetore.mode binding",
       "Journal order (seq and hash link)",
-      "Approval journal: approver signature, binding to the held call, expiry, single use",
+      "Approval journal: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it)",
     ],
     observe_note: "An observe receipt records a decision that was NOT enforced.",
     verify_error: "verify could not run",
@@ -516,6 +518,7 @@ const I18N = {
     head_none: (c, u) => `Sem head (${c} encadeadas, ${u} não encadeadas)`,
     head_warn: "Guarde este head fora desta máquina e passe-o como --expected-head: sem ele, entradas apagadas no fim do journal não são detectadas.",
     expected_head: (h) => `Comparado com --expected-head ${h}.`,
+    expected_approval_head: (h) => `Comparado com --expected-approval-head ${h}.`,
     failures: "Falhas reportadas pelo verify",
     appr_journal: "Journal de aprovações",
     appr_text: (d, e) => `${d} decisões, ${e} execuções`, appr_none: "Ainda não há decisões de aprovação.",
@@ -527,7 +530,7 @@ const I18N = {
       `Assinatura da autoridade contra ${i} na hora da decisão`,
       "Vínculo de praetore.mode",
       "Ordem do journal (seq e link hash)",
-      "Journal de aprovações: assinatura do aprovador, vínculo com a chamada retida, expiração, uso único",
+      "Journal de aprovações: assinatura do aprovador, vínculo com a chamada retida, expiração, um uso por aprovação (uma aprovação cuja execução e cujo recibo reencaminhado são ambos cortados do fim dos journals pode rodar de novo; passe os dois heads guardados para detectar)",
     ],
     observe_note: "Um recibo observe registra uma decisão que NÃO foi aplicada.",
     verify_error: "o verify não pôde rodar",
@@ -2154,6 +2157,7 @@ function renderIntegrity() {
   } else {
     appr.append(el("p", { class: "card-sub" }, t("appr_none")));
   }
+  if (v.approval.expected_head) appr.append(el("p", { class: "mono" }, t("expected_approval_head", v.approval.expected_head)));
   root.append(appr);
 
   root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("home_dir")),

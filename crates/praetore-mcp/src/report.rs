@@ -150,6 +150,29 @@ pub struct Heads {
 }
 
 impl Heads {
+    /// The `verify` command that checks both journals still end at these
+    /// heads, one argument group per line, to be run as one line. `DIR`
+    /// stands for the home, which reports never print.
+    pub fn verify_command_lines(&self) -> Vec<String> {
+        let mut lines = vec!["praetore-mcp verify --dir DIR".to_owned()];
+        if let Some((_, head)) = &self.receipt {
+            lines.push(format!("  --expected-head {head}"));
+        }
+        if let Some(head) = &self.approval {
+            lines.push(format!("  --expected-approval-head {head}"));
+        }
+        lines
+    }
+
+    /// [`Heads::verify_command_lines`] on one line.
+    pub fn verify_command(&self) -> String {
+        self.verify_command_lines()
+            .iter()
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     fn of(report: &VerifyReport) -> Self {
         Self {
             receipt: report.head.map(|head| (head.seq, head.prev.to_string())),
@@ -555,6 +578,7 @@ fn header_json(report: &Report) -> Value {
         },
         "receipt_journal_head": close_receipt,
         "approval_journal_head": close_approval,
+        "verify_command": report.close_heads.verify_command(),
         "verify": {
             "result": if report.verify.passed { "passed" } else { "failed" },
             "checked_at": rfc3339(report.verify.checked_at),

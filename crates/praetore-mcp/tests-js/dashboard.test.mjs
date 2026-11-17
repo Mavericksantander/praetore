@@ -915,3 +915,25 @@ test("dates the page formats with Intl never show escaped spaces", async () => {
   assert.ok(/\d\d:\d\d/.test(card), card);
   assert.ok(!card.includes("\\u{202f}") && !card.includes("\\u{a0}"), card);
 });
+
+// B1: the checks list does not promise one use without the condition it
+// needs: both journals cut at the end let an approval run again, and only
+// the saved heads show it. Same text in Spanish, English and Portuguese.
+test("the integrity checks list says when one use per approval does not hold", async () => {
+  const p = page({ hash: "#/info/integrity" });
+  await p.start(fixture("healthy"));
+  for (const [code, words] of [
+    ["es", ["un uso por aprobación", "se recortan ambos del final de los journals", "pasa los dos heads guardados"]],
+    ["en", ["one use per approval", "are both cut from the end of the journals can run again", "pass both saved heads to detect it"]],
+    ["pt", ["um uso por aprovação", "são ambos cortados do fim dos journals", "passe os dois heads guardados"]],
+  ]) {
+    if (code !== "es") {
+      const select = p.byId.get("lang");
+      select.value = code;
+      select.listeners.get("change")[0]();
+    }
+    const text = p.text("info-integrity");
+    for (const w of words) assert.ok(text.includes(w), `${code}: ${w}\n${text}`);
+    assert.ok(!/single use|uso único/.test(text), `${code}: ${text}`);
+  }
+});

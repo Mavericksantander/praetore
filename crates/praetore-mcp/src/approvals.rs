@@ -35,6 +35,7 @@ const MAX_TTL_SECONDS: i64 = 86_400;
 /// One approval record stays small enough to append in one write.
 const MAX_RECORD_BYTES: usize = 48 * 1024;
 const MODE_KEY: &str = "praetore.mode";
+const APPROVAL_KEY: &str = crate::gate::APPROVAL_CONTEXT_KEY;
 
 const DECISION_KEYS: &[&str] = &[
     "approval_id",
@@ -87,12 +88,32 @@ struct Binding {
 }
 
 /// What enforce does with a `REQUIRE_APPROVAL` verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum HoldOrForward {
-    /// The call was not forwarded. `message` is the MCP tool error text.
-    Hold { message: String },
+    /// The call was not forwarded. The held receipt is in the journal at
+    /// `journaled`; `message` is the MCP tool error text.
+    Hold { journaled: PathBuf, message: String },
     /// One unused approval matched this exact call and was consumed.
-    Forward { approval_id: String },
+    /// `evidence` is the receipt that names `approval_id` in its signed
+    /// context, journaled at `journaled`; the held receipt was not written.
+    Forward {
+        approval_id: String,
+        evidence: Box<Evidence>,
+        journaled: PathBuf,
+    },
+    /// The call was not forwarded. `evidence` is the receipt written for it
+    /// (or that could not be written: `journaled` is the error).
+    Failed {
+        evidence: Box<Evidence>,
+        journaled: Result<PathBuf, String>,
+        error: String,
+    },
+}
+
+/// The receipt written for a call on the approval path, and where.
+struct Written {
+    evidence: Evidence,
+    journaled: Result<PathBuf, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,49 +189,153 @@ struct JournalEntry {
     canonical: Vec<u8>,
 }
 
-/// Enforce path: do not forward. Either consume one matching approval or
-/// register (or reuse) a pending id the person can approve from a terminal.
+/// Enforce path for a `REQUIRE_APPROVAL` receipt `held`, not journaled yet.
+///
+/// Under the approval lock: if an approval of this exact call is unused, the
+/// call is signed again with the approval id in its context
+/// (`sign_forward`), that receipt is journaled (`journal`), then the
+/// execution is recorded, and the call may be forwarded once. An approval is
+/// used when the approval journal has its execution or when a receipt in the
+/// receipts journal names it, so cutting the approval journal alone does not
+/// free it. Otherwise `held` is journaled and a pending id is registered (or
+/// reused) for the person to approve from a terminal.
 pub fn on_require_approval(
     home: &Home,
     server: &str,
     params: &Value,
-    evidence: &Evidence,
+    held: &Evidence,
+    sign_forward: &dyn Fn(&str) -> Result<Evidence, String>,
+    journal: &dyn Fn(&Evidence) -> Result<PathBuf, String>,
+) -> HoldOrForward {
+    let mut written = None;
+    match hold_or_forward(
+        home,
+        server,
+        params,
+        held,
+        sign_forward,
+        journal,
+        &mut written,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let written = written.unwrap_or_else(|| Written {
+                evidence: held.clone(),
+                journaled: journal(held),
+            });
+            HoldOrForward::Failed {
+                evidence: Box::new(written.evidence),
+                journaled: written.journaled,
+                error,
+            }
+        }
+    }
+}
+
+fn hold_or_forward(
+    home: &Home,
+    server: &str,
+    params: &Value,
+    held: &Evidence,
+    sign_forward: &dyn Fn(&str) -> Result<Evidence, String>,
+    journal: &dyn Fn(&Evidence) -> Result<PathBuf, String>,
+    written: &mut Option<Written>,
 ) -> Result<HoldOrForward, String> {
     let binding = binding_from_call(server, params)?;
-    if evidence.decision.outcome != DecisionOutcome::RequireApproval {
+    if held.decision.outcome != DecisionOutcome::RequireApproval {
         return Err("approval handling called for a call that is not REQUIRE_APPROVAL".into());
     }
-    binding_matches_evidence(&binding, evidence)?;
-    with_lock(home, |journal| {
-        let entries = read_journal(home, journal)?;
+    binding_matches_evidence(&binding, held)?;
+    with_lock(home, |journal_path| {
+        let entries = read_journal(home, journal_path)?;
         let now = now_utc()?;
-        if let Some(approval_id) = first_unused_approval(home, &entries, &binding, now)? {
+        let named = approvals_named_in_receipts(home)?;
+        if let Some(approval_id) = first_unused_approval(home, &entries, &binding, &named, now)? {
+            let evidence = sign_forward(&approval_id)?;
+            if evidence.decision.outcome != DecisionOutcome::RequireApproval {
+                return Err("the call signed with its approval is not REQUIRE_APPROVAL".into());
+            }
+            binding_matches_evidence(&binding, &evidence)?;
+            if approval_named(&evidence)? != Some(approval_id.as_str()) {
+                return Err("the call signed with its approval does not name it".into());
+            }
+            let journaled = journal(&evidence);
+            *written = Some(Written {
+                evidence: evidence.clone(),
+                journaled: journaled.clone(),
+            });
+            let path = journaled?;
             append_execution(
                 home,
-                journal,
+                journal_path,
                 &entries,
                 &approval_id,
                 &binding,
                 &evidence.evidence_id.to_string(),
                 now,
             )?;
-            return Ok(HoldOrForward::Forward { approval_id });
+            return Ok(HoldOrForward::Forward {
+                approval_id,
+                evidence: Box::new(evidence),
+                journaled: path,
+            });
         }
+        let journaled = journal(held);
+        *written = Some(Written {
+            evidence: held.clone(),
+            journaled: journaled.clone(),
+        });
+        let path = journaled?;
         let pending = reuse_or_create_pending(
             home,
             &entries,
             &binding,
-            &evidence.evidence_id.to_string(),
+            &held.evidence_id.to_string(),
             now,
             approval_ttl(home)?,
         )?;
         Ok(HoldOrForward::Hold {
+            journaled: path,
             message: hold_message(home, &pending),
         })
     })
 }
 
-/// Pending approvals, soonest expiry first.
+/// The approval id a receipt names in its signed context, if any. A value
+/// that is not 64 lowercase hex characters is an error.
+pub fn approval_named(evidence: &Evidence) -> Result<Option<&str>, String> {
+    match evidence.context.get(APPROVAL_KEY) {
+        None => Ok(None),
+        Some(value) => match value.as_str() {
+            Some(id) if valid_id(id) => Ok(Some(id)),
+            _ => Err(format!("{APPROVAL_KEY} is not 64 lowercase hex characters")),
+        },
+    }
+}
+
+/// Approval ids named by receipts in the receipts journal. Only lines that
+/// contain the context key are parsed; one that cannot be read is an error,
+/// so the call is not forwarded.
+fn approvals_named_in_receipts(home: &Home) -> Result<BTreeSet<String>, String> {
+    let mut named = BTreeSet::new();
+    for line in crate::receipts::read_journal(home)? {
+        if !line.text.contains(APPROVAL_KEY) {
+            continue;
+        }
+        let entry = crate::journal::parse_line(&line.text).map_err(|e| {
+            format!(
+                "cannot read {}:{} to check which approvals were used: {e}",
+                line.file.shown(),
+                line.line_number
+            )
+        })?;
+        if let Some(id) = approval_named(&entry.evidence)? {
+            named.insert(id.to_owned());
+        }
+    }
+    Ok(named)
+}
+
 pub fn list_pending(home: &Home) -> Result<Vec<PendingInfo>, String> {
     let mut listed = Vec::new();
     let dir = pending_dir(home);
@@ -579,11 +704,16 @@ pub fn decided_at_by_evidence(home: &Home) -> BTreeMap<String, String> {
 }
 
 /// Checks the approval journal: signatures, binding to the named receipts,
-/// expiry, and single use. An absent journal is success (homes from v0.3.3).
+/// expiry, and single use. Then the receipts that name an approval in their
+/// signed context: one receipt per approval, a signed approve decision for
+/// it, and its execution for that receipt. An absent journal is success
+/// when no receipt names an approval (homes from v0.3.3).
 pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, String> {
     let path = journal_path(home);
     if !path.exists() {
-        return Ok(ApprovalReport::default());
+        let mut report = ApprovalReport::default();
+        check_named_approvals(&[], evidence, &mut report.failures);
+        return Ok(report);
     }
     let entries = read_journal_unlocked(home)?;
     let mut report = ApprovalReport::default();
@@ -677,10 +807,73 @@ pub fn verify(home: &Home, evidence: &[Evidence]) -> Result<ApprovalReport, Stri
             ));
         }
     }
+    check_named_approvals(&entries, evidence, &mut report.failures);
     if !entries.is_empty() {
         report.head = Some(head);
     }
     Ok(report)
+}
+
+/// Receipts that name an approval id in their signed context. Old receipts
+/// (v0.3.6 and before) name none and are not checked here.
+fn check_named_approvals(
+    entries: &[JournalEntry],
+    evidence: &[Evidence],
+    failures: &mut Vec<String>,
+) {
+    let mut named: BTreeMap<&str, Vec<&Evidence>> = BTreeMap::new();
+    for receipt in evidence {
+        match approval_named(receipt) {
+            Ok(Some(id)) => named.entry(id).or_default().push(receipt),
+            Ok(None) => {}
+            Err(error) => failures.push(format!(
+                "FAIL approvals: receipt {}: {error}",
+                receipt.evidence_id
+            )),
+        }
+    }
+    for (approval_id, receipts) in &named {
+        if receipts.len() > 1 {
+            failures.push(format!(
+                "FAIL approvals: {} forwarded receipts name approval {approval_id}, and an approval authorizes one call",
+                receipts.len()
+            ));
+        }
+        let decision = entries.iter().find(|entry| {
+            entry.record["kind"] == "decision" && entry.record["approval_id"] == *approval_id
+        });
+        match decision {
+            None => {
+                for receipt in receipts {
+                    failures.push(format!(
+                        "FAIL approvals: receipt {} names approval {approval_id}, which has no signed decision in the approval journal",
+                        receipt.evidence_id
+                    ));
+                }
+                continue;
+            }
+            Some(decision) if decision.record["outcome"] != "approve" => {
+                failures.push(format!(
+                    "FAIL approvals: a forwarded receipt names approval {approval_id}, which was rejected"
+                ));
+                continue;
+            }
+            Some(_) => {}
+        }
+        for receipt in receipts {
+            let evidence_id = receipt.evidence_id.to_string();
+            let executed = entries.iter().any(|entry| {
+                entry.record["kind"] == "execution"
+                    && entry.record["approval_id"] == *approval_id
+                    && entry.record["evidence_id"] == evidence_id.as_str()
+            });
+            if !executed {
+                failures.push(format!(
+                    "FAIL approvals: receipt {evidence_id} names approval {approval_id} and the approval journal has no execution of it for that receipt"
+                ));
+            }
+        }
+    }
 }
 
 fn verify_decision(
@@ -780,17 +973,22 @@ fn execution_within_window(
     Ok(())
 }
 
+/// The first approval of `binding` that is signed, not expired and not used:
+/// no execution in the approval journal and not in `named`, the ids that
+/// receipts in the receipts journal name.
 fn first_unused_approval(
     home: &Home,
     entries: &[JournalEntry],
     binding: &Binding,
+    named: &BTreeSet<String>,
     now: OffsetDateTime,
 ) -> Result<Option<String>, String> {
-    let used: BTreeSet<&str> = entries
+    let mut used: BTreeSet<&str> = entries
         .iter()
         .filter(|entry| entry.record["kind"] == "execution")
         .filter_map(|entry| entry.record["approval_id"].as_str())
         .collect();
+    used.extend(named.iter().map(String::as_str));
     let approver = read_approver_pin(home).ok();
     for entry in entries {
         if entry.record["kind"] != "decision" || entry.record["outcome"] != "approve" {

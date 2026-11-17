@@ -4,6 +4,30 @@
 
 ### Added
 
+- **praetore-mcp: `verify --expected-approval-head HEX`.** The approval
+  journal must end at a head printed earlier, as `--expected-head` does
+  for the receipts journal: records cut from the end, or the whole file
+  deleted, fail `verify`. `dashboard` takes the same flag, and the session
+  report prints `praetore-mcp verify --dir DIR --expected-head ...
+  --expected-approval-head ...` with both heads at close (JSON
+  `verify_command`, and the last section of the PDF). The README check of
+  a saved approval head uses the flag. The `approval journal: ... head HEX`
+  line now ends with where to keep the head and which flag takes it, and
+  the approval checks (in `verify` and in the dashboard) say "one use per
+  approval" with the case where it does not hold instead of "single use".
+
+- **praetore-mcp: the receipt of a call forwarded on an approval names it.**
+  The receipt carries `context["praetore.approval_id"]`, signed with the
+  intent. Before forwarding, `wrap` treats an approval as used when the
+  approval journal has its execution or a receipt in the receipts journal
+  names it, so cutting the approval journal alone no longer frees a used
+  approval. `verify` fails when two receipts name one approval, when a
+  receipt names an approval with no signed decision or a rejected one, or
+  when the approval journal has no execution of it for that receipt.
+  Receipts without the key (v0.3.6 and before) verify as before, with
+  `praetore-mcp verify` and with `praetore-verify`; tests pin a home
+  written by 0.3.6 and one written with the key.
+
 - **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
   in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
   open, even when the MCP client starts `wrap` with a filtered environment.

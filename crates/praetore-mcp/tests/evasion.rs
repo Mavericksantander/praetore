@@ -427,22 +427,27 @@ fn dropping_the_last_receipts_or_the_journal_fails_only_verify_with_the_expected
     assert!(!out.status.success(), "deleted: {}", stdout(&out));
 }
 
-/// (c) and (d) Limitación conocida. Dropping the execution record from the
-/// end of `approvals/journal.jsonl` makes a used approval unused again: the
-/// same call is forwarded a second time and `verify` passes. The receipts
-/// do not show it: the held call and each forwarded call all record
-/// REQUIRE_APPROVAL and none carries the approval id, and `--expected-head`
-/// covers only the receipts journal. Closing it needs a head for the
-/// approval journal kept outside the home, or the execution bound into the
-/// receipts chain so `verify` sees two executions of one approval.
+/// The approval id the receipt `receipt` (a journal line) names in its
+/// signed context, if any.
+fn named_approval(receipt: &Value) -> Option<&str> {
+    receipt["evidence"]["context"]["praetore.approval_id"].as_str()
+}
+
+/// (c) and (d) Bloqueado and detectado. Dropping the execution record from
+/// the end of `approvals/journal.jsonl` does not make a used approval unused
+/// again. The forwarded call's receipt names the approval id in its signed
+/// context, and `wrap` treats an approval named in the receipts journal as
+/// used, so the same call is held. `verify` fails too: the receipt names an
+/// approval that has no execution for it.
 #[test]
-fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
+fn truncating_the_approval_journal_holds_a_used_approval_and_fails_verify() {
     let (temp, home) = init_home();
     let target = temp.path().join("target.txt");
     let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
     hold_and_approve(&home, &arguments);
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    assert!(verify(&home).status.success());
 
     let journal = approval_journal(&home);
     let text = fs::read_to_string(&journal).unwrap();
@@ -452,30 +457,311 @@ fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
     fs::write(&journal, format!("{}\n", lines[0])).unwrap();
 
     let (_, stderr) = wrap(&home, &[call(12, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 0, "held: {stderr}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a");
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("the approval journal has no execution of it for that receipt"),
+        "{}",
+        stdout(&out)
+    );
+
+    // The forwarded receipt names the approval; the two held ones do not.
+    let decision: Value = serde_json::from_str(lines[0]).unwrap();
+    let approval_id = string_under(&decision, "approval_id").expect("approval_id in the journal");
+    let all = receipts(&home);
+    assert_eq!(all.len(), 3, "held, forwarded, held again");
+    let named: Vec<Option<&str>> = all.iter().map(named_approval).collect();
+    assert_eq!(named, [None, Some(approval_id.as_str()), None]);
+}
+
+/// (c) and (d) Detectado después con los dos heads (guardados fuera de la
+/// máquina); limitación conocida sin ellos. Cutting the end of both
+/// journals, the execution record and the forwarded receipt that names the
+/// approval, leaves an unused approval and two consistent, shorter
+/// journals: the same call runs again and plain `verify` passes.
+/// `--expected-head` and `--expected-approval-head` with the heads printed
+/// after the first run fail.
+#[test]
+fn truncating_both_journals_runs_an_approval_again_and_only_the_saved_heads_find_it() {
+    let (temp, home) = init_home();
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let out = verify(&home);
+    let receipts_head = printed_head(&out);
+    let approval_head = printed_approval_head(&out);
+
+    let journal = approval_journal(&home);
+    let text = fs::read_to_string(&journal).unwrap();
+    let first = text.lines().next().unwrap().to_owned();
+    fs::write(&journal, format!("{first}\n")).unwrap();
+    assert!(named_approval(&receipts(&home)[1]).is_some());
+    rewrite_receipts(&home, |index, line| (index == 0).then(|| line.to_owned()));
+
+    let (_, stderr) = wrap(&home, &[call(12, "append", arguments)]);
     assert_eq!(executed(&stderr, "append"), 1, "forwarded again: {stderr}");
     assert_eq!(fs::read_to_string(&target).unwrap(), "aa");
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
+    let out = verify_with_head(&home, &receipts_head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let out = verify_with_approval_head(&home, &approval_head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
 
-    // Why nothing else shows the second run: the receipts of the held call
-    // and of both forwarded calls look the same. All three record
-    // REQUIRE_APPROVAL, and none carries the approval id or any key naming
-    // an approval.
-    let decision: Value = serde_json::from_str(lines[0]).unwrap();
-    let approval_id = string_under(&decision, "approval_id").expect("approval_id in the journal");
-    let all = receipts(&home);
-    assert_eq!(all.len(), 3, "held, forwarded, forwarded again");
-    for receipt in &all {
-        assert_eq!(
-            receipt["evidence"]["decision"]["outcome"], "RequireApproval",
-            "{receipt}"
-        );
-        assert!(
-            keys_of(receipt).iter().all(|key| !key.contains("approval")),
-            "{receipt}"
-        );
-        assert!(!receipt.to_string().contains(&approval_id), "{receipt}");
+/// (c) and (d) Bloqueado and detectado. The forwarded receipt cut in half,
+/// so that its line still holds `praetore.approval_id` but is not JSON, and
+/// the execution record dropped from the approval journal. `wrap` cannot
+/// tell which approval that line names, so the approval path fails closed
+/// and the retry is held; `verify` fails on the line. A later receipt keeps
+/// the cut line off the end of the journal, so `wrap` can still append.
+#[test]
+fn a_cut_receipt_line_that_names_an_approval_holds_the_retry_and_fails_verify() {
+    let (temp, home) = init_home();
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(
+        &home,
+        &[
+            call(11, "append", arguments.clone()),
+            call(12, "echo", json!({"text": "after"})),
+        ],
+    );
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    assert_eq!(executed(&stderr, "echo"), 1, "{stderr}");
+    assert!(named_approval(&receipts(&home)[1]).is_some());
+
+    let key = "praetore.approval_id";
+    rewrite_receipts(&home, |index, line| {
+        Some(if index == 1 {
+            let end = line.find(key).unwrap() + key.len() + 8;
+            line[..end].to_owned()
+        } else {
+            line.to_owned()
+        })
+    });
+    let text = fs::read_to_string(&receipt_files(&home)[0]).unwrap();
+    let cut = text.lines().nth(1).unwrap();
+    assert!(cut.contains(key), "{cut}");
+    assert!(serde_json::from_str::<Value>(cut).is_err(), "{cut}");
+    let journal = approval_journal(&home);
+    let approvals = fs::read_to_string(&journal).unwrap();
+    let first = approvals.lines().next().unwrap().to_owned();
+    fs::write(&journal, format!("{first}\n")).unwrap();
+
+    let (_, stderr) = wrap(&home, &[call(13, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 0, "held: {stderr}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a");
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+/// m1: the forwarded receipt is journaled, then the execution record cannot
+/// be written (`approvals/journal.jsonl` read-only, as a full disk or a
+/// crash between the two would leave it). The call is not executed,
+/// `verify` reports that receipt as having no execution, and the approval
+/// is spent: once the file is writable again, the retry is held under a new
+/// pending id.
+#[cfg(unix)]
+#[test]
+fn an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, home) = init_home();
+    let target = temp.path().join("target.txt");
+    let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let approved = fs::read_to_string(approval_journal(&home)).unwrap();
+    let decision: Value = serde_json::from_str(approved.lines().next().unwrap()).unwrap();
+    let approval_id = string_under(&decision, "approval_id").unwrap();
+
+    let journal = approval_journal(&home);
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o400)).unwrap();
+    if fs::OpenOptions::new().append(true).open(&journal).is_ok() {
+        // Running as root: the mode does not stop the write.
+        fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+        eprintln!("skipped: a 0400 file is still writable by this user");
+        return;
     }
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(executed(&stderr, "append"), 0, "not executed: {stderr}");
+    assert!(!target.exists());
+    let all = receipts(&home);
+    assert_eq!(all.len(), 2, "held, then the forwarded receipt");
+    assert_eq!(named_approval(&all[1]), Some(approval_id.as_str()));
+    assert_eq!(
+        fs::read_to_string(&journal).unwrap(),
+        approved,
+        "no execution"
+    );
+
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("has no execution of it for that receipt"),
+        "{}",
+        stdout(&out)
+    );
+
+    assert!(approvals::list_pending(&home).unwrap().is_empty());
+    let (_, stderr) = wrap(&home, &[call(12, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 0, "held again: {stderr}");
+    let pending = approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_ne!(pending[0].approval_id, approval_id, "a new pending id");
+}
+
+/// The approval id is signed: changing it in the forwarded receipt fails
+/// `verify` (the receipt no longer matches its attester signature).
+#[test]
+fn the_approval_id_in_a_forwarded_receipt_is_signed() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let all = receipts(&home);
+    let id = named_approval(&all[1]).expect("forwarded receipt names the approval");
+    let other = "0".repeat(64);
+    let files = receipt_files(&home);
+    let text = fs::read_to_string(&files[0]).unwrap();
+    assert_eq!(text.matches(id).count(), 1, "{text}");
+    fs::write(&files[0], text.replace(id, &other)).unwrap();
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+/// The head on the `approval journal: ... head HEX` line of `verify`.
+fn printed_approval_head(out: &Output) -> String {
+    let text = stdout(out);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("approval journal: "))
+        .expect("verify prints the approval journal line");
+    let head = line
+        .split_once(" head ")
+        .and_then(|(_, rest)| rest.get(..64))
+        .unwrap()
+        .to_owned();
+    assert!(
+        head.len() == 64 && head.chars().all(|c| c.is_ascii_hexdigit()),
+        "{line}"
+    );
+    head
+}
+
+/// B1: `verify` says where to keep the approval head and which flag takes
+/// it, as it does for the receipts head, and its checks line does not
+/// promise one use without the condition: both journals cut at the end let
+/// an approval run again, and only the saved heads show it.
+#[test]
+fn verify_says_where_to_keep_the_approval_head_and_when_one_use_holds() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let out = verify(&home);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let text = stdout(&out);
+    let head = printed_approval_head(&out);
+    assert!(
+        text.lines().any(|line| line
+            == format!(
+                "approval journal: 1 decision(s), 1 execution(s), head {head}; keep it outside this machine and pass it as --expected-approval-head to detect records removed at the end"
+            )),
+        "{text}"
+    );
+    let checks = text
+        .lines()
+        .find(|line| line.starts_with("approval checks: "))
+        .expect("verify prints the approval checks");
+    assert!(
+        checks.starts_with(
+            "approval checks: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it)."
+        ),
+        "{checks}"
+    );
+    assert!(!checks.contains("single use"), "{checks}");
+}
+
+fn verify_with_approval_head(home: &Home, head: &str) -> Output {
+    cli(&[
+        "verify",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--expected-approval-head",
+        head,
+    ])
+}
+
+/// (c) `verify --expected-approval-head`: the approval journal must end at
+/// the head printed earlier. It passes at that head, and fails once the
+/// last record is cut or the file is deleted. The cut record here is an
+/// approval no call used yet, which plain `verify` cannot miss: no receipt
+/// names it. A malformed head is a usage error.
+#[test]
+fn verify_with_the_expected_approval_head_fails_after_a_cut_or_a_deletion() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let head = printed_approval_head(&verify(&home));
+    let out = verify_with_approval_head(&home, &head);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let both = cli(&[
+        "verify",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--expected-head",
+        &printed_head(&verify(&home)),
+        "--expected-approval-head",
+        &head,
+    ]);
+    assert!(both.status.success(), "{}", stdout(&both));
+
+    // A second approval, not used yet, then cut from the end.
+    let other = json!({"path": temp.path().join("u.txt").to_str().unwrap(), "text": "b"});
+    hold_and_approve(&home, &other);
+    let head = printed_approval_head(&verify(&home));
+    let journal = approval_journal(&home);
+    let text = fs::read_to_string(&journal).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "decision, execution, decision");
+    fs::write(&journal, format!("{}\n", lines[..2].join("\n"))).unwrap();
+    assert!(
+        verify(&home).status.success(),
+        "plain verify passes after the cut"
+    );
+    let out = verify_with_approval_head(&home, &head);
+    assert_eq!(out.status.code(), Some(1), "cut: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("does not match the expected approval head"),
+        "{}",
+        stdout(&out)
+    );
+
+    fs::remove_file(&journal).unwrap();
+    let out = verify_with_approval_head(&home, &head);
+    assert_eq!(out.status.code(), Some(1), "deleted: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("approval journal has no head"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = verify_with_approval_head(&home, "abc");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--expected-approval-head must be 64"),
+        "{out:?}"
+    );
 }
 
 /// The `sh` block of README.md (Local approval) that saves and checks the
@@ -488,8 +774,12 @@ fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
         .split("```sh\n")
         .skip(1)
         .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
-        .find(|block| block.contains("approval journal still holds"))
+        .find(|block| block.contains("approval journal still ends at"))
         .expect("README.md has the approval head check");
+    assert!(
+        block.contains("--expected-approval-head"),
+        "the README check no longer uses --expected-approval-head"
+    );
     let script: String = block
         .lines()
         .filter(|line| !line.starts_with("SAVED="))
@@ -517,9 +807,9 @@ fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
     (printed.join("\n"), (*verdict).to_owned())
 }
 
-/// n3: the README command that replaces "compare by hand". A head saved
-/// after a run stays valid when later approvals are added, and fails once
-/// the journal is cut before it or deleted.
+/// The README command that checks a saved approval head with
+/// `verify --expected-approval-head`: the head printed after a run passes,
+/// a later approval moves it, and cutting or deleting the journal fails.
 #[cfg(unix)]
 #[test]
 fn the_readme_approval_head_check_finds_a_cut_or_deleted_journal() {
@@ -529,51 +819,40 @@ fn the_readme_approval_head_check_finds_a_cut_or_deleted_journal() {
     let (_, stderr) = wrap(&home, &[call(11, "append", first.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
 
-    let (saved, verdict) = readme_approval_head_check(&home, "none");
+    let (saved, verdict) = readme_approval_head_check(&home, &"0".repeat(64));
     assert!(
         saved.len() == 64 && saved.chars().all(|c| c.is_ascii_hexdigit()),
         "printed head: {saved:?}"
     );
     assert_eq!(verdict, "approval journal changed or verify failed");
     let (_, verdict) = readme_approval_head_check(&home, &saved);
-    assert_eq!(verdict, format!("approval journal still holds {saved}"));
+    assert_eq!(verdict, format!("approval journal still ends at {saved}"));
 
-    // A later approval, decided and used: the saved head is still in the chain.
+    // A later approval, decided and used, moves the head: the old one no
+    // longer passes, the new one does.
     let second = json!({"path": temp.path().join("b.txt").to_str().unwrap(), "text": "b"});
     hold_and_approve(&home, &second);
     let (_, stderr) = wrap(&home, &[call(12, "append", second.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
     let (now, verdict) = readme_approval_head_check(&home, &saved);
     assert_ne!(now, saved, "the head moved");
-    assert_eq!(verdict, format!("approval journal still holds {saved}"));
+    assert_eq!(verdict, "approval journal changed or verify failed");
+    let (_, verdict) = readme_approval_head_check(&home, &now);
+    assert_eq!(verdict, format!("approval journal still ends at {now}"));
 
-    // The first execution record dropped, with everything after it: the
-    // first approval can run again, and the check fails.
+    // The last execution record dropped: the check with the saved head fails.
     let journal = approval_journal(&home);
     let text = fs::read_to_string(&journal).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "two decisions, two executions");
-    fs::write(&journal, format!("{}\n", lines[0])).unwrap();
-    assert!(verify(&home).status.success(), "plain verify still passes");
-    let (_, verdict) = readme_approval_head_check(&home, &saved);
+    fs::write(&journal, format!("{}\n", lines[..3].join("\n"))).unwrap();
+    let (_, verdict) = readme_approval_head_check(&home, &now);
     assert_eq!(verdict, "approval journal changed or verify failed");
 
     fs::remove_file(&journal).unwrap();
-    let (printed, verdict) = readme_approval_head_check(&home, &saved);
+    let (printed, verdict) = readme_approval_head_check(&home, &now);
     assert_eq!(printed, "", "no head to print");
     assert_eq!(verdict, "approval journal changed or verify failed");
-}
-
-/// Every object key in `value`, at any depth.
-fn keys_of(value: &Value) -> Vec<String> {
-    match value {
-        Value::Object(map) => map
-            .iter()
-            .flat_map(|(key, inner)| std::iter::once(key.clone()).chain(keys_of(inner)))
-            .collect(),
-        Value::Array(items) => items.iter().flat_map(keys_of).collect(),
-        _ => Vec::new(),
-    }
 }
 
 /// The first string found under `key` in `value`, at any depth.
@@ -589,17 +868,13 @@ fn string_under(value: &Value, key: &str) -> Option<String> {
     }
 }
 
-/// (c) Bloqueado for the call, limitación conocida for the trace. Deleting
+/// (c) Bloqueado for the call, detectado for the trace. Deleting
 /// `approvals/journal.jsonl` before the approved call ran erases the
 /// decision with it: the call is held again. Deleting it after the call ran
-/// erases the decision and the execution. `verify` reads
-/// `approvals/journal.jsonl` when it is there (approver signature, binding
-/// to the held receipt, expiry, single use), but with the file gone there is
-/// no record to check, and no receipt names the approval, so it passes.
-/// Closing it needs `verify` to require, for each receipt forwarded on an
-/// approval, the signed decision it names.
+/// erases the decision and the execution, and `verify` fails: the forwarded
+/// receipt names an approval with no signed decision.
 #[test]
-fn deleting_the_approval_journal_holds_the_call_and_verify_still_passes() {
+fn deleting_the_approval_journal_holds_the_call_and_fails_verify_after_it_ran() {
     let (temp, home) = init_home();
     let target = temp.path().join("target.txt");
     let arguments = json!({"path": target.to_str().unwrap(), "text": "a"});
@@ -608,16 +883,115 @@ fn deleting_the_approval_journal_holds_the_call_and_verify_still_passes() {
     let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 0, "{stderr}");
     assert!(!target.exists());
+    assert!(
+        verify(&home).status.success(),
+        "nothing ran on the approval"
+    );
 
     // Approved and executed, then the approval journal deleted.
     let pending = approvals::list_pending(&home).unwrap();
     approvals::decide(&home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap();
-    let (_, stderr) = wrap(&home, &[call(12, "append", arguments)]);
+    let (_, stderr) = wrap(&home, &[call(12, "append", arguments.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
     assert!(verify(&home).status.success());
     fs::remove_file(approval_journal(&home)).unwrap();
     let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("which has no signed decision in the approval journal"),
+        "{}",
+        stdout(&out)
+    );
+    // Nor does it free the approval for the next call.
+    let (_, stderr) = wrap(&home, &[call(13, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 0, "{stderr}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a");
+}
+
+/// Signs a receipt for `append(arguments)` on server `fake` that names
+/// `approval_id`, with the home's own keys, and appends it to the receipts
+/// journal. That is what a process holding the home can write; `wrap`
+/// itself only writes one per approval.
+fn forge_named_receipt(
+    home: &Home,
+    arguments: &Value,
+    approval_id: &str,
+) -> praetore_core::Evidence {
+    let gate = praetore_mcp::gate::Gate::load(home, praetore_mcp::gate::Mode::Enforce).unwrap();
+    let params = json!({"name": "append", "arguments": arguments});
+    let evidence = gate
+        .evaluate_evidence_with("fake", &params, Some(approval_id))
+        .unwrap();
+    praetore_mcp::gate::Journal::new(home)
+        .append(&evidence)
+        .unwrap();
+    evidence
+}
+
+/// (d) Detectado. Two receipts that name one approval fail `verify`, also
+/// when the approval journal records an execution for each.
+#[test]
+fn two_receipts_naming_one_approval_fail_verify() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let id = named_approval(&receipts(&home)[1]).unwrap().to_owned();
+    let second = forge_named_receipt(&home, &arguments, &id);
+    approvals::record_duplicate_execution(&home, &id, &second).unwrap();
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "2 forwarded receipts name approval {id}, and an approval authorizes one call"
+        )),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// (c) Detectado. A receipt that names a rejected approval, or an id that
+/// is not 64 lowercase hex characters, fails `verify`.
+#[test]
+fn a_receipt_naming_a_rejected_or_malformed_approval_fails_verify() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    let (_, stderr) = wrap(&home, &[call(10, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 0, "{stderr}");
+    let pending = approvals::list_pending(&home).unwrap();
+    let id = pending[0].approval_id.clone();
+    approvals::decide(&home, &id, HumanOutcome::Reject, None).unwrap();
+    assert!(verify(&home).status.success());
+    forge_named_receipt(&home, &arguments, &id);
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "a forwarded receipt names approval {id}, which was rejected"
+        )),
+        "{}",
+        stdout(&out)
+    );
+
+    let (_temp, home) = init_home();
+    hold_and_approve(&home, &arguments);
+    let receipt = forge_named_receipt(&home, &arguments, "not-an-id");
+    let out = verify(&home);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains(&format!(
+            "receipt {}: praetore.approval_id is not 64 lowercase hex characters",
+            receipt.evidence_id
+        )),
+        "{}",
+        stdout(&out)
+    );
+    // The approved call is not forwarded either: `wrap` cannot tell which
+    // approvals the receipts journal names, so the approval path fails
+    // closed.
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 0, "{stderr}");
 }
 
 // ---------- (d) reusing an approval ----------

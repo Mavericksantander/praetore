@@ -1,0 +1,57 @@
+{
+  "format_version": 2,
+  "id": "praetore-mcp-default",
+  "version": 4,
+  "canonical_version": 1,
+  "semantics_version": 2,
+  "action_classes": {
+    "mcp.tools/call": "Mission"
+  },
+  "rules": [
+    {
+      "id": "allow-echo",
+      "action_type": "mcp.tools/call",
+      "effect": "Allow",
+      "required_capability": "mcp:tools/call",
+      "target": "fake",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "echo"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "deny-delete",
+      "action_type": "mcp.tools/call",
+      "effect": "Deny",
+      "required_capability": "mcp:tools/call",
+      "target": "fake",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "delete"
+        }
+      ],
+      "context_conditions": []
+    },
+    {
+      "id": "approve-append",
+      "action_type": "mcp.tools/call",
+      "effect": "RequireApproval",
+      "required_capability": "mcp:tools/call",
+      "target": "fake",
+      "parameter_conditions": [
+        {
+          "key": "tool",
+          "operator": "Exact",
+          "expected": "append"
+        }
+      ],
+      "context_conditions": []
+    }
+  ]
+}
