@@ -303,6 +303,91 @@ pub(crate) fn assert_journal_intact(
 mod tests {
     use super::*;
 
+    /// The invariant `AppendErrorPreservesLength` of
+    /// `docs/formal/JournalAppend.tla`, on the real [`commit_journal_line`]:
+    /// for each fault mode and each prefix the write stores (0 to 401
+    /// bytes), an error after a short or failed write leaves the file at
+    /// its previous length and bytes, and that is what the last fsync saw.
+    /// `Ok` comes back only for the whole line (`OkMeansWholeLine`). The
+    /// spec is not model-checked in CI; this test is what runs.
+    #[test]
+    fn append_error_preserves_length() {
+        let spec = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/formal/JournalAppend.tla"),
+        )
+        .expect("docs/formal/JournalAppend.tla");
+        for name in ["AppendErrorPreservesLength ==", "OkMeansWholeLine =="] {
+            assert!(spec.contains(name), "the spec no longer defines {name}");
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("journal.jsonl");
+        let before = b"{\"seq\":0}\n".to_vec();
+        let line = line_of_401();
+        let mut checked = 0;
+        for mode in [
+            FaultMode::Short,
+            FaultMode::StorageFull,
+            FaultMode::FileTooLarge,
+        ] {
+            for room in 0..=line.len() {
+                fs::write(&path, &before).expect("seed");
+                let mut file = FaultyFile::open(&path, room, mode).expect("open");
+                let result = commit_journal_line(&mut file, &line);
+                let after = fs::read(&path).expect("read");
+                match result {
+                    Ok(()) => {
+                        assert_eq!(room, line.len(), "{mode:?} room {room}: Ok for a cut line");
+                        assert_eq!(after, [before.as_slice(), &line].concat());
+                    }
+                    Err(error) => {
+                        assert!(
+                            room < line.len(),
+                            "{mode:?}: error for a whole line: {error}"
+                        );
+                        assert_eq!(after, before, "{mode:?} room {room}: {error}");
+                        assert_eq!(
+                            file.durable.as_deref(),
+                            Some(before.as_slice()),
+                            "{mode:?} room {room}: the fsync after the rollback"
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 3 * 402);
+    }
+
+    /// Outside the invariant's condition: when the rollback itself fails,
+    /// the error says so, so the caller knows the length is not known.
+    #[test]
+    fn a_failed_rollback_is_named_in_the_error() {
+        struct NoTruncate(Vec<u8>);
+        impl JournalWriter for NoTruncate {
+            fn len(&self) -> io::Result<u64> {
+                Ok(self.0.len() as u64)
+            }
+            fn write_bytes(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(&buf[..buf.len() / 2]);
+                Ok(buf.len() / 2)
+            }
+            fn sync_data(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+            fn set_len(&mut self, _: u64) -> io::Result<()> {
+                Err(io::Error::other("set_len refused"))
+            }
+        }
+        let mut file = NoTruncate(b"x\n".to_vec());
+        let error = commit_journal_line(&mut file, b"0123456789\n").expect_err("short");
+        let text = error.to_string();
+        assert!(
+            text.contains("failed to restore the journal to 2 bytes")
+                && text.contains("set_len refused"),
+            "{text}"
+        );
+    }
+
     /// A full write whose fsync fails stays on the writer. Truncating it
     /// would drop a line the write already accepted.
     #[test]
