@@ -540,12 +540,51 @@ fn printed_approval_head(out: &Output) -> String {
         .lines()
         .find(|line| line.starts_with("approval journal: "))
         .expect("verify prints the approval journal line");
-    let head = line.rsplit(" head ").next().unwrap().to_owned();
+    let head = line
+        .split_once(" head ")
+        .and_then(|(_, rest)| rest.get(..64))
+        .unwrap()
+        .to_owned();
     assert!(
         head.len() == 64 && head.chars().all(|c| c.is_ascii_hexdigit()),
         "{line}"
     );
     head
+}
+
+/// B1: `verify` says where to keep the approval head and which flag takes
+/// it, as it does for the receipts head, and its checks line does not
+/// promise one use without the condition: both journals cut at the end let
+/// an approval run again, and only the saved heads show it.
+#[test]
+fn verify_says_where_to_keep_the_approval_head_and_when_one_use_holds() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments)]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let out = verify(&home);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let text = stdout(&out);
+    let head = printed_approval_head(&out);
+    assert!(
+        text.lines().any(|line| line
+            == format!(
+                "approval journal: 1 decision(s), 1 execution(s), head {head}; keep it outside this machine and pass it as --expected-approval-head to detect records removed at the end"
+            )),
+        "{text}"
+    );
+    let checks = text
+        .lines()
+        .find(|line| line.starts_with("approval checks: "))
+        .expect("verify prints the approval checks");
+    assert!(
+        checks.starts_with(
+            "approval checks: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it)."
+        ),
+        "{checks}"
+    );
+    assert!(!checks.contains("single use"), "{checks}");
 }
 
 fn verify_with_approval_head(home: &Home, head: &str) -> Output {

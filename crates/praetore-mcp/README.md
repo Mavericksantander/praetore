@@ -813,7 +813,7 @@ receipts journal. Keep the head off this machine:
 ```sh
 # DIR is the home, for example ~/.praetore/mcp.
 # After a run you trust: print the approval head; keep it off this machine.
-praetore-mcp verify --dir "$DIR" | sed -n 's/^approval journal: .* head //p'
+praetore-mcp verify --dir "$DIR" | sed -n 's/^approval journal: .* head \([0-9a-f]\{64\}\).*/\1/p'
 
 # Later, with that value:
 SAVED=<approval head kept off this machine>

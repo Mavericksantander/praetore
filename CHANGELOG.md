@@ -11,7 +11,10 @@
   report prints `praetore-mcp verify --dir DIR --expected-head ...
   --expected-approval-head ...` with both heads at close (JSON
   `verify_command`, and the last section of the PDF). The README check of
-  a saved approval head uses the flag.
+  a saved approval head uses the flag. The `approval journal: ... head HEX`
+  line now ends with where to keep the head and which flag takes it, and
+  the approval checks (in `verify` and in the dashboard) say "one use per
+  approval" with the case where it does not hold instead of "single use".
 
 - **praetore-mcp: the receipt of a call forwarded on an approval names it.**
   The receipt carries `context["praetore.approval_id"]`, signed with the

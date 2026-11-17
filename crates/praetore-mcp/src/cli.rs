@@ -834,13 +834,13 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     println!("observe receipts record a decision that was NOT enforced.");
     match report.approval_head {
         Some(head) => println!(
-            "approval journal: {} decision(s), {} execution(s), head {head}",
+            "approval journal: {} decision(s), {} execution(s), head {head}; keep it outside this machine and pass it as --expected-approval-head to detect records removed at the end",
             report.approval_decisions, report.approval_executions
         ),
         None => println!("approval journal: none"),
     }
     println!(
-        "approval checks: approver signature, binding to the held call, expiry, single use. An observe REQUIRE_APPROVAL receipt means enforce would ask; it is not a hold."
+        "approval checks: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it). An observe REQUIRE_APPROVAL receipt means enforce would ask; it is not a hold."
     );
     Ok(if report.failures.is_empty() { 0 } else { 1 })
 }
