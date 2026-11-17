@@ -79,8 +79,10 @@ tools/call is evaluated: initialize, tools/list and the rest of the MCP
 traffic pass, so a client can start the server and list its tools. Observe
 mode records a DENY and forwards the call, but it still refuses a tools/call
 the policy does not classify, a client line it cannot parse that may name a
-safety* tool, and every tools/call when the home cannot be loaded (before
-init, for example). Allow tools with
+safety* tool, a client line over 32 MiB, and a whole batch when a tools/call
+in it is refused. When the home cannot be loaded (before init, for example),
+every tools/call and every client line that cannot be parsed is refused.
+Allow tools with
 `praetore-mcp policy allow --id ID --server NAME --tool NAME`.
 
 Running init again on an initialized DIR adds the approver key when it is

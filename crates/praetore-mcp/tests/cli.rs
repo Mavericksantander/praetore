@@ -116,8 +116,10 @@ fn usage_errors_exit_two() {
 }
 
 /// Observe mode is not "never blocks": it still refuses unclassified calls,
-/// unparseable lines that may name a safety* tool and every call when the
-/// home cannot be loaded. The help says so, in words a test can pin.
+/// unparseable lines that may name a safety* tool, lines over 32 MiB,
+/// batches with a refused call, and, when the home cannot be loaded, every
+/// call and every unparseable line. The help says so, in words a test can
+/// pin.
 #[test]
 fn init_help_says_what_observe_mode_still_refuses() {
     let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -126,8 +128,10 @@ fn init_help_says_what_observe_mode_still_refuses() {
         init.contains(
             "Observe mode records a DENY and forwards the call, but it still refuses a \
              tools/call the policy does not classify, a client line it cannot parse that \
-             may name a safety* tool, and every tools/call when the home cannot be loaded \
-             (before init, for example)."
+             may name a safety* tool, a client line over 32 MiB, and a whole batch when a \
+             tools/call in it is refused. When the home cannot be loaded (before init, for \
+             example), every tools/call and every client line that cannot be parsed is \
+             refused."
         ),
         "{init}"
     );
