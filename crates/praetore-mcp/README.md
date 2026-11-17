@@ -297,7 +297,8 @@ Cursor (`~/.cursor/mcp.json`), each with `install --mode enforce` in front of
 `deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused,
 the file was not created, and `verify` checked every receipt. On a DENY the
 client sees only `Denied by PRÆTORE. Evidence id: <id>`, whatever decided
-it; the rule is on stderr and in the signed receipt. Not checked: Windows, Linux, VS Code.
+it; the rule is on stderr and in the signed receipt. Not checked: Windows,
+Linux, VS Code.
 
 A config file that two default paths resolve to (for example Cursor's
 `~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
