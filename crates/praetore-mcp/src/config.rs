@@ -36,6 +36,20 @@ pub fn path(home: &Home) -> PathBuf {
 /// The key of the approval TTL in `config.toml`.
 pub const APPROVAL_TTL_KEY: &str = "approval_ttl_seconds";
 
+/// A key as written, without the quotes TOML allows around it
+/// (`"key"` or `'key'`).
+fn unquoted(key: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = key
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    key
+}
+
 /// The raw `approval_ttl_seconds` value of `config.toml`, or `None` when the
 /// file or the key is absent. Unlike [`load`], this fails on a file that
 /// cannot be read, on a line naming the key without `= value`, and on the
@@ -58,12 +72,12 @@ pub fn approval_ttl_seconds(home: &Home) -> Result<Option<String>, String> {
             .split(|c: char| c.is_whitespace() || c == '=')
             .next()
             .unwrap_or_default();
-        if first != APPROVAL_TTL_KEY {
+        if unquoted(first) != APPROVAL_TTL_KEY {
             continue;
         }
         let value = line
             .split_once('=')
-            .filter(|(key, _)| key.trim() == APPROVAL_TTL_KEY)
+            .filter(|(key, _)| unquoted(key.trim()) == APPROVAL_TTL_KEY)
             .map(|(_, value)| value.trim());
         let Some(value) = value else {
             return Err(format!(
@@ -118,7 +132,7 @@ pub fn parse(text: &str) -> (Config, Vec<String>) {
             problems.push(format!("line {at}: expected `key = value`; ignored"));
             continue;
         };
-        match (key.trim(), value.trim()) {
+        match (unquoted(key.trim()), value.trim()) {
             ("report", "true") => config.report = true,
             ("report", "false") => config.report = false,
             ("report", other) => problems.push(format!(
@@ -179,6 +193,21 @@ mod tests {
             let error = approval_ttl_seconds(&home).unwrap_err();
             assert!(error.contains(says), "{text:?}: {error}");
         }
+        // m3: a quoted key (TOML allows it) is the key, never a warning.
+        for text in [
+            "\"approval_ttl_seconds\" = 1800\n",
+            "'approval_ttl_seconds' = 1800\n",
+        ] {
+            write(text);
+            assert_eq!(
+                approval_ttl_seconds(&home),
+                Ok(Some("1800".into())),
+                "{text:?}"
+            );
+            assert!(parse(text).1.is_empty(), "{text:?}: {:?}", parse(text).1);
+        }
+        write("\"approval_ttl_seconds\"\t1800\n");
+        assert!(approval_ttl_seconds(&home).is_err());
         // A key that only starts like it is another key.
         write("approval_ttl_seconds_x = 1\n");
         assert_eq!(approval_ttl_seconds(&home), Ok(None));

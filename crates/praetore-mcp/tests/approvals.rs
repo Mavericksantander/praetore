@@ -1365,6 +1365,15 @@ fn the_config_ttl_holds_under_a_filtered_environment_and_the_env_wins() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(held_window(&home, &out, 8), 120, "{out:?}");
 
+    // m3: a quoted key is the key.
+    fs::write(
+        home.root.join("config.toml"),
+        "\"approval_ttl_seconds\" = 1800\n",
+    )
+    .unwrap();
+    let out = wrap_filtered_env(&home, &session(echo(10, json!({"n": 4}))), &[]);
+    assert_eq!(held_window(&home, &out, 10), 1800, "{out:?}");
+
     // Without the config line, the old file and then the default apply.
     fs::write(home.root.join("config.toml"), "report = true\n").unwrap();
     let out = wrap_filtered_env(&home, &session(echo(9, json!({"n": 3}))), &[]);
