@@ -439,6 +439,51 @@ fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "aa");
     let out = verify(&home);
     assert!(out.status.success(), "{}", stdout(&out));
+
+    // Why nothing else shows the second run: the receipts of the held call
+    // and of both forwarded calls look the same. All three record
+    // REQUIRE_APPROVAL, and none carries the approval id or any key naming
+    // an approval.
+    let decision: Value = serde_json::from_str(lines[0]).unwrap();
+    let approval_id = string_under(&decision, "approval_id").expect("approval_id in the journal");
+    let all = receipts(&home);
+    assert_eq!(all.len(), 3, "held, forwarded, forwarded again");
+    for receipt in &all {
+        assert_eq!(
+            receipt["evidence"]["decision"]["outcome"], "RequireApproval",
+            "{receipt}"
+        );
+        assert!(
+            keys_of(receipt).iter().all(|key| !key.contains("approval")),
+            "{receipt}"
+        );
+        assert!(!receipt.to_string().contains(&approval_id), "{receipt}");
+    }
+}
+
+/// Every object key in `value`, at any depth.
+fn keys_of(value: &Value) -> Vec<String> {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .flat_map(|(key, inner)| std::iter::once(key.clone()).chain(keys_of(inner)))
+            .collect(),
+        Value::Array(items) => items.iter().flat_map(keys_of).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The first string found under `key` in `value`, at any depth.
+fn string_under(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| map.values().find_map(|inner| string_under(inner, key))),
+        Value::Array(items) => items.iter().find_map(|inner| string_under(inner, key)),
+        _ => None,
+    }
 }
 
 /// (c) Bloqueado for the call, limitación conocida for the trace. Deleting

@@ -55,3 +55,4 @@ The defences above were checked by removing each one and running `tests/evasion.
 | Server in the binding (`first_unused_approval` compares only tool and arguments) | `an_approval_does_not_cover_another_server_or_another_held_tool` |
 | Tool in the binding (`first_unused_approval` compares only server and arguments) | `an_approval_does_not_cover_another_server_or_another_held_tool` |
 | Chain order in `verify` (the seq/prev problem dropped) | `a_receipt_removed_from_the_middle_fails_verify` |
+| Not a defence, a pinned fact of case c, d: a receipt key naming an approval (`praetore.approval_id` added to every receipt's context) | `truncating_the_approval_journal_lets_a_used_approval_run_again` |
