@@ -3,6 +3,8 @@
 //! report (here) and the dashboard (`tests-js/dashboard.test.mjs`). Data
 //! keeps the exact value.
 
+mod lex;
+
 use serde_json::json;
 use std::{
     fs,
@@ -154,69 +156,158 @@ fn the_pdf_report_shows_a_tool_name_with_control_characters_escaped() {
     );
 }
 
-/// Every terminal message formats a path through `Shown` (`.shown()`),
-/// never `Path::display`, which writes control characters as they are.
-/// The exceptions keep the exact path as data.
-#[test]
-fn src_formats_paths_with_shown_not_display() {
-    const EXCEPTIONS: &[(&str, &str, &str)] = &[
-        (
-            "src/commands.rs",
-            "shell_word(&root.display().to_string())",
-            "Windows --dir word for a command to copy, not POSIX-quoted",
-        ),
-        (
-            "src/commands.rs",
-            "quote(&absolute.display().to_string())",
-            "quote() writes control characters as $'\\xHH'",
-        ),
-        (
-            "src/commands.rs",
-            "root.canonicalize().unwrap().display()",
-            "unit test",
-        ),
-        ("src/policy.rs", "root.display());", "unit test"),
-        (
-            "src/dashboard.rs",
-            ".display().to_string()",
-            "JSON data for the page, escaped there by shown()",
-        ),
-    ];
+/// One allowed use: the file, the exact line of code (trimmed) and why.
+struct Exception {
+    file: &'static str,
+    line: &'static str,
+    why: &'static str,
+}
+
+const fn allow(file: &'static str, line: &'static str, why: &'static str) -> Exception {
+    Exception { file, line, why }
+}
+
+/// Lines that may keep `Path::display`: the exact path is data here.
+const DISPLAY_EXCEPTIONS: &[Exception] = &[
+    allow(
+        "src/commands.rs",
+        "return crate::policy::shell_word(&root.display().to_string());",
+        "Windows --dir word of a command to copy; not POSIX-quoted",
+    ),
+    allow(
+        "src/commands.rs",
+        "quote(&absolute.display().to_string())",
+        "quote() writes control characters as $'\\xHH'",
+    ),
+    allow(
+        "src/commands.rs",
+        "text.ends_with(&format!(\"{}'\", root.canonicalize().unwrap().display())),",
+        "unit test comparing with the exact path",
+    ),
+    allow(
+        "src/policy.rs",
+        "let data = format!(\"/System/Volumes/Data{}\", root.display());",
+        "unit test building a path, not a message",
+    ),
+    allow(
+        "src/dashboard.rs",
+        "\"home\": home.root.display().to_string(),",
+        "JSON data for the page, escaped there by shown()",
+    ),
+    allow(
+        "src/dashboard.rs",
+        "\"attester_pin\": home.attester_pin().display().to_string(),",
+        "JSON data for the page, escaped there by shown()",
+    ),
+    allow(
+        "src/dashboard.rs",
+        "\"issuer_pins\": home.issuer_pins().display().to_string(),",
+        "JSON data for the page, escaped there by shown()",
+    ),
+    allow(
+        "src/dashboard.rs",
+        "let location = json!({\"file\": line.file.display().to_string(), \"line\": line.line_number});",
+        "JSON data for the page, escaped there by shown()",
+    ),
+    allow(
+        "src/dashboard.rs",
+        "\"path\": home.policy().display().to_string(),",
+        "JSON data for the page, escaped there by shown()",
+    ),
+];
+
+/// Every `src/**/*.rs` file: its path from the crate root and its text.
+fn src_files() -> Vec<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut found = Vec::new();
+    let mut files = Vec::new();
     let mut stack = vec![root.join("src")];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
                 stack.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "rs") {
-                continue;
-            }
-            let file = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            for (index, line) in fs::read_to_string(&path).unwrap().lines().enumerate() {
-                let code = line.split("//").next().unwrap_or_default();
-                if !code.contains(".display()") {
-                    continue;
-                }
-                let allowed = EXCEPTIONS
-                    .iter()
-                    .any(|(f, snippet, _)| *f == file && code.contains(snippet));
-                if !allowed {
-                    found.push(format!("{file}:{}: {}", index + 1, line.trim()));
-                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let file = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((file, fs::read_to_string(&path).unwrap()));
             }
         }
     }
+    files.sort();
+    files
+}
+
+/// Lines of `source` (1-based, with their code as written) where `hit`
+/// finds a forbidden use in the lexed code, so text inside comments and
+/// string literals never counts and code after a `//` inside a string
+/// still does.
+fn offending_lines(source: &str, hit: impl Fn(&str) -> bool) -> Vec<(usize, String)> {
+    let lexed = lex::lex(source);
+    lexed
+        .code
+        .lines()
+        .zip(source.lines())
+        .enumerate()
+        .filter(|(_, (code, _))| hit(code))
+        .map(|(index, (_, line))| (index + 1, line.trim().to_owned()))
+        .collect()
+}
+
+/// Uses of `hit` in src not covered by `exceptions`, and exceptions that
+/// no longer match a line (so the list cannot outlive the code).
+fn check_guard(
+    exceptions: &[Exception],
+    hit: impl Fn(&str) -> bool + Copy,
+) -> (Vec<String>, Vec<String>) {
+    let mut found = Vec::new();
+    let mut used = vec![false; exceptions.len()];
+    for (file, source) in src_files() {
+        for (number, line) in offending_lines(&source, hit) {
+            match exceptions
+                .iter()
+                .position(|e| e.file == file && e.line == line)
+            {
+                Some(index) => used[index] = true,
+                None => found.push(format!("{file}:{number}: {line}")),
+            }
+        }
+    }
+    let stale = exceptions
+        .iter()
+        .zip(used)
+        .filter(|(_, used)| !used)
+        .map(|(e, _)| format!("{}: {} ({})", e.file, e.line, e.why))
+        .collect();
+    (found, stale)
+}
+
+/// m5: every terminal message formats a path through `Shown`
+/// (`.shown()`), never `Path::display`, which writes control characters
+/// as they are. The exceptions keep the exact path as data.
+#[test]
+fn src_formats_paths_with_shown_not_display() {
+    let (found, stale) = check_guard(DISPLAY_EXCEPTIONS, |code| code.contains(".display()"));
     assert!(
         found.is_empty(),
-        "format these paths with `.shown()` (use crate::shown::Show), or add an exception with its reason:\n{}",
+        "format these paths with `.shown()` (use crate::shown::Show), or add an exception with its exact line and reason:\n{}",
         found.join("\n")
     );
+    assert!(
+        stale.is_empty(),
+        "exceptions that match no line any more:\n{}",
+        stale.join("\n")
+    );
+}
+
+/// The guard reads code, not text: `.display()` after a `//` inside a
+/// string is code; in a comment or a string it is not.
+#[test]
+fn the_guard_sees_code_after_a_double_slash_in_a_string() {
+    let source = "fn f(p: &Path) {\n    eprintln!(\"open http://x/ {}\", p.display());\n    // p.display() in a comment\n    let s = \"p.display()\";\n}\n";
+    let hits = offending_lines(source, |code| code.contains(".display()"));
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].0, 2);
 }
