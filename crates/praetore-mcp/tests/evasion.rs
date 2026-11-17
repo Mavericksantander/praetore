@@ -461,6 +461,92 @@ fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
     }
 }
 
+/// The `sh` block of README.md (Local approval) that saves and checks the
+/// approval head, run as written, with `SAVED` from the environment instead
+/// of its placeholder line.
+fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
+    let readme =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md")).unwrap();
+    let block = readme
+        .split("```sh\n")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
+        .find(|block| block.contains("approval journal still holds"))
+        .expect("README.md has the approval head check");
+    let script: String = block
+        .lines()
+        .filter(|line| !line.starts_with("SAVED="))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let bin_dir = Path::new(bin()).parent().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("sh")
+        .args(["-c", &script])
+        .env("PATH", path)
+        .env("DIR", &home.root)
+        .env("SAVED", saved)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    // The save command prints the head, or nothing when there is none; the
+    // check always prints one verdict line, last.
+    let lines: Vec<&str> = text.lines().collect();
+    let (verdict, printed) = lines.split_last().expect("a verdict line");
+    (printed.join("\n"), (*verdict).to_owned())
+}
+
+/// n3: the README command that replaces "compare by hand". A head saved
+/// after a run stays valid when later approvals are added, and fails once
+/// the journal is cut before it or deleted.
+#[cfg(unix)]
+#[test]
+fn the_readme_approval_head_check_finds_a_cut_or_deleted_journal() {
+    let (temp, home) = init_home();
+    let first = json!({"path": temp.path().join("a.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &first);
+    let (_, stderr) = wrap(&home, &[call(11, "append", first.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+
+    let (saved, verdict) = readme_approval_head_check(&home, "none");
+    assert!(
+        saved.len() == 64 && saved.chars().all(|c| c.is_ascii_hexdigit()),
+        "printed head: {saved:?}"
+    );
+    assert_eq!(verdict, "approval journal changed or verify failed");
+    let (_, verdict) = readme_approval_head_check(&home, &saved);
+    assert_eq!(verdict, format!("approval journal still holds {saved}"));
+
+    // A later approval, decided and used: the saved head is still in the chain.
+    let second = json!({"path": temp.path().join("b.txt").to_str().unwrap(), "text": "b"});
+    hold_and_approve(&home, &second);
+    let (_, stderr) = wrap(&home, &[call(12, "append", second.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let (now, verdict) = readme_approval_head_check(&home, &saved);
+    assert_ne!(now, saved, "the head moved");
+    assert_eq!(verdict, format!("approval journal still holds {saved}"));
+
+    // The first execution record dropped, with everything after it: the
+    // first approval can run again, and the check fails.
+    let journal = approval_journal(&home);
+    let text = fs::read_to_string(&journal).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "two decisions, two executions");
+    fs::write(&journal, format!("{}\n", lines[0])).unwrap();
+    assert!(verify(&home).status.success(), "plain verify still passes");
+    let (_, verdict) = readme_approval_head_check(&home, &saved);
+    assert_eq!(verdict, "approval journal changed or verify failed");
+
+    fs::remove_file(&journal).unwrap();
+    let (printed, verdict) = readme_approval_head_check(&home, &saved);
+    assert_eq!(printed, "", "no head to print");
+    assert_eq!(verdict, "approval journal changed or verify failed");
+}
+
 /// Every object key in `value`, at any depth.
 fn keys_of(value: &Value) -> Vec<String> {
     match value {
