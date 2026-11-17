@@ -15,6 +15,8 @@
 //! the truncate still leaves a cut line; `verify` and the next append keep
 //! treating that as damage.
 
+#[cfg(test)]
+use crate::shown::Show;
 use std::{
     fs,
     io::{self, Write},
@@ -183,7 +185,7 @@ impl FaultyFile {
         if created {
             return Err(io::Error::other(format!(
                 "journal {} did not exist",
-                path.display()
+                path.shown()
             )));
         }
         Ok(Self {
