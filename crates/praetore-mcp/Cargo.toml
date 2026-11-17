@@ -41,6 +41,8 @@ libc = "0.2.189"
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
 libc = "0.2.189"
 tempfile = "3"
+# tests/lint_guard.rs reads Cargo.toml and .cargo/config.toml tables.
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 [[example]]
 name = "fake_server"

@@ -128,7 +128,7 @@ pub fn journal_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// Last line of `path` without its newline, `None` for an empty file.
 /// A last line without a newline (interrupted write) is an error: nothing
 /// is appended after it until someone looks at the journal.
-fn last_line(path: &Path) -> Result<Option<String>, String> {
+fn last_line(path: &Path, verify: &str) -> Result<Option<String>, String> {
     let fail = |e: io::Error| format!("cannot read {}: {e}", path.display());
     let mut file = fs::File::open(path).map_err(fail)?;
     let len = file.metadata().map_err(fail)?.len();
@@ -141,7 +141,7 @@ fn last_line(path: &Path) -> Result<Option<String>, String> {
     file.read_to_end(&mut tail).map_err(fail)?;
     let Some(body) = tail.strip_suffix(b"\n") else {
         return Err(format!(
-            "{} does not end with a newline (interrupted write?); run `praetore-mcp verify`",
+            "{} does not end with a newline (interrupted write?); run `{verify}`",
             path.display()
         ));
     };
@@ -157,20 +157,25 @@ fn last_line(path: &Path) -> Result<Option<String>, String> {
 
 /// Where the next entry goes: the newest daily file that is not older than
 /// `today` (so file order stays chain order if the clock goes back), and the
-/// position after the last entry of the journal.
-pub fn next_append(dir: &Path, today: PathBuf) -> Result<(PathBuf, Position), String> {
+/// position after the last entry of the journal. `verify` is the command
+/// an error tells to run ([`crate::commands::command`]).
+pub fn next_append(
+    dir: &Path,
+    today: PathBuf,
+    verify: &str,
+) -> Result<(PathBuf, Position), String> {
     let files = journal_files(dir)?;
     let path = match files.last() {
         Some(newest) if *newest > today => newest.clone(),
         _ => today,
     };
     for file in files.iter().rev() {
-        let Some(text) = last_line(file)? else {
+        let Some(text) = last_line(file, verify)? else {
             continue;
         };
         let entry = parse_line(&text).map_err(|e| {
             format!(
-                "last entry of {} is unreadable ({e}); run `praetore-mcp verify`",
+                "last entry of {} is unreadable ({e}); run `{verify}`",
                 file.display()
             )
         })?;

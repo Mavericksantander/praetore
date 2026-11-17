@@ -1213,6 +1213,111 @@ fn approve_of_a_pending_call_with_an_unreadable_expiry_asks_for_no_code() {
 /// id (it could never be decided again, so the call would be stuck until
 /// it expired), and the rejected id is never executed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+/// A decide that stopped after it appended the decision and before it
+/// removed the pending file: `approvals` prints the outcome and no
+/// commands for that id, and the session report counts it once, as
+/// decided, not also as pending. Seeded without hooks: the pending file is
+/// written back after a real decide.
+#[test]
+fn approvals_prints_no_commands_for_an_id_already_decided() {
+    use praetore_mcp::approvals::{self, HumanOutcome};
+    for (outcome, word) in [
+        (HumanOutcome::Reject, "reject"),
+        (HumanOutcome::Approve, "approve"),
+    ] {
+        let (_temp, home) = init_home();
+        require_echo(&home);
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &[]);
+        let decided = approval_id_from(tool_text(by_id(&responses, 7)));
+        let (responses, _, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 2}))), &[]);
+        let open = approval_id_from(tool_text(by_id(&responses, 8)));
+        let path = home
+            .root
+            .join("approvals")
+            .join("pending")
+            .join(format!("{decided}.json"));
+        let pending = fs::read(&path).unwrap();
+        approvals::decide(&home, &decided, outcome, None).unwrap();
+        fs::write(&path, &pending).unwrap();
+
+        let out = run(&["approvals", "--dir", home.root.to_str().unwrap()], "");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{word}: {text}");
+        let block = |id: &str| {
+            text.split("\n\n")
+                .find(|block| block.starts_with(&format!("id         {id}\n")))
+                .unwrap_or_else(|| panic!("{word}: no block for {id}:\n{text}"))
+                .to_owned()
+        };
+        let decided_block = block(&decided);
+        assert!(
+            decided_block.contains(&format!("\ndecided: {word} already; ")),
+            "{word}: {decided_block}"
+        );
+        assert!(
+            !decided_block.contains("\napprove ") && !decided_block.contains("\nreject "),
+            "{word}: commands printed for a decided id: {decided_block}"
+        );
+        let open_block = block(&open);
+        assert!(
+            open_block.contains(&format!(" approve {open} --dir ")),
+            "{word}: {open_block}"
+        );
+
+        // Both sessions' reports, written again from the journal as it is
+        // now: the decided call is one approval row, decided, and only the
+        // open call is pending.
+        let names = |regen: bool| {
+            let mut names: Vec<String> = fs::read_dir(home.root.join("reports"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.ends_with(".json") && name.contains(".regen-") == regen)
+                .collect();
+            names.sort();
+            names
+        };
+        for name in names(false) {
+            let session = name
+                .trim_end_matches(".json")
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .to_owned();
+            let out = run(
+                &[
+                    "report",
+                    "--dir",
+                    home.root.to_str().unwrap(),
+                    "--session",
+                    &session,
+                ],
+                "",
+            );
+            assert!(out.status.success(), "{word}: {out:?}");
+        }
+        let decided_key = if word == "reject" {
+            "rejected"
+        } else {
+            "approved"
+        };
+        let (mut decided_rows, mut pending_rows) = (0, 0);
+        for name in names(true) {
+            let document: Value = serde_json::from_str(
+                &fs::read_to_string(home.root.join("reports").join(&name)).unwrap(),
+            )
+            .unwrap();
+            let summary = &document["header"]["summary"];
+            decided_rows += summary[decided_key].as_u64().unwrap();
+            pending_rows += summary["pending"].as_u64().unwrap();
+        }
+        assert_eq!(decided_rows, 1, "{word}");
+        assert_eq!(
+            pending_rows, 1,
+            "{word}: the decided call is counted as pending too"
+        );
+    }
+}
+
 #[test]
 fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
     use praetore_mcp::approvals::{self, HumanOutcome};
