@@ -104,7 +104,9 @@ passed to the server unchanged (including any --help).
   --dir DIR     home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --name SERVER server name used in policy rules and receipts
                 (default: the command's file name)
-  --mode MODE   observe (default): forward every call, record the decision
+  --mode MODE   observe (default): record the decision and forward the call;
+                unclassified calls and client lines that cannot be checked
+                are still refused (see `praetore-mcp init --help`)
                 enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
                 `praetore-mcp approve <id>` for that exact call
   --no-report   do not write the session report (same as `report = false`

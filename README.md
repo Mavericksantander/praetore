@@ -388,8 +388,10 @@ plain language:
   MCP server are governed. The client's own built-in tools are not. If
   something happened and there is no receipt for it, it did not go through
   this install.
-- **Observe mode (the arrival mode) does not block.** A DENY receipt records
-  what enforce would have blocked, but the call still runs.
+- **Observe mode (the arrival mode) does not block DENY.** A DENY receipt
+  records what enforce would have blocked, but the call still runs. Observe
+  still refuses a call the policy does not classify and client lines it
+  cannot check; the praetore-mcp README lists them.
 - **What `praetore-mcp verify` checks.** This installation's receipt journal
   (integrity, signatures, mode binding). In observe, a receipt records a
   decision that was not enforced. `OK 0 receipts` means the journal is
