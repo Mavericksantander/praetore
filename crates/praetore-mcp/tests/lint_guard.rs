@@ -527,12 +527,30 @@ fn the_guard_finds_each_way_to_allow_the_lint() {
     assert!(!flags_silence(&config_rustflags("[build]\njobs = 4\n")));
 }
 
+/// Lines of `text` where its code (comments and string literals left out,
+/// white space ignored) contains `needle`, written without white space:
+/// `.append( true)`, `write_all (` and a call split over lines all count.
+fn code_calls(text: &str, needle: &str) -> Vec<usize> {
+    let (chars, lines) = compact(&lex::lex(text).code);
+    let mut found: Vec<usize> = chars
+        .match_indices(needle)
+        .map(|(at, _)| lines[chars[..at].chars().count()])
+        .collect();
+    found.dedup();
+    found
+}
+
+/// Without the closing parenthesis, so `.append(true,)` counts too.
+const APPEND_OPEN: &str = ".append(true";
+const WRITE_ALL: &str = "write_all(";
+
 /// Journal lines are appended only by `journal_io`. Clippy's
 /// `disallowed-methods` cannot say "no `write_all` on a journal file": it
 /// matches a method path for the whole crate, and `write_all` is the right
 /// call for pending files, reports and the dashboard. This test is the
 /// check that fits. `journal_io` writes a line once; a retry of the tail is
-/// what leaves a cut JSON line when the disk fills.
+/// what leaves a cut JSON line when the disk fills. Calls are found in the
+/// lexed code with white space ignored ([`code_calls`]).
 #[test]
 fn journal_append_does_not_call_write_all_outside_the_helper() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -540,7 +558,7 @@ fn journal_append_does_not_call_write_all_outside_the_helper() {
     let helper_path = src.join("journal_io.rs");
     let helper = fs::read_to_string(&helper_path).unwrap();
     assert!(
-        !helper.contains("write_all("),
+        code_calls(&helper, WRITE_ALL).is_empty(),
         "journal_io must write each line once"
     );
     assert!(helper.contains("fn commit_journal_line"));
@@ -551,7 +569,7 @@ fn journal_append_does_not_call_write_all_outside_the_helper() {
     let mut append_open = Vec::new();
     for path in &files {
         let text = fs::read_to_string(path).unwrap();
-        if text.contains(".append(true)") {
+        if !code_calls(&text, APPEND_OPEN).is_empty() {
             append_open.push(path.strip_prefix(&src).unwrap().display().to_string());
         }
     }
@@ -573,16 +591,11 @@ fn journal_append_does_not_call_write_all_outside_the_helper() {
         "approval journal does not use the shared append"
     );
     assert!(
-        !gate.contains("write_all("),
+        code_calls(&gate, WRITE_ALL).is_empty(),
         "receipts journal calls write_all"
     );
 
-    let write_all_lines: Vec<usize> = approvals
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| line.contains("write_all("))
-        .map(|(index, _)| index + 1)
-        .collect();
+    let write_all_lines = code_calls(&approvals, WRITE_ALL);
     let private_at = approvals
         .lines()
         .position(|line| line.starts_with("fn write_private("))
@@ -605,4 +618,47 @@ fn journal_append_does_not_call_write_all_outside_the_helper() {
         !write_all_lines.is_empty(),
         "write_private no longer writes its pending file; the allow-range in this test is stale"
     );
+}
+
+/// The journal guard sees a call however it is spaced or split, and never
+/// one inside a comment or a string.
+#[test]
+fn the_journal_guard_sees_spaced_calls() {
+    for (source, needle, lines) in [
+        ("options.append(true);\n", APPEND_OPEN, vec![1]),
+        ("options.append( true);\n", APPEND_OPEN, vec![1]),
+        ("options . append ( true ) ;\n", APPEND_OPEN, vec![1]),
+        (
+            "options\n    .append(\n        true,\n    );\n",
+            APPEND_OPEN,
+            vec![2],
+        ),
+        (
+            "options\n    .append(\n        true\n    );\n",
+            APPEND_OPEN,
+            vec![2],
+        ),
+        ("file.write_all(b\"x\")?;\n", WRITE_ALL, vec![1]),
+        ("file.write_all (b\"x\")?;\n", WRITE_ALL, vec![1]),
+        ("file\n    .write_all\n    (b\"x\")?;\n", WRITE_ALL, vec![2]),
+        (
+            "Write::write_all(&mut file, b\"x\")?;\n",
+            WRITE_ALL,
+            vec![1],
+        ),
+        ("// file.write_all(b\"x\");\n", WRITE_ALL, vec![]),
+        (
+            "let s = \"options.append(true) write_all(\";\n",
+            APPEND_OPEN,
+            vec![],
+        ),
+        (
+            "let s = \"options.append(true) write_all(\";\n",
+            WRITE_ALL,
+            vec![],
+        ),
+        ("/* .append( true) */ file.flush()?;\n", APPEND_OPEN, vec![]),
+    ] {
+        assert_eq!(code_calls(source, needle), lines, "{source:?} {needle:?}");
+    }
 }
