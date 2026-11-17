@@ -18,7 +18,7 @@
 use crate::{
     gate::PATH_CHECK_CONTEXT_KEY,
     journal,
-    receipts::{self, Check, LineVerdict, VerifyReport},
+    receipts::{self, Check, ExpectedHeads, LineVerdict, VerifyReport},
     report,
     store::{self, Home},
 };
@@ -78,7 +78,7 @@ pub fn bind_addr(addr: SocketAddr) -> Result<TcpListener, String> {
 pub fn serve(
     listener: &TcpListener,
     home: &Home,
-    expected_head: Option<&str>,
+    expected: ExpectedHeads<'_>,
     max_requests: Option<usize>,
 ) -> Result<(), String> {
     let port = listener
@@ -89,7 +89,7 @@ pub fn serve(
     for (index, stream) in listener.incoming().enumerate() {
         if let Ok(stream) = stream {
             // A failed connection only affects that client.
-            let _ = handle(stream, home, expected_head, port, &mut cache);
+            let _ = handle(stream, home, expected, port, &mut cache);
         }
         if max_requests.is_some_and(|max| index + 1 >= max) {
             break;
@@ -101,7 +101,7 @@ pub fn serve(
 fn handle(
     mut stream: TcpStream,
     home: &Home,
-    expected_head: Option<&str>,
+    expected: ExpectedHeads<'_>,
     port: u16,
     cache: &mut Cache,
 ) -> std::io::Result<()> {
@@ -125,7 +125,7 @@ fn handle(
         respond_with(
             &String::from_utf8_lossy(&buffer),
             home,
-            expected_head,
+            expected,
             port,
             cache,
         )
@@ -201,7 +201,16 @@ impl Response {
 
 /// Answers one raw request with a fresh [`Cache`].
 pub fn respond(request: &str, home: &Home, expected_head: Option<&str>, port: u16) -> Response {
-    respond_with(request, home, expected_head, port, &mut Cache::default())
+    respond_with(
+        request,
+        home,
+        ExpectedHeads {
+            receipts: expected_head,
+            approvals: None,
+        },
+        port,
+        &mut Cache::default(),
+    )
 }
 
 /// Answers one raw request. Only GET; the Host header must name this
@@ -210,7 +219,7 @@ pub fn respond(request: &str, home: &Home, expected_head: Option<&str>, port: u1
 pub fn respond_with(
     request: &str,
     home: &Home,
-    expected_head: Option<&str>,
+    expected: ExpectedHeads<'_>,
     port: u16,
     cache: &mut Cache,
 ) -> Response {
@@ -284,7 +293,7 @@ pub fn respond_with(
         "/api/state" => match Query::parse(query) {
             Ok(query) => {
                 let reports = cache.reports(home);
-                let snapshot = cache.get(home, expected_head);
+                let snapshot = cache.get(home, expected);
                 let mut state = page_state(home, snapshot, &query);
                 state["reports"] = reports;
                 Response::json(&state)
@@ -297,7 +306,7 @@ pub fn respond_with(
                     .into_iter()
                     .find_map(|(key, value)| (key == "id").then_some(value))
             });
-            let snapshot = cache.get(home, expected_head);
+            let snapshot = cache.get(home, expected);
             match id.and_then(|id| snapshot.by_evidence.get(&id).copied()) {
                 Some(index) => {
                     let approval_status =
@@ -350,7 +359,7 @@ pub struct Cache {
 
 impl Cache {
     /// The current snapshot, verified again if a file changed.
-    pub fn get(&mut self, home: &Home, expected_head: Option<&str>) -> &Snapshot {
+    pub fn get(&mut self, home: &Home, expected: ExpectedHeads<'_>) -> &Snapshot {
         // Stamped before reading: a write during verification changes the
         // stamp, and the next request verifies again.
         let stamps = stamps(home);
@@ -360,7 +369,7 @@ impl Cache {
         );
         if !fresh {
             self.verifications += 1;
-            self.snapshot = Some(Snapshot::read(home, expected_head, stamps));
+            self.snapshot = Some(Snapshot::read(home, expected, stamps));
         }
         self.snapshot.as_ref().expect("set above")
     }
@@ -465,11 +474,11 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn read(home: &Home, expected_head: Option<&str>, stamps: Option<Vec<FileStamp>>) -> Self {
-        let (verify, lines) = match receipts::verify_journal(home, expected_head) {
+    fn read(home: &Home, expected: ExpectedHeads<'_>, stamps: Option<Vec<FileStamp>>) -> Self {
+        let (verify, lines) = match receipts::verify_journal_with(home, expected) {
             Ok(mut report) => {
                 let lines = std::mem::take(&mut report.lines);
-                (verify_view(&report, home, expected_head), lines)
+                (verify_view(&report, home, expected), lines)
             }
             Err(error) => {
                 // Pins or journal unreadable: show the receipts, not verified.
@@ -1092,7 +1101,19 @@ fn reports_view(home: &Home, mut file: impl FnMut(&Path, &str) -> Option<ReportF
 /// Everything, read and verified now, with every receipt in journal order.
 /// The page uses [`page_state`]; this is the whole view, for tests.
 pub fn state(home: &Home, expected_head: Option<&str>) -> Value {
-    let snapshot = Snapshot::read(home, expected_head, None);
+    state_with(
+        home,
+        ExpectedHeads {
+            receipts: expected_head,
+            approvals: None,
+        },
+    )
+}
+
+/// [`state`] with both expected heads, as `dashboard --expected-head
+/// --expected-approval-head` passes them.
+pub fn state_with(home: &Home, expected: ExpectedHeads<'_>) -> Value {
+    let snapshot = Snapshot::read(home, expected, None);
     let approval_status = crate::approvals::status_by_evidence(home).unwrap_or_default();
     let receipts: Vec<Value> = snapshot
         .lines
@@ -1157,7 +1178,7 @@ fn pending_view(home: &Home, snapshot: &Snapshot, status: &BTreeMap<String, Stri
     }
 }
 
-fn verify_view(report: &VerifyReport, home: &Home, expected_head: Option<&str>) -> Value {
+fn verify_view(report: &VerifyReport, home: &Home, expected: ExpectedHeads<'_>) -> Value {
     json!({
         "status": if report.failures.is_empty() { "ok" } else { "fail" },
         "total": report.total,
@@ -1167,13 +1188,14 @@ fn verify_view(report: &VerifyReport, home: &Home, expected_head: Option<&str>) 
         "chained": report.chained,
         "unchained": report.unchained,
         "head": report.head.map(|head| json!({"next_seq": head.seq, "prev": head.prev.to_string()})),
-        "expected_head": expected_head,
+        "expected_head": expected.receipts,
         "attester_pin": home.attester_pin().display().to_string(),
         "issuer_pins": home.issuer_pins().display().to_string(),
         "approval": {
             "decisions": report.approval_decisions,
             "executions": report.approval_executions,
             "head": report.approval_head,
+            "expected_head": expected.approvals,
         },
     })
 }

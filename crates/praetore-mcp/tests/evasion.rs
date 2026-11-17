@@ -478,6 +478,89 @@ fn truncating_the_approval_journal_lets_a_used_approval_run_again() {
     }
 }
 
+/// The head on the `approval journal: ... head HEX` line of `verify`.
+fn printed_approval_head(out: &Output) -> String {
+    let text = stdout(out);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("approval journal: "))
+        .expect("verify prints the approval journal line");
+    let head = line.rsplit(" head ").next().unwrap().to_owned();
+    assert!(
+        head.len() == 64 && head.chars().all(|c| c.is_ascii_hexdigit()),
+        "{line}"
+    );
+    head
+}
+
+fn verify_with_approval_head(home: &Home, head: &str) -> Output {
+    cli(&[
+        "verify",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--expected-approval-head",
+        head,
+    ])
+}
+
+/// (c) `verify --expected-approval-head`: the approval journal must end at
+/// the head printed earlier. It passes at that head, and fails once the
+/// last record is cut or the file is deleted, while plain `verify` passes.
+/// A malformed head is a usage error.
+#[test]
+fn verify_with_the_expected_approval_head_fails_after_a_cut_or_a_deletion() {
+    let (temp, home) = init_home();
+    let arguments = json!({"path": temp.path().join("t.txt").to_str().unwrap(), "text": "a"});
+    hold_and_approve(&home, &arguments);
+    let (_, stderr) = wrap(&home, &[call(11, "append", arguments.clone())]);
+    assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
+    let head = printed_approval_head(&verify(&home));
+    let out = verify_with_approval_head(&home, &head);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let both = cli(&[
+        "verify",
+        "--dir",
+        home.root.to_str().unwrap(),
+        "--expected-head",
+        &printed_head(&verify(&home)),
+        "--expected-approval-head",
+        &head,
+    ]);
+    assert!(both.status.success(), "{}", stdout(&both));
+
+    let journal = approval_journal(&home);
+    let text = fs::read_to_string(&journal).unwrap();
+    let first = text.lines().next().unwrap().to_owned();
+    fs::write(&journal, format!("{first}\n")).unwrap();
+    assert!(
+        verify(&home).status.success(),
+        "plain verify passes after the cut"
+    );
+    let out = verify_with_approval_head(&home, &head);
+    assert_eq!(out.status.code(), Some(1), "cut: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("does not match the expected approval head"),
+        "{}",
+        stdout(&out)
+    );
+
+    fs::remove_file(&journal).unwrap();
+    let out = verify_with_approval_head(&home, &head);
+    assert_eq!(out.status.code(), Some(1), "deleted: {}", stdout(&out));
+    assert!(
+        stdout(&out).contains("approval journal has no head"),
+        "{}",
+        stdout(&out)
+    );
+
+    let out = verify_with_approval_head(&home, "abc");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--expected-approval-head must be 64"),
+        "{out:?}"
+    );
+}
+
 /// The `sh` block of README.md (Local approval) that saves and checks the
 /// approval head, run as written, with `SAVED` from the environment instead
 /// of its placeholder line.
@@ -488,8 +571,12 @@ fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
         .split("```sh\n")
         .skip(1)
         .filter_map(|rest| rest.split_once("```").map(|(block, _)| block))
-        .find(|block| block.contains("approval journal still holds"))
+        .find(|block| block.contains("approval journal still ends at"))
         .expect("README.md has the approval head check");
+    assert!(
+        block.contains("--expected-approval-head"),
+        "the README check no longer uses --expected-approval-head"
+    );
     let script: String = block
         .lines()
         .filter(|line| !line.starts_with("SAVED="))
@@ -517,9 +604,9 @@ fn readme_approval_head_check(home: &Home, saved: &str) -> (String, String) {
     (printed.join("\n"), (*verdict).to_owned())
 }
 
-/// n3: the README command that replaces "compare by hand". A head saved
-/// after a run stays valid when later approvals are added, and fails once
-/// the journal is cut before it or deleted.
+/// The README command that checks a saved approval head with
+/// `verify --expected-approval-head`: the head printed after a run passes,
+/// a later approval moves it, and cutting or deleting the journal fails.
 #[cfg(unix)]
 #[test]
 fn the_readme_approval_head_check_finds_a_cut_or_deleted_journal() {
@@ -529,37 +616,38 @@ fn the_readme_approval_head_check_finds_a_cut_or_deleted_journal() {
     let (_, stderr) = wrap(&home, &[call(11, "append", first.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
 
-    let (saved, verdict) = readme_approval_head_check(&home, "none");
+    let (saved, verdict) = readme_approval_head_check(&home, &"0".repeat(64));
     assert!(
         saved.len() == 64 && saved.chars().all(|c| c.is_ascii_hexdigit()),
         "printed head: {saved:?}"
     );
     assert_eq!(verdict, "approval journal changed or verify failed");
     let (_, verdict) = readme_approval_head_check(&home, &saved);
-    assert_eq!(verdict, format!("approval journal still holds {saved}"));
+    assert_eq!(verdict, format!("approval journal still ends at {saved}"));
 
-    // A later approval, decided and used: the saved head is still in the chain.
+    // A later approval, decided and used, moves the head: the old one no
+    // longer passes, the new one does.
     let second = json!({"path": temp.path().join("b.txt").to_str().unwrap(), "text": "b"});
     hold_and_approve(&home, &second);
     let (_, stderr) = wrap(&home, &[call(12, "append", second.clone())]);
     assert_eq!(executed(&stderr, "append"), 1, "{stderr}");
     let (now, verdict) = readme_approval_head_check(&home, &saved);
     assert_ne!(now, saved, "the head moved");
-    assert_eq!(verdict, format!("approval journal still holds {saved}"));
+    assert_eq!(verdict, "approval journal changed or verify failed");
+    let (_, verdict) = readme_approval_head_check(&home, &now);
+    assert_eq!(verdict, format!("approval journal still ends at {now}"));
 
-    // The first execution record dropped, with everything after it: the
-    // first approval can run again, and the check fails.
+    // The last execution record dropped: the check with the saved head fails.
     let journal = approval_journal(&home);
     let text = fs::read_to_string(&journal).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "two decisions, two executions");
-    fs::write(&journal, format!("{}\n", lines[0])).unwrap();
-    assert!(verify(&home).status.success(), "plain verify still passes");
-    let (_, verdict) = readme_approval_head_check(&home, &saved);
+    fs::write(&journal, format!("{}\n", lines[..3].join("\n"))).unwrap();
+    let (_, verdict) = readme_approval_head_check(&home, &now);
     assert_eq!(verdict, "approval journal changed or verify failed");
 
     fs::remove_file(&journal).unwrap();
-    let (printed, verdict) = readme_approval_head_check(&home, &saved);
+    let (printed, verdict) = readme_approval_head_check(&home, &now);
     assert_eq!(printed, "", "no head to print");
     assert_eq!(verdict, "approval journal changed or verify failed");
 }

@@ -365,11 +365,46 @@ pub struct LineVerdict {
     pub verified: bool,
 }
 
+/// Heads printed by an earlier `verify` and kept where the journals'
+/// writers cannot change them. Each journal must still end at its head.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpectedHeads<'a> {
+    /// `--expected-head`: the receipts journal.
+    pub receipts: Option<&'a str>,
+    /// `--expected-approval-head`: `approvals/journal.jsonl`.
+    pub approvals: Option<&'a str>,
+}
+
+/// [`verify_journal_with`] with only the receipts head.
+pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<VerifyReport, String> {
+    verify_journal_with(
+        home,
+        ExpectedHeads {
+            receipts: expected_head,
+            approvals: None,
+        },
+    )
+}
+
 /// Verifies every receipt and the order of the journal: no entry removed,
 /// duplicated or reordered between the first and the last chained entry.
-/// Entries removed at the end are only detected with `expected_head`.
-pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<VerifyReport, String> {
-    let expected_head = expected_head
+/// Entries removed at the end are only detected with an expected head:
+/// `expected.receipts` for the receipts journal, `expected.approvals` for
+/// the approval journal.
+pub fn verify_journal_with(
+    home: &Home,
+    expected: ExpectedHeads<'_>,
+) -> Result<VerifyReport, String> {
+    let expected_approval_head = expected
+        .approvals
+        .map(|text| {
+            (text.len() == 64 && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+                .then_some(text)
+                .ok_or("--expected-approval-head must be 64 lowercase hex characters")
+        })
+        .transpose()?;
+    let expected_head = expected
+        .receipts
         .map(|text| {
             praetore_core::journal_chain::ChainLink::from_hex(text)
                 .ok_or("--expected-head must be 64 lowercase hex characters")
@@ -447,6 +482,18 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
     }
     let approvals = crate::approvals::verify(home, &parsed_evidence)?;
     report.failures.extend(approvals.failures);
+    if let Some(expected) = expected_approval_head {
+        match approvals.head.as_deref() {
+            Some(head) if head == expected => {}
+            Some(head) => report.failures.push(format!(
+                "FAIL approval journal head {head} ({} decision(s), {} execution(s)) does not match the expected approval head {expected}: records were removed or added",
+                approvals.decisions, approvals.executions
+            )),
+            None => report.failures.push(format!(
+                "FAIL approval journal has no head (absent or empty); expected {expected}: records were removed"
+            )),
+        }
+    }
     report.approval_decisions = approvals.decisions;
     report.approval_executions = approvals.executions;
     report.approval_head = approvals.head;

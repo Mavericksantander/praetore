@@ -178,6 +178,7 @@ const I18N = {
     head_none: (c, u) => `Sin head (${c} encadenadas, ${u} sin encadenar)`,
     head_warn: "Guarda este head fuera de esta máquina y pásalo como --expected-head: sin él no se detectan entradas borradas al final del journal.",
     expected_head: (h) => `Comparado con --expected-head ${h}.`,
+    expected_approval_head: (h) => `Comparado con --expected-approval-head ${h}.`,
     failures: "Fallas reportadas por verify",
     appr_journal: "Journal de aprobaciones",
     appr_text: (d, e) => `${d} decisiones, ${e} ejecuciones`, appr_none: "Todavía no hay decisiones de aprobación.",
@@ -347,6 +348,7 @@ const I18N = {
     head_none: (c, u) => `No head (${c} chained, ${u} unchained)`,
     head_warn: "Keep this head outside this machine and pass it as --expected-head: without it, entries removed at the end of the journal are not detected.",
     expected_head: (h) => `Compared with --expected-head ${h}.`,
+    expected_approval_head: (h) => `Compared with --expected-approval-head ${h}.`,
     failures: "Failures reported by verify",
     appr_journal: "Approval journal",
     appr_text: (d, e) => `${d} decision(s), ${e} execution(s)`, appr_none: "No approval decisions yet.",
@@ -516,6 +518,7 @@ const I18N = {
     head_none: (c, u) => `Sem head (${c} encadeadas, ${u} não encadeadas)`,
     head_warn: "Guarde este head fora desta máquina e passe-o como --expected-head: sem ele, entradas apagadas no fim do journal não são detectadas.",
     expected_head: (h) => `Comparado com --expected-head ${h}.`,
+    expected_approval_head: (h) => `Comparado com --expected-approval-head ${h}.`,
     failures: "Falhas reportadas pelo verify",
     appr_journal: "Journal de aprovações",
     appr_text: (d, e) => `${d} decisões, ${e} execuções`, appr_none: "Ainda não há decisões de aprovação.",
@@ -2154,6 +2157,7 @@ function renderIntegrity() {
   } else {
     appr.append(el("p", { class: "card-sub" }, t("appr_none")));
   }
+  if (v.approval.expected_head) appr.append(el("p", { class: "mono" }, t("expected_approval_head", v.approval.expected_head)));
   root.append(appr);
 
   root.append(el("div", { class: "card section-gap" }, el("h2", {}, t("home_dir")),

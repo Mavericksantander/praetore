@@ -180,7 +180,7 @@ fn pdf_and_json_download_byte_for_byte_with_attachment_headers() {
     let served = home.clone();
     let count = names.len();
     let server = std::thread::spawn(move || {
-        dashboard::serve(&listener, &served, None, Some(count)).unwrap();
+        dashboard::serve(&listener, &served, Default::default(), Some(count)).unwrap();
     });
     for name in &names {
         let response = http(
@@ -391,7 +391,7 @@ fn the_state_lists_close_reports_with_regenerations_grouped_apart() {
     let (_temp, home) = home_with_reports();
     let mut cache = dashboard::Cache::default();
     let raw = "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n";
-    let response = dashboard::respond_with(raw, &home, None, 8787, &mut cache);
+    let response = dashboard::respond_with(raw, &home, Default::default(), 8787, &mut cache);
     assert_eq!(response.status, 200);
     let state: Value = serde_json::from_slice(&response.body).unwrap();
     let items = state["reports"]["items"].as_array().unwrap();
@@ -433,7 +433,7 @@ fn the_state_lists_close_reports_with_regenerations_grouped_apart() {
     }
     assert_eq!(regens[0]["header"]["verify"]["result"], "passed");
     // A second request reads only what changed; the answer is the same.
-    let again = dashboard::respond_with(raw, &home, None, 8787, &mut cache);
+    let again = dashboard::respond_with(raw, &home, Default::default(), 8787, &mut cache);
     let again: Value = serde_json::from_slice(&again.body).unwrap();
     assert_eq!(again["reports"], state["reports"]);
 }
@@ -599,7 +599,7 @@ fn served_names(home: &Home) -> Vec<String> {
 
 fn api_reports(home: &Home, cache: &mut dashboard::Cache) -> Value {
     let raw = "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:8787\r\n\r\n";
-    let response = dashboard::respond_with(raw, home, None, 8787, cache);
+    let response = dashboard::respond_with(raw, home, Default::default(), 8787, cache);
     assert_eq!(response.status, 200);
     serde_json::from_slice::<Value>(&response.body).unwrap()["reports"].clone()
 }

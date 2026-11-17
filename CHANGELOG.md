@@ -4,6 +4,15 @@
 
 ### Added
 
+- **praetore-mcp: `verify --expected-approval-head HEX`.** The approval
+  journal must end at a head printed earlier, as `--expected-head` does
+  for the receipts journal: records cut from the end, or the whole file
+  deleted, fail `verify`. `dashboard` takes the same flag, and the session
+  report prints `praetore-mcp verify --dir DIR --expected-head ...
+  --expected-approval-head ...` with both heads at close (JSON
+  `verify_command`, and the last section of the PDF). The README check of
+  a saved approval head uses the flag.
+
 - **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
   in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
   open, even when the MCP client starts `wrap` with a filtered environment.

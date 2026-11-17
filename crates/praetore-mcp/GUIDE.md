@@ -418,7 +418,7 @@ The verification status, per receipt and for the whole journal, comes from
 the same code as `praetore-mcp verify` and is also shown in the sidebar. It
 covers the receipts only. It includes the journal order (seq/prev) and the
 journal head. Keep the head outside this machine. `--expected-head HEX`
-works as it does for `verify`. The result is kept in memory and computed
+and `--expected-approval-head HEX` work as they do for `verify`. The result is kept in memory and computed
 again when any file `verify` reads (the journal files, the attester and
 issuer pins, the approver pin, the approval journal) changes length,
 modification time, change time or inode. On a platform without change times
@@ -644,9 +644,10 @@ Read these before relying on anything above.
    A process that can act as this user can open a terminal and approve.
    That is not a guarantee that a person reviewed the call. The terminal
    check is cooperative. Deleting or truncating `approvals/journal.jsonl`
-   lets an approval be used again. `verify` does not detect that deletion
-   or truncation unless you check a saved approval head; the command is in
-   the README, Local approval. There is no flag for that head. The v0.3.3 `praetore-mcp verify` does
+   lets an approval be used again. `verify` detects that deletion or
+   truncation only with `--expected-approval-head HEX`, a head printed
+   earlier and kept off this machine; the command is in the README, Local
+   approval. The v0.3.3 `praetore-mcp verify` does
    not read 0.3.4 receipts. Observe mode
    does not hold the call; `praetore-mcp receipts` shows
    `enforce would ask` on that receipt.

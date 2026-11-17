@@ -26,8 +26,8 @@ Usage:
                          [--mode observe|enforce] [--dry-run] [--yes]
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
-  praetore-mcp verify    [--dir DIR] [--expected-head HEX]
-  praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]
+  praetore-mcp verify    [--dir DIR] [--expected-head HEX] [--expected-approval-head HEX]
+  praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
   praetore-mcp report    [--dir DIR] [--session ID | --last]
   praetore-mcp approvals [--dir DIR]
   praetore-mcp approve   <id> [--dir DIR]
@@ -188,7 +188,8 @@ for a new approval. The rejection is signed with the local approver key.
 
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
 
-const VERIFY_HELP: &str = "Usage: praetore-mcp verify [--dir DIR] [--expected-head HEX]
+const VERIFY_HELP: &str =
+    "Usage: praetore-mcp verify [--dir DIR] [--expected-head HEX] [--expected-approval-head HEX]
 
 Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
@@ -208,6 +209,12 @@ earlier) still verify.
                        wrapped servers cannot write: the journal must end at
                        it. Without it, entries removed at the end of the
                        journal are not detected.
+  --expected-approval-head HEX
+                       approval head printed by an earlier run (the line
+                       `approval journal: ... head HEX`), kept the same way:
+                       approvals/journal.jsonl must end at it. Without it,
+                       records removed at the end of that journal, or the
+                       whole file, are not detected.
 
 Entries written by an earlier praetore-mcp version (unchained) are verified
 one by one and counted apart; they may only come before the first chained
@@ -217,7 +224,7 @@ Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
 cannot be read.";
 
 const DASHBOARD_HELP: &str =
-    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]
+    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
 
 Serves a read-only page over the receipts journal at http://127.0.0.1:N/
 (127.0.0.1 only, never another address). It shows what the agent is doing
@@ -240,6 +247,8 @@ Any local process of any user can open the page and read what it shows
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --port N             TCP port on 127.0.0.1 (default 8787; 0 picks a free port)
   --expected-head HEX  passed to the same check as `verify --expected-head`
+  --expected-approval-head HEX
+                       passed to the same check as `verify --expected-approval-head`
 
 Exit code: 2 on a usage error or if the port cannot be opened; otherwise it
 runs until stopped.";
@@ -766,9 +775,20 @@ fn cmd_receipts(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_verify(args: &[String]) -> Result<i32, String> {
-    let parsed = parse(args, &["--dir", "--expected-head"], &[], false)?;
+    let parsed = parse(
+        args,
+        &["--dir", "--expected-head", "--expected-approval-head"],
+        &[],
+        false,
+    )?;
     let home = parsed.home()?;
-    let report = receipts::verify_journal(&home, parsed.value("--expected-head"))?;
+    let report = receipts::verify_journal_with(
+        &home,
+        receipts::ExpectedHeads {
+            receipts: parsed.value("--expected-head"),
+            approvals: parsed.value("--expected-approval-head"),
+        },
+    )?;
     for failure in &report.failures {
         println!("{failure}");
     }
@@ -826,7 +846,17 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
 }
 
 fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
-    let parsed = parse(args, &["--dir", "--port", "--expected-head"], &[], false)?;
+    let parsed = parse(
+        args,
+        &[
+            "--dir",
+            "--port",
+            "--expected-head",
+            "--expected-approval-head",
+        ],
+        &[],
+        false,
+    )?;
     let port = match parsed.value("--port") {
         None => crate::dashboard::DEFAULT_PORT,
         Some(value) => value
@@ -839,6 +869,12 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
     {
         return Err("--expected-head must be 64 lowercase hex characters".into());
     }
+    let expected_approval_head = parsed.value("--expected-approval-head");
+    if let Some(head) = expected_approval_head
+        && !(head.len() == 64 && head.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+    {
+        return Err("--expected-approval-head must be 64 lowercase hex characters".into());
+    }
     let home = parsed.home()?;
     let listener = crate::dashboard::bind(port)?;
     let address = listener
@@ -847,7 +883,11 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
     println!("praetore-mcp dashboard (read-only): http://{address}/");
     println!("home: {}", home.root.shown());
     println!("listening on 127.0.0.1 only; stop with Ctrl-C");
-    crate::dashboard::serve(&listener, &home, expected_head, None)?;
+    let expected = receipts::ExpectedHeads {
+        receipts: expected_head,
+        approvals: expected_approval_head,
+    };
+    crate::dashboard::serve(&listener, &home, expected, None)?;
     Ok(0)
 }
 
