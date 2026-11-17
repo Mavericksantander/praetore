@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeSet, HashSet},
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -1308,6 +1307,8 @@ pub fn verdict_from(evidence: &Evidence, journaled: Result<PathBuf, String>) -> 
 
 /// Hash-linked JSONL journal: `receipts/<UTC date>.jsonl`, one chained
 /// entry per line (see [`crate::journal`]), fsynced after each write.
+/// A short or failed write is truncated back to the previous length
+/// (`journal_io`), so the receipt is not persisted.
 pub struct Journal {
     dir: PathBuf,
     /// `verify` on this journal's home, for the errors that send there.
@@ -1358,32 +1359,19 @@ impl Journal {
 }
 
 fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(crate::journal::nofollow_flag());
-    }
-    // Creating the daily file adds an entry to the directory: fsync the
-    // directory too, or a crash could lose the file with its receipts.
-    let (mut file, created) = match options.open(path) {
-        Ok(file) => (file, false),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            (options.create_new(true).open(path)?, true)
-        }
-        Err(error) => return Err(error),
-    };
-    // One write per line; the journal lock keeps concurrent wrappers (one
-    // per server) from interleaving.
-    file.write_all(bytes)?;
-    file.sync_data()?;
-    if created && let Some(dir) = path.parent() {
-        crate::fsutil::sync_dir(dir)?;
-    }
-    Ok(())
+    // One line per append. The journal lock keeps concurrent wrappers (one
+    // per server) from interleaving. The shared helper rolls a short or
+    // failed write back to the previous length.
+    crate::journal_io::append_journal_file(path, bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn seed_one_receipt(home: &Home) -> PathBuf {
+    let gate = Gate::load(home, Mode::Observe).unwrap();
+    let evidence = gate
+        .evaluate_evidence("s", &json!({"name": "echo", "arguments": {"n": 1}}))
+        .unwrap();
+    gate.journal.append(&evidence).unwrap()
 }
 
 #[cfg(test)]
@@ -2765,5 +2753,38 @@ mod tests {
             journal.path_for(at),
             PathBuf::from("/receipts/2026-05-28.jsonl")
         );
+    }
+
+    /// A writer that stores 180 bytes of a 401-byte line and then stops.
+    /// The receipts file stays at its previous length and `verify` still passes.
+    #[test]
+    fn receipt_journal_short_write_keeps_previous_length() {
+        fail_receipt_append(
+            crate::journal_io::FaultMode::Short,
+            std::io::ErrorKind::StorageFull,
+        );
+    }
+
+    /// Same prefix, then `StorageFull` (ENOSPC) after the file has grown.
+    #[test]
+    fn receipt_journal_enospc_keeps_previous_length() {
+        fail_receipt_append(
+            crate::journal_io::FaultMode::StorageFull,
+            std::io::ErrorKind::StorageFull,
+        );
+    }
+
+    fn fail_receipt_append(mode: crate::journal_io::FaultMode, kind: std::io::ErrorKind) {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let path = seed_one_receipt(&home);
+        let original = fs::read(&path).unwrap();
+        assert!(original.ends_with(b"\n"));
+        let mut writer =
+            crate::journal_io::FaultyFile::open(&path, crate::journal_io::PROBE_ROOM, mode)
+                .unwrap();
+        let error =
+            crate::journal_io::commit_journal_line(&mut writer, &crate::journal_io::line_of_401())
+                .unwrap_err();
+        crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
     }
 }
