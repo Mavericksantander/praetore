@@ -294,9 +294,10 @@ Checked with the real apps on macOS (arm64): Claude Desktop
 (`~/Library/Application Support/Claude/claude_desktop_config.json`) and
 Cursor (`~/.cursor/mcp.json`), each with `install --mode enforce` in front of
 `@modelcontextprotocol/server-filesystem@2.1.0` launched with `npx`, and a
-`deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused
-with the rule and evidence id shown in the chat, the file was not created,
-and `verify` checked every receipt. Not checked: Windows, Linux, VS Code.
+`deny` rule for `write_file`: reads were ALLOWed, `write_file` was refused,
+the file was not created, and `verify` checked every receipt. On a DENY the
+client sees only `Denied by PRÆTORE. Evidence id: <id>`, whatever decided
+it; the rule is on stderr and in the signed receipt. Not checked: Windows, Linux, VS Code.
 
 A config file that two default paths resolve to (for example Cursor's
 `~/.cursor/mcp.json` and `./.cursor/mcp.json` when run from `~`, or a
