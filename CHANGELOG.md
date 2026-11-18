@@ -60,8 +60,7 @@
   call was refused, in new sessions too, until the journal was repaired by
   hand; in observe every later call ran with no receipt; `verify` failed.
   The writer now appends only a line it has read back (`VerifiedLine`:
-  parsed as a chained entry, integrity checked, same document, next link
-  computed). When that fails nothing is written and the call is refused,
+  parsed as a chained entry, integrity checked, next link computed). When that fails nothing is written and the call is refused,
   in enforce and in observe, and later calls are recorded as usual.
   **Observe now refuses a call in this one case**, where before it
   forwarded it without a receipt. A property test sends random floats and

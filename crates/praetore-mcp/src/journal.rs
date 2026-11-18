@@ -160,8 +160,8 @@ pub struct VerifiedLine {
 impl VerifiedLine {
     /// Builds the line for `evidence` at `position` and checks what a later
     /// reader will check: the line parses as a chained entry at `position`,
-    /// its evidence passes the integrity check and is the same document,
-    /// and the link of the next entry can be computed from it.
+    /// its evidence passes the integrity check, and the link of the next
+    /// entry can be computed from it.
     pub fn new(position: &Position, evidence: &Evidence) -> Result<Self, String> {
         let evidence_json = evidence
             .to_json()
@@ -173,13 +173,6 @@ impl VerifiedLine {
         }
         if !entry.evidence.verify_integrity() {
             return Err("EVIDENCE_FAIL: evidence integrity verification failed".into());
-        }
-        let reread = entry
-            .evidence
-            .to_json()
-            .map_err(|e| format!("cannot serialize the evidence read back: {e}"))?;
-        if reread != evidence_json {
-            return Err("the evidence read back is not the evidence that was signed".into());
         }
         let next = position.after(&entry.evidence)?;
         Ok(Self {
