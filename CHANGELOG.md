@@ -64,6 +64,13 @@
   holds for a bad `approval_ttl_seconds` in `config.toml`. Action: fix or
   delete the file the message names.
 
+### Changed
+
+- **Observability: praetore-mcp observe warnings for ambiguous client lines
+  include the SHA-256 and length of the raw line.** The warning names the
+  line the same way the warning for an unparseable line does, so the
+  forwarded line can be matched in a capture.
+
 ### Fixed
 
 - **praetore-mcp: `verify --expected-head` passed with receipts added
