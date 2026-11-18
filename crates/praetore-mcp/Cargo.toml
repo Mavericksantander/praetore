@@ -40,6 +40,8 @@ libc = "0.2.189"
 # G7 runtime tests count engine calls with the test-only probe.
 praetore-core = { path = "../praetore-core", features = ["test-probe"] }
 libc = "0.2.189"
+# tests/journal_verified_line.rs: random numbers through wrap, then verify.
+proptest = "1"
 tempfile = "3"
 # tests/lint_guard.rs reads Cargo.toml and .cargo/config.toml tables.
 toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
