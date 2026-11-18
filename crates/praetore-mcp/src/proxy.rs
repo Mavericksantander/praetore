@@ -5,6 +5,7 @@
 
 use crate::{
     gate::{Evaluator, GateError, Mode, Verdict},
+    journal::JournalError,
     json::JsonValue,
 };
 use praetore_core::DecisionOutcome;
@@ -412,6 +413,23 @@ fn decide_verdict(
     warnings: &mut Vec<String>,
 ) -> CallDecision {
     if let Err(error) = &verdict.journaled {
+        // A receipt that would not verify when read back is never written,
+        // and its call is not forwarded in either mode: the call would run
+        // with no receipt, and no later repair of the journal could add one.
+        if let JournalError::Unverifiable(_) = error {
+            warnings.push(format!(
+                "praetore-mcp: ERROR receipt for {server}/{tool} (evidence {}) was not written: {error}; call REFUSED ({mode}). A number in the arguments does not survive being written and read back; send it in the form it prints as",
+                verdict.evidence_id,
+                mode = match mode {
+                    Mode::Enforce => "enforce",
+                    Mode::Observe => "observe: this call cannot have a receipt",
+                }
+            ));
+            return CallDecision::Block(format!(
+                "PRÆTORE could not write a receipt for this tool call that verifies when read back, so it was refused. Evidence id: {}",
+                verdict.evidence_id
+            ));
+        }
         match mode {
             Mode::Enforce => {
                 warnings.push(format!(
@@ -773,7 +791,7 @@ mod tests {
 
     struct Fixed {
         result: Result<DecisionOutcome, String>,
-        journal_ok: bool,
+        journal_error: Option<JournalError>,
         calls: Vec<(String, Value)>,
     }
 
@@ -781,7 +799,7 @@ mod tests {
         fn new(result: Result<DecisionOutcome, String>) -> Self {
             Self {
                 result,
-                journal_ok: true,
+                journal_error: None,
                 calls: Vec::new(),
             }
         }
@@ -797,10 +815,9 @@ mod tests {
                 evidence_id: Uuid::nil(),
                 rule_ids: vec!["rule-x".into()],
                 reason: "Policy rule 'rule-x' matched".into(),
-                journaled: if self.journal_ok {
-                    Ok(PathBuf::from("/j"))
-                } else {
-                    Err("disk full".into())
+                journaled: match &self.journal_error {
+                    None => Ok(PathBuf::from("/j")),
+                    Some(error) => Err(error.clone()),
                 },
                 consumed_approval: None,
                 hold_message: None,
@@ -941,10 +958,36 @@ mod tests {
         assert!(out.warnings[0].contains("WITHOUT a receipt"));
     }
 
+    /// A receipt that would not verify when read back: the call is not
+    /// forwarded in either mode, and the client gets a reply with its id.
+    #[test]
+    fn an_unverifiable_receipt_refuses_the_call_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+            eval.journal_error = Some(JournalError::Unverifiable("EVIDENCE_FAIL".into()));
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{mode:?}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{mode:?}");
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not write a receipt"),
+                "{reply}"
+            );
+            assert!(
+                out.warnings[0].contains("was not written") && out.warnings[0].contains("REFUSED"),
+                "{:?}",
+                out.warnings
+            );
+        }
+    }
+
     #[test]
     fn journal_failure_refuses_in_enforce_and_warns_in_observe() {
         let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
-        eval.journal_ok = false;
+        eval.journal_error = Some(JournalError::Unavailable("disk full".into()));
         let out = handle_client_line(CALL, Mode::Enforce, "fs", &mut eval);
         assert!(out.to_server.is_none());
         assert!(out.to_client.is_some());

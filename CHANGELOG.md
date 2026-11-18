@@ -53,6 +53,20 @@
 
 ### Fixed
 
+- **praetore-mcp: one number could stop the receipts journal for good.**
+  The writer appended a receipt without reading it back, and only the next
+  append read that line. A call with a float such as `99.9999999999999929`
+  left a line that fails its own integrity check: in enforce every later
+  call was refused, in new sessions too, until the journal was repaired by
+  hand; in observe every later call ran with no receipt; `verify` failed.
+  The writer now appends only a line it has read back (`VerifiedLine`:
+  parsed as a chained entry, integrity checked, next link computed). When that fails nothing is written and the call is refused,
+  in enforce and in observe, and later calls are recorded as usual.
+  **Observe now refuses a call in this one case**, where before it
+  forwarded it without a receipt. A property test sends random floats and
+  number literals through `wrap` in both modes and runs `verify`
+  (`tests/journal_verified_line.rs`).
+
 - **praetore-mcp: the gate decided on a number the server did not read.**
   `serde_json` was built without `float_roundtrip`, so the proxy read
   `49.9999999999999965` as 49.99999999999999 while it forwarded the

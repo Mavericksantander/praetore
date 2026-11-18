@@ -11,6 +11,7 @@
 //! retry are ordinary evidence lines. Putting decisions in that chain would
 //! have changed how v0.3.3 lines are linked.
 
+use crate::journal::JournalError;
 use crate::shown::Show;
 use crate::store::{self, Home};
 use ed25519_dalek::{Signer, SigningKey};
@@ -105,7 +106,7 @@ pub enum HoldOrForward {
     /// (or that could not be written: `journaled` is the error).
     Failed {
         evidence: Box<Evidence>,
-        journaled: Result<PathBuf, String>,
+        journaled: Result<PathBuf, JournalError>,
         error: String,
     },
 }
@@ -113,7 +114,7 @@ pub enum HoldOrForward {
 /// The receipt written for a call on the approval path, and where.
 struct Written {
     evidence: Evidence,
-    journaled: Result<PathBuf, String>,
+    journaled: Result<PathBuf, JournalError>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +206,7 @@ pub fn on_require_approval(
     params: &Value,
     held: &Evidence,
     sign_forward: &dyn Fn(&str) -> Result<Evidence, String>,
-    journal: &dyn Fn(&Evidence) -> Result<PathBuf, String>,
+    journal: &dyn Fn(&Evidence) -> Result<PathBuf, JournalError>,
 ) -> HoldOrForward {
     let mut written = None;
     match hold_or_forward(
@@ -238,7 +239,7 @@ fn hold_or_forward(
     params: &Value,
     held: &Evidence,
     sign_forward: &dyn Fn(&str) -> Result<Evidence, String>,
-    journal: &dyn Fn(&Evidence) -> Result<PathBuf, String>,
+    journal: &dyn Fn(&Evidence) -> Result<PathBuf, JournalError>,
     written: &mut Option<Written>,
 ) -> Result<HoldOrForward, String> {
     let binding = binding_from_call(server, params)?;
