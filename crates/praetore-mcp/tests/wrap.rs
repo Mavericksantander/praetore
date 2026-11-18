@@ -1614,11 +1614,20 @@ fn oversized_lines_are_refused_in_observe_too() {
     assert!(stderr.contains("REFUSED client message over"), "{stderr}");
     assert!(!stderr.contains("EXECUTED safety"), "{stderr}");
     assert!(stderr.contains("EXECUTED echo"), "{stderr}");
+    let refusal = by_id(&responses, &json!("big"));
+    assert_eq!(refusal["jsonrpc"], "2.0");
+    assert_eq!(refusal["error"]["code"], -32600, "{refusal}");
+    assert!(
+        refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("32 MiB"),
+        "{refusal}"
+    );
     assert_eq!(
         by_id(&responses, &json!("after"))["result"]["isError"],
         false
     );
-    assert!(responses.iter().all(|r| r["id"] != "big"));
 }
 
 /// The head line counts the chained entries present in the journal, not the

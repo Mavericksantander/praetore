@@ -725,9 +725,12 @@ Things to know:
     rounded f64. A client that prints large or small floats with an
     exponent (JavaScript and Python do, for example `1e+21`) is refused in
     enforce for those values.
-* Client lines over 32 MiB are refused in both modes, with a stderr
-  warning: they are not parsed, so they cannot be checked for a `safety*`
-  tool (G7).
+* Client lines over 32 MiB are refused in both modes. They are not parsed
+  and not forwarded, so they cannot be checked for a `safety*` tool (G7).
+  The client gets a JSON-RPC error instead of waiting: `-32600` with the
+  request `id` when that value is complete in the first 32 MiB, otherwise
+  `-32700` with `id` null. The following line is handled normally. A stderr
+  line names the refusal.
 * If the home cannot be loaded when `wrap` starts (not initialized, or
   missing or invalid keys, pins, authority or policy), **both modes refuse
   every `tools/call` (fail closed)** and gate the remaining traffic as
