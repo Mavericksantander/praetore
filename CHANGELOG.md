@@ -41,6 +41,19 @@
 
 ### Breaking
 
+- **praetore-mcp: `verify` exits 0 only against both heads; without them
+  it exits 3.** A journal rewritten from the first entry with the keys in
+  the home, or cut at the end, passed `verify` as `OK`: every check read
+  only the home. `verify` now has three results: `OK` (exit 0) when both
+  `--expected-head` and `--expected-approval-head` are given and both
+  journals end exactly there, `UNANCHORED` (exit 3) when every check
+  passed but a head is missing, with a warning that says what cannot be
+  detected, and `FAIL` (exit 1). Both options take `none` for a journal
+  that must not exist yet. **A script that runs `verify` without the
+  heads and expects exit 0 now gets 3.** `init` prints how to save the
+  heads, and the dashboard state has `verify.assurance`
+  (`anchored`, `unanchored`, `failed`).
+
 - **praetore-mcp: an invalid TTL source stops `wrap` even when another one
   wins.** Before, only the source in use was read:
   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` hid a bad `approvals/ttl-seconds`
@@ -58,6 +71,66 @@
   to get no reply and wait for its own timeout. It now gets `-32600` with
   the request id when that value is complete in the first 32 MiB, or
   `-32700` with `id` null when it is not. The next line is answered normally.
+
+- **praetore-mcp: `verify --expected-head` passed with receipts added
+  before the chain.** A bare evidence line placed before the first chained
+  entry was counted as an "unchained earlier entry" and verified, and the
+  head did not cover it. `verify` now rebuilds the chain from the head
+  backwards (`journal::Chain::rebuild`; the head is `--expected-head`, or
+  the last entry without it) and fails unless the lines of the journal
+  are exactly that chain, in order. A line outside the chain, a missing
+  entry and a reordered entry each fail, with the file and line.
+  **Breaking: a journal with lines written by 0.3.3 or earlier no longer
+  verifies.** Those lines have no `seq` or `prev`; move that journal out
+  of `receipts/` to keep it. An entry removed from the middle now also
+  fails the entries before it, which the chain no longer reaches.
+
+- **praetore-mcp: keys were read through symlinks.** A scratch home whose
+  `keys` was a symlink to another home's `keys/`, with a policy that
+  allows everything, loaded: `wrap` signed receipts with the other home's
+  keys, and the process that set it up never opened a key file. Keys are
+  now reached only through `KeyPath`: `DIR/keys` must be a real directory
+  and each key a regular file with one name, both owned by the user
+  running praetore-mcp, no directory above them may be a symlink made by a
+  user, and the file is opened with `O_NOFOLLOW`. On such a layout `wrap`
+  refuses every `tools/call` in both modes, and `init`, `verify` and
+  `policy check` exit non-zero. **A home under a symlinked directory that
+  a user made (for example a symlinked `~/.praetore`) no longer loads**;
+  move the home to its real path. Symlinks owned by root, such as `/tmp`
+  on macOS, are accepted.
+
+- **praetore-mcp: one number could stop the receipts journal for good.**
+  The writer appended a receipt without reading it back, and only the next
+  append read that line. A call with a float such as `99.9999999999999929`
+  left a line that fails its own integrity check: in enforce every later
+  call was refused, in new sessions too, until the journal was repaired by
+  hand; in observe every later call ran with no receipt; `verify` failed.
+  The writer now appends only a line it has read back (`VerifiedLine`:
+  parsed as a chained entry, integrity checked, next link computed). When that fails nothing is written and the call is refused,
+  in enforce and in observe, and later calls are recorded as usual.
+  **Observe now refuses a call in this one case**, where before it
+  forwarded it without a receipt. A property test sends random floats and
+  number literals through `wrap` in both modes and runs `verify`
+  (`tests/journal_verified_line.rs`).
+
+- **praetore-mcp: the gate decided on a number the server did not read.**
+  `serde_json` was built without `float_roundtrip`, so the proxy read
+  `49.9999999999999965` as 49.99999999999999 while it forwarded the
+  original bytes, which the server reads as 50.0. A rule `DENY amount >=
+  50` let that call through with an ALLOW receipt that verified; the same
+  literal skipped a REQUIRE_APPROVAL rule and misread `Exact`, `In`, `>`
+  and `<=`. A literal such as `99.9999999999999929` also left a receipt
+  that `verify` could not read, after which enforce refused every call.
+  `serde_json` is now built with `float_roundtrip` in praetore-mcp,
+  praetore-core, praetore-verify and praetore-receipt, and a number in the
+  `params` of a `tools/call` whose text is not the canonical form of its
+  value makes the line ambiguous: enforce refuses it and names the form to
+  send, observe forwards it and warns. This also refuses `50.00`, exponent
+  forms such as `1e2`, `-0` and integers above 2^64 - 1 in enforce. CI
+  checks the feature in every package that ships `serde_json`
+  (`scripts/check-float-roundtrip.sh`) and runs a table of boundary
+  literals against a server that logs the value it read
+  (`tests/numeric_gate.rs`).
 
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode

@@ -71,6 +71,27 @@ fn a_home_written_by_0_3_6_still_verifies_with_both_heads() {
     );
 }
 
+/// The same home with the receipts head and `--expected-approval-head
+/// none`: the approval journal is there, so the saved state "no approval
+/// journal" does not hold.
+#[test]
+fn an_approval_journal_fails_the_expected_state_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    copy_dir(&fixture("0.3.6"), &home);
+    let out = verify(
+        &home,
+        "8bb82a68865e714262fef57ce0f506834e2b6e1e0968f39f96fb07f7bd015446",
+        "none",
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("--expected-approval-head none says there was none: records were added"),
+        "{stdout}"
+    );
+}
+
 /// The home written after 0.3.6 verifies too; its forwarded receipt names
 /// the approval, and deleting the approval journal then fails `verify`,
 /// which it does not for the 0.3.6 home.
@@ -106,8 +127,9 @@ fn a_deleted_approval_journal_fails_only_the_home_whose_receipts_name_it() {
     copy_dir(&fixture("0.3.6"), &old);
     fs::remove_file(old.join("approvals/journal.jsonl")).unwrap();
     let out = plain(&old);
+    // Nothing fails; without the heads the result is "not anchored".
     assert!(
-        out.status.success(),
+        out.status.code() == Some(3),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );

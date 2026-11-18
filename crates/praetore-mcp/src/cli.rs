@@ -65,6 +65,8 @@ Exit codes:
        allowed only by an allow-all rule, or `install` / `uninstall` could
        not read, parse or write a config (or was not confirmed)
   2    usage error, or the command could not run (message on stderr)
+  3    `verify` found nothing wrong but was not given both heads kept
+       outside this machine (UNANCHORED): not a pass, see `verify --help`
   wrap exits with the MCP server's exit code; 127 if the server cannot be
        started, 1 if the server was killed by a signal. SIGINT or SIGTERM
        to wrap ends wrap by that signal";
@@ -205,8 +207,10 @@ Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
 decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
-previous one, so an entry removed, duplicated or reordered before the last
-one is reported. Prints the head (entry count and last link).
+previous one, and the lines of the journal must be exactly the chain that
+ends at the head (the --expected-head, or the last entry without it). A
+line outside that chain, a missing entry and a reordered entry all fail.
+Prints the head (entry count and last link).
 
 Also checks DIR/approvals/journal.jsonl when it exists: the approver
 signature, that the decision is bound to the held receipt, that an
@@ -217,21 +221,28 @@ earlier) still verify.
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --expected-head HEX  head printed by an earlier run and kept somewhere the
                        wrapped servers cannot write: the journal must end at
-                       it. Without it, entries removed at the end of the
-                       journal are not detected.
+                       it. `none` for a journal that must still be empty.
   --expected-approval-head HEX
                        approval head printed by an earlier run (the line
                        `approval journal: ... head HEX`), kept the same way:
-                       approvals/journal.jsonl must end at it. Without it,
-                       records removed at the end of that journal, or the
-                       whole file, are not detected.
+                       approvals/journal.jsonl must end at it. `none` when
+                       there must be no approval journal.
 
-Entries written by an earlier praetore-mcp version (unchained) are verified
-one by one and counted apart; they may only come before the first chained
-entry.
+A result has one of three levels, in the first word of the summary line:
+  OK          every check passed and both journals end at the states given
+              with the two options above.
+  UNANCHORED  every check passed, but one of the two options was not given.
+              The keys that sign receipts and approvals are files in the
+              home: a journal rewritten with them, or cut at the end, passes
+              every check that reads only the home. This is not a pass.
+  FAIL        a check failed.
 
-Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
-cannot be read.";
+A line written by praetore-mcp 0.3.3 or earlier (a bare evidence document,
+unchained) is not part of any chain and fails, wherever it is.
+
+Exit code: 0 for OK, 3 for UNANCHORED, 1 for FAIL, 2 if the journal or the
+pins cannot be read or the arguments are wrong. A script that checks only
+for exit 0 therefore passes only with both heads.";
 
 const DASHBOARD_HELP: &str =
     "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
@@ -519,6 +530,16 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!("  To see what the policy decides for each tool of a server:");
             println!("    {program} policy coverage --server NAME{dir} -- <server command>");
             println!("  Next: {program} install --dry-run{dir}");
+            println!();
+            println!(
+                "  Evidence: `verify` passes (exit 0) only against two heads kept outside this"
+            );
+            println!("  machine. After a session you trust, run:");
+            println!("    {program} verify{dir}");
+            println!("  and keep the two heads it prints where this machine cannot write. Later:");
+            println!("    {program} verify{dir} --expected-head HEX --expected-approval-head HEX");
+            println!("  Without them verify exits 3 (not anchored): the keys are files in this");
+            println!("  home, and a journal rewritten with them cannot be told from this one.");
         }
     }
     if !matches!(outcome, InitOutcome::Created) {
@@ -794,6 +815,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         false,
     )?;
     let home = parsed.home()?;
+    crate::keypath::check_home_keys(&home)?;
     let report = receipts::verify_journal_with(
         &home,
         receipts::ExpectedHeads {
@@ -815,13 +837,10 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         .iter()
         .map(|(k, v)| (k.as_str(), *v))
         .collect();
+    let assurance = report.assurance();
     println!(
         "{} {} receipts: {} verified, {} failed | mode: {} | decision: {}",
-        if report.failures.is_empty() {
-            "OK"
-        } else {
-            "FAIL"
-        },
+        assurance.label(),
         report.total,
         report.ok,
         report.failures.len(),
@@ -835,7 +854,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     match report.head {
         Some(head) => println!(
-            "journal head: {} chained entries present, next seq {}, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
+            "journal head: {} chained entries present, next seq {}, head {} ({} unchained lines); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
             report.chained, head.seq, head.prev, report.unchained
         ),
         None => println!(
@@ -854,7 +873,24 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     println!(
         "approval checks: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it). An observe REQUIRE_APPROVAL receipt means enforce would ask; it is not a hold."
     );
-    Ok(if report.failures.is_empty() { 0 } else { 1 })
+    match &assurance {
+        receipts::Assurance::Anchored => println!(
+            "anchored: both journals end exactly at the states given with --expected-head and --expected-approval-head."
+        ),
+        receipts::Assurance::Unanchored { missing } => {
+            println!(
+                "WARNING: NOT ANCHORED (exit {}). {} not given. Every check above reads only this home, and the keys that sign receipts and approvals are files in it: without a head kept outside this machine, verify cannot detect a journal rewritten with those keys, or entries removed at the end. This result is not a pass.",
+                receipts::UNANCHORED_EXIT,
+                missing.join(" and ")
+            );
+            println!(
+                "to anchor: keep the two heads printed above somewhere this machine cannot write, and pass them next time as --expected-head HEX --expected-approval-head HEX (use `{}` for a journal that does not exist yet).",
+                receipts::NO_JOURNAL
+            );
+        }
+        receipts::Assurance::Failed => {}
+    }
+    Ok(assurance.exit_code())
 }
 
 fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
@@ -1173,6 +1209,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
         "check" => {
             let parsed = parse(rest, &["--dir"], &[], false)?;
             let home = parsed.home()?;
+            crate::keypath::check_home_keys(&home)?;
             let path = home.policy();
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
