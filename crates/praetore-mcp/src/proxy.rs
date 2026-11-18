@@ -252,6 +252,19 @@ fn classify_text(text: &str) -> Classified {
         Ok(value) => value,
         Err(error) => return Classified::Unparseable(error),
     };
+    // A number whose text is not the canonical serialization of a correct
+    // parse is not forwarded. The bytes would be executed as a different
+    // value from the one the policy compared (binary64 rounding, or an
+    // integer a binary64 parser cannot hold).
+    if let Some(reason) = value.number_ambiguity() {
+        let mut candidates = Vec::new();
+        collect_calls(&value, &mut candidates);
+        return Classified::Ambiguous {
+            reason,
+            candidates,
+            unparsed: false,
+        };
+    }
     match &value {
         JsonValue::Object(_) => match check_message(&value) {
             Ok(Some(call)) => Classified::ToolCall(call),
@@ -1104,14 +1117,63 @@ mod tests {
         assert_eq!(reply[1]["id"], "b");
         assert_eq!(reply[1]["result"]["isError"], true);
 
-        // Nothing blocked: original bytes (including number formatting).
-        let raw = br#"[{"jsonrpc":"2.0","id":1.50,"method":"tools/call","params":{"name":"x","arguments":{"n":1e2}}}]"#;
+        // Nothing blocked: original bytes, including a canonical fraction.
+        // `1.50` and `1e2` are not canonical and are refused above this path.
+        let raw = br#"[{"jsonrpc":"2.0","id":1.5,"method":"tools/call","params":{"name":"x","arguments":{"n":100.0}}}]"#;
         let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
         assert_eq!(
             out.to_server.as_deref().map(|b| &b[..b.len() - 1]),
             Some(&raw[..])
         );
+    }
+
+    #[test]
+    fn noncanonical_number_is_ambiguous_refused_in_enforce_and_recorded_in_observe() {
+        let raw = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pay","arguments":{"amount":49.9999999999999965}}}"#;
+        let classified = classify(raw);
+        let Classified::Ambiguous {
+            reason, candidates, ..
+        } = &classified
+        else {
+            panic!("expected ambiguous, got {classified:?}");
+        };
+        assert!(reason.contains("49.9999999999999965"), "{reason}");
+        assert!(reason.contains("50.0"), "{reason}");
+        assert_eq!(candidates.len(), 1);
+
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let enforced = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
+        assert!(
+            enforced.to_server.is_none(),
+            "enforce forwarded the literal"
+        );
+        assert!(
+            enforced
+                .warnings
+                .iter()
+                .any(|line| line.contains("ambiguous")),
+            "{:?}",
+            enforced.warnings
+        );
+        assert_eq!(
+            eval.calls.len(),
+            0,
+            "enforce evaluated a non-canonical number"
+        );
+
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let observed = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert!(observed.to_server.is_some(), "observe dropped the line");
+        assert!(
+            observed
+                .warnings
+                .iter()
+                .any(|line| line.contains("ambiguous") && line.contains("49.9999999999999965")),
+            "{:?}",
+            observed.warnings
+        );
+        assert_eq!(eval.calls.len(), 1, "observe did not record the call");
     }
 
     #[test]

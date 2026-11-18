@@ -16,7 +16,7 @@ praetore-gateway = { path = "../praetore-gateway" }
 praetore-receipt = { path = "../praetore-receipt" }
 praetore-core = { path = "../praetore-core" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value", "float_roundtrip"] }
 sha2 = "0.11.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", default-features = false }

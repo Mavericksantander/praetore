@@ -35,7 +35,7 @@ praetore-replay-postgres = { path = "../praetore-replay-postgres" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value", "float_roundtrip"] }
 sha2 = "0.11.0"
 subtle = "2.6.1"
 time = { version = "0.3", features = ["formatting", "parsing"] }

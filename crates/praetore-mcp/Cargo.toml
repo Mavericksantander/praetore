@@ -25,7 +25,7 @@ pdf-writer = "0.15"
 praetore-core = { path = "../praetore-core" }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0", features = ["raw_value"] }
+serde_json = { version = "1.0", features = ["raw_value", "float_roundtrip"] }
 sha2 = "0.11.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 unicode-normalization = "0.1.26"
@@ -46,3 +46,6 @@ toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 
 [[example]]
 name = "fake_server"
+
+[[example]]
+name = "number_probe"

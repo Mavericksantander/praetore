@@ -25,6 +25,8 @@ jobs:
         with:
           components: clippy, rustfmt
       - run: cargo test --workspace --locked
+      - name: serde_json float_roundtrip on client and journal parsers
+        run: scripts/check-serde-json-float-roundtrip.sh
       # G7: shown separately so the log shows each test ran. A renamed or
       # missing test fails the step (the counts are pinned).
       - name: G7 safety actions never reach the evaluator (output shown)
