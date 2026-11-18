@@ -66,6 +66,13 @@
 
 ### Fixed
 
+- **praetore-mcp: a `[table]` line in `config.toml` stops `wrap`.** The file
+  is a flat list of `key = value` lines. A header such as `[tabla]` or
+  `[[tabla]]` used to be a warning (`expected key = value; ignored`) and
+  the keys under it were still applied. `wrap` now exits 2 and does not
+  start the server. A bad `report` value or an unknown key is still a
+  warning.
+
 - **praetore-mcp: `verify --expected-head` passed with receipts added
   before the chain.** A bare evidence line placed before the first chained
   entry was counted as an "unchained earlier entry" and verified, and the
