@@ -159,9 +159,13 @@ pub struct VerifyReport {
     pub chained: u64,
     /// Position after the last chained entry: `seq` is the next sequence
     /// number (the last entry's `seq` + 1, not a count of the entries
-    /// present, see `chained`) and `prev` the link to keep somewhere the
-    /// journal's writers cannot change and pass back as `expected_head`.
+    /// present, see `chained`) and `prev` the chain link.
     pub head: Option<Position>,
+    /// Anchor compared with `--expected-head`. `unchained` counts the bare
+    /// lines before the chain, so those lines are inside the anchor.
+    /// `None` when [`head`](Self::head) is `None` and there is no unchained
+    /// line, or when a chained entry could not be linked.
+    pub journal_head: Option<crate::journal::JournalHead>,
     pub by_mode: BTreeMap<String, usize>,
     pub by_decision: BTreeMap<&'static str, usize>,
     pub approval_decisions: usize,
@@ -388,9 +392,14 @@ pub fn verify_journal(home: &Home, expected_head: Option<&str>) -> Result<Verify
 
 /// Verifies every receipt and the order of the journal: no entry removed,
 /// duplicated or reordered between the first and the last chained entry.
-/// Entries removed at the end are only detected with an expected head:
-/// `expected.receipts` for the receipts journal, `expected.approvals` for
-/// the approval journal.
+/// Entries removed at the end, and unchained lines added or removed before
+/// the chain, are detected with an expected head: `expected.receipts` is
+/// the receipts token ([`crate::journal::JournalHead`]), `expected.approvals`
+/// is the approval journal's link.
+///
+/// The approval journal has no unchained lines. Every line is `seq`, `prev`
+/// and `record`, and a line that is not that shape fails to parse, so
+/// `--expected-approval-head` stays the 64-hex link.
 pub fn verify_journal_with(
     home: &Home,
     expected: ExpectedHeads<'_>,
@@ -405,10 +414,7 @@ pub fn verify_journal_with(
         .transpose()?;
     let expected_head = expected
         .receipts
-        .map(|text| {
-            praetore_core::journal_chain::ChainLink::from_hex(text)
-                .ok_or("--expected-head must be 64 lowercase hex characters")
-        })
+        .map(crate::journal::JournalHead::parse_expected)
         .transpose()?;
     let attester = store::read_attester_pin(&home.attester_pin())?;
     let pins = store::read_issuer_pins(&home.issuer_pins())?;
@@ -468,12 +474,15 @@ pub fn verify_journal_with(
     report.chained = chain.chained;
     report.unchained = chain.unchained;
     report.head = chain.head();
+    report.journal_head = chain.journal_head();
     if let Some(expected) = expected_head {
-        match report.head {
-            Some(head) if head.prev == expected => {}
+        match report.journal_head {
+            Some(head) if head == expected => {}
             Some(head) => report.failures.push(format!(
-                "FAIL journal head {} ({} chained entries present, next seq {}) does not match the expected head {expected}: entries were removed or added",
-                head.prev, report.chained, head.seq
+                "FAIL journal head {head} ({} chained entries present, {} unchained, next seq {}) does not match the expected head {expected}: entries were removed or added",
+                report.chained,
+                report.unchained,
+                report.head.map(|position| position.seq).unwrap_or(0)
             )),
             None => report.failures.push(format!(
                 "FAIL journal has no verifiable head; expected {expected}"

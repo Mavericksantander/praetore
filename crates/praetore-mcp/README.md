@@ -314,10 +314,16 @@ when a new daily file is created). Each line is
 [`docs/proposals/journal-chain-jsonl.md`](../../docs/proposals/journal-chain-jsonl.md)):
 `seq` counts from 0 across all daily files and `prev` is the hash link of the
 previous entry. `praetore-mcp verify` reports an entry that was removed,
-duplicated or reordered before the last one, and prints the head (entry
-count and last link). Entries removed at the end of the journal leave a
+duplicated or reordered before the last one, and prints the head token
+`<unchained>.<chained>.<64 lowercase hex>`. `unchained` is the number of
+bare lines before the chain, `chained` is how many chained entries are
+present, and the 64 hex characters are the chain link (64 zeros when there
+are unchained lines and no chained entry). `--expected-head` takes that
+token. Adding or removing an unchained line changes it. A bare 64-hex
+link, the head printed before this token, is rejected with an error and
+does not verify. Entries removed at the end of the journal leave a
 valid shorter chain: they are only detected with `verify --expected-head`
-against a head kept where the wrapped servers cannot write. Without that,
+against a token kept where the wrapped servers cannot write. Without that,
 the journal shows what is in it, not that nothing is missing. Lines written
 by earlier versions (a bare evidence document) still verify, are counted as
 unchained, and may only come before the first chained entry. The v0.3.3
@@ -329,7 +335,7 @@ interrupted write), nothing more is appended: enforce refuses calls and
 observe warns until the journal is checked. A daily file that starts at
 `seq` 0 (and has at most 4096 entries) also verifies with `praetore-verify
 journal --journal FILE --attester-pin attester-public-key.hex`, with the same
-head. Each `evidence` is a complete
+chain link (the 64 hex characters in the token when `unchained` is 0). Each `evidence` is a complete
 PRÆTORE HighAssurance (`v2`) `Evidence` document:
 
 * `action`: `action_type` `mcp.tools/call`, `target` = server name,

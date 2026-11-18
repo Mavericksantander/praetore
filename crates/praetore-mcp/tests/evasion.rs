@@ -366,12 +366,16 @@ fn a_receipts_journal_cut_mid_line_fails_verify() {
     assert!(!out.status.success(), "{}", stdout(&out));
 }
 
-/// The receipts journal head that `verify` prints.
+/// The receipts journal head token that `verify` prints
+/// (`<unchained>.<chained>.<link>`).
 fn printed_head(out: &Output) -> String {
     let text = stdout(out);
     let at = text.find(" head ").expect("verify prints the journal head") + " head ".len();
-    let head = &text[at..at + 64];
-    assert!(head.chars().all(|c| c.is_ascii_hexdigit()), "{text}");
+    let head = text[at..].split_whitespace().next().expect("head token");
+    assert!(
+        praetore_mcp::journal::JournalHead::parse(head).is_some(),
+        "{text}"
+    );
     head.to_owned()
 }
 
@@ -383,6 +387,55 @@ fn verify_with_head(home: &Home, head: &str) -> Output {
         "--expected-head",
         head,
     ])
+}
+
+/// (c) Detectado después con `--expected-head`. A bare evidence line
+/// prepended before the chain does not change the chain link. The head
+/// token counts those lines, so the saved token no longer matches. A bare
+/// 64-hex link, the previous head text, is rejected and does not match.
+#[test]
+fn prepending_a_valid_unchained_line_fails_verify_with_the_expected_head() {
+    let (_temp, home) = three_receipts();
+    let before = verify(&home);
+    assert!(before.status.success(), "{}", stdout(&before));
+    let head = printed_head(&before);
+    let files = receipt_files(&home);
+    let original = fs::read_to_string(&files[0]).unwrap();
+    let (out, stderr) = wrap(&home, &[call(9, "echo", json!({"n": 9}))]);
+    assert!(out.status.success(), "{stderr}");
+    let text = fs::read_to_string(&files[0]).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert_eq!(format!("{}\n", lines[..3].join("\n")), original);
+    let marker = "\"evidence\":";
+    let start = lines[3].find(marker).unwrap() + marker.len();
+    let bare = &lines[3][start..lines[3].len() - 1];
+    assert!(bare.starts_with('{') && bare.ends_with('}'), "{bare}");
+    fs::write(&files[0], format!("{bare}\n{original}")).unwrap();
+
+    let out = verify(&home);
+    let report = stdout(&out);
+    assert!(out.status.success(), "{report}");
+    assert!(report.contains("1 unchained"), "{report}");
+    let out = verify_with_head(&home, &head);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stdout(&out).contains("does not match the expected head"),
+        "{}",
+        stdout(&out)
+    );
+    let fresh = printed_head(&verify(&home));
+    assert_ne!(fresh, head);
+    assert!(verify_with_head(&home, &fresh).status.success(), "{fresh}");
+
+    let legacy = head.rsplit_once('.').unwrap().1.to_owned();
+    assert_eq!(legacy.len(), 64);
+    let out = verify_with_head(&home, &legacy);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("legacy 64-hex link"),
+        "{out:?}"
+    );
 }
 
 /// (c) Detectado después con `--expected-head` (head guardado fuera de la

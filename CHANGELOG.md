@@ -41,6 +41,16 @@
 
 ### Breaking
 
+- **praetore-mcp: `--expected-head` is `<unchained>.<chained>.<64 hex>`.**
+  The token counts bare evidence lines before the chain, so adding or
+  removing one of them no longer leaves the chain link unchanged. A bare
+  64-hex link, the head printed before this token, is rejected (exit 2)
+  and does not verify. The 64 hex characters are still the chain link
+  (`praetore-verify journal` prints that link for a daily file that starts
+  at seq 0, when `unchained` is 0). `--expected-approval-head` stays 64
+  hex: every approval line is chained. Action: print the head again and
+  keep the token, not the link alone.
+
 - **praetore-mcp: an invalid TTL source stops `wrap` even when another one
   wins.** Before, only the source in use was read:
   `PRAETORE_MCP_APPROVAL_TTL_SECONDS` hid a bad `approvals/ttl-seconds`

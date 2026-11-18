@@ -144,7 +144,8 @@ pub fn valid_session_id(id: &str) -> bool {
 /// The heads of both journals.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Heads {
-    /// Next sequence number and link after the last chained receipt.
+    /// Next sequence number and the `--expected-head` token
+    /// (`<unchained>.<chained>.<link>`).
     pub receipt: Option<(u64, String)>,
     pub approval: Option<String>,
 }
@@ -175,7 +176,12 @@ impl Heads {
 
     fn of(report: &VerifyReport) -> Self {
         Self {
-            receipt: report.head.map(|head| (head.seq, head.prev.to_string())),
+            receipt: report.journal_head.map(|head| {
+                (
+                    report.head.map(|position| position.seq).unwrap_or(0),
+                    head.to_string(),
+                )
+            }),
             approval: report.approval_head.clone(),
         }
     }

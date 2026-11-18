@@ -171,7 +171,7 @@ fn assert_state_matches_verify(home: &Home) -> Value {
             report.contains(&format!(
                 "next seq {}, head {}",
                 head["next_seq"],
-                head["prev"].as_str().unwrap()
+                head["token"].as_str().unwrap()
             )),
             "{report}"
         ),
@@ -408,7 +408,7 @@ fn verification_status_matches_verify_when_an_entry_is_removed() {
 #[test]
 fn verification_status_matches_verify_with_an_expected_head() {
     let (_temp, home) = home_with_receipts();
-    let wrong = "0".repeat(64);
+    let wrong = format!("0.999999.{}", "ab".repeat(32));
     let state = dashboard::state(&home, Some(&wrong));
     let out = run(
         &[

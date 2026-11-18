@@ -1378,7 +1378,16 @@ fn verify_output(home: &Home, extra: &[&str]) -> (Option<i32>, String) {
 
 fn head_of(report: &str) -> String {
     let start = report.find(" head ").unwrap() + " head ".len();
-    report[start..start + 64].to_owned()
+    let token = report[start..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(
+        praetore_mcp::journal::JournalHead::parse(&token).is_some(),
+        "{report}"
+    );
+    token
 }
 
 /// Journal order: the journal is a hash chain. Every entry carries `seq` and
@@ -1441,9 +1450,26 @@ fn verify_detects_removed_duplicated_reordered_and_truncated_entries() {
         "{report}"
     );
 
-    // An expected head that is not 64 lowercase hex is a usage error.
+    // An expected head that is not the token is a usage error. Upper case
+    // is not the token, and neither is the bare link it used to be.
     let (code, _) = verify_output(&home, &["--expected-head", &head.to_uppercase()]);
-    assert_ne!(code, Some(0));
+    assert_eq!(code, Some(2));
+    let legacy = head.rsplit_once('.').unwrap().1;
+    let out = run(
+        &[
+            "verify",
+            "--dir",
+            home.root.to_str().unwrap(),
+            "--expected-head",
+            legacy,
+        ],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("legacy 64-hex link"),
+        "{out:?}"
+    );
 }
 
 /// A whole daily file removed from the middle of the journal breaks the

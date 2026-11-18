@@ -26,8 +26,8 @@ Usage:
                          [--mode observe|enforce] [--dry-run] [--yes]
   praetore-mcp uninstall [--client claude-desktop|cursor|vscode] [--config FILE] [--dry-run] [--yes]
   praetore-mcp receipts  [--dir DIR] [--tail N]
-  praetore-mcp verify    [--dir DIR] [--expected-head HEX] [--expected-approval-head HEX]
-  praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
+  praetore-mcp verify    [--dir DIR] [--expected-head TOKEN] [--expected-approval-head HEX]
+  praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head TOKEN] [--expected-approval-head HEX]
   praetore-mcp report    [--dir DIR] [--session ID | --last]
   praetore-mcp approvals [--dir DIR]
   praetore-mcp approve   <id> [--dir DIR]
@@ -199,14 +199,15 @@ for a new approval. The rejection is signed with the local approver key.
   --dir DIR   home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)";
 
 const VERIFY_HELP: &str =
-    "Usage: praetore-mcp verify [--dir DIR] [--expected-head HEX] [--expected-approval-head HEX]
+    "Usage: praetore-mcp verify [--dir DIR] [--expected-head TOKEN] [--expected-approval-head HEX]
 
 Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
 decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
 previous one, so an entry removed, duplicated or reordered before the last
-one is reported. Prints the head (entry count and last link).
+one is reported. Prints the head token
+<unchained>.<chained>.<64 lowercase hex>.
 
 Also checks DIR/approvals/journal.jsonl when it exists: the approver
 signature, that the decision is bound to the held receipt, that an
@@ -215,26 +216,31 @@ one approval was not used twice. Homes without that file (v0.3.3 and
 earlier) still verify.
 
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
-  --expected-head HEX  head printed by an earlier run and kept somewhere the
-                       wrapped servers cannot write: the journal must end at
-                       it. Without it, entries removed at the end of the
-                       journal are not detected.
+  --expected-head TOKEN
+                       head token printed by an earlier run and kept somewhere
+                       the wrapped servers cannot write: <unchained>.<chained>.<64 lowercase hex>.
+                       unchained is the number of bare lines before the chain.
+                       A bare 64-hex link is a legacy head and is rejected.
+                       Without this token, entries removed at the end of the
+                       journal, and unchained lines added or removed before
+                       the chain, are not detected.
   --expected-approval-head HEX
                        approval head printed by an earlier run (the line
                        `approval journal: ... head HEX`), kept the same way:
                        approvals/journal.jsonl must end at it. Without it,
                        records removed at the end of that journal, or the
-                       whole file, are not detected.
+                       whole file, are not detected. Every approval line is
+                       chained, so this value stays 64 lowercase hex.
 
 Entries written by an earlier praetore-mcp version (unchained) are verified
 one by one and counted apart; they may only come before the first chained
-entry.
+entry. Their count is part of the head token.
 
 Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
 cannot be read.";
 
 const DASHBOARD_HELP: &str =
-    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
+    "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head TOKEN] [--expected-approval-head HEX]
 
 Serves a read-only page over the receipts journal at http://127.0.0.1:N/
 (127.0.0.1 only, never another address). It shows what the agent is doing
@@ -256,7 +262,8 @@ Any local process of any user can open the page and read what it shows
 
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --port N             TCP port on 127.0.0.1 (default 8787; 0 picks a free port)
-  --expected-head HEX  passed to the same check as `verify --expected-head`
+  --expected-head TOKEN
+                       passed to the same check as `verify --expected-head`
   --expected-approval-head HEX
                        passed to the same check as `verify --expected-approval-head`
 
@@ -833,10 +840,12 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         home.attester_pin().shown(),
         home.issuer_pins().shown()
     );
-    match report.head {
+    match report.journal_head {
         Some(head) => println!(
-            "journal head: {} chained entries present, next seq {}, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
-            report.chained, head.seq, head.prev, report.unchained
+            "journal head: {} chained entries present, next seq {}, head {head} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed or added, including unchained lines before the chain",
+            head.chained,
+            report.head.map(|position| position.seq).unwrap_or(0),
+            head.unchained
         ),
         None => println!(
             "journal head: none ({} chained, {} unchained entries)",
@@ -876,10 +885,8 @@ fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
             .map_err(|_| format!("--port must be a number from 0 to 65535, got {value:?}"))?,
     };
     let expected_head = parsed.value("--expected-head");
-    if let Some(head) = expected_head
-        && praetore_core::journal_chain::ChainLink::from_hex(head).is_none()
-    {
-        return Err("--expected-head must be 64 lowercase hex characters".into());
+    if let Some(head) = expected_head {
+        crate::journal::JournalHead::parse_expected(head)?;
     }
     let expected_approval_head = parsed.value("--expected-approval-head");
     if let Some(head) = expected_approval_head

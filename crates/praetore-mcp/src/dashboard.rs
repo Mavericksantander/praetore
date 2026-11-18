@@ -1187,7 +1187,15 @@ fn verify_view(report: &VerifyReport, home: &Home, expected: ExpectedHeads<'_>) 
         "failures": report.failures,
         "chained": report.chained,
         "unchained": report.unchained,
-        "head": report.head.map(|head| json!({"next_seq": head.seq, "prev": head.prev.to_string()})),
+        "head": report.journal_head.map(|head| json!({
+            "next_seq": report.head.map(|position| position.seq).unwrap_or(0),
+            "prev": report.head.map(|position| position.prev.to_string()).unwrap_or_else(|| {
+                praetore_core::journal_chain::ChainLink::GENESIS.to_string()
+            }),
+            "unchained": head.unchained,
+            "chained": head.chained,
+            "token": head.token(),
+        })),
         "expected_head": expected.receipts,
         "attester_pin": home.attester_pin().display().to_string(),
         "issuer_pins": home.issuer_pins().display().to_string(),

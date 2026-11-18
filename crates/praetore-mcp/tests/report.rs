@@ -275,9 +275,10 @@ fn a_session_with_allow_deny_and_an_approval_writes_both_files() {
     let verified = receipts::verify_journal(&home, None).unwrap();
     assert!(verified.failures.is_empty(), "{:?}", verified.failures);
     let head = verified.head.unwrap();
+    let token = verified.journal_head.unwrap().to_string();
     assert_eq!(
         header["receipt_journal_head"],
-        json!({"next_seq": head.seq, "head": head.prev.to_string()})
+        json!({"next_seq": head.seq, "head": token})
     );
     assert_eq!(
         header["approval_journal_head"],
@@ -290,7 +291,7 @@ fn a_session_with_allow_deny_and_an_approval_writes_both_files() {
         command,
         format!(
             "praetore-mcp verify --dir DIR --expected-head {} --expected-approval-head {}",
-            head.prev,
+            token,
             verified.approval_head.as_deref().unwrap()
         )
     );

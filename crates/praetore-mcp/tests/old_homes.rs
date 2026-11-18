@@ -43,6 +43,35 @@ fn verify(home: &Path, receipts_head: &str, approval_head: &str) -> Output {
         .unwrap()
 }
 
+fn plain(home: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_praetore-mcp"))
+        .args(["verify", "--dir", home.to_str().unwrap()])
+        .output()
+        .unwrap()
+}
+
+/// The token `verify` prints for the receipts journal. Its link component
+/// is `legacy`, the 64-hex head of the release that wrote the home, and
+/// passing that bare link is an error.
+fn token_for(home: &Path, legacy: &str) -> String {
+    let out = plain(home);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    let at = stdout.find(" head ").expect("head line") + " head ".len();
+    let token = stdout[at..].split_whitespace().next().unwrap().to_owned();
+    assert!(
+        token.starts_with("0.") && token.ends_with(legacy),
+        "token {token} does not keep the legacy link {legacy}"
+    );
+    let legacy_out = verify(home, legacy, &"0".repeat(64));
+    assert_eq!(legacy_out.status.code(), Some(2), "{legacy_out:?}");
+    assert!(
+        String::from_utf8_lossy(&legacy_out.stderr).contains("legacy 64-hex link"),
+        "{legacy_out:?}"
+    );
+    token
+}
+
 /// A 0.3.6 home: no receipt names an approval, and the forwarded call is
 /// tied to its approval only by the execution record. It still verifies,
 /// with both heads it had at 0.3.6.
@@ -54,9 +83,13 @@ fn a_home_written_by_0_3_6_still_verifies_with_both_heads() {
     let journal = fs::read_to_string(home.join("receipts/2026-11-17.jsonl")).unwrap();
     assert!(!journal.contains("praetore.approval_id"));
     assert_eq!(journal.matches("praetore-mcp/0.3.6").count(), 4);
-    let out = verify(
+    let receipts = token_for(
         &home,
         "8bb82a68865e714262fef57ce0f506834e2b6e1e0968f39f96fb07f7bd015446",
+    );
+    let out = verify(
+        &home,
+        &receipts,
         "ee7b4d244ad58a58367dc40c96731264c7b92fa7131e7a6baeb7d0cbddbb7005",
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -79,9 +112,13 @@ fn a_deleted_approval_journal_fails_only_the_home_whose_receipts_name_it() {
     let temp = tempfile::tempdir().unwrap();
     let new = temp.path().join("new");
     copy_dir(&fixture("approval-id"), &new);
-    let out = verify(
+    let receipts = token_for(
         &new,
         "97176c3c5aac8471ec5fa87ed01aecc27aca233559477f5b2b7f9e8a7b1df8cf",
+    );
+    let out = verify(
+        &new,
+        &receipts,
         "f871c9b0b5783891c6d4c92719f022919ea19d80d4a491aae565716f1e65ae3b",
     );
     assert!(
@@ -90,12 +127,6 @@ fn a_deleted_approval_journal_fails_only_the_home_whose_receipts_name_it() {
         String::from_utf8_lossy(&out.stdout)
     );
 
-    let plain = |home: &Path| {
-        Command::new(env!("CARGO_BIN_EXE_praetore-mcp"))
-            .args(["verify", "--dir", home.to_str().unwrap()])
-            .output()
-            .unwrap()
-    };
     fs::remove_file(new.join("approvals/journal.jsonl")).unwrap();
     let out = plain(&new);
     let stdout = String::from_utf8_lossy(&out.stdout);

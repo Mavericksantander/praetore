@@ -10,7 +10,8 @@
 //!
 //! Lines written before the chain existed (a bare evidence document) are
 //! read as unchained entries. They may only come before the first chained
-//! entry, and `verify` counts them apart.
+//! entry, and `verify` counts them apart. The head token includes that
+//! count, so adding or removing one of those lines changes the anchor.
 
 use crate::shown::Show;
 use praetore_core::{
@@ -55,6 +56,84 @@ impl Position {
         let prev = receipt_link(self.seq, &self.prev, evidence).map_err(|e| e.to_string())?;
         Ok(Self { seq, prev })
     }
+}
+
+/// Anchor of a receipts journal, the value `verify` prints and
+/// `--expected-head` compares.
+///
+/// `link` is the chain link after the last chained entry, or
+/// [`ChainLink::GENESIS`] when `chained` is 0. `unchained` is the number of
+/// bare evidence lines before that chain. The text form is
+/// `<unchained>.<chained>.<link>` ([`JournalHead::token`]). A bare 64-hex
+/// link is not this token: [`JournalHead::parse_expected`] rejects it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalHead {
+    pub unchained: u64,
+    pub chained: u64,
+    pub link: ChainLink,
+}
+
+impl JournalHead {
+    /// `<unchained>.<chained>.<64 lowercase hex>`, with no leading zeros
+    /// on either count (`0` for zero).
+    pub fn token(self) -> String {
+        format!("{}.{}.{}", self.unchained, self.chained, self.link)
+    }
+
+    /// Parses [`JournalHead::token`]. Anything else, including a bare
+    /// 64-hex link, is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.split('.');
+        let unchained = parse_count(parts.next()?)?;
+        let chained = parse_count(parts.next()?)?;
+        let link = ChainLink::from_hex(parts.next()?)?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            unchained,
+            chained,
+            link,
+        })
+    }
+
+    /// Parses a `--expected-head` value. A bare 64-hex link is a legacy
+    /// head and an error, not a match.
+    pub fn parse_expected(text: &str) -> Result<Self, String> {
+        if let Some(head) = Self::parse(text) {
+            return Ok(head);
+        }
+        if ChainLink::from_hex(text).is_some() {
+            return Err(
+                "--expected-head is a legacy 64-hex link and is not an anchor. \
+                 Pass the token <unchained>.<chained>.<64 lowercase hex> printed after `head `."
+                    .into(),
+            );
+        }
+        Err(
+            "--expected-head must be <unchained>.<chained>.<64 lowercase hex>, \
+             the token printed after `head `."
+                .into(),
+        )
+    }
+}
+
+impl std::fmt::Display for JournalHead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.token())
+    }
+}
+
+/// A decimal `u64` with no leading zeros, except `0` itself.
+fn parse_count(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > 20 || !bytes.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if bytes.len() > 1 && bytes[0] == b'0' {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// One journal line: a chained entry, or an unchained line written before
@@ -309,5 +388,56 @@ impl ChainCheck {
     /// be linked or there is no chained entry.
     pub fn head(&self) -> Option<Position> {
         self.head
+    }
+
+    /// The anchor of this journal. `None` when it is empty, or when a
+    /// chained entry is present but its link could not be computed.
+    /// With only unchained lines, `link` is [`ChainLink::GENESIS`].
+    pub fn journal_head(&self) -> Option<JournalHead> {
+        if self.chained == 0 && self.unchained == 0 {
+            return None;
+        }
+        if self.chained > 0 && self.head.is_none() {
+            return None;
+        }
+        Some(JournalHead {
+            unchained: self.unchained,
+            chained: self.chained,
+            link: self
+                .head
+                .map(|position| position.prev)
+                .unwrap_or(ChainLink::GENESIS),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_head_token_rejects_a_legacy_link_and_a_padded_count() {
+        let link = "ab".repeat(32);
+        let head = JournalHead::parse(&format!("0.3.{link}")).unwrap();
+        assert_eq!(head.unchained, 0);
+        assert_eq!(head.chained, 3);
+        assert_eq!(head.link.to_hex(), link);
+        assert_eq!(head.token(), format!("0.3.{link}"));
+        assert!(JournalHead::parse(&link).is_none());
+        assert!(JournalHead::parse(&format!("00.3.{link}")).is_none());
+        assert!(JournalHead::parse(&format!("0.3.{link}.1")).is_none());
+        let legacy = JournalHead::parse_expected(&link).unwrap_err();
+        assert!(legacy.contains("legacy 64-hex link"), "{legacy}");
+        assert!(
+            JournalHead::parse_expected("zz")
+                .unwrap_err()
+                .contains("must be")
+        );
+        let spec = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/formal/JournalHead.tla"),
+        )
+        .expect("docs/formal/JournalHead.tla");
+        assert!(spec.contains("UnchainedPrefixIsInsideTheHead"));
     }
 }

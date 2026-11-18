@@ -428,8 +428,11 @@ FAIL.
 The verification status, per receipt and for the whole journal, comes from
 the same code as `praetore-mcp verify` and is also shown in the sidebar. It
 covers the receipts only. It includes the journal order (seq/prev) and the
-journal head. Keep the head outside this machine. `--expected-head HEX`
-and `--expected-approval-head HEX` work as they do for `verify`. The result is kept in memory and computed
+journal head. Keep the head token outside this machine. `--expected-head`
+takes `<unchained>.<chained>.<64 lowercase hex>`, the token `verify` prints.
+A bare 64-hex link is rejected. `--expected-approval-head HEX` stays 64
+lowercase hex: every approval line is chained.
+Both flags work as they do for `verify`. The result is kept in memory and computed
 again when any file `verify` reads (the journal files, the attester and
 issuer pins, the approver pin, the approval journal) changes length,
 modification time, change time or inode. On a platform without change times
