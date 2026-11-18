@@ -350,10 +350,12 @@ approve a wrapped `.mcp.json` server, a Claude Code already running while
 ### Known limits of `install`
 
 `install` rewrites config files. It does not see how a client resolves its
-servers at run time, and `verify` does not check which servers a client
-runs. The limits below are open in this version. In each of them a server
-can run without going through `praetore-mcp wrap` with your home and mode,
-its calls leave no receipt in your home, and `verify` still exits 0.
+servers at run time. `verify` checks the receipts in your home, not which
+servers a client runs, so it detects none of the cases below. The limits
+are open in this version. In each of them, what runs after `install` can
+differ from what `install` reported: a server that is not wrapped, a
+server wrapped for another home or mode, or a server wrapped under a name
+that your policy gives to another one.
 
 - **An entry that looks wrapped is skipped.** `install` treats an entry as
   already wrapped when the file name of `command` is `praetore-mcp` and the
@@ -362,29 +364,28 @@ its calls leave no receipt in your home, and `verify` still exits 0.
   asked for. A config file from someone else (for example the `.mcp.json`
   of a cloned repository) can carry such an entry, and it is listed as
   `skipped: already wrapped by praetore-mcp`. This applies to every client.
-- **A plugin copy of a wrapped server.** Claude Code hides a plugin server
-  that has the same command as a configured server. Wrapping changes the
-  command of the configured one, so the plugin copy may load as a second,
-  unwrapped server with the same tools. `install` does not list plugin
-  servers.
+- **Plugin servers.** `install` does not read or list the servers that
+  Claude Code plugins declare.
 - **Sources `install` does not read.** For Claude Code these include the
   `.mcp.json` of any directory other than the current one, `--mcp-config`
-  files, plugin servers (`--plugin-dir` and installed plugins), servers
-  declared in agent files, managed MCP configuration and claude.ai
-  connectors. `install` does not name them and prints no warning for them.
+  files, servers declared in agent files, managed MCP configuration and
+  claude.ai connectors. `install` does not name them and prints no warning
+  for them.
 - **The server identity is the config key.** `install` passes the key of
   the entry as `--name`, and policy rules and receipts identify a server
   only by that name. Nothing ties the name to the command it starts. An
   entry with the name of a server your policy allows gets those rules, and
-  its receipts carry that name, whatever program it runs. In Claude Code a
-  project `.mcp.json` entry takes precedence over a user-scope entry with
-  the same name.
+  its receipts carry that name, whatever program it runs. The only
+  same-name case `install` reports is a local-scope entry over a wrapped
+  user-scope entry (see above).
 - **Local scope: a warning, and exit 0.** `install` reports local-scope
   servers and overrides (see above) and still exits 0, so a script or a CI
   step that reads only the exit code does not see them.
-- **`CLAUDE_CONFIG_DIR`.** `install` reads `~/.claude.json` only. When
-  Claude Code runs with `CLAUDE_CONFIG_DIR` set, user-scope servers kept
-  under that directory are outside what `install` reads and wraps.
+- **`CLAUDE_CONFIG_DIR`.** `install` does not follow it. With the variable
+  set it prints a warning and still reads only `~/.claude.json` and, when
+  it exists, `./.mcp.json`. Where Claude Code keeps its servers when the
+  variable is set was not checked; servers kept anywhere else are outside
+  what `install` reads and wraps.
 - **Another process that rewrites the file.** The changed-file check
   covers a write that lands before `install` compares the file. A process
   that read the file before `install` replaced it, and writes its whole

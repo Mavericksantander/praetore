@@ -164,8 +164,8 @@ does not wrap: it lists those servers as
 Claude Code before `install`: it rewrites `~/.claude.json` while it runs,
 and if the file changes while `install` works, nothing is written. The
 README section "Claude Code" says what was checked. The README section
-"Known limits of `install`" lists the cases in which a server runs
-without the wrapper after `install`.
+"Known limits of `install`" lists the cases in which what runs after
+`install` can differ from what `install` reported.
 
 ```sh
 praetore-mcp install --client cursor --mode observe --dry-run
