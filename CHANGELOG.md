@@ -53,6 +53,20 @@
 
 ### Fixed
 
+- **praetore-mcp: keys were read through symlinks.** A scratch home whose
+  `keys` was a symlink to another home's `keys/`, with a policy that
+  allows everything, loaded: `wrap` signed receipts with the other home's
+  keys, and the process that set it up never opened a key file. Keys are
+  now reached only through `KeyPath`: `DIR/keys` must be a real directory
+  and each key a regular file with one name, both owned by the user
+  running praetore-mcp, no directory above them may be a symlink made by a
+  user, and the file is opened with `O_NOFOLLOW`. On such a layout `wrap`
+  refuses every `tools/call` in both modes, and `init`, `verify` and
+  `policy check` exit non-zero. **A home under a symlinked directory that
+  a user made (for example a symlinked `~/.praetore`) no longer loads**;
+  move the home to its real path. Symlinks owned by root, such as `/tmp`
+  on macOS, are accepted.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

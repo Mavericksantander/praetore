@@ -714,6 +714,15 @@ Things to know:
   every `tools/call` (fail closed)** and gate the remaining traffic as
   enforce does; other MCP messages still reach the server. Fix the home
   (`praetore-mcp init`, `praetore-mcp policy check`) and restart the client.
+* Keys are read only from a real `DIR/keys`. A home does not load, and
+  `init`, `verify` and `policy check` exit non-zero, when `DIR/keys` is a
+  symlink, when a key file is a symlink, has a second name (a hard link) or
+  is not owned by the user running praetore-mcp, or when a directory above
+  `DIR/keys` is a symlink that a user made. A symlink owned by root (`/tmp`
+  and `/var` on macOS) is accepted. Otherwise a scratch home with links to
+  another home's keys and a policy of its own would sign receipts with
+  those keys. This does not stop a process that reads the key files and
+  copies them; see the trust model.
 * Errors while evaluating one call after a successful start (clock, replay
   guard): **enforce refuses the call (fail closed); observe forwards it with
   a loud stderr warning and no receipt.** Exceptions (G7): an unclassified

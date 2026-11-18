@@ -2,7 +2,7 @@
 
 This page lists what an agent, or another process running as the same OS user, can try to get a `tools/call` past praetore-mcp or to remove its trace. It records what happens on main after praetore-mcp 0.3.6.
 
-Each row names the test that pins the behaviour. All of them are in `crates/praetore-mcp/tests/evasion.rs`. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
+Each row names the test that pins the behaviour. They are in `crates/praetore-mcp/tests/evasion.rs`, unless the row names another file. A test pins a limitation as well as a defence. When a limitation is closed, its test fails and has to be changed together with this table.
 
 Status:
 
@@ -73,6 +73,7 @@ The defences above were checked by removing each one and running `tests/evasion.
 | A receipt naming an approval with no execution for it (`verify` check removed) | `truncating_the_approval_journal_holds_a_used_approval_and_fails_verify` |
 | A malformed approval id in a receipt (`verify` ignores it) | `a_receipt_naming_a_rejected_or_malformed_approval_fails_verify` |
 | The execution record that cannot be written ignored (`let _ = append_execution(..)`, the call forwarded anyway) | `an_execution_record_that_cannot_be_written_spends_the_approval_and_fails_verify` |
+| c | Sign with another home's keys without reading them: a scratch home whose `keys`, key files or parent directory are symlinks (or whose key files are hard links) to that home's, with a policy of its own | bloqueado (the scratch home does not load; `wrap` refuses every call) | `keys_dir_as_a_symlink_is_refused`, `a_key_file_as_a_symlink_is_refused`, `a_key_file_as_a_hard_link_is_refused` and `a_parent_directory_as_a_symlink_is_refused`, in `crates/praetore-mcp/tests/keys_symlinks.rs` | Already blocked. Reading and copying the key files is still possible for the same user |
 
 The duplicate and the rejected checks are caught by the message the test asserts, not by the exit code. With either check removed, `verify` still exits 1 because another check fails on the same journals:
 
