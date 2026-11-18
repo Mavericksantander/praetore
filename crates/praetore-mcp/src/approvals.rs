@@ -161,6 +161,56 @@ impl Expiry {
     }
 }
 
+/// The signed approval window. Built only from the retained receipt's
+/// signed timestamp and the configured TTL. The pending file's
+/// `created_at` and `expires_at` are not inputs.
+struct ApprovalWindow {
+    created_at: String,
+    expires_at: String,
+}
+
+impl ApprovalWindow {
+    fn from_retained(evidence: &Evidence, ttl: Duration) -> Result<Self, String> {
+        let created_at = evidence
+            .decided_at
+            .clone()
+            .filter(|text| !text.is_empty())
+            .ok_or("retained receipt has no signed timestamp")?;
+        let created = parse_time(&created_at)?;
+        let seconds = ttl.whole_seconds();
+        if !(1..=MAX_TTL_SECONDS).contains(&seconds) {
+            return Err(format!(
+                "approval TTL must be from 1 to {MAX_TTL_SECONDS} seconds, got {seconds}"
+            ));
+        }
+        let expires = created
+            .checked_add(Duration::seconds(seconds))
+            .ok_or("approval expiry is outside the representable range")?;
+        let expires_at = expires
+            .format(&Rfc3339)
+            .map_err(|error| error.to_string())?;
+        let span = expires - created;
+        if span.is_negative() || span.whole_seconds() > MAX_TTL_SECONDS {
+            return Err(format!(
+                "approval window is {} seconds; the maximum is {MAX_TTL_SECONDS}",
+                span.whole_seconds()
+            ));
+        }
+        Ok(Self {
+            created_at,
+            expires_at,
+        })
+    }
+
+    fn created_at(&self) -> &str {
+        &self.created_at
+    }
+
+    fn expires_at(&self) -> &str {
+        &self.expires_at
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Decided {
     pub approval_id: String,
@@ -286,14 +336,8 @@ fn hold_or_forward(
             journaled: journaled.clone(),
         });
         let path = journaled?;
-        let pending = reuse_or_create_pending(
-            home,
-            &entries,
-            &binding,
-            &held.evidence_id.to_string(),
-            now,
-            approval_ttl(home)?,
-        )?;
+        let pending =
+            reuse_or_create_pending(home, &entries, &binding, held, now, approval_ttl(home)?)?;
         Ok(HoldOrForward::Hold {
             journaled: path,
             message: hold_message(home, &pending),
@@ -477,9 +521,6 @@ pub fn decide(
             return Err(format!("{} does not match its approval id", path.shown()));
         }
         let now = now_utc()?;
-        if info.expiry.is_expired_at(now) {
-            return Err(expired_message(approval_id, &info.expiry, outcome));
-        }
         let binding = binding_from_pending(&pending)?;
         if let Some(shown) = shown {
             let current = String::from_utf8(canonical_bytes(&binding.arguments)?)
@@ -501,6 +542,22 @@ pub fn decide(
         binding_matches_evidence(&binding, &evidence).map_err(|error| {
             format!("{error}; nothing was signed and the pending file was kept")
         })?;
+        // The signed window is the retained receipt's timestamp plus the
+        // TTL. A pending file that names another window is not signed.
+        let window = ApprovalWindow::from_retained(&evidence, approval_ttl(home)?)?;
+        let pending_created = pending["created_at"].as_str().unwrap_or("");
+        if pending_created != window.created_at() || info.expiry.text() != window.expires_at() {
+            if info.expiry.is_expired_at(now) {
+                return Err(expired_message(approval_id, &info.expiry, outcome));
+            }
+            return Err(
+                "pending approval window does not match the retained receipt; nothing was signed and the pending file was kept"
+                    .into(),
+            );
+        }
+        if info.expiry.is_expired_at(now) {
+            return Err(expired_message(approval_id, &info.expiry, outcome));
+        }
         let approver = store::approver_secret(home)?;
         let approver_key_id = public_hex(&approver);
         let pin = read_approver_pin(home)?;
@@ -510,10 +567,6 @@ pub fn decide(
                     .into(),
             );
         }
-        let created_at = pending["created_at"]
-            .as_str()
-            .ok_or("pending approval has no created_at")?
-            .to_owned();
         let arguments = pending
             .get("arguments")
             .cloned()
@@ -528,9 +581,13 @@ pub fn decide(
             "tool": info.tool,
             "arguments": arguments,
             "pending_evidence_id": info.evidence_id,
-            "created_at": created_at,
-            "expires_at": info.expiry.text(),
-            "decided_at": timestamp(now)?,
+            "created_at": window.created_at(),
+            "expires_at": window.expires_at(),
+            // Full precision. Truncating to the second can put this before
+            // the receipt timestamp taken earlier in the same second.
+            "decided_at": OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(|error| error.to_string())?,
         });
         let signed = sign_record(&record, DECISION_DOMAIN, &approver)?;
         let entries = read_journal(home, journal)?;
@@ -915,8 +972,24 @@ fn verify_decision(
     if created > decided || decided > expires {
         return Err("decision times are not created_at <= decided_at <= expires_at".into());
     }
+    let span = expires - created;
+    if span.is_negative() || span.whole_seconds() > MAX_TTL_SECONDS {
+        return Err(format!(
+            "approval window is {} seconds; the maximum is {MAX_TTL_SECONDS}",
+            span.whole_seconds()
+        ));
+    }
     let pending_id = required_str(&entry.record, "pending_evidence_id")?;
     let evidence = find_evidence(evidence, pending_id)?;
+    let receipt_at = evidence
+        .decided_at
+        .as_deref()
+        .ok_or("retained receipt has no signed timestamp")?;
+    if required_str(&entry.record, "created_at")? != receipt_at {
+        return Err(
+            "created_at does not match the signed timestamp of the retained receipt".into(),
+        );
+    }
     if evidence.decision.outcome != DecisionOutcome::RequireApproval {
         return Err("pending evidence is not a REQUIRE_APPROVAL receipt".into());
     }
@@ -1030,7 +1103,7 @@ fn reuse_or_create_pending(
     home: &Home,
     entries: &[JournalEntry],
     binding: &Binding,
-    evidence_id: &str,
+    held: &Evidence,
     now: OffsetDateTime,
     ttl: Duration,
 ) -> Result<PendingInfo, String> {
@@ -1056,18 +1129,16 @@ fn reuse_or_create_pending(
         }
     }
     let approval_id = random_id();
+    let window = ApprovalWindow::from_retained(held, ttl)?;
     let value = json!({
         "schema": 1,
         "approval_id": approval_id,
         "server": binding.server,
         "tool": binding.tool,
         "arguments": binding.arguments,
-        "evidence_id": evidence_id,
-        "created_at": timestamp(now)?,
-        "expires_at": timestamp(
-            now.checked_add(ttl)
-                .ok_or("approval expiry is outside the representable range")?,
-        )?,
+        "evidence_id": held.evidence_id.to_string(),
+        "created_at": window.created_at(),
+        "expires_at": window.expires_at(),
     });
     let path = pending_path(home, &approval_id);
     if let Some(parent) = path.parent() {
@@ -1780,5 +1851,121 @@ mod tests {
                 .unwrap_err();
         crate::journal_io::assert_journal_intact(&home, &path, &original, &writer, &error, kind);
         assert_eq!(report.approval_decisions, 1, "{report:?}");
+    }
+
+    #[test]
+    fn spec_defines_decision_window_within_signed_hold_plus_ttl() {
+        let spec = include_str!("../../../docs/formal/ApprovalWindow.tla");
+        let cfg = include_str!("../../../docs/formal/ApprovalWindow.cfg");
+        assert!(
+            spec.contains("DecisionWindowWithinSignedHoldPlusTtl =="),
+            "the spec no longer defines DecisionWindowWithinSignedHoldPlusTtl =="
+        );
+        assert!(cfg.contains("DecisionWindowWithinSignedHoldPlusTtl"));
+    }
+
+    /// A pending file edited to 2099 is not signed. `decide` takes the
+    /// window from the retained receipt and the TTL.
+    #[test]
+    fn decide_refuses_a_pending_file_edited_to_2099() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        let path = pending_path(&home, &id);
+        let mut pending: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        pending["created_at"] = json!("2099-01-01T00:00:00Z");
+        pending["expires_at"] = json!("2099-01-02T00:00:00Z");
+        fs::write(&path, serde_json::to_vec_pretty(&pending).unwrap()).unwrap();
+        for outcome in [HumanOutcome::Approve, HumanOutcome::Reject] {
+            let error = decide(&home, &id, outcome, None).unwrap_err();
+            assert!(
+                error.contains("does not match the retained receipt")
+                    && error.contains("nothing was signed"),
+                "{outcome:?}: {error}"
+            );
+        }
+        assert!(!journal_path(&home).exists(), "a decision was signed");
+        assert!(path.is_file(), "the pending file is kept");
+    }
+
+    /// A signed decision whose window is longer than a day fails `verify`
+    /// with exit 1. The fixture is signed here, not by the approve command.
+    #[test]
+    fn verify_rejects_a_signed_window_longer_than_a_day() {
+        let (_temp, home) = crate::journal_io::temp_home();
+        let id = hold_echo(&home);
+        let pending: Value =
+            serde_json::from_str(&fs::read_to_string(pending_path(&home, &id)).unwrap()).unwrap();
+        let evidence = held_receipt(&home);
+        let created = evidence.decided_at.clone().unwrap();
+        let created_at = parse_time(&created).unwrap();
+        let expires = (created_at + Duration::seconds(MAX_TTL_SECONDS + 1))
+            .format(&Rfc3339)
+            .unwrap();
+        let approver = store::approver_secret(&home).unwrap();
+        let record = json!({
+            "schema": 1,
+            "kind": "decision",
+            "approval_id": id,
+            "approver_key_id": public_hex(&approver),
+            "outcome": "approve",
+            "server": pending["server"],
+            "tool": pending["tool"],
+            "arguments": pending["arguments"],
+            "pending_evidence_id": pending["evidence_id"],
+            "created_at": created,
+            "expires_at": expires,
+            "decided_at": created,
+        });
+        let signed = sign_record(&record, DECISION_DOMAIN, &approver).unwrap();
+        with_lock(&home, |journal| append_signed(journal, &[], &signed)).unwrap();
+
+        let bin = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/debug/praetore-mcp");
+        assert!(
+            bin.is_file(),
+            "build praetore-mcp before this test ({})",
+            bin.display()
+        );
+        let out = std::process::Command::new(&bin)
+            .args(["verify", "--dir", home.root.to_str().unwrap()])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stdout.contains("maximum is 86400"), "{stdout}\n{stderr}");
+    }
+
+    fn hold_echo(home: &Home) -> String {
+        use crate::gate::{Evaluator, Gate, Mode};
+        use praetore_core::{PolicyCondition, PolicyEffect, PolicyRule};
+        let mut policy = store::default_policy();
+        policy.rules.push(
+            PolicyRule::new(
+                "approve-echo",
+                store::ACTION_TYPE,
+                PolicyEffect::RequireApproval,
+            )
+            .with_capability(store::CAPABILITY)
+            .with_parameter_condition(PolicyCondition::exact("tool", json!("echo"))),
+        );
+        fs::write(home.policy(), serde_json::to_vec_pretty(&policy).unwrap()).unwrap();
+        let mut gate = Gate::load(home, Mode::Enforce).unwrap();
+        let verdict = Evaluator::evaluate(
+            &mut gate,
+            "fake",
+            &json!({"name": "echo", "arguments": {"n": 1}}),
+        )
+        .unwrap();
+        assert_eq!(verdict.outcome, DecisionOutcome::RequireApproval);
+        let pending = list_pending(home).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        pending[0].approval_id.clone()
+    }
+
+    fn held_receipt(home: &Home) -> Evidence {
+        let lines = crate::receipts::read_journal(home).unwrap();
+        assert_eq!(lines.len(), 1, "{}", lines.len());
+        crate::journal::parse_line(&lines[0].text).unwrap().evidence
     }
 }

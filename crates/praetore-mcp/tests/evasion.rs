@@ -1160,31 +1160,45 @@ fn window_of(value: &Value) -> i64 {
     (at("expires_at") - at("created_at")).whole_seconds()
 }
 
-/// (b) Limitación conocida, con rastro. `PRAETORE_MCP_APPROVAL_TTL_SECONDS`
-/// in the `env` block of the MCP client config reaches `wrap`, so a process
-/// that can edit that config can stretch the window of every new approval
-/// up to 24 h. The window is signed into each decision (`created_at`,
-/// `expires_at` in `approvals/journal.jsonl`), and `verify` passes: it
-/// checks that an execution is inside the window, not how long the window
-/// is. Closing it needs the TTL set where the agent cannot write, or
-/// `verify` checking each window against a maximum kept outside the home.
+/// `PRAETORE_MCP_APPROVAL_TTL_SECONDS` in the wrapped process stretches the
+/// pending file. The signed window is the retained receipt plus the TTL of
+/// the process that calls `decide`. A pending file written with another TTL
+/// is not signed.
 #[test]
-fn the_ttl_env_var_in_the_client_config_stretches_new_approvals() {
+fn the_ttl_env_var_of_wrap_does_not_set_the_signed_window() {
     let (_temp, home) = init_home();
     assert_eq!(approval_window(&home, &[]), (600, 600), "default");
     let (_temp, home) = init_home();
-    assert_eq!(
-        approval_window(&home, &[(TTL_ENV, "86400")]),
-        (86400, 86400)
+    let arguments = json!({"path": home.root.join("w.txt").to_str().unwrap(), "text": "w"});
+    let (out, stderr) = wrap_full(
+        &home,
+        "fake",
+        &[call(10, "append", arguments)],
+        &[(TTL_ENV, "86400")],
     );
-    let out = verify(&home);
-    assert!(out.status.success(), "{}", stdout(&out));
+    assert!(out.status.success(), "{stderr}");
+    let pending = approvals::list_pending(&home).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let path = home
+        .root
+        .join("approvals")
+        .join("pending")
+        .join(format!("{}.json", pending[0].approval_id));
+    let file: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(window_of(&file), 86400, "{file}");
+    let error =
+        approvals::decide(&home, &pending[0].approval_id, HumanOutcome::Approve, None).unwrap_err();
+    assert!(
+        error.contains("does not match the retained receipt"),
+        "{error}"
+    );
+    assert!(!approval_journal(&home).exists());
 }
 
 /// (b) Limitación conocida, con rastro. `DIR/approvals/ttl-seconds` is read
 /// from the home, so a process that can write the home can stretch the
 /// window of every new approval up to 24 h, whatever the client config
-/// says. Same trace and same `verify` result as the env var.
+/// says. The signed window is that TTL, and `verify` accepts it.
 #[test]
 fn the_ttl_seconds_file_in_the_home_stretches_new_approvals() {
     let (_temp, home) = init_home();
@@ -1198,8 +1212,8 @@ fn the_ttl_seconds_file_in_the_home_stretches_new_approvals() {
 /// (b) Limitación conocida, con rastro. `approval_ttl_seconds` in
 /// `DIR/config.toml` is read from the home, whatever environment the client
 /// passes, so a process that can write the home can stretch the window of
-/// every new approval up to 24 h. Same trace and same `verify` result as
-/// the env var and `approvals/ttl-seconds`.
+/// every new approval up to 24 h. The signed window is that TTL, and
+/// `verify` accepts it, as with `approvals/ttl-seconds`.
 #[test]
 fn the_ttl_in_config_toml_stretches_new_approvals() {
     let (_temp, home) = init_home();
