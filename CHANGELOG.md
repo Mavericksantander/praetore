@@ -53,6 +53,20 @@
 
 ### Fixed
 
+- **praetore-mcp: keys were read through symlinks.** A scratch home whose
+  `keys` was a symlink to another home's `keys/`, with a policy that
+  allows everything, loaded: `wrap` signed receipts with the other home's
+  keys, and the process that set it up never opened a key file. Keys are
+  now reached only through `KeyPath`: `DIR/keys` must be a real directory
+  and each key a regular file with one name, both owned by the user
+  running praetore-mcp, no directory above them may be a symlink made by a
+  user, and the file is opened with `O_NOFOLLOW`. On such a layout `wrap`
+  refuses every `tools/call` in both modes, and `init`, `verify` and
+  `policy check` exit non-zero. **A home under a symlinked directory that
+  a user made (for example a symlinked `~/.praetore`) no longer loads**;
+  move the home to its real path. Symlinks owned by root, such as `/tmp`
+  on macOS, are accepted.
+
 - **praetore-mcp: one number could stop the receipts journal for good.**
   The writer appended a receipt without reading it back, and only the next
   append read that line. A call with a float such as `99.9999999999999929`
