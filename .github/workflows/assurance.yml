@@ -118,6 +118,12 @@ jobs:
         run: make demo demo-verify
       - name: Receipt verification demo (DEMO/TEST-ONLY keys)
         run: ./demo/verify-receipt.sh
+      - name: Keys reached through a symlink or a hard link are refused (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test keys_symlinks -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 5 passed" <<<"$output" || { echo "::error::expected the 5 tests of tests/keys_symlinks.rs to run and pass"; exit 1; }
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # A new Expiry::at() call without #[expect] must fail clippy in this
       # job's environment. tests/lint_guard.rs reads sources and config
