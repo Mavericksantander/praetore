@@ -104,11 +104,98 @@ pub fn parse_line(text: &str) -> Result<Entry, String> {
 
 /// The line written for `evidence_json` (canonical evidence) at `position`,
 /// newline included.
-pub fn chained_line(position: &Position, evidence_json: &str) -> String {
+fn chained_line(position: &Position, evidence_json: &str) -> String {
     format!(
         "{{\"seq\":{},\"prev\":\"{}\",\"evidence\":{evidence_json}}}\n",
         position.seq, position.prev
     )
+}
+
+/// Why a receipt did not reach the journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalError {
+    /// The line for this receipt does not read back as the receipt that was
+    /// signed, so writing it would leave an entry that `verify` rejects and
+    /// that stops every later append. Nothing was written. The call is
+    /// refused in both modes: forwarding it would run a call whose receipt
+    /// can never exist.
+    Unverifiable(String),
+    /// The journal could not be read, locked or written. Enforce refuses
+    /// the call; observe forwards it and warns.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for JournalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unverifiable(error) => write!(
+                f,
+                "the receipt does not verify when read back, so it was not written ({error})"
+            ),
+            Self::Unavailable(error) => f.write_str(error),
+        }
+    }
+}
+
+impl From<JournalError> for String {
+    fn from(error: JournalError) -> Self {
+        error.to_string()
+    }
+}
+
+/// A journal line that was read back before it is written: the only thing
+/// [`crate::gate::Journal`] appends.
+///
+/// The writer used to serialize a receipt and append it, and only the next
+/// append read that line. A receipt that does not survive its own JSON
+/// round trip (a float that prints as text which parses to another float)
+/// was therefore written, and from then on every append failed on it.
+#[derive(Debug)]
+pub struct VerifiedLine {
+    text: String,
+    position: Position,
+    next: Position,
+}
+
+impl VerifiedLine {
+    /// Builds the line for `evidence` at `position` and checks what a later
+    /// reader will check: the line parses as a chained entry at `position`,
+    /// its evidence passes the integrity check, and the link of the next
+    /// entry can be computed from it.
+    pub fn new(position: &Position, evidence: &Evidence) -> Result<Self, String> {
+        let evidence_json = evidence
+            .to_json()
+            .map_err(|e| format!("cannot serialize evidence: {e}"))?;
+        let text = chained_line(position, &evidence_json);
+        let entry = parse_line(text.strip_suffix('\n').unwrap_or(&text))?;
+        if entry.position != Some(*position) {
+            return Err("the line does not read back at its own position".into());
+        }
+        if !entry.evidence.verify_integrity() {
+            return Err("EVIDENCE_FAIL: evidence integrity verification failed".into());
+        }
+        let next = position.after(&entry.evidence)?;
+        Ok(Self {
+            text,
+            position: *position,
+            next,
+        })
+    }
+
+    /// The line, newline included.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.text.as_bytes()
+    }
+
+    /// Where this line goes.
+    pub fn position(&self) -> &Position {
+        &self.position
+    }
+
+    /// Where the entry after this one goes.
+    pub fn next(&self) -> &Position {
+        &self.next
+    }
 }
 
 /// Daily files (`*.jsonl`) in `dir`, in name (date) order.

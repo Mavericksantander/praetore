@@ -124,6 +124,26 @@ jobs:
           output="$(cargo test --locked -p praetore-mcp --test journal_exact_chain -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
           echo "$output"
           grep -q "test result: ok\. 8 passed" <<<"$output" || { echo "::error::expected the 8 tests of tests/journal_exact_chain.rs to run and pass"; exit 1; }
+      - name: Keys reached through a symlink or a hard link are refused (output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test keys_symlinks -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 5 passed" <<<"$output" || { echo "::error::expected the 5 tests of tests/keys_symlinks.rs to run and pass"; exit 1; }
+      - name: serde_json is built with float_roundtrip in every package that ships it
+        run: scripts/check-float-roundtrip.sh
+      - name: The gate decides on the number the server reads (boundary literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test numeric_gate -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 2 passed" <<<"$output" || { echo "::error::expected the 2 tests of tests/numeric_gate.rs to run and pass"; exit 1; }
+      - name: Every appended receipt verifies (random floats and literals, output shown)
+        run: |
+          set -euo pipefail
+          output="$(cargo test --locked -p praetore-mcp --test journal_verified_line -- --nocapture 2>&1)" || { echo "$output"; exit 1; }
+          echo "$output"
+          grep -q "test result: ok\. 4 passed" <<<"$output" || { echo "::error::expected the 4 tests of tests/journal_verified_line.rs to run and pass"; exit 1; }
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # A new Expiry::at() call without #[expect] must fail clippy in this
       # job's environment. tests/lint_guard.rs reads sources and config
