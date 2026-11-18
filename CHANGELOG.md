@@ -53,6 +53,13 @@
 
 ### Fixed
 
+- **praetore-mcp: a `[table]` line in `config.toml` stops `wrap`.** The file
+  is a flat list of `key = value` lines. A header such as `[tabla]` or
+  `[[tabla]]` used to be a warning (`expected key = value; ignored`) and
+  the keys under it were still applied. `wrap` now exits 2 and does not
+  start the server. A bad `report` value or an unknown key is still a
+  warning.
+
 - **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
   help, the `init` output, the READMEs and the GUIDE said observe mode
   never blocks (the 0.3.5 entry below says so too). It records a DENY and

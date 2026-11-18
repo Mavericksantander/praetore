@@ -595,7 +595,10 @@ is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
 praetore-mcp: approval TTL: config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000; wrap did not start
 ```
 
-A bad value is never skipped in favour of another source. Other problems in `config.toml`
+A bad value is never skipped in favour of another source. A TOML table
+header (`[tabla]`, `[[tabla]]`) is not a warning: `config.toml` is a flat
+list of `key = value` lines, and `wrap` stops with exit code 2 instead of
+reading the keys under that header. Other problems in `config.toml`
 (a bad `report` value, an unknown key) stay warnings.
 
 The report is a view of the journal: it signs nothing, changes no journal

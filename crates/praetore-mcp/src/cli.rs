@@ -591,7 +591,8 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
         ));
     }
     let home = parsed.home()?;
-    let (config, warnings) = crate::config::load(&home);
+    let (config, warnings) =
+        crate::config::load(&home).map_err(|error| format!("{error}; wrap did not start"))?;
     for warning in warnings {
         eprintln!("praetore-mcp: warning: {warning}");
     }
