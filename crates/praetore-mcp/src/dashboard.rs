@@ -1181,6 +1181,14 @@ fn pending_view(home: &Home, snapshot: &Snapshot, status: &BTreeMap<String, Stri
 fn verify_view(report: &VerifyReport, home: &Home, expected: ExpectedHeads<'_>) -> Value {
     json!({
         "status": if report.failures.is_empty() { "ok" } else { "fail" },
+        // What `status: ok` is worth: "anchored" only when both journals
+        // were compared with a head given to `dashboard`; "unanchored" is
+        // the result `verify` reports with exit 3.
+        "assurance": match report.assurance() {
+            crate::receipts::Assurance::Anchored => "anchored",
+            crate::receipts::Assurance::Unanchored { .. } => "unanchored",
+            crate::receipts::Assurance::Failed => "failed",
+        },
         "total": report.total,
         "verified": report.ok,
         "failed": report.failures.len(),

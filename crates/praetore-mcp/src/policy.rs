@@ -255,6 +255,27 @@ pub fn render_list(policy: &Policy) -> String {
     out
 }
 
+/// The field after `arguments.` when that field itself contains `.`.
+/// A condition on `arguments.a.b` matches a literal top-level argument key
+/// `"a.b"`, which the caller chooses, not the nested field `a.b`.
+pub fn dotted_argument_field(key: &str) -> Option<&str> {
+    let field = key.strip_prefix("arguments.")?;
+    field.contains('.').then_some(field)
+}
+
+/// Rules whose parameter conditions use [`dotted_argument_field`].
+pub fn literal_dotted_argument_rules(policy: &Policy) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for rule in &policy.rules {
+        for condition in &rule.parameter_conditions {
+            if dotted_argument_field(&condition.key).is_some() {
+                found.push((rule.id.clone(), condition.key.clone()));
+            }
+        }
+    }
+    found
+}
+
 /// Non-fatal findings that predict surprising decisions in HighAssurance.
 /// `program` starts each printed command and `dir_suffix` ends it (see
 /// [`crate::commands`]).
@@ -321,9 +342,7 @@ pub fn lint(policy: &Policy, program: &str, dir_suffix: &str) -> Vec<String> {
                     rule.id
                 ));
             }
-            if let Some(field) = condition.key.strip_prefix("arguments.")
-                && field.contains('.')
-            {
+            if let Some(field) = dotted_argument_field(&condition.key) {
                 warnings.push(format!(
                     "rule {:?}: {:?} does not address a nested field; it matches a literal top-level argument key {field:?}, which the caller controls (nested fields are unsupported)",
                     rule.id, condition.key
@@ -756,7 +775,7 @@ pub fn render_coverage(
         }
     }
     out.push_str(
-        "note: decisions are read from the rules for a call where no argument condition matches; observe mode records them and never blocks.\n",
+        "note: decisions are read from the rules for a call where no argument condition matches; observe mode records a DENY and forwards the call.\n",
     );
     out
 }
@@ -911,6 +930,18 @@ mod tests {
         assert_eq!(policy.rules.len(), 0);
         assert_eq!(policy.version, 3);
         assert!(remove_rule(&policy, "nope").is_err());
+    }
+
+    #[test]
+    fn dotted_argument_field_is_only_a_dot_inside_the_field() {
+        assert_eq!(dotted_argument_field("arguments.a.b"), Some("a.b"));
+        assert_eq!(
+            dotted_argument_field("arguments.opts.path"),
+            Some("opts.path")
+        );
+        assert_eq!(dotted_argument_field("arguments.path"), None);
+        assert_eq!(dotted_argument_field("arguments."), None);
+        assert_eq!(dotted_argument_field("tool"), None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The local praetore-mcp home: LOCAL/DEV keys, signed authority, trust pins
 //! in `praetore-verify` formats, the policy, and the receipts journal.
 
+use crate::keypath::KeyPath;
 use crate::shown::Show;
 use praetore_core::{
     AgentId, AgentIdentity, AgentKeyPair, Authority, EvidenceAttesterKey, Policy,
@@ -15,6 +16,11 @@ use std::{
 };
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use zeroize::Zeroizing;
+
+const ISSUER_KEY: &str = "issuer.local-dev.key";
+const AGENT_KEY: &str = "agent.local-dev.key";
+const ATTESTER_KEY: &str = "attester.local-dev.key";
+const APPROVER_KEY: &str = "approver.local-dev.key";
 
 pub const ISSUER_NAME: &str = "praetore-mcp-local-issuer";
 pub const CAPABILITY: &str = "mcp:tools/call";
@@ -71,19 +77,28 @@ impl Home {
         self.root.join("keys")
     }
     pub fn issuer_key(&self) -> PathBuf {
-        self.keys_dir().join("issuer.local-dev.key")
+        self.keys_dir().join(ISSUER_KEY)
     }
     pub fn agent_key(&self) -> PathBuf {
-        self.keys_dir().join("agent.local-dev.key")
+        self.keys_dir().join(AGENT_KEY)
     }
     pub fn attester_key(&self) -> PathBuf {
-        self.keys_dir().join("attester.local-dev.key")
+        self.keys_dir().join(ATTESTER_KEY)
+    }
+    /// Every secret key file of the home.
+    pub fn key_files(&self) -> [PathBuf; 4] {
+        [
+            self.issuer_key(),
+            self.agent_key(),
+            self.attester_key(),
+            self.approver_key(),
+        ]
     }
     /// Local approver key, distinct from the issuer, agent and attester.
     /// Not part of [`Self::is_initialized`]: a home from v0.3.3 does not
     /// have it until `init` is run again.
     pub fn approver_key(&self) -> PathBuf {
-        self.keys_dir().join("approver.local-dev.key")
+        self.keys_dir().join(APPROVER_KEY)
     }
     pub fn agent(&self) -> PathBuf {
         self.root.join("agent.json")
@@ -145,6 +160,7 @@ pub enum InitOutcome {
 /// Creates the home. Never overwrites: a fully initialized home is left
 /// untouched; a partially initialized one is an error.
 pub fn init(home: &Home) -> Result<InitOutcome, String> {
+    crate::keypath::check_home_keys(home)?;
     if home.is_initialized() {
         return if ensure_approver_key(home)? {
             Ok(InitOutcome::ApproverKeyAdded)
@@ -253,12 +269,12 @@ fn public_matches_existing(
     home: &Home,
     public: &praetore_core::VerifiedPublicKey,
 ) -> Result<bool, String> {
-    for (path, role) in [
-        (home.issuer_key(), "issuer"),
-        (home.agent_key(), "agent"),
-        (home.attester_key(), "evidence-attester"),
+    for (name, role) in [
+        (ISSUER_KEY, "issuer"),
+        (AGENT_KEY, "agent"),
+        (ATTESTER_KEY, "evidence-attester"),
     ] {
-        let secret = read_secret(&path, role)?;
+        let secret = read_secret(&KeyPath::new(home, name)?, role)?;
         if AgentKeyPair::from_secret_bytes(&secret).public_key() == *public {
             return Ok(true);
         }
@@ -277,7 +293,7 @@ fn write_approver_pair(home: &Home, secret: &[u8; 32]) -> Result<(), String> {
 }
 
 /// The policy `init` writes: no rules, so every `tools/call` is denied by
-/// default (in enforce mode; observe never blocks). Only `tools/call` is
+/// default (in enforce mode; observe records DENY and forwards). Only `tools/call` is
 /// evaluated, so `initialize`, `tools/list` and every other message reach
 /// the server without a rule and a client can start it and list its tools.
 pub fn default_policy() -> Policy {
@@ -393,9 +409,9 @@ fn read(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.shown()))
 }
 
-fn read_secret(path: &Path, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
-    check_secret_permissions(path)?;
-    let text = Zeroizing::new(read(path)?);
+fn read_secret(key: &KeyPath, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    let path = key.path();
+    let text = key.read()?;
     let file: KeyFile = serde_json::from_str(&text)
         .map_err(|_| format!("{} is not a praetore-mcp key file", path.shown()))?;
     let hex_secret = Zeroizing::new(file.secret_key_hex);
@@ -419,35 +435,12 @@ fn read_secret(path: &Path, role: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     Ok(secret)
 }
 
-#[cfg(unix)]
-fn check_secret_permissions(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(path)
-        .map_err(|e| format!("cannot read {}: {e}", path.shown()))?
-        .permissions()
-        .mode();
-    if mode & 0o077 != 0 {
-        return Err(format!(
-            "{} is accessible by group/others (mode {:o}); run: chmod 600 {}",
-            path.shown(),
-            mode & 0o777,
-            path.shown()
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_secret_permissions(_path: &Path) -> Result<(), String> {
-    Ok(())
-}
-
 pub(crate) fn approver_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String> {
-    read_secret(&home.approver_key(), "approver")
+    read_secret(&KeyPath::new(home, APPROVER_KEY)?, "approver")
 }
 
 pub(crate) fn attester_secret(home: &Home) -> Result<Zeroizing<[u8; 32]>, String> {
-    read_secret(&home.attester_key(), "evidence-attester")
+    read_secret(&KeyPath::new(home, ATTESTER_KEY)?, "evidence-attester")
 }
 
 pub fn read_attester_pin(path: &Path) -> Result<praetore_core::VerifiedPublicKey, String> {
@@ -494,9 +487,9 @@ pub fn load(home: &Home) -> Result<LoadedHome, String> {
             crate::commands::command("init", &home.root)
         ));
     }
-    let agent_secret = read_secret(&home.agent_key(), "agent")?;
+    let agent_secret = read_secret(&KeyPath::new(home, AGENT_KEY)?, "agent")?;
     let agent_key = AgentKeyPair::from_secret_bytes(&agent_secret);
-    let attester_secret = read_secret(&home.attester_key(), "evidence-attester")?;
+    let attester_secret = read_secret(&KeyPath::new(home, ATTESTER_KEY)?, "evidence-attester")?;
     let attester_key = EvidenceAttesterKey::from_secret_bytes(&attester_secret);
     let agent = AgentIdentity::from_json(&read(&home.agent())?)
         .map_err(|e| format!("{}: {e}", home.agent().shown()))?;

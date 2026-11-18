@@ -280,7 +280,7 @@ Steps
     absolute path of ~/.local/bin/praetore-mcp, and its args must start
     with `wrap`. If `command` is still the original server program, stop.
     The install did not apply. `praetore-mcp verify` can still print
-    `OK 0 receipts` in that case, which is an empty journal, not a
+    `UNANCHORED 0 receipts` in that case, which is an empty journal, not a
     successful install.
     Tell me to restart the client. A running client keeps the old config.
     If a wrapped server does not start and wrap exits 127, the client
@@ -299,7 +299,7 @@ Steps
 12. Run `praetore-mcp verify` and show me the output. That command checks
     this installation's receipt journal (integrity, signatures, mode
     binding). In observe, a receipt records a decision that was not
-    enforced. Do not download or run `praetore-verify`. `OK 0 receipts`
+    enforced. Do not download or run `praetore-verify`. `UNANCHORED 0 receipts`
     means the journal is empty.
 13. First rule, only if I say yes, and only if a wrapped server is named
     `filesystem` (the test server, or one I already had under that name).
@@ -388,11 +388,13 @@ plain language:
   MCP server are governed. The client's own built-in tools are not. If
   something happened and there is no receipt for it, it did not go through
   this install.
-- **Observe mode (the arrival mode) does not block.** A DENY receipt records
-  what enforce would have blocked, but the call still runs.
+- **Observe mode (the arrival mode) does not block DENY.** A DENY receipt
+  records what enforce would have blocked, but the call still runs. Observe
+  still refuses a call the policy does not classify and client lines it
+  cannot check; the praetore-mcp README lists them.
 - **What `praetore-mcp verify` checks.** This installation's receipt journal
   (integrity, signatures, mode binding). In observe, a receipt records a
-  decision that was not enforced. `OK 0 receipts` means the journal is
+  decision that was not enforced. `UNANCHORED 0 receipts` means the journal is
   empty. It does not mean a server was wrapped. On macOS, do not download
   or run the release's `praetore-verify` binary. It is a Linux ELF x86_64
   file. The Sigstore check of `SHA256SUMS` is optional and needs `cosign`.

@@ -186,15 +186,16 @@ praetore-mcp receipts --tail 5
 praetore-mcp verify
 ```
 
-`OK 0 receipts` means the journal is empty. It does not mean a server was
+`UNANCHORED 0 receipts` means the journal is empty. It does not mean a server was
 wrapped.
 
 **From 0.3.5, the policy `init` writes is default deny.** It has no rules
 and no `allow-all-mcp-tool-calls` rule. In enforce mode every `tools/call`
 that no rule allows is denied, including tools you have not looked at and
-tools a server adds later. Observe mode does not block anything, so the
-observe step above works with no rules: the receipts show `DENY` with no
-rule id. `init` needs no rule for the client to start the server or list
+tools a server adds later. Observe mode forwards a DENY instead of blocking
+it, so the observe step above works with no rules: the receipts show `DENY`
+with no rule id. Observe still refuses what both modes refuse (see
+"Limits", item 6). `init` needs no rule for the client to start the server or list
 its tools: only `tools/call` is evaluated. `init` in v0.3.4 and earlier
 wrote an allow-all rule instead (`allow-all-mcp-tool-calls`); see "A home
 from v0.3.4" below.
@@ -257,14 +258,14 @@ wrapped.
 
 ```sh
 praetore-mcp receipts --tail 5
-praetore-mcp verify    # OK N receipts: N verified, 0 failed; prints the journal head
+praetore-mcp verify    # UNANCHORED N receipts: N verified, 0 failed (exit 3); prints the two heads to keep elsewhere
 ```
 
 The v0.3.3 `praetore-mcp verify` does not read 0.3.4 receipts. A 0.3.4
 journal line is `{"seq","prev","evidence"}`. v0.3.3 reads each line as a
-bare evidence document. This release's `praetore-mcp verify` still reads a
-v0.3.3 journal: those lines are unchained and may only come before the
-first chained entry.
+bare evidence document. This release's `praetore-mcp verify` fails on a
+v0.3.3 line wherever it is: it has no `seq` or `prev`, so it is outside
+the chain. Move a v0.3.3 journal out of `receipts/` to keep it.
 
 ### A home from v0.3.4
 
@@ -606,7 +607,10 @@ is valid: with `PRAETORE_MCP_APPROVAL_TTL_SECONDS=120` set,
 praetore-mcp: approval TTL: config.toml approval_ttl_seconds must be from 1 to 86400 seconds, got 90000; wrap did not start
 ```
 
-A bad value is never skipped in favour of another source. Other problems in `config.toml`
+A bad value is never skipped in favour of another source. A TOML table
+header (`[tabla]`, `[[tabla]]`) is not a warning: `config.toml` is a flat
+list of `key = value` lines, and `wrap` stops with exit code 2 instead of
+reading the keys under that header. Other problems in `config.toml`
 (a bad `report` value, an unknown key) stay warnings.
 
 The report is a view of the journal: it signs nothing, changes no journal
@@ -700,10 +704,17 @@ Read these before relying on anything above.
    the file afterwards. Anything that changes the filesystem in between (for
    example replacing a directory with a symlink) is not seen by the
    decision.
-6. **Observe mode does not block anything.** It records what enforce would
-   have decided, labeled `praetore.mode: observe` in the signed receipt. Use
-   it to try a policy, not to stop calls. In enforce, a tool that no rule
-   allows is denied by default.
+6. **Observe mode does not block DENY.** It records what enforce would
+   have decided, labeled `praetore.mode: observe` in the signed receipt, and
+   forwards the call. Use it to try a policy, not to stop calls. It still
+   refuses, as enforce does: a `tools/call` the policy does not classify, a
+   client line it cannot parse that may name a `safety*` tool, a client
+   line over 32 MiB (the client gets a JSON-RPC error, `-32600` with the id
+   when the kept prefix contains it, otherwise `-32700` with id null), and a
+   whole batch when a `tools/call` in it is refused.
+   When the home cannot be loaded, every `tools/call` and every client line
+   that cannot be parsed is refused. In enforce, a tool that no rule allows
+   is denied by default.
 7. **The proxy is cooperative.** Whoever can edit the client config can
    remove the wrapper. The proxy does not see actions the server takes on its
    own initiative.
@@ -734,7 +745,7 @@ Read these before relying on anything above.
 | The server does not start; `wrap` exits with 127 | The client could not find the server command (for example `npx`) with the PATH apps get from the desktop | Put the absolute path in the config, e.g. `/opt/homebrew/bin/npx` (check with `which npx`), then `install` again. In the macOS check, both apps found Homebrew's `npx` without this. |
 | `install` says the config `is not strict JSON` | The file has comments or trailing commas (JSONC) | Remove them, or wrap the server by hand with `praetore-mcp wrap ... -- <command>`. The file is never rewritten in this case. |
 | `install --mode enforce` says `nothing to change` / `already wrapped` and exits 0 | The entry is already wrapped. `install` does not change `--mode` on a wrapped entry. Exit 0 leaves the mode already in the config | `praetore-mcp uninstall --client <client> --yes`, then `praetore-mcp install --client <client> --mode enforce --yes`, then restart the client. Or edit `--mode` in the config and restart. |
-| `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `OK 0 receipts` means the journal is empty. |
+| `install` or `uninstall` prints `not modifying ... without confirmation; re-run with --yes` and exits 1 | stdin is not a terminal, and `--yes` was not passed. The file was not changed | Read the dry-run, then re-run with `--yes`. A later `verify` that prints `UNANCHORED 0 receipts` means the journal is empty. |
 | The same Cursor file is listed twice when running `install` from `~` | A build up to `9735974`: `~/.cursor/mcp.json` and `./.cursor/mcp.json` are the same file | Harmless (the second pass is skipped). Current builds list it once ([#52](https://github.com/Mavericksantander/praetore/pull/52)). |
 | `praetore-mcp wrap --help` fails with `unexpected argument "--help"` | A build up to `9735974`, before per-command help ([#49](https://github.com/Mavericksantander/praetore/pull/49)) | Reinstall (see the README's Install section), or use `praetore-mcp --help`, which lists every option. |
 | `another praetore-mcp policy command is running (lock …)` | A previous `policy` command was interrupted | If no other `policy` command is running, delete `~/.praetore/mcp/policy.json.lock`. |

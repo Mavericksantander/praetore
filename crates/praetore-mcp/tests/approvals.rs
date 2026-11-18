@@ -15,6 +15,13 @@ use std::{
     time::Duration,
 };
 
+/// Whether a `verify` run without the heads kept elsewhere found nothing
+/// wrong: the summary says UNANCHORED and the exit code is 3, not 0 (a
+/// result without both heads is not a pass).
+fn unanchored(out: &Output) -> bool {
+    out.status.code() == Some(3) && String::from_utf8_lossy(&out.stdout).starts_with("UNANCHORED ")
+}
+
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_praetore-mcp")
 }
@@ -179,13 +186,24 @@ fn verify(home: &Home) -> Output {
 /// Drives `approve` on a pseudo-terminal and types the code the command prints.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn approve_on_tty(home: &Home, id: &str) -> Output {
-    approve_on_tty_with(home, id, &|| {})
+    approve_on_tty_env(home, id, &[])
+}
+
+/// `approve` with `env`, so its TTL is the one `wrap` used to write the pending window.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn approve_on_tty_env(home: &Home, id: &str, env: &[(&str, &str)]) -> Output {
+    approve_on_tty_with(home, id, &|| {}, env)
 }
 
 /// Like [`approve_on_tty`], and runs `before_code` after the call is printed
 /// and before the confirmation code is typed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output {
+fn approve_on_tty_with(
+    home: &Home,
+    id: &str,
+    before_code: &dyn Fn(),
+    env: &[(&str, &str)],
+) -> Output {
     use std::io::{Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
@@ -205,13 +223,14 @@ fn approve_on_tty_with(home: &Home, id: &str, before_code: &dyn Fn()) -> Output 
     let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
     let slave_in = slave.try_clone().unwrap();
     let slave_out = slave.try_clone().unwrap();
-    let mut child = Command::new(bin())
+    let mut child = Command::new(bin());
+    child
         .args(["approve", id, "--dir", home.root.to_str().unwrap()])
+        .envs(env.iter().copied())
         .stdin(Stdio::from(slave_in))
         .stdout(Stdio::from(slave_out))
-        .stderr(Stdio::from(slave))
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::from(slave));
+    let mut child = child.spawn().unwrap();
     let mut master = std::fs::File::from(master);
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0, "{}", std::io::Error::last_os_error());
@@ -376,7 +395,7 @@ fn enforce_holds_the_call_and_names_the_exact_command() {
     assert_eq!(recorded[0].context["praetore.mode"], "enforce");
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -553,7 +572,7 @@ fn approved_call_forwards_once_and_a_second_retry_asks_again() {
 
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("1 decision(s), 1 execution(s)"), "{report}");
 }
 
@@ -588,7 +607,7 @@ fn different_arguments_do_not_use_the_approval() {
     assert_ne!(other, id);
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -645,7 +664,7 @@ fn rejected_call_is_not_forwarded() {
     assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("1 decision(s), 0 execution(s)"), "{report}");
     let table = run(&["receipts", "--dir", home.root.to_str().unwrap()], "");
     let table = String::from_utf8_lossy(&table.stdout);
@@ -681,7 +700,7 @@ fn expired_pending_and_expired_approval_do_not_pass() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "4")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    let approved = approve_on_tty(&home, &id);
+    let approved = approve_on_tty_env(&home, &id, &env);
     assert!(
         approved.status.success(),
         "{}",
@@ -693,7 +712,7 @@ fn expired_pending_and_expired_approval_do_not_pass() {
     assert_eq!(by_id(&responses, 8)["result"]["isError"], true);
     let verify = verify(&home);
     assert!(
-        verify.status.success(),
+        unanchored(&verify),
         "{}",
         String::from_utf8_lossy(&verify.stdout)
     );
@@ -709,7 +728,7 @@ fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     assert!(approve_on_tty(&home, &id).status.success());
     let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
 
     let path = home.root.join("approvals").join("journal.jsonl");
     let original = fs::read(&path).unwrap();
@@ -728,7 +747,7 @@ fn verify_rejects_a_bad_signature_and_a_reused_approval() {
     assert!(report.contains("signature"), "{report}");
 
     fs::write(&path, &original).unwrap();
-    assert!(verify(&home).status.success());
+    assert!(unanchored(&verify(&home)));
     let executed = evidence(&home)
         .into_iter()
         .rfind(|item| item.decision.outcome == DecisionOutcome::RequireApproval)
@@ -760,7 +779,7 @@ fn observe_does_not_hold_and_the_receipt_says_enforce_would_ask() {
     assert!(table.contains("enforce would ask"), "{table}");
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(report.contains("approval journal: none"), "{report}");
 }
 
@@ -796,7 +815,7 @@ fn an_evidence_only_journal_still_verifies() {
     assert!(value.get("record").is_none(), "{line}");
     let verify = verify(&home);
     let report = String::from_utf8_lossy(&verify.stdout);
-    assert!(verify.status.success(), "{report}");
+    assert!(unanchored(&verify), "{report}");
     assert!(
         report.contains("1 receipts: 1 verified, 0 failed"),
         "{report}"
@@ -822,12 +841,17 @@ fn pending_changed_after_it_was_shown_is_not_signed() {
         .join("approvals")
         .join("pending")
         .join(format!("{id}.json"));
-    let approved = approve_on_tty_with(&home, &id, &|| {
-        let text = fs::read_to_string(&path).unwrap();
-        let edited = text.replace("\"shown\"", "\"changed\"");
-        assert_ne!(edited, text);
-        fs::write(&path, edited).unwrap();
-    });
+    let approved = approve_on_tty_with(
+        &home,
+        &id,
+        &|| {
+            let text = fs::read_to_string(&path).unwrap();
+            let edited = text.replace("\"shown\"", "\"changed\"");
+            assert_ne!(edited, text);
+            fs::write(&path, edited).unwrap();
+        },
+        &[],
+    );
     let text = String::from_utf8_lossy(&approved.stdout);
     let before = text.split("confirmation:").next().unwrap();
     assert!(
@@ -891,7 +915,7 @@ fn verify_rejects_an_execution_after_the_approval_window() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "4")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    let approved = approve_on_tty(&home, &id);
+    let approved = approve_on_tty_env(&home, &id, &env);
     assert!(
         approved.status.success(),
         "{}",
@@ -926,8 +950,14 @@ fn approvals_show_the_expiry_in_local_time_with_utc_and_what_is_left() {
     )
     .unwrap();
     let utc = file["expires_at"].as_str().unwrap();
-    // 2026-11-15T23:34:40Z -> "2026-11-15 23:34:40"
-    let utc_text = utc.trim_end_matches('Z').replace('T', " ");
+    // The stored timestamp can carry a fraction of a second. The line shows
+    // whole seconds: 2026-11-15T23:34:40.5Z -> "2026-11-15 23:34:40".
+    let utc_text = utc
+        .split('.')
+        .next()
+        .unwrap_or(utc)
+        .trim_end_matches('Z')
+        .replace('T', " ");
     let listed = run_env(
         &["approvals", "--dir", home.root.to_str().unwrap()],
         "",
@@ -952,7 +982,7 @@ fn the_status_tells_an_expired_unused_approval_from_an_executed_one() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "3")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    assert!(approve_on_tty(&home, &id).status.success());
+    assert!(approve_on_tty_env(&home, &id, &env).status.success());
     let held = held_evidence_id(&home);
     let status = praetore_mcp::approvals::status_by_evidence(&home).unwrap();
     assert!(status[&held].starts_with("approve by "), "{status:?}");
@@ -981,7 +1011,7 @@ fn the_status_tells_an_expired_unused_approval_from_an_executed_one() {
     let env = [("PRAETORE_MCP_APPROVAL_TTL_SECONDS", "3")];
     let (responses, _, _) = wrap(&home, "enforce", &session(echo(7, json!({"n": 1}))), &env);
     let id = approval_id_from(tool_text(by_id(&responses, 7)));
-    assert!(approve_on_tty(&home, &id).status.success());
+    assert!(approve_on_tty_env(&home, &id, &env).status.success());
     let (_, stderr, _) = wrap(&home, "enforce", &session(echo(8, json!({"n": 1}))), &[]);
     assert_eq!(stderr.matches("EXECUTED echo").count(), 1, "{stderr}");
     thread::sleep(Duration::from_secs(4));
@@ -1374,7 +1404,7 @@ fn a_decided_id_whose_pending_file_was_left_is_not_reused() {
         assert_eq!(executions_of_decided, expected, "{outcome:?}");
         let verify = verify(&home);
         assert!(
-            verify.status.success(),
+            unanchored(&verify),
             "{}",
             String::from_utf8_lossy(&verify.stdout)
         );
@@ -1659,6 +1689,20 @@ fn assert_config_stops_wrap(text: &str, says: &str) {
             && stderr.contains(says),
         "{text:?}: {stderr}"
     );
+}
+
+/// A TOML table header is not a warning. `wrap` exits 2 and does not start
+/// the server, so keys written under the header are not applied.
+#[test]
+fn a_toml_table_in_config_stops_wrap_at_startup() {
+    for text in [
+        "[tabla]\n",
+        "[tabla]\nreport = false\n",
+        "[[servers]]\napproval_ttl_seconds = 1800\n",
+        "report = true\n[tabla]\n",
+    ] {
+        assert_config_stops_wrap(text, "TOML tables are not accepted");
+    }
 }
 
 /// n1: `approval_ttl_seconds: 90000` (YAML style) names the key, so it is

@@ -48,12 +48,15 @@ DIR defaults to $PRAETORE_MCP_HOME, then ~/.praetore/mcp.
 Keys created by `init` are LOCAL/DEV keys, including a separate approver
 key. The policy written by `init` has no rules: in enforce mode every
 tools/call is denied until a `policy allow` rule allows it. Observe mode
-records decisions but never blocks. Enforce mode blocks DENY. A
-REQUIRE_APPROVAL call is not forwarded until someone runs `approve`
-for that exact call. `approve` reads a confirmation from an interactive
-terminal; that check is cooperative (a process that can act as this user
-can still approve). If the home cannot be loaded (e.g. no `init`), `wrap`
-refuses every tools/call in both modes.
+records a DENY and forwards the call; it still refuses unclassified calls,
+unparseable lines that may name a safety* tool, lines over 32 MiB and
+batches with a refused call, and, when the home cannot be loaded, every
+tools/call. Enforce mode blocks DENY. A REQUIRE_APPROVAL call is not
+forwarded until someone runs `approve` for that exact call. `approve`
+reads a confirmation from an interactive terminal; that check is
+cooperative (a process that can act as this user can still approve). If
+the home cannot be loaded (e.g. no `init`), `wrap` refuses every tools/call
+and every unparseable client line in both modes.
 
 Exit codes:
   0    success (also --help and --version)
@@ -63,6 +66,8 @@ Exit codes:
        allowed only by an allow-all rule, or `install` / `uninstall` could
        not read, parse or write a config (or was not confirmed)
   2    usage error, or the command could not run (message on stderr)
+  3    `verify` found nothing wrong but was not given both heads kept
+       outside this machine (UNANCHORED): not a pass, see `verify --help`
   wrap exits with the MCP server's exit code; 127 if the server cannot be
        started, 1 if the server was killed by a signal. SIGINT or SIGTERM
        to wrap ends wrap by that signal";
@@ -76,7 +81,12 @@ DIR. The approver key is separate from the issuer, agent and attester keys.
 With no rules, every tools/call is denied by default in enforce mode. Only
 tools/call is evaluated: initialize, tools/list and the rest of the MCP
 traffic pass, so a client can start the server and list its tools. Observe
-mode never blocks. Allow tools with
+mode records a DENY and forwards the call, but it still refuses a tools/call
+the policy does not classify, a client line it cannot parse that may name a
+safety* tool, a client line over 32 MiB, and a whole batch when a tools/call
+in it is refused. When the home cannot be loaded (before init, for example),
+every tools/call and every client line that cannot be parsed is refused.
+Allow tools with
 `praetore-mcp policy allow --id ID --server NAME --tool NAME`.
 
 Running init again on an initialized DIR adds the approver key when it is
@@ -97,7 +107,9 @@ passed to the server unchanged (including any --help).
   --dir DIR     home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --name SERVER server name used in policy rules and receipts
                 (default: the command's file name)
-  --mode MODE   observe (default): forward every call, record the decision
+  --mode MODE   observe (default): record the decision and forward the call;
+                unclassified calls and client lines that cannot be checked
+                are still refused (see `praetore-mcp init --help`)
                 enforce: block DENY. REQUIRE_APPROVAL is not forwarded until
                 `praetore-mcp approve <id>` for that exact call
   --no-report   do not write the session report (same as `report = false`
@@ -208,8 +220,10 @@ Checks every receipt in the journal: integrity hash, attester signature,
 agent intent signature, authority signature against the issuer pins at
 decision time, and the praetore.mode binding. Checks the order of the
 journal too: each entry carries a sequence number and the hash link of the
-previous one, so an entry removed, duplicated or reordered before the last
-one is reported. Prints the head (entry count and last link).
+previous one, and the lines of the journal must be exactly the chain that
+ends at the head (the --expected-head, or the last entry without it). A
+line outside that chain, a missing entry and a reordered entry all fail.
+Prints the head (entry count and last link).
 
 Also checks DIR/approvals/journal.jsonl when it exists: the approver
 signature, that the decision is bound to the held receipt, that an
@@ -220,21 +234,28 @@ earlier) still verify.
   --dir DIR            home directory (default $PRAETORE_MCP_HOME, then ~/.praetore/mcp)
   --expected-head HEX  head printed by an earlier run and kept somewhere the
                        wrapped servers cannot write: the journal must end at
-                       it. Without it, entries removed at the end of the
-                       journal are not detected.
+                       it. `none` for a journal that must still be empty.
   --expected-approval-head HEX
                        approval head printed by an earlier run (the line
                        `approval journal: ... head HEX`), kept the same way:
-                       approvals/journal.jsonl must end at it. Without it,
-                       records removed at the end of that journal, or the
-                       whole file, are not detected.
+                       approvals/journal.jsonl must end at it. `none` when
+                       there must be no approval journal.
 
-Entries written by an earlier praetore-mcp version (unchained) are verified
-one by one and counted apart; they may only come before the first chained
-entry.
+A result has one of three levels, in the first word of the summary line:
+  OK          every check passed and both journals end at the states given
+              with the two options above.
+  UNANCHORED  every check passed, but one of the two options was not given.
+              The keys that sign receipts and approvals are files in the
+              home: a journal rewritten with them, or cut at the end, passes
+              every check that reads only the home. This is not a pass.
+  FAIL        a check failed.
 
-Exit code: 0 if every receipt verifies, 1 if any fails, 2 if the journal
-cannot be read.";
+A line written by praetore-mcp 0.3.3 or earlier (a bare evidence document,
+unchained) is not part of any chain and fails, wherever it is.
+
+Exit code: 0 for OK, 3 for UNANCHORED, 1 for FAIL, 2 if the journal or the
+pins cannot be read or the arguments are wrong. A script that checks only
+for exit 0 therefore passes only with both heads.";
 
 const DASHBOARD_HELP: &str =
     "Usage: praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX] [--expected-approval-head HEX]
@@ -513,13 +534,25 @@ fn cmd_init(args: &[String]) -> Result<i32, String> {
             println!(
                 "  In enforce mode every tools/call is denied unless a rule allows it. Observe"
             );
-            println!("  mode never blocks. To allow a tool:");
+            println!("  mode records a DENY and forwards the call, but it still refuses calls the");
+            println!("  policy does not classify and client lines it cannot check (see");
+            println!("  `init --help`). To allow a tool:");
             let program = crate::commands::program();
             let dir = dir_suffix(&home);
             println!("    {program} policy allow --id ID --server NAME --tool NAME{dir}");
             println!("  To see what the policy decides for each tool of a server:");
             println!("    {program} policy coverage --server NAME{dir} -- <server command>");
             println!("  Next: {program} install --dry-run{dir}");
+            println!();
+            println!(
+                "  Evidence: `verify` passes (exit 0) only against two heads kept outside this"
+            );
+            println!("  machine. After a session you trust, run:");
+            println!("    {program} verify{dir}");
+            println!("  and keep the two heads it prints where this machine cannot write. Later:");
+            println!("    {program} verify{dir} --expected-head HEX --expected-approval-head HEX");
+            println!("  Without them verify exits 3 (not anchored): the keys are files in this");
+            println!("  home, and a journal rewritten with them cannot be told from this one.");
         }
     }
     if !matches!(outcome, InitOutcome::Created) {
@@ -592,7 +625,8 @@ fn cmd_wrap(args: &[String]) -> Result<i32, String> {
         ));
     }
     let home = parsed.home()?;
-    let (config, warnings) = crate::config::load(&home);
+    let (config, warnings) =
+        crate::config::load(&home).map_err(|error| format!("{error}; wrap did not start"))?;
     for warning in warnings {
         eprintln!("praetore-mcp: warning: {warning}");
     }
@@ -861,6 +895,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         false,
     )?;
     let home = parsed.home()?;
+    crate::keypath::check_home_keys(&home)?;
     let report = receipts::verify_journal_with(
         &home,
         receipts::ExpectedHeads {
@@ -882,13 +917,10 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
         .iter()
         .map(|(k, v)| (k.as_str(), *v))
         .collect();
+    let assurance = report.assurance();
     println!(
         "{} {} receipts: {} verified, {} failed | mode: {} | decision: {}",
-        if report.failures.is_empty() {
-            "OK"
-        } else {
-            "FAIL"
-        },
+        assurance.label(),
         report.total,
         report.ok,
         report.failures.len(),
@@ -902,7 +934,7 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     );
     match report.head {
         Some(head) => println!(
-            "journal head: {} chained entries present, next seq {}, head {} ({} unchained earlier entries); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
+            "journal head: {} chained entries present, next seq {}, head {} ({} unchained lines); keep it outside this machine and pass it as --expected-head to detect entries removed at the end",
             report.chained, head.seq, head.prev, report.unchained
         ),
         None => println!(
@@ -921,7 +953,24 @@ fn cmd_verify(args: &[String]) -> Result<i32, String> {
     println!(
         "approval checks: approver signature, binding to the held call, expiry, one use per approval (an approval whose execution and forwarded receipt are both cut from the end of the journals can run again; pass both saved heads to detect it). An observe REQUIRE_APPROVAL receipt means enforce would ask; it is not a hold."
     );
-    Ok(if report.failures.is_empty() { 0 } else { 1 })
+    match &assurance {
+        receipts::Assurance::Anchored => println!(
+            "anchored: both journals end exactly at the states given with --expected-head and --expected-approval-head."
+        ),
+        receipts::Assurance::Unanchored { missing } => {
+            println!(
+                "WARNING: NOT ANCHORED (exit {}). {} not given. Every check above reads only this home, and the keys that sign receipts and approvals are files in it: without a head kept outside this machine, verify cannot detect a journal rewritten with those keys, or entries removed at the end. This result is not a pass.",
+                receipts::UNANCHORED_EXIT,
+                missing.join(" and ")
+            );
+            println!(
+                "to anchor: keep the two heads printed above somewhere this machine cannot write, and pass them next time as --expected-head HEX --expected-approval-head HEX (use `{}` for a journal that does not exist yet).",
+                receipts::NO_JOURNAL
+            );
+        }
+        receipts::Assurance::Failed => {}
+    }
+    Ok(assurance.exit_code())
 }
 
 fn cmd_dashboard(args: &[String]) -> Result<i32, String> {
@@ -1240,6 +1289,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
         "check" => {
             let parsed = parse(rest, &["--dir"], &[], false)?;
             let home = parsed.home()?;
+            crate::keypath::check_home_keys(&home)?;
             let path = home.policy();
             let text = fs::read_to_string(&path)
                 .map_err(|e| format!("cannot read {}: {e}", path.shown()))?;
@@ -1267,15 +1317,24 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                     for warning in &warnings {
                         println!("warning: {warning}");
                     }
+                    let dotted = policy::literal_dotted_argument_rules(&parsed_policy);
+                    if !dotted.is_empty() {
+                        println!(
+                            "INVALID: {} argument condition(s) use arguments.<a.b>, which matches a literal top-level key the caller controls, not a nested field. Nested fields are not supported, and enforce mode will not load this policy.",
+                            dotted.len()
+                        );
+                    }
                     // Build the same engine `wrap` builds, so key/pin/policy
                     // problems surface here instead of as refused calls.
+                    // Observe still loads a dotted key (the check above is
+                    // what fails the command). Enforce refuses it in Gate::load.
                     let engine = if home.is_initialized() {
                         crate::gate::Gate::load(&home, Mode::Observe).map(|_| ())
                     } else {
                         Err(format!("{} is not initialized", home.root.shown()))
                     };
                     match engine {
-                        Ok(()) => {
+                        Ok(()) if dotted.is_empty() => {
                             println!(
                                 "OK {} policy {} v{}: {} rule(s), digest {digest}, {} warning(s); HighAssurance engine starts",
                                 path.shown(),
@@ -1286,6 +1345,7 @@ fn cmd_policy(args: &[String]) -> Result<i32, String> {
                             );
                             0
                         }
+                        Ok(()) => 1,
                         Err(error) => {
                             println!("INVALID engine: {error}");
                             1
