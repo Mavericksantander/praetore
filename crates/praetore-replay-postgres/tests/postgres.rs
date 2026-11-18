@@ -61,7 +61,9 @@ impl VerifyWithTestEvidenceAttester for praetore_gateway::GatewayReceipt {
 }
 
 static TEST_DATABASE_SETUP: OnceLock<()> = OnceLock::new();
-/// Migration 0024 is the newest: every older rollback runs after it.
+/// Migration 0025 is the newest: every older rollback runs after it.
+const ROLLBACK_0025: &str =
+    include_str!("../../../docs/rollback/0025-journal-position-existing-key.sql");
 const ROLLBACK_0024: &str =
     include_str!("../../../docs/rollback/0024-journal-commit-order-position.sql");
 const TEST_NOW: &str = "2026-06-01T12:00:00Z";
@@ -3198,7 +3200,8 @@ fn postgres_migrations_baseline_0009_database_records_without_reexecuting() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     assert_eq!(oids(&mut client), before, "0001-0009 must not run again");
@@ -7162,7 +7165,8 @@ fn postgres_migrations_0013_database_applies_only_0014() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     assert!(again.is_empty());
@@ -7517,7 +7521,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
 
     // The held request is signed `awaiting_approval` (0022): the 0022
     // rollback refuses while that row exists and changes nothing.
-    // 0023 is newer, so roll it back first.
+    // 0025 is the newest migration, so roll the newer ones back first.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
@@ -7573,7 +7578,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7603,6 +7609,7 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
     // With such rows the rollback fails as a whole and 0020 stays (0021 is
     // rolled back first, so only the row guard can refuse it).
     forget_awaiting_approval_attestations();
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
@@ -7620,7 +7627,8 @@ fn postgres_approval_close_reasons_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7705,6 +7713,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
     assert_eq!(state(), up);
 
     // Down (0021 first): the columns, their constraints and grant are gone.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
@@ -7722,7 +7731,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -7881,6 +7891,7 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
 
     // With classified rows the rollback fails as a whole and 0020 stays
     // (0021 is rolled back first, so only the row guard can refuse it).
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     connect_client().batch_execute(ROLLBACK_0022).unwrap();
@@ -7898,7 +7909,8 @@ fn postgres_failure_class_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -8548,6 +8560,7 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     // 0023 replaces the v2 attestation trigger this count includes.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state(), (2, 2, true));
@@ -8576,7 +8589,8 @@ fn postgres_journal_insert_rules_migration_rolls_back_and_applies_again() {
             "0021_journal_insert_rules",
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
@@ -10601,6 +10615,7 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     let mut admin = connect_client();
     praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
     // This test checks 0022. 0023 only replaces the attestation insert trigger.
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let initial = state();
@@ -10651,10 +10666,12 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
         vec![
             "0022_awaiting_approval_state",
             "0023_attestation_output_digest",
-            "0024_journal_commit_order_position"
+            "0024_journal_commit_order_position",
+            "0025_journal_position_existing_key"
         ]
     );
     praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     assert_eq!(state().0, up.0);
@@ -10667,6 +10684,7 @@ fn postgres_awaiting_approval_migration_rolls_back_and_applies_again() {
     let clock = SharedClock::at_test_now();
     let fixture = create_postgres_approval_gateway_with_clock(Uuid::new_v4(), Some(clock.clone()));
     let late = approved_pending(&fixture);
+    connect_client().batch_execute(ROLLBACK_0025).unwrap();
     connect_client().batch_execute(ROLLBACK_0024).unwrap();
     connect_client().batch_execute(ROLLBACK_0023).unwrap();
     let error = connect_client()
@@ -10827,7 +10845,7 @@ mod journal_position {
     }
 
     /// Brings an empty database to 0023, recorded by the runner as if it
-    /// had applied it, so that `apply_migrations` applies only 0024.
+    /// had applied it, so that `apply_migrations` applies 0024 and 0025.
     fn at_0023(admin: &mut Client) {
         let end = praetore_replay_postgres::MIGRATIONS
             .iter()
@@ -11100,6 +11118,117 @@ mod journal_position {
         let whole = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
         assert_eq!(whole.head.entries.get(), 2);
         assert_eq!(evidence_ids(&whole.text)[1], next.evidence_id.to_string());
+    }
+
+    /// A repeated INSERT ... ON CONFLICT DO NOTHING of a primary key that is
+    /// already in the journal must not take a position. The position trigger
+    /// runs before PostgreSQL resolves the conflict, so a counter update that
+    /// commits with the discarded row leaves a permanent gap: chain_seq is
+    /// immutable, and every later export of the tenant fails.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_on_conflict_does_not_consume_a_position() {
+        let role = TestRole::create("LOGIN NOBYPASSRLS");
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        admin
+            .batch_execute(&format!("GRANT praetore_runtime TO {}", role.name))
+            .unwrap();
+        let mut runtime = connect_scratch_as(&scratch, &role.name);
+        verify_runtime_role(&mut runtime).unwrap();
+
+        let first = receipt(TENANT_A, None, None);
+        assert_eq!(insert_committed(&mut runtime, TENANT_A, &first), 0);
+        let next_seq = |client: &mut Client| -> i64 {
+            client
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .get(0)
+        };
+        assert_eq!(next_seq(&mut admin), 1);
+
+        // The replay claim is already committed. Only the journal INSERT is
+        // repeated, with ON CONFLICT DO NOTHING, as praetore_runtime.
+        let mut transaction = runtime.transaction().unwrap();
+        transaction
+            .execute(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&TENANT_A.to_string()],
+            )
+            .unwrap();
+        let agent = *first.agent.id.as_uuid();
+        let repeated = transaction.execute(
+            "INSERT INTO praetore.execution_journal \
+             (tenant_id, agent_id, request_id, request_digest, action_digest, \
+              authorization_status, execution_status, evidence_json, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                     clock_timestamp(), clock_timestamp()) \
+             ON CONFLICT DO NOTHING",
+            &[
+                &TENANT_A,
+                &agent,
+                &first.request_id,
+                &"ab".repeat(32),
+                &first.to_json().unwrap(),
+            ],
+        );
+        match repeated {
+            Ok(inserted) => {
+                assert_eq!(inserted, 0, "ON CONFLICT DO NOTHING inserts no second row");
+                transaction.commit().unwrap();
+            }
+            Err(error) => {
+                assert_eq!(
+                    error.code(),
+                    Some(&postgres::error::SqlState::UNIQUE_VIOLATION),
+                    "{error}"
+                );
+                assert!(
+                    db_message(error).contains("execution journal row already exists"),
+                    "a repeated primary key is rejected before a position is taken"
+                );
+                drop(transaction);
+            }
+        }
+
+        assert_eq!(
+            next_seq(&mut admin),
+            1,
+            "ON CONFLICT DO NOTHING must not consume a journal position"
+        );
+        let rows_after_conflict: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal WHERE tenant_id = $1",
+                &[&TENANT_A],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(rows_after_conflict, 1);
+
+        let later = receipt(TENANT_A, None, None);
+        insert_committed(&mut runtime, TENANT_A, &later);
+        let positions: Vec<i64> = admin
+            .query(
+                "SELECT chain_seq FROM praetore.execution_journal \
+                 WHERE tenant_id = $1 ORDER BY chain_seq",
+                &[&TENANT_A],
+            )
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        let contiguous: Vec<i64> = (0..positions.len() as i64).collect();
+        assert_eq!(positions, contiguous, "chain_seq must be 0..n-1");
+        assert_eq!(next_seq(&mut admin), positions.len() as i64);
+        let exported = export_tenant(&mut admin, TENANT_A, &pins())
+            .expect("export_tenant after a later insert");
+        assert_eq!(
+            evidence_ids(&exported.text),
+            [first.evidence_id.to_string(), later.evidence_id.to_string()]
+        );
     }
 
     /// chain_seq cannot be chosen or changed: the trigger overwrites the
@@ -11378,7 +11507,13 @@ mod journal_position {
             .get(0);
 
         let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-        assert_eq!(applied, vec!["0024_journal_commit_order_position"]);
+        assert_eq!(
+            applied,
+            vec![
+                "0024_journal_commit_order_position",
+                "0025_journal_position_existing_key"
+            ]
+        );
         praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
 
         let events_after: i64 = admin
@@ -11478,12 +11613,21 @@ mod journal_position {
                 .get(0)
         };
         assert_eq!(objects(&mut admin), 4);
+        // 0025 only repoints the position trigger. Roll it back first so
+        // 0024's guard accepts this database.
+        admin.batch_execute(ROLLBACK_0025).unwrap();
         admin.batch_execute(ROLLBACK_0024).unwrap();
         assert_eq!(objects(&mut admin), 0);
         // Not recorded any more: a second run refuses and changes nothing.
         assert!(scratch.connect().batch_execute(ROLLBACK_0024).is_err());
         let applied = praetore_replay_postgres::apply_migrations(&mut admin).unwrap();
-        assert_eq!(applied, vec!["0024_journal_commit_order_position"]);
+        assert_eq!(
+            applied,
+            vec![
+                "0024_journal_commit_order_position",
+                "0025_journal_position_existing_key"
+            ]
+        );
         praetore_replay_postgres::verify_schema_current(&mut admin).unwrap();
         assert_eq!(objects(&mut admin), 4);
         let after = export_tenant(&mut admin, TENANT_A, &pins()).unwrap();
@@ -11491,7 +11635,9 @@ mod journal_position {
     }
 
     /// Row level security, SECURITY DEFINER and privileges of 0024 as the
-    /// catalog records them after the runner migrates.
+    /// catalog records them after the runner migrates. 0025's assignment is
+    /// the same kind of function: EXECUTE denied to PUBLIC and to
+    /// praetore_runtime, and the position trigger calls it.
     #[test]
     #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
     fn postgres_journal_position_catalog_after_migration() {
@@ -11532,6 +11678,76 @@ mod journal_position {
             !row.get::<_, bool>(3),
             "praetore_runtime cannot execute the assignment"
         );
+        let rejection = admin
+            .query_one(
+                "SELECT pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE'), \
+                        pg_catalog.has_function_privilege('praetore_runtime', p.oid, 'EXECUTE') \
+                 FROM pg_catalog.pg_proc p \
+                 WHERE p.oid = \
+                     'praetore.reject_execution_journal_position_change_v1()'::regprocedure",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !rejection.get::<_, bool>(0),
+            "PUBLIC cannot execute reject_execution_journal_position_change_v1"
+        );
+        assert!(
+            !rejection.get::<_, bool>(1),
+            "praetore_runtime cannot execute reject_execution_journal_position_change_v1"
+        );
+        let privileges = admin
+            .query_one(
+                "SELECT pg_catalog.has_table_privilege(\
+                     'praetore_runtime', 'praetore.journal_positions', 'INSERT'), \
+                        pg_catalog.has_table_privilege(\
+                     'praetore_runtime', 'praetore.journal_positions', 'DELETE'), \
+                        pg_catalog.has_column_privilege(\
+                     'praetore_runtime', 'praetore.execution_journal', 'chain_seq', 'UPDATE')",
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !privileges.get::<_, bool>(0),
+            "praetore_runtime cannot INSERT into praetore.journal_positions"
+        );
+        assert!(
+            !privileges.get::<_, bool>(1),
+            "praetore_runtime cannot DELETE from praetore.journal_positions"
+        );
+        assert!(
+            !privileges.get::<_, bool>(2),
+            "praetore_runtime cannot UPDATE praetore.execution_journal.chain_seq"
+        );
+        let row = admin
+            .query_one(
+                "SELECT p.prosecdef, p.proconfig, \
+                        pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE'), \
+                        pg_catalog.has_function_privilege('praetore_runtime', p.oid, 'EXECUTE') \
+                 FROM pg_catalog.pg_proc p \
+                 WHERE p.oid = 'praetore.assign_execution_journal_position_v2()'::regprocedure",
+                &[],
+            )
+            .unwrap();
+        assert!(row.get::<_, bool>(0), "v2 is SECURITY DEFINER");
+        assert_eq!(
+            row.get::<_, Option<Vec<String>>>(1),
+            Some(vec!["search_path=pg_catalog, praetore, pg_temp".to_owned()]),
+            "v2 pins its search_path"
+        );
+        assert!(!row.get::<_, bool>(2), "PUBLIC cannot execute v2");
+        assert!(!row.get::<_, bool>(3), "praetore_runtime cannot execute v2");
+        let trigger: String = admin
+            .query_one(
+                "SELECT p.proname \
+                 FROM pg_catalog.pg_trigger tg \
+                 JOIN pg_catalog.pg_proc p ON p.oid = tg.tgfoid \
+                 WHERE tg.tgname = 'execution_journal_position_v1' AND NOT tg.tgisinternal",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(trigger, "assign_execution_journal_position_v2");
     }
 
     /// 0024 applied by a schema owner that is neither superuser nor
@@ -11575,8 +11791,14 @@ mod journal_position {
             .unwrap();
         let mut owner = connect_scratch_as(&scratch, &owner_role.name);
         let applied = praetore_replay_postgres::apply_migrations(&mut owner)
-            .expect("0024 applies as an owner without superuser or BYPASSRLS");
-        assert_eq!(applied, ["0024_journal_commit_order_position"]);
+            .expect("0024 and 0025 apply as an owner without superuser or BYPASSRLS");
+        assert_eq!(
+            applied,
+            [
+                "0024_journal_commit_order_position",
+                "0025_journal_position_existing_key"
+            ]
+        );
         drop(owner);
 
         // The former order: created_at within each tenant.
@@ -11705,6 +11927,500 @@ mod journal_position {
             .collect();
         positions.sort_unstable();
         assert_eq!(positions, [2, 3]);
+    }
+
+    const CONCURRENT_WRITERS: usize = 8;
+    const TRANSACTIONS_PER_WRITER: usize = 25;
+    /// The writer plan (tenant, rollback, sleep) is the same on every run.
+    const WRITER_PLAN_SEED: u32 = 0x0024_1550;
+
+    /// 32-bit Numerical Recipes LCG. The plan is drawn before any thread
+    /// starts, so scheduling does not change which transactions roll back.
+    struct PlanRng(u32);
+
+    impl PlanRng {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0
+        }
+    }
+
+    struct WriterStep {
+        tenant: Uuid,
+        rollback: bool,
+        sleep_ms: i32,
+    }
+
+    fn writer_plan() -> Vec<Vec<WriterStep>> {
+        let mut rng = PlanRng(WRITER_PLAN_SEED);
+        (0..CONCURRENT_WRITERS)
+            .map(|_| {
+                (0..TRANSACTIONS_PER_WRITER)
+                    .map(|_| {
+                        let tenant = if rng.next_u32().is_multiple_of(2) {
+                            TENANT_A
+                        } else {
+                            TENANT_B
+                        };
+                        // One draw in five: about 20% of the transactions.
+                        let rollback = rng.next_u32().is_multiple_of(5);
+                        let sleep_ms = i32::try_from(rng.next_u32() % 21).unwrap();
+                        WriterStep {
+                            tenant,
+                            rollback,
+                            sleep_ms,
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// `count` and `max(chain_seq)` of one tenant in one snapshot.
+    type TenantCounts = (i64, Option<i64>);
+
+    /// Sets the flag on drop, including when a writer panics, so the reader
+    /// cannot keep running after the writers have stopped.
+    struct StopReader<'a>(&'a AtomicBool);
+
+    impl Drop for StopReader<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    /// Eight threads, two tenants, about one transaction in five rolled
+    /// back, and `pg_sleep` of 0 to 20 ms between INSERT and COMMIT. A
+    /// repeatable-read reader takes snapshots for the whole run. Per tenant
+    /// the committed `chain_seq` values are `0..n-1`, `next_seq` is `n`, and
+    /// `export_tenant` succeeds. Every snapshot is a prefix:
+    /// `max(chain_seq) = count - 1` (an empty snapshot has no max).
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_many_writers_are_contiguous_in_commit_order() {
+        let scratch = migrated();
+        let base = config(&scratch);
+        let plan = writer_plan();
+        let stop = AtomicBool::new(false);
+        let snapshots: Mutex<Vec<[TenantCounts; 2]>> = Mutex::new(Vec::new());
+
+        let committed = thread::scope(|scope| {
+            let stop_flag = &stop;
+            let recorded = &snapshots;
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let reader_config = base.clone();
+            let reader = scope.spawn(move || {
+                let mut client = reader_config
+                    .connect(NoTls)
+                    .expect("repeatable-read reader connects");
+                ready_tx.send(()).expect("reader is connected");
+                while !stop_flag.load(Ordering::Acquire) {
+                    let mut transaction = client
+                        .build_transaction()
+                        .isolation_level(postgres::IsolationLevel::RepeatableRead)
+                        .start()
+                        .expect("repeatable-read snapshot");
+                    let mut shot: [TenantCounts; 2] = [(0, None), (0, None)];
+                    for (index, tenant) in [TENANT_A, TENANT_B].into_iter().enumerate() {
+                        let row = transaction
+                            .query_one(
+                                "SELECT count(*)::bigint, max(chain_seq) \
+                                 FROM praetore.execution_journal WHERE tenant_id = $1",
+                                &[&tenant],
+                            )
+                            .expect("read one snapshot");
+                        let count: i64 = row.get(0);
+                        let max_seq: Option<i64> = row.get(1);
+                        shot[index] = (count, max_seq);
+                    }
+                    transaction.commit().expect("end the snapshot");
+                    recorded.lock().expect("record the snapshot").push(shot);
+                    thread::sleep(StdDuration::from_millis(2));
+                }
+            });
+            let release_reader = StopReader(&stop);
+            ready_rx
+                .recv_timeout(StdDuration::from_secs(30))
+                .expect("the reader did not connect within 30 s");
+
+            let mut totals = [0_i64, 0_i64];
+            let writers: Vec<_> = plan
+                .into_iter()
+                .map(|steps| {
+                    let writer_config = base.clone();
+                    scope.spawn(move || {
+                        let mut client = writer_config.connect(NoTls).expect("writer connects");
+                        let mut committed = [0_i64, 0_i64];
+                        for step in steps {
+                            let evidence = receipt(step.tenant, None, None);
+                            let mut transaction = client
+                                .build_transaction()
+                                .isolation_level(postgres::IsolationLevel::ReadCommitted)
+                                .start()
+                                .expect("writer transaction");
+                            insert(&mut transaction, step.tenant, &evidence, None)
+                                .expect("journal insert");
+                            if step.rollback {
+                                transaction
+                                    .rollback()
+                                    .expect("rollback returns the position");
+                            } else {
+                                let seconds = f64::from(step.sleep_ms) / 1000.0;
+                                transaction
+                                    .execute("SELECT pg_catalog.pg_sleep($1)", &[&seconds])
+                                    .expect("pg_sleep between insert and commit");
+                                transaction.commit().expect("commit");
+                                if step.tenant == TENANT_A {
+                                    committed[0] += 1;
+                                } else {
+                                    committed[1] += 1;
+                                }
+                            }
+                        }
+                        committed
+                    })
+                })
+                .collect();
+            for writer in writers {
+                let committed = writer.join().expect("writer thread");
+                totals[0] += committed[0];
+                totals[1] += committed[1];
+            }
+            drop(release_reader);
+            reader.join().expect("repeatable-read reader");
+            totals
+        });
+
+        let snapshots = snapshots.into_inner().expect("snapshots");
+        assert!(
+            !snapshots.is_empty(),
+            "the repeatable-read reader took no snapshot"
+        );
+        println!(
+            "seed={WRITER_PLAN_SEED:#x}, committed A={} B={}, snapshots {}",
+            committed[0],
+            committed[1],
+            snapshots.len()
+        );
+        for snapshot in &snapshots {
+            for (tenant, &(count, max_seq)) in [TENANT_A, TENANT_B].into_iter().zip(snapshot) {
+                assert_eq!(
+                    max_seq,
+                    (count > 0).then_some(count - 1),
+                    "tenant {tenant}: max(chain_seq) = count - 1 \
+                     (count {count}, max {max_seq:?})"
+                );
+            }
+        }
+
+        let mut admin = scratch.connect();
+        for (tenant, committed) in [(TENANT_A, committed[0]), (TENANT_B, committed[1])] {
+            assert!(
+                committed > 0,
+                "tenant {tenant} had no committed transaction"
+            );
+            let positions: Vec<i64> = admin
+                .query(
+                    "SELECT chain_seq FROM praetore.execution_journal \
+                     WHERE tenant_id = $1 ORDER BY chain_seq",
+                    &[&tenant],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            let expected: Vec<i64> = (0..committed).collect();
+            assert_eq!(
+                positions, expected,
+                "tenant {tenant}: chain_seq is 0..n-1 for n committed transactions"
+            );
+            let next_seq: i64 = admin
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&tenant],
+                )
+                .unwrap()
+                .get(0);
+            assert_eq!(next_seq, committed, "tenant {tenant}: next_seq = n");
+            let exported = export_tenant(&mut admin, tenant, &pins()).unwrap();
+            assert_eq!(exported.head.entries.get(), committed as u64);
+        }
+    }
+
+    /// An INSERT the initial-state rules refuse (`allowed` / `executed`)
+    /// takes no position. `next_seq` is unchanged, and while that transaction
+    /// is still open another writer of the same tenant, with `lock_timeout`
+    /// of 200 ms, is not refused with `lock_not_available`.
+    #[test]
+    #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+    fn postgres_journal_position_refused_initial_state_takes_no_position() {
+        let scratch = migrated();
+        let mut admin = scratch.connect();
+        assert_eq!(
+            insert_committed(&mut admin, TENANT_A, &receipt(TENANT_A, None, None)),
+            0
+        );
+        let next_seq = |client: &mut Client| -> i64 {
+            client
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .get(0)
+        };
+        let before = next_seq(&mut admin);
+
+        let refused = receipt(TENANT_A, None, None);
+        let mut holder = scratch.connect();
+        let mut open = holder.transaction().unwrap();
+        open.execute(
+            "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+            &[&TENANT_A.to_string()],
+        )
+        .unwrap();
+        let agent = *refused.agent.id.as_uuid();
+        open.execute(
+            "INSERT INTO praetore.replay_claims (tenant_id, agent_id, request_id) \
+             VALUES ($1, $2, $3)",
+            &[&TENANT_A, &agent, &refused.request_id],
+        )
+        .unwrap();
+        let error = open
+            .execute(
+                "INSERT INTO praetore.execution_journal \
+                 (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                  authorization_status, execution_status, evidence_json, output_json) \
+                 VALUES ($1, $2, $3, $4, $4, 'allowed', 'executed', $5, '{}')",
+                &[
+                    &TENANT_A,
+                    &agent,
+                    &refused.request_id,
+                    &"ab".repeat(32),
+                    &refused.to_json().unwrap(),
+                ],
+            )
+            .unwrap_err();
+        let message = db_message(error);
+        assert!(
+            message.contains("invalid initial execution journal state"),
+            "{message}"
+        );
+        assert_eq!(
+            next_seq(&mut admin),
+            before,
+            "a refused insert leaves next_seq unchanged"
+        );
+        let visible: i64 = admin
+            .query_one(
+                "SELECT count(*) FROM praetore.execution_journal WHERE request_id = $1",
+                &[&refused.request_id],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(visible, 0, "the refused row is not in the journal");
+
+        // The refused transaction is still open across this writer.
+        let mut other = scratch.connect();
+        other.batch_execute("SET lock_timeout = '200ms'").unwrap();
+        let followed = receipt(TENANT_A, None, None);
+        let mut transaction = other.transaction().unwrap();
+        let inserted = insert(&mut transaction, TENANT_A, &followed, None);
+        if let Err(error) = &inserted {
+            assert_ne!(
+                error.code(),
+                Some(&postgres::error::SqlState::LOCK_NOT_AVAILABLE),
+                "the refused insert must not hold the tenant position: {error}"
+            );
+        }
+        inserted.expect("a writer of the same tenant inserts while the refused insert is open");
+        assert_eq!(position(&mut transaction, followed.request_id), before);
+        transaction.commit().unwrap();
+        assert_eq!(next_seq(&mut admin), before + 1);
+
+        open.rollback().unwrap();
+    }
+
+    /// LOCAL REVIEW TESTS (CTO dictamen #163).
+    mod r163_review {
+        use super::*;
+        use postgres::IsolationLevel;
+        use std::{sync::mpsc, thread, time::Duration as StdDuration};
+
+        fn runtime(scratch: &ScratchDatabase, role: &TestRole) -> Client {
+            let mut client = connect_scratch_as(scratch, &role.name);
+            verify_runtime_role(&mut client).unwrap();
+            client
+        }
+
+        fn runtime_role(scratch: &ScratchDatabase) -> TestRole {
+            let role = TestRole::create("LOGIN NOBYPASSRLS");
+            scratch
+                .connect()
+                .batch_execute(&format!("GRANT praetore_runtime TO {}", role.name))
+                .unwrap();
+            role
+        }
+
+        fn next_seq(client: &mut Client) -> i64 {
+            client
+                .query_one(
+                    "SELECT next_seq FROM praetore.journal_positions WHERE tenant_id = $1",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .get(0)
+        }
+
+        fn positions(client: &mut Client) -> Vec<i64> {
+            client
+                .query(
+                    "SELECT chain_seq FROM praetore.execution_journal \
+                     WHERE tenant_id = $1 ORDER BY chain_seq",
+                    &[&TENANT_A],
+                )
+                .unwrap()
+                .iter()
+                .map(|row| row.get(0))
+                .collect()
+        }
+
+        fn raw(
+            transaction: &mut postgres::Transaction<'_>,
+            evidence: &Evidence,
+            tail: &str,
+        ) -> Result<u64, postgres::Error> {
+            transaction.execute(
+                "SELECT pg_catalog.set_config('praetore.tenant_id', $1, true)",
+                &[&TENANT_A.to_string()],
+            )?;
+            let agent = *evidence.agent.id.as_uuid();
+            transaction.execute(
+                &format!(
+                    "INSERT INTO praetore.execution_journal \
+                     (tenant_id, agent_id, request_id, request_digest, action_digest, \
+                      authorization_status, execution_status, evidence_json, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, $4, 'allowed', 'authorized', $5, \
+                             clock_timestamp(), clock_timestamp()) {tail}"
+                ),
+                &[
+                    &TENANT_A,
+                    &agent,
+                    &evidence.request_id,
+                    &"ab".repeat(32),
+                    &evidence.to_json().unwrap(),
+                ],
+            )
+        }
+
+        fn outcome(result: Result<u64, postgres::Error>) -> String {
+            match result {
+                Ok(n) => format!("Ok({n})"),
+                Err(error) => format!(
+                    "Err({:?}: {})",
+                    error.code().map(|c| c.code().to_owned()),
+                    db_message(error)
+                ),
+            }
+        }
+
+        /// ON CONFLICT with an explicit target and DO UPDATE.
+        #[test]
+        #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+        fn r163_on_conflict_do_update_and_explicit_target() {
+            let scratch = migrated();
+            let role = runtime_role(&scratch);
+            let mut rt = runtime(&scratch, &role);
+            let mut admin = scratch.connect();
+            let first = receipt(TENANT_A, None, None);
+            insert_committed(&mut rt, TENANT_A, &first);
+            for tail in [
+                "ON CONFLICT (tenant_id, agent_id, request_id) DO NOTHING",
+                "ON CONFLICT (tenant_id, agent_id, request_id) DO UPDATE SET updated_at = EXCLUDED.updated_at",
+            ] {
+                let mut tx = rt.transaction().unwrap();
+                let result = raw(&mut tx, &first, tail);
+                let ok = result.is_ok();
+                eprintln!("R163 [{tail}] -> {}", outcome(result));
+                if ok {
+                    tx.commit().unwrap();
+                } else {
+                    drop(tx);
+                }
+                eprintln!(
+                    "R163 [{tail}] next_seq={} positions={:?}",
+                    next_seq(&mut admin),
+                    positions(&mut admin)
+                );
+            }
+            let later = receipt(TENANT_A, None, None);
+            insert_committed(&mut rt, TENANT_A, &later);
+            let p = positions(&mut admin);
+            eprintln!("R163 explicit/do-update final positions={p:?}");
+            assert_eq!(
+                p,
+                vec![0, 1],
+                "no gap after explicit-target DO NOTHING and DO UPDATE"
+            );
+            export_tenant(&mut admin, TENANT_A, &pins()).expect("export after conflicts");
+        }
+
+        /// A duplicate key sent by a second session while the first holds the
+        /// tenant lock (READ COMMITTED and REPEATABLE READ).
+        #[test]
+        #[ignore = "requires PRAETORE_TEST_DATABASE_URL"]
+        fn r163_concurrent_duplicate_on_conflict() {
+            for isolation in [
+                IsolationLevel::ReadCommitted,
+                IsolationLevel::RepeatableRead,
+            ] {
+                let scratch = migrated();
+                let role = runtime_role(&scratch);
+                let mut a = runtime(&scratch, &role);
+                let mut admin = scratch.connect();
+                let key = receipt(TENANT_A, None, None);
+                // Seed a first row so the counter row exists.
+                insert_committed(&mut a, TENANT_A, &receipt(TENANT_A, None, None));
+                let mut b = runtime(&scratch, &role);
+                let mut tx_a = a.transaction().unwrap();
+                insert(&mut tx_a, TENANT_A, &key, None).unwrap();
+                let (send, recv) = mpsc::channel();
+                let key_b = key.clone();
+                let handle = thread::spawn(move || {
+                    let mut tx = b
+                        .build_transaction()
+                        .isolation_level(isolation)
+                        .start()
+                        .unwrap();
+                    tx.query_one("SELECT 1", &[]).unwrap(); // snapshot before A commits
+                    let result = raw(&mut tx, &key_b, "ON CONFLICT DO NOTHING");
+                    let ok = result.is_ok();
+                    let text = outcome(result);
+                    if ok {
+                        tx.commit().unwrap();
+                    } else {
+                        drop(tx);
+                    }
+                    send.send(text).unwrap();
+                });
+                thread::sleep(StdDuration::from_millis(700));
+                let blocked = recv.try_recv().is_err();
+                tx_a.commit().unwrap();
+                let text = recv.recv_timeout(StdDuration::from_secs(20)).unwrap();
+                handle.join().unwrap();
+                let p = positions(&mut admin);
+                let n = next_seq(&mut admin);
+                eprintln!(
+                    "R163 concurrent {isolation:?}: B blocked while A held lock={blocked}; B -> {text}; next_seq={n} positions={p:?}"
+                );
+                let later = receipt(TENANT_A, None, None);
+                insert_committed(&mut a, TENANT_A, &later);
+                let p = positions(&mut admin);
+                eprintln!("R163 concurrent {isolation:?}: after later insert positions={p:?}");
+                assert!(blocked, "B waits for the tenant lock");
+                assert_eq!(p, vec![0, 1, 2], "{isolation:?}: no gap");
+            }
+        }
     }
 }
 

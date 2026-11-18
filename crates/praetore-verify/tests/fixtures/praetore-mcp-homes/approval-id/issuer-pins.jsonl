@@ -1,0 +1,1 @@
+{"schema_version":1,"issuer":"praetore-mcp-local-issuer","key_id":"29f888fd4c06cc21fa77567d611b0f70777400fe9121cee900186a78e28597ea","algorithm":"ed25519","public_key":"156bf52c00013a910cd300dc3fb387958020719c5467678ec91d141bf7b232eb","validity":{"not_before":"2026-11-17T05:09:09Z","not_after":"2027-11-16T05:09:09Z"}}

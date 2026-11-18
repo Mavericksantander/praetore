@@ -2,6 +2,62 @@
 
 ## Unreleased
 
+### Added
+
+- **Delegated authority to approve.** A tenant's delegation root, pinned
+  in the optional `PRAETORE_GATEWAY_DELEGATION_FILE`, signs delegations to
+  delegators and approvers with an exact list of action types, a validity
+  window and a decreasing `max_depth`; revocations are signed by the
+  delegation's issuer or the root and invalidate every delegation below.
+  Schema version 2 human decisions carry the `delegation_chain` in the
+  signed payload. The gateway checks the chain when it records the decision
+  and when it claims the dispatch; `praetore-verify outcomes` checks it with
+  `--delegation-root-pin`, `--delegations` and `--policy`, and fails a
+  version 2 decision without them (`DELEGATION_UNVERIFIED`). The root
+  approves in its own name only when the policy sets
+  `approval_delegation.root_may_approve`; absent, the policy digest is
+  unchanged. Revocations are read at startup: a new one needs a restart.
+  Version 1 decisions and existing policies are unchanged. The console
+  still signs version 1 decisions only, and its compliance package fails
+  for a tenant with version 2 decisions; verify those with
+  `praetore-verify outcomes`.
+  Design: `docs/proposals/approval-delegation.md`.
+
+- **praetore-mcp: `verify --expected-approval-head HEX`.** The approval
+  journal must end at a head printed earlier, as `--expected-head` does
+  for the receipts journal: records cut from the end, or the whole file
+  deleted, fail `verify`. `dashboard` takes the same flag, and the session
+  report prints `praetore-mcp verify --dir DIR --expected-head ...
+  --expected-approval-head ...` with both heads at close (JSON
+  `verify_command`, and the last section of the PDF). The README check of
+  a saved approval head uses the flag. The `approval journal: ... head HEX`
+  line now ends with where to keep the head and which flag takes it, and
+  the approval checks (in `verify` and in the dashboard) say "one use per
+  approval" with the case where it does not hold instead of "single use".
+
+- **praetore-mcp: the receipt of a call forwarded on an approval names it.**
+  The receipt carries `context["praetore.approval_id"]`, signed with the
+  intent. Before forwarding, `wrap` treats an approval as used when the
+  approval journal has its execution or a receipt in the receipts journal
+  names it, so cutting the approval journal alone no longer frees a used
+  approval. `verify` fails when two receipts name one approval, when a
+  receipt names an approval with no signed decision or a rejected one, or
+  when the approval journal has no execution of it for that receipt.
+  Receipts without the key (v0.3.6 and before) verify as before, with
+  `praetore-mcp verify` and with `praetore-verify`; tests pin a home
+  written by 0.3.6 and one written with the key.
+
+- **praetore-mcp: approval TTL in the home config.** `approval_ttl_seconds`
+  in `DIR/config.toml` (1 to 86400) sets how long a pending approval stays
+  open, even when the MCP client starts `wrap` with a filtered environment.
+  `PRAETORE_MCP_APPROVAL_TTL_SECONDS` still wins over it, and
+  `approvals/ttl-seconds` is still read after it. `wrap` now reads and
+  checks every TTL source that is set before it starts the server: a value
+  out of range or not an integer in any of them, a malformed
+  `approval_ttl_seconds` line (`approval_ttl_seconds: 1800` included), or a
+  `config.toml` that cannot be read or starts with a byte order mark, stops it with exit code 2 and names the source, even when
+  a source of higher priority is valid.
+
 ### Breaking
 
 - **Delegated approval changes Rust types.** `HumanApprovalDecision` gains
@@ -12,6 +68,463 @@
   `delegation_chain: None` and `delegation: None` to struct literals, and
   handle the new error variants in exhaustive matches. Nothing signed,
   recorded or exported by earlier versions changes.
+
+- **praetore-mcp: `verify` exits 0 only against both heads; without them
+  it exits 3.** A journal rewritten from the first entry with the keys in
+  the home, or cut at the end, passed `verify` as `OK`: every check read
+  only the home. `verify` now has three results: `OK` (exit 0) when both
+  `--expected-head` and `--expected-approval-head` are given and both
+  journals end exactly there, `UNANCHORED` (exit 3) when every check
+  passed but a head is missing, with a warning that says what cannot be
+  detected, and `FAIL` (exit 1). Both options take `none` for a journal
+  that must not exist yet. **A script that runs `verify` without the
+  heads and expects exit 0 now gets 3.** `init` prints how to save the
+  heads, and the dashboard state has `verify.assurance`
+  (`anchored`, `unanchored`, `failed`).
+
+- **praetore-mcp: an invalid TTL source stops `wrap` even when another one
+  wins.** Before, only the source in use was read:
+  `PRAETORE_MCP_APPROVAL_TTL_SECONDS` hid a bad `approvals/ttl-seconds`
+  (`0`, `soon`, a value over 86400), and `wrap` started. Now every source
+  that is set is checked, so an existing home with such a file next to a
+  valid env var stops at startup with exit code 2 and
+  `approval TTL: approvals/ttl-seconds ...; wrap did not start`. The same
+  holds for a bad `approval_ttl_seconds` in `config.toml`. Action: fix or
+  delete the file the message names.
+
+### Changed
+
+- **Observability: praetore-mcp observe warnings for ambiguous client lines
+  include the SHA-256 and length of the raw line.** The warning names the
+  line the same way the warning for an unparseable line does, so the
+  forwarded line can be matched in a capture.
+
+### Fixed
+
+- **A repeated journal INSERT no longer takes a position (migration 0025).**
+  Before 0025, `INSERT ... ON CONFLICT DO NOTHING` or `DO UPDATE` on a
+  primary key already in `praetore.execution_journal` discarded the row
+  but committed the counter update in `praetore.journal_positions`. The
+  gap in `chain_seq` is permanent, and every later export of that tenant
+  fails. The position trigger now refuses the existing key after it takes
+  the tenant lock, so the counter update is undone. **Visible change:
+  `ON CONFLICT` on an existing journal key now returns SQLSTATE 23505
+  (`unique_violation`; 40001 under REPEATABLE READ) instead of doing
+  nothing.** Gaps already present are not repaired, and export still
+  fails for them. Applying 0025 holds ACCESS EXCLUSIVE on
+  `praetore.execution_journal` only for the `DROP TRIGGER`/`CREATE
+  TRIGGER` (it does not rewrite rows): apply it with the gateways
+  stopped or in a maintenance window. Manual rollback:
+  `docs/rollback/0025-journal-position-existing-key.sql`.
+
+- **praetore-mcp: a client line over 32 MiB gets a JSON-RPC error.** The
+  line is still not parsed and not forwarded (both modes). The client used
+  to get no reply and wait for its own timeout. It now gets `-32600` with
+  the request id when that value is complete in the first 32 MiB, or
+  `-32700` with `id` null when it is not. The next line is answered normally.
+
+- **praetore-mcp: a condition key `arguments.a.b` is not a nested field.**
+  It matches a literal top-level argument key `"a.b"`, which the caller
+  controls. `policy check` used to warn and exit 0. It now exits 1.
+  `wrap --mode enforce` refuses to load a policy that contains one, and
+  every `tools/call` is refused until the rule is removed.
+
+- **praetore-mcp: a `[table]` line in `config.toml` stops `wrap`.** The file
+  is a flat list of `key = value` lines. A header such as `[tabla]` or
+  `[[tabla]]` used to be a warning (`expected key = value; ignored`) and
+  the keys under it were still applied. `wrap` now exits 2 and does not
+  start the server. A bad `report` value or an unknown key is still a
+  warning.
+
+- **praetore-mcp: `verify --expected-head` passed with receipts added
+  before the chain.** A bare evidence line placed before the first chained
+  entry was counted as an "unchained earlier entry" and verified, and the
+  head did not cover it. `verify` now rebuilds the chain from the head
+  backwards (`journal::Chain::rebuild`; the head is `--expected-head`, or
+  the last entry without it) and fails unless the lines of the journal
+  are exactly that chain, in order. A line outside the chain, a missing
+  entry and a reordered entry each fail, with the file and line.
+  **Breaking: a journal with lines written by 0.3.3 or earlier no longer
+  verifies.** Those lines have no `seq` or `prev`; move that journal out
+  of `receipts/` to keep it. An entry removed from the middle now also
+  fails the entries before it, which the chain no longer reaches.
+
+- **praetore-mcp: keys were read through symlinks.** A scratch home whose
+  `keys` was a symlink to another home's `keys/`, with a policy that
+  allows everything, loaded: `wrap` signed receipts with the other home's
+  keys, and the process that set it up never opened a key file. Keys are
+  now reached only through `KeyPath`: `DIR/keys` must be a real directory
+  and each key a regular file with one name, both owned by the user
+  running praetore-mcp, no directory above them may be a symlink made by a
+  user, and the file is opened with `O_NOFOLLOW`. On such a layout `wrap`
+  refuses every `tools/call` in both modes, and `init`, `verify` and
+  `policy check` exit non-zero. **A home under a symlinked directory that
+  a user made (for example a symlinked `~/.praetore`) no longer loads**;
+  move the home to its real path. Symlinks owned by root, such as `/tmp`
+  on macOS, are accepted.
+
+- **praetore-mcp: one number could stop the receipts journal for good.**
+  The writer appended a receipt without reading it back, and only the next
+  append read that line. A call with a float such as `99.9999999999999929`
+  left a line that fails its own integrity check: in enforce every later
+  call was refused, in new sessions too, until the journal was repaired by
+  hand; in observe every later call ran with no receipt; `verify` failed.
+  The writer now appends only a line it has read back (`VerifiedLine`:
+  parsed as a chained entry, integrity checked, next link computed). When that fails nothing is written and the call is refused,
+  in enforce and in observe, and later calls are recorded as usual.
+  **Observe now refuses a call in this one case**, where before it
+  forwarded it without a receipt. A property test sends random floats and
+  number literals through `wrap` in both modes and runs `verify`
+  (`tests/journal_verified_line.rs`).
+
+- **praetore-mcp: the gate decided on a number the server did not read.**
+  `serde_json` was built without `float_roundtrip`, so the proxy read
+  `49.9999999999999965` as 49.99999999999999 while it forwarded the
+  original bytes, which the server reads as 50.0. A rule `DENY amount >=
+  50` let that call through with an ALLOW receipt that verified; the same
+  literal skipped a REQUIRE_APPROVAL rule and misread `Exact`, `In`, `>`
+  and `<=`. A literal such as `99.9999999999999929` also left a receipt
+  that `verify` could not read, after which enforce refused every call.
+  `serde_json` is now built with `float_roundtrip` in praetore-mcp,
+  praetore-core, praetore-verify and praetore-receipt, and a number in the
+  `params` of a `tools/call` whose text is not the canonical form of its
+  value makes the line ambiguous: enforce refuses it and names the form to
+  send, observe forwards it and warns. This also refuses `50.00`, exponent
+  forms such as `1e2`, `-0` and integers above 2^64 - 1 in enforce. CI
+  checks the feature in every package that ships `serde_json`
+  (`scripts/check-float-roundtrip.sh`) and runs a table of boundary
+  literals against a server that logs the value it read
+  (`tests/numeric_gate.rs`).
+
+- **praetore-mcp: what observe mode refuses, and what a DENY shows.** The
+  help, the `init` output, the READMEs and the GUIDE said observe mode
+  never blocks (the 0.3.5 entry below says so too). It records a DENY and
+  forwards the call, but it still refuses, as enforce does, a `tools/call`
+  the policy does not classify, a client line it cannot parse that may
+  name a `safety*` tool, a client line over 32 MiB, and a whole batch when
+  a `tools/call` in it is refused; when the home cannot be loaded, every
+  `tools/call` and every client line that cannot be parsed. The texts now
+  say so, and tests pin the `init` help, the top-level help and the `init`
+  output. The README also said a DENY shows the rule in the chat: the
+  client sees only `Denied by PRÆTORE. Evidence id: <id>`, and the rule is
+  on stderr and in the receipt. A test skipped as root now prints why.
+
+- **praetore-mcp: error messages name the binary and the home.** The
+  not-initialized notes of `install`, the approval and receipt journal
+  errors that say to run `verify` or `init`, and the invalid-policy error
+  now print the command with the binary's absolute path and `--dir`, like
+  the other printed commands.
+- **praetore-mcp: an id that is already decided is not offered again.**
+  If `approve` or `reject` stopped after it signed the decision and before
+  it removed the pending file, `approvals` listed that id with its
+  `approve` and `reject` commands, and the session report counted it as
+  pending as well as decided. `approvals` now prints
+  `decided: <outcome> already; ...` with no commands, and the report counts
+  it once, as decided.
+- **praetore-mcp: control characters in paths and names are escaped where
+  a person reads them.** Terminal messages, the dashboard and the PDF
+  report write control characters (C0 with `\r`, `\n`, NUL and ESC, DEL,
+  C1), zero-width and bidi characters as `\u{..}`, so a file or home name
+  cannot clear or fake the line it is shown in. Printed commands write such
+  a path as `$'...'` with `\xHH` escapes. JSON output and the report JSON
+  keep the exact value.
+
+## 0.3.6 - 2026-11-16
+
+### Added
+
+- **praetore-mcp: a report of each `wrap` session.** When a session ends
+  (the client or the server closes, or SIGINT/SIGTERM on macOS and Linux)
+  and it recorded at least one receipt, `wrap` writes
+  `DIR/reports/session-<start UTC>-<id>.json` and `.pdf`. The JSON has a
+  header (praetore-mcp version, agent, server, mode, seq range, the heads
+  of the receipts and approval journals at close, the result of `verify`)
+  and the session's receipts, each one the journal line copied byte for
+  byte. The PDF shows the same session for a person: PRÆTOR TECHNOLOGIES
+  wordmark, local time with UTC next to it, summary (ALLOW, DENY, held,
+  approved, expired), the calls (time, tool, decision, rule, short reason),
+  the approvals with the approver key id and time, the result of `verify`,
+  both heads and the SHA-256 of the JSON. If `verify` fails the first page
+  says `VERIFY FAILED` and both files are still written. The report is a
+  view: it signs nothing and does not change the journal; if it cannot be
+  written the reason goes to stderr and the exit code and every decision
+  stay the same. `wrap --no-report` and `report = false` in
+  `DIR/config.toml` (new, optional file) turn it off.
+  `praetore-mcp report [--dir DIR] [--session ID | --last]` writes a new
+  report of a session from the journal as it is now (exit code 1 if it
+  says verify failed): a new pair,
+  `session-<start UTC>-<id>.regen-<now UTC>.json` and `.pdf`, next to the
+  original, with `regenerated_from` in its header. The report written at
+  close is never replaced. The session's approval records are copied from
+  the approval journal byte for byte; if it cannot be read, the header and
+  the PDF say so. The PDF is written in Rust with `pdf-writer` (MIT OR
+  Apache-2.0; adds no other crate to the lockfile), with no network access
+  and no external process.
+- **praetore-mcp: session reports in the dashboard.** A new Sessions view
+  (Spanish, English, Portuguese) lists the reports in `DIR/reports/`, newest
+  first: session id, agent, server, mode, open and close time (local and
+  UTC), the decisions and, apart, the approval statuses, the result of
+  `verify`, and buttons to download the PDF and the JSON (with the JSON's
+  SHA-256). The pairs `report` wrote later are grouped under the report they
+  came from. `GET /reports/<file>` serves a file only when its name is
+  exactly a report file name, it opens without following a symlink as a
+  regular file with a single link, owned by the dashboard's user, its real
+  path is in `DIR/reports/` and its content is a report (a JSON with the
+  report schema; a PDF that starts with `%PDF` and whose JSON passes the
+  same checks); anything else gets 404, a file over 64 MiB 413 (not read),
+  any method but GET 405. While the
+  page is open, a new session shows up on the next refresh with a "Report
+  ready" notice. At close, `wrap` prints, after the report path, the
+  command that starts the dashboard on the home with `--port 8787`
+  (absolute and quoted) and the link `http://127.0.0.1:8787/#/sessions/<id>`,
+  saying that on another port the page is `#/sessions/<id>` there. In the
+  approval history and in the Live list, an approved or rejected call
+  shows the time of the person's decision from the approval journal
+  (`approval_decided_at` on the held rows of `/api/state`), noted as such.
+  The Sessions view lists a file only when `GET /reports/` serves it. The Live caption says how many rows
+  it shows and since when. The dashboard still
+  writes nothing: it does not write, regenerate or sign a report. The view
+  signs nothing, does not prove that a person reviewed a session, and is
+  tamper-evident only against an external copy of the heads.
+
+### Changed
+
+- **praetore-mcp: the dashboard refuses a request whose `Origin` is not
+  its own** (`http://127.0.0.1:PORT` or `http://localhost:PORT`), with 403,
+  on top of the `Host` check.
+- **praetore-mcp: the report header names the build.** `praetore_mcp_version`
+  (JSON) and the PDF header are the version for a release build and
+  `<version>-dev+<short commit>` (or `<version>-dev`) for any other build.
+  A release build is only one whose commit carries the exact tag
+  `v<crate version>`, or one built with `PRAETORE_MCP_RELEASE=1`. The
+  commit comes from git only when the repository found is this one;
+  otherwise from `PRAETORE_MCP_BUILD_COMMIT`, or none. `praetore-mcp
+  --version` prints the same build version. CI fails a tag that is not
+  `v<crate version>`, a tag build that does not print exactly
+  `praetore-mcp <crate version>`, any other build that does not print
+  exactly `praetore-mcp <crate version>-dev+<commit>`, and a binary that
+  cannot run on the runner (Rosetta 2 is installed for x86_64 on Apple
+  silicon). The end-to-end smoke test compares `--version` with the crate
+  version (`cargo metadata`, or `--expect-version`), prereleases included.
+- **praetore-mcp: the decision tiles of the report PDF are two fixed rows.**
+  The first counts decisions, one per call, from the receipts (ALLOW, DENY,
+  HELD, FORWARDED, WOULD ASK); the second, labeled apart, counts the
+  approval status of the held calls (APPROVED, REJECTED, PENDING,
+  EXPIRED). Every tile is shown, 0 included, so HELD and PENDING no longer
+  read as two events of the same call.
+
+- **praetore-mcp: with reports on, `wrap` writes the report before it ends
+  by SIGINT or SIGTERM (macOS and Linux).** Before, the signal ended `wrap`
+  at once. Now, when the session report is on, `wrap` waits up to 300 ms
+  for the server to end, forwards the signal to it, waits up to 2 s more,
+  kills it if it is still running, writes the report, and then ends by that
+  same signal, so the parent still sees `wrap` terminated by SIGINT or
+  SIGTERM, as in 0.3.5. A second signal ends it at once without the report.
+  With `--no-report` or `report = false` no handler is installed and the
+  signal ends `wrap` at once, as in 0.3.5. A signal that was ignored when
+  `wrap` started stays ignored.
+
+### Fixed
+
+- **praetore-mcp: an approval that expired undecided reads Expired.**
+  Before, the dashboard's Live view showed such a call as waiting for a
+  decision while "To decide" listed nothing. The server now labels a held
+  call nobody decided `expired` once its `expires_at` has passed (or
+  cannot be read, as for `approve`), and lists to decide only the calls it
+  labels `pending`, from the same map. The drawing, the Live list, the
+  approval history and the drawer show Vencida / Expired / Vencida, and
+  `praetore-mcp receipts` shows `expired`. The session report uses the same
+  rule, so a pending call whose `expires_at` cannot be read is Expired
+  there too (before, it stayed Pending), and so do `approve`, `reject` and
+  holding the same call again. `praetore-mcp approvals` prints
+  `expired: run the agent again so the call is held again` for such a call
+  in place of its `approve` and `reject` commands. The journal and the
+  signed receipts are unchanged.
+
+- **praetore-mcp: printed commands run when the binary is not on `PATH`.**
+  The `approve` and `reject` commands in the tool error of a held call, in
+  `approvals` and in the dashboard, and the commands that `init` (its
+  allow-all warning included), `policy check`, `policy allow`,
+  `policy coverage` and the not-initialized errors print, start with the
+  absolute path of the running binary (`std::env::current_exe`,
+  canonicalized, so a symlink such as `~/.local/bin/praetore-mcp` prints
+  the file it points to) and always pass `--dir` as an absolute path, also
+  for the default home, both single-quoted for a POSIX shell (`'` written
+  as `'\''`). The not-initialized notes of `install` still say
+  `praetore-mcp init`. Before, they started with
+  `praetore-mcp`, and a binary extracted to a folder off `PATH` answered
+  "command not found". If the binary's path cannot be read the commands
+  start with `praetore-mcp`, as before. The dashboard shows and copies the
+  strings the server sends, unchanged. On Windows nothing changes.
+- **praetore-mcp: approval expiry is shown in local time, with what is
+  left.** `approvals`, `approve` and the dashboard show the expiry in local
+  time with UTC beside it and the time left (`in 9 min 40 s`); the tool
+  error of a held call adds that line after `Expires (UTC)`. After an
+  approval, `approve` prints the time to retry before. `approve` on an
+  expired call says so before it asks for the confirmation code
+  (`this approval expired at HH:MM (local time) / HH:MM UTC; run the agent
+  again so the call is held again`) and signs nothing; its exit code stays
+  2. The dashboard marks an approval that expired before any retry ran as
+  expired, apart from one that was approved and executed (`receipts` shows
+  `approve by KEY, expired unused` or `approve by KEY, executed once`).
+  Approval is unchanged: bound to the exact call, single use, the same
+  TTL, decided only in a terminal; the dashboard stays read-only.
+- **praetore-mcp: a decided approval id is not handed out again after a
+  crash.** `approve` and `reject` append the decision to the approval
+  journal and then remove the pending file. If the process stopped between
+  the two, holding the same call again reused the decided id, so a
+  rejected call stayed held under it until it expired. A pending file
+  whose id already has a decision is now removed and the call is held with
+  a new id. A rejected id still never runs, and an approved id runs at
+  most once.
+- **praetore-mcp: the report PDF says `1 RECEIPT`** for a session with one
+  receipt (it said `1 RECEIPTS`).
+
+### Internal
+
+- praetore-mcp: clippy keeps `Expiry::at` for display only, a test refuses
+  an allow of that lint anywhere in the crate, and new tests cover a
+  signal while the report is written and the fixes above.
+
+## 0.3.5 - 2026-11-15
+
+praetore-mcp: `init` writes a default-deny policy (no
+`allow-all-mcp-tool-calls`), `policy coverage` reports what the policy
+decides for each tool a server lists, and `dashboard` serves a read-only
+local page over the receipts journal. Also carries everything merged to
+main since v0.3.4, including the dashboard minors and latency tests that
+tolerate a loaded machine from #175.
+
+### Changed
+
+- **praetore-mcp: `init` writes a default-deny policy (behavior change for
+  enforce mode).** The policy has no rules. Before, it had
+  `allow-all-mcp-tool-calls`, which allowed every `tools/call` that no other
+  rule matched, so DENY rules that named tools left every other tool
+  allowed: with DENY rules per tool, `copy_file` and `append_file` of
+  `@modelcontextprotocol/server-filesystem@2.3.0` were allowed because no
+  rule named them. Now, in enforce mode, every `tools/call` that no rule
+  allows is denied; allow tools with
+  `praetore-mcp policy allow --id ID --server NAME --tool NAME`. No rule is
+  needed to start a server: only `tools/call` is evaluated, so
+  `initialize`, `tools/list` and the rest of the MCP traffic pass. Observe
+  mode is unchanged and never blocks. Existing homes keep their policy:
+  `init` on a home that has an allow-all rule leaves it in place and prints
+  a warning with `praetore-mcp policy remove --id allow-all-mcp-tool-calls`.
+  Not in v0.3.4: `init` in that release still writes
+  `allow-all-mcp-tool-calls` (#167). The GUIDE records that fact and how
+  to remove the rule from a home created by that release (#168).
+- **praetore-mcp: `policy check` warns about allow-all next to tool
+  rules.** When the policy has an allow-all rule and DENY or
+  REQUIRE_APPROVAL rules for specific tools, it says that tools those rules
+  do not name are allowed and suggests `policy coverage`. `policy deny`,
+  `require-approval` and `allow` print the same warning after the change
+  (#167).
+
+### Added
+
+- **`praetore-mcp dashboard [--dir DIR] [--port N] [--expected-head HEX]`.**
+  A read-only local page over `receipts/*.jsonl`, served on 127.0.0.1 only
+  (default port 8787, `0` picks a free one). Any other address is refused.
+  The page shows a summary (total, ALLOW, DENY, active policy id, version
+  and digest, and a warning when an allow-all rule meets enforce receipts),
+  the decisions table (local time and UTC, server, tool, arguments,
+  decision, rule or `default deny`, mode, evidence id) with filters, and
+  each receipt's full JSON, `path_check` and agent, attester and authority
+  signatures with their key ids. The verification status, per receipt and
+  for the journal, with seq/prev and the journal head, comes from the code
+  behind `praetore-mcp verify`. To share it, `verify`'s per-receipt check
+  is split into one result per check (`receipts::check_evidence`). `verify`
+  prints the same output as before. HTML, CSS and JS are embedded in the
+  binary. Nothing is loaded from the network or written under DIR. Only
+  GET requests with a loopback `Host` are answered. Texts in Spanish,
+  English and Portuguese. The table shows 100 receipts per page, newest
+  first; the filters (decision, tool, time range, text) run on the server
+  over the whole journal. The verification result is kept in memory until
+  a file `verify` reads changes, so a reload of an unchanged 10,000-receipt
+  journal does not run `verify` again (#166).
+- **praetore-mcp dashboard: home, live, chain and information views.** The
+  page opens on a home view with the agent, the servers, the mode, the
+  verification result and the ALLOW, DENY and pending counts. The live view
+  draws the newest receipts: an allowed call reaches its box, a denied one
+  stops at a red bar that shows the rule id, default deny or the engine
+  check, and a call waiting for approval stops at an amber bar marked as an
+  unsigned notice that `verify` does not check. The chain view draws the
+  receipts in seq order joined by the `prev` hash link and shows the link
+  cut, with the reason, where `verify` fails. Opening a receipt shows its
+  tool, arguments, rule, mode, local time and UTC, evidence id, seq, `prev`
+  and its `verify` result. The live view marks a receipt that `verify`
+  rejects, with the reason, and moves only when a receipt arrives, the
+  `verify` result changes or the pending calls change. Live and chain each
+  have a text list view with the same content, and nothing moves when the
+  system asks for reduced motion. The drawings use a 2D canvas and code
+  embedded in the binary; the page keeps the same Content-Security-Policy
+  and loads nothing from the network. The page now uses one dark color
+  scheme (#172, #173).
+- **praetore-mcp: `policy coverage [--dir DIR] [--server NAME] -- <command>
+  [args...]`.** Starts the MCP server, sends `initialize` and `tools/list`
+  (every page), closes it, and prints for each tool what the policy
+  decides: the rule that applies or default deny, and whether a rule
+  depends on an argument. Tools allowed only by an allow-all rule are
+  listed apart. Exit code 0 when there are none, 1 when there is one, 2 on a
+  usage error or when the server cannot be started or does not answer. It
+  sends no `tools/call` and writes nothing under `DIR`. For each tool
+  denied because no rule names it, it prints the
+  `praetore-mcp policy allow --id ... --server ... --tool ...` line that
+  allows it, quoted to run as printed in a POSIX shell. Tools with a rule
+  that depends on an argument get no line, and neither do tool names with
+  characters outside `A-Z a-z 0-9 _ - .` (#167, #170).
+- Commands that praetore-mcp prints with `--dir DIR` quote `DIR` when it
+  has spaces or other characters a shell would interpret.
+- `scripts/mcp-smoke.py` checks `policy coverage` against
+  `@modelcontextprotocol/server-filesystem@2.3.0`, and the smoke test now
+  allows `read_text_file` with an explicit rule.
+
+### Fixed
+
+- praetore-mcp dashboard: the live view writes the whole reason `verify`
+  gives for a rejected receipt, over up to three lines, and says when a
+  longer one continues in the receipt detail. It was clipped (#175).
+- praetore-mcp dashboard: `/favicon.ico` is answered with 204 instead of
+  404, so the browser console shows no error. Only GET on loopback, as for
+  the other paths (#175).
+- praetore-safety-client: the non-blocking latency tests no longer fail on
+  a loaded machine; a slow `send` still fails them (#175).
+- **console: keep the operator language chosen during the first catalog
+  load.** If the operator changed language while that catalog request was
+  still in flight, the first load could overwrite the choice and put the
+  page back in Spanish (#161).
+- **console: the package language test builds every download at one fixed
+  instant**, so the byte-for-byte comparison no longer fails when two
+  builds straddle a second (#171).
+
+## 0.3.4 - 2026-11-13
+
+Adds local approval to praetore-mcp: in enforce mode a `REQUIRE_APPROVAL`
+rule holds the call until someone approves or rejects it from a terminal on
+the same machine. Also carries everything merged to main since v0.3.3.
+
+### Added
+
+- **praetore-mcp 0.3.4: local approval for `REQUIRE_APPROVAL`.** In enforce
+  mode a matching `tools/call` is not forwarded. The proxy writes a pending
+  file under the praetore-mcp home and returns the approval id plus the
+  exact `praetore-mcp approve <id> --dir <home>` command. `approvals` lists
+  pending calls, `approve` and `reject` sign the decision with a new local
+  approver key (`init` creates it; running `init` again adds it to an
+  existing home and does not replace keys or receipts). `approve` reads a
+  confirmation code from an interactive terminal. That check is cooperative.
+  An approval is bound to the server, tool and canonical arguments, expires
+  (default 10 minutes, `PRAETORE_MCP_APPROVAL_TTL_SECONDS` or
+  `approvals/ttl-seconds`), and authorizes one later matching call. The
+  decision and that execution are appended to `approvals/journal.jsonl`.
+  `verify` checks the approver signature, the binding, the expiry and that
+  the approval was not used twice. `receipts` shows the state. Observe mode
+  still forwards, and the receipt list says enforce would ask. Receipt
+  lines in `receipts/*.jsonl` are unchanged, so journals written by v0.3.3
+  and by current main keep verifying.
+
+### Breaking
 
 - **The console's JSON API sends codes and UTC instants instead of Spanish
   text.** `situacion`, `relato`, `aviso`, `mensaje` and `nota` are stable
@@ -206,24 +719,6 @@
 
 ### Added
 
-- **Delegated authority to approve.** A tenant's delegation root, pinned
-  in the optional `PRAETORE_GATEWAY_DELEGATION_FILE`, signs delegations to
-  delegators and approvers with an exact list of action types, a validity
-  window and a decreasing `max_depth`; revocations are signed by the
-  delegation's issuer or the root and invalidate every delegation below.
-  Schema version 2 human decisions carry the `delegation_chain` in the
-  signed payload. The gateway checks the chain when it records the decision
-  and when it claims the dispatch; `praetore-verify outcomes` checks it with
-  `--delegation-root-pin`, `--delegations` and `--policy`, and fails a
-  version 2 decision without them (`DELEGATION_UNVERIFIED`). The root
-  approves in its own name only when the policy sets
-  `approval_delegation.root_may_approve`; absent, the policy digest is
-  unchanged. Revocations are read at startup: a new one needs a restart.
-  Version 1 decisions and existing policies are unchanged. The console
-  still signs version 1 decisions only, and its compliance package fails
-  for a tenant with version 2 decisions; verify those with
-  `praetore-verify outcomes`.
-  Design: `docs/proposals/approval-delegation.md`.
 - **Console language and local time.** The console page can be read in
   Spanish, English or Portuguese (Brazil), chosen with a selector at the top
   and kept in the browser (`localStorage`, key `praetore_idioma`); without a

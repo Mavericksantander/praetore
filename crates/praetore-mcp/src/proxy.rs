@@ -5,6 +5,7 @@
 
 use crate::{
     gate::{Evaluator, GateError, Mode, Verdict},
+    journal::JournalError,
     json::JsonValue,
 };
 use praetore_core::DecisionOutcome;
@@ -41,7 +42,8 @@ pub enum Classified {
     /// Not UTF-8, not JSON, or JSON with duplicate keys.
     Unparseable(String),
     /// Valid here, but another MCP server parser could read it differently
-    /// (bare `\r` line splitting, case-insensitive keys, nested batches).
+    /// (bare `\r` line splitting, case-insensitive keys, nested batches, a
+    /// number of a `tools/call` that is not in canonical form).
     /// `candidates` are every `tools/call` reading found, for observe.
     Ambiguous {
         reason: String,
@@ -100,6 +102,24 @@ fn nested_fold_problem(value: &JsonValue) -> Option<String> {
         JsonValue::Object(entries) => fold_problem(value, false)
             .or_else(|| entries.iter().find_map(|(_, v)| nested_fold_problem(v))),
         JsonValue::Array(items) => items.iter().find_map(nested_fold_problem),
+        _ => None,
+    }
+}
+
+/// A number anywhere in `value` whose text is not the canonical form of the
+/// value this proxy reads. The server gets the client's bytes and parses
+/// that text itself: an f64 parser, a decimal parser and a bigint parser
+/// only agree on a canonical literal, so the gate cannot decide on another.
+fn number_problem(value: &JsonValue) -> Option<String> {
+    match value {
+        JsonValue::Number(number) if !number.is_canonical() => Some(format!(
+            "number {} is not written in canonical form (read here as {}): the server may read another value; send it as {}",
+            number.literal(),
+            number.value(),
+            number.value()
+        )),
+        JsonValue::Object(entries) => entries.iter().find_map(|(_, v)| number_problem(v)),
+        JsonValue::Array(items) => items.iter().find_map(number_problem),
         _ => None,
     }
 }
@@ -183,7 +203,8 @@ fn check_message(value: &JsonValue) -> Result<Option<ToolCall>, Ambiguity> {
         && let Some(params) = value.get("params")
     {
         problem = fold_problem(params, true)
-            .or_else(|| params.get("arguments").and_then(nested_fold_problem));
+            .or_else(|| params.get("arguments").and_then(nested_fold_problem))
+            .or_else(|| number_problem(params));
     }
     match problem {
         None => Ok(exact),
@@ -392,6 +413,23 @@ fn decide_verdict(
     warnings: &mut Vec<String>,
 ) -> CallDecision {
     if let Err(error) = &verdict.journaled {
+        // A receipt that would not verify when read back is never written,
+        // and its call is not forwarded in either mode: the call would run
+        // with no receipt, and no later repair of the journal could add one.
+        if let JournalError::Unverifiable(_) = error {
+            warnings.push(format!(
+                "praetore-mcp: ERROR receipt for {server}/{tool} (evidence {}) was not written: {error}; call REFUSED ({mode}). A number in the arguments does not survive being written and read back; send it in the form it prints as",
+                verdict.evidence_id,
+                mode = match mode {
+                    Mode::Enforce => "enforce",
+                    Mode::Observe => "observe: this call cannot have a receipt",
+                }
+            ));
+            return CallDecision::Block(format!(
+                "PRÆTORE could not write a receipt for this tool call that verifies when read back, so it was refused. Evidence id: {}",
+                verdict.evidence_id
+            ));
+        }
         match mode {
             Mode::Enforce => {
                 warnings.push(format!(
@@ -445,10 +483,27 @@ fn decide_verdict(
             ));
             CallDecision::Block(denied())
         }
-        (Mode::Enforce, DecisionOutcome::RequireApproval) => CallDecision::Block(format!(
-            "This tool call requires human approval (not supported by praetore-mcp yet), so it was not executed. Rule: {rules}. Evidence id: {}",
-            verdict.evidence_id
-        )),
+        (Mode::Enforce, DecisionOutcome::RequireApproval) => {
+            if let Some(id) = &verdict.consumed_approval {
+                warnings.push(format!(
+                    "praetore-mcp: {server}/{tool} forwarded once under local approval {id} (evidence {})",
+                    verdict.evidence_id
+                ));
+                CallDecision::Forward
+            } else {
+                let text = verdict.hold_message.clone().unwrap_or_else(|| {
+                    format!(
+                        "This tool call is waiting for local human approval and was not executed. Evidence id: {}",
+                        verdict.evidence_id
+                    )
+                });
+                warnings.push(format!(
+                    "praetore-mcp: {server}/{tool} waiting for local approval (evidence {})",
+                    verdict.evidence_id
+                ));
+                CallDecision::Block(text)
+            }
+        }
     }
 }
 
@@ -457,7 +512,7 @@ fn decide_verdict(
 pub fn display_safe(value: &str) -> String {
     // Control, zero-width and bidi characters are written as `\u{XXXX}`
     // (G7), so a tool name cannot pass for another in a table or log line.
-    praetore_core::display::escape_bounded(value, 200)
+    crate::shown::bounded(value, 200)
 }
 
 pub fn outcome_label(outcome: DecisionOutcome) -> &'static str {
@@ -646,7 +701,8 @@ pub fn handle_client_line(
             Mode::Enforce => refuse_unparseable(&mut out, "an ambiguous", &reason, raw),
             Mode::Observe => {
                 out.warnings.push(format!(
-                    "praetore-mcp: WARNING ambiguous client line ({reason}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
+                    "praetore-mcp: WARNING ambiguous client line ({reason}; {}); forwarded unchanged (observe), recording {} possible tools/call reading(s)",
+                    fingerprint(raw),
                     candidates.len()
                 ));
                 let mut refused = None;
@@ -728,6 +784,213 @@ pub fn handle_client_line(
     out
 }
 
+/// JSON-RPC error for a client line longer than the bytes kept in `prefix`.
+/// `-32600` carries the top-level `id` when that value is complete in
+/// `prefix`. Otherwise `-32700` with `id` null (no id, a truncated id, a
+/// second id, or a batch).
+pub fn oversized_line_response(prefix: &[u8]) -> Vec<u8> {
+    let (id, code) = match extract_top_level_id(prefix) {
+        Some(id) => (id, -32600),
+        None => (Value::Null, -32700),
+    };
+    line(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": "praetore-mcp: client message over 32 MiB was not forwarded"
+        }
+    }))
+}
+
+struct Scan<'a> {
+    input: &'a [u8],
+    i: usize,
+}
+
+impl Scan<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.i).copied()
+    }
+
+    fn bump(&mut self) -> Option<u8> {
+        let byte = self.peek()?;
+        self.i += 1;
+        Some(byte)
+    }
+
+    fn skip_ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    fn skip_string(&mut self) -> bool {
+        if self.bump() != Some(b'"') {
+            return false;
+        }
+        while let Some(byte) = self.bump() {
+            match byte {
+                b'"' => return true,
+                b'\\' => match self.bump() {
+                    Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {}
+                    Some(b'u') => {
+                        let end = self.i.saturating_add(4);
+                        if end > self.input.len()
+                            || !self.input[self.i..end]
+                                .iter()
+                                .all(|c| c.is_ascii_hexdigit())
+                        {
+                            return false;
+                        }
+                        self.i = end;
+                    }
+                    _ => return false,
+                },
+                _ => {}
+            }
+        }
+        false
+    }
+
+    fn skip_literal(&mut self, literal: &[u8]) -> bool {
+        if self.input[self.i..].starts_with(literal) {
+            self.i += literal.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_digits(&mut self) -> bool {
+        let start = self.i;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        self.i > start
+    }
+
+    fn skip_number(&mut self) -> bool {
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        if !self.skip_digits() {
+            return false;
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            if !self.skip_digits() {
+                return false;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if !self.skip_digits() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn skip_value(&mut self) -> bool {
+        match self.peek() {
+            Some(b'"') => self.skip_string(),
+            Some(b'{') => self.skip_container(b'{', b'}'),
+            Some(b'[') => self.skip_container(b'[', b']'),
+            Some(b't') => self.skip_literal(b"true"),
+            Some(b'f') => self.skip_literal(b"false"),
+            Some(b'n') => self.skip_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
+            _ => false,
+        }
+    }
+
+    fn skip_container(&mut self, open: u8, close: u8) -> bool {
+        if self.bump() != Some(open) {
+            return false;
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() == Some(close) {
+                self.i += 1;
+                return true;
+            }
+            if open == b'{' {
+                if !self.skip_string() {
+                    return false;
+                }
+                self.skip_ws();
+                if self.bump() != Some(b':') {
+                    return false;
+                }
+                self.skip_ws();
+            }
+            if !self.skip_value() {
+                return false;
+            }
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.i += 1,
+                Some(byte) if byte == close => {
+                    self.i += 1;
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
+/// Top-level JSON-RPC `id` when `prefix` holds a complete value for it.
+/// `Some(Null)` means the document's id is JSON null (`-32600`). `None`
+/// means the id cannot be taken from this prefix (`-32700`).
+fn extract_top_level_id(input: &[u8]) -> Option<Value> {
+    let mut scan = Scan { input, i: 0 };
+    scan.skip_ws();
+    if scan.bump() != Some(b'{') {
+        return None;
+    }
+    let mut found = None;
+    loop {
+        scan.skip_ws();
+        match scan.peek() {
+            Some(b'}') => return found,
+            Some(b'"') => {}
+            None => return found,
+            _ => return None,
+        }
+        let key_start = scan.i;
+        if !scan.skip_string() {
+            return None;
+        }
+        let key: String = serde_json::from_slice(&scan.input[key_start..scan.i]).ok()?;
+        scan.skip_ws();
+        if scan.bump() != Some(b':') {
+            return None;
+        }
+        scan.skip_ws();
+        let value_start = scan.i;
+        let complete = scan.skip_value();
+        if key == "id" {
+            if !complete || found.is_some() {
+                return None;
+            }
+            found = Some(serde_json::from_slice(&scan.input[value_start..scan.i]).ok()?);
+        } else if !complete {
+            return found;
+        }
+        scan.skip_ws();
+        match scan.peek() {
+            Some(b',') => scan.i += 1,
+            Some(b'}') | None => return found,
+            _ => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,7 +999,7 @@ mod tests {
 
     struct Fixed {
         result: Result<DecisionOutcome, String>,
-        journal_ok: bool,
+        journal_error: Option<JournalError>,
         calls: Vec<(String, Value)>,
     }
 
@@ -744,7 +1007,7 @@ mod tests {
         fn new(result: Result<DecisionOutcome, String>) -> Self {
             Self {
                 result,
-                journal_ok: true,
+                journal_error: None,
                 calls: Vec::new(),
             }
         }
@@ -760,11 +1023,12 @@ mod tests {
                 evidence_id: Uuid::nil(),
                 rule_ids: vec!["rule-x".into()],
                 reason: "Policy rule 'rule-x' matched".into(),
-                journaled: if self.journal_ok {
-                    Ok(PathBuf::from("/j"))
-                } else {
-                    Err("disk full".into())
+                journaled: match &self.journal_error {
+                    None => Ok(PathBuf::from("/j")),
+                    Some(error) => Err(error.clone()),
                 },
+                consumed_approval: None,
+                hold_message: None,
             })
         }
     }
@@ -880,7 +1144,7 @@ mod tests {
             reply["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
-                .contains("requires human approval (not supported by praetore-mcp yet)")
+                .contains("waiting for local human approval")
         );
     }
 
@@ -902,10 +1166,36 @@ mod tests {
         assert!(out.warnings[0].contains("WITHOUT a receipt"));
     }
 
+    /// A receipt that would not verify when read back: the call is not
+    /// forwarded in either mode, and the client gets a reply with its id.
+    #[test]
+    fn an_unverifiable_receipt_refuses_the_call_in_both_modes() {
+        for mode in [Mode::Enforce, Mode::Observe] {
+            let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+            eval.journal_error = Some(JournalError::Unverifiable("EVIDENCE_FAIL".into()));
+            let out = handle_client_line(CALL, mode, "fs", &mut eval);
+            assert!(out.to_server.is_none(), "{mode:?}");
+            let reply: Value = serde_json::from_slice(out.to_client.as_deref().unwrap()).unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{mode:?}");
+            assert!(
+                reply["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("could not write a receipt"),
+                "{reply}"
+            );
+            assert!(
+                out.warnings[0].contains("was not written") && out.warnings[0].contains("REFUSED"),
+                "{:?}",
+                out.warnings
+            );
+        }
+    }
+
     #[test]
     fn journal_failure_refuses_in_enforce_and_warns_in_observe() {
         let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
-        eval.journal_ok = false;
+        eval.journal_error = Some(JournalError::Unavailable("disk full".into()));
         let out = handle_client_line(CALL, Mode::Enforce, "fs", &mut eval);
         assert!(out.to_server.is_none());
         assert!(out.to_client.is_some());
@@ -939,6 +1229,33 @@ mod tests {
         assert_eq!(reply["id"], Value::Null);
         assert!(out.warnings[0].contains(&digest), "{:?}", out.warnings);
         assert!(eval.calls.is_empty());
+    }
+
+    /// Ambiguous client lines in observe: the warning names the raw line by
+    /// its SHA-256 and length, the same fingerprint as the other line notices.
+    #[test]
+    fn observe_ambiguous_line_warning_includes_sha256() {
+        let raw = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"Method\":\"tools/call\",\"params\":{\"name\":\"rm\"}}\n";
+        let digest = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(raw));
+        assert!(matches!(
+            classify(raw),
+            Classified::Ambiguous {
+                unparsed: false,
+                ..
+            }
+        ));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(raw, Mode::Observe, "s", &mut eval);
+        assert_eq!(out.to_server.as_deref(), Some(&raw[..]));
+        assert!(out.to_client.is_none());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        let warning = &out.warnings[0];
+        assert!(warning.contains("ambiguous client line"), "{warning}");
+        assert!(warning.contains("(observe)"), "{warning}");
+        assert!(
+            warning.contains(&format!("sha256 {digest}, {} bytes", raw.len())),
+            "{warning}"
+        );
     }
 
     fn nested_call(name: &str, depth: usize) -> Vec<u8> {
@@ -1085,14 +1402,63 @@ mod tests {
         assert_eq!(reply[1]["id"], "b");
         assert_eq!(reply[1]["result"]["isError"], true);
 
-        // Nothing blocked: original bytes (including number formatting).
-        let raw = br#"[{"jsonrpc":"2.0","id":1.50,"method":"tools/call","params":{"name":"x","arguments":{"n":1e2}}}]"#;
+        // Nothing blocked: original bytes (including the formatting of a
+        // number outside `params`).
+        let raw = br#"[{"jsonrpc":"2.0","id":1.50,"method":"tools/call","params":{"name":"x","arguments":{"n":100.0}}}]"#;
         let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
         let out = handle_client_line(raw, Mode::Enforce, "s", &mut eval);
         assert_eq!(
             out.to_server.as_deref().map(|b| &b[..b.len() - 1]),
             Some(&raw[..])
         );
+    }
+
+    #[test]
+    fn a_number_not_in_canonical_form_makes_a_tools_call_ambiguous() {
+        let call = |number: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"x","arguments":{{"a":[{{"n":{number}}}]}}}}}}"#
+            )
+        };
+        for number in ["50", "50.0", "49.99999999999999", "-7", "0.1"] {
+            assert!(
+                matches!(classify(call(number).as_bytes()), Classified::ToolCall(_)),
+                "{number}"
+            );
+        }
+        for number in [
+            "49.9999999999999965",
+            "50.00000000000000001",
+            "50.00",
+            "1e2",
+            "-0",
+            "18446744073709551616",
+        ] {
+            let Classified::Ambiguous {
+                reason, candidates, ..
+            } = classify(call(number).as_bytes())
+            else {
+                panic!("{number} was not ambiguous");
+            };
+            assert!(
+                reason.contains(&format!("number {number} is not written in canonical form")),
+                "{reason}"
+            );
+            // Observe still records the reading this proxy has.
+            assert_eq!(candidates.len(), 1, "{number}");
+        }
+        // In a batch element too, and enforce forwards none of it.
+        let raw = format!("[{}]", call("1e2"));
+        assert!(matches!(
+            classify(raw.as_bytes()),
+            Classified::Ambiguous { .. }
+        ));
+        let mut eval = Fixed::new(Ok(DecisionOutcome::Allow));
+        let out = handle_client_line(call("1e2").as_bytes(), Mode::Enforce, "s", &mut eval);
+        assert!(out.to_server.is_none());
+        // A message that is not a tools/call is forwarded as written.
+        let raw = br#"{"jsonrpc":"2.0","id":1,"method":"x/progress","params":{"progress":5e-1}}"#;
+        assert_eq!(classify(raw), Classified::Passthrough);
     }
 
     #[test]
@@ -1228,5 +1594,42 @@ mod tests {
         // Ordinary non-reserved keys with distinct folds stay fine.
         let ok = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"Path":"/a","mode":"r"}}}"#;
         assert!(matches!(classify(ok), Classified::ToolCall(_)));
+    }
+
+    fn oversized(prefix: &str) -> Value {
+        serde_json::from_slice(&oversized_line_response(prefix.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn oversized_line_uses_32600_when_the_id_is_in_the_prefix() {
+        for (prefix, id) in [
+            (
+                r#"{"jsonrpc":"2.0","id":"big","method":"tools/call","params":{"f":""#,
+                json!("big"),
+            ),
+            (r#"{"id":7,"#, json!(7)),
+            ("{ \"id\" : null }", json!(null)),
+            (r#"{"params":{"id":1},"id":"late"}"#, json!("late")),
+        ] {
+            let reply = oversized(prefix);
+            assert_eq!(reply["id"], id, "{prefix}");
+            assert_eq!(reply["error"]["code"], -32600, "{prefix}");
+        }
+    }
+
+    #[test]
+    fn oversized_line_uses_32700_when_the_id_is_not_extractable() {
+        for prefix in [
+            r#"{"jsonrpc":"2.0","method":"tools/call","params":{"f":"xxxx"#,
+            r#"{"id":"trun"#,
+            r#"{"id":1,"id":2}"#,
+            r#"[{"jsonrpc":"2.0","id":1}]"#,
+            "not json",
+            r#"{"method":"see \"id\" here"}"#,
+        ] {
+            let reply = oversized(prefix);
+            assert_eq!(reply["id"], Value::Null, "{prefix}");
+            assert_eq!(reply["error"]["code"], -32700, "{prefix}");
+        }
     }
 }
