@@ -163,7 +163,9 @@ does not wrap: it lists those servers as
 `not wrapped (local scope, project <path>)` and ends with a WARNING. Quit
 Claude Code before `install`: it rewrites `~/.claude.json` while it runs,
 and if the file changes while `install` works, nothing is written. The
-README section "Claude Code" says what was checked.
+README section "Claude Code" says what was checked. The README section
+"Known limits of `install`" lists the cases in which a server runs
+without the wrapper after `install`.
 
 ```sh
 praetore-mcp install --client cursor --mode observe --dry-run

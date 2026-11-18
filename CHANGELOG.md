@@ -15,6 +15,9 @@
   rewritten. A file that changes while `install` runs is not written.
   `install` without `--client` now also processes `~/.claude.json` when it
   exists.
+  The README section "Known limits of `install`" lists seven cases, for
+  Claude Code and in part for every client, in which a server runs without
+  the wrapper after `install`; none of them is closed in this version.
 
 - **praetore-mcp: `verify --expected-approval-head HEX`.** The approval
   journal must end at a head printed earlier, as `--expected-head` does
